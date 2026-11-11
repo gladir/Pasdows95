@@ -1,0 +1,57 @@
+PASDOWS 95 - LISEZ-MOI
+======================
+
+Pasdows 95 est un clone de Windows 95 ecrit en Pascal. Tout le
+systeme tient dans un seul fichier, IO.SYS, compile par WPC
+(Windows 95 Pascal Compiler) a partir de KERNEL\IO.PAS. IO.SYS est
+amorcable directement depuis ce CD-ROM (El Torito, sans emulation).
+
+DEMARRAGE
+---------
+  F8        Menu de demarrage (Normal, Mode sans echec, Invite de
+            commandes seulement, Redemarrer).
+  F5        Mode sans echec.
+  Maj+F5    Invite de commandes seulement (tapez WIN pour lancer
+            l'interface graphique).
+
+UTILISATION
+-----------
+  Demarrer (ou Ctrl+Echap)   Menu Demarrer : Programmes, Documents,
+                              Parametres, Aide, Executer, Arreter.
+  Double-clic                 Ouvrir une icone du bureau ou un fichier.
+  Barre de titre              Glisser pour deplacer une fenetre ;
+                              boutons Reduire, Agrandir et Fermer.
+  Alt+F4                      Fermer la fenetre active.
+  Alt+Tab                     Passer a une autre fenetre.
+  F1                          Aide de Pasdows.
+
+PROGRAMMES
+----------
+  Poste de travail, Explorateur, Bloc-notes (F5 = heure et date),
+  Calculatrice, Paint, Invite MS-DOS, Panneau de configuration
+  (Affichage, Date/Heure, Parametres regionaux, Systeme),
+  Corbeille, Aide, Executer et Arreter Pasdows (arret, redemarrage
+  ou mode MS-DOS).
+
+  Commandes de l'Invite MS-DOS : CLS, DATE, DIR [/W], ECHO, EXIT,
+  HELP, MEM, SET, TIME, TYPE, VER, VOL, WIN ainsi que CALC, CONTROL,
+  EXPLORER, NOTEPAD, PAINT et WINVER.
+
+LANGUE
+------
+  La langue par defaut est le francais. La variable d'environnement
+  LANGUAGE choisit une autre langue : LANGUAGE=EN (anglais),
+  LANGUAGE=GR (allemand), LANGUAGE=IT (italien), LANGUAGE=SP
+  (espagnol). Elle se fixe dans AUTOEXEC.BAT, avec SET dans l'Invite
+  MS-DOS ou dans Parametres regionaux ; le changement est immediat.
+
+  The default language is French. Type SET LANGUAGE=EN in the MS-DOS
+  Prompt (or use Regional Settings) to switch Pasdows to English.
+
+MATERIEL
+--------
+  Processeur 8086 ou superieur, carte VGA, clavier et souris PS/2,
+  lecteur de CD-ROM amorcable (BIOS avec INT 13h etendue).
+  Essai : qemu-system-i386 -m 32 -cdrom PASDOWS.ISO -boot d
+
+https://www.gladir.com/pasdows95

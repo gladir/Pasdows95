@@ -1,0 +1,15 @@
+;MSDOS.SYS de Pasdows 95 (lu par IO.SYS au demarrage)
+;BootMenu=1  : afficher le menu de demarrage (sinon touche F8)
+;BootGUI=0   : demarrer en mode invite de commandes seulement
+;Logo=0      : ne pas afficher l'ecran d'accueil
+;BootDelay=n : secondes d'attente de la touche F8
+[Paths]
+WinDir=D:\
+WinBootDir=D:\
+HostWinBootDrv=D
+
+[Options]
+BootMenu=0
+BootGUI=1
+Logo=1
+BootDelay=2
