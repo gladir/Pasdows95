@@ -1,6 +1,6 @@
 /* NETTEST : essai de TCP/IP (Winsock 1.1, ICMP.DLL) sur Pasdows 95 */
 /* Compilation (MinGW) :
-   i686-w64-mingw32-gcc -O1 -nostdlib -e _start@0 -mwindows -x c
+   i686-w64-mingw32-gcc -march=i386 -O1 -nostdlib -e _start@0 -mwindows -x c
      -o NETTEST.EXE NETTEST.C -lkernel32 -luser32 -lgdi32 -lwsock32
      -lmsvcrt */
 #include <windows.h>

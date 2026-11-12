@@ -4282,15 +4282,45 @@ Begin
   ClientRect(wkDos, X1, Y1, X2, Y2);
   Bar(X1, Y1, X2, Y2, cBlack);
   For R := 0 To ConRows - 1 Do
-  Begin
-    N := ConCols;
-    While (N > 0) And (ConBuf[R * ConCols + N - 1] = ' ') Do Dec(N);
-    S := '';
-    For C := 0 To N - 1 Do S := S + ConBuf[R * ConCols + C];
-    OutText(X1, Y1 + R * 16, S, cSilver);
-  End;
+    { lignes hors de la zone a redessiner : rien a faire }
+    If (Y1 + R * 16 <= ClipY2) And (Y1 + R * 16 + 15 >= ClipY1) Then
+    Begin
+      N := ConCols;
+      While (N > 0) And (ConBuf[R * ConCols + N - 1] = ' ') Do Dec(N);
+      S := '';
+      For C := 0 To N - 1 Do S := S + ConBuf[R * ConCols + C];
+      OutText(X1, Y1 + R * 16, S, cSilver);
+    End;
   Bar(X1 + ConX * 8, Y1 + ConY * 16 + 13, X1 + ConX * 8 + 7,
       Y1 + ConY * 16 + 14, cSilver);
+End;
+
+{ Redessiner seulement les colonnes C1..C2 de la ligne R (frappe d'un
+  caractere, retour arriere) : l'ancienne et la nouvelle position du
+  curseur. Toute la fenetre etait redessinee a chaque touche. }
+Procedure ConRefreshCells(R, C1, C2 : Integer);
+Var I : Integer; X1, Y1, X2, Y2 : Integer; Cr, Cc : Byte;
+Begin
+  If ConText Then
+  Begin
+    For I := R * 80 To R * 80 + 79 Do
+      MemW[$B800:I * 2] := Ord(ConBuf[I]) Or $0700;
+    Cr := ConY; Cc := ConX;
+    asm
+      mov ah,02h
+      xor bh,bh
+      mov dh,Cr
+      mov dl,Cc
+      int 10h
+    end;
+  End
+  Else
+  Begin
+    If Not Wins[wkDos].Open Or Wins[wkDos].Min Then Exit;
+    ClientRect(wkDos, X1, Y1, X2, Y2);
+    WinPartRedraw(wkDos, X1 + C1 * 8, Y1 + R * 16,
+                  Min(X1 + C2 * 8 + 7, X2), Min(Y1 + R * 16 + 15, Y2));
+  End;
 End;
 
 Procedure ConPrompt;
@@ -4517,7 +4547,9 @@ Begin
 End;
 
 Procedure ConKey(Const E : TEvent);
+Var OX, OY : Integer;
 Begin
+  OX := ConX; OY := ConY;
   If E.Sc = scEnter Then
   Begin
     ConNewLine;
@@ -4559,7 +4591,11 @@ Begin
   End
   Else
     Exit;
-  ConRefresh;
+  { meme ligne (ni retour a la ligne ni defilement) : redessin partiel }
+  If (E.Sc <> scEnter) And (ConY = OY) Then
+    ConRefreshCells(ConY, Min(OX, ConX), Max(OX, ConX))
+  Else
+    ConRefresh;
 End;
 
 { ------------------------------------------------------------------ }
