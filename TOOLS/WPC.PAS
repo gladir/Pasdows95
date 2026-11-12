@@ -972,8 +972,8 @@ Type
     IntVal   : LongInt;      { valeur entiere (TK_INTEGER/CHAR)   }
     RealVal  : Real;         { valeur reelle (TK_REAL)            }
     RealKind : Integer;      { TK_REAL : 4 Single, 8 Double, 10 Extended (plus petit type exact, comme FPC) }
-    Line     : Integer;      { ligne source (1-base)              }
-    Col      : Integer;      { colonne source (1-base)            }
+    Line     : LongInt;      { ligne source (1-base)              }
+    Col      : LongInt;      { colonne source (1-base)            }
   End;
 
 Var
@@ -1023,7 +1023,7 @@ Function  D16Selected : Boolean; Forward;
 
 Const
   MAX_DATA   = {$IFDEF FPC}16384{$ELSE}128{$ENDIF};
-  MAX_TOKENS = {$IFDEF FPC}131072{$ELSE}4096{$ENDIF};
+  MAX_TOKENS = {$IFDEF FPC}300000{$ELSE}4096{$ENDIF};
   TOKENS_W32 = {$IFDEF FPC}16384{$ELSE}4096{$ENDIF};  { limite des autres cibles }
 
   { Prefixes de mangling pour les labels generes }
@@ -3223,8 +3223,8 @@ Procedure TokenPoolAdd(Const T : TToken);
 Begin
   If TokenCount >= TokenPoolLimit Then
   Begin
-    WarnMsg('pool de tokens plein');
-    Exit;
+    FatalError('pool de tokens plein (' + IntToStr_(TokenPoolLimit) +
+               ' jetons) : source trop grand');
   End;
   TokenPool[TokenCount] := T;
   Inc(TokenCount);
@@ -28178,6 +28178,16 @@ Begin
     If ProcIntr[FI] And AsmNative Then
     Begin
       EmitInstr('PUSHAD');
+      If KrnVmm32 Then
+      Begin
+        { VMM32 : l interruption peut survenir dans du code 16 bits
+          (anneau 3) dont DS/ES n ont pas une base nulle }
+        EmitInstr('PUSH DS');
+        EmitInstr('PUSH ES');
+        EmitInstr('MOV AX,10h');
+        EmitInstr('MOV DS,AX');
+        EmitInstr('MOV ES,AX');
+      End;
       EmitInstr('CLD');
     End;
     { espace supplementaire : copies locales des parametres valeur chaine/agregat }
@@ -28258,6 +28268,11 @@ Begin
     Begin
       EmitInstr('MOV ESP,EBP');
       EmitInstr('POP EBP');
+      If KrnVmm32 Then
+      Begin
+        EmitInstr('POP ES');
+        EmitInstr('POP DS');
+      End;
       EmitInstr('POPAD');
       EmitInstr('IRETD');
     End

@@ -289,8 +289,9 @@ End;
 
 Function Trim(S : String) : String;
 Begin
-  While (Length(S) > 0) And (S[1] = ' ') Do Delete(S, 1, 1);
-  While (Length(S) > 0) And (S[Length(S)] = ' ') Do
+  { espaces, tabulations et autres caracteres de controle }
+  While (Length(S) > 0) And (S[1] <= ' ') Do Delete(S, 1, 1);
+  While (Length(S) > 0) And (S[Length(S)] <= ' ') Do
     Delete(S, Length(S), 1);
   Trim := S;
 End;
@@ -550,7 +551,7 @@ End;
 { ==================================================================== }
 
 Var
-  Gdt      : Array[0..9] Of LongInt;
+  Gdt      : Array[0..17] Of LongInt;
   GdtPtr   : TDescPtr;
   Idt      : Array[0..255] Of TGate;
   IdtPtr   : TDescPtr;
@@ -587,13 +588,15 @@ Begin
 End;
 
 Procedure InitGdt;
+Var I : LongInt;
 Begin
   Gdt[0] := 0;          Gdt[1] := 0;
   Gdt[2] := $0000FFFF;  Gdt[3] := $00CF9A00;
   Gdt[4] := $0000FFFF;  Gdt[5] := $00CF9200;
   Gdt[6] := $0000FFFF;  Gdt[7] := $00CF9200;
   Gdt[8] := 0;          Gdt[9] := 0;
-  GdtPtr.Limit := 5 * 8 - 1;
+  For I := 10 To 17 Do Gdt[I] := 0;
+  GdtPtr.Limit := 9 * 8 - 1;
   GdtPtr.Base := LongInt(@Gdt);
   asm
     lgdt GdtPtr
@@ -711,7 +714,7 @@ End;
 Procedure InitPic;
 Begin
   Port[$20] := $11; Port[$A0] := $11;
-  Port[$21] := $20; Port[$A1] := $28;
+  Port[$21] := $50; Port[$A1] := $58;
   Port[$21] := $04; Port[$A1] := $02;
   Port[$21] := $01; Port[$A1] := $01;
   Port[$21] := $F8; Port[$A1] := $FF;
@@ -730,11 +733,13 @@ Begin
   SetGate(13, LongInt(@Exc0D)); SetGate(14, LongInt(@Exc0E));
   SetGate(16, LongInt(@Exc10)); SetGate(17, LongInt(@Exc11));
   SetGate(19, LongInt(@Exc13));
-  For I := $20 To $27 Do SetGate(I, LongInt(@IrqMaster));
-  For I := $28 To $2F Do SetGate(I, LongInt(@IrqSlave));
-  SetGate($20, LongInt(@IrqTimer));
-  SetGate($21, LongInt(@IrqKeyboard));
-  SetGate($2C, LongInt(@IrqMouse));
+  { IRQ en 50h-5Fh (comme Windows 95) : 20h-2Fh restent aux appels
+    logiciels des programmes 16 bits (INT 21h, INT 2Fh, INT 31h) }
+  For I := $50 To $57 Do SetGate(I, LongInt(@IrqMaster));
+  For I := $58 To $5F Do SetGate(I, LongInt(@IrqSlave));
+  SetGate($50, LongInt(@IrqTimer));
+  SetGate($51, LongInt(@IrqKeyboard));
+  SetGate($5C, LongInt(@IrqMouse));
   IdtPtr.Limit := 256 * 8 - 1;
   IdtPtr.Base := LongInt(@Idt);
   asm
@@ -935,6 +940,7 @@ Var
   RootLba, RootSize : LongInt;
   VolLabel  : String[32];
   KObjs     : Array[0..MaxKObj - 1] Of TKObj;
+  KObjOwner : Array[0..MaxKObj - 1] Of LongInt;
   RamFiles  : Array[0..MaxRam - 1] Of TRamFile;
   CurDirS   : String[127];
   LastErr0  : LongInt;
@@ -1227,6 +1233,7 @@ Begin
       KObjs[I].F1 := 0; KObjs[I].F2 := 0; KObjs[I].F3 := 0;
       KObjs[I].F4 := 0; KObjs[I].F5 := 0; KObjs[I].F6 := 0;
       KObjs[I].Name := ''; KObjs[I].Mask := '';
+      KObjOwner[I] := HeapOwner;
       KObjNew := I;
       Exit;
     End;
@@ -1320,10 +1327,15 @@ End;
 
 { Repertoires fixes du disque C: }
 Function IsCDir(Path : String) : Boolean;
+Var I : LongInt;
 Begin
   IsCDir := (Path = 'C:\') Or (Path = 'C:\WINDOWS') Or
             (Path = 'C:\WINDOWS\SYSTEM') Or (Path = 'C:\TEMP') Or
             (Path = 'C:\WINDOWS\TEMP');
+  { repertoires crees (entrees d'attribut 10h du disque en memoire) }
+  For I := 0 To MaxRam - 1 Do
+    If RamFiles[I].Used And (RamFiles[I].Attr = $10) And
+       (RamFiles[I].Path = Path) Then IsCDir := True;
 End;
 
 Function RamFind(Path : String) : LongInt;
@@ -2474,6 +2486,12 @@ Var
   MsgQ     : Array[0..MaxThread * MaxQueue - 1] Of TMsgRec;
   CurT     : LongInt;
   FpuArea  : Array[0..MaxThread * 112 - 1] Of Byte;
+  { par tache : pile de l'anneau 0 pour le code 16 bits (TSS.ESP0),
+    proprietaire des blocs memoire (1 Win32, 2 Win16), tache Win16 }
+  ThrEsp0  : Array[0..MaxThread - 1] Of LongInt;
+  ThrOwner : Array[0..MaxThread - 1] Of LongInt;
+  ThrW16   : Array[0..MaxThread - 1] Of Boolean;
+  TssBase  : LongInt;
   SwSave   : LongInt;
   SwNew    : LongInt;
   NextTid  : LongInt;
@@ -2569,11 +2587,12 @@ Begin
   SwSave := LongInt(@Threads[CurT].Esp);
   SwNew := Threads[N].Esp;
   CurT := N;
-  HeapOwner := Ord(Threads[N].IsApp);
+  HeapOwner := ThrOwner[N];
+  If TssBase <> 0 Then MemL[0:TssBase + 4] := ThrEsp0[N];
   ThreadSetFs(N);
   SliceStart := Ticks;
   SwitchCtx;
-  HeapOwner := Ord(Threads[CurT].IsApp);
+  HeapOwner := ThrOwner[CurT];
   A := LongInt(@FpuArea) + CurT * 112;
   asm
     mov eax,A
@@ -2593,8 +2612,10 @@ Begin
   end;
   If (CurT <= 0) Or (Ticks - SliceStart < 20) Then Exit;
   If Not Threads[CurT].IsApp Then Exit;
-  Eip := MemL[0:F + 36];
-  If (Eip >= KImgLo) And (Eip < KImgHi) Then Exit;
+  Eip := MemL[0:F + 44];
+  { code 16 bits (anneau 3) : toujours preemptible }
+  If (MemL[0:F + 48] And 3) <> 3 Then
+    If (Eip >= KImgLo) And (Eip < KImgHi) Then Exit;
   KSchedule;
 End;
 
@@ -2683,6 +2704,9 @@ Begin
   Threads[T].Param := Param;
   Threads[T].ExitCode := 259;
   Threads[T].IsApp := IsApp;
+  ThrOwner[T] := Ord(IsApp);
+  ThrW16[T] := False;
+  ThrEsp0[T] := (Threads[T].Stack + StackSz - 64) And Not 15;
   Threads[T].PaintReq := False;
   Threads[T].KObj := KObjNew(koThread);
   If Threads[T].KObj >= 0 Then KObjs[Threads[T].KObj].F1 := T;
@@ -6336,13 +6360,13 @@ Begin
   V := Vec And 255;
   If Vec >= 256 Then
   Begin
-    Err := MemL[0:Frame + 36];
-    Eip := MemL[0:Frame + 40];
+    Err := MemL[0:Frame + 44];
+    Eip := MemL[0:Frame + 48];
   End
   Else
   Begin
     Err := 0;
-    Eip := MemL[0:Frame + 36];
+    Eip := MemL[0:Frame + 44];
   End;
   Case V Of
     0 : Nm := 'Division par zero';
@@ -6353,15 +6377,17 @@ Begin
   Else
     Nm := 'Exception ' + IntStr(V);
   End;
-  S := Nm + ' EIP=' + HexStr(Eip, 8) + ' ERR=' + HexStr(Err, 4) +
-       ' EAX=' + HexStr(MemL[0:Frame + 32], 8) + ' EBX=' +
-       HexStr(MemL[0:Frame + 20], 8) + ' ECX=' + HexStr(MemL[0:Frame + 28], 8)
-       + ' EDX=' + HexStr(MemL[0:Frame + 24], 8) + ' ESI=' +
-       HexStr(MemL[0:Frame + 8], 8) + ' EDI=' + HexStr(MemL[0:Frame + 4], 8)
-       + ' EBP=' + HexStr(MemL[0:Frame], 8) + ' ESP=' +
-       HexStr(Frame + 40 + 4 * Ord(Vec >= 256), 8);
+  S := Nm + ' EIP=' + HexStr(Eip, 8) + ' CS=' +
+       HexStr(MemL[0:Frame + 48 + 4 * Ord(Vec >= 256)], 4)
+       + ' ERR=' + HexStr(Err, 4) +
+       ' EAX=' + HexStr(MemL[0:Frame + 40], 8) + ' EBX=' +
+       HexStr(MemL[0:Frame + 28], 8) + ' ECX=' + HexStr(MemL[0:Frame + 36], 8)
+       + ' EDX=' + HexStr(MemL[0:Frame + 32], 8) + ' ESI=' +
+       HexStr(MemL[0:Frame + 16], 8) + ' EDI=' + HexStr(MemL[0:Frame + 12], 8)
+       + ' EBP=' + HexStr(MemL[0:Frame + 20], 8) + ' ESP=' +
+       HexStr(Frame + 56 + 4 * Ord(Vec >= 256), 8);
   KLog('FAUTE (tache ' + IntStr(CurT) + ') ' + S);
-  X := Frame + 40 + 4 * Ord(Vec >= 256);
+  X := Frame + 56 + 4 * Ord(Vec >= 256);
   S := 'Pile :';
   For V := 0 To 11 Do S := S + ' ' + HexStr(MemL[0:X + V * 4], 8);
   KLog(S);
@@ -7138,6 +7164,59 @@ Begin
   DeleteFileA := 1;
 End;
 
+Function CreateDirectoryA(PName, Sec : LongInt) : LongInt;
+Var S : String; R, Attr, Size, Time, Lba, Ram : LongInt;
+Begin
+  CreateDirectoryA := 0;
+  S := FullPath(PStr(PName));
+  If Length(S) > 3 Then
+    If S[Length(S)] = '\' Then S := Copy(S, 1, Length(S) - 1);
+  If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
+  Begin
+    SetErr(183);
+    Exit;
+  End;
+  If (Copy(S, 1, 2) <> 'C:') Then
+  Begin
+    SetErr(ErrAccessDenied);
+    Exit;
+  End;
+  If Not IsCDir(ParentDir(S)) Then
+  Begin
+    SetErr(ErrPathNotFound);
+    Exit;
+  End;
+  R := RamNew(S);
+  If R < 0 Then
+  Begin
+    SetErr(4);
+    Exit;
+  End;
+  RamFiles[R].Attr := $10;
+  CreateDirectoryA := 1;
+End;
+
+Function RemoveDirectoryA(PName : LongInt) : LongInt;
+Var S : String; R, I : LongInt;
+Begin
+  RemoveDirectoryA := 0;
+  S := FullPath(PStr(PName));
+  R := RamFind(S);
+  If (R < 0) Or (RamFiles[R].Attr <> $10) Then
+  Begin
+    SetErr(ErrPathNotFound);
+    Exit;
+  End;
+  For I := 0 To MaxRam - 1 Do
+    If RamFiles[I].Used And (ParentDir(RamFiles[I].Path) = S) Then
+    Begin
+      SetErr(145);
+      Exit;
+    End;
+  RamFiles[R].Used := False;
+  RemoveDirectoryA := 1;
+End;
+
 Function MoveFileA(PSrc, PDst : LongInt) : LongInt;
 Var R : LongInt;
 Begin
@@ -7393,7 +7472,10 @@ Function OpenFile(PName, POf, Style : LongInt) : LongInt;
 Var S : String; Attr, Size, Time, Lba, Ram, H : LongInt;
 Begin
   OpenFile := -1;
-  S := FullPath(PStr(PName));
+  { OF_REOPEN : chemin pris dans le tampon OFSTRUCT d'une ouverture
+    precedente }
+  If ((Style And $8000) <> 0) And (POf <> 0) Then S := PStr(POf + 8)
+  Else S := FullPath(PStr(PName));
   If POf <> 0 Then
   Begin
     Mem[0:POf] := 136; Mem[0:POf + 1] := 0;
@@ -7413,7 +7495,8 @@ Begin
   End;
   If (Style And $200) <> 0 Then
   Begin
-    OpenFile := DeleteFileA(PName);
+    S := S + #0;
+    OpenFile := DeleteFileA(LongInt(@S[1]));
     Exit;
   End;
   If (Style And $1000) <> 0 Then H := KOpenFile(S, True, 2)
@@ -7920,7 +8003,7 @@ Begin
       Line := Trim(Line);
       If (Length(Line) > 1) And (Line[1] = '[') Then
       Begin
-        Cur := UpStr(Copy(Line, 2, Pos(']', Line) - 2));
+        Cur := UpStr(Trim(Copy(Line, 2, Pos(']', Line) - 2)));
         InSect := Cur = Sect;
       End
       Else If InSect And (Pos('=', Line) > 0) Then
@@ -7938,17 +8021,56 @@ Begin
   KFree(A);
 End;
 
+{ Noms des cles d'une section (ou des sections si Sect = #0), separes
+  par des zeros, double zero final ; nombre d'octets ecrits }
+Function IniEnum(F, Sect : String; Buf, N : LongInt) : LongInt;
+Var A, Size, P, C, O : LongInt; Line, Cur, Nm : String; InSect : Boolean;
+Begin
+  IniEnum := 0;
+  If N < 2 Then Exit;
+  Mem[0:Buf] := 0; Mem[0:Buf + 1] := 0;
+  A := LoadWholeFile(IniPath(F), Size);
+  If A = 0 Then Exit;
+  Sect := UpStr(Sect);
+  InSect := False; Line := ''; O := 0;
+  For P := 0 To Size Do
+  Begin
+    If P < Size Then C := Mem[0:A + P] Else C := 10;
+    If (C = 10) Or (C = 13) Then
+    Begin
+      Line := Trim(Line);
+      Nm := '';
+      If (Length(Line) > 1) And (Line[1] = '[') Then
+      Begin
+        Cur := Trim(Copy(Line, 2, Pos(']', Line) - 2));
+        InSect := UpStr(Cur) = Sect;
+        If Sect = #0 Then Nm := Cur;
+      End
+      Else If InSect And (Pos('=', Line) > 0) And (Line[1] <> ';') Then
+        Nm := Trim(Copy(Line, 1, Pos('=', Line) - 1));
+      If (Nm <> '') And (O + Length(Nm) + 2 <= N) Then
+      Begin
+        For C := 1 To Length(Nm) Do Mem[0:Buf + O + C - 1] := Ord(Nm[C]);
+        O := O + Length(Nm) + 1;
+        Mem[0:Buf + O - 1] := 0;
+        Mem[0:Buf + O] := 0;
+      End;
+      Line := '';
+    End
+    Else If Length(Line) < 250 Then Line := Line + Chr(C);
+  End;
+  KFree(A);
+  IniEnum := O;
+End;
+
 Function GetPrivateProfileStringA(App, Key, Def, Buf, N, F : LongInt)
   : LongInt;
 Var V : String;
 Begin
   If (App = 0) Or (Key = 0) Then
   Begin
-    If N >= 2 Then
-    Begin
-      Mem[0:Buf] := 0; Mem[0:Buf + 1] := 0;
-    End;
-    GetPrivateProfileStringA := 0;
+    If App = 0 Then V := #0 Else V := PStr(App);
+    GetPrivateProfileStringA := IniEnum(PStr(F), V, Buf, N);
     Exit;
   End;
   If Not IniGet(PStr(F), PStr(App), PStr(Key), V) Then V := PStr(Def);
@@ -14979,19 +15101,21 @@ Begin
   KillingApp := True;
   For I := 0 To MaxWnd - 1 Do
     If Wnds[I].Used And (Wnds[I].Thread > 0) And
-       Threads[Wnds[I].Thread].IsApp Then
+       Threads[Wnds[I].Thread].IsApp And Not ThrW16[Wnds[I].Thread] Then
     Begin
       Wnds[I].Proc := 0;
       Wnds[I].IKind := ikStatic;
       DestroyW(I);
     End;
   For I := 1 To MaxThread - 1 Do
-    If Threads[I].Used And Threads[I].IsApp And (I <> CurT) Then
+    If Threads[I].Used And Threads[I].IsApp And (I <> CurT) And
+       Not ThrW16[I] Then
       Threads[I].State := tsDead;
   For I := 0 To MaxTimer - 1 Do WTimers[I].Used := False;
   For I := 0 To MaxMMTimer - 1 Do MMTimers[I].Used := False;
   For I := 0 To MaxKObj - 1 Do
-    If KObjs[I].Used And (KObjs[I].Kind In [koFile, koFind]) Then
+    If KObjs[I].Used And (KObjs[I].Kind In [koFile, koFind]) And
+       (KObjOwner[I] = 1) Then
       KObjs[I].Used := False;
   For I := 0 To MaxDC - 1 Do
     If Dcs[I].Used And (Gdis[Dcs[I].Gdi].Owner = 1) Then DcFree(I);
@@ -15000,7 +15124,8 @@ Begin
   For I := 0 To MaxVBlk - 1 Do VBlks[I].Used := False;
   For I := 0 To MaxMod - 1 Do Mods[I].Used := False;
   For I := 0 To MaxClass - 1 Do
-    If Classes[I].Used And (Classes[I].IKind = ikNone) Then
+    If Classes[I].Used And (Classes[I].IKind = ikNone) And
+       ((Classes[I].Inst <= 0) Or (Classes[I].Inst > $FFFF)) Then
       Classes[I].Used := False;
   KFreeOwner(1);
   StubArea := 0;
@@ -15031,10 +15156,21 @@ Begin
 End;
 
 { Lancer un programme Windows (.EXE du CD-ROM ou du disque virtuel) }
+Function IsNeFile(Path : String) : Boolean; Forward;
+Function RunNe(Path, Args : String; Show : LongInt) : Boolean; Forward;
+
 Function RunExe(Path, Args : String) : Boolean;
 Var M, T, Sub : LongInt; S : String;
 Begin
   RunExe := False;
+  { programme Windows 3.x (NE) : sous-systeme Win16 }
+  S := FindModuleFile(Path);
+  If (S <> '') And IsNeFile(S) Then
+  Begin
+    KLog('Lancement de ' + S + ' (Win16)');
+    RunExe := RunNe(S, Args, 1);
+    Exit;
+  End;
   If AppRunning Then
   Begin
     MsgBoxOpen('Pasdows', L('Un programme Windows est d'#130'j'#133' en ' +
@@ -15093,9 +15229,4748 @@ Begin
   CursorSetShape(0);
 End;
 
+{ Table des API Win16 : module (K KERNEL, U USER, G GDI, B KEYBOARD,
+  L LZEXPAND, S SHELL, M MMSYSTEM, E WIN87EM, N WING, V VER, C COMMDLG,
+  T TOOLHELP, Y SYSTEM, D DISPLAY, O SOUND), ordinal, arguments dans
+  l'ordre de declaration (W mot, I entier signe, L long, P pointeur
+  lointain converti, S pointeur lointain brut, D double, V variable),
+  resultat (W AX, L DX:AX, R registres) ; =n : constante ; X inconnue.
+  Ordinaux d'apres la documentation de l'API Windows 3.1. }
+
+Const
+  W16ApiN = 1760;
+  W16Apis : Array[0..W16ApiN - 1] Of String[40] = (
+    'K001:X>W FatalExit',
+    'K002:>W ExitKernel',
+    'K003:>L GetVersion',
+    'K004:WWW>W LocalInit',
+    'K005:WW>W LocalAlloc',
+    'K006:WWW>W LocalReAlloc',
+    'K007:W>W LocalFree',
+    'K008:W>L LocalLock',
+    'K009:W>W LocalUnlock',
+    'K010:W>W LocalSize',
+    'K011:W>W LocalHandle',
+    'K012:W>W LocalFlags',
+    'K013:W>W LocalCompact',
+    'K014:L>L LocalNotify',
+    'K015:WL>W GlobalAlloc',
+    'K016:WLW>W GlobalReAlloc',
+    'K017:W>W GlobalFree',
+    'K018:W>L GlobalLock',
+    'K019:W>W GlobalUnlock',
+    'K020:W>L GlobalSize',
+    'K021:W>L GlobalHandle',
+    'K022:W>W GlobalFlags',
+    'K023:W>W LockSegment',
+    'K024:W>W UnlockSegment',
+    'K025:L>L GlobalCompact',
+    'K026:W>W GlobalFreeAll',
+    'K027:WPW>W GetModuleName',
+    'K028:>L GlobalMasterHandle',
+    'K029:>W Yield',
+    'K030:W>W WaitEvent',
+    'K031:W>W PostEvent',
+    'K032:WI>W SetPriority',
+    'K033:W>W LockCurrentTask',
+    'K034:WW>W SetTaskQueue',
+    'K035:W>W GetTaskQueue',
+    'K036:>L GetCurrentTask',
+    'K037:>L GetCurrentPDB',
+    'K038:WS>L SetTaskSignalProc',
+    'K039:X>W SetTaskSwitchProc',
+    'K040:X>W SetTaskInterchange',
+    'K041:>W EnableDos',
+    'K042:>W DisableDos',
+    'K043:X>W IsScreenGrab',
+    'K044:X>W BuildPDB',
+    'K045:PP>W LoadModule',
+    'K046:W>W FreeModule',
+    'K047:S>L GetModuleHandle',
+    'K048:W>W GetModuleUsage',
+    'K049:WPI>W GetModuleFileName',
+    'K050:WP>L GetProcAddress',
+    'K051:SW>L MakeProcInstance',
+    'K052:S>W FreeProcInstance',
+    'K053:X>W CallProcInstance',
+    'K054:WWW>W GetInstanceData',
+    'K055:R>R Catch',
+    'K056:R>R Throw',
+    'K057:PPI>W GetProfileInt',
+    'K058:PPPPW>W GetProfileString',
+    'K059:PPP>W WriteProfileString',
+    'K060:WPP>W FindResource',
+    'K061:WW>W LoadResource',
+    'K062:W>L LockResource',
+    'K063:W>W FreeResource',
+    'K064:WW>W AccessResource',
+    'K065:WW>L SizeofResource',
+    'K066:WWL>W AllocResource',
+    'K067:WPS>L SetResourceHandler',
+    'K068:W>W InitAtomTable',
+    'K069:P>W FindAtom',
+    'K070:P>W AddAtom',
+    'K071:W>W DeleteAtom',
+    'K072:WPW>W GetAtomName',
+    'K073:W>W GetAtomHandle',
+    'K074:PPW>W OpenFile',
+    'K075:X>W OpenPathName',
+    'K076:X>W DeletePathName',
+    'K077:S>L Reserved1',
+    'K078:SS>L Reserved2',
+    'K079:S>L Reserved3',
+    'K080:S>L Reserved4',
+    'K081:W>W _lclose',
+    'K082:WSW>W _lread',
+    'K083:PW>W _lcreat',
+    'K084:WLW>L _llseek',
+    'K085:PW>W _lopen',
+    'K086:WPW>W _lwrite',
+    'K087:PP>W Reserved5',
+    'K088:SP>L lstrcpy',
+    'K089:SP>L lstrcat',
+    'K090:P>W lstrlen',
+    'K091:R>R InitTask',
+    'K092:W>L GetTempDrive',
+    'K093:S>L GetCodeHandle',
+    'K094:W>W DefineHandleTable',
+    'K095:P>W LoadLibrary',
+    'K096:W>W FreeLibrary',
+    'K097:WPWP>W GetTempFileName',
+    'K098:>W GetLastDiskChange',
+    'K099:>L GetLPErrMode',
+    'K100:>W ValidateCodeSegments',
+    'K101:X>W NoHookDosCall',
+    'K102:R>R DOS3Call',
+    'K103:R>R NetBIOSCall',
+    'K104:SP>W GetCodeInfo',
+    'K105:>W GetExeVersion',
+    'K106:W>L SetSwapAreaSize',
+    'K107:W>W SetErrorMode',
+    'K108:WWW>W SwitchStackTo',
+    'K109:R>R SwitchStackBack',
+    'K110:W>L PatchCodeHandle',
+    'K111:W>L GlobalWire',
+    'K112:W>W GlobalUnWire',
+    'K113:=3 __AHSHIFT',
+    'K114:=8 __AHINCR',
+    'K115:P>W OutputDebugString',
+    'K116:X>W InitLib',
+    'K117:>W OldYield',
+    'K118:>W GetTaskQueueDS',
+    'K119:>W GetTaskQueueES',
+    'K120:X>W UndefDynLink',
+    'K121:WW>W LocalShrink',
+    'K122:>W IsTaskLocked',
+    'K123:>W KbdRst',
+    'K124:>W EnableKernel',
+    'K125:>W DisableKernel',
+    'K126:X>W MemoryFreed',
+    'K127:PPIP>W GetPrivateProfileInt',
+    'K128:PPPPWP>W GetPrivateProfileStrin',
+    'K129:PPPP>W WritePrivateProfileStr',
+    'K130:P>L FileCDR',
+    'K131:>L GetDOSEnvironment',
+    'K132:>L GetWinFlags',
+    'K133:W>W GetExePtr',
+    'K134:PW>W GetWindowsDirectory',
+    'K135:PW>W GetSystemDirectory',
+    'K136:W>W GetDriveType',
+    'K137:WP>W FatalAppExit',
+    'K138:W>L GetHeapSpaces',
+    'K139:X>W DoSignal',
+    'K140:SPPWW>W SetSigHandler',
+    'K141:X>W InitTask1',
+    'K142:PW>W GetProfileSectionNames',
+    'K143:PWP>W GetPrivateProfileSecti',
+    'K144:PP>W CreateDirectory',
+    'K145:P>W RemoveDirectory',
+    'K146:P>W DeleteFile',
+    'K147:L>W SetLastError',
+    'K148:>L GetLastError',
+    'K149:P>W GetVersionEx',
+    'K150:W>W DirectedYield',
+    'K151:X>W WinOldApCall',
+    'K152:>W GetNumTasks',
+    'K154:S>W GlobalNotify',
+    'K155:>W GetTaskDS',
+    'K156:L>L LimitEMSPages',
+    'K157:L>L GetCurPID',
+    'K158:W>W IsWinOldApTask',
+    'K159:W>L GlobalHandleNoRIP',
+    'K160:X>W EMSCopy',
+    'K161:>W LocalCountFree',
+    'K162:>W LocalHeapSize',
+    'K163:W>W GlobalLRUOldest',
+    'K164:W>W GlobalLRUNewest',
+    'K165:W>W A20Proc',
+    'K166:PW>W WinExec',
+    'K167:W>W GetExpWinVer',
+    'K168:WWW>W DirectResAlloc',
+    'K169:W>L GetFreeSpace',
+    'K170:W>W AllocCStoDSAlias',
+    'K171:W>W AllocDStoCSAlias',
+    'K172:W>W AllocAlias',
+    'K173:=0 __ROMBIOS',
+    'K174:=0 __A000H',
+    'K175:W>W AllocSelector',
+    'K176:W>W FreeSelector',
+    'K177:WW>W PrestoChangoSelector',
+    'K178:=1043 __WINFLAGS',
+    'K179:=0 __D000H',
+    'K180:LL>W LongPtrAdd',
+    'K181:=0 __B000H',
+    'K182:=0 __B800H',
+    'K183:=0 __0000H',
+    'K184:L>L GlobalDOSAlloc',
+    'K185:W>W GlobalDOSFree',
+    'K186:W>L GetSelectorBase',
+    'K187:WL>W SetSelectorBase',
+    'K188:W>L GetSelectorLimit',
+    'K189:WL>W SetSelectorLimit',
+    'K190:=0 __E000H',
+    'K191:W>W GlobalPageLock',
+    'K192:W>W GlobalPageUnlock',
+    'K193:=0 __0040H',
+    'K194:=0 __F000H',
+    'K195:=0 __C000H',
+    'K196:WWW>W SelectorAccessRights',
+    'K197:W>W GlobalFix',
+    'K198:W>W GlobalUnfix',
+    'K199:W>W SetHandleCount',
+    'K200:>W ValidateFreeSpaces',
+    'K201:X>W ReplaceInst',
+    'K202:X>W RegisterPtrace',
+    'K203:R>R DebugBreak',
+    'K204:X>W SwapRecording',
+    'K205:X>W CVWBreak',
+    'K206:W>W AllocSelectorArray',
+    'K207:W>W IsDBCSLeadByte',
+    'K208:WLLL>L K208',
+    'K209:LLWL>L K209',
+    'K210:LLWLL>L K210',
+    'K211:LLW>L K211',
+    'K213:LLWW>L K213',
+    'K214:LLW>L K214',
+    'K215:LW>L K215',
+    'K216:LLPL>L RegEnumKey',
+    'K217:LPP>L RegOpenKey',
+    'K218:LPP>L RegCreateKey',
+    'K219:LP>L RegDeleteKey',
+    'K220:L>L RegCloseKey',
+    'K221:LPLPL>L RegSetValue',
+    'K222:LP>L RegDeleteValue',
+    'K223:LLPPPPPP>L RegEnumValue',
+    'K224:LPPP>L RegQueryValue',
+    'K225:LPPPPP>L RegQueryValueEx',
+    'K226:LPLLPL>L RegSetValueEx',
+    'K227:L>L RegFlushKey',
+    'K228:W>W K228',
+    'K229:L>W K229',
+    'K230:W>L GlobalSmartPageLock',
+    'K231:W>L GlobalSmartPageUnlock',
+    'K232:X>W RegLoadKey',
+    'K233:X>W RegUnloadKey',
+    'K234:X>W RegSaveKey',
+    'K235:X>W InvalidateNlsCache',
+    'K236:X>W GetProductName',
+    'K237:>W K237',
+    'K262:X>W WOWWaitForMsgAndEvent',
+    'K263:X>W WOWMsgBox',
+    'K273:X>W K273',
+    'K274:PPW>W GetShortPathName',
+    'K310:W>W LocalHandleDelta',
+    'K311:P>L GetSetKernelDOSProc',
+    'K314:X>W DebugDefineSegment',
+    'K315:>W WriteOutProfiles',
+    'K316:>L GetFreeMemInfo',
+    'K318:X>W FatalExitHook',
+    'K319:X>W FlushCachedFileHandle',
+    'K320:W>W IsTask',
+    'K323:W>W IsRomModule',
+    'K324:WP>W LogError',
+    'K325:WPP>W LogParamError',
+    'K326:W>W IsRomFile',
+    'K327:R>R K327',
+    'K328:V>W _DebugOutput',
+    'K329:PW>W K329',
+    'K332:=0 THHOOK',
+    'K334:SW>W IsBadReadPtr',
+    'K335:SW>W IsBadWritePtr',
+    'K336:S>W IsBadCodePtr',
+    'K337:SW>W IsBadStringPtr',
+    'K338:S>W HasGPHandler',
+    'K339:>W DiagQuery',
+    'K340:P>W DiagOutput',
+    'K341:P>L ToolHelpHook',
+    'K342:=0 __GP',
+    'K343:X>W RegisterWinOldApHook',
+    'K344:X>W GetWinOldApHooks',
+    'K345:W>W IsSharedSelector',
+    'K346:SL>W IsBadHugeReadPtr',
+    'K347:SL>W IsBadHugeWritePtr',
+    'K348:PPL>W hmemcpy',
+    'K349:WSL>L _hread',
+    'K350:WPL>L _hwrite',
+    'K351:>W BUNNY_351',
+    'K352:SPW>L lstrcatn',
+    'K353:SPW>L lstrcpyn',
+    'K354:W>L GetAppCompatFlags',
+    'K355:PW>W GetWinDebugInfo',
+    'K356:P>W SetWinDebugInfo',
+    'K357:S>L MapSL',
+    'K358:L>L MapLS',
+    'K359:S>L UnMapLS',
+    'K360:PPW>W OpenFileEx',
+    'K361:>W PIGLET_361',
+    'K362:X>W ThunkTerminateProcess',
+    'K365:R>R GlobalChangeLockCount',
+    'K403:WW>W FarSetOwner',
+    'K404:W>W FarGetOwner',
+    'K406:PPPWP>W WritePrivateProfileStr',
+    'K407:PPPWP>W GetPrivateProfileStruc',
+    'K408:X>W KERNEL_408',
+    'K409:X>W KERNEL_409',
+    'K410:X>W CreateProcessFromWinEx',
+    'K411:LP>L GetCurrentDirectory',
+    'K412:P>W SetCurrentDirectory',
+    'K413:PP>W FindFirstFile',
+    'K414:WP>W FindNextFile',
+    'K415:W>W FindClose',
+    'K416:PPP>W WritePrivateProfileSec',
+    'K417:PP>W WriteProfileSection',
+    'K418:PPWP>W GetPrivateProfileSecti',
+    'K419:PPW>W GetProfileSection',
+    'K420:P>L GetFileAttributes',
+    'K421:PL>W SetFileAttributes',
+    'K422:PPPPP>W GetDiskFreeSpace',
+    'K423:P>W LogApiThk',
+    'K431:PW>W IsPeFormat',
+    'K432:X>W FileTimeToLocalFileTim',
+    'K434:PPW>W UnicodeToAnsi',
+    'K435:X>W GetTaskFlags',
+    'K436:P>W _ConfirmSysLevel',
+    'K437:P>W _CheckNotSysLevel',
+    'K438:PL>W _CreateSysLevel',
+    'K439:P>W _EnterSysLevel',
+    'K440:P>W _LeaveSysLevel',
+    'K441:PLSSLP>L CreateThread16',
+    'K442:>L VWin32_EventCreate',
+    'K443:L>L VWin32_EventDestroy',
+    'K444:PW>W Local32Info',
+    'K445:PW>W Local32First',
+    'K446:P>W Local32Next',
+    'K447:>W WIN32_OldYield',
+    'K448:X>W KERNEL_448',
+    'K449:>L GetpWin16Lock',
+    'K450:L>L VWin32_EventWait',
+    'K451:L>L VWin32_EventSet',
+    'K452:P>L LoadLibrary32',
+    'K453:LP>L GetProcAddress32',
+    'K454:=0 __FLATCS',
+    'K455:=0 __FLATDS',
+    'K456:WWW>L DefResourceHandler',
+    'K457:LL>L CreateW32Event',
+    'K458:L>L SetW32Event',
+    'K459:L>L ResetW32Event',
+    'K460:LL>L WaitForSingleObject',
+    'K461:LPLL>L WaitForMultipleObjects',
+    'K462:>L GetCurrentThreadId',
+    'K463:LW>L SetThreadQueue',
+    'K464:L>L GetThreadQueue',
+    'K465:X>W NukeProcess',
+    'K466:W>W ExitProcess',
+    'K467:X>W WOACreateConsole',
+    'K468:X>W WOASpawnConApp',
+    'K469:X>W WOAGimmeTitle',
+    'K470:X>W WOADestroyConsole',
+    'K471:>L GetCurrentProcessId',
+    'K472:R>R MapHInstLS',
+    'K473:R>R MapHInstSL',
+    'K474:L>L CloseW32Handle',
+    'K475:>W GetTEBSelectorFS',
+    'K476:L>L ConvertToGlobalHandle',
+    'K477:X>W WOAFullScreen',
+    'K478:X>W WOATerminateProcess',
+    'K479:L>L KERNEL_479',
+    'K480:>W _EnterWin16Lock',
+    'K481:>W _LeaveWin16Lock',
+    'K482:P>L LoadSystemLibrary32',
+    'K483:L>L MapProcessHandle',
+    'K484:LIL>L SetProcessDword',
+    'K485:LI>L GetProcessDword',
+    'K486:L>L FreeLibrary32',
+    'K487:LPW>L GetModuleFileName32',
+    'K488:P>L GetModuleHandle32',
+    'K489:X>W KERNEL_489',
+    'K490:W>W KERNEL_490',
+    'K491:LL>L RegisterServiceProcess',
+    'K492:X>W WOAAbort',
+    'K493:LLLL>W UTInit',
+    'K494:X>W KERNEL_494',
+    'K495:LPLLL>L WaitForMultipleObjects',
+    'K500:V>L WOW16Call',
+    'K501:X>W KDDBGOUT',
+    'K502:X>W WOWGETNEXTVDMCOMMAND',
+    'K503:X>W WOWREGISTERSHELLWINDOW',
+    'K504:X>W WOWLOADMODULE',
+    'K505:X>W WOWQUERYPERFORMANCECOU',
+    'K506:X>W WOWCURSORICONOP',
+    'K507:X>W WOWFAILEDEXEC',
+    'K508:X>W WOWCLOSECOMPORT',
+    'K511:X>W WOWKILLREMOTETASK',
+    'K512:X>W WOWQUERYDEBUG',
+    'K513:PLL>L LoadLibraryEx32W',
+    'K514:L>L FreeLibrary32W',
+    'K515:LP>L GetProcAddress32W',
+    'K516:SW>L GetVDMPointer32W',
+    'K517:V>L CallProc32W',
+    'K518:V>L _CallProcEx32W',
+    'K519:X>W EXITKERNELTHUNK',
+    'K520:=4200 __MOD_KERNEL',
+    'K521:=4201 __MOD_DKERNEL',
+    'K522:=4203 __MOD_USER',
+    'K523:=4204 __MOD_DUSER',
+    'K524:=4205 __MOD_GDI',
+    'K525:=4206 __MOD_DGDI',
+    'K526:=4207 __MOD_KEYBOARD',
+    'K527:=4208 __MOD_SOUND',
+    'K528:=4209 __MOD_SHELL',
+    'K529:=4210 __MOD_WINSOCK',
+    'K530:=4211 __MOD_TOOLHELP',
+    'K531:=4212 __MOD_MMEDIA',
+    'K532:=4213 __MOD_COMMDLG',
+    'K541:X>W WOWSETEXITONLASTAPP',
+    'K544:X>W WOWSETCOMPATHANDLE',
+    'K533:X>W ConvertDDEHandleLS',
+    'K534:X>W ConvertDDEHandleSL',
+    'K535:LL>L VWin32_BoostThreadGrou',
+    'K536:LL>L VWin32_BoostThreadStat',
+    'K537:X>W KERNEL_537',
+    'K538:X>W ThunkTheTemplateHandle',
+    'K540:X>W KERNEL_540',
+    'K542:X>W KERNEL_542',
+    'K543:X>W KERNEL_543',
+    'K560:LS>L SetThunkletCallbackGlu',
+    'K561:SL>L AllocLSThunkletCallbac',
+    'K562:LL>L AllocSLThunkletCallbac',
+    'K563:SL>L FindLSThunkletCallback',
+    'K564:LL>L FindSLThunkletCallback',
+    'K566:X>W KERNEL_566',
+    'K567:SLW>L AllocLSThunkletCallbac',
+    'K568:LLW>L AllocSLThunkletCallbac',
+    'K600:X>W AllocCodeAlias',
+    'K601:X>W FreeCodeAlias',
+    'K602:>W GetDummyModuleHandleDS',
+    'K603:X>W KERNEL_603',
+    'K604:R>R CBClientGlueSL',
+    'K605:LL>L AllocSLThunkletCallbac',
+    'K606:SL>L AllocLSThunkletCallbac',
+    'K607:SLL>L AllocLSThunkletSysthun',
+    'K608:LSL>L AllocSLThunkletSysthun',
+    'K609:SL>L FindLSThunkletCallback',
+    'K610:LL>L FindSLThunkletCallback',
+    'K611:LL>W FreeThunklet',
+    'K612:P>W IsSLThunklet',
+    'K613:X>W HugeMapLS',
+    'K614:X>W HugeUnMapLS',
+    'K615:LLL>W ConvertDialog32To16',
+    'K616:LLL>W ConvertMenu32To16',
+    'K617:P>W GetMenu32Size',
+    'K618:P>W GetDialog32Size',
+    'K619:WSL>W RegisterCBClient',
+    'K620:R>R CBClientThunkSL',
+    'K621:R>R CBClientThunkSLEx',
+    'K622:WSL>W UnRegisterCBClient',
+    'K623:L>W InitCBClient',
+    'K624:LL>L SetFastQueue',
+    'K625:>L GetFastQueue',
+    'K626:X>W SmashEnvironment',
+    'K627:SLW>W IsBadFlatReadWritePtr',
+    'K630:R>R C16ThkSL',
+    'K631:R>R C16ThkSL01',
+    'K651:PPWLPPW>L ThunkConnect16',
+    'K652:X>W IsThreadId',
+    'K653:X>W OkWithKernelToChangeUs',
+    'K666:PLPL>L UTGlue16',
+    'K667:WW>L EntryAddrProc',
+    'K668:WWW>L MyAlloc',
+    'K669:LWWWLW>W DllEntryPoint',
+    'K700:>L SSInit',
+    'K701:X>W SSOnBigStack',
+    'K702:X>W SSCall',
+    'K703:X>W CallProc32WFix',
+    'K704:R>R SSConfirmSmallStack',
+    'K901:R>R __wine_vxd_vmm',
+    'K905:R>R __wine_vxd_timer',
+    'K909:R>R __wine_vxd_reboot',
+    'K910:R>R __wine_vxd_vdd',
+    'K912:R>R __wine_vxd_vmd',
+    'K914:R>R __wine_vxd_comm',
+    'K923:R>R __wine_vxd_shell',
+    'K933:R>R __wine_vxd_pagefile',
+    'K938:R>R __wine_vxd_apm',
+    'K939:R>R __wine_vxd_vxdloader',
+    'K945:R>R __wine_vxd_win32s',
+    'K951:R>R __wine_vxd_configmg',
+    'K955:R>R __wine_vxd_enable',
+    'U001:WPPW>W MessageBox',
+    'U002:>W OldExitWindows',
+    'U003:X>W EnableOEMLayer',
+    'U004:X>W DisableOEMLayer',
+    'U005:W>W InitApp',
+    'U006:W>W PostQuitMessage',
+    'U007:LW>W ExitWindows',
+    'U010:WWWS>W SetTimer',
+    'U011:WWWS>W SetSystemTimer',
+    'U012:WW>W KillTimer',
+    'U013:>L GetTickCount',
+    'U014:>L GetTimerResolution',
+    'U015:>L GetCurrentTime',
+    'U016:P>W ClipCursor',
+    'U017:P>W GetCursorPos',
+    'U018:W>W SetCapture',
+    'U019:>W ReleaseCapture',
+    'U020:W>W SetDoubleClickTime',
+    'U021:>W GetDoubleClickTime',
+    'U022:W>W SetFocus',
+    'U023:>W GetFocus',
+    'U024:WP>W RemoveProp',
+    'U025:WP>W GetProp',
+    'U026:WPW>W SetProp',
+    'U027:WS>W EnumProps',
+    'U028:WP>W ClientToScreen',
+    'U029:WP>W ScreenToClient',
+    'U030:L>W WindowFromPoint',
+    'U031:W>W IsIconic',
+    'U032:WP>W GetWindowRect',
+    'U033:WP>W GetClientRect',
+    'U034:WW>W EnableWindow',
+    'U035:W>W IsWindowEnabled',
+    'U036:WSW>W GetWindowText',
+    'U037:WS>W SetWindowText',
+    'U038:W>W GetWindowTextLength',
+    'U039:WP>W BeginPaint',
+    'U040:WP>W EndPaint',
+    'U041:PPLIIIIWWWS>W CreateWindow',
+    'U042:WW>W ShowWindow',
+    'U043:W>W CloseWindow',
+    'U044:W>W OpenIcon',
+    'U045:W>W BringWindowToTop',
+    'U046:W>W GetParent',
+    'U047:W>W IsWindow',
+    'U048:WW>W IsChild',
+    'U049:W>W IsWindowVisible',
+    'U050:PP>W FindWindow',
+    'U051:X>W BEAR51',
+    'U052:>W AnyPopup',
+    'U053:W>W DestroyWindow',
+    'U054:SL>W EnumWindows',
+    'U055:WSL>W EnumChildWindows',
+    'U056:WWWWWW>W MoveWindow',
+    'U057:P>W RegisterClass',
+    'U058:WPW>W GetClassName',
+    'U059:W>W SetActiveWindow',
+    'U060:>W GetActiveWindow',
+    'U061:WIIPP>W ScrollWindow',
+    'U062:WWIW>W SetScrollPos',
+    'U063:WW>W GetScrollPos',
+    'U064:WWIIW>W SetScrollRange',
+    'U065:WWPP>W GetScrollRange',
+    'U066:W>W GetDC',
+    'U067:W>W GetWindowDC',
+    'U068:WW>W ReleaseDC',
+    'U069:W>W SetCursor',
+    'U070:WW>W SetCursorPos',
+    'U071:W>W ShowCursor',
+    'U072:PIIII>W SetRect',
+    'U073:P>W SetRectEmpty',
+    'U074:PP>W CopyRect',
+    'U075:P>W IsRectEmpty',
+    'U076:PL>W PtInRect',
+    'U077:PII>W OffsetRect',
+    'U078:PII>W InflateRect',
+    'U079:PPP>W IntersectRect',
+    'U080:PPP>W UnionRect',
+    'U081:WPW>W FillRect',
+    'U082:WP>W InvertRect',
+    'U083:WPW>W FrameRect',
+    'U084:WIIW>W DrawIcon',
+    'U085:WPIPW>W DrawText',
+    'U086:>L IconSize',
+    'U087:WPWS>W DialogBox',
+    'U088:WI>W EndDialog',
+    'U089:WPWS>W CreateDialog',
+    'U090:WP>W IsDialogMessage',
+    'U091:WW>W GetDlgItem',
+    'U092:WWS>W SetDlgItemText',
+    'U093:WWSW>W GetDlgItemText',
+    'U094:WWWW>W SetDlgItemInt',
+    'U095:WIPW>W GetDlgItemInt',
+    'U096:WWWW>W CheckRadioButton',
+    'U097:WWW>W CheckDlgButton',
+    'U098:WW>W IsDlgButtonChecked',
+    'U099:WPW>W DlgDirSelect',
+    'U100:WPWWW>W DlgDirList',
+    'U101:WWWWL>L SendDlgItemMessage',
+    'U102:PLW>W AdjustWindowRect',
+    'U103:WP>W MapDialogRect',
+    'U104:W>W MessageBeep',
+    'U105:WW>W FlashWindow',
+    'U106:W>W GetKeyState',
+    'U107:WWWL>L DefWindowProc',
+    'U108:PWWW>W GetMessage',
+    'U109:PWWWW>W PeekMessage',
+    'U110:WWWL>W PostMessage',
+    'U111:WWWL>L SendMessage',
+    'U112:>W WaitMessage',
+    'U113:P>W TranslateMessage',
+    'U114:P>L DispatchMessage',
+    'U115:L>W ReplyMessage',
+    'U116:WWWL>W PostAppMessage',
+    'U117:W>W WindowFromDC',
+    'U118:P>W RegisterWindowMessage',
+    'U119:>L GetMessagePos',
+    'U120:>L GetMessageTime',
+    'U121:IS>L SetWindowsHook',
+    'U122:SWWWL>L CallWindowProc',
+    'U123:PI>W CallMsgFilter',
+    'U124:W>W UpdateWindow',
+    'U125:WPW>W InvalidateRect',
+    'U126:WWW>W InvalidateRgn',
+    'U127:WP>W ValidateRect',
+    'U128:WW>W ValidateRgn',
+    'U129:WI>W GetClassWord',
+    'U130:WIW>W SetClassWord',
+    'U131:WI>L GetClassLong',
+    'U132:WIL>L SetClassLong',
+    'U133:WI>W GetWindowWord',
+    'U134:WIW>W SetWindowWord',
+    'U135:WI>L GetWindowLong',
+    'U136:WIL>L SetWindowLong',
+    'U137:W>W OpenClipboard',
+    'U138:>W CloseClipboard',
+    'U139:>W EmptyClipboard',
+    'U140:>W GetClipboardOwner',
+    'U141:WW>W SetClipboardData',
+    'U142:W>W GetClipboardData',
+    'U143:>W CountClipboardFormats',
+    'U144:W>W EnumClipboardFormats',
+    'U145:P>W RegisterClipboardForma',
+    'U146:WPI>W GetClipboardFormatName',
+    'U147:W>W SetClipboardViewer',
+    'U148:>W GetClipboardViewer',
+    'U149:WW>W ChangeClipboardChain',
+    'U150:WP>W LoadMenu',
+    'U151:>W CreateMenu',
+    'U152:W>W DestroyMenu',
+    'U153:WWSWW>W ChangeMenu',
+    'U154:WWW>W CheckMenuItem',
+    'U155:WWW>W EnableMenuItem',
+    'U156:WW>W GetSystemMenu',
+    'U157:W>W GetMenu',
+    'U158:WW>W SetMenu',
+    'U159:WW>W GetSubMenu',
+    'U160:W>W DrawMenuBar',
+    'U161:WWPIW>W GetMenuString',
+    'U162:WWWW>W HiliteMenuItem',
+    'U163:WWWW>W CreateCaret',
+    'U164:>W DestroyCaret',
+    'U165:WW>W SetCaretPos',
+    'U166:W>W HideCaret',
+    'U167:W>W ShowCaret',
+    'U168:W>W SetCaretBlinkTime',
+    'U169:>W GetCaretBlinkTime',
+    'U170:W>W ArrangeIconicWindows',
+    'U171:WPWL>W WinHelp',
+    'U172:WW>W SwitchToThisWindow',
+    'U173:WP>W LoadCursor',
+    'U174:WP>W LoadIcon',
+    'U175:WP>W LoadBitmap',
+    'U176:WWPI>W LoadString',
+    'U177:WP>W LoadAccelerators',
+    'U178:WWP>W TranslateAccelerator',
+    'U179:I>W GetSystemMetrics',
+    'U180:W>L GetSysColor',
+    'U181:WPP>W SetSysColors',
+    'U182:WW>W KillSystemTimer',
+    'U183:P>W GetCaretPos',
+    'U184:X>W QuerySendMessage',
+    'U185:WWSSIIIII>W GrayString',
+    'U186:W>W SwapMouseButton',
+    'U187:>W EndMenu',
+    'U188:W>W SetSysModalWindow',
+    'U189:>W GetSysModalWindow',
+    'U190:WPW>W GetUpdateRect',
+    'U191:WL>W ChildWindowFromPoint',
+    'U192:>W InSendMessage',
+    'U193:W>W IsClipboardFormatAvail',
+    'U194:WPW>W DlgDirSelectComboBox',
+    'U195:WPWWW>W DlgDirListComboBox',
+    'U196:WIIPIIPI>L TabbedTextOut',
+    'U197:WPWWP>L GetTabbedTextExtent',
+    'U198:WW>W CascadeChildWindows',
+    'U199:WW>W TileChildWindows',
+    'U200:PWW>W OpenComm',
+    'U201:P>W SetCommState',
+    'U202:WP>W GetCommState',
+    'U203:WP>W GetCommError',
+    'U204:WPW>W ReadComm',
+    'U205:WPW>W WriteComm',
+    'U206:WW>W TransmitCommChar',
+    'U207:W>W CloseComm',
+    'U208:WW>L SetCommEventMask',
+    'U209:WW>W GetCommEventMask',
+    'U210:W>W SetCommBreak',
+    'U211:W>W ClearCommBreak',
+    'U212:WW>W UngetCommChar',
+    'U213:PP>W BuildCommDCB',
+    'U214:WW>L EscapeCommFunction',
+    'U215:WW>W FlushComm',
+    'U216:WWWW>L UserSeeUserDo',
+    'U217:WI>W LookupMenuHandle',
+    'U218:WWWS>W DialogBoxIndirect',
+    'U219:WPWS>W CreateDialogIndirect',
+    'U220:P>W LoadMenuIndirect',
+    'U221:WIIPPWP>W ScrollDC',
+    'U222:P>W GetKeyboardState',
+    'U223:P>W SetKeyboardState',
+    'U224:W>W GetWindowTask',
+    'U225:WSL>W EnumTaskWindows',
+    'U226:X>W LockInput',
+    'U227:WWW>W GetNextDlgGroupItem',
+    'U228:WWW>W GetNextDlgTabItem',
+    'U229:W>W GetTopWindow',
+    'U230:WW>W GetNextWindow',
+    'U231:>W GetSystemDebugState',
+    'U232:WWWWWWW>W SetWindowPos',
+    'U233:WW>W SetParent',
+    'U234:IS>W UnhookWindowsHook',
+    'U235:IWLP>L DefHookProc',
+    'U236:>W GetCapture',
+    'U237:WWW>W GetUpdateRgn',
+    'U238:WW>W ExcludeUpdateRgn',
+    'U239:WPWSL>W DialogBoxParam',
+    'U240:WWWSL>W DialogBoxIndirectParam',
+    'U241:WPWSL>W CreateDialogParam',
+    'U242:WPWSL>W CreateDialogIndirectPa',
+    'U243:>L GetDialogBaseUnits',
+    'U244:PP>W EqualRect',
+    'U245:IWII>W EnableCommNotification',
+    'U246:PP>W ExitWindowsExec',
+    'U247:>W GetCursor',
+    'U248:>W GetOpenClipboardWindow',
+    'U249:W>W GetAsyncKeyState',
+    'U250:WWW>W GetMenuState',
+    'U251:WWLL>L SendDriverMessage',
+    'U252:PPL>W OpenDriver',
+    'U253:WLL>L CloseDriver',
+    'U254:W>W GetDriverModuleHandle',
+    'U255:LWWLL>L DefDriverProc',
+    'U256:WP>W GetDriverInfo',
+    'U257:WL>W GetNextDriver',
+    'U258:WWPW>W MapWindowPoints',
+    'U259:I>W BeginDeferWindowPos',
+    'U260:WWWIIIIW>W DeferWindowPos',
+    'U261:W>W EndDeferWindowPos',
+    'U262:WW>W GetWindow',
+    'U263:W>W GetMenuItemCount',
+    'U264:WW>W GetMenuItemID',
+    'U265:WW>W ShowOwnedPopups',
+    'U266:W>W SetMessageQueue',
+    'U267:WWW>W ShowScrollBar',
+    'U268:P>W GlobalAddAtom',
+    'U269:W>W GlobalDeleteAtom',
+    'U270:P>W GlobalFindAtom',
+    'U271:WPI>W GlobalGetAtomName',
+    'U272:W>W IsZoomed',
+    'U273:WWP>W ControlPanelInfo',
+    'U274:X>W GetNextQueueWindow',
+    'U275:X>W RepaintScreen',
+    'U276:X>W LockMyTask',
+    'U277:W>W GetDlgCtrlID',
+    'U278:>W GetDesktopHwnd',
+    'U279:>W OldSetDeskPattern',
+    'U280:WW>W SetSystemMenu',
+    'U281:W>W GetSysColorBrush',
+    'U282:WWW>W SelectPalette',
+    'U283:W>W RealizePalette',
+    'U284:W>W GetFreeSystemResources',
+    'U285:P>W SetDeskWallpaper',
+    'U286:>W GetDesktopWindow',
+    'U287:W>W GetLastActivePopup',
+    'U288:>L GetMessageExtraInfo',
+    'U289:R>R keybd_event',
+    'U290:WPWW>W RedrawWindow',
+    'U291:ISWW>L SetWindowsHookEx',
+    'U292:S>W UnhookWindowsHookEx',
+    'U293:SIWL>L CallNextHookEx',
+    'U294:W>W LockWindowUpdate',
+    'U299:R>R mouse_event',
+    'U300:X>W UnloadInstalledDrivers',
+    'U301:X>W EDITWNDPROC',
+    'U302:X>W STATICWNDPROC',
+    'U303:X>W BUTTONWNDPROC',
+    'U304:X>W SBWNDPROC',
+    'U305:X>W DESKTOPWNDPROC',
+    'U306:X>W MENUWNDPROC',
+    'U307:X>W LBOXCTLWNDPROC',
+    'U308:WWWL>L DefDlgProc',
+    'U309:P>W GetClipCursor',
+    'U314:WWWWW>W SignalProc',
+    'U319:WIIPPWPW>W ScrollWindowEx',
+    'U320:X>W SysErrorBox',
+    'U321:S>L SetEventHook',
+    'U322:X>W WinOldAppHackOMatic',
+    'U323:X>W GetMessage2',
+    'U324:WWWW>W FillWindow',
+    'U325:WWWWP>W PaintRect',
+    'U326:WWW>W GetControlBrush',
+    'U331:W>W EnableHardwareInput',
+    'U332:>W UserYield',
+    'U333:>W IsUserIdle',
+    'U334:W>L GetQueueStatus',
+    'U335:>W GetInputState',
+    'U336:WWW>W LoadCursorIconHandler',
+    'U337:>L GetMouseEventProc',
+    'U338:X>W ECGETDS',
+    'U343:X>W GetFilePortName',
+    'U344:X>W COMBOBOXCTLWNDPROC',
+    'U345:X>W BEAR345',
+    'U356:WWW>W LoadDIBCursorHandler',
+    'U357:WWW>W LoadDIBIconHandler',
+    'U358:W>W IsMenu',
+    'U359:WWL>W GetDCEx',
+    'U362:WWLL>W DCHook',
+    'U364:PWWWW>W LookupIconIdFromDirect',
+    'U368:WW>W CopyIcon',
+    'U369:WW>W CopyCursor',
+    'U370:WP>W GetWindowPlacement',
+    'U371:WP>W SetWindowPlacement',
+    'U372:X>W GetInternalIconHeader',
+    'U373:PPP>W SubtractRect',
+    'U374:LWWWLW>W DllEntryPoint',
+    'U375:X>W DrawTextEx',
+    'U376:X>W SetMessageExtraInfo',
+    'U378:X>W SetPropEx',
+    'U379:X>W GetPropEx',
+    'U380:X>W RemovePropEx',
+    'U382:X>W SetWindowContextHelpID',
+    'U383:X>W GetWindowContextHelpID',
+    'U384:WW>W SetMenuContextHelpId',
+    'U385:W>W GetMenuContextHelpId',
+    'U389:WPWWWW>L LoadImage',
+    'U390:WWWWW>W CopyImage',
+    'U391:LLLW>W SignalProc32',
+    'U394:WWWWWWWWW>W DrawIconEx',
+    'U395:WP>W GetIconInfo',
+    'U397:P>W RegisterClassEx',
+    'U398:WSP>W GetClassInfoEx',
+    'U399:WLW>W ChildWindowFromPointEx',
+    'U400:>W FinalUserInit',
+    'U402:PI>W GetPriorityClipboardFo',
+    'U403:PW>W UnregisterClass',
+    'U404:WSP>W GetClassInfo',
+    'U406:WWWWWPP>W CreateCursor',
+    'U407:WWWWWPP>W CreateIcon',
+    'U408:WPPP>W CreateCursorIconIndire',
+    'U409:WW>W InitThreadInput',
+    'U410:WWWWS>W InsertMenu',
+    'U411:WWWS>W AppendMenu',
+    'U412:WWW>W RemoveMenu',
+    'U413:WWW>W DeleteMenu',
+    'U414:WWWWS>W ModifyMenu',
+    'U415:>W CreatePopupMenu',
+    'U416:WWIIIWP>W TrackPopupMenu',
+    'U417:>L GetMenuCheckMarkDimens',
+    'U418:WWWWW>W SetMenuItemBitmaps',
+    'U420:V>W _wsprintf',
+    'U421:PPP>W wvsprintf',
+    'U422:WPWW>W DlgDirSelectEx',
+    'U423:WPWW>W DlgDirSelectComboBoxEx',
+    'U427:WWPP>W FindWindowEx',
+    'U428:X>W TileWindows',
+    'U429:X>W CascadeWindows',
+    'U430:PP>W lstrcmp',
+    'U431:S>L AnsiUpper',
+    'U432:S>L AnsiLower',
+    'U433:W>W IsCharAlpha',
+    'U434:W>W IsCharAlphaNumeric',
+    'U435:W>W IsCharUpper',
+    'U436:W>W IsCharLower',
+    'U437:PW>W AnsiUpperBuff',
+    'U438:PW>W AnsiLowerBuff',
+    'U441:WWWP>W InsertMenuItem',
+    'U443:X>W GetMenuItemInfo',
+    'U445:WWWWL>L DefFrameProc',
+    'U446:X>W SetMenuItemInfo',
+    'U447:WWWL>L DefMDIChildProc',
+    'U448:WWPP>W DrawAnimatedRects',
+    'U449:WWSLWIIIIW>W DrawState',
+    'U450:PLWLWWW>W CreateIconFromResource',
+    'U451:WP>W TranslateMDISysAccel',
+    'U452:LPPLIIIIWWWS>W CreateWindowEx',
+    'U454:PLWL>W AdjustWindowRectEx',
+    'U455:WL>W GetIconID',
+    'U456:WW>W LoadIconHandler',
+    'U457:W>W DestroyIcon',
+    'U458:W>W DestroyCursor',
+    'U459:SPPP>L DumpIcon',
+    'U460:WPP>W GetInternalWindowPos',
+    'U461:WWPP>W SetInternalWindowPos',
+    'U462:WW>W CalcChildScroll',
+    'U463:WWWL>W ScrollChildren',
+    'U464:WWWWWW>L DragObject',
+    'U465:WL>W DragDetect',
+    'U466:WP>W DrawFocusRect',
+    'U470:X>W StringFunc',
+    'U471:PP>W lstrcmpi',
+    'U472:S>L AnsiNext',
+    'U473:PS>L AnsiPrev',
+    'U475:WIPW>W SetScrollInfo',
+    'U476:WIP>W GetScrollInfo',
+    'U477:P>W GetKeyboardLayoutName',
+    'U478:X>W LoadKeyboardLayout',
+    'U479:X>W MenuItemFromPoint',
+    'U480:X>W GetUserLocalObjType',
+    'U482:WWW>W EnableScrollBar',
+    'U483:WWPW>W SystemParametersInfo',
+    'U489:>W USER_489',
+    'U490:>W USER_490',
+    'U492:>W USER_492',
+    'U496:>W USER_496',
+    'U498:X>W BEAR498',
+    'U499:WPW>W WNetErrorText',
+    'U500:X>W FARCALLNETDRIVER',
+    'U501:PPWP>W WNetOpenJob',
+    'U502:WPP>W WNetCloseJob',
+    'U503:PW>W WNetAbortJob',
+    'U504:PW>W WNetHoldJob',
+    'U505:PW>W WNetReleaseJob',
+    'U506:PW>W WNetCancelJob',
+    'U507:PWW>W WNetSetJobCopies',
+    'U508:WPPW>W WNetWatchQueue',
+    'U509:P>W WNetUnwatchQueue',
+    'U510:PPP>W WNetLockQueueData',
+    'U511:P>W WNetUnlockQueueData',
+    'U512:PPP>W WNetGetConnection',
+    'U513:W>W WNetGetCaps',
+    'U514:W>W WNetDeviceMode',
+    'U515:WWP>W WNetBrowseDialog',
+    'U516:PP>W WNetGetUser',
+    'U517:PPP>W WNetAddConnection',
+    'U518:PW>W WNetCancelConnection',
+    'U519:P>W WNetGetError',
+    'U520:WPP>W WNetGetErrorText',
+    'U521:X>W WNetEnable',
+    'U522:X>W WNetDisable',
+    'U523:WP>W WNetRestoreConnection',
+    'U524:WPP>W WNetWriteJob',
+    'U525:WW>W WNetConnectDialog',
+    'U526:WW>W WNetDisconnectDialog',
+    'U527:WW>W WNetConnectionDialog',
+    'U528:WP>W WNetViewQueueDialog',
+    'U529:WWWPW>W WNetPropertyDialog',
+    'U530:PP>W WNetGetDirectoryType',
+    'U531:WPW>W WNetDirectoryNotify',
+    'U532:WWPPWW>W WNetGetPropertyText',
+    'U533:X>W WNetInitialize',
+    'U534:X>W WNetLogon',
+    'U535:X>W WOWWORDBREAKPROC',
+    'U537:X>W MOUSEEVENT',
+    'U538:X>W KEYBDEVENT',
+    'U595:X>W OLDEXITWINDOWS',
+    'U600:>W GetShellWindow',
+    'U601:X>W DoHotkeyStuff',
+    'U602:X>W SetCheckCursorTimer',
+    'U604:X>W BroadcastSystemMessage',
+    'U605:X>W HackTaskMonitor',
+    'U606:LSWWPWP>W FormatMessage',
+    'U608:>W GetForegroundWindow',
+    'U609:W>W SetForegroundWindow',
+    'U610:WW>W DestroyIcon32',
+    'U620:PL>L ChangeDisplaySettings',
+    'U621:PLP>W EnumDisplaySettings',
+    'U640:LPLLL>L MsgWaitForMultipleObje',
+    'U650:X>W ActivateKeyboardLayout',
+    'U651:X>W GetKeyboardLayout',
+    'U652:X>W GetKeyboardLayoutList',
+    'U654:X>W UnloadKeyboardLayout',
+    'U655:X>W PostPostedMessages',
+    'U656:WPWW>W DrawFrameControl',
+    'U657:WWPWWPW>W DrawCaptionTemp',
+    'U658:X>W DispatchInput',
+    'U659:WPWW>W DrawEdge',
+    'U660:WWPW>W DrawCaption',
+    'U661:X>W SetSysColorsTemp',
+    'U662:X>W DrawMenubarTemp',
+    'U663:X>W GetMenuDefaultItem',
+    'U664:X>W SetMenuDefaultItem',
+    'U665:WWWP>W GetMenuItemRect',
+    'U666:WWWWW>W CheckMenuRadioItem',
+    'U667:X>W TrackPopupMenuEx',
+    'U668:WWW>W SetWindowRgn',
+    'U669:X>W GetWindowRgn',
+    'U800:X>W CHOOSEFONT_CALLBACK16',
+    'U801:X>W FINDREPLACE_CALLBACK16',
+    'U802:X>W OPENFILENAME_CALLBACK1',
+    'U803:X>W PRINTDLG_CALLBACK16',
+    'U804:X>W CHOOSECOLOR_CALLBACK16',
+    'U819:PWWWWW>W PeekMessage32',
+    'U820:PWWWW>L GetMessage32',
+    'U821:PW>W TranslateMessage32',
+    'U822:PW>L DispatchMessage32',
+    'U823:PWW>W CallMsgFilter32',
+    'U825:X>W PostMessage32',
+    'U826:X>W PostThreadMessage32',
+    'U827:P>W MessageBoxIndirect',
+    'U851:X>W MsgThkConnectionDataLS',
+    'U853:X>W FT_USRFTHKTHKCONNECTIO',
+    'U854:X>W FT__USRF2THKTHKCONNECT',
+    'U855:X>W Usr32ThkConnectionData',
+    'U890:X>W InstallIMT',
+    'U891:X>W UninstallIMT',
+    'U902:WWPWW>W LoadSystemLanguageStri',
+    'U905:>W ChangeDialogTemplate',
+    'U906:>W GetNumLanguages',
+    'U907:WWPW>W GetLanguageName',
+    'U909:WPW>W SetWindowTextEx',
+    'U910:>W BiDiMessageBoxEx',
+    'U911:WWPW>W SetDlgItemTextEx',
+    'U912:WW>L ChangeKeyboardLanguage',
+    'U913:WW>W GetCodePageSystemFont',
+    'U914:WWWL>W QueryCodePage',
+    'U915:W>L GetAppCodePage',
+    'U916:WPWPLWWPW>W CreateDialogIndirectPa',
+    'U918:WWWPLWWPW>W DialogBoxIndirectParam',
+    'U919:WWWPW>W LoadLanguageString',
+    'U920:WWWW>L SetAppCodePage',
+    'U922:>L GetBaseCodePage',
+    'U923:WPPW>W FindLanguageResource',
+    'U924:WW>L ChangeKeyboardCodePage',
+    'U930:WPPWW>W MessageBoxEx',
+    'G001:WL>L SetBkColor',
+    'G002:WW>W SetBkMode',
+    'G003:WW>W SetMapMode',
+    'G004:WW>W SetROP2',
+    'G005:WW>W SetRelAbs',
+    'G006:WW>W SetPolyFillMode',
+    'G007:WW>W SetStretchBltMode',
+    'G008:WI>W SetTextCharacterExtra',
+    'G009:WL>L SetTextColor',
+    'G010:WII>W SetTextJustification',
+    'G011:WII>L SetWindowOrg',
+    'G012:WII>L SetWindowExt',
+    'G013:WII>L SetViewportOrg',
+    'G014:WII>L SetViewportExt',
+    'G015:WII>L OffsetWindowOrg',
+    'G016:WIIII>L ScaleWindowExt',
+    'G017:WII>L OffsetViewportOrg',
+    'G018:WIIII>L ScaleViewportExt',
+    'G019:WII>W LineTo',
+    'G020:WII>L MoveTo',
+    'G021:WIIII>W ExcludeClipRect',
+    'G022:WIIII>W IntersectClipRect',
+    'G023:WIIIIIIII>W Arc',
+    'G024:WIIII>W Ellipse',
+    'G025:WIIL>W FloodFill',
+    'G026:WIIIIIIII>W Pie',
+    'G027:WIIII>W Rectangle',
+    'G028:WIIIIII>W RoundRect',
+    'G029:WIIIIL>W PatBlt',
+    'G030:W>W SaveDC',
+    'G031:WIIL>L SetPixel',
+    'G032:WII>W OffsetClipRgn',
+    'G033:WIIPW>W TextOut',
+    'G034:WIIIIWIIL>W BitBlt',
+    'G035:WIIIIWIIIIL>W StretchBlt',
+    'G036:>W Polygon',
+    'G037:>W Polyline',
+    'G038:WWWSP>L Escape',
+    'G039:WI>W RestoreDC',
+    'G040:WWW>W FillRgn',
+    'G041:WWWWW>W FrameRgn',
+    'G042:WW>W InvertRgn',
+    'G043:WW>W PaintRgn',
+    'G044:WW>W SelectClipRgn',
+    'G045:WW>W SelectObject',
+    'G046:X>W BITMAPBITS',
+    'G047:WWWI>W CombineRgn',
+    'G048:WWWWP>W CreateBitmap',
+    'G049:P>W CreateBitmapIndirect',
+    'G050:P>W CreateBrushIndirect',
+    'G051:WWW>W CreateCompatibleBitmap',
+    'G052:W>W CreateCompatibleDC',
+    'G053:PPPP>W CreateDC',
+    'G054:IIII>W CreateEllipticRgn',
+    'G055:P>W CreateEllipticRgnIndir',
+    'G056:IIIIIWWWWWWWWP>W CreateFont',
+    'G057:P>W CreateFontIndirect',
+    'G058:WL>W CreateHatchBrush',
+    'G060:W>W CreatePatternBrush',
+    'G061:IIL>W CreatePen',
+    'G062:P>W CreatePenIndirect',
+    'G063:PWW>W CreatePolygonRgn',
+    'G064:IIII>W CreateRectRgn',
+    'G065:P>W CreateRectRgnIndirect',
+    'G066:L>W CreateSolidBrush',
+    'G067:WPI>W DPtoLP',
+    'G068:W>W DeleteDC',
+    'G069:W>W DeleteObject',
+    'G070:WPSL>W EnumFonts',
+    'G071:WWSL>W EnumObjects',
+    'G072:WW>W EqualRgn',
+    'G073:WIIII>W ExcludeVisRect',
+    'G074:WLP>L GetBitmapBits',
+    'G075:W>L GetBkColor',
+    'G076:W>W GetBkMode',
+    'G077:WP>W GetClipBox',
+    'G078:W>L GetCurrentPosition',
+    'G079:W>L GetDCOrg',
+    'G080:WI>W GetDeviceCaps',
+    'G081:W>W GetMapMode',
+    'G082:WIP>W GetObject',
+    'G083:WII>L GetPixel',
+    'G084:W>W GetPolyFillMode',
+    'G085:W>W GetROP2',
+    'G086:W>W GetRelAbs',
+    'G087:W>W GetStockObject',
+    'G088:W>W GetStretchBltMode',
+    'G089:W>W GetTextCharacterExtra',
+    'G090:W>L GetTextColor',
+    'G091:WPI>L GetTextExtent',
+    'G092:WIP>W GetTextFace',
+    'G093:WP>W GetTextMetrics',
+    'G094:W>L GetViewportExt',
+    'G095:W>L GetViewportOrg',
+    'G096:W>L GetWindowExt',
+    'G097:W>L GetWindowOrg',
+    'G098:WIIII>W IntersectVisRect',
+    'G099:WPI>W LPtoDP',
+    'G100:IIIISL>W LineDDA',
+    'G101:WII>W OffsetRgn',
+    'G102:WII>W OffsetVisRgn',
+    'G103:WII>W PtVisible',
+    'G104:WP>W RectVisibleOld',
+    'G105:WW>W SelectVisRgn',
+    'G106:WLP>L SetBitmapBits',
+    'G117:WII>L SetDCOrg',
+    'G118:X>W InternalCreateDC',
+    'G119:P>W AddFontResource',
+    'G120:X>W GetContinuingTextExten',
+    'G121:W>W Death',
+    'G122:WWWWWWW>W Resurrection',
+    'G123:WW>W PlayMetaFile',
+    'G124:P>W GetMetaFile',
+    'G125:P>W CreateMetaFile',
+    'G126:W>W CloseMetaFile',
+    'G127:W>W DeleteMetaFile',
+    'G128:III>W MulDiv',
+    'G129:W>W SaveVisRgn',
+    'G130:W>W RestoreVisRgn',
+    'G131:W>W InquireVisRgn',
+    'G132:PPW>W SetEnvironment',
+    'G133:PPW>W GetEnvironment',
+    'G134:WP>W GetRgnBox',
+    'G136:P>W RemoveFontResource',
+    'G137:X>W GSV',
+    'G138:X>W DPXlate',
+    'G139:X>W SetWinViewExt',
+    'G140:X>W ScaleExt',
+    'G141:X>W WordSet',
+    'G142:X>W RectStuff',
+    'G143:X>W OffsetOrg',
+    'G144:X>W LockDC',
+    'G145:X>W UnlockDC',
+    'G146:X>W LockUnlock',
+    'G147:X>W GDI_FarFrame',
+    'G148:WII>L SetBrushOrg',
+    'G149:W>L GetBrushOrg',
+    'G150:W>W UnrealizeObject',
+    'G151:WP>W CopyMetaFile',
+    'G152:X>W GDIInitApp',
+    'G153:PPPP>W CreateIC',
+    'G154:WL>L GetNearestColor',
+    'G155:WW>W QueryAbort',
+    'G156:WWW>W CreateDiscardableBitma',
+    'G157:X>W CompatibleBitmap',
+    'G158:X>W EnumCallback',
+    'G159:W>W GetMetaFileBits',
+    'G160:W>W SetMetaFileBits',
+    'G161:WII>W PtInRegion',
+    'G162:W>L GetBitmapDimension',
+    'G163:WII>L SetBitmapDimension',
+    'G164:X>W PixToLine',
+    'G169:X>W IsDCDirty',
+    'G170:X>W SetDCStatus',
+    'G171:X>W LVBUNION',
+    'G172:WIIII>W SetRectRgn',
+    'G173:W>W GetClipRgn',
+    'G174:X>W BLOAT',
+    'G175:WWSL>W EnumMetaFile',
+    'G176:WPPW>W PlayMetaFileRecord',
+    'G177:X>W RCOS',
+    'G178:X>W RSIN',
+    'G179:W>W GetDCState',
+    'G180:WW>W SetDCState',
+    'G181:WP>W RectInRegionOld',
+    'G182:X>W REQUESTSEM',
+    'G183:X>W CLEARSEM',
+    'G184:X>W STUFFVISIBLE',
+    'G185:X>W STUFFINREGION',
+    'G186:X>W DELETEABOVELINEFONTS',
+    'G188:X>W GetTextExtentEx',
+    'G190:WSL>W SetDCHook',
+    'G191:WP>L GetDCHook',
+    'G192:WW>W SetHookFlags',
+    'G193:WPW>W SetBoundsRect',
+    'G194:WPW>W GetBoundsRect',
+    'G195:X>W SelectBitmap',
+    'G196:W>W SetMetaFileBitsBetter',
+    'G201:X>W DMBITBLT',
+    'G202:X>W DMCOLORINFO',
+    'G206:X>W dmEnumDFonts',
+    'G207:X>W DMENUMOBJ',
+    'G208:X>W DMOUTPUT',
+    'G209:X>W DMPIXEL',
+    'G210:X>W dmRealizeObject',
+    'G211:X>W DMSTRBLT',
+    'G212:X>W DMSCANLR',
+    'G213:X>W BRUTE',
+    'G214:X>W DMEXTTEXTOUT',
+    'G215:X>W DMGETCHARWIDTH',
+    'G216:X>W DMSTRETCHBLT',
+    'G217:X>W DMDIBBITS',
+    'G218:X>W DMSTRETCHDIBITS',
+    'G219:X>W DMSETDIBTODEV',
+    'G220:X>W DMTRANSPOSE',
+    'G230:W>W CreatePQ',
+    'G231:W>W MinPQ',
+    'G232:W>W ExtractPQ',
+    'G233:WWW>W InsertPQ',
+    'G234:WW>W SizePQ',
+    'G235:W>W DeletePQ',
+    'G240:PPW>W OpenJob',
+    'G241:WPW>W WriteSpool',
+    'G242:WPW>W WriteDialog',
+    'G243:W>W CloseJob',
+    'G244:WW>W DeleteJob',
+    'G245:WP>L GetSpoolJob',
+    'G246:W>W StartSpoolPage',
+    'G247:W>W EndSpoolPage',
+    'G248:X>W QueryJob',
+    'G250:PPW>W Copy',
+    'G253:X>W DeleteSpoolPage',
+    'G254:X>W SpoolFile',
+    'G267:X>W StartDocPrintEra',
+    'G268:X>W StartPagePrinter',
+    'G269:X>W WritePrinter',
+    'G270:X>W EndPagePrinter',
+    'G271:X>W AbortPrinter',
+    'G272:X>W EndDocPrinter',
+    'G274:X>W ClosePrinter',
+    'G280:X>W GetRealDriverInfo',
+    'G281:PPLPL>L DrvSetPrinterData',
+    'G282:PPPPLP>L DrvGetPrinterData',
+    'G299:X>W ENGINEGETCHARWIDTHEX',
+    'G300:PSL>L EngineEnumerateFont',
+    'G301:P>W EngineDeleteFont',
+    'G302:PPP>L EngineRealizeFont',
+    'G303:PWWP>W EngineGetCharWidth',
+    'G304:PW>W EngineSetFontContext',
+    'G305:WPWWPLP>W EngineGetGlyphBMP',
+    'G306:WPP>L EngineMakeFontDir',
+    'G307:WWWP>W GetCharABCWidths',
+    'G308:WWP>W GetOutlineTextMetrics',
+    'G309:WWWPLPP>L GetGlyphOutline',
+    'G310:WPPP>W CreateScalableFontReso',
+    'G311:WLLPL>L GetFontData',
+    'G312:X>W ConvertOutLineFontFile',
+    'G313:PW>W GetRasterizerCaps',
+    'G314:X>W EngineExtTextOut',
+    'G315:LLLL>L EngineRealizeFontExt',
+    'G316:X>W EngineGetCharWidthStr',
+    'G317:X>W EngineGetGlyphBmpExt',
+    'G330:WPSL>W EnumFontFamilies',
+    'G332:WWP>W GetKerningPairs',
+    'G345:W>W GetTextAlign',
+    'G346:WW>W SetTextAlign',
+    'G347:X>W MFDRAWTEXT',
+    'G348:WIIIIIIII>W Chord',
+    'G349:WL>L SetMapperFlags',
+    'G350:WWWP>W GetCharWidth',
+    'G351:WIIWPPWP>W ExtTextOut',
+    'G352:X>W GetPhysicalFontHandle',
+    'G353:X>W GetAspectRatioFilter',
+    'G354:X>W ShrinkGDIHeap',
+    'G355:X>W FTrapping0',
+    'G360:P>W CreatePalette',
+    'G361:WWW>W GDISelectPalette',
+    'G362:W>W GDIRealizePalette',
+    'G363:WWWP>W GetPaletteEntries',
+    'G364:WWWP>W SetPaletteEntries',
+    'G365:W>W RealizeDefaultPalette',
+    'G366:W>W UpdateColors',
+    'G367:WWWP>W AnimatePalette',
+    'G368:WW>W ResizePalette',
+    'G370:WL>W GetNearestPaletteIndex',
+    'G372:WIILW>W ExtFloodFill',
+    'G373:WW>W SetSystemPaletteUse',
+    'G374:W>W GetSystemPaletteUse',
+    'G375:WWWP>W GetSystemPaletteEntrie',
+    'G376:WP>W ResetDC',
+    'G377:WP>W StartDoc',
+    'G378:W>W EndDoc',
+    'G379:W>W StartPage',
+    'G380:W>W EndPage',
+    'G381:WS>W SetAbortProc',
+    'G382:W>W AbortDoc',
+    'G400:WPIIL>W FastWindowFrame',
+    'G401:X>W GDIMOVEBITMAP',
+    'G402:X>W GDIGETBITSGLOBAL',
+    'G403:WW>W GdiInit2',
+    'G404:X>W GetTTGlyphIndexMap',
+    'G405:W>W FinalGdiInit',
+    'G406:X>W CREATEREALBITMAPINDIRE',
+    'G407:WWWWP>W CreateUserBitmap',
+    'G408:X>W CREATEREALBITMAP',
+    'G409:WWW>W CreateUserDiscardableB',
+    'G410:>W IsValidMetaFile',
+    'G411:W>W GetCurLogFont',
+    'G412:W>W IsDCCurrentPalette',
+    'G439:>W StretchDIBits',
+    'G440:WWWWPPW>W SetDIBits',
+    'G441:WWWWPPW>W GetDIBits',
+    'G442:WPLPPW>W CreateDIBitmap',
+    'G443:WIIIIIIWWPPW>W SetDIBitsToDevice',
+    'G444:IIIIII>W CreateRoundRectRgn',
+    'G445:WW>W CreateDIBPatternBrush',
+    'G449:X>W DEVICECOLORMATCH',
+    'G450:WPPW>W PolyPolygon',
+    'G451:PPWW>W CreatePolyPolygonRgn',
+    'G452:WWWW>L GdiSeeGdiDo',
+    'G460:X>W GDITASKTERMINATION',
+    'G461:WW>W SetObjectOwner',
+    'G462:W>W IsGDIObject',
+    'G463:WW>W MakeObjectPrivate',
+    'G464:X>W FIXUPBOGUSPUBLISHERMET',
+    'G465:WP>W RectVisible',
+    'G466:WP>W RectInRegion',
+    'G467:X>W UNICODETOANSI',
+    'G468:WP>W GetBitmapDimensionEx',
+    'G469:WP>W GetBrushOrgEx',
+    'G470:WP>W GetCurrentPositionEx',
+    'G471:WPIP>W GetTextExtentPoint',
+    'G472:WP>W GetViewportExtEx',
+    'G473:WP>W GetViewportOrgEx',
+    'G474:WP>W GetWindowExtEx',
+    'G475:WP>W GetWindowOrgEx',
+    'G476:WIIP>W OffsetViewportOrgEx',
+    'G477:WIIP>W OffsetWindowOrgEx',
+    'G478:WIIP>W SetBitmapDimensionEx',
+    'G479:WIIP>W SetViewportExtEx',
+    'G480:WIIP>W SetViewportOrgEx',
+    'G481:WIIP>W SetWindowExtEx',
+    'G482:WIIP>W SetWindowOrgEx',
+    'G483:WIIP>W MoveToEx',
+    'G484:WIIIIP>W ScaleViewportExtEx',
+    'G485:WIIIIP>W ScaleWindowExtEx',
+    'G486:WP>W GetAspectRatioFilterEx',
+    'G489:WPWPLL>W CreateDIBSection',
+    'G490:X>W CloseEnhMetafile',
+    'G491:X>W CopyEnhMetafile',
+    'G492:X>W CreateEnhMetafile',
+    'G493:X>W DeleteEnhMetafile',
+    'G495:X>W GDIComment',
+    'G496:X>W GetEnhMetafile',
+    'G497:X>W GetEnhMetafileBits',
+    'G498:X>W GetEnhMetafileDescript',
+    'G499:X>W GetEnhMetafileHeader',
+    'G501:X>W GetEnhMetafilePaletteE',
+    'G502:WPW>W PolyBezier',
+    'G503:WPW>W PolyBezierTo',
+    'G504:X>W PlayEnhMetafileRecord',
+    'G505:X>W SetEnhMetafileBits',
+    'G506:X>W SetMetaRgn',
+    'G508:WWW>W ExtSelectClipRgn',
+    'G511:W>W AbortPath',
+    'G512:W>W BeginPath',
+    'G513:W>W CloseFigure',
+    'G514:W>W EndPath',
+    'G515:W>W FillPath',
+    'G516:W>W FlattenPath',
+    'G517:WPPW>W GetPath',
+    'G518:W>W PathToRegion',
+    'G519:WW>W SelectClipPath',
+    'G520:W>W StrokeAndFillPath',
+    'G521:W>W StrokePath',
+    'G522:W>W WidenPath',
+    'G523:X>W ExtCreatePen',
+    'G524:W>W GetArcDirection',
+    'G525:WW>W SetArcDirection',
+    'G526:X>W GetMiterLimit',
+    'G527:X>W SetMiterLimit',
+    'G528:X>W GDIParametersInfo',
+    'G529:W>W CreateHalftonePalette',
+    'G530:>W RawTextOut',
+    'G531:>W RawExtTextOut',
+    'G532:WPW>W RawGetTextExtent',
+    'G536:>W BiDiLayout',
+    'G538:>W BiDiCreateTabString',
+    'G540:>W BiDiGlyphOut',
+    'G543:>W BiDiGetStringExtent',
+    'G555:>W BiDiDeleteString',
+    'G556:>W BiDiSetDefaults',
+    'G558:>W BiDiGetDefaults',
+    'G560:>W BiDiShape',
+    'G561:>W BiDiFontComplement',
+    'G564:>W BiDiSetKashida',
+    'G565:>W BiDiKExtTextOut',
+    'G566:>W BiDiShapeEx',
+    'G569:>W BiDiCreateStringEx',
+    'G571:>W GetTextExtentRtoL',
+    'G572:>W GetHDCCharSet',
+    'G573:>W BiDiLayoutEx',
+    'G602:WWWP>W SetDIBColorTable',
+    'G603:WWWP>W GetDIBColorTable',
+    'G604:WL>W SetSolidBrush',
+    'G605:W>W SysDeleteObject',
+    'G606:WLW>W SetMagicColors',
+    'G607:WLP>L GetRegionData',
+    'G608:X>W ExtCreateRegion',
+    'G609:L>W GdiFreeResources',
+    'G610:LLLW>W GdiSignalProc32',
+    'G611:X>W GetRandomRgn',
+    'G612:W>W GetTextCharset',
+    'G613:WPSLL>W EnumFontFamiliesEx',
+    'G614:X>W AddLpkToGDI',
+    'G615:X>W GetCharacterPlacement',
+    'G616:W>L GetFontLanguageInfo',
+    'G650:X>W BuildInverseTableDIB',
+    'G701:X>W GDITHKCONNECTIONDATALS',
+    'G702:X>W FT_GDIFTHKTHKCONNECTIO',
+    'G703:X>W FDTHKCONNECTIONDATASL',
+    'G704:X>W ICMTHKCONNECTIONDATASL',
+    'G820:X>W ICMCreateTransform',
+    'G821:X>W ICMDeleteTransform',
+    'G822:X>W ICMTranslateRGB',
+    'G823:X>W ICMTranslateRGBs',
+    'G824:X>W ICMCheckColorsInGamut',
+    'B001:P>W Inquire',
+    'B002:SP>W Enable',
+    'B003:>W Disable',
+    'B004:WWPPW>W ToAscii',
+    'B005:PP>W AnsiToOem',
+    'B006:PP>W OemToAnsi',
+    'B007:W>W SetSpeed',
+    'B009:X>W INQUIREEX',
+    'B010:X>W TOASCIIEX',
+    'B011:X>W VKKEYSCANEX',
+    'B012:X>W MAPVIRTUALKEYEX',
+    'B013:X>W NEWTABLEEX',
+    'B014:X>W __EXPORTEDSTUB',
+    'B100:W>L ScreenSwitchEnable',
+    'B128:W>L OemKeyScan',
+    'B129:W>W VkKeyScan',
+    'B130:W>W GetKeyboardType',
+    'B131:WW>W MapVirtualKey',
+    'B132:>W GetKBCodePage',
+    'B133:LPW>W GetKeyNameText',
+    'B134:PPW>W AnsiToOemBuff',
+    'B135:PPW>W OemToAnsiBuff',
+    'L001:WW>L LZCopy',
+    'L002:PPW>W LZOpenFile',
+    'L003:W>W LZInit',
+    'L004:WLW>L LZSeek',
+    'L005:WPW>W LZRead',
+    'L006:W>W LZClose',
+    'L007:>W LZStart',
+    'L008:WW>L CopyLZFile',
+    'L009:>W LZDone',
+    'L010:PP>W GetExpandedName',
+    'S001:LPP>L RegOpenKey',
+    'S002:LPP>L RegCreateKey',
+    'S003:L>L RegCloseKey',
+    'S004:LP>L RegDeleteKey',
+    'S005:LPLPL>L RegSetValue',
+    'S006:LPPP>L RegQueryValue',
+    'S007:LLPL>L RegEnumKey',
+    'S009:WW>W DragAcceptFiles',
+    'S011:WIPI>W DragQueryFile',
+    'S012:W>W DragFinish',
+    'S013:WP>W DragQueryPoint',
+    'S020:WPPPPI>W ShellExecute',
+    'S021:PPP>W FindExecutable',
+    'S022:WPPW>W ShellAbout',
+    'S033:WWWL>W AboutDlgProc',
+    'S034:WPI>W ExtractIcon',
+    'S036:WPP>W ExtractAssociatedIcon',
+    'S037:PW>L DoEnvironmentSubst',
+    'S038:P>L FindEnvironmentString',
+    'S039:WPIW>W InternalExtractIcon',
+    'S040:PWPPW>W ExtractIconEx',
+    'S101:LWWWLW>L DllEntryPoint',
+    'S102:WW>W RegisterShellHook',
+    'S103:WWL>L ShellHookProc',
+    'S157:X>W RESTARTDIALOG',
+    'S262:L>W DriveType',
+    'S401:X>W SHCHECKDRIVE',
+    'M001:WWWP>L WEP',
+    'M002:PW>L sndPlaySound',
+    'M003:PWL>L PlaySound',
+    'M004:LWWWLW>L DllEntryPoint',
+    'M005:>L mmsystemGetVersion',
+    'M006:LWWLL>L DriverProc',
+    'M008:>L WMMMidiRunOnce',
+    'M030:P>W OutputDebugStr',
+    'M031:LWWWLLL>L DriverCallback',
+    'M032:>L StackEnter',
+    'M033:>L StackLeave',
+    'M034:X>W MMDRVINSTALL',
+    'M101:>L joyGetNumDevs',
+    'M102:WPW>L joyGetDevCaps',
+    'M103:WP>L joyGetPos',
+    'M104:WP>L joyGetThreshold',
+    'M105:W>L joyReleaseCapture',
+    'M106:WWWW>L joySetCapture',
+    'M107:WW>L joySetThreshold',
+    'M109:W>L joySetCalibration',
+    'M110:WP>L joyGetPosEx',
+    'M111:X>W JOYCONFIGCHANGED',
+    'M201:>L midiOutGetNumDevs',
+    'M202:WPW>L midiOutGetDevCaps',
+    'M203:WPW>L midiOutGetErrorText',
+    'M204:PWLLL>L midiOutOpen',
+    'M205:W>L midiOutClose',
+    'M206:WSW>L midiOutPrepareHeader',
+    'M207:WSW>L midiOutUnprepareHeader',
+    'M208:WL>L midiOutShortMsg',
+    'M209:WSW>L midiOutLongMsg',
+    'M210:W>L midiOutReset',
+    'M211:WP>L midiOutGetVolume',
+    'M212:WL>L midiOutSetVolume',
+    'M213:WWPW>L midiOutCachePatches',
+    'M214:WWPW>L midiOutCacheDrumPatche',
+    'M215:WP>L midiOutGetID',
+    'M216:WWLL>L midiOutMessage',
+    'M250:WPL>L midiStreamProperty',
+    'M251:PPLLLL>L midiStreamOpen',
+    'M252:W>L midiStreamClose',
+    'M253:WPW>L midiStreamPosition',
+    'M254:WPW>L midiStreamOut',
+    'M255:W>L midiStreamPause',
+    'M256:W>L midiStreamRestart',
+    'M257:W>L midiStreamStop',
+    'M301:>L midiInGetNumDevs',
+    'M302:WPW>L midiInGetDevCaps',
+    'M303:WPW>L midiInGetErrorText',
+    'M304:PWLLL>L midiInOpen',
+    'M305:W>L midiInClose',
+    'M306:WSW>L midiInPrepareHeader',
+    'M307:WSW>L midiInUnprepareHeader',
+    'M308:WSW>L midiInAddBuffer',
+    'M309:W>L midiInStart',
+    'M310:W>L midiInStop',
+    'M311:W>L midiInReset',
+    'M312:WP>L midiInGetID',
+    'M313:WWLL>L midiInMessage',
+    'M350:>L auxGetNumDevs',
+    'M351:WPW>L auxGetDevCaps',
+    'M352:WP>L auxGetVolume',
+    'M353:WL>L auxSetVolume',
+    'M354:WWLL>L auxOutMessage',
+    'M401:>L waveOutGetNumDevs',
+    'M402:WPW>L waveOutGetDevCaps',
+    'M403:WPW>L waveOutGetErrorText',
+    'M404:PWPLLL>L waveOutOpen',
+    'M405:W>L waveOutClose',
+    'M406:WSW>L waveOutPrepareHeader',
+    'M407:WSW>L waveOutUnprepareHeader',
+    'M408:WSW>L waveOutWrite',
+    'M409:W>L waveOutPause',
+    'M410:W>L waveOutRestart',
+    'M411:W>L waveOutReset',
+    'M412:WPW>L waveOutGetPosition',
+    'M413:WP>L waveOutGetPitch',
+    'M414:WL>L waveOutSetPitch',
+    'M415:WP>L waveOutGetVolume',
+    'M416:WL>L waveOutSetVolume',
+    'M417:WP>L waveOutGetPlaybackRate',
+    'M418:WL>L waveOutSetPlaybackRate',
+    'M419:W>L waveOutBreakLoop',
+    'M420:WP>L waveOutGetID',
+    'M421:WWLL>L waveOutMessage',
+    'M501:>L waveInGetNumDevs',
+    'M502:WPW>L waveInGetDevCaps',
+    'M503:WPW>L waveInGetErrorText',
+    'M504:PWPLLL>L waveInOpen',
+    'M505:W>L waveInClose',
+    'M506:WSW>L waveInPrepareHeader',
+    'M507:WSW>L waveInUnprepareHeader',
+    'M508:WSW>L waveInAddBuffer',
+    'M509:W>L waveInStart',
+    'M510:W>L waveInStop',
+    'M511:W>L waveInReset',
+    'M512:WPW>L waveInGetPosition',
+    'M513:WP>L waveInGetID',
+    'M514:WWLL>L waveInMessage',
+    'M601:PW>L timeGetSystemTime',
+    'M602:WWSLW>L timeSetEvent',
+    'M603:W>L timeKillEvent',
+    'M604:PW>L timeGetDevCaps',
+    'M605:W>L timeBeginPeriod',
+    'M606:W>L timeEndPeriod',
+    'M607:>L timeGetTime',
+    'M701:WWLL>L mciSendCommand',
+    'M702:PPWW>L mciSendString',
+    'M703:P>L mciGetDeviceID',
+    'M705:WPW>L mciLoadCommandResource',
+    'M706:LPW>L mciGetErrorString',
+    'M707:WL>L mciSetDriverData',
+    'M708:W>L mciGetDriverData',
+    'M710:W>L mciDriverYield',
+    'M711:WWW>L mciDriverNotify',
+    'M712:P>L mciExecute',
+    'M713:W>L mciFreeCommandResource',
+    'M714:WPL>L mciSetYieldProc',
+    'M715:LP>L mciGetDeviceIDFromElem',
+    'M716:WP>L mciGetYieldProc',
+    'M717:W>L mciGetCreatorTask',
+    'M800:>L mixerGetNumDevs',
+    'M801:WPW>L mixerGetDevCaps',
+    'M802:PWLLL>L mixerOpen',
+    'M803:W>L mixerClose',
+    'M804:WWLL>L mixerMessage',
+    'M805:WPL>L mixerGetLineInfo',
+    'M806:WPL>L mixerGetID',
+    'M807:WPL>L mixerGetLineControls',
+    'M808:WPL>L mixerGetControlDetails',
+    'M809:WPL>L mixerSetControlDetails',
+    'M900:LPL>L mmTaskCreate',
+    'M902:W>L mmTaskBlock',
+    'M903:W>L mmTaskSignal',
+    'M904:>W mmGetCurrentTask',
+    'M905:>L mmTaskYield',
+    'E001:R>R __fpMath',
+    'E003:PW>W __WinEm87Info',
+    'E004:PW>W __WinEm87Restore',
+    'E005:PW>W __WinEm87Save',
+    'V002:PPPP>L GetFileResourceSize',
+    'V003:PPPLLP>L GetFileResource',
+    'V006:PP>L GetFileVersionInfoSize',
+    'V007:PLLP>L GetFileVersionInfo',
+    'V008:WPPPPPPP>L VerFindFile',
+    'V009:WPPPPPPP>L VerInstallFile',
+    'V010:WPW>L VerLanguageName',
+    'V011:SPPP>L VerQueryValue',
+    'V020:X>W GETFILEVERSIONINFORAW',
+    'C001:S>W GetOpenFileName',
+    'C002:S>W GetSaveFileName',
+    'C005:P>W ChooseColor',
+    'C006:WWWL>L FileOpenDlgProc',
+    'C007:WWWL>L FileSaveDlgProc',
+    'C008:WWWL>L ColorDlgProc',
+    'C011:S>W FindText',
+    'C012:S>W ReplaceText',
+    'C013:WWWL>L FindTextDlgProc',
+    'C014:WWWL>L ReplaceTextDlgProc',
+    'C015:P>W ChooseFont',
+    'C016:WWWL>W FormatCharDlgProc',
+    'C018:PPWL>W FontStyleEnumProc',
+    'C019:PPWL>W FontFamilyEnumProc',
+    'C020:P>W PrintDlg',
+    'C021:WWWL>L PrintDlgProc',
+    'C022:WWWL>L PrintSetupDlgProc',
+    'C026:>L CommDlgExtendedError',
+    'C027:PPW>W GetFileTitle',
+    'T050:W>W GlobalHandleToSel',
+    'T051:PW>W GlobalFirst',
+    'T052:PW>W GlobalNext',
+    'T053:P>W GlobalInfo',
+    'T054:PW>W GlobalEntryHandle',
+    'T055:PWW>W GlobalEntryModule',
+    'T056:PW>W LocalInfo',
+    'T057:PW>W LocalFirst',
+    'T058:P>W LocalNext',
+    'T059:P>W ModuleFirst',
+    'T060:P>W ModuleNext',
+    'T061:PP>W ModuleFindName',
+    'T062:PW>W ModuleFindHandle',
+    'T063:P>W TaskFirst',
+    'T064:P>W TaskNext',
+    'T065:PW>W TaskFindHandle',
+    'T066:PW>W StackTraceFirst',
+    'T067:PWWWW>W StackTraceCSIPFirst',
+    'T068:P>W StackTraceNext',
+    'T069:X>W ClassFirst',
+    'T070:X>W ClassNext',
+    'T071:P>W SystemHeapInfo',
+    'T072:P>W MemManInfo',
+    'T073:WSW>W NotifyRegister',
+    'T074:W>W NotifyUnregister',
+    'T075:WS>W InterruptRegister',
+    'T076:W>W InterruptUnRegister',
+    'T077:WW>W TerminateApp',
+    'T078:WLPL>L MemoryRead',
+    'T079:WLPL>L MemoryWrite',
+    'T080:P>W TimerCount',
+    'T081:X>W TASKSETCSIP',
+    'T082:X>W TASKGETCSIP',
+    'T083:X>W TASKSWITCH',
+    'T084:PW>W Local32Info',
+    'T085:PW>W Local32First',
+    'T086:P>W Local32Next',
+    'Y001:WW>L InquireSystem',
+    'Y002:WS>W CreateSystemTimer',
+    'Y003:W>W KillSystemTimer',
+    'Y004:>W EnableSystemTimers',
+    'Y005:>W DisableSystemTimers',
+    'Y006:>L GetSystemMSecCount',
+    'Y007:>W Get80x87SaveSize',
+    'Y008:P>W Save80x87State',
+    'Y009:P>W Restore80x87State',
+    'Y013:X>W INQUIRELONGINTS',
+    'Y020:W>W A20_Proc',
+    'D001:X>W BitBlt',
+    'D002:X>W ColorInfo',
+    'D003:X>W Control',
+    'D004:X>W Disable',
+    'D005:X>W Enable',
+    'D006:X>W EnumFonts',
+    'D007:X>W EnumObj',
+    'D008:X>W Output',
+    'D009:X>W Pixel',
+    'D010:X>W RealizeObject',
+    'D011:X>W StrBlt',
+    'D012:X>W ScanLR',
+    'D013:X>W DeviceMode',
+    'D014:X>W ExtTextOut',
+    'D015:X>W GetCharWidth',
+    'D016:X>W DeviceBitmap',
+    'D017:X>W FastBorder',
+    'D018:X>W SetAttribute',
+    'D019:X>W DeviceBitmapBits',
+    'D020:X>W CreateBitmap',
+    'D021:X>W DIBScreenBlt',
+    'D022:X>W SetPalette',
+    'D023:X>W GetPalette',
+    'D024:X>W SetPaletteTranslate',
+    'D025:X>W GetPaletteTranslate',
+    'D026:X>W UpdateColors',
+    'D027:X>W StretchBlt',
+    'D028:X>W StretchDIBits',
+    'D029:X>W SelectBitmap',
+    'D030:X>W BitmapBits',
+    'D031:X>W ReEnable',
+    'D039:X>W DIBBlt',
+    'D040:X>W CreateDIBitmap',
+    'D041:X>W DIBToDevice',
+    'D090:X>W Do_Polylines',
+    'D091:X>W Do_Scanlines',
+    'D092:X>W SaveScreenBitmap',
+    'D101:P>W Inquire',
+    'D102:P>W SetCursor',
+    'D103:WW>W MoveCursor',
+    'D104:>W CheckCursor',
+    'D400:X>W PExtTextOut',
+    'D401:X>W PStrBlt',
+    'D402:X>W RExtTextOut',
+    'D403:X>W RStrBlt',
+    'D450:WP>L GetDriverResourceID',
+    'D500:W>W UserRepaintDisable',
+    'D501:X>W ORDINAL_ONLY1',
+    'D502:X>W ORDINAL_ONLY2',
+    'D600:X>W InkReady',
+    'D601:X>W GetLPDevice',
+    'O001:>W OpenSound',
+    'O002:>W CloseSound',
+    'O003:WW>W SetVoiceQueueSize',
+    'O004:WWWW>W SetVoiceNote',
+    'O005:WWWWW>W SetVoiceAccent',
+    'O006:WWW>W SetVoiceEnvelope',
+    'O007:WW>W SetSoundNoise',
+    'O008:WLW>W SetVoiceSound',
+    'O009:>W StartSound',
+    'O010:>W StopSound',
+    'O011:W>W WaitSoundState',
+    'O012:>W SyncAllVoices',
+    'O013:W>W CountVoiceNotes',
+    'O014:>L GetThresholdEvent',
+    'O015:>W GetThresholdStatus',
+    'O016:WW>W SetVoiceThreshold',
+    'O017:>W DoBeep',
+    'O018:X>W MYOPENSOUND');
+
+{ ==================================================================== }
+{ Partie 14 - Sous-systeme Win16 : anneau 3, LDT, passerelles, memoire }
+{ ==================================================================== }
+{ Les programmes Windows 3.x (format NE) s'executent comme sous
+  Windows 95 : en mode protege 16 bits, a l'anneau 3, dans des
+  segments decrits par une LDT. Une interruption survenue dans du code
+  16 bits bascule sur la pile de l'anneau 0 de la tache (TSS.ESP0).
+  Les appels d'API passent par une passerelle d'appel (GDT 38h) :
+  chaque fonction importee est une petite souche 16 bits
+  (push n / call far 3Bh:0 / retf taille). Les rappels (procedures de
+  fenetre 16 bits...) sont appeles par Call16 et reviennent par la
+  passerelle 43h.
+  Selecteurs : (indice LDT * 8) + 7 ; increment des blocs > 64 Ko
+  (__AHINCR) : 8. }
+
+Const
+  LdtMax = 4096;
+  SelGateApi = $3B;
+  SelGateCb = $43;
+  W16CbOfs = $FFF0;        { souche de retour des rappels }
+
+Var
+  Ldt : Array[0..LdtMax * 2 - 1] Of LongInt;
+  LdtUsed : Array[0..LdtMax - 1] Of Boolean;
+  { blocs globaux : taille, nombre de tuiles, adresse, proprietaire }
+  GSize, GTiles, GLin, GOwner, GLock : Array[0..LdtMax - 1] Of LongInt;
+  Tss : Array[0..31] Of LongInt;
+  W16ThunkSel, W16ThunkLin : LongInt;
+  EnterStub, ApiGateStub, CbGateStub : LongInt;
+  Ret16Ax, Ret16Dx, W16Cf : LongInt;
+  Ctx16 : Array[0..MaxThread * 16 - 1] Of LongInt;
+  Ctx16N : Array[0..MaxThread - 1] Of LongInt;
+  { pile 16 bits courante de chaque tache (dernier appel d'API) }
+  T16Ss, T16Sp, T16Ds, T16Mod : Array[0..MaxThread - 1] Of LongInt;
+  { bloc de parametres de Call16 }
+  C16 : Array[0..15] Of LongInt;
+  W16Ready : Boolean;
+
+{ ------------------------------------------------------------------ }
+{ Descripteurs                                                       }
+{ ------------------------------------------------------------------ }
+
+{ Acc : $FA code 16 bits, $F2 donnees 16 bits (anneau 3) }
+Procedure DescSet(I, Base, Limit, Acc : LongInt);
+Var G : LongInt;
+Begin
+  G := 0;
+  If Limit > $FFFFF Then
+  Begin
+    Limit := Limit Shr 12;
+    G := $800000;
+  End;
+  Ldt[I * 2] := (Limit And $FFFF) Or ((Base And $FFFF) Shl 16);
+  Ldt[I * 2 + 1] := ((Base Shr 16) And $FF) Or (Acc Shl 8) Or
+                    (Limit And $F0000) Or G Or (Base And LongInt($FF000000));
+End;
+
+Function SelBase(Sel : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  SelBase := 0;
+  If (Sel And 4) = 0 Then Exit;
+  I := (Sel Shr 3) And $1FFF;
+  If I >= LdtMax Then Exit;
+  SelBase := ((Ldt[I * 2] Shr 16) And $FFFF) Or
+             ((Ldt[I * 2 + 1] And $FF) Shl 16) Or
+             (Ldt[I * 2 + 1] And LongInt($FF000000));
+End;
+
+Function SelLimit(Sel : LongInt) : LongInt;
+Var I, L : LongInt;
+Begin
+  SelLimit := 0;
+  If (Sel And 4) = 0 Then Exit;
+  I := (Sel Shr 3) And $1FFF;
+  If I >= LdtMax Then Exit;
+  L := (Ldt[I * 2] And $FFFF) Or (Ldt[I * 2 + 1] And $F0000);
+  If (Ldt[I * 2 + 1] And $800000) <> 0 Then L := (L Shl 12) Or $FFF;
+  SelLimit := L;
+End;
+
+Function SelValid(Sel : LongInt) : Boolean;
+Var I : LongInt;
+Begin
+  I := (Sel Shr 3) And $1FFF;
+  SelValid := ((Sel And 4) <> 0) And (I > 0) And (I < LdtMax) And
+              LdtUsed[I];
+End;
+
+{ N selecteurs consecutifs ; selecteur du premier ou 0 }
+Function SelAlloc(N : LongInt) : LongInt;
+Var I, K, Run : LongInt;
+Begin
+  SelAlloc := 0;
+  Run := 0;
+  For I := 1 To LdtMax - 1 Do
+  Begin
+    If LdtUsed[I] Then Run := 0 Else Inc(Run);
+    If Run = N Then
+    Begin
+      For K := I - N + 1 To I Do
+      Begin
+        LdtUsed[K] := True;
+        GSize[K] := 0; GTiles[K] := 0; GLin[K] := 0; GLock[K] := 0;
+        GOwner[K] := HeapOwner;
+        Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
+      End;
+      SelAlloc := ((I - N + 1) Shl 3) Or 7;
+      Exit;
+    End;
+  End;
+  KLog('Win16 : LDT pleine');
+End;
+
+Procedure SelFree(Sel, N : LongInt);
+Var I, K : LongInt;
+Begin
+  I := (Sel Shr 3) And $1FFF;
+  For K := I To I + N - 1 Do
+    If (K > 0) And (K < LdtMax) Then
+    Begin
+      LdtUsed[K] := False;
+      Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
+      GSize[K] := 0; GTiles[K] := 0;
+    End;
+End;
+
+{ Pointeur 16:16 -> adresse lineaire (0 si nul) }
+Function Lin16(P : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := (P Shr 16) And $FFFF;
+  If S = 0 Then Lin16 := 0
+  Else Lin16 := SelBase(S) + (P And $FFFF);
+End;
+
+Function MakeFar(Sel, Ofs : LongInt) : LongInt;
+Begin
+  MakeFar := ((Sel And $FFFF) Shl 16) Or (Ofs And $FFFF);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Memoire globale 16 bits : poignee = selecteur                     }
+{ ------------------------------------------------------------------ }
+
+Procedure GDescs(I, Lin, Size, Tiles, Acc : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To Tiles - 1 Do
+    DescSet(I + K, Lin + K * $10000, Size - K * $10000 - 1, Acc);
+End;
+
+Function GAlloc16(Size : LongInt; Code : Boolean) : LongInt;
+Var Lin, Tiles, Sel, I, Acc : LongInt;
+Begin
+  GAlloc16 := 0;
+  If Size <= 0 Then Size := 1;
+  Size := (Size + 15) And Not 15;
+  Tiles := (Size + $FFFF) Div $10000;
+  Lin := KAlloc(Size);
+  If Lin = 0 Then Exit;
+  FillMem(Lin, Size, 0);
+  Sel := SelAlloc(Tiles);
+  If Sel = 0 Then
+  Begin
+    KFree(Lin);
+    Exit;
+  End;
+  I := Sel Shr 3;
+  If Code Then Acc := $FA Else Acc := $F2;
+  GDescs(I, Lin, Size, Tiles, Acc);
+  GSize[I] := Size; GTiles[I] := Tiles; GLin[I] := Lin;
+  GAlloc16 := Sel;
+End;
+
+Function GIdx(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GIdx := -1;
+  If Not SelValid(H) Then Exit;
+  I := (H Shr 3) And $1FFF;
+  If GTiles[I] > 0 Then GIdx := I;
+End;
+
+Procedure GFree16(H : LongInt);
+Var I : LongInt;
+Begin
+  I := GIdx(H);
+  If I < 0 Then Exit;
+  KFree(GLin[I]);
+  SelFree(H, GTiles[I]);
+End;
+
+Function GReAlloc16(H, Size : LongInt) : LongInt;
+Var I, Lin, Tiles, Sel, J, Acc : LongInt;
+Begin
+  GReAlloc16 := 0;
+  I := GIdx(H);
+  If I < 0 Then Exit;
+  If Size <= 0 Then Size := 1;
+  Size := (Size + 15) And Not 15;
+  Tiles := (Size + $FFFF) Div $10000;
+  Lin := KAlloc(Size);
+  If Lin = 0 Then Exit;
+  FillMem(Lin, Size, 0);
+  MoveMem(GLin[I], Lin, Min(Size, GSize[I]));
+  KFree(GLin[I]);
+  Acc := (Ldt[I * 2 + 1] Shr 8) And $FF;
+  If Tiles <= GTiles[I] Then
+  Begin
+    If Tiles < GTiles[I] Then
+      SelFree(((I + Tiles) Shl 3) Or 7, GTiles[I] - Tiles);
+    Sel := H;
+    J := I;
+  End
+  Else
+  Begin
+    Sel := SelAlloc(Tiles);
+    If Sel = 0 Then Exit;
+    SelFree(H, GTiles[I]);
+    J := Sel Shr 3;
+  End;
+  GDescs(J, Lin, Size, Tiles, Acc);
+  GSize[J] := Size; GTiles[J] := Tiles; GLin[J] := Lin;
+  GReAlloc16 := Sel;
+End;
+
+{ Liberer les blocs et selecteurs d'un proprietaire (fin de tache) }
+Procedure GFreeOwner(Own : LongInt);
+Var I : LongInt;
+Begin
+  For I := 1 To LdtMax - 1 Do
+    If LdtUsed[I] And (GOwner[I] = Own) Then
+    Begin
+      If GTiles[I] > 0 Then KFree(GLin[I]);
+      LdtUsed[I] := False;
+      Ldt[I * 2] := 0; Ldt[I * 2 + 1] := 0;
+      GTiles[I] := 0;
+    End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Tas local d'un segment de donnees (LocalAlloc) : blocs precedes   }
+{ d'un en-tete (mot taille totale, mot 1 si occupe)                  }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxLHeap = 32;
+
+Var
+  LHSel, LHStart, LHEnd : Array[0..MaxLHeap - 1] Of LongInt;
+
+Function LHeapOf(Sel : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  LHeapOf := -1;
+  For I := 0 To MaxLHeap - 1 Do
+    If (LHSel[I] = (Sel Or 3)) And (LHSel[I] <> 0) Then
+    Begin
+      LHeapOf := I;
+      Exit;
+    End;
+End;
+
+Function LocalInitK(Sel, Start, Stop : LongInt) : Boolean;
+Var I, B : LongInt;
+Begin
+  LocalInitK := False;
+  If Not SelValid(Sel) Then Exit;
+  I := LHeapOf(Sel);
+  If I < 0 Then
+    For B := MaxLHeap - 1 DownTo 0 Do
+      If LHSel[B] = 0 Then I := B;
+  If I < 0 Then Exit;
+  Start := (Start + 3) And Not 3;
+  If Stop > SelLimit(Sel) Then Stop := SelLimit(Sel) + 1;
+  If Stop > $FFF0 Then Stop := $FFF0;
+  If Stop - Start < 16 Then Exit;
+  LHSel[I] := Sel Or 3; LHStart[I] := Start; LHEnd[I] := Stop;
+  B := SelBase(Sel);
+  MemW[0:B + Start] := Stop - Start;
+  MemW[0:B + Start + 2] := 0;
+  { InstanceData : pLocalHeap }
+  MemW[0:B + 6] := Start;
+  LocalInitK := True;
+End;
+
+Function LocalAllocK(Sel, Flags, Size : LongInt) : LongInt;
+Var H, B, P, Sz, Need, R : LongInt;
+Begin
+  LocalAllocK := 0;
+  H := LHeapOf(Sel);
+  If H < 0 Then Exit;
+  B := SelBase(Sel);
+  If Size <= 0 Then Size := 1;
+  Need := ((Size + 3) And Not 3) + 4;
+  { fusion des blocs libres consecutifs puis premier ajuste }
+  P := LHStart[H];
+  While P < LHEnd[H] Do
+  Begin
+    Sz := MemW[0:B + P];
+    If Sz < 4 Then Exit;
+    If MemW[0:B + P + 2] = 0 Then
+    Begin
+      While (P + Sz < LHEnd[H]) And (MemW[0:B + P + Sz + 2] = 0) And
+            (MemW[0:B + P + Sz] >= 4) Do
+      Begin
+        Sz := Sz + MemW[0:B + P + Sz];
+        MemW[0:B + P] := Sz;
+      End;
+      If Sz >= Need Then
+      Begin
+        If Sz - Need >= 8 Then
+        Begin
+          MemW[0:B + P + Need] := Sz - Need;
+          MemW[0:B + P + Need + 2] := 0;
+          MemW[0:B + P] := Need;
+        End;
+        MemW[0:B + P + 2] := 1;
+        R := P + 4;
+        FillMem(B + R, MemW[0:B + P] - 4, 0);
+        LocalAllocK := R;
+        Exit;
+      End;
+    End;
+    P := P + Sz;
+  End;
+End;
+
+Function LocalSizeK(Sel, Hd : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  LocalSizeK := 0;
+  If (Hd < 4) Or (LHeapOf(Sel) < 0) Then Exit;
+  B := SelBase(Sel);
+  LocalSizeK := MemW[0:B + Hd - 4] - 4;
+End;
+
+Procedure LocalFreeK(Sel, Hd : LongInt);
+Begin
+  If (Hd < 4) Or (LHeapOf(Sel) < 0) Then Exit;
+  MemW[0:SelBase(Sel) + Hd - 2] := 0;
+End;
+
+Function LocalReAllocK(Sel, Hd, Size, Flags : LongInt) : LongInt;
+Var N, Old : LongInt;
+Begin
+  LocalReAllocK := 0;
+  If Hd = 0 Then Exit;
+  Old := LocalSizeK(Sel, Hd);
+  If (Size <= Old) And (Size > 0) Then
+  Begin
+    LocalReAllocK := Hd;
+    Exit;
+  End;
+  N := LocalAllocK(Sel, Flags, Size);
+  If N = 0 Then Exit;
+  MoveMem(SelBase(Sel) + Hd, SelBase(Sel) + N, Min(Old, Size));
+  LocalFreeK(Sel, Hd);
+  LocalReAllocK := N;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Passage a l'anneau 3 et retour                                     }
+{ ------------------------------------------------------------------ }
+
+Procedure PutB(Var A : LongInt; B : LongInt);
+Begin
+  Mem[0:A] := B And $FF;
+  Inc(A);
+End;
+
+Procedure PutD(Var A : LongInt; D : LongInt);
+Begin
+  MemL[0:A] := D;
+  A := A + 4;
+End;
+
+Function CbFinish : LongInt;
+Begin
+  CbFinish := Ctx16[CurT * 16 + Ctx16N[CurT] - 1];
+End;
+
+Procedure W16ApiEntry(Frame : LongInt); Forward;
+
+{ Souches en code machine (adresses lineaires, segment de code 08h) }
+Procedure BuildW16Stubs;
+Var A, Ret : LongInt;
+Begin
+  A := KAlloc(512);
+  { EnterStub : EAX = bloc C16 (CS, IP, SS, SP, DS, ES, AX, BX, CX, DX,
+    SI, DI, BP, adresse de sauvegarde d'ESP) }
+  EnterStub := A;
+  PutB(A, $55); PutB(A, $53); PutB(A, $56); PutB(A, $57);
+  PutB(A, $8B); PutB(A, $50); PutB(A, 52);          { mov edx,[eax+52] }
+  Ret := EnterStub + 96;
+  PutB(A, $68); PutD(A, Ret);                       { push Ret }
+  PutB(A, $89); PutB(A, $22);                       { mov [edx],esp }
+  PutB(A, $89); PutB(A, $25); PutD(A, TssBase + 4); { mov [esp0],esp }
+  PutB(A, $8B); PutB(A, $48); PutB(A, 56);          { mov ecx,[eax+56] }
+  PutB(A, $89); PutB(A, $21);                       { mov [ecx],esp }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 8);           { push [eax+8] SS }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 12);          { push [eax+12] SP }
+  PutB(A, $68); PutD(A, $3202);                     { push EFLAGS }
+  PutB(A, $FF); PutB(A, $30);                       { push [eax] CS }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 4);           { push [eax+4] IP }
+  PutB(A, $8B); PutB(A, $58); PutB(A, 28);          { mov ebx,[eax+28] }
+  PutB(A, $8B); PutB(A, $48); PutB(A, 32);          { mov ecx,[eax+32] }
+  PutB(A, $8B); PutB(A, $50); PutB(A, 36);          { mov edx,[eax+36] }
+  PutB(A, $8B); PutB(A, $70); PutB(A, 40);          { mov esi,[eax+40] }
+  PutB(A, $8B); PutB(A, $78); PutB(A, 44);          { mov edi,[eax+44] }
+  PutB(A, $8B); PutB(A, $68); PutB(A, 48);          { mov ebp,[eax+48] }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 20);          { push [eax+20] ES }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 16);          { push [eax+16] DS }
+  PutB(A, $8B); PutB(A, $40); PutB(A, 24);          { mov eax,[eax+24] }
+  PutB(A, $1F); PutB(A, $07);                       { pop ds ; pop es }
+  PutB(A, $CF);                                     { iretd }
+  A := Ret;
+  PutB(A, $5F); PutB(A, $5E); PutB(A, $5B); PutB(A, $5D);
+  PutB(A, $C3);
+  { ApiGateStub : entree de la passerelle d'appel des API }
+  A := EnterStub + 128;
+  ApiGateStub := A;
+  PutB(A, $60); PutB(A, $1E); PutB(A, $06);         { pushad ds es }
+  PutB(A, $66); PutB(A, $B8); PutB(A, $10); PutB(A, 0);
+  PutB(A, $8E); PutB(A, $D8); PutB(A, $8E); PutB(A, $C0);
+  PutB(A, $55); PutB(A, $89); PutB(A, $E5);         { push ebp ; mov }
+  PutB(A, $FC); PutB(A, $55);                       { cld ; push ebp }
+  PutB(A, $B8); PutD(A, LongInt(@W16ApiEntry));
+  PutB(A, $FF); PutB(A, $D0);                       { call eax }
+  PutB(A, $8D); PutB(A, $64); PutB(A, $24); PutB(A, 4); { lea esp,+4 }
+  PutB(A, $5D);                                     { pop ebp }
+  PutB(A, $0F); PutB(A, $BA); PutB(A, $25);         { bt [W16Cf],0 }
+  PutD(A, LongInt(@W16Cf)); PutB(A, 0);
+  PutB(A, $07); PutB(A, $1F); PutB(A, $61);         { pop es ds ; popad }
+  PutB(A, $CB);                                     { retf }
+  { CbGateStub : retour d'un rappel 16 bits }
+  A := EnterStub + 256;
+  CbGateStub := A;
+  PutB(A, $66); PutB(A, $B9); PutB(A, $10); PutB(A, 0);
+  PutB(A, $8E); PutB(A, $D9); PutB(A, $8E); PutB(A, $C1);
+  PutB(A, $A3); PutD(A, LongInt(@Ret16Ax));
+  PutB(A, $89); PutB(A, $15); PutD(A, LongInt(@Ret16Dx));
+  PutB(A, $B8); PutD(A, LongInt(@CbFinish));
+  PutB(A, $FF); PutB(A, $D0);
+  PutB(A, $89); PutB(A, $C4);                       { mov esp,eax }
+  PutB(A, $C3);
+End;
+
+{ Appel d'un code 16 bits CS:IP (anneau 3) ; rend DX:AX.
+  Les registres d'entree sont pris dans C16[6..12]. }
+Function Call16(Cs, Ip, Ss, Sp, Ds, Es : LongInt) : LongInt;
+Var A, OldE, N, S : LongInt;
+Begin
+  Call16 := 0;
+  N := Ctx16N[CurT];
+  If N >= 16 Then
+  Begin
+    KLog('Win16 : rappels trop imbriques');
+    Exit;
+  End;
+  C16[0] := Cs And $FFFF; C16[1] := Ip And $FFFF;
+  C16[2] := Ss And $FFFF; C16[3] := Sp And $FFFF;
+  C16[4] := Ds And $FFFF; C16[5] := Es And $FFFF;
+  C16[13] := LongInt(@Ctx16[CurT * 16 + N]);
+  C16[14] := LongInt(@ThrEsp0[CurT]);
+  Ctx16N[CurT] := N + 1;
+  OldE := ThrEsp0[CurT];
+  A := LongInt(@C16);
+  S := EnterStub;
+  asm
+    mov eax,A
+    mov ecx,S
+    call ecx
+  end;
+  { de retour par la passerelle 43h : ESP0 de nouveau celui d'avant }
+  Ctx16N[CurT] := N;
+  ThrEsp0[CurT] := OldE;
+  MemL[0:TssBase + 4] := OldE;
+  Call16 := (Ret16Ax And $FFFF) Or ((Ret16Dx And $FFFF) Shl 16);
+End;
+
+Procedure InitW16;
+Var B, I, A : LongInt;
+Begin
+  { TSS : pile de l'anneau 0 (SS0 = 10h), pas de table d'E/S }
+  FillMem(LongInt(@Tss), 128, 0);
+  TssBase := LongInt(@Tss);
+  Tss[2] := $10;
+  Tss[25] := 104 Shl 16;
+  B := TssBase;
+  Gdt[10] := 103 Or ((B And $FFFF) Shl 16);
+  Gdt[11] := ((B Shr 16) And $FF) Or $8900 Or (B And LongInt($FF000000));
+  { LDT }
+  B := LongInt(@Ldt);
+  Gdt[12] := ((LdtMax * 8 - 1) And $FFFF) Or ((B And $FFFF) Shl 16);
+  Gdt[13] := ((B Shr 16) And $FF) Or $8200 Or (B And LongInt($FF000000));
+  BuildW16Stubs;
+  { passerelles d'appel 386 de niveau 3 vers le segment de code 08h }
+  Gdt[14] := (ApiGateStub And $FFFF) Or ($08 Shl 16);
+  Gdt[15] := (ApiGateStub And LongInt($FFFF0000)) Or $EC00;
+  Gdt[16] := (CbGateStub And $FFFF) Or ($08 Shl 16);
+  Gdt[17] := (CbGateStub And LongInt($FFFF0000)) Or $EC00;
+  For I := 0 To LdtMax - 1 Do LdtUsed[I] := False;
+  LdtUsed[0] := True;
+  asm
+    mov ax,28h
+    ltr ax
+    mov ax,30h
+    lldt ax
+  end;
+  { segment des souches 16 bits (une souche de 16 octets par API) }
+  W16ThunkSel := GAlloc16($10000, True);
+  W16ThunkLin := SelBase(W16ThunkSel);
+  GOwner[W16ThunkSel Shr 3] := 0;
+  A := W16ThunkLin + W16CbOfs;
+  PutB(A, $9A); PutB(A, 0); PutB(A, 0);             { call far 43h:0 }
+  PutB(A, SelGateCb); PutB(A, 0);
+  { ESP0 de la tache 0 }
+  ThrEsp0[0] := 0;
+  W16Ready := True;
+  KLog('Win16 : LDT ' + IntStr(LdtMax) + ' selecteurs, souches pretes');
+End;
+
+{ ------------------------------------------------------------------ }
+{ Modules NE (executables et DLL Windows 3.x)                         }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxNe = 24;
+  MaxNeSeg = 96;
+  W16SysLet = 'KUGBLSMENVCTYDO';
+  W16SysMods : Array[1..15] Of String[8] = ('KERNEL', 'USER', 'GDI',
+    'KEYBOARD', 'LZEXPAND', 'SHELL', 'MMSYSTEM', 'WIN87EM', 'WING', 'VER',
+    'COMMDLG', 'TOOLHELP', 'SYSTEM', 'DISPLAY', 'SOUND');
+
+Var
+  NeUsed, NeDll, NeInit : Array[0..MaxNe - 1] Of Boolean;
+  NeName : Array[0..MaxNe - 1] Of String[12];
+  NePath : Array[0..MaxNe - 1] Of String[80];
+  NeFile, NeHdr, NeNSeg, NeAuto, NeHMod, NeInst : Array[0..MaxNe - 1]
+    Of LongInt;
+  NeSegSel : Array[0..MaxNe * MaxNeSeg - 1] Of LongInt;
+  { API : module (lettre), ordinal, signature, taille des arguments }
+  ApiLet : Array[0..W16ApiN - 1] Of Char;
+  ApiOrd, ApiArgB, ApiEq : Array[0..W16ApiN - 1] Of LongInt;
+  ApiWarned : Array[0..W16ApiN - 1] Of Boolean;
+  W16Env : LongInt;
+  SysLetS : String;
+  W16ErrMode : LongInt;
+
+{ Parametres d'un appel d'API en cours }
+Var
+  ArgV : Array[1..16] Of LongInt;
+  ArgRaw : Array[1..16] Of LongInt;
+  ArgLin, ArgF, ArgIdx : LongInt;
+
+Function ApiSig(I : LongInt) : String;
+Var S : String; P : LongInt;
+Begin
+  S := W16Apis[I];
+  P := Pos(':', S);
+  S := Copy(S, P + 1, 40);
+  P := Pos('>', S);
+  If P > 0 Then ApiSig := Copy(S, 1, P - 1) Else ApiSig := S;
+End;
+
+Function ApiRet(I : LongInt) : Char;
+Var S : String; P : LongInt;
+Begin
+  S := W16Apis[I];
+  P := Pos('>', S);
+  If P > 0 Then ApiRet := S[P + 1] Else ApiRet := 'W';
+End;
+
+Function ApiName(I : LongInt) : String;
+Var S : String; P : LongInt;
+Begin
+  S := W16Apis[I];
+  P := Pos(' ', S);
+  ApiName := Copy(S, P + 1, 40);
+End;
+
+Function SigBytes(S : String) : LongInt;
+Var I, N : LongInt;
+Begin
+  N := 0;
+  For I := 1 To Length(S) Do
+    Case S[I] Of
+      'W', 'I' : N := N + 2;
+      'L', 'P', 'S' : N := N + 4;
+      'D' : N := N + 8;
+    End;
+  SigBytes := N;
+End;
+
+{ Souches 16 bits : push n / call far 3Bh:0 / retf taille }
+Procedure InitW16Apis;
+Var I, A, V : LongInt; S, Sg : String;
+Begin
+  SysLetS := W16SysLet;
+  For I := 0 To W16ApiN - 1 Do
+  Begin
+    S := W16Apis[I];
+    ApiLet[I] := S[1];
+    Val(Copy(S, 2, 3), ApiOrd[I], V);
+    ApiEq[I] := -1;
+    ApiWarned[I] := False;
+    If S[6] = '=' Then
+    Begin
+      Sg := Copy(S, 7, 20);
+      If Pos(' ', Sg) > 0 Then Sg := Copy(Sg, 1, Pos(' ', Sg) - 1);
+      Val(Sg, ApiEq[I], V);
+      ApiArgB[I] := 0;
+      Continue;
+    End;
+    Sg := ApiSig(I);
+    If (Sg = 'V') Or (Sg = 'R') Or (Sg = 'X') Then ApiArgB[I] := 0
+    Else ApiArgB[I] := SigBytes(Sg);
+    A := W16ThunkLin + I * 16;
+    PutB(A, $68); PutB(A, I And $FF); PutB(A, I Shr 8);
+    PutB(A, $9A); PutB(A, 0); PutB(A, 0); PutB(A, SelGateApi); PutB(A, 0);
+    If ApiArgB[I] = 0 Then PutB(A, $CB)
+    Else
+    Begin
+      PutB(A, $CA); PutB(A, ApiArgB[I] And $FF); PutB(A, ApiArgB[I] Shr 8);
+    End;
+  End;
+  { __WINFLAGS : mode protege, 486, mode etendu, coprocesseur, pagination }
+  For I := 0 To W16ApiN - 1 Do
+    If (ApiLet[I] = 'K') And (ApiOrd[I] = 178) Then ApiEq[I] := $0C29;
+End;
+
+Function ApiFind(Let : Char; Ord : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  ApiFind := -1;
+  For I := 0 To W16ApiN - 1 Do
+    If (ApiLet[I] = Let) And (ApiOrd[I] = Ord) Then
+    Begin
+      ApiFind := I;
+      Exit;
+    End;
+End;
+
+Function SysModLet(Name : String) : Char;
+Var I : LongInt;
+Begin
+  SysModLet := ' ';
+  Name := UpStr(Name);
+  For I := 1 To 15 Do
+    If W16SysMods[I] = Name Then SysModLet := SysLetS[I];
+End;
+
+{ Chaine de N octets a l'adresse A }
+Function PStrN(A, N : LongInt) : String;
+Var S : String; I : LongInt;
+Begin
+  S := '';
+  If N > 255 Then N := 255;
+  For I := 0 To N - 1 Do S := S + Chr(Mem[0:A + I]);
+  PStrN := S;
+End;
+
+Function NeFind(Name : String) : LongInt;
+Var I : LongInt;
+Begin
+  NeFind := -1;
+  Name := UpStr(Name);
+  For I := 0 To MaxNe - 1 Do
+    If NeUsed[I] And (NeName[I] = Name) Then
+    Begin
+      NeFind := I;
+      Exit;
+    End;
+End;
+
+{ Module d'une poignee d'instance, de module ou de segment }
+Function NeOfHandle(H : LongInt) : LongInt;
+Var I, K : LongInt;
+Begin
+  NeOfHandle := -1;
+  H := H Or 3;
+  For I := 0 To MaxNe - 1 Do
+    If NeUsed[I] Then
+    Begin
+      If ((NeHMod[I] Or 3) = H) Or ((NeInst[I] <> 0) And
+         ((NeInst[I] Or 3) = H)) Then
+      Begin
+        NeOfHandle := I;
+        Exit;
+      End;
+      For K := 0 To NeNSeg[I] - 1 Do
+        If (NeSegSel[I * MaxNeSeg + K] Or 3) = H Then
+        Begin
+          NeOfHandle := I;
+          Exit;
+        End;
+    End;
+  If (H = 3) And (CurT >= 0) Then NeOfHandle := T16Mod[CurT];
+End;
+
+{ Entree Ord d'un module : segment (1..n) et deplacement }
+Function NeEntry(M, Ord : LongInt; Var Seg, Ofs : LongInt) : Boolean;
+Var P, N, Ind, Cur, K : LongInt;
+Begin
+  NeEntry := False;
+  P := NeHdr[M] + MemW[0:NeHdr[M] + 4];
+  Cur := 1;
+  Repeat
+    N := Mem[0:P];
+    If N = 0 Then Exit;
+    Ind := Mem[0:P + 1];
+    P := P + 2;
+    If Ind = 0 Then
+    Begin
+      Cur := Cur + N;
+      Continue;
+    End;
+    For K := 0 To N - 1 Do
+    Begin
+      If Cur = Ord Then
+      Begin
+        If Ind = $FF Then
+        Begin
+          Seg := Mem[0:P + 3]; Ofs := MemW[0:P + 4];
+        End
+        Else
+        Begin
+          Seg := Ind; Ofs := MemW[0:P + 1];
+        End;
+        NeEntry := True;
+        Exit;
+      End;
+      If Ind = $FF Then P := P + 6 Else P := P + 3;
+      Inc(Cur);
+    End;
+  Until False;
+End;
+
+{ Ordinal d'un nom exporte (tables des noms residents et non residents) }
+Function NeNameOrd(M : LongInt; Name : String) : LongInt;
+Var P, L, Pass : LongInt; S : String;
+Begin
+  NeNameOrd := 0;
+  Name := UpStr(Name);
+  For Pass := 0 To 1 Do
+  Begin
+    If Pass = 0 Then P := NeHdr[M] + MemW[0:NeHdr[M] + $26]
+    Else
+    Begin
+      If MemL[0:NeHdr[M] + $2C] = 0 Then Exit;
+      P := NeFile[M] + MemL[0:NeHdr[M] + $2C];
+    End;
+    L := Mem[0:P];
+    While L <> 0 Do
+    Begin
+      S := PStrN(P + 1, L);
+      If UpStr(S) = Name Then
+      Begin
+        NeNameOrd := MemW[0:P + 1 + L];
+        Exit;
+      End;
+      P := P + L + 3;
+      L := Mem[0:P];
+    End;
+  End;
+End;
+
+Function NeEntryFar(M, Ord : LongInt) : LongInt;
+Var Sg, Of2 : LongInt;
+Begin
+  NeEntryFar := 0;
+  If NeEntry(M, Ord, Sg, Of2) And (Sg >= 1) And (Sg <= NeNSeg[M]) Then
+    NeEntryFar := MakeFar(NeSegSel[M * MaxNeSeg + Sg - 1], Of2);
+End;
+
+Function LoadNe(Path : String; IsDll : Boolean) : LongInt; Forward;
+
+{ Cible d'une importation : pointeur 16:16 (ou constante si Eq) }
+Function NeImport(M, ModIdx, Ord : LongInt; ByName : String;
+                  Var Eq : Boolean) : LongInt;
+Var Nm : String; L : Char; I, D : LongInt;
+Begin
+  NeImport := 0;
+  Eq := False;
+  I := NeHdr[M] + MemW[0:NeHdr[M] + $2A] +
+       MemW[0:NeHdr[M] + MemW[0:NeHdr[M] + $28] + (ModIdx - 1) * 2];
+  Nm := UpStr(PStrN(I + 1, Mem[0:I]));
+  L := SysModLet(Nm);
+  If L <> ' ' Then
+  Begin
+    If ByName <> '' Then
+    Begin
+      ByName := UpStr(ByName);
+      I := -1;
+      For D := 0 To W16ApiN - 1 Do
+        If (ApiLet[D] = L) And (UpStr(ApiName(D)) = ByName) Then I := D;
+    End
+    Else I := ApiFind(L, Ord);
+    If I < 0 Then
+    Begin
+      KLog('Win16 : ordinal inconnu ' + Nm + '.' + IntStr(Ord));
+      Exit;
+    End;
+    If ApiEq[I] >= 0 Then
+    Begin
+      Eq := True;
+      NeImport := ApiEq[I];
+      Exit;
+    End;
+    NeImport := MakeFar(W16ThunkSel, I * 16);
+    Exit;
+  End;
+  D := NeFind(Nm);
+  If D < 0 Then D := LoadNe(Nm + '.DLL', True);
+  If D < 0 Then
+  Begin
+    KLog('Win16 : module introuvable ' + Nm);
+    Exit;
+  End;
+  If ByName <> '' Then Ord := NeNameOrd(D, ByName);
+  NeImport := NeEntryFar(D, Ord);
+End;
+
+{ Relocations d'un segment }
+Procedure NeRelocate(M, S : LongInt);
+Var Sg, Fl, Lin, R, Cnt, K, Src, Ty, Ofs, A, B, V, Sel, Next, Tgt,
+    Guard : LongInt;
+    Eq, Add : Boolean; Nm : String;
+Begin
+  Sg := NeHdr[M] + MemW[0:NeHdr[M] + $22] + S * 8;
+  Fl := MemW[0:Sg + 4];
+  If (Fl And $100) = 0 Then Exit;
+  R := NeFile[M] + (MemW[0:Sg] Shl MemW[0:NeHdr[M] + $32]);
+  If MemW[0:Sg + 2] = 0 Then R := R + $10000 Else R := R + MemW[0:Sg + 2];
+  Lin := SelBase(NeSegSel[M * MaxNeSeg + S]);
+  Cnt := MemW[0:R];
+  For K := 0 To Cnt - 1 Do
+  Begin
+    Src := Mem[0:R + 2 + K * 8];
+    Ty := Mem[0:R + 3 + K * 8];
+    Ofs := MemW[0:R + 4 + K * 8];
+    A := MemW[0:R + 6 + K * 8];
+    B := MemW[0:R + 8 + K * 8];
+    Add := (Ty And 4) <> 0;
+    Eq := False;
+    Tgt := 0;
+    Case Ty And 3 Of
+      0 :
+        If (A And $FF) = $FF Then Tgt := NeEntryFar(M, B)
+        Else If (A And $FF) <= NeNSeg[M] Then
+          Tgt := MakeFar(NeSegSel[M * MaxNeSeg + (A And $FF) - 1], B);
+      1 : Tgt := NeImport(M, A, B, '', Eq);
+      2 :
+      Begin
+        V := NeHdr[M] + MemW[0:NeHdr[M] + $2A] + B;
+        Nm := PStrN(V + 1, Mem[0:V]);
+        Tgt := NeImport(M, A, 0, Nm, Eq);
+      End;
+      3 : Continue;   { correction du coprocesseur : sans objet }
+    End;
+    Sel := (Tgt Shr 16) And $FFFF;
+    Guard := 0;
+    Repeat
+      Next := MemW[0:Lin + Ofs];
+      Case Src Of
+        0 :
+          If Add Then Mem[0:Lin + Ofs] := (Mem[0:Lin + Ofs] + Tgt) And $FF
+          Else Mem[0:Lin + Ofs] := Tgt And $FF;
+        2 :
+          If Eq Then MemW[0:Lin + Ofs] := Tgt And $FFFF
+          Else If Add Then MemW[0:Lin + Ofs] := MemW[0:Lin + Ofs] + Sel
+          Else MemW[0:Lin + Ofs] := Sel;
+        3 :
+          If Add Then
+            MemW[0:Lin + Ofs] := MemW[0:Lin + Ofs] + (Tgt And $FFFF)
+          Else
+          Begin
+            MemW[0:Lin + Ofs] := Tgt And $FFFF;
+            MemW[0:Lin + Ofs + 2] := Sel;
+          End;
+        5 :
+          If Add Then
+            MemW[0:Lin + Ofs] := MemW[0:Lin + Ofs] + (Tgt And $FFFF)
+          Else MemW[0:Lin + Ofs] := Tgt And $FFFF;
+        11 :
+        Begin
+          MemL[0:Lin + Ofs] := Tgt And $FFFF;
+          MemW[0:Lin + Ofs + 4] := Sel;
+        End;
+        13 :
+          If Add Then MemL[0:Lin + Ofs] := MemL[0:Lin + Ofs] + (Tgt And $FFFF)
+          Else MemL[0:Lin + Ofs] := Tgt And $FFFF;
+      End;
+      If Add Then Break;
+      Ofs := Next;
+      Inc(Guard);
+    Until (Ofs = $FFFF) Or (Guard > 32768);
+  End;
+End;
+
+{ Prologues des fonctions exportees : push ds / pop ax / nop (1E 58 90)
+  ou mov ax,ds / nop (8C D8 90) -> mov ax,DGROUP }
+Procedure NePatchExports(M : LongInt);
+Var P, N, Ind, K, Sg, Of2, Lin : LongInt;
+Begin
+  If NeInst[M] = 0 Then Exit;
+  P := NeHdr[M] + MemW[0:NeHdr[M] + 4];
+  Repeat
+    N := Mem[0:P];
+    If N = 0 Then Exit;
+    Ind := Mem[0:P + 1];
+    P := P + 2;
+    If Ind = 0 Then Continue;
+    For K := 0 To N - 1 Do
+    Begin
+      If Ind = $FF Then
+      Begin
+        Sg := Mem[0:P + 3]; Of2 := MemW[0:P + 4];
+      End
+      Else
+      Begin
+        Sg := Ind; Of2 := MemW[0:P + 1];
+      End;
+      If ((Mem[0:P] And 1) <> 0) And (Sg >= 1) And (Sg <= NeNSeg[M]) Then
+      Begin
+        Lin := SelBase(NeSegSel[M * MaxNeSeg + Sg - 1]) + Of2;
+        If (Mem[0:Lin + 2] = $90) And (((Mem[0:Lin] = $1E) And
+           (Mem[0:Lin + 1] = $58)) Or ((Mem[0:Lin] = $8C) And
+           (Mem[0:Lin + 1] = $D8))) Then
+        Begin
+          Mem[0:Lin] := $B8;
+          MemW[0:Lin + 1] := NeInst[M];
+        End;
+      End;
+      If Ind = $FF Then P := P + 6 Else P := P + 3;
+    End;
+  Until False;
+End;
+
+Function LoadNe(Path : String; IsDll : Boolean) : LongInt;
+Var M, I, F, FSize, Ne, Sg, Off, Len, Fl, Mn, Sz, Sel, Lin, Own,
+    L : LongInt; Nm : String;
+Begin
+  LoadNe := -1;
+  Path := FindModuleFile(Path);
+  If Path = '' Then Exit;
+  M := -1;
+  For I := MaxNe - 1 DownTo 0 Do
+    If Not NeUsed[I] Then M := I;
+  If M < 0 Then Exit;
+  F := LoadWholeFile(Path, FSize);
+  If F = 0 Then Exit;
+  Ne := F + MemW[0:F + $3C];
+  If (MemW[0:F] <> $5A4D) Or (MemW[0:Ne] <> $454E) Then
+  Begin
+    KFree(F);
+    Exit;
+  End;
+  NeUsed[M] := True; NeInit[M] := False;
+  NeFile[M] := F; NeHdr[M] := Ne;
+  NeDll[M] := (MemW[0:Ne + $0C] And $8000) <> 0;
+  NeNSeg[M] := Min(MemW[0:Ne + $1C], MaxNeSeg);
+  NeAuto[M] := MemW[0:Ne + $0E];
+  L := Ne + MemW[0:Ne + $26];
+  NeName[M] := UpStr(PStrN(L + 1, Mem[0:L]));
+  NePath[M] := Path;
+  KLog('Win16 : module ' + NeName[M] + ' (' + Path + '), ' +
+       IntStr(NeNSeg[M]) + ' segments');
+  Own := HeapOwner;
+  NeHMod[M] := GAlloc16(64, False);
+  NeInst[M] := 0;
+  { segments }
+  For I := 0 To NeNSeg[M] - 1 Do
+  Begin
+    Sg := Ne + MemW[0:Ne + $22] + I * 8;
+    Off := MemW[0:Sg] Shl MemW[0:Ne + $32];
+    Len := MemW[0:Sg + 2];
+    Fl := MemW[0:Sg + 4];
+    Mn := MemW[0:Sg + 6];
+    If (Len = 0) And (Off <> 0) Then Len := $10000;
+    If Mn = 0 Then Sz := $10000 Else Sz := Mn;
+    If Sz < Len Then Sz := Len;
+    If I + 1 = NeAuto[M] Then Sz := $10000;
+    Sel := GAlloc16(Sz, (Fl And 1) = 0);
+    NeSegSel[M * MaxNeSeg + I] := Sel;
+    If Sel = 0 Then Exit;
+    Lin := SelBase(Sel);
+    If (Off <> 0) And (Len > 0) Then MoveMem(F + Off, Lin, Len);
+    If I + 1 = NeAuto[M] Then
+    Begin
+      NeInst[M] := Sel;
+      { segment automatique : limite 64 Ko }
+      DescSet(Sel Shr 3, Lin, $FFFF, $F2);
+    End;
+  End;
+  { relocations (les DLL importees se chargent au passage) }
+  For I := 0 To NeNSeg[M] - 1 Do NeRelocate(M, I);
+  NePatchExports(M);
+  HeapOwner := Own;
+  LoadNe := M;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Appel d'une procedure 16 bits avec arguments sur la pile de la     }
+{ tache : Args = mots/longs dans l'ordre Pascal (premier empile en    }
+{ premier, donc a l'adresse la plus haute)                           }
+{ ------------------------------------------------------------------ }
+
+Var
+  CbStkSel : Array[0..MaxThread - 1] Of LongInt;
+  PArgN : LongInt;
+  PArgV, PArgS : Array[0..15] Of LongInt;
+
+Procedure PArgClear;
+Begin
+  PArgN := 0;
+End;
+
+Procedure PArgW(V : LongInt);
+Begin
+  PArgV[PArgN] := V And $FFFF; PArgS[PArgN] := 2; Inc(PArgN);
+End;
+
+Procedure PArgL(V : LongInt);
+Begin
+  PArgV[PArgN] := V; PArgS[PArgN] := 4; Inc(PArgN);
+End;
+
+{ Pile 16 bits a utiliser pour un rappel : celle de la tache appelante
+  (en cours d'appel d'API) ou une pile de secours }
+Procedure CbStack(Var Ss, Sp : LongInt);
+Begin
+  If T16Sp[CurT] <> 0 Then
+  Begin
+    Ss := T16Ss[CurT]; Sp := T16Sp[CurT] And $FFFE;
+    Exit;
+  End;
+  If CbStkSel[CurT] = 0 Then CbStkSel[CurT] := GAlloc16($8000, False);
+  Ss := CbStkSel[CurT]; Sp := $7FF0;
+End;
+
+{ Reserve N octets sur la pile 16 bits ; rend l'adresse 16:16 }
+Function StkReserve(Ss : LongInt; Var Sp : LongInt; N : LongInt)
+  : LongInt;
+Begin
+  Sp := (Sp - N) And $FFFE;
+  StkReserve := MakeFar(Ss, Sp);
+End;
+
+Function CallProc16(Proc, Ds, Ss, Sp : LongInt) : LongInt;
+Var I, B, OS, OP : LongInt;
+Begin
+  B := SelBase(Ss);
+  For I := 0 To PArgN - 1 Do
+  Begin
+    Sp := Sp - PArgS[I];
+    If PArgS[I] = 2 Then MemW[0:B + Sp] := PArgV[I]
+    Else MemL[0:B + Sp] := PArgV[I];
+  End;
+  Sp := Sp - 4;
+  MemW[0:B + Sp] := W16CbOfs;
+  MemW[0:B + Sp + 2] := W16ThunkSel;
+  C16[6] := 0; C16[7] := 0; C16[8] := 0; C16[9] := 0;
+  C16[10] := 0; C16[11] := 0; C16[12] := 0;
+  { pendant le rappel, la pile de la tache est sous Sp }
+  OS := T16Ss[CurT]; OP := T16Sp[CurT];
+  T16Ss[CurT] := Ss; T16Sp[CurT] := Sp;
+  CallProc16 := Call16((Proc Shr 16) And $FFFF, Proc And $FFFF, Ss, Sp,
+                       Ds, Ds);
+  T16Ss[CurT] := OS; T16Sp[CurT] := OP;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Procedures 16 bits vues comme des procedures 32 bits : une souche   }
+{ (pop ecx / push n / push ecx / jmp W16Bridge) par procedure         }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxPr16 = 256;
+
+Var
+  W16Trace : Boolean;
+  Pr16Proc, Pr16Ds, Pr16Stub, Pr16Thr : Array[0..MaxPr16 - 1] Of LongInt;
+  Pr16N : LongInt;
+  BridgeThunk : LongInt;
+  RcTmp : Array[0..15] Of LongInt;
+
+Function MakeBridge(Proc, Ds : LongInt) : LongInt;
+Var I, A : LongInt;
+Begin
+  MakeBridge := 0;
+  If Proc = 0 Then Exit;
+  For I := 0 To Pr16N - 1 Do
+    If (Pr16Proc[I] = Proc) And (Pr16Ds[I] = Ds) Then
+    Begin
+      MakeBridge := Pr16Stub[I];
+      Exit;
+    End;
+  If Pr16N >= MaxPr16 Then Exit;
+  If BridgeThunk = 0 Then BridgeThunk := KernelExport('W16Bridge');
+  I := Pr16N;
+  Inc(Pr16N);
+  A := KAlloc(16);
+  Pr16Proc[I] := Proc; Pr16Ds[I] := Ds; Pr16Stub[I] := A;
+  Pr16Thr[I] := CurT;
+  PutB(A, $59);
+  PutB(A, $68); PutD(A, I);
+  PutB(A, $51);
+  PutB(A, $B8); PutD(A, BridgeThunk);
+  PutB(A, $FF); PutB(A, $E0);
+  MakeBridge := Pr16Stub[I];
+End;
+
+{ Procedure 16 bits d'une souche (0 si procedure 32 bits) }
+Function Proc16Of(A : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  Proc16Of := 0;
+  For I := 0 To Pr16N - 1 Do
+    If Pr16Stub[I] = A Then
+    Begin
+      Proc16Of := Pr16Proc[I];
+      Exit;
+    End;
+End;
+
+Procedure Rect16To32(P16, P32 : LongInt);
+Var K, V : LongInt;
+Begin
+  For K := 0 To 3 Do
+  Begin
+    V := MemW[0:P16 + K * 2];
+    If V >= $8000 Then V := V - $10000;
+    MemL[0:P32 + K * 4] := V;
+  End;
+End;
+
+Procedure Rect32To16(P32, P16 : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To 3 Do MemW[0:P16 + K * 2] := MemL[0:P32 + K * 4] And $FFFF;
+End;
+
+Function SX16(V : LongInt) : LongInt;
+Begin
+  V := V And $FFFF;
+  If V >= $8000 Then V := V - $10000;
+  SX16 := V;
+End;
+
+Function StrToStack(Ss : LongInt; Var Sp : LongInt; P : LongInt)
+  : LongInt;
+Var N, B : LongInt;
+Begin
+  StrToStack := P;
+  If (P = 0) Or ((P Shr 16) = 0) Then Exit;
+  N := StrLenZ(P) + 1;
+  B := SelBase(Ss);
+  StrToStack := StkReserve(Ss, Sp, N);
+  MoveMem(P, B + Sp, N);
+End;
+
+{ Appel d'une procedure de fenetre 16 bits (via sa souche n) }
+Function W16Bridge(Idx, H, M, WP, LP : LongInt) : LongInt;
+Var Ss, Sp, B, M16, W16, L16, R, Post, P16, A, K : LongInt;
+Begin
+  W16Bridge := 0;
+  If (Idx < 0) Or (Idx >= Pr16N) Then Exit;
+  CbStack(Ss, Sp);
+  B := SelBase(Ss);
+  Sp := Sp - 16;
+  M16 := M; W16 := WP And $FFFF; L16 := LP; Post := 0; P16 := 0;
+  Case M Of
+    $111 :
+      L16 := (LP And $FFFF) Or (((WP Shr 16) And $FFFF) Shl 16);
+    $132..$138 :
+    Begin
+      M16 := $19;
+      L16 := (LP And $FFFF) Or ((M - $132) Shl 16);
+    End;
+    $114, $115 :
+      L16 := ((WP Shr 16) And $FFFF) Or ((LP And $FFFF) Shl 16);
+    6 :
+      L16 := (LP And $FFFF) Or (((WP Shr 16) And $FFFF) Shl 16);
+    $113 : L16 := 0;
+    1, $81 :
+      If LP <> 0 Then
+      Begin
+        P16 := StkReserve(Ss, Sp, 34);
+        A := B + Sp;
+        MemL[0:A] := MemL[0:LP];
+        MemW[0:A + 4] := MemL[0:LP + 4];
+        MemW[0:A + 6] := MemL[0:LP + 8];
+        MemW[0:A + 8] := MemL[0:LP + 12];
+        MemW[0:A + 10] := MemL[0:LP + 16];
+        MemW[0:A + 12] := MemL[0:LP + 20];
+        MemW[0:A + 14] := MemL[0:LP + 24];
+        MemW[0:A + 16] := MemL[0:LP + 28];
+        MemL[0:A + 18] := MemL[0:LP + 32];
+        MemL[0:A + 30] := MemL[0:LP + 44];
+        K := StrToStack(Ss, Sp, MemL[0:LP + 36]);
+        MemL[0:B + (P16 And $FFFF) + 22] := K;
+        K := StrToStack(Ss, Sp, MemL[0:LP + 40]);
+        MemL[0:B + (P16 And $FFFF) + 26] := K;
+        L16 := P16;
+      End;
+    $0C : L16 := StrToStack(Ss, Sp, LP);
+    $0D :
+    Begin
+      K := Min(WP, 2048);
+      P16 := StkReserve(Ss, Sp, K + 2);
+      Mem[0:B + Sp] := 0;
+      L16 := P16; Post := 1;
+    End;
+    $24 :
+    Begin
+      P16 := StkReserve(Ss, Sp, 20);
+      For K := 0 To 9 Do MemW[0:B + Sp + K * 2] := MemL[0:LP + K * 4];
+      L16 := P16; Post := 2;
+    End;
+    $46, $47 :
+    Begin
+      P16 := StkReserve(Ss, Sp, 14);
+      For K := 0 To 6 Do MemW[0:B + Sp + K * 2] := MemL[0:LP + K * 4];
+      L16 := P16; Post := 3;
+    End;
+    $83 :
+    Begin
+      P16 := StkReserve(Ss, Sp, 28);
+      For K := 0 To 11 Do
+        MemW[0:B + Sp + K * 2] := MemL[0:LP + K * 4];
+      MemL[0:B + Sp + 24] := 0;
+      L16 := P16; Post := 4;
+    End;
+  End;
+  PArgClear;
+  PArgW(H); PArgW(M16); PArgW(W16); PArgL(L16);
+  R := CallProc16(Pr16Proc[Idx], Pr16Ds[Idx], Ss, Sp);
+  A := B + (P16 And $FFFF);
+  Case Post Of
+    1 :
+    Begin
+      K := Min(WP, 2048);
+      If K > 0 Then
+      Begin
+        MoveMem(A, LP, K);
+        Mem[0:LP + K - 1] := 0;
+      End;
+      R := R And $FFFF;
+    End;
+    2 : For K := 0 To 9 Do MemL[0:LP + K * 4] := SX16(MemW[0:A + K * 2]);
+    3 :
+      If M = $46 Then
+        For K := 2 To 6 Do MemL[0:LP + K * 4] := SX16(MemW[0:A + K * 2]);
+    4 :
+    Begin
+      For K := 0 To 11 Do MemL[0:LP + K * 4] := SX16(MemW[0:A + K * 2]);
+      R := R And $FFFF;
+    End;
+  End;
+  { resultat 16 bits signe pour les messages qui rendent un mot }
+  If (M <> $111) And ((R Shr 16) = 0) And (M <> 1) And (M <> $81) Then
+    R := R And $FFFF;
+  W16Bridge := R;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Messages d'un programme 16 bits vers une fenetre 32 bits           }
+{ ------------------------------------------------------------------ }
+
+Var
+  MFix, MFixP : LongInt;
+
+Procedure Msg16To32(H : LongInt; Var M, WP, LP : LongInt);
+Var W, K, N : LongInt;
+Begin
+  MFix := 0;
+  WP := WP And $FFFF;
+  Case M Of
+    $111 :
+    Begin
+      WP := WP Or (((LP Shr 16) And $FFFF) Shl 16);
+      LP := LP And $FFFF;
+      Exit;
+    End;
+    $19 :
+    Begin
+      M := $132 + ((LP Shr 16) And $FFFF);
+      LP := LP And $FFFF;
+      Exit;
+    End;
+    $114, $115 :
+    Begin
+      WP := WP Or ((LP And $FFFF) Shl 16);
+      LP := (LP Shr 16) And $FFFF;
+      Exit;
+    End;
+    6 :
+    Begin
+      WP := WP Or (((LP Shr 16) And $FFFF) Shl 16);
+      LP := LP And $FFFF;
+      Exit;
+    End;
+    $0C, $0D : LP := Lin16(LP);
+  End;
+  If (M < $400) Or (M > $43F) Then Exit;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  N := M - $400;
+  K := Wnds[W].IKind;
+  If K = ikEdit Then
+  Begin
+    M := $B0 + N;
+    Case N Of
+      1 :
+      Begin
+        WP := LP And $FFFF;
+        LP := (LP Shr 16) And $FFFF;
+      End;
+      2, 3, 4 :
+      Begin
+        MFixP := Lin16(LP);
+        If N > 2 Then Rect16To32(MFixP, LongInt(@RcTmp));
+        LP := LongInt(@RcTmp);
+        If N = 2 Then MFix := 1;
+      End;
+      $12, $14 : LP := Lin16(LP);
+    End;
+  End
+  Else If K = ikButton Then M := $F0 + N
+  Else If K = ikStatic Then M := $170 + N
+  Else If K = ikListBox Then
+  Begin
+    M := $180 + N - 1;
+    If (N = 1) Or (N = 2) Or (N = $A) Or (N = $D) Or (N = $E) Or
+       (N = $10) Or (N = $23) Then LP := Lin16(LP);
+    If N = $19 Then
+    Begin
+      MFixP := Lin16(LP);
+      LP := LongInt(@RcTmp);
+      MFix := 1;
+    End;
+  End
+  Else If K = ikComboBox Then
+  Begin
+    M := $140 + N;
+    If (N = 3) Or (N = 5) Or (N = 8) Or (N = $A) Or (N = $C) Or
+       (N = $D) Or (N = $18) Then LP := Lin16(LP);
+  End;
+End;
+
+Procedure Msg16Fix;
+Begin
+  If MFix = 1 Then Rect32To16(LongInt(@RcTmp), MFixP);
+  MFix := 0;
+End;
+
+{ Message 16 bits vers une fenetre : procedure 16 bits directement,
+  sinon traduction et appel de la procedure 32 bits }
+Function Pr16Of(A : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  Pr16Of := -1;
+  For I := 0 To Pr16N - 1 Do
+    If Pr16Stub[I] = A Then Pr16Of := I;
+End;
+
+{ Message 16 bits vers une procedure : procedure 16 bits appelee
+  directement, sinon traduction et procedure 32 bits (ou defaut) }
+Function CallWnd16(P, H, M, WP, LP : LongInt; Def : Boolean) : LongInt;
+Var I, R, Ss, Sp : LongInt;
+Begin
+  I := Pr16Of(P);
+  If (I >= 0) And Not Def Then
+  Begin
+    CbStack(Ss, Sp);
+    PArgClear;
+    PArgW(H); PArgW(M); PArgW(WP); PArgL(LP);
+    CallWnd16 := CallProc16(Pr16Proc[I], Pr16Ds[I], Ss, Sp - 16);
+    Exit;
+  End;
+  Msg16To32(H, M, WP, LP);
+  If Def Then R := DefWindowProcA(H, M, WP, LP)
+  Else If P <> 0 Then R := CallWindowProcA(P, H, M, WP, LP)
+  Else R := SendMessageA(H, M, WP, LP);
+  Msg16Fix;
+  CallWnd16 := R;
+End;
+
+Function SendMsg16(H, M, WP, LP : LongInt) : LongInt;
+Var W : LongInt;
+Begin
+  W := WndOf(H);
+  If (W >= 0) And (Pr16Of(Wnds[W].Proc) >= 0) Then
+    SendMsg16 := CallWnd16(Wnds[W].Proc, H, M, WP, LP, False)
+  Else SendMsg16 := CallWnd16(0, H, M, WP, LP, False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Entree de la passerelle des API 16 bits                            }
+{ ------------------------------------------------------------------ }
+
+Procedure W16Dispatch(Idx : LongInt); Forward;
+
+Procedure SetAX(V : LongInt);
+Begin
+  MemL[0:ArgF + 40] := (MemL[0:ArgF + 40] And LongInt($FFFF0000)) Or
+                       (V And $FFFF);
+End;
+
+Procedure SetDXAX(V : LongInt);
+Begin
+  SetAX(V);
+  MemL[0:ArgF + 32] := (MemL[0:ArgF + 32] And LongInt($FFFF0000)) Or
+                       ((V Shr 16) And $FFFF);
+End;
+
+Function RegW(Ofs : LongInt) : LongInt;
+Begin
+  RegW := MemL[0:ArgF + Ofs] And $FFFF;
+End;
+
+Procedure SetRegW(Ofs, V : LongInt);
+Begin
+  MemL[0:ArgF + Ofs] := (MemL[0:ArgF + Ofs] And LongInt($FFFF0000)) Or
+                        (V And $FFFF);
+End;
+
+{ Retirer N octets d'arguments de la pile 16 bits (fonctions PASCAL a
+  nombre variable d'arguments) : l'adresse de retour remonte }
+Procedure W16PopArgs(N : LongInt);
+Var Ss, Sp, B : LongInt;
+Begin
+  Ss := MemL[0:ArgF + 56] And $FFFF;
+  Sp := MemL[0:ArgF + 52] And $FFFF;
+  B := SelBase(Ss);
+  MemL[0:B + Sp + N] := MemL[0:B + Sp];
+  MemL[0:ArgF + 52] := (MemL[0:ArgF + 52] And LongInt($FFFF0000)) Or
+                       ((Sp + N) And $FFFF);
+End;
+
+Procedure W16ApiEntry(Frame : LongInt);
+Var Ss, Esp3, Sp, B, Idx, OS, OP, K, Off, N, V, OL, OF2, OI : LongInt;
+    Sv, SvR : Array[1..16] Of LongInt;
+    Sg, S : String;
+Begin
+  Ss := MemL[0:Frame + 56] And $FFFF;
+  Esp3 := MemL[0:Frame + 52];
+  Sp := Esp3 And $FFFF;
+  B := SelBase(Ss);
+  Idx := MemW[0:B + Sp];
+  MemL[0:Frame + 52] := (Esp3 And LongInt($FFFF0000)) Or ((Sp + 2) And $FFFF);
+  For K := 1 To 16 Do
+  Begin
+    Sv[K] := ArgV[K]; SvR[K] := ArgRaw[K];
+  End;
+  OL := ArgLin; OF2 := ArgF; OI := ArgIdx;
+  OS := T16Ss[CurT]; OP := T16Sp[CurT];
+  T16Ss[CurT] := Ss; T16Sp[CurT] := Sp;
+  ArgF := Frame;
+  ArgLin := B + Sp + 6;
+  ArgIdx := Idx;
+  W16Cf := 0;
+  If (Idx >= 0) And (Idx < W16ApiN) Then
+  Begin
+    Sg := ApiSig(Idx);
+    If (Sg <> 'V') And (Sg <> 'R') And (Sg <> 'X') Then
+    Begin
+      N := Length(Sg);
+      Off := 0;
+      For K := N DownTo 1 Do
+      Begin
+        Case Sg[K] Of
+          'W', 'I' :
+          Begin
+            V := MemW[0:ArgLin + Off];
+            If (Sg[K] = 'I') And (V >= $8000) Then V := V - $10000;
+            Off := Off + 2;
+          End;
+          'D' :
+          Begin
+            V := MemL[0:ArgLin + Off];
+            Off := Off + 8;
+          End;
+        Else
+          V := MemL[0:ArgLin + Off];
+          Off := Off + 4;
+        End;
+        If K <= 16 Then
+        Begin
+          ArgRaw[K] := V;
+          If Sg[K] = 'P' Then ArgV[K] := Lin16(V) Else ArgV[K] := V;
+        End;
+      End;
+    End;
+    If W16Trace Then
+    Begin
+      S := '16> ' + ApiName(Idx);
+      If (Sg <> 'V') And (Sg <> 'R') And (Sg <> 'X') Then
+        For K := 1 To Min(Length(Sg), 8) Do
+        Begin
+          S := S + ' ' + HexStr(ArgRaw[K], 4);
+          If (Sg[K] = 'P') And (ArgV[K] <> 0) Then
+            If (Mem[0:ArgV[K]] >= 32) And (Mem[0:ArgV[K]] < 127) Then
+              S := S + '"' + Copy(PStr(ArgV[K]), 1, 40) + '"';
+        End;
+      KLog(S);
+    End;
+    W16Dispatch(Idx);
+    If W16Trace Then
+      KLog('16< ' + ApiName(Idx) + ' = ' + HexStr(RegW(32), 4) + ':' +
+           HexStr(RegW(40), 4));
+  End;
+  T16Ss[CurT] := OS; T16Sp[CurT] := OP;
+  For K := 1 To 16 Do
+  Begin
+    ArgV[K] := Sv[K]; ArgRaw[K] := SvR[K];
+  End;
+  ArgLin := OL; ArgF := OF2; ArgIdx := OI;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Taches Win16                                                       }
+{ ------------------------------------------------------------------ }
+
+Var
+  T16Psp, T16Show : Array[0..MaxThread - 1] Of LongInt;
+  T16Cmd : Array[0..MaxThread - 1] Of String[127];
+  NeSeq : Array[0..MaxNe - 1] Of LongInt;
+  NeSeqN : LongInt;
+
+Procedure W16Terminate(Code : LongInt);
+Var I, M, K, Own : LongInt;
+Begin
+  KLog('Win16 : fin de la tache ' + IntStr(CurT) + ' (' + IntStr(Code) +
+       ')');
+  KillingApp := True;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds[I].Used And (Wnds[I].Thread = CurT) Then
+    Begin
+      Wnds[I].Proc := 0;
+      Wnds[I].IKind := ikStatic;
+      DestroyW(I);
+    End;
+  KillingApp := False;
+  Own := ThrOwner[CurT];
+  For I := 0 To MaxGdi - 1 Do
+    If Gdis[I].Used And (Gdis[I].Owner = Own) And Not Gdis[I].Stock Then
+      Gdis[I].Used := False;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs[I].Used And (KObjOwner[I] = Own) And
+       (KObjs[I].Kind In [koFile, koFind]) Then KObjs[I].Used := False;
+  M := T16Mod[CurT];
+  If (M >= 0) And NeUsed[M] And Not NeDll[M] Then
+  Begin
+    For K := 0 To NeNSeg[M] - 1 Do GFree16(NeSegSel[M * MaxNeSeg + K]);
+    GFree16(NeHMod[M]);
+    KFree(NeFile[M]);
+    NeUsed[M] := False;
+  End;
+  GFreeOwner(Own);
+  T16Mod[CurT] := -1;
+  CbStkSel[CurT] := 0;
+  ExitThreadK(Code);
+End;
+
+Procedure W16InitDll(M, Ss, Sp : LongInt);
+Var Ne, Cs, Ip, Ds : LongInt;
+Begin
+  NeInit[M] := True;
+  Ne := NeHdr[M];
+  Cs := MemW[0:Ne + $16]; Ip := MemW[0:Ne + $14];
+  If (Cs = 0) Or (Cs > NeNSeg[M]) Then Exit;
+  Ds := NeInst[M];
+  KLog('Win16 : initialisation de ' + NeName[M]);
+  C16[6] := 0; C16[7] := 0; C16[8] := MemW[0:Ne + $10]; C16[9] := 0;
+  C16[10] := 0; C16[11] := Ds; C16[12] := 0;
+  If Ds = 0 Then C16[11] := NeHMod[M];
+  Call16(NeSegSel[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, 0);
+End;
+
+Function W16TaskMain(M : LongInt) : LongInt;
+Var Ne, Ds, Ss, Sp, StkSz, Heap, Lin, Cs, Ip, I, J, Best, DataSz,
+    Sg : LongInt; S : String;
+Begin
+  W16TaskMain := 0;
+  T16Mod[CurT] := M;
+  Ne := NeHdr[M];
+  Ds := NeInst[M];
+  StkSz := MemW[0:Ne + $12];
+  If StkSz < $1400 Then StkSz := $1400;
+  Heap := MemW[0:Ne + $10];
+  Sg := Ne + MemW[0:Ne + $22] + (NeAuto[M] - 1) * 8;
+  DataSz := MemW[0:Sg + 6];
+  If DataSz = 0 Then DataSz := MemW[0:Sg + 2];
+  Ss := Ds;
+  If MemW[0:Ne + $1A] <> NeAuto[M] Then
+    Ss := NeSegSel[M * MaxNeSeg + MemW[0:Ne + $1A] - 1];
+  Sp := MemW[0:Ne + $18];
+  If Sp = 0 Then Sp := DataSz + StkSz;
+  If Sp > $FFFE Then Sp := $FFFE;
+  Sp := Sp And $FFFE;
+  { PSP : INT 20h, environnement, ligne de commande }
+  T16Psp[CurT] := GAlloc16(256, False);
+  Lin := SelBase(T16Psp[CurT]);
+  Mem[0:Lin] := $CD; Mem[0:Lin + 1] := $20;
+  MemW[0:Lin + $2C] := W16Env;
+  S := T16Cmd[CurT];
+  If S <> '' Then S := ' ' + S;
+  If Length(S) > 125 Then S := Copy(S, 1, 125);
+  Mem[0:Lin + $80] := Length(S);
+  For I := 1 To Length(S) Do Mem[0:Lin + $80 + I] := Ord(S[I]);
+  Mem[0:Lin + $81 + Length(S)] := 13;
+  { donnees d'instance : pile }
+  Lin := SelBase(Ds);
+  MemW[0:Lin + $0A] := Sp - StkSz + 16;
+  MemW[0:Lin + $0C] := Sp;
+  MemW[0:Lin + $0E] := Sp;
+  T16Ds[CurT] := Ds;
+  { DLL dans l'ordre de fin de chargement }
+  Repeat
+    Best := -1;
+    For J := 0 To MaxNe - 1 Do
+      If NeUsed[J] And NeDll[J] And Not NeInit[J] Then
+        If (Best < 0) Or (NeSeq[J] < NeSeq[Best]) Then Best := J;
+    If Best >= 0 Then W16InitDll(Best, Ss, Sp - 16);
+  Until Best < 0;
+  Cs := MemW[0:Ne + $16]; Ip := MemW[0:Ne + $14];
+  KLog('Win16 : lancement de ' + NeName[M] + ' CS:IP ' + HexStr(Cs, 2) +
+       ':' + HexStr(Ip, 4) + ' SS:SP ' + HexStr(Ss, 4) + ':' + HexStr(Sp, 4));
+  C16[6] := 0; C16[7] := StkSz; C16[8] := Heap; C16[9] := 0;
+  C16[10] := 0; C16[11] := Ds; C16[12] := 0;
+  Call16(NeSegSel[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, T16Psp[CurT]);
+  W16Terminate(0);
+End;
+
+Function IsNeFile(Path : String) : Boolean;
+Var H, Buf, N : LongInt;
+Begin
+  IsNeFile := False;
+  Buf := KAlloc(64);
+  H := KOpenFile(Path, False, 3);
+  If H <> INVALID_HANDLE Then
+  Begin
+    If KReadFile(H, Buf, 64, N) And (N = 64) And (MemW[0:Buf] = $5A4D)
+    Then
+    Begin
+      SetFilePointer(H, MemL[0:Buf + $3C], 0, 0);
+      If KReadFile(H, Buf, 2, N) And (MemW[0:Buf] = $454E) Then
+        IsNeFile := True;
+    End;
+    CloseHandle(H);
+  End;
+  KFree(Buf);
+End;
+
+Function RunNe(Path, Args : String; Show : LongInt) : Boolean;
+Var M, T, J, Own : LongInt;
+Begin
+  RunNe := False;
+  If Not W16Ready Then Exit;
+  Own := HeapOwner;
+  HeapOwner := 2;
+  M := LoadNe(Path, False);
+  If M < 0 Then
+  Begin
+    HeapOwner := Own;
+    Exit;
+  End;
+  For J := 0 To MaxNe - 1 Do
+    If NeUsed[J] And (NeSeq[J] = 0) Then
+    Begin
+      Inc(NeSeqN);
+      NeSeq[J] := NeSeqN;
+    End;
+  T := ThreadNew(LongInt(@W16TaskMain), M, $10000, True);
+  HeapOwner := Own;
+  If T < 0 Then Exit;
+  ThrW16[T] := True;
+  ThrOwner[T] := 16 + T;
+  T16Cmd[T] := Args;
+  T16Show[T] := Show;
+  T16Sp[T] := 0;
+  RunNe := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fichiers DOS des programmes 16 bits : numeros 5..63 (les          }
+{ bibliotheques C 16 bits indexent leurs tables par ce numero)        }
+{ ------------------------------------------------------------------ }
+
+Var
+  DosH : Array[0..63] Of LongInt;
+  T16Dta : Array[0..MaxThread - 1] Of LongInt;
+  RegHN : LongInt;
+
+Function DosHNew(KH : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DosHNew := -1;
+  If KH = INVALID_HANDLE Then Exit;
+  For I := 5 To 63 Do
+    If DosH[I] = 0 Then
+    Begin
+      DosH[I] := KH;
+      DosHNew := I;
+      Exit;
+    End;
+  CloseHandle(KH);
+End;
+
+Function DosHGet(H : LongInt) : LongInt;
+Begin
+  DosHGet := INVALID_HANDLE;
+  H := H And $FFFF;
+  If (H >= 5) And (H <= 63) And (DosH[H] <> 0) Then DosHGet := DosH[H]
+  Else If H <= 4 Then DosHGet := HStdOut;
+End;
+
+Procedure DosHClose(H : LongInt);
+Var I, K : LongInt;
+Begin
+  H := H And $FFFF;
+  If (H >= 5) And (H <= 63) And (DosH[H] <> 0) Then
+  Begin
+    K := DosH[H];
+    DosH[H] := 0;
+    { un numero duplique (45h) partage l'objet fichier }
+    For I := 5 To 63 Do
+      If DosH[I] = K Then Exit;
+    CloseHandle(K);
+  End;
+End;
+
+Function DosHDup(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DosHDup := -1;
+  H := H And $FFFF;
+  If (H < 5) Or (H > 63) Or (DosH[H] = 0) Then Exit;
+  For I := 5 To 63 Do
+    If DosH[I] = 0 Then
+    Begin
+      DosH[I] := DosH[H];
+      DosHDup := I;
+      Exit;
+    End;
+End;
+
+Function T16DtaOf : LongInt;
+Begin
+  If T16Dta[CurT] = 0 Then T16Dta[CurT] := MakeFar(T16Psp[CurT], $80);
+  T16DtaOf := T16Dta[CurT];
+End;
+
+{ Ressource d'un module NE : Typ/Id entiers (bit 15 force) ou noms }
+Function NeRes(M, Typ, Id : LongInt; TName, IName : String;
+               Var Ptr, Len : LongInt) : Boolean;
+Var R, Sh, T, Cnt, K, E, V : LongInt; Ok : Boolean;
+
+  Function RName(Ofs : LongInt) : String;
+  Begin
+    RName := UpStr(PStrN(R + Ofs + 1, Mem[0:R + Ofs]));
+  End;
+
+Begin
+  NeRes := False;
+  If (M < 0) Or Not NeUsed[M] Then Exit;
+  If MemW[0:NeHdr[M] + $24] = MemW[0:NeHdr[M] + $26] Then Exit;
+  R := NeHdr[M] + MemW[0:NeHdr[M] + $24];
+  Sh := MemW[0:R];
+  T := R + 2;
+  While MemW[0:T] <> 0 Do
+  Begin
+    V := MemW[0:T];
+    Cnt := MemW[0:T + 2];
+    If (V And $8000) <> 0 Then Ok := (TName = '') And ((V And $7FFF) = Typ)
+    Else Ok := (TName <> '') And (RName(V) = TName);
+    If Ok Then
+      For K := 0 To Cnt - 1 Do
+      Begin
+        E := T + 8 + K * 12;
+        V := MemW[0:E + 6];
+        If (V And $8000) <> 0 Then Ok := (IName = '') And ((V And $7FFF) = Id)
+        Else Ok := (IName <> '') And (RName(V) = IName);
+        If Ok Then
+        Begin
+          Ptr := NeFile[M] + (MemW[0:E] Shl Sh);
+          Len := MemW[0:E + 2] Shl Sh;
+          NeRes := True;
+          Exit;
+        End;
+      End;
+    T := T + 8 + Cnt * 12;
+  End;
+End;
+
+{ Nom ou entier d'une ressource passee par pointeur 16:16 }
+Procedure ResKey(Raw : LongInt; Var N : LongInt; Var S : String);
+Var E : LongInt;
+Begin
+  S := '';
+  N := Raw And $FFFF;
+  If (Raw Shr 16) <> 0 Then
+  Begin
+    S := UpStr(PStr(Lin16(Raw)));
+    If (Length(S) > 1) And (S[1] = '#') Then
+    Begin
+      Val(Copy(S, 2, 10), N, E);
+      S := '';
+    End;
+  End;
+End;
+
+Function LoadString16(Inst, Id, Buf, Max : LongInt) : LongInt;
+Var M, P, L, K, N : LongInt;
+Begin
+  LoadString16 := 0;
+  M := NeOfHandle(Inst);
+  If Not NeRes(M, 6, (Id Shr 4) + 1, '', '', P, L) Then Exit;
+  For K := 0 To (Id And 15) - 1 Do P := P + 1 + Mem[0:P];
+  N := Mem[0:P];
+  If Max <= 0 Then Exit;
+  If N > Max - 1 Then N := Max - 1;
+  MoveMem(P + 1, Buf, N);
+  Mem[0:Buf + N] := 0;
+  LoadString16 := N;
+End;
+
+{ wsprintf 16 bits : %d %i %u %x %X %c %s (%ld %lu %lx pour les longs) }
+Function WSPrintf16(Dst, Fmt, Va : LongInt) : LongInt;
+Var I, N, V, W, L : LongInt; C : Char; S, Pad : String; Lng, Left,
+    Zero : Boolean;
+Begin
+  N := 0;
+  I := 0;
+  While Mem[0:Fmt + I] <> 0 Do
+  Begin
+    C := Chr(Mem[0:Fmt + I]);
+    Inc(I);
+    If C <> '%' Then
+    Begin
+      Mem[0:Dst + N] := Ord(C);
+      Inc(N);
+      Continue;
+    End;
+    Left := False; Zero := False; W := 0; Lng := False;
+    If Chr(Mem[0:Fmt + I]) = '-' Then Begin Left := True; Inc(I) End;
+    If Chr(Mem[0:Fmt + I]) = '0' Then Begin Zero := True; Inc(I) End;
+    While (Mem[0:Fmt + I] >= 48) And (Mem[0:Fmt + I] <= 57) Do
+    Begin
+      W := W * 10 + Mem[0:Fmt + I] - 48;
+      Inc(I);
+    End;
+    If Chr(Mem[0:Fmt + I]) = '.' Then
+    Begin
+      Inc(I);
+      While (Mem[0:Fmt + I] >= 48) And (Mem[0:Fmt + I] <= 57) Do Inc(I);
+    End;
+    If UpCase(Chr(Mem[0:Fmt + I])) = 'L' Then Begin Lng := True; Inc(I) End;
+    C := Chr(Mem[0:Fmt + I]);
+    Inc(I);
+    S := '';
+    Case C Of
+      'd', 'i', 'u', 'x', 'X' :
+      Begin
+        If Lng Then Begin V := MemL[0:Va]; Va := Va + 4 End
+        Else
+        Begin
+          V := MemW[0:Va]; Va := Va + 2;
+          If (C In ['d', 'i']) And (V >= $8000) Then V := V - $10000;
+        End;
+        If C In ['x', 'X'] Then
+        Begin
+          If Lng Then S := HexStr(V, 8) Else S := HexStr(V, 4);
+          While (Length(S) > 1) And (S[1] = '0') Do Delete(S, 1, 1);
+          If C = 'x' Then
+            For L := 1 To Length(S) Do
+              If S[L] In ['A'..'F'] Then S[L] := Chr(Ord(S[L]) + 32);
+        End
+        Else S := IntStr(V);
+      End;
+      'c' :
+      Begin
+        S := Chr(MemW[0:Va] And $FF); Va := Va + 2;
+      End;
+      's' :
+      Begin
+        S := PStr(Lin16(MemL[0:Va])); Va := Va + 4;
+      End;
+      '%' : S := '%';
+    End;
+    Pad := '';
+    While Length(S) + Length(Pad) < W Do
+      If Zero And Not Left Then Pad := Pad + '0' Else Pad := Pad + ' ';
+    If Left Then S := S + Pad Else S := Pad + S;
+    For L := 1 To Length(S) Do
+    Begin
+      Mem[0:Dst + N] := Ord(S[L]);
+      Inc(N);
+    End;
+  End;
+  Mem[0:Dst + N] := 0;
+  WSPrintf16 := N;
+End;
+
+{ Fenetre de premier niveau d'une classe et/ou d'un titre }
+Function FindWin(Cls, Name : LongInt) : LongInt;
+Var I : LongInt; C, N : String;
+Begin
+  FindWin := 0;
+  C := ''; N := '';
+  If Cls <> 0 Then C := UpStr(PStr(Cls));
+  If Name <> 0 Then N := PStr(Name);
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds[I].Used And Not IsChildW(I) And (Wnds[I].IKind = ikNone) Then
+      If ((C = '') Or (UpStr(Classes[Wnds[I].Cls].Name) = C)) And
+         ((Name = 0) Or (Wnds[I].Text = N)) Then
+      Begin
+        FindWin := HwndOf(I);
+        Exit;
+      End;
+End;
+
+Function FindWindowA(Cls, Name : LongInt) : LongInt;
+Begin
+  If (Cls <> 0) And (Cls < $10000) Then Cls := 0;
+  FindWindowA := FindWin(Cls, Name);
+End;
+
+{ MSG 32 bits (28 octets) <-> MSG 16 bits (18 octets) }
+Procedure Msg32To16(P32, P16 : LongInt);
+Var M, WP, LP : LongInt;
+Begin
+  M := MemL[0:P32 + 4]; WP := MemL[0:P32 + 8]; LP := MemL[0:P32 + 12];
+  Case M Of
+    $111 : LP := (LP And $FFFF) Or (((WP Shr 16) And $FFFF) Shl 16);
+    $114, $115 :
+      LP := ((WP Shr 16) And $FFFF) Or ((LP And $FFFF) Shl 16);
+    $113 : LP := 0;
+  End;
+  MemW[0:P16] := MemL[0:P32];
+  MemW[0:P16 + 2] := M;
+  MemW[0:P16 + 4] := WP;
+  MemL[0:P16 + 6] := LP;
+  MemL[0:P16 + 10] := MemL[0:P32 + 16];
+  MemW[0:P16 + 14] := MemL[0:P32 + 20];
+  MemW[0:P16 + 16] := MemL[0:P32 + 24];
+End;
+
+Procedure Msg16To32P(P16, P32 : LongInt);
+Var H, M, WP, LP : LongInt;
+Begin
+  H := MemW[0:P16]; M := MemW[0:P16 + 2];
+  WP := MemW[0:P16 + 4]; LP := MemL[0:P16 + 6];
+  Msg16To32(H, M, WP, LP);
+  MemL[0:P32] := H; MemL[0:P32 + 4] := M;
+  MemL[0:P32 + 8] := WP; MemL[0:P32 + 12] := LP;
+  MemL[0:P32 + 16] := MemL[0:P16 + 10];
+  MemL[0:P32 + 20] := SX16(MemW[0:P16 + 14]);
+  MemL[0:P32 + 24] := SX16(MemW[0:P16 + 16]);
+End;
+
+{ Appel d'une fonction stdcall 32 bits : N arguments a partir de A
+  (A[0] premier argument) }
+Function CallStd(Proc, A, N : LongInt) : LongInt;
+Var R, P, K : LongInt;
+Begin
+  R := 0;
+  P := A + (N - 1) * 4;
+  asm
+    mov ecx,N
+    mov edx,P
+  @l:
+    test ecx,ecx
+    jz @c
+    push dword ptr [edx]
+    sub edx,4
+    dec ecx
+    jmp @l
+  @c:
+    mov eax,Proc
+    call eax
+    mov R,eax
+  end;
+  CallStd := R;
+End;
+
+Procedure W16Fail(Msg : String);
+Begin
+  MsgBoxOpen('Pasdows', Msg, $10);
+  W16Terminate(1);
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS3Call / INT 21h                                                 }
+{ ------------------------------------------------------------------ }
+
+Var
+  DosIsInt : Boolean;
+  W16Tmp : LongInt;
+
+Procedure DosCF(E : LongInt);
+Begin
+  If DosIsInt Then
+  Begin
+    If E <> 0 Then MemL[0:ArgF + 52] := MemL[0:ArgF + 52] Or 1
+    Else MemL[0:ArgF + 52] := MemL[0:ArgF + 52] And Not 1;
+  End
+  Else W16Cf := Ord(E <> 0);
+  If E <> 0 Then SetAX(E);
+End;
+
+Function DosPtr(SegOfs, Ofs : LongInt) : LongInt;
+Begin
+  DosPtr := SelBase(RegW(SegOfs)) + RegW(Ofs);
+End;
+
+Function DosErr : LongInt;
+Var E : LongInt;
+Begin
+  E := Threads[CurT].LastErr;
+  If (E <= 0) Or (E > 255) Then E := 5;
+  DosErr := E;
+End;
+
+Function DosDrive : LongInt;
+Begin
+  DosDrive := Ord(UpCase(CurDirS[1])) - 65;
+End;
+
+Procedure DosFind(Dta : LongInt; First : Boolean);
+Var H, Fd, Ok, Attr, Mask, D, T : LongInt; S : String;
+Begin
+  Fd := W16Tmp;
+  If First Then
+  Begin
+    Mask := RegW(36);
+    H := FindFirstFileA(DosPtr(8, 32), Fd);
+    If H = INVALID_HANDLE Then
+    Begin
+      DosCF(18);
+      Exit;
+    End;
+    MemL[0:Dta] := H;
+    Mem[0:Dta + 4] := Mask;
+    Ok := 1;
+  End
+  Else
+  Begin
+    H := MemL[0:Dta];
+    Mask := Mem[0:Dta + 4];
+    Ok := FindNextFileA(H, Fd);
+  End;
+  While Ok <> 0 Do
+  Begin
+    Attr := MemL[0:Fd];
+    If ((Attr And $16) And Not Mask) = 0 Then
+    Begin
+      Mem[0:Dta + 21] := Attr;
+      D := 0; T := 0;
+      FileTimeToDosDateTime(Fd + 20, LongInt(@D), LongInt(@T));
+      MemW[0:Dta + 22] := T; MemW[0:Dta + 24] := D;
+      MemL[0:Dta + 26] := MemL[0:Fd + 32];
+      S := UpStr(PStr(Fd + 44));
+      If Length(S) > 12 Then S := Copy(S, 1, 12);
+      PutPStr(Dta + 30, S, 13);
+      DosCF(0);
+      Exit;
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  FindClose(H);
+  DosCF(18);
+End;
+
+Procedure W16Dos;
+Var AH, AL, H, N, R, P, D, T : LongInt; S : String;
+Begin
+  AH := (RegW(40) Shr 8) And $FF;
+  AL := RegW(40) And $FF;
+  If W16Tmp = 0 Then W16Tmp := KAlloc(512);
+  DosCF(0);
+  If W16Trace Then
+  Begin
+    P := DosPtr(8, 32);
+    If (Mem[0:P] >= 32) And (Mem[0:P] < 127) Then S := Copy(PStr(P), 1, 40)
+    Else S := '';
+    KLog('INT 21h AH=' + HexStr(AH, 2) + ' AL=' + HexStr(AL, 2) + ' BX=' +
+         HexStr(RegW(28), 4) + ' CX=' + HexStr(RegW(36), 4) + ' DX=' +
+         HexStr(RegW(32), 4) + ' ' + S);
+  End;
+  Case AH Of
+    $0D : ;
+    $0E :
+    Begin
+      If RegW(32) And $FF = 2 Then CurDirS := 'C:'
+      Else If RegW(32) And $FF = 3 Then CurDirS := 'D:';
+      SetAX((RegW(40) And $FF00) Or 4);
+    End;
+    $19 : SetAX((RegW(40) And $FF00) Or DosDrive);
+    $1A : T16Dta[CurT] := MakeFar(RegW(8), RegW(32));
+    $2F :
+    Begin
+      If T16Dta[CurT] = 0 Then T16Dta[CurT] := MakeFar(T16Psp[CurT], $80);
+      SetRegW(4, (T16Dta[CurT] Shr 16) And $FFFF);
+      SetRegW(28, T16Dta[CurT] And $FFFF);
+    End;
+    $25 : ;
+    $35 :
+    Begin
+      SetRegW(4, 0); SetRegW(28, 0);
+    End;
+    $2A :
+    Begin
+      GetLocalTime(W16Tmp);
+      SetRegW(36, MemW[0:W16Tmp]);
+      SetRegW(32, (MemW[0:W16Tmp + 2] Shl 8) Or MemW[0:W16Tmp + 6]);
+      SetAX((RegW(40) And $FF00) Or MemW[0:W16Tmp + 4]);
+    End;
+    $2C :
+    Begin
+      GetLocalTime(W16Tmp);
+      SetRegW(36, (MemW[0:W16Tmp + 8] Shl 8) Or MemW[0:W16Tmp + 10]);
+      SetRegW(32, (MemW[0:W16Tmp + 12] Shl 8) Or
+                  (MemW[0:W16Tmp + 14] Div 10));
+    End;
+    $30 :
+    Begin
+      SetAX($0007);
+      SetRegW(28, 0); SetRegW(36, 0);
+    End;
+    $33 : SetRegW(32, 0);
+    $36 :
+    Begin
+      S := Chr(64 + (RegW(32) And $FF)) + ':\';
+      If RegW(32) And $FF = 0 Then S := Copy(CurDirS, 1, 2) + '\';
+      PutPStr(W16Tmp + 400, S, 8);
+      If GetDiskFreeSpaceA(W16Tmp + 400, W16Tmp, W16Tmp + 4, W16Tmp + 8,
+                           W16Tmp + 12) <> 0 Then
+      Begin
+        SetAX(MemL[0:W16Tmp]);
+        SetRegW(28, Min(MemL[0:W16Tmp + 8], $FFFF));
+        SetRegW(36, MemL[0:W16Tmp + 4]);
+        SetRegW(32, Min(MemL[0:W16Tmp + 12], $FFFF));
+      End
+      Else SetAX($FFFF);
+    End;
+    $39 : If CreateDirectoryA(DosPtr(8, 32), 0) = 0 Then DosCF(DosErr);
+    $3A : If RemoveDirectoryA(DosPtr(8, 32)) = 0 Then DosCF(DosErr);
+    $3B : If SetCurrentDirectoryA(DosPtr(8, 32)) = 0 Then DosCF(3);
+    $3C, $5B :
+    Begin
+      If AH = $3C Then D := 2 Else D := 1;
+      H := DosHNew(KOpenFile(PStr(DosPtr(8, 32)), True, D));
+      If H < 0 Then DosCF(DosErr) Else SetAX(H);
+    End;
+    $3D :
+    Begin
+      H := DosHNew(KOpenFile(PStr(DosPtr(8, 32)), (AL And 3) <> 0, 3));
+      If H < 0 Then DosCF(DosErr) Else SetAX(H);
+    End;
+    $3E : DosHClose(RegW(28));
+    $3F :
+    Begin
+      H := DosHGet(RegW(28));
+      If (RegW(28) <= 4) Then SetAX(0)
+      Else If KReadFile(H, DosPtr(8, 32), RegW(36), N) Then SetAX(N)
+      Else DosCF(6);
+    End;
+    $40 :
+    Begin
+      H := DosHGet(RegW(28));
+      If RegW(36) = 0 Then
+      Begin
+        SetEndOfFile(H);
+        SetAX(0);
+      End
+      Else
+      Begin
+        N := KWriteFile(H, DosPtr(8, 32), RegW(36));
+        If N < 0 Then DosCF(5) Else SetAX(N);
+      End;
+    End;
+    $41 : If DeleteFileA(DosPtr(8, 32)) = 0 Then DosCF(2);
+    $42 :
+    Begin
+      H := DosHGet(RegW(28));
+      R := SetFilePointer(H, (RegW(36) Shl 16) Or RegW(32), 0, AL);
+      If R = -1 Then DosCF(6)
+      Else
+      Begin
+        SetAX(R); SetRegW(32, (R Shr 16) And $FFFF);
+      End;
+    End;
+    $43 :
+      If AL = 0 Then
+      Begin
+        R := GetFileAttributesA(DosPtr(8, 32));
+        If R = -1 Then DosCF(2) Else SetRegW(36, R);
+      End
+      Else SetFileAttributesA(DosPtr(8, 32), RegW(36));
+    $44 :
+      Case AL Of
+        0 :
+          If RegW(28) <= 4 Then SetRegW(32, $80D3)
+          Else SetRegW(32, DosDrive);
+        8 : SetAX(1);
+        9 :
+          If ((RegW(28) And $FF) = 4) Or
+             (((RegW(28) And $FF) = 0) And (DosDrive = 3)) Then
+            SetRegW(32, $1000)
+          Else SetRegW(32, 0);
+      Else
+        DosCF(1);
+      End;
+    $45 :
+    Begin
+      N := DosHDup(RegW(28));
+      If N < 0 Then DosCF(4) Else SetAX(N);
+    End;
+    $47 :
+    Begin
+      S := CurDirS;
+      If Length(S) > 3 Then S := Copy(S, 4, 255) Else S := '';
+      PutPStr(DosPtr(8, 16), S, 64);
+    End;
+    $48 :
+    Begin
+      H := GAlloc16(RegW(28) * 16, False);
+      If H = 0 Then
+      Begin
+        SetRegW(28, 0);
+        DosCF(8);
+      End
+      Else SetAX(H);
+    End;
+    $49 : GFree16(RegW(4));
+    $4A :
+      If GReAlloc16(RegW(4), RegW(28) * 16) <> (RegW(4) Or 3) Then
+        DosCF(8);
+    $4C : W16Terminate(AL);
+    $4E : DosFind(Lin16(T16DtaOf), True);
+    $4F : DosFind(Lin16(T16DtaOf), False);
+    $50 : ;
+    $51, $62 : SetRegW(28, T16Psp[CurT]);
+    $56 : If MoveFileA(DosPtr(8, 32), DosPtr(4, 12)) = 0 Then DosCF(5);
+    $57 :
+      If AL = 0 Then
+      Begin
+        H := DosHGet(RegW(28));
+        D := 0; T := 0;
+        If GetFileTime(H, 0, 0, W16Tmp) <> 0 Then
+          FileTimeToDosDateTime(W16Tmp, LongInt(@D), LongInt(@T));
+        SetRegW(36, T); SetRegW(32, D);
+      End;
+    $59 :
+    Begin
+      SetAX(DosErr); SetRegW(28, $0D01); SetRegW(36, 0);
+    End;
+    $6C :
+    Begin
+      P := DosPtr(8, 16);
+      D := RegW(32);
+      If GetFileAttributesA(P) <> -1 Then
+      Begin
+        If (D And 3) = 0 Then N := 0
+        Else If (D And 3) = 1 Then
+        Begin
+          N := 3; R := 1;
+        End
+        Else
+        Begin
+          N := 2; R := 3;
+        End;
+      End
+      Else If (D And $10) <> 0 Then
+      Begin
+        N := 1; R := 2;
+      End
+      Else N := -1;
+      If N = 0 Then DosCF(80)
+      Else If N < 0 Then DosCF(2)
+      Else
+      Begin
+        H := DosHNew(KOpenFile(PStr(P), (RegW(28) And 3) <> 0, N));
+        If H < 0 Then DosCF(DosErr)
+        Else
+        Begin
+          SetAX(H);
+          SetRegW(36, R);
+        End;
+      End;
+    End;
+    $71 : DosCF($7100);
+  Else
+    KLog('Win16 : INT 21h AH=' + HexStr(AH, 2) + 'h non gere');
+    DosCF(1);
+  End;
+End;
+
+Procedure Int21Tail;
+Var F, OF2 : LongInt;
+Begin
+  asm
+    mov eax,[ebp]
+    mov F,eax
+    sti
+  end;
+  OF2 := ArgF;
+  ArgF := F;
+  DosIsInt := True;
+  W16Dos;
+  DosIsInt := False;
+  ArgF := OF2;
+End;
+
+Procedure Int21Gate; Interrupt;
+Begin
+  Int21Tail;
+End;
+
+{ INT 2Fh (multiplexage) et INT 31h (DPMI) : rien d'installe }
+Procedure Int2FGate; Interrupt;
+Begin
+End;
+
+{ ------------------------------------------------------------------ }
+{ API Win16 : code = rang du module * 1000 + ordinal                 }
+{ (1 KERNEL, 2 USER, 3 GDI, 4 KEYBOARD, 5 LZEXPAND, 6 SHELL,         }
+{  7 MMSYSTEM, 8 WIN87EM, 9 WING, 10 VER, 11 COMMDLG, 12 TOOLHELP)   }
+{ ------------------------------------------------------------------ }
+
+Var
+  W16Buf : LongInt;
+  WinIni, WinDirZ, SysDirZ : String;
+
+Function A(K : LongInt) : LongInt;
+Begin
+  A := ArgV[K];
+End;
+
+Function W16Inst : LongInt;
+Begin
+  W16Inst := T16Ds[CurT];
+End;
+
+Procedure RetStrCopy(Dst, Src, Max : LongInt);
+Var N : LongInt;
+Begin
+  N := StrLenZ(Src);
+  If N > Max - 1 Then N := Max - 1;
+  If N < 0 Then N := 0;
+  MoveMem(Src, Dst, N);
+  Mem[0:Dst + N] := 0;
+  SetAX(N);
+End;
+
+Procedure W16RegisterClass(P : LongInt);
+Var C : LongInt;
+Begin
+  C := W16Buf;
+  FillMem(C, 48, 0);
+  MemL[0:C] := MemW[0:P];
+  MemL[0:C + 4] := MakeBridge(MemL[0:P + 2], W16Inst);
+  MemL[0:C + 8] := SX16(MemW[0:P + 6]);
+  MemL[0:C + 12] := SX16(MemW[0:P + 8]);
+  MemL[0:C + 16] := MemW[0:P + 10];
+  MemL[0:C + 20] := MemW[0:P + 12];
+  MemL[0:C + 24] := MemW[0:P + 14];
+  MemL[0:C + 28] := MemW[0:P + 16];
+  If (MemL[0:P + 18] Shr 16) <> 0 Then MemL[0:C + 32] := Lin16(MemL[0:P + 18])
+  Else MemL[0:C + 32] := MemW[0:P + 18];
+  If (MemL[0:P + 22] Shr 16) <> 0 Then MemL[0:C + 36] := Lin16(MemL[0:P + 22])
+  Else MemL[0:C + 36] := MemW[0:P + 22];
+  SetAX(RegisterClassA(C));
+End;
+
+Procedure W16WinExec(Cmd : String; Show : LongInt);
+Var P : LongInt; Prog, Args : String;
+Begin
+  Cmd := Trim(Cmd);
+  P := Pos(' ', Cmd);
+  If P > 0 Then
+  Begin
+    Prog := Copy(Cmd, 1, P - 1);
+    Args := Trim(Copy(Cmd, P + 1, 255));
+  End
+  Else
+  Begin
+    Prog := Cmd; Args := '';
+  End;
+  If Pos('.', BaseName(Prog)) = 0 Then Prog := Prog + '.EXE';
+  KLog('WinExec ' + Prog + ' [' + Args + ']');
+  If FindModuleFile(Prog) = '' Then
+  Begin
+    SetAX(2);
+    Exit;
+  End;
+  If IsNeFile(FindModuleFile(Prog)) Then
+  Begin
+    If RunNe(FindModuleFile(Prog), Args, Show) Then SetAX(33) Else SetAX(11);
+  End
+  Else If RunExe(Prog, Args) Then SetAX(33)
+  Else SetAX(11);
+End;
+
+Procedure W16Dispatch(Idx : LongInt);
+Var Code, R, P, K, N, S, H, M, T, F, Ss, Sp : LongInt; Str : String;
+Begin
+  If W16Buf = 0 Then W16Buf := KAlloc(4096);
+  Code := Pos(ApiLet[Idx], SysLetS) * 1000 + ApiOrd[Idx];
+  If ApiSig(Idx) <> 'R' Then SetDXAX(0);
+  Case Code Of
+    { -------------------------------- KERNEL ------------------------ }
+    1001, 1137 :
+    Begin
+      If Code = 1137 Then Str := PStr(A(2)) Else Str := 'FatalExit';
+      W16Fail(NeName[T16Mod[CurT]] + ' : ' + Str);
+    End;
+    1003 : SetDXAX($07005F03);
+    1004 :
+    Begin
+      S := A(1);
+      If S = 0 Then S := RegW(8);
+      SetAX(Ord(LocalInitK(S, A(2), A(3))));
+    End;
+    1005 : SetAX(LocalAllocK(RegW(8), A(1), A(2)));
+    1006 : SetAX(LocalReAllocK(RegW(8), A(1), A(2), A(3)));
+    1007 :
+    Begin
+      LocalFreeK(RegW(8), A(1));
+      SetAX(0);
+    End;
+    1008 : SetDXAX(MakeFar(RegW(8), A(1)));
+    1009 : SetAX(0);
+    1010 : SetAX(LocalSizeK(RegW(8), A(1)));
+    1012 : SetAX(0);
+    1013 : SetDXAX(0);
+    1015 :
+    Begin
+      R := GAlloc16(A(2), False);
+      SetAX(R);
+    End;
+    1016 :
+      If (A(3) And $80) <> 0 Then SetAX(A(1))
+      Else SetAX(GReAlloc16(A(1), A(2)));
+    1017 :
+    Begin
+      GFree16(A(1));
+      SetAX(0);
+    End;
+    1018, 1023 :
+      If GIdx(A(1)) >= 0 Then SetDXAX(MakeFar(A(1), 0))
+      Else If (Code = 1023) And (A(1) = $FFFF) Then SetAX(RegW(8))
+      Else If SelValid(A(1)) Then SetDXAX(MakeFar(A(1), 0));
+    1019, 1024 : SetAX(0);
+    1020 :
+    Begin
+      K := GIdx(A(1));
+      If K >= 0 Then SetDXAX(GSize[K]);
+    End;
+    1021 : SetDXAX(MakeFar(A(1), A(1)));
+    1022 : SetAX(0);
+    1025 : SetDXAX(HeapFreeBytes);
+    1029, 1030 : KYield;
+    1036 : SetDXAX($8000 + CurT);
+    1037 : SetAX(T16Psp[CurT]);
+    1047 :
+    Begin
+      If (ArgRaw[1] Shr 16) = 0 Then
+      Begin
+        M := NeOfHandle(ArgRaw[1]);
+        If M >= 0 Then SetAX(NeHMod[M]);
+        Exit;
+      End;
+      Str := UpStr(PStr(Lin16(ArgRaw[1])));
+      If Pos('.', Str) > 0 Then Str := Copy(Str, 1, Pos('.', Str) - 1);
+      M := NeFind(Str);
+      If M >= 0 Then SetAX(NeHMod[M]);
+    End;
+    1048 :
+    Begin
+      M := NeOfHandle(A(1));
+      If M >= 0 Then SetAX(1);
+    End;
+    1049 :
+    Begin
+      M := NeOfHandle(A(1));
+      If M >= 0 Then RetStrCopy(A(2), LongInt(@NePath[M]) + 1, A(3))
+      Else SetAX(0);
+      If M >= 0 Then PutPStr(A(2), NePath[M], A(3));
+    End;
+    1050 :
+    Begin
+      M := NeOfHandle(A(1));
+      If M >= 0 Then
+      Begin
+        If (ArgRaw[2] Shr 16) = 0 Then N := ArgRaw[2] And $FFFF
+        Else N := NeNameOrd(M, PStr(A(2)));
+        SetDXAX(NeEntryFar(M, N));
+      End;
+    End;
+    1051 : SetDXAX(ArgRaw[1]);
+    1052 : ;
+    1057 : SetAX(GetPrivateProfileIntA(A(1), A(2), A(3), LongInt(@WinIni) + 1));
+    1058 :
+      SetAX(GetPrivateProfileStringA(A(1), A(2), A(3), A(4), A(5),
+                                     LongInt(@WinIni) + 1));
+    1059 :
+      SetAX(WritePrivateProfileStringA(A(1), A(2), A(3),
+                                       LongInt(@WinIni) + 1));
+    1074 :
+    Begin
+      R := OpenFile(A(1), A(2), A(3));
+      If (R = -1) Or (R = 0) And ((A(3) And $4200) = 0) Then SetAX($FFFF)
+      Else If (A(3) And $4200) <> 0 Then
+      Begin
+        If R <> 0 Then CloseHandle(R);
+        SetAX(1);
+      End
+      Else SetAX(DosHNew(R));
+    End;
+    1081 :
+    Begin
+      DosHClose(A(1));
+      SetAX(0);
+    End;
+    1082, 1349 :
+    Begin
+      If KReadFile(DosHGet(A(1)), Lin16(A(2)), A(3), N) Then SetDXAX(N)
+      Else SetDXAX(-1);
+      If Code = 1082 Then SetRegW(32, 0);
+    End;
+    1083 :
+    Begin
+      R := DosHNew(KOpenFile(PStr(A(1)), True, 2));
+      If R < 0 Then SetAX($FFFF) Else SetAX(R);
+    End;
+    1084 :
+    Begin
+      R := SetFilePointer(DosHGet(A(1)), A(2), 0, A(3));
+      SetDXAX(R);
+    End;
+    1085 :
+    Begin
+      R := DosHNew(KOpenFile(PStr(A(1)), (A(2) And 3) <> 0, 3));
+      If R < 0 Then SetAX($FFFF) Else SetAX(R);
+    End;
+    1086, 1350 :
+    Begin
+      R := KWriteFile(DosHGet(A(1)), A(2), A(3));
+      SetDXAX(R);
+      If Code = 1086 Then SetRegW(32, 0);
+    End;
+    1088 :
+    Begin
+      RetStrCopy(Lin16(A(1)), A(2), 65536);
+      SetDXAX(A(1));
+    End;
+    1089 :
+    Begin
+      P := Lin16(A(1));
+      RetStrCopy(P + StrLenZ(P), A(2), 65536);
+      SetDXAX(A(1));
+    End;
+    1090 : SetAX(StrLenZ(A(1)));
+    1091 :
+    Begin
+      { InitTask : tas local, pile, ligne de commande }
+      M := T16Mod[CurT];
+      S := RegW(8);
+      P := SelBase(S);
+      LocalInitK(S, Max(MemW[0:P + $0E], $100), $FFF0);
+      SetAX(1);
+      SetRegW(36, MemW[0:NeHdr[M] + $12]);
+      SetRegW(12, S);
+      SetRegW(16, 0);
+      SetRegW(4, T16Psp[CurT]);
+      SetRegW(28, $81);
+      If T16Show[CurT] = 0 Then T16Show[CurT] := 1;
+      SetRegW(32, T16Show[CurT]);
+    End;
+    1102 : W16Dos;
+    1107 :
+    Begin
+      SetAX(W16ErrMode);
+      W16ErrMode := A(1);
+    End;
+    1127 : SetAX(GetPrivateProfileIntA(A(1), A(2), A(3), A(4)));
+    1128 : SetAX(GetPrivateProfileStringA(A(1), A(2), A(3), A(4), A(5),
+                                          A(6)));
+    1129 : SetAX(WritePrivateProfileStringA(A(1), A(2), A(3), A(4)));
+    1131 : SetDXAX(MakeFar(W16Env, 0));
+    1132 : SetDXAX($0C29);
+    1134 : RetStrCopy(A(1), LongInt(@WinDirZ) + 1, A(2));
+    1135 : RetStrCopy(A(1), LongInt(@SysDirZ) + 1, A(2));
+    1136 :
+      Case A(1) Of
+        2 : SetAX(3);
+        3 : SetAX(4);
+      Else
+        SetAX(0);
+      End;
+    1166 : W16WinExec(PStr(A(1)), A(2));
+    1207 : SetAX(0);
+    1513 : SetDXAX(LoadLibraryA(A(1)));
+    1514 : SetDXAX(1);
+    1515 :
+      If (ArgRaw[2] Shr 16) = 0 Then
+        SetDXAX(GetProcAddress(A(1), ArgRaw[2] And $FFFF))
+      Else SetDXAX(GetProcAddress(A(1), A(2)));
+    1516 : SetDXAX(Lin16(ArgRaw[1]));
+    1517 :
+    Begin
+      { CallProc32W(p1..pN, proc, conversions, N) : PASCAL variable }
+      N := MemL[0:ArgLin];
+      F := MemL[0:ArgLin + 4];
+      P := MemL[0:ArgLin + 8];
+      If N > 32 Then N := 32;
+      For K := 0 To N - 1 Do
+      Begin
+        R := MemL[0:ArgLin + 12 + K * 4];
+        If ((F Shr K) And 1) <> 0 Then R := Lin16(R);
+        MemL[0:W16Buf + (N - 1 - K) * 4] := R;
+      End;
+      R := CallStd(P, W16Buf, N);
+      W16PopArgs(12 + N * 4);
+      SetDXAX(R);
+    End;
+    { --------------------------------- USER ------------------------- }
+    2001 : SetAX(MessageBoxA(A(1), A(2), A(3), A(4)));
+    2005 : SetAX(1);
+    2010 : SetAX(SetTimer(A(1), A(2), A(3), MakeBridge(ArgRaw[4], W16Inst)));
+    2012 : SetAX(KillTimer(A(1), A(2)));
+    2013 : SetDXAX(Ticks);
+    2014 : SetDXAX(Ticks);
+    2015 : SetDXAX(Ticks);
+    2018 : SetAX(SetCapture(A(1)));
+    2019 : ReleaseCapture;
+    2022 : SetAX(SetFocus(A(1)));
+    2023 : SetAX(GetFocus);
+    2024 : SetAX(RemovePropA(A(1), A(2)));
+    2025 : SetAX(GetPropA(A(1), A(2)));
+    2026 : SetAX(SetPropA(A(1), A(2), A(3)));
+    2017 :
+    Begin
+      R := GetCursorPos(W16Buf);
+      MemW[0:A(1)] := MemL[0:W16Buf]; MemW[0:A(1) + 2] := MemL[0:W16Buf + 4];
+    End;
+    2032, 2033 :
+    Begin
+      If Code = 2032 Then R := GetWindowRect(A(1), W16Buf)
+      Else R := GetClientRect(A(1), W16Buf);
+      Rect32To16(W16Buf, A(2));
+    End;
+    2034 : SetAX(EnableWindow(A(1), A(2)));
+    2035 : SetAX(IsWindowEnabled(A(1)));
+    2036 :
+    Begin
+      R := GetWindowTextA(A(1), Lin16(A(2)), A(3));
+      SetAX(R);
+    End;
+    2037 : SetAX(SetWindowTextA(A(1), Lin16(A(2))));
+    2038 : SetAX(GetWindowTextLengthA(A(1)));
+    2039 :
+    Begin
+      R := BeginPaint(A(1), W16Buf);
+      P := A(2);
+      FillMem(P, 32, 0);
+      MemW[0:P] := R;
+      MemW[0:P + 2] := MemL[0:W16Buf + 4];
+      Rect32To16(W16Buf + 8, P + 4);
+      SetAX(R);
+    End;
+    2040 :
+    Begin
+      MemL[0:W16Buf] := MemW[0:A(2)];
+      R := EndPaint(A(1), W16Buf);
+      SetAX(1);
+    End;
+    2041, 2452 :
+    Begin
+      If Code = 2041 Then K := 0 Else K := 1;
+      { CreateWindowEx : style etendu en premier argument }
+      If K = 0 Then T := 0 Else T := A(1);
+      For N := 4 To 7 Do
+        If ArgV[N + K] = -32768 Then ArgV[N + K] := LongInt($80000000);
+      P := A(1 + K);
+      If (ArgRaw[1 + K] Shr 16) = 0 Then P := ArgRaw[1 + K] And $FFFF;
+      R := CreateWindowExA(T, P, A(2 + K), A(3 + K), A(4 + K), A(5 + K),
+                           A(6 + K), A(7 + K), A(8 + K), A(9 + K),
+                           A(10 + K), ArgRaw[11 + K]);
+      SetAX(R);
+    End;
+    2042 : SetAX(ShowWindow(A(1), A(2)));
+    2043 : SetAX(ShowWindow(A(1), 6));
+    2044 : SetAX(ShowWindow(A(1), 9));
+    2045 : SetAX(BringWindowToTop(A(1)));
+    2046 : SetAX(GetParent(A(1)));
+    2047 : SetAX(IsWindow(A(1)));
+    2048 : SetAX(IsChild(A(1), A(2)));
+    2049 : SetAX(IsWindowVisible(A(1)));
+    2050 : SetAX(FindWin(A(1), A(2)));
+    2053 : SetAX(DestroyWindow(A(1)));
+    2056 :
+      SetAX(MoveWindow(A(1), SX16(A(2)), SX16(A(3)), SX16(A(4)), SX16(A(5)),
+                       A(6)));
+    2057 : W16RegisterClass(A(1));
+    2058 : SetAX(GetClassNameA(A(1), A(2), A(3)));
+    2059 : SetAX(SetActiveWindow(A(1)));
+    2060 : SetAX(GetActiveWindow);
+    2066 : SetAX(GetDC(A(1)));
+    2067 : SetAX(GetWindowDC(A(1)));
+    2068 : SetAX(ReleaseDC(A(1), A(2)));
+    2069 : SetAX(SetCursor(A(1)));
+    2071 : SetAX(ShowCursor(A(1)));
+    2076 :
+    Begin
+      Rect16To32(A(1), W16Buf);
+      SetAX(PtInRect(W16Buf, SX16(A(2)), SX16(A(2) Shr 16)));
+    End;
+    2072 :
+    Begin
+      MemL[0:W16Buf] := A(2); MemL[0:W16Buf + 4] := A(3);
+      MemL[0:W16Buf + 8] := A(4); MemL[0:W16Buf + 12] := A(5);
+      Rect32To16(W16Buf, A(1));
+    End;
+    2081 :
+    Begin
+      Rect16To32(A(2), W16Buf);
+      SetAX(FillRect(A(1), W16Buf, A(3)));
+    End;
+    2085 :
+    Begin
+      Rect16To32(A(4), W16Buf);
+      R := DrawTextA(A(1), A(2), A(3), W16Buf, A(5));
+      Rect32To16(W16Buf, A(4));
+      SetAX(R);
+    End;
+    2106 : SetAX(GetKeyState(A(1)));
+    2107 : SetDXAX(CallWnd16(0, A(1), A(2), A(3), A(4), True));
+    2108, 2109 :
+    Begin
+      If Code = 2108 Then R := GetMessageA(W16Buf + 64, A(2), A(3), A(4))
+      Else R := PeekMessageA(W16Buf + 64, A(2), A(3), A(4), A(5));
+      If (R <> 0) Or (Code = 2108) Then Msg32To16(W16Buf + 64, A(1));
+      SetAX(R);
+    End;
+    2110 :
+    Begin
+      H := A(1); M := A(2); P := A(3); R := A(4);
+      Msg16To32(H, M, P, R);
+      SetAX(PostMessageA(H, M, P, R));
+    End;
+    2111 : SetDXAX(SendMsg16(A(1), A(2), A(3), A(4)));
+    2112 : SetAX(WaitMessage);
+    2113 :
+    Begin
+      Msg16To32P(A(1), W16Buf + 64);
+      SetAX(TranslateMessage(W16Buf + 64));
+    End;
+    2114 :
+    Begin
+      P := A(1);
+      H := MemW[0:P];
+      K := WndOf(H);
+      If (K >= 0) And (Pr16Of(Wnds[K].Proc) >= 0) And
+         (MemW[0:P + 2] <> $113) Then
+        SetDXAX(CallWnd16(Wnds[K].Proc, H, MemW[0:P + 2], MemW[0:P + 4],
+                          MemL[0:P + 6], False))
+      Else
+      Begin
+        Msg16To32P(P, W16Buf + 64);
+        SetDXAX(DispatchMessageA(W16Buf + 64));
+      End;
+    End;
+    2118 : SetAX(RegisterWindowMessageA(A(1)));
+    2122 :
+    Begin
+      P := ArgRaw[1];
+      For K := 0 To Pr16N - 1 Do
+        If Pr16Proc[K] = P Then P := Pr16Stub[K];
+      SetDXAX(CallWnd16(P, A(2), A(3), A(4), A(5), False));
+    End;
+    2124 : SetAX(UpdateWindow(A(1)));
+    2125 :
+      If A(2) = 0 Then SetAX(InvalidateRect(A(1), 0, A(3)))
+      Else
+      Begin
+        Rect16To32(A(2), W16Buf);
+        SetAX(InvalidateRect(A(1), W16Buf, A(3)));
+      End;
+    2126 : SetAX(InvalidateRgn(A(1), A(2), A(3)));
+    2127 :
+      If A(2) = 0 Then SetAX(ValidateRect(A(1), 0))
+      Else
+      Begin
+        Rect16To32(A(2), W16Buf);
+        SetAX(ValidateRect(A(1), W16Buf));
+      End;
+    2128 : SetAX(ValidateRect(A(1), 0));
+    2133 : SetAX(GetWindowWord(A(1), A(2)));
+    2134 : SetAX(SetWindowWord(A(1), A(2), A(3)));
+    2135 :
+    Begin
+      R := GetWindowLongA(A(1), A(2));
+      If (A(2) = -4) And (Proc16Of(R) <> 0) Then R := Proc16Of(R);
+      SetDXAX(R);
+    End;
+    2136 :
+    Begin
+      R := A(3);
+      If A(2) = -4 Then R := MakeBridge(ArgRaw[3], W16Inst);
+      R := SetWindowLongA(A(1), A(2), R);
+      If (A(2) = -4) And (Proc16Of(R) <> 0) Then R := Proc16Of(R);
+      SetDXAX(R);
+    End;
+    2150 : SetAX(LoadMenuA(W16Inst, A(2)));
+    2158 : SetAX(SetMenu(A(1), A(2)));
+    2157 : SetAX(GetMenu(A(1)));
+    2173 :
+    Begin
+      If (ArgRaw[2] Shr 16) = 0 Then P := ArgRaw[2] And $FFFF Else P := A(2);
+      If A(1) = 0 Then SetAX(LoadCursorA(0, P))
+      Else SetAX(LoadCursorA(0, $7F00));
+    End;
+    2174 :
+    Begin
+      If (ArgRaw[2] Shr 16) = 0 Then P := ArgRaw[2] And $FFFF Else P := A(2);
+      If A(1) = 0 Then SetAX(LoadIconA(0, P)) Else SetAX(LoadIconA(0, $7F00));
+    End;
+    2176 : SetAX(LoadString16(A(1), A(2), A(3), A(4)));
+    2179 : SetAX(GetSystemMetrics(A(1)));
+    2180 : SetDXAX(GetSysColor(A(1)));
+    2232 :
+      SetAX(SetWindowPos(A(1), A(2), SX16(A(3)), SX16(A(4)), SX16(A(5)),
+                         SX16(A(6)), A(7)));
+    2262 : SetAX(GetWindow(A(1), A(2)));
+    2284 : SetAX(90);
+    2224 :
+    Begin
+      K := WndOf(A(1));
+      If K >= 0 Then SetAX($8000 + Wnds[K].Thread);
+    End;
+    2286 : SetAX(GetDesktopWindow);
+    2420 :
+    Begin
+      R := WSPrintf16(Lin16(MemL[0:ArgLin]), Lin16(MemL[0:ArgLin + 4]),
+                      ArgLin + 8);
+      SetAX(R);
+    End;
+    2421 :
+      SetAX(WSPrintf16(A(1), A(2), Lin16(ArgRaw[3])));
+    2430 : SetAX(lstrcmpA(A(1), A(2)));
+    2431, 2432 :
+    Begin
+      If (ArgRaw[1] Shr 16) = 0 Then
+      Begin
+        R := ArgRaw[1] And $FF;
+        If (Code = 2431) And (R >= 97) And (R <= 122) Then R := R - 32;
+        If (Code = 2432) And (R >= 65) And (R <= 90) Then R := R + 32;
+        SetDXAX(R);
+      End
+      Else
+      Begin
+        P := Lin16(ArgRaw[1]);
+        While Mem[0:P] <> 0 Do
+        Begin
+          R := Mem[0:P];
+          If (Code = 2431) And (R >= 97) And (R <= 122) Then Mem[0:P] := R - 32;
+          If (Code = 2432) And (R >= 65) And (R <= 90) Then Mem[0:P] := R + 32;
+          Inc(P);
+        End;
+        SetDXAX(ArgRaw[1]);
+      End;
+    End;
+    2471 : SetAX(lstrcmpiA(A(1), A(2)));
+    2472 :
+      If Mem[0:Lin16(ArgRaw[1])] <> 0 Then SetDXAX(ArgRaw[1] + 1)
+      Else SetDXAX(ArgRaw[1]);
+    2473 :
+      If Lin16(ArgRaw[2]) > A(1) Then SetDXAX(ArgRaw[2] - 1)
+      Else SetDXAX(ArgRaw[2]);
+    { ---------------------------------- GDI -------------------------- }
+    3001 : SetDXAX(SetBkColor(A(1), A(2)));
+    3002 : SetAX(SetBkMode(A(1), A(2)));
+    3009 : SetDXAX(SetTextColor(A(1), A(2)));
+    3033 : SetAX(TextOutA(A(1), SX16(A(2)), SX16(A(3)), A(4), A(5)));
+    3045 : SetAX(SelectObject(A(1), A(2)));
+    3066 : SetAX(CreateSolidBrush(A(1)));
+    3069 : SetAX(DeleteObject(A(1)));
+    3080 : SetAX(GetDeviceCaps(A(1), A(2)));
+    3087 : SetAX(GetStockObject(A(1)));
+    { ------------------------------- KEYBOARD ------------------------ }
+    4005, 4006 :
+    Begin
+      If A(1) <> A(2) Then RetStrCopy(A(2), A(1), 65536);
+      SetAX(1);
+    End;
+    { ------------------------------- LZEXPAND ------------------------ }
+    5001 :
+    Begin
+      N := 0;
+      Repeat
+        If Not KReadFile(DosHGet(A(1)), W16Buf, 4096, K) Then K := 0;
+        If K > 0 Then
+        Begin
+          KWriteFile(DosHGet(A(2)), W16Buf, K);
+          N := N + K;
+        End;
+      Until K <= 0;
+      SetDXAX(N);
+    End;
+    5002 :
+    Begin
+      R := OpenFile(A(1), A(2), A(3));
+      If R = -1 Then SetAX($FFFF) Else SetAX(DosHNew(R));
+    End;
+    5006 : DosHClose(A(1));
+    { --------------------------------- SHELL ------------------------- }
+    6001 : SetDXAX(2);
+    6002 :
+    Begin
+      Inc(RegHN);
+      If A(3) <> 0 Then MemL[0:A(3)] := $4000 + RegHN;
+      SetDXAX(0);
+    End;
+    6003, 6004, 6005 : SetDXAX(0);
+    6006 : SetDXAX(2);
+    6007 : SetDXAX(259);
+  Else
+    If Not ApiWarned[Idx] Then
+    Begin
+      ApiWarned[Idx] := True;
+      KLog('Win16 : API non implementee ' + ApiName(Idx) + ' (' +
+           W16SysMods[Pos(ApiLet[Idx], SysLetS)] + '.' +
+           IntStr(ApiOrd[Idx]) + ')');
+    End;
+  End;
+End;
+
+{ Environnement DOS, chemins et portes d'interruption de niveau 3 }
+Procedure W16Init2;
+Var P, N : LongInt;
+Begin
+  W16Trace := ApiTrace;
+  WinIni := 'C:\WINDOWS\WIN.INI';
+  WinDirZ := 'C:\WINDOWS';
+  SysDirZ := 'C:\WINDOWS\SYSTEM';
+  P := GetEnvironmentStringsA;
+  N := 0;
+  While (MemW[0:P + N] <> 0) And (N < 4000) Do Inc(N);
+  W16Env := GAlloc16(N + 64, False);
+  GOwner[W16Env Shr 3] := 0;
+  MoveMem(P, SelBase(W16Env), N + 2);
+  SetGate($21, LongInt(@Int21Gate));
+  SetGate($2F, LongInt(@Int2FGate));
+  SetGate($31, LongInt(@Int2FGate));
+  Idt[$21].Flags := $EE00;
+  Idt[$2F].Flags := $EE00;
+  Idt[$31].Flags := $EE00;
+End;
+
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
-exports VideoForWindowsVersion,
+exports VideoForWindowsVersion, W16Bridge, CreateDirectoryA,
+  RemoveDirectoryA, FindWindowA,
   GetEnvironmentVariableA, SetEnvironmentVariableA,
   GetEnvironmentStrings, GetEnvironmentStringsA, FreeEnvironmentStringsA,
   GetVersion, GetVersionExA, GetSystemInfo, GetCommandLineA, GetStartupInfoA,
@@ -15315,6 +20190,9 @@ BEGIN
   InitGdi;
   InitExports;
   If ApiTrace Then TraceInit;
+  InitW16;
+  InitW16Apis;
+  W16Init2;
   AppProcObj := -1;
   DeskBuild;
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,
