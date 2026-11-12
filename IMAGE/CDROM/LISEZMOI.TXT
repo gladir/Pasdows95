@@ -24,6 +24,14 @@ PROGRAMMES WINDOWS 95
   WPC -CW32 a partir de EXEMPLES\HELLO.PAS. Un projecteur Macromedia
   Director 5 avec son film (.DIR) a ete essaye avec succes.
 
+  DirectX : DDRAW.DLL (plein ecran 320x200, 320x240 ou 640x480 en
+  256 couleurs, Flip, Blt, Lock, palettes), DSOUND.DLL (muet),
+  DINPUT.DLL (clavier, souris) et DSETUP.DLL. Exemple : DDTEST.EXE
+  (Echap pour quitter).
+
+  Les programmes Windows 3.1 (16 bits, format NE) sont aussi
+  pris en charge (KERNEL, USER, GDI, SHELL, VER, LZEXPAND...).
+
   Le son est emule par une carte son muette : les programmes
   synchronises sur le son avancent normalement, sans l'entendre.
 

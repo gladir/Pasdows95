@@ -566,6 +566,15 @@ Var
   MouHead, MouTail : LongInt;
   { horloge temps reel }
   RtcYear, RtcMonth, RtcDay, RtcHour, RtcMin, RtcSec, RtcDow : LongInt;
+  { DirectInput : etat des touches par code de balayage (E0 : +80h),
+    deplacements et boutons de la souris depuis la derniere lecture }
+  ScanDown : Array[0..255] Of Byte;
+  ScanE0 : Boolean;
+  ScanHit : Array[0..255] Of Byte;
+  DIMX, DIMY, DIMBtn : LongInt;
+  { DirectDraw : surface primaire affichee en plein ecran (exclusif) }
+  DDShow, DDDirty : Boolean;
+  DDBuf, DDW, DDH : LongInt;
 
 Procedure SetGate(N, Addr : LongInt);
 Begin
@@ -665,6 +674,16 @@ Procedure IrqKeyboard; Interrupt;
 Var B, N : LongInt;
 Begin
   B := Port[$60];
+  { etat DirectInput des touches, a l'instant de l'interruption }
+  If B = $E0 Then ScanE0 := True
+  Else
+  Begin
+    N := (B And $7F) + Ord(ScanE0) * $80;
+    ScanDown[N] := Ord((B And $80) = 0) * $80;
+    { appui memorise jusqu'a la prochaine lecture de l'etat }
+    If (B And $80) = 0 Then ScanHit[N] := $80;
+    ScanE0 := False;
+  End;
   N := (KbTail + 1) And 255;
   If N <> KbHead Then
   Begin
@@ -2422,8 +2441,18 @@ End;
 
 { Composer la zone modifiee et l'afficher }
 Procedure FlushScreen;
-Var R, C, I : TRect;
+Var R, C, I : TRect; Y : LongInt;
 Begin
+  { DirectDraw en mode exclusif : la surface primaire occupe l'ecran }
+  If DDShow Then
+  Begin
+    If DDDirty Then
+      For Y := 0 To Min(DDH, ScrH) - 1 Do
+        MoveMem(DDBuf + Y * DDW, Lfb + Y * LfbPitch, Min(DDW, ScrW));
+    DDDirty := False;
+    SetR(Dirty, 0, 0, 0, 0);
+    Exit;
+  End;
   If (Dirty.L >= Dirty.R) Or (Dirty.T >= Dirty.B) Then Exit;
   R := Dirty;
   SetR(Dirty, 0, 0, 0, 0);
@@ -4208,6 +4237,7 @@ Begin
     Dx := MouQDx[MouHead]; Dy := MouQDy[MouHead]; Bt := MouQBtn[MouHead];
     MouHead := (MouHead + 1) And 255;
     NX := NX + Dx; NY := NY + Dy;
+    DIMX := DIMX + Dx; DIMY := DIMY + Dy; DIMBtn := Bt;
     If NX < 0 Then NX := 0;
     If NY < 0 Then NY := 0;
     If NX > ScrW - 1 Then NX := ScrW - 1;
@@ -6389,9 +6419,9 @@ Begin
        HexStr(Frame + 56 + 4 * Ord(Vec >= 256), 8);
   KLog('FAUTE (tache ' + IntStr(CurT) + ') ' + S);
   X := Frame + 56 + 4 * Ord(Vec >= 256);
-  S := 'Pile :';
-  For V := 0 To 11 Do S := S + ' ' + HexStr(MemL[0:X + V * 4], 8);
-  KLog(S);
+  Nm := 'Pile :';
+  For V := 0 To 11 Do Nm := Nm + ' ' + HexStr(MemL[0:X + V * 4], 8);
+  KLog(Nm);
   V := Vec And 255;
   HeapOwner := 0;
   If (CurT > 0) And Threads[CurT].IsApp Then
@@ -14707,10 +14737,12 @@ End;
 
 Const
   MaxMod = 16;
-  SysDlls : Array[0..13] Of String[12] = ('KERNEL32.DLL', 'USER32.DLL',
-    'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL', 'OLE32.DLL',
-    'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL', 'COMCTL32.DLL',
-    'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL');
+  SysDllN = 18;
+  SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
+    'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
+    'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
+    'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
+    'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL');
 
 Type
   TModule = Record
@@ -14953,7 +14985,7 @@ Begin
   IsSysDll := False;
   Name := UpStr(BaseName(Name));
   If Pos('.', Name) = 0 Then Name := Name + '.DLL';
-  For I := 0 To 13 Do
+  For I := 0 To SysDllN - 1 Do
     If SysDlls[I] = Name Then IsSysDll := True;
 End;
 
@@ -15252,7 +15284,7 @@ Begin
   M := 0;
   Nm := UpStr(BaseName(Nm));
   If Pos('.', Nm) = 0 Then Nm := Nm + '.DLL';
-  For I := 0 To 13 Do
+  For I := 0 To SysDllN - 1 Do
     If SysDlls[I] = Nm Then M := HDllBase + I * $10000;
   If M = 0 Then SetErr(126);
   GetModuleHandleA := M;
@@ -15561,6 +15593,7 @@ Begin
   HeapOwner := 0;
   AppRunning := False;
   AppBase := 0;
+  DDShow := False;
   If AppProcObj >= 0 Then KObjs[AppProcObj].F2 := 1;
   CaptureWin := -1;
   CurHide := 0;
@@ -21197,9 +21230,1235 @@ Begin
   Idt[$31].Flags := $EE00;
 End;
 
+{ ==================================================================== }
+{ Partie 15 - DirectX : DirectDraw, DirectSound, DirectInput, DSETUP   }
+{ ==================================================================== }
+{ DirectX est integre au noyau comme les autres DLL systeme (DDRAW.DLL,
+  DSOUND.DLL, DINPUT.DLL, DSETUP.DLL) : les objets COM sont des blocs
+  dont le premier mot pointe sur une table de methodes ; chaque methode
+  est une fonction du noyau exportee en stdcall.
+  Objet : +0 table, +4 references, +8 sorte (1 DirectDraw, 2 vue
+  DirectDraw2, 3 surface, 4 palette, 5 decoupeur, 6 DirectSound,
+  7 tampon de son, 8 DirectInput, 9 peripherique d'entree).
+  DirectDraw : affichage 640x480 en 256 couleurs ; en mode exclusif la
+  surface primaire est copiee telle quelle sur l'ecran (FlushScreen) et
+  sa palette devient la palette materielle. DirectSound : tampons
+  muets dont la position de lecture avance en temps reel (comme la
+  carte son muette). DirectInput : clavier (codes de balayage) et
+  souris (deplacements relatifs). }
+
+Const
+  DD_OK = 0;
+  E_NOTIMPL = LongInt($80004001);
+  E_NOINTERFACE = LongInt($80004002);
+  DDERR_INVALIDPARAMS = LongInt($80070057);
+  DDERR_INVALIDMODE = LongInt($88760078);
+  DDERR_NOTFOUND = LongInt($887600FF);
+  DDERR_WASSTILLDRAWING = LongInt($8876021C);
+
+Var
+  VtDD, VtDD2, VtSurf, VtPal, VtClip, VtDS, VtDSB, VtDI, VtDID : LongInt;
+  DDCoopWnd, DDCoopFl, DDBpp : LongInt;
+  DDPrimary : LongInt;
+
+{ Table de methodes : VtNew puis VtAdd('nom,nom,...') (listes courtes,
+  une chaine Pascal est limitee a 255 caracteres) }
+Var
+  VtCur, VtCnt : LongInt;
+
+Function VtNew : LongInt;
+Begin
+  VtCur := KAlloc(256);
+  VtCnt := 0;
+  VtNew := VtCur;
+End;
+
+Procedure VtAdd(S : String);
+Var P : LongInt; Nm : String;
+Begin
+  While S <> '' Do
+  Begin
+    P := Pos(',', S);
+    If P > 0 Then
+    Begin
+      Nm := Copy(S, 1, P - 1); Delete(S, 1, P);
+    End
+    Else
+    Begin
+      Nm := S; S := '';
+    End;
+    Nm := Trim(Nm);
+    MemL[0:VtCur + VtCnt * 4] := KernelExport(Nm);
+    If MemL[0:VtCur + VtCnt * 4] = 0 Then
+      KLog('DirectX : methode absente ' + Nm);
+    Inc(VtCnt);
+  End;
+End;
+
+Function ComNew(Vt, Kind, Size : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  O := KAlloc(Size);
+  FillMem(O, Size, 0);
+  MemL[0:O] := Vt;
+  MemL[0:O + 4] := 1;
+  MemL[0:O + 8] := Kind;
+  ComNew := O;
+End;
+
+Function GuidIs(P, D1 : LongInt) : Boolean;
+Begin
+  GuidIs := (P <> 0) And (MemL[0:P] = D1);
+End;
+
+{ Methodes non ecrites, selon le nombre d'arguments (This compris) }
+Function DXNI1(T : LongInt) : LongInt;
+Begin
+  DXNI1 := E_NOTIMPL;
+End;
+
+Function DXNI2(T, A : LongInt) : LongInt;
+Begin
+  DXNI2 := E_NOTIMPL;
+End;
+
+Function DXNI3(T, A, B : LongInt) : LongInt;
+Begin
+  DXNI3 := E_NOTIMPL;
+End;
+
+Function DXNI4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DXNI4 := E_NOTIMPL;
+End;
+
+Function DXNI5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DXNI5 := E_NOTIMPL;
+End;
+
+Function DXNI6(T, A, B, C, D, E : LongInt) : LongInt;
+Begin
+  DXNI6 := E_NOTIMPL;
+End;
+
+Function DXOK1(T : LongInt) : LongInt;
+Begin
+  DXOK1 := DD_OK;
+End;
+
+Function DXOK2(T, A : LongInt) : LongInt;
+Begin
+  DXOK2 := DD_OK;
+End;
+
+Function DXOK3(T, A, B : LongInt) : LongInt;
+Begin
+  DXOK3 := DD_OK;
+End;
+
+Function COMAddRef(T : LongInt) : LongInt;
+Begin
+  MemL[0:T + 4] := MemL[0:T + 4] + 1;
+  COMAddRef := MemL[0:T + 4];
+End;
+
+Procedure SurfFreeK(S : LongInt);
+Begin
+  If S = DDPrimary Then
+  Begin
+    DDPrimary := 0;
+    DDShow := False;
+    DefaultPalette;
+    MarkAll;
+  End
+  Else If MemL[0:S + 24] <> 0 Then KFree(MemL[0:S + 24]);
+  If MemL[0:S + 32] <> 0 Then SurfFreeK(MemL[0:S + 32]);
+End;
+
+Function COMRelease(T : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := MemL[0:T + 4] - 1;
+  MemL[0:T + 4] := R;
+  COMRelease := R;
+  If R > 0 Then Exit;
+  If MemL[0:T + 8] = 3 Then SurfFreeK(T);
+  If (MemL[0:T + 8] = 7) And (MemL[0:T + 16] <> 0) Then
+    KFree(MemL[0:T + 16]);
+  If MemL[0:T + 8] = 1 Then
+  Begin
+    DDShow := False;
+    DDCoopFl := 0;
+    MarkAll;
+  End;
+End;
+
+Function COMQIUnk(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  COMQIUnk := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidIs(Riid, 0) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    COMQIUnk := DD_OK;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectDraw                                                         }
+{ ------------------------------------------------------------------ }
+
+Procedure DDInitVt;
+Begin
+  If VtDD <> 0 Then Exit;
+  VtDD := VtNew;
+  VtAdd('DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,');
+  VtAdd('DD_CreatePalette,DD_CreateSurface,DXNI3,DD_EnumDisplayModes,');
+  VtAdd('DXNI5,DD_FlipToGDISurface,DD_GetCaps,DD_GetDisplayMode,DXNI3,');
+  VtAdd('DXNI2,DD_GetMonitorFrequency,DD_GetScanLine,DD_GetVBStatus,');
+  VtAdd('DXOK2,DD_RestoreDisplayMode,DD_SetCooperativeLevel,');
+  VtAdd('DD_SetDisplayMode,DD_WaitForVB');
+  VtDD2 := VtNew;
+  VtAdd('DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,');
+  VtAdd('DD_CreatePalette,DD_CreateSurface,DXNI3,DD_EnumDisplayModes,');
+  VtAdd('DXNI5,DD_FlipToGDISurface,DD_GetCaps,DD_GetDisplayMode,DXNI3,');
+  VtAdd('DXNI2,DD_GetMonitorFrequency,DD_GetScanLine,DD_GetVBStatus,');
+  VtAdd('DXOK2,DD_RestoreDisplayMode,DD_SetCooperativeLevel,');
+  VtAdd('DD_SetDisplayMode2,DD_WaitForVB,DD_GetAvailableVidMem');
+  VtSurf := VtNew;
+  VtAdd('SF_QI,COMAddRef,COMRelease,DXOK2,DXNI2,SF_Blt,');
+  VtAdd('DXNI4,SF_BltFast,DXOK3,DXNI3,DXNI4,SF_Flip,SF_GetAttachedSurface,');
+  VtAdd('DXOK2,SF_GetCaps,DXNI2,SF_GetColorKey,SF_GetDC,DXOK2,DXNI3,');
+  VtAdd('SF_GetPalette,SF_GetPixelFormat,SF_GetSurfaceDesc,DXOK3,DXOK1,');
+  VtAdd('SF_Lock,SF_ReleaseDC,DXOK1,SF_SetClipper,SF_SetColorKey,DXNI3,');
+  VtAdd('SF_SetPalette,SF_Unlock,DXNI6,DXNI2,DXNI3,SF_GetDDInterface,');
+  VtAdd('DXOK2,DXOK2,DXNI3');
+  VtPal := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,PL_GetCaps,');
+  VtAdd('PL_GetEntries,DXOK4,PL_SetEntries');
+  VtClip := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DXNI4,CL_GetHWnd,');
+  VtAdd('DXOK3,CL_IsClipListChanged,DXOK3,CL_SetHWnd');
+End;
+
+Function DXOK4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DXOK4 := DD_OK;
+End;
+
+Function DirectDrawCreate(Guid, PDD, Outer : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  DDInitVt;
+  DirectDrawCreate := DDERR_INVALIDPARAMS;
+  If PDD = 0 Then Exit;
+  O := ComNew(VtDD, 1, 32);
+  MemL[0:PDD] := O;
+  If DDW = 0 Then
+  Begin
+    DDW := 640; DDH := 480; DDBpp := 8;
+  End;
+  KLog('DirectDraw : objet cree');
+  DirectDrawCreate := DD_OK;
+End;
+
+Function DirectDrawEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Var S1, S2 : String;
+Begin
+  S1 := 'Pasdows 95 VESA' + #0;
+  S2 := 'display' + #0;
+  If W16Buf = 0 Then W16Buf := KAlloc(4096);
+  MemL[0:W16Buf] := 0;
+  MemL[0:W16Buf + 4] := LongInt(@S1[1]);
+  MemL[0:W16Buf + 8] := LongInt(@S2[1]);
+  MemL[0:W16Buf + 12] := Ctx;
+  CallStd(Cb, W16Buf, 4);
+  DirectDrawEnumerateA := DD_OK;
+End;
+
+Function DD_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  DD_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidIs(Riid, LongInt($6C14DB80)) Or GuidIs(Riid, 0) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    DD_QI := DD_OK;
+  End
+  Else If GuidIs(Riid, LongInt($B3A6F3E0)) Then
+  Begin
+    O := ComNew(VtDD2, 2, 32);
+    MemL[0:Ppv] := O;
+    DD_QI := DD_OK;
+  End;
+End;
+
+Function DD_SetCooperativeLevel(T, H, Fl : LongInt) : LongInt;
+Begin
+  DDCoopWnd := H;
+  DDCoopFl := Fl;
+  KLog('DirectDraw : niveau de cooperation ' + HexStr(Fl, 4));
+  DD_SetCooperativeLevel := DD_OK;
+End;
+
+Function DD_SetDisplayMode(T, W, H, Bpp : LongInt) : LongInt;
+Begin
+  DD_SetDisplayMode := DDERR_INVALIDMODE;
+  KLog('DirectDraw : mode ' + IntStr(W) + 'x' + IntStr(H) + 'x' +
+       IntStr(Bpp));
+  If (Bpp <> 8) Or (W > ScrW) Or (H > ScrH) Or (W <= 0) Or (H <= 0) Then
+    Exit;
+  DDW := W; DDH := H; DDBpp := 8;
+  DD_SetDisplayMode := DD_OK;
+End;
+
+Function DD_SetDisplayMode2(T, W, H, Bpp, Rate, Fl : LongInt) : LongInt;
+Begin
+  DD_SetDisplayMode2 := DD_SetDisplayMode(T, W, H, Bpp);
+End;
+
+Function DD_RestoreDisplayMode(T : LongInt) : LongInt;
+Begin
+  DDW := 640; DDH := 480;
+  DD_RestoreDisplayMode := DD_OK;
+End;
+
+Function DD_FlipToGDISurface(T : LongInt) : LongInt;
+Begin
+  DD_FlipToGDISurface := DD_OK;
+End;
+
+{ DDSURFACEDESC (108 octets) d'une surface 8 bits }
+Procedure DDFillDesc(P, W, H, Pitch, Bits, Caps : LongInt);
+Begin
+  FillMem(P, 108, 0);
+  MemL[0:P] := 108;
+  MemL[0:P + 4] := $100F Or $800;
+  MemL[0:P + 8] := H;
+  MemL[0:P + 12] := W;
+  MemL[0:P + 16] := Pitch;
+  MemL[0:P + 36] := Bits;
+  MemL[0:P + 72] := 32;
+  MemL[0:P + 76] := $60;
+  MemL[0:P + 84] := 8;
+  MemL[0:P + 104] := Caps;
+End;
+
+Function DD_EnumDisplayModes(T, Fl, PDesc, Ctx, Cb : LongInt) : LongInt;
+Var D, K, W, H : LongInt;
+Begin
+  D := KAlloc(128);
+  For K := 0 To 2 Do
+  Begin
+    Case K Of
+      0 : Begin W := 320; H := 200 End;
+      1 : Begin W := 320; H := 240 End;
+    Else
+      W := 640; H := 480;
+    End;
+    DDFillDesc(D, W, H, W, 0, 0);
+    MemL[0:D + 4] := $1006;
+    If W16Buf = 0 Then W16Buf := KAlloc(4096);
+    MemL[0:W16Buf] := D;
+    MemL[0:W16Buf + 4] := Ctx;
+    If CallStd(Cb, W16Buf, 2) = 0 Then Break;
+  End;
+  KFree(D);
+  DD_EnumDisplayModes := DD_OK;
+End;
+
+Function DD_GetDisplayMode(T, P : LongInt) : LongInt;
+Begin
+  DDFillDesc(P, DDW, DDH, DDW, 0, 0);
+  MemL[0:P + 4] := $100E;
+  DD_GetDisplayMode := DD_OK;
+End;
+
+{ DDCAPS : capacites materielles et logicielles }
+Function DD_GetCaps(T, PHal, PHel : LongInt) : LongInt;
+Var K, P, Sz : LongInt;
+Begin
+  For K := 0 To 1 Do
+  Begin
+    If K = 0 Then P := PHal Else P := PHel;
+    If P = 0 Then Continue;
+    Sz := MemL[0:P];
+    If (Sz <= 0) Or (Sz > 512) Then Sz := 316;
+    FillMem(P + 4, Sz - 4, 0);
+    MemL[0:P + 4] := $40 Or $200 Or $400000 Or $04000000 Or $08000000;
+    MemL[0:P + 16] := $200;
+    MemL[0:P + 28] := 4;
+    MemL[0:P + 60] := 4 * 1024 * 1024;
+    MemL[0:P + 64] := 4 * 1024 * 1024;
+    MemL[0:P + 72] := $240;
+  End;
+  DD_GetCaps := DD_OK;
+End;
+
+Function DD_GetMonitorFrequency(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 60;
+  DD_GetMonitorFrequency := DD_OK;
+End;
+
+Function DD_GetScanLine(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := (Ticks * 31) Mod 525;
+  DD_GetScanLine := DD_OK;
+End;
+
+Function DD_GetVBStatus(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := Ord(Ticks Mod 16 < 2);
+  DD_GetVBStatus := DD_OK;
+End;
+
+Function DD_WaitForVB(T, Fl, Ev : LongInt) : LongInt;
+Begin
+  KSleep(16 - Ticks Mod 16);
+  DD_WaitForVB := DD_OK;
+End;
+
+Function DD_GetAvailableVidMem(T, Caps, PTot, PFree : LongInt) : LongInt;
+Begin
+  If PTot <> 0 Then MemL[0:PTot] := 4 * 1024 * 1024;
+  If PFree <> 0 Then MemL[0:PFree] := 4 * 1024 * 1024;
+  DD_GetAvailableVidMem := DD_OK;
+End;
+
+{ Surface : +12 largeur, +16 hauteur, +20 pas, +24 bits, +28 capacites,
+  +32 tampon arriere attache, +36 palette, +40/+44 cle de couleur
+  source, +48 cle active, +52 DC, +56 decoupeur }
+Function SurfMake(W, H, Caps, Bits : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := ComNew(VtSurf, 3, 64);
+  MemL[0:S + 12] := W; MemL[0:S + 16] := H;
+  MemL[0:S + 20] := (W + 3) And Not 3;
+  If Bits = 0 Then
+  Begin
+    Bits := KAlloc(MemL[0:S + 20] * H + 16);
+    FillMem(Bits, MemL[0:S + 20] * H, 0);
+  End
+  Else MemL[0:S + 20] := W;
+  MemL[0:S + 24] := Bits;
+  MemL[0:S + 28] := Caps;
+  SurfMake := S;
+End;
+
+Function DD_CreateSurface(T, PDesc, PSurf, Outer : LongInt) : LongInt;
+Var Fl, Caps, W, H, S, B, N : LongInt;
+Begin
+  DD_CreateSurface := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PSurf = 0) Then Exit;
+  Fl := MemL[0:PDesc + 4];
+  Caps := 0;
+  If (Fl And 1) <> 0 Then Caps := MemL[0:PDesc + 104];
+  If (Caps And $200) <> 0 Then
+  Begin
+    { surface primaire : l'ecran }
+    If DDBuf = 0 Then DDBuf := KAlloc(ScrW * ScrH + 16);
+    FillMem(DDBuf, ScrW * ScrH, 0);
+    S := SurfMake(DDW, DDH, Caps Or $20 Or $4000, DDBuf);
+    DDPrimary := S;
+    If (DDCoopFl And $11) = $11 Then
+    Begin
+      DDShow := True;
+      DDDirty := True;
+    End;
+    N := 0;
+    If (Fl And $20) <> 0 Then N := MemL[0:PDesc + 20];
+    If N > 0 Then
+    Begin
+      B := SurfMake(DDW, DDH, (Caps And Not $220) Or 4 Or $4000, 0);
+      MemL[0:S + 32] := B;
+    End;
+    KLog('DirectDraw : surface primaire ' + IntStr(DDW) + 'x' +
+         IntStr(DDH) + ', ' + IntStr(N) + ' tampon(s) arriere');
+  End
+  Else
+  Begin
+    W := MemL[0:PDesc + 12]; H := MemL[0:PDesc + 8];
+    If ((Fl And 4) = 0) Or (W <= 0) Then W := DDW;
+    If ((Fl And 2) = 0) Or (H <= 0) Then H := DDH;
+    S := SurfMake(W, H, Caps Or $40, 0);
+    If (Fl And $10000) <> 0 Then
+    Begin
+      MemL[0:S + 40] := MemL[0:PDesc + 64];
+      MemL[0:S + 44] := MemL[0:PDesc + 68];
+      MemL[0:S + 48] := 1;
+    End;
+  End;
+  MemL[0:PSurf] := S;
+  DD_CreateSurface := DD_OK;
+End;
+
+Function DD_CreatePalette(T, Fl, PEnt, PPal, Outer : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := ComNew(VtPal, 4, 16 + 1024);
+  If PEnt <> 0 Then MoveMem(PEnt, P + 16, 1024);
+  MemL[0:P + 12] := Fl;
+  If PPal <> 0 Then MemL[0:PPal] := P;
+  DD_CreatePalette := DD_OK;
+End;
+
+Function DD_CreateClipper(T, Fl, PClip, Outer : LongInt) : LongInt;
+Begin
+  If PClip <> 0 Then MemL[0:PClip] := ComNew(VtClip, 5, 16);
+  DD_CreateClipper := DD_OK;
+End;
+
+{ Palette : +12 drapeaux, +16 entrees ; appliquee a l'ecran si elle est
+  celle de la surface primaire }
+Procedure PalApply(P : LongInt);
+Var I, E : LongInt;
+Begin
+  For I := 0 To 255 Do
+  Begin
+    E := P + 16 + I * 4;
+    SysPalSet(I, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
+  End;
+  Inc(PalVer);
+  DacAll;
+End;
+
+Function PL_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 4 Or $400;
+  PL_GetCaps := DD_OK;
+End;
+
+Function PL_GetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
+Begin
+  If (Start >= 0) And (Start + N <= 256) Then
+    MoveMem(T + 16 + Start * 4, PEnt, N * 4);
+  PL_GetEntries := DD_OK;
+End;
+
+Function PL_SetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
+Begin
+  PL_SetEntries := DDERR_INVALIDPARAMS;
+  If (Start < 0) Or (Start + N > 256) Then Exit;
+  MoveMem(PEnt, T + 16 + Start * 4, N * 4);
+  If (DDPrimary <> 0) And (MemL[0:DDPrimary + 36] = T) Then PalApply(T);
+  PL_SetEntries := DD_OK;
+End;
+
+Function CL_GetHWnd(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 12];
+  CL_GetHWnd := DD_OK;
+End;
+
+Function CL_IsClipListChanged(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  CL_IsClipListChanged := DD_OK;
+End;
+
+Function CL_SetHWnd(T, Fl, H : LongInt) : LongInt;
+Begin
+  MemL[0:T + 12] := H;
+  CL_SetHWnd := DD_OK;
+End;
+
+{ Surfaces }
+
+Function SF_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  SF_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidIs(Riid, 0) Or GuidIs(Riid, LongInt($6C14DB81)) Or
+     GuidIs(Riid, LongInt($57805885)) Or GuidIs(Riid, LongInt($DA044E00))
+  Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    SF_QI := DD_OK;
+  End;
+End;
+
+{ Mise a jour de l'ecran apres un changement de la surface primaire }
+Procedure SurfTouched(S : LongInt);
+Var R : TRect; Y : LongInt;
+Begin
+  If S <> DDPrimary Then Exit;
+  If DDShow Then
+  Begin
+    DDDirty := True;
+    Exit;
+  End;
+  { fenetre : la primaire est l'ecran, recopiee dans le tampon }
+  For Y := 0 To Min(DDH, ScrH) - 1 Do
+    MoveMem(DDBuf + Y * DDW, Back.Bits + Y * Back.Pitch, Min(DDW, ScrW));
+  SetR(R, 0, 0, ScrW, ScrH);
+  MarkDirty(R);
+End;
+
+Function SF_GetSurfaceDesc(T, P : LongInt) : LongInt;
+Begin
+  DDFillDesc(P, MemL[0:T + 12], MemL[0:T + 16], MemL[0:T + 20],
+             MemL[0:T + 24], MemL[0:T + 28]);
+  SF_GetSurfaceDesc := DD_OK;
+End;
+
+Function SF_Lock(T, PRect, PDesc, Fl, Ev : LongInt) : LongInt;
+Begin
+  SF_GetSurfaceDesc(T, PDesc);
+  If PRect <> 0 Then
+    MemL[0:PDesc + 36] := MemL[0:T + 24] + MemL[0:PRect + 4] *
+                          MemL[0:T + 20] + MemL[0:PRect];
+  SF_Lock := DD_OK;
+End;
+
+Function SF_Unlock(T, P : LongInt) : LongInt;
+Begin
+  SurfTouched(T);
+  SF_Unlock := DD_OK;
+End;
+
+Function SF_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 28];
+  SF_GetCaps := DD_OK;
+End;
+
+Function SF_GetPixelFormat(T, P : LongInt) : LongInt;
+Begin
+  FillMem(P, 32, 0);
+  MemL[0:P] := 32; MemL[0:P + 4] := $60; MemL[0:P + 12] := 8;
+  SF_GetPixelFormat := DD_OK;
+End;
+
+Function SF_GetAttachedSurface(T, PCaps, PSurf : LongInt) : LongInt;
+Begin
+  SF_GetAttachedSurface := DDERR_NOTFOUND;
+  If (PSurf = 0) Or (MemL[0:T + 32] = 0) Then Exit;
+  MemL[0:PSurf] := MemL[0:T + 32];
+  COMAddRef(MemL[0:T + 32]);
+  SF_GetAttachedSurface := DD_OK;
+End;
+
+{ Echange des tampons de la chaine primaire / arriere }
+Function SF_Flip(T, Ovr, Fl : LongInt) : LongInt;
+Var B, Tmp : LongInt;
+Begin
+  SF_Flip := DD_OK;
+  B := MemL[0:T + 32];
+  If B = 0 Then Exit;
+  If T = DDPrimary Then
+  Begin
+    { la primaire garde DDBuf : on y recopie le tampon arriere, qui
+      recoit l'ancienne image (echange) }
+    Tmp := KAlloc(DDW * DDH);
+    MoveMem(DDBuf, Tmp, DDW * DDH);
+    MoveMem(MemL[0:B + 24], DDBuf, DDW * DDH);
+    MoveMem(Tmp, MemL[0:B + 24], DDW * DDH);
+    KFree(Tmp);
+    SurfTouched(T);
+  End
+  Else
+  Begin
+    Tmp := MemL[0:T + 24];
+    MemL[0:T + 24] := MemL[0:B + 24];
+    MemL[0:B + 24] := Tmp;
+  End;
+End;
+
+Function SF_GetColorKey(T, Fl, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := MemL[0:T + 40]; MemL[0:P + 4] := MemL[0:T + 44];
+  End;
+  SF_GetColorKey := DD_OK;
+End;
+
+Function SF_SetColorKey(T, Fl, P : LongInt) : LongInt;
+Begin
+  If P = 0 Then MemL[0:T + 48] := 0
+  Else
+  Begin
+    MemL[0:T + 40] := MemL[0:P]; MemL[0:T + 44] := MemL[0:P + 4];
+    MemL[0:T + 48] := 1;
+  End;
+  SF_SetColorKey := DD_OK;
+End;
+
+Function SF_SetPalette(T, P : LongInt) : LongInt;
+Begin
+  MemL[0:T + 36] := P;
+  If P <> 0 Then COMAddRef(P);
+  If (T = DDPrimary) And (P <> 0) And DDShow Then
+  Begin
+    PalApply(P);
+    DDDirty := True;
+  End;
+  SF_SetPalette := DD_OK;
+End;
+
+Function SF_GetPalette(T, PP : LongInt) : LongInt;
+Begin
+  SF_GetPalette := DDERR_NOTFOUND;
+  If (PP = 0) Or (MemL[0:T + 36] = 0) Then Exit;
+  MemL[0:PP] := MemL[0:T + 36];
+  COMAddRef(MemL[0:T + 36]);
+  SF_GetPalette := DD_OK;
+End;
+
+Function SF_SetClipper(T, C : LongInt) : LongInt;
+Begin
+  MemL[0:T + 56] := C;
+  SF_SetClipper := DD_OK;
+End;
+
+Function SF_GetDDInterface(T, P : LongInt) : LongInt;
+Begin
+  SF_GetDDInterface := E_NOTIMPL;
+End;
+
+{ Transfert de SRect (src) vers DRect (dst) avec mise a l'echelle et
+  cle de couleur source eventuelle }
+Procedure SurfBlt(D, DL, DT, DR, DB, S, SL, ST, SR, SB : LongInt;
+                  Key : Boolean);
+Var X, Y, SX, SY, DW, DH, SW, SH, V, K, DA, SA : LongInt;
+Begin
+  If DL < 0 Then DL := 0;
+  If DT < 0 Then DT := 0;
+  If DR > MemL[0:D + 12] Then DR := MemL[0:D + 12];
+  If DB > MemL[0:D + 16] Then DB := MemL[0:D + 16];
+  DW := DR - DL; DH := DB - DT; SW := SR - SL; SH := SB - ST;
+  If (DW <= 0) Or (DH <= 0) Or (SW <= 0) Or (SH <= 0) Then Exit;
+  K := MemL[0:S + 40] And $FF;
+  For Y := 0 To DH - 1 Do
+  Begin
+    SY := ST + (Y * SH) Div DH;
+    If (SY < 0) Or (SY >= MemL[0:S + 16]) Then Continue;
+    DA := MemL[0:D + 24] + (DT + Y) * MemL[0:D + 20] + DL;
+    SA := MemL[0:S + 24] + SY * MemL[0:S + 20];
+    If (DW = SW) And Not Key And (SL >= 0) And
+       (SL + SW <= MemL[0:S + 12]) Then
+    Begin
+      MoveMem(SA + SL, DA, DW);
+      Continue;
+    End;
+    For X := 0 To DW - 1 Do
+    Begin
+      SX := SL + (X * SW) Div DW;
+      If (SX < 0) Or (SX >= MemL[0:S + 12]) Then Continue;
+      V := Mem[0:SA + SX];
+      If Key And (V = K) Then Continue;
+      Mem[0:DA + X] := V;
+    End;
+  End;
+End;
+
+Procedure RectOr(P, W, H : LongInt; Var L, T, R, B : LongInt);
+Begin
+  If P = 0 Then
+  Begin
+    L := 0; T := 0; R := W; B := H;
+  End
+  Else
+  Begin
+    L := MemL[0:P]; T := MemL[0:P + 4];
+    R := MemL[0:P + 8]; B := MemL[0:P + 12];
+  End;
+End;
+
+Function SF_Blt(T, PDst, Src, PSrc, Fl, Fx : LongInt) : LongInt;
+Var DL, DT, DR, DB, SL, ST, SR, SB, Y, C : LongInt;
+Begin
+  RectOr(PDst, MemL[0:T + 12], MemL[0:T + 16], DL, DT, DR, DB);
+  If (Fl And $400) <> 0 Then
+  Begin
+    { DDBLT_COLORFILL }
+    C := 0;
+    If Fx <> 0 Then C := MemL[0:Fx + 80] And $FF;
+    If DL < 0 Then DL := 0;
+    If DT < 0 Then DT := 0;
+    If DR > MemL[0:T + 12] Then DR := MemL[0:T + 12];
+    If DB > MemL[0:T + 16] Then DB := MemL[0:T + 16];
+    For Y := DT To DB - 1 Do
+      If DR > DL Then
+        FillMem(MemL[0:T + 24] + Y * MemL[0:T + 20] + DL, DR - DL, C);
+  End
+  Else If Src <> 0 Then
+  Begin
+    RectOr(PSrc, MemL[0:Src + 12], MemL[0:Src + 16], SL, ST, SR, SB);
+    SurfBlt(T, DL, DT, DR, DB, Src, SL, ST, SR, SB,
+            ((Fl And $8000) <> 0) And (MemL[0:Src + 48] <> 0));
+  End;
+  SurfTouched(T);
+  SF_Blt := DD_OK;
+End;
+
+Function SF_BltFast(T, X, Y, Src, PSrc, Trans : LongInt) : LongInt;
+Var SL, ST, SR, SB : LongInt;
+Begin
+  SF_BltFast := DDERR_INVALIDPARAMS;
+  If Src = 0 Then Exit;
+  RectOr(PSrc, MemL[0:Src + 12], MemL[0:Src + 16], SL, ST, SR, SB);
+  SurfBlt(T, X, Y, X + SR - SL, Y + SB - ST, Src, SL, ST, SR, SB,
+          ((Trans And 1) <> 0) And (MemL[0:Src + 48] <> 0));
+  SurfTouched(T);
+  SF_BltFast := DD_OK;
+End;
+
+{ Contexte GDI sur la surface : DIB 8 bits (haut en bas) partageant la
+  memoire de la surface, table de couleurs = palette systeme }
+Function SF_GetDC(T, PHdc : LongInt) : LongInt;
+Var B, Hdc, I : LongInt;
+Begin
+  SF_GetDC := DDERR_INVALIDPARAMS;
+  If PHdc = 0 Then Exit;
+  B := GdiNew(goBitmap);
+  If B < 0 Then Exit;
+  Gdis[B].I1 := MemL[0:T + 24];
+  Gdis[B].I2 := MemL[0:T + 12]; Gdis[B].I3 := MemL[0:T + 16];
+  Gdis[B].I4 := 8; Gdis[B].I5 := MemL[0:T + 20];
+  Gdis[B].I7 := 1 Or 2 Or 8;
+  Gdis[B].I6 := KAlloc(1024);
+  For I := 0 To 255 Do
+    MemL[0:Gdis[B].I6 + I * 4] := (SysPal[I * 3] Shl 16) Or
+      (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+  Hdc := CreateCompatibleDC(0);
+  SelectObject(Hdc, GdiH(B));
+  MemL[0:T + 52] := Hdc;
+  MemL[0:T + 60] := B;
+  MemL[0:PHdc] := Hdc;
+  SF_GetDC := DD_OK;
+End;
+
+Function SF_ReleaseDC(T, Hdc : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  DeleteDC(Hdc);
+  B := MemL[0:T + 60];
+  If (B >= 0) And (MemL[0:T + 52] = Hdc) Then
+  Begin
+    If Gdis[B].I6 <> 0 Then KFree(Gdis[B].I6);
+    Gdis[B].I6 := 0;
+    Gdis[B].Used := False;
+  End;
+  MemL[0:T + 52] := 0;
+  SurfTouched(T);
+  SF_ReleaseDC := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectSound (muet) : tampon +12 taille, +16 donnees, +20 lecture,  }
+{ +24 en boucle, +28 debut (Ticks), +32 octets/s, +36 position de    }
+{ depart, +40 WAVEFORMATEX, +60 volume, +64 balance, +68 frequence   }
+{ ------------------------------------------------------------------ }
+
+Procedure DSInitVt;
+Begin
+  If VtDS <> 0 Then Exit;
+  VtDS := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DS_CreateSoundBuffer,');
+  VtAdd('DS_GetCaps,DS_DuplicateSoundBuffer,DXOK3,DXOK1,DS_GetSpeakerConfig,');
+  VtAdd('DXOK2,DXOK2');
+  VtDSB := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DSB_GetCaps,');
+  VtAdd('DSB_GetCurrentPosition,DSB_GetFormat,DSB_GetVolume,DSB_GetPan,');
+  VtAdd('DSB_GetFrequency,DSB_GetStatus,DXOK3,DSB_Lock,DSB_Play,');
+  VtAdd('DSB_SetCurrentPosition,DXOK2,DSB_SetVolume,DSB_SetPan,');
+  VtAdd('DSB_SetFrequency,DSB_Stop,DXOK5,DXOK1');
+End;
+
+Function DXOK5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DXOK5 := DD_OK;
+End;
+
+Function DirectSoundCreate(Guid, PDS, Outer : LongInt) : LongInt;
+Begin
+  DSInitVt;
+  DirectSoundCreate := DDERR_INVALIDPARAMS;
+  If PDS = 0 Then Exit;
+  MemL[0:PDS] := ComNew(VtDS, 6, 32);
+  KLog('DirectSound : objet cree (son muet)');
+  DirectSoundCreate := DD_OK;
+End;
+
+Function DirectSoundEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Var S1, S2 : String;
+Begin
+  S1 := 'Pasdows Son' + #0;
+  S2 := '' + #0;
+  If W16Buf = 0 Then W16Buf := KAlloc(4096);
+  MemL[0:W16Buf] := 0;
+  MemL[0:W16Buf + 4] := LongInt(@S1[1]);
+  MemL[0:W16Buf + 8] := LongInt(@S2[1]);
+  MemL[0:W16Buf + 12] := Ctx;
+  CallStd(Cb, W16Buf, 4);
+  DirectSoundEnumerateA := DD_OK;
+End;
+
+Function DS_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    FillMem(P + 4, 92, 0);
+    MemL[0:P + 4] := $F0F;
+    MemL[0:P + 8] := 100; MemL[0:P + 12] := 100000;
+  End;
+  DS_GetCaps := DD_OK;
+End;
+
+Function DS_GetSpeakerConfig(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 4;
+  DS_GetSpeakerConfig := DD_OK;
+End;
+
+Function DS_CreateSoundBuffer(T, PDesc, PBuf, Outer : LongInt) : LongInt;
+Var B, Sz, Fmt : LongInt;
+Begin
+  DS_CreateSoundBuffer := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PBuf = 0) Then Exit;
+  B := ComNew(VtDSB, 7, 96);
+  Sz := MemL[0:PDesc + 8];
+  Fmt := MemL[0:PDesc + 16];
+  If (MemL[0:PDesc + 4] And 1) <> 0 Then Sz := 16384;
+  If Sz <= 0 Then Sz := 4096;
+  MemL[0:B + 12] := Sz;
+  MemL[0:B + 16] := KAlloc(Sz + 16);
+  FillMem(MemL[0:B + 16], Sz, 0);
+  MemL[0:B + 32] := 22050;
+  If Fmt <> 0 Then
+  Begin
+    MoveMem(Fmt, B + 40, 18);
+    If MemL[0:Fmt + 8] > 0 Then MemL[0:B + 32] := MemL[0:Fmt + 8];
+    MemL[0:B + 68] := MemL[0:Fmt + 4];
+  End;
+  MemL[0:PBuf] := B;
+  DS_CreateSoundBuffer := DD_OK;
+End;
+
+Function DS_DuplicateSoundBuffer(T, Src, PDst : LongInt) : LongInt;
+Begin
+  If (Src <> 0) And (PDst <> 0) Then
+  Begin
+    MemL[0:PDst] := Src;
+    COMAddRef(Src);
+  End;
+  DS_DuplicateSoundBuffer := DD_OK;
+End;
+
+{ Position de lecture courante d'un tampon (avance en temps reel) }
+Function DSBPos(B : LongInt) : LongInt;
+Var P, N : LongInt;
+Begin
+  P := MemL[0:B + 36];
+  If MemL[0:B + 20] <> 0 Then
+  Begin
+    N := ((Ticks - MemL[0:B + 28]) Div 10) * (MemL[0:B + 32] Div 100);
+    P := P + N;
+    If P >= MemL[0:B + 12] Then
+    Begin
+      If MemL[0:B + 24] <> 0 Then P := P Mod MemL[0:B + 12]
+      Else
+      Begin
+        P := 0;
+        MemL[0:B + 20] := 0;
+        MemL[0:B + 36] := 0;
+      End;
+    End;
+  End;
+  DSBPos := P;
+End;
+
+Function DSB_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P + 4] := 8; MemL[0:P + 8] := MemL[0:T + 12];
+    MemL[0:P + 12] := 0; MemL[0:P + 16] := 0;
+  End;
+  DSB_GetCaps := DD_OK;
+End;
+
+Function DSB_GetCurrentPosition(T, PPlay, PWrite : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := DSBPos(T);
+  If PPlay <> 0 Then MemL[0:PPlay] := P;
+  If PWrite <> 0 Then MemL[0:PWrite] := (P + 512) Mod MemL[0:T + 12];
+  DSB_GetCurrentPosition := DD_OK;
+End;
+
+Function DSB_GetFormat(T, P, N, PN : LongInt) : LongInt;
+Begin
+  If (P <> 0) And (N >= 16) Then MoveMem(T + 40, P, Min(N, 18));
+  If PN <> 0 Then MemL[0:PN] := 18;
+  DSB_GetFormat := DD_OK;
+End;
+
+Function DSB_GetVolume(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 60];
+  DSB_GetVolume := DD_OK;
+End;
+
+Function DSB_GetPan(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 64];
+  DSB_GetPan := DD_OK;
+End;
+
+Function DSB_GetFrequency(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 68];
+  DSB_GetFrequency := DD_OK;
+End;
+
+Function DSB_GetStatus(T, P : LongInt) : LongInt;
+Begin
+  DSBPos(T);
+  If P <> 0 Then
+    MemL[0:P] := Ord(MemL[0:T + 20] <> 0) Or (Ord(MemL[0:T + 24] <> 0) * 4);
+  DSB_GetStatus := DD_OK;
+End;
+
+Function DSB_Lock(T, Ofs, N, P1, N1, P2, N2, Fl : LongInt) : LongInt;
+Var Sz, A : LongInt;
+Begin
+  Sz := MemL[0:T + 12];
+  If (Fl And 1) <> 0 Then Ofs := (DSBPos(T) + 512) Mod Sz;
+  If (Fl And 2) <> 0 Then
+  Begin
+    Ofs := 0; N := Sz;
+  End;
+  If N > Sz Then N := Sz;
+  Ofs := Ofs Mod Sz;
+  A := Min(N, Sz - Ofs);
+  If P1 <> 0 Then MemL[0:P1] := MemL[0:T + 16] + Ofs;
+  If N1 <> 0 Then MemL[0:N1] := A;
+  If P2 <> 0 Then
+  Begin
+    If N > A Then MemL[0:P2] := MemL[0:T + 16] Else MemL[0:P2] := 0;
+  End;
+  If N2 <> 0 Then MemL[0:N2] := N - A;
+  DSB_Lock := DD_OK;
+End;
+
+Function DSB_Play(T, R1, R2, Fl : LongInt) : LongInt;
+Begin
+  If MemL[0:T + 20] = 0 Then
+  Begin
+    MemL[0:T + 28] := Ticks;
+    MemL[0:T + 20] := 1;
+  End;
+  MemL[0:T + 24] := Fl And 1;
+  DSB_Play := DD_OK;
+End;
+
+Function DSB_Stop(T : LongInt) : LongInt;
+Begin
+  MemL[0:T + 36] := DSBPos(T);
+  MemL[0:T + 20] := 0;
+  DSB_Stop := DD_OK;
+End;
+
+Function DSB_SetCurrentPosition(T, P : LongInt) : LongInt;
+Begin
+  MemL[0:T + 36] := P Mod MemL[0:T + 12];
+  MemL[0:T + 28] := Ticks;
+  DSB_SetCurrentPosition := DD_OK;
+End;
+
+Function DSB_SetVolume(T, V : LongInt) : LongInt;
+Begin
+  MemL[0:T + 60] := V;
+  DSB_SetVolume := DD_OK;
+End;
+
+Function DSB_SetPan(T, V : LongInt) : LongInt;
+Begin
+  MemL[0:T + 64] := V;
+  DSB_SetPan := DD_OK;
+End;
+
+Function DSB_SetFrequency(T, V : LongInt) : LongInt;
+Begin
+  MemL[0:T + 68] := V;
+  If V > 0 Then
+    MemL[0:T + 32] := V * MemW[0:T + 40 + 12];
+  DSB_SetFrequency := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectInput : peripherique +12 sorte (1 clavier, 2 souris)          }
+{ ------------------------------------------------------------------ }
+
+Procedure DIInitVt;
+Begin
+  If VtDI <> 0 Then Exit;
+  VtDI := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DI_CreateDevice,');
+  VtAdd('DI_EnumDevices,DI_GetDeviceStatus,DXOK3,DXOK3');
+  VtDID := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DID_GetCapabilities,');
+  VtAdd('DXOK4,DXNI3,DXOK3,DXOK1,DXOK1,DID_GetDeviceState,DID_GetDeviceData,');
+  VtAdd('DXOK2,DXOK2,DXOK3,DXNI4,DXNI2,DXOK3,DXOK4');
+End;
+
+Function DirectInputCreateA(Inst, Ver, PDI, Outer : LongInt) : LongInt;
+Begin
+  DIInitVt;
+  DirectInputCreateA := DDERR_INVALIDPARAMS;
+  If PDI = 0 Then Exit;
+  MemL[0:PDI] := ComNew(VtDI, 8, 32);
+  KLog('DirectInput : objet cree');
+  DirectInputCreateA := DD_OK;
+End;
+
+Function DI_CreateDevice(T, Guid, PDev, Outer : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  DI_CreateDevice := DDERR_NOTFOUND;
+  If (PDev = 0) Or (Guid = 0) Then Exit;
+  D := ComNew(VtDID, 9, 32);
+  If MemL[0:Guid] = LongInt($6F1D2B61) Then MemL[0:D + 12] := 1
+  Else If MemL[0:Guid] = LongInt($6F1D2B60) Then MemL[0:D + 12] := 2
+  Else Exit;
+  MemL[0:PDev] := D;
+  DI_CreateDevice := DD_OK;
+End;
+
+Function DI_EnumDevices(T, Typ, Cb, Ctx, Fl : LongInt) : LongInt;
+Begin
+  DI_EnumDevices := DD_OK;
+End;
+
+Function DI_GetDeviceStatus(T, Guid : LongInt) : LongInt;
+Begin
+  DI_GetDeviceStatus := DD_OK;
+End;
+
+Function DID_GetCapabilities(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    FillMem(P + 4, 40, 0);
+    MemL[0:P + 4] := 5;
+    If MemL[0:T + 12] = 1 Then
+    Begin
+      MemL[0:P + 8] := 3; MemL[0:P + 16] := 128;
+    End
+    Else
+    Begin
+      MemL[0:P + 8] := 2; MemL[0:P + 12] := 2; MemL[0:P + 16] := 3;
+    End;
+  End;
+  DID_GetCapabilities := DD_OK;
+End;
+
+Function DID_GetDeviceState(T, N, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If MemL[0:T + 12] = 1 Then
+  Begin
+    For I := 0 To Min(N, 256) - 1 Do
+    Begin
+      Mem[0:P + I] := ScanDown[I] Or ScanHit[I];
+      ScanHit[I] := 0;
+    End;
+  End
+  Else If N >= 16 Then
+  Begin
+    MemL[0:P] := DIMX; MemL[0:P + 4] := DIMY; MemL[0:P + 8] := 0;
+    DIMX := 0; DIMY := 0;
+    Mem[0:P + 12] := Ord((DIMBtn And 1) <> 0) * $80;
+    Mem[0:P + 13] := Ord((DIMBtn And 2) <> 0) * $80;
+    Mem[0:P + 14] := 0; Mem[0:P + 15] := 0;
+  End;
+  DID_GetDeviceState := DD_OK;
+End;
+
+Function DID_GetDeviceData(T, Sz, P, PN, Fl : LongInt) : LongInt;
+Begin
+  If PN <> 0 Then MemL[0:PN] := 0;
+  DID_GetDeviceData := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DSETUP.DLL : DirectX 3 est deja present dans Pasdows               }
+{ ------------------------------------------------------------------ }
+
+Function DirectXSetup(H, Root, Fl : LongInt) : LongInt;
+Begin
+  KLog('DirectXSetup : DirectX integre a Pasdows, rien a installer');
+  DirectXSetup := 0;
+End;
+
+Function DirectXSetupA(H, Root, Fl : LongInt) : LongInt;
+Begin
+  DirectXSetupA := 0;
+End;
+
+Function DirectXDeviceDriverSetup(H, Drv, Dir, Fl : LongInt) : LongInt;
+Begin
+  DirectXDeviceDriverSetup := 0;
+End;
+
+Function DirectXSetupGetVersion(PVer, PRev : LongInt) : LongInt;
+Begin
+  If PVer <> 0 Then MemL[0:PVer] := $00040004;
+  If PRev <> 0 Then MemL[0:PRev] := $00000044;
+  DirectXSetupGetVersion := 1;
+End;
+
+Function DirectXSetupSetCallback(Cb : LongInt) : LongInt;
+Begin
+  DirectXSetupSetCallback := 0;
+End;
+
+Function DirectXRegisterApplication(H, P : LongInt) : LongInt;
+Begin
+  DirectXRegisterApplication := 1;
+End;
+
+Function DirectXUnRegisterApplication(H, P : LongInt) : LongInt;
+Begin
+  DirectXUnRegisterApplication := 1;
+End;
+
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
 exports VideoForWindowsVersion,
+  DXNI1, DXNI2, DXNI3, DXNI4, DXNI5, DXNI6, DXOK1, DXOK2, DXOK3, COMAddRef,
+  COMRelease, COMQIUnk, DXOK4, DirectDrawCreate, DirectDrawEnumerateA, DD_QI,
+  DD_SetCooperativeLevel, DD_SetDisplayMode, DD_SetDisplayMode2,
+  DD_RestoreDisplayMode, DD_FlipToGDISurface, DD_EnumDisplayModes,
+  DD_GetDisplayMode, DD_GetCaps, DD_GetMonitorFrequency, DD_GetScanLine,
+  DD_GetVBStatus, DD_WaitForVB, DD_GetAvailableVidMem, DD_CreateSurface,
+  DD_CreatePalette, DD_CreateClipper, PL_GetCaps, PL_GetEntries,
+  PL_SetEntries, CL_GetHWnd, CL_IsClipListChanged, CL_SetHWnd, SF_QI,
+  SF_GetSurfaceDesc, SF_Lock, SF_Unlock, SF_GetCaps, SF_GetPixelFormat,
+  SF_GetAttachedSurface, SF_Flip, SF_GetColorKey, SF_SetColorKey,
+  SF_SetPalette, SF_GetPalette, SF_SetClipper, SF_GetDDInterface, SF_Blt,
+  SF_BltFast, SF_GetDC, SF_ReleaseDC, DXOK5, DirectSoundCreate,
+  DirectSoundEnumerateA, DS_GetCaps, DS_GetSpeakerConfig,
+  DS_CreateSoundBuffer, DS_DuplicateSoundBuffer, DSB_GetCaps,
+  DSB_GetCurrentPosition, DSB_GetFormat, DSB_GetVolume, DSB_GetPan,
+  DSB_GetFrequency, DSB_GetStatus, DSB_Lock, DSB_Play, DSB_Stop,
+  DSB_SetCurrentPosition, DSB_SetVolume, DSB_SetPan, DSB_SetFrequency,
+  DirectInputCreateA, DI_CreateDevice, DI_EnumDevices, DI_GetDeviceStatus,
+  DID_GetCapabilities, DID_GetDeviceState, DID_GetDeviceData, DirectXSetup,
+  DirectXSetupA, DirectXDeviceDriverSetup, DirectXSetupGetVersion,
+  DirectXSetupSetCallback, DirectXRegisterApplication,
+  DirectXUnRegisterApplication,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
