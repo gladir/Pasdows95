@@ -972,8 +972,8 @@ Type
     IntVal   : LongInt;      { valeur entiere (TK_INTEGER/CHAR)   }
     RealVal  : Real;         { valeur reelle (TK_REAL)            }
     RealKind : Integer;      { TK_REAL : 4 Single, 8 Double, 10 Extended (plus petit type exact, comme FPC) }
-    Line     : Integer;      { ligne source (1-base)              }
-    Col      : Integer;      { colonne source (1-base)            }
+    Line     : LongInt;      { ligne source (1-base)              }
+    Col      : LongInt;      { colonne source (1-base)            }
   End;
 
 Var
@@ -1023,7 +1023,7 @@ Function  D16Selected : Boolean; Forward;
 
 Const
   MAX_DATA   = {$IFDEF FPC}16384{$ELSE}128{$ENDIF};
-  MAX_TOKENS = {$IFDEF FPC}131072{$ELSE}4096{$ENDIF};
+  MAX_TOKENS = {$IFDEF FPC}300000{$ELSE}4096{$ENDIF};
   TOKENS_W32 = {$IFDEF FPC}16384{$ELSE}4096{$ENDIF};  { limite des autres cibles }
 
   { Prefixes de mangling pour les labels generes }
@@ -1736,6 +1736,72 @@ Begin
 End;
 
 { ------------------------------------------------------------ }
+{ LexLitTail : suite de segments #nn, #$nn et 'xxx' concatenes  }
+{ (ex. #0#27'abc'#8#9'def'#13'ghi')                              }
+{ ------------------------------------------------------------ }
+
+Procedure LexLitTail(Var S : TString);
+Var
+  V  : LongInt;
+  Ch : Char;
+Begin
+  While (LexColNo <= Length(LexLine)) And
+        ((LexLine[LexColNo] = '#') Or (LexLine[LexColNo] = '''')) Do
+  Begin
+    If LexLine[LexColNo] = '#' Then
+    Begin
+      Inc(LexColNo); { sauter '#' }
+      V := 0;
+      If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
+      Begin
+        Inc(LexColNo);
+        While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
+        Begin
+          V := V * 16 + HexVal(LexLine[LexColNo]);
+          Inc(LexColNo);
+        End;
+      End
+      Else
+      Begin
+        While (LexColNo <= Length(LexLine)) And
+              (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
+        Begin
+          V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
+          Inc(LexColNo);
+        End;
+      End;
+      If Length(S) < MAX_STR Then
+        S := S + Chr(V And $FF);
+    End
+    Else
+    Begin
+      Inc(LexColNo); { sauter la quote ouvrante }
+      While LexColNo <= Length(LexLine) Do
+      Begin
+        Ch := LexLine[LexColNo];
+        If Ch = '''' Then
+        Begin
+          Inc(LexColNo);
+          If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
+          Begin
+            If Length(S) < MAX_STR Then S := S + '''';
+            Inc(LexColNo);
+          End
+          Else
+            Break;
+        End
+        Else
+        Begin
+          If Length(S) < MAX_STR Then
+            S := S + Ch;
+          Inc(LexColNo);
+        End;
+      End;
+    End;
+  End;
+End;
+
+{ ------------------------------------------------------------ }
 { LexScanString : chaine Pascal entre apostrophes              }
 { Gere le doublement de quote : 'l''echo' -> l'echo            }
 { ------------------------------------------------------------ }
@@ -1772,60 +1838,8 @@ Begin
     End;
   End;
 
-  { Concatenation implicite : 'abc'#13#10'def' }
-  { Si suivi de #nn, concatener }
-  While (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '#') Do
-  Begin
-    Inc(LexColNo); { sauter '#' }
-    V := 0;
-    If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
-    Begin
-      Inc(LexColNo);
-      While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
-      Begin
-        V := V * 16 + HexVal(LexLine[LexColNo]);
-        Inc(LexColNo);
-      End;
-    End
-    Else
-    Begin
-      While (LexColNo <= Length(LexLine)) And
-            (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
-      Begin
-        V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
-        Inc(LexColNo);
-      End;
-    End;
-    If Length(S) < MAX_STR Then
-      S := S + Chr(V And $FF);
-
-    { Si encore suivi d une chaine 'xxx', concatener aussi }
-    If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-    Begin
-      Inc(LexColNo);
-      While LexColNo <= Length(LexLine) Do
-      Begin
-        Ch := LexLine[LexColNo];
-        If Ch = '''' Then
-        Begin
-          Inc(LexColNo);
-          If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-          Begin
-            If Length(S) < MAX_STR Then S := S + '''';
-            Inc(LexColNo);
-          End
-          Else
-            Break;
-        End
-        Else
-        Begin
-          If Length(S) < MAX_STR Then
-            S := S + Ch;
-          Inc(LexColNo);
-        End;
-      End;
-    End;
-  End;
+  { Concatenation implicite : 'abc'#13#10'def'#9'ghi'... }
+  LexLitTail(S);
 
   CurToken.Kind    := TK_STRING;
   CurToken.Val     := S;
@@ -1848,85 +1862,8 @@ Var
   Ch : Char;
 Begin
   S := '';
-  { Scanner une sequence de #nn segments et concatener }
-  While (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '#') Do
-  Begin
-    Inc(LexColNo); { sauter '#' }
-    V := 0;
-    If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
-    Begin
-      Inc(LexColNo); { sauter '$' }
-      While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
-      Begin
-        V := V * 16 + HexVal(LexLine[LexColNo]);
-        Inc(LexColNo);
-      End;
-    End
-    Else
-    Begin
-      While (LexColNo <= Length(LexLine)) And
-            (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
-      Begin
-        V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
-        Inc(LexColNo);
-      End;
-    End;
-    If Length(S) < MAX_STR Then
-      S := S + Chr(V And $FF);
-  End;
-
-  { Si suivi d une chaine 'xxx', concatener }
-  If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-  Begin
-    Inc(LexColNo); { sauter quote ouvrante }
-    While LexColNo <= Length(LexLine) Do
-    Begin
-      Ch := LexLine[LexColNo];
-      If Ch = '''' Then
-      Begin
-        Inc(LexColNo);
-        If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-        Begin
-          If Length(S) < MAX_STR Then S := S + '''';
-          Inc(LexColNo);
-        End
-        Else
-          Break;
-      End
-      Else
-      Begin
-        If Length(S) < MAX_STR Then
-          S := S + Ch;
-        Inc(LexColNo);
-      End;
-    End;
-    { Peut etre suivi d un autre #nn }
-    While (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '#') Do
-    Begin
-      Inc(LexColNo);
-      V := 0;
-      If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
-      Begin
-        Inc(LexColNo);
-        While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
-        Begin
-          V := V * 16 + HexVal(LexLine[LexColNo]);
-          Inc(LexColNo);
-        End;
-      End
-      Else
-      Begin
-        While (LexColNo <= Length(LexLine)) And
-              (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
-        Begin
-          V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
-          Inc(LexColNo);
-        End;
-      End;
-      If Length(S) < MAX_STR Then
-        S := S + Chr(V And $FF);
-    End;
-  End;
+  { Scanner une suite de segments #nn et 'xxx' et les concatener }
+  LexLitTail(S);
 
   { Si un seul caractere -> TK_CHAR, sinon TK_STRING }
   If Length(S) = 1 Then
@@ -3223,8 +3160,8 @@ Procedure TokenPoolAdd(Const T : TToken);
 Begin
   If TokenCount >= TokenPoolLimit Then
   Begin
-    WarnMsg('pool de tokens plein');
-    Exit;
+    FatalError('pool de tokens plein (' + IntToStr_(TokenPoolLimit) +
+               ' jetons) : source trop grand');
   End;
   TokenPool[TokenCount] := T;
   Inc(TokenCount);
@@ -14216,7 +14153,15 @@ Begin
             ParseExpr(PI);
             CoerceCharArray;
             If LastExprIsPascalStr Then
+              EmitInstr('INC EAX')
+            Else If TypeIsString(LastVarTypeIdx) Then
+            Begin
+              { chaine temporaire (STRBUF1 d une concatenation) : la copier
+                dans l anneau STRRING, sinon l evaluation de S l ecrase }
+              EmitInstr('MOV ESI,EAX');
+              EmitInstr('CALL ' + TP_RT_PFX + 'STRRET');
               EmitInstr('INC EAX');
+            End;
             EmitInstr('PUSH EAX');
             EPMatch(',');
             ParseExpr(PI);
@@ -18963,6 +18908,11 @@ Begin
     Up := StrUpperCase(TokenPool[EP].Val);
   ParsePrimaryInner(PI);
   If Up = '' Then Exit;
+  { une variable locale, un parametre ou une variable d une procedure
+    englobante masque tout sous-programme homonyme (meme une fonction
+    imbriquee d une autre procedure) : le type est deja pose }
+  If (PI >= 0) And ((FindLocal(PI, Up) >= 0) Or (FindParam(PI, Up) >= 0) Or
+     IsOuterVarName(PI, Up)) Then Exit;
   SI := SymFind(Up);
   If (SI < 0) Or (SymTab[SI].Kind <> SK_FUNC) Then Exit;
   If SymTab[SI].IsExternal Then
@@ -22136,6 +22086,7 @@ Var
   LblEnd  : TString;
   LblNext : TString;
   LblHit  : TString;
+  LblSkip : TString;
   Up      : TString;
   CaseVal : LongInt;
   RangeHi : LongInt;
@@ -22219,12 +22170,14 @@ Begin
       Begin
         Inc(EP);  { consommer .. }
         RangeHi := ConstTokExprAt(EP);
+        { hors de cette plage : essayer la valeur suivante de la branche }
+        LblSkip := LabelGen;
         EmitInstr('MOV EAX,DWORD PTR [ESP]');
         EmitInstr('CMP EAX,' + IntToStr_(CaseVal));
-        EmitInstr('JL ' + LblNext);
+        EmitInstr('JL ' + LblSkip);
         EmitInstr('CMP EAX,' + IntToStr_(RangeHi));
         EmitInstr('JLE ' + LblHit);
-        EmitInstr('JMP ' + LblNext);
+        EmitLabel(LblSkip);
       End
       Else
       Begin
@@ -28165,6 +28118,16 @@ Begin
     If ProcIntr[FI] And AsmNative Then
     Begin
       EmitInstr('PUSHAD');
+      If KrnVmm32 Then
+      Begin
+        { VMM32 : l interruption peut survenir dans du code 16 bits
+          (anneau 3) dont DS/ES n ont pas une base nulle }
+        EmitInstr('PUSH DS');
+        EmitInstr('PUSH ES');
+        EmitInstr('MOV AX,10h');
+        EmitInstr('MOV DS,AX');
+        EmitInstr('MOV ES,AX');
+      End;
       EmitInstr('CLD');
     End;
     { espace supplementaire : copies locales des parametres valeur chaine/agregat }
@@ -28245,6 +28208,11 @@ Begin
     Begin
       EmitInstr('MOV ESP,EBP');
       EmitInstr('POP EBP');
+      If KrnVmm32 Then
+      Begin
+        EmitInstr('POP ES');
+        EmitInstr('POP DS');
+      End;
       EmitInstr('POPAD');
       EmitInstr('IRETD');
     End
@@ -42111,6 +42079,26 @@ Begin
 End;
 
 { --- Resolution des fixups (code relatif + donnees absolues) --- }
+{ Reference a une variable ou un sous-programme jamais defini : le
+  source utilise un identificateur inconnu (erreur de compilation) }
+Var
+  BcUnresN : LongInt;
+  BcUnresList : TString;
+
+Procedure BcUnresolved(Const Lbl : TString);
+Var U : TString;
+Begin
+  U := '';
+  If Copy(Lbl, 1, Length(TP_VAR_PFX)) = TP_VAR_PFX Then
+    U := Copy(Lbl, Length(TP_VAR_PFX) + 1, 255)
+  Else If Copy(Lbl, 1, Length(TP_FUNC_PFX)) = TP_FUNC_PFX Then
+    U := Copy(Lbl, Length(TP_FUNC_PFX) + 1, 255);
+  If U = '' Then Exit;
+  If Pos(' ' + U + ' ', ' ' + BcUnresList + ' ') > 0 Then Exit;
+  Inc(BcUnresN);
+  If Length(BcUnresList) < 200 Then BcUnresList := BcUnresList + U + ' ';
+End;
+
 Procedure BcResolveFixups(DataVA: LongInt);
 Var
   I: LongInt;
@@ -42118,6 +42106,8 @@ Var
   Val: LongInt;
   Nm: TString;
 Begin
+  BcUnresN := 0;
+  BcUnresList := '';
   { Adresses dans la section .data (constantes typees : PChar, @variable, @procedure) }
   For I := 0 To BcDFixCnt - 1 Do
   Begin
@@ -42165,7 +42155,8 @@ Begin
           BcCode[FixOfs + 1] := Byte(Val Shr 8);
           BcCode[FixOfs + 2] := Byte(Val Shr 16);
           BcCode[FixOfs + 3] := Byte(Val Shr 24);
-        End;
+        End
+        Else BcUnresolved(BcFixups[I].LblName);
       End;
       BC_FIX_ABS32_DATA:
       Begin
@@ -42184,6 +42175,7 @@ Begin
           Else
           Begin
             Val := DataVA;
+            BcUnresolved(BcFixups[I].LblName);
           End;
         End;
         BcCode[FixOfs] := Byte(Val);
@@ -42213,6 +42205,8 @@ Begin
       End;
     End; { case }
   End;
+  If BcUnresN > 0 Then
+    FatalError('identificateur(s) inconnu(s) : ' + BcUnresList);
 End;
 
 { --- BcResolveFixups6502 : resoudre les fixups pour cibles 6502 (LE) --- }

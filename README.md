@@ -29,6 +29,9 @@ Pasdows 95 est un clone de Windows 95 écrit en Turbo Pascal / Free Pascal et co
 	<li>Lecture du CD-ROM ISO 9660 par l'INT 13h étendue du BIOS, options de <b>MSDOS.SYS</b> (<i>BootMenu</i>, <i>BootGUI</i>, <i>Logo</i>, <i>BootDelay</i>) et commandes <b>SET</b> de <b>AUTOEXEC.BAT</b>.</li>
 	<li>Démarrage normal : IO.SYS passe en VESA 640x480 en 256 couleurs, charge VMM32.VXD au-dessus du premier mégaoctet et passe en mode protégé 32 bits. Sans VMM32.VXD, avec moins de 16 Mo ou sans VESA (et en mode sans échec), IO.SYS garde son interface VGA 16 couleurs.</li>
 	<li><b>Programmes Windows 95</b> : chargeur PE (relocalisations, importations, ressources, DLL), tâches Win32 préemptives avec TIB et sauvegarde du coprocesseur, files de messages, fenêtres, classes, dialogues et contrôles (BUTTON, EDIT, LISTBOX, COMBOBOX, SCROLLBAR, STATIC), GDI avec palettes logiques, DIB et sections DIB, fichiers sur le CD-ROM (D:) et disque virtuel en mémoire (C:), minuteries multimédia et carte son muette (waveOut). Essayé avec un projecteur Macromedia Director 5 et son film, qui se déroule entièrement.</li>
+	<li><b>Programmes Windows 3.1</b> (Win16) : chargeur NE, segments de code en anneau 3 dans la LDT, passerelles d'appel vers l'API 16 bits de KERNEL, USER, GDI, SHELL, VER, LZEXPAND, TOOLHELP... (essayé avec un programme d'installation Microsoft ACME).</li>
+	<li><b>DirectX</b> (version 4.04.0068 annoncée) : objets COM de <b>DDRAW.DLL</b> (DirectDrawCreate, mode plein écran 320x200, 320x240 ou 640x480 en 256 couleurs, surface primaire et tampons arrière avec Flip, Lock/Unlock, Blt avec remplissage, couleur transparente et étirement, BltFast, GetDC pour écrire avec GDI, palettes et clippers), <b>DSOUND.DLL</b> (DirectSound muet dont les tampons avancent en temps réel), <b>DINPUT.DLL</b> (clavier et souris, GetDeviceState) et <b>DSETUP.DLL</b>. Exemple : <b>EXEMPLES/DDTEST.C</b> (DDTEST.EXE sur le CD-ROM).</li>
+	<li><b>Réseau TCP/IP</b> : pilote de carte <b>NE2000</b> (PCI RTL8029 ou ISA en 300h, comme la « NE2000 compatible » de Windows 95), pile TCP/IP écrite en Pascal (ARP, IP, ICMP, UDP, TCP avec retransmission et fenêtres, boucle locale 127.0.0.1), client <b>DHCP</b> et résolveur <b>DNS</b>. Les programmes utilisent <b>WSOCK32.DLL</b> / <b>WS2_32.DLL</b> (Winsock 1.1 par nom ou par ordinal : socket, connect, bind, listen, accept, send, recv, sendto, recvfrom, select, ioctlsocket, gethostbyname, WSAAsyncSelect...) et <b>ICMP.DLL</b> (IcmpSendEcho). Dans Pasdows : <i>Démarrer, Paramètres, Réseau (TCP/IP)</i> ou <i>Exécuter</i> <b>winipcfg</b> affiche la configuration IP, <b>ping</b> <i>hôte</i> envoie des échos ICMP. Exemple : <b>EXEMPLES/NETTEST.C</b> (NETTEST.EXE sur le CD-ROM : TCP et UDP locaux, ping, DNS, HTTP).</li>
 	<li>Interface graphique (palette de Windows 95) : écran d'accueil, bureau et icônes (dont les .EXE du CD-ROM), barre des tâches avec horloge, menu Démarrer et sous-menus, fenêtres en relief déplaçables, boutons Réduire / Agrandir / Fermer, souris PS/2 et clavier.</li>
 	<li>Applications : Poste de travail et Explorateur (navigation sur le CD-ROM), Bloc-notes, Calculatrice, Paint, Invite MS-DOS (CLS, DATE, DIR, ECHO, EXIT, HELP, MEM, SET, TIME, TYPE, VER, VOL, WIN...), Panneau de configuration (Affichage, Date/Heure, Paramètres régionaux, Système), Corbeille, Aide, Exécuter, À propos, Bienvenue.</li>
 	<li>Arrêter Pasdows : arrêt de l'ordinateur (APM), redémarrage ou redémarrage en mode MS-DOS (texte 80x25, <b>EXIT</b> ou <b>WIN</b> pour revenir).</li>
@@ -58,8 +61,10 @@ cd KERNEL
 ```
 
 ```bash
-qemu-system-i386 -m 64 -cdrom IMAGE/PASDOWS.ISO -boot d
+qemu-system-i386 -m 64 -cdrom IMAGE/PASDOWS.ISO -boot d -nic user,model=ne2k_pci
 ```
+
+L'option <b>-nic user,model=ne2k_pci</b> donne à Pasdows une carte réseau NE2000 (qemu fournit l'adresse IP par DHCP ; l'hôte est joignable en 10.0.2.2). Sans elle, TCP/IP ne fonctionne qu'en boucle locale.
 
 Pour exécuter un programme Windows 95, copiez-le (avec ses fichiers de données) dans <i>IMAGE/CDROM</i>, relancez BUILD, puis double-cliquez son icône sur le bureau de Pasdows.
 

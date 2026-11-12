@@ -86,7 +86,7 @@ Const
   { Tables }
   MaxWnd      = 256;
   MaxClass    = 64;
-  MaxGdi      = 2048;
+  MaxGdi      = 1024;
   MaxKObj     = 256;
   MaxThread   = 16;
   MaxQueue    = 256;
@@ -289,8 +289,9 @@ End;
 
 Function Trim(S : String) : String;
 Begin
-  While (Length(S) > 0) And (S[1] = ' ') Do Delete(S, 1, 1);
-  While (Length(S) > 0) And (S[Length(S)] = ' ') Do
+  { espaces, tabulations et autres caracteres de controle }
+  While (Length(S) > 0) And (S[1] <= ' ') Do Delete(S, 1, 1);
+  While (Length(S) > 0) And (S[Length(S)] <= ' ') Do
     Delete(S, Length(S), 1);
   Trim := S;
 End;
@@ -550,7 +551,7 @@ End;
 { ==================================================================== }
 
 Var
-  Gdt      : Array[0..9] Of LongInt;
+  Gdt      : Array[0..17] Of LongInt;
   GdtPtr   : TDescPtr;
   Idt      : Array[0..255] Of TGate;
   IdtPtr   : TDescPtr;
@@ -565,6 +566,15 @@ Var
   MouHead, MouTail : LongInt;
   { horloge temps reel }
   RtcYear, RtcMonth, RtcDay, RtcHour, RtcMin, RtcSec, RtcDow : LongInt;
+  { DirectInput : etat des touches par code de balayage (E0 : +80h),
+    deplacements et boutons de la souris depuis la derniere lecture }
+  ScanDown : Array[0..255] Of Byte;
+  ScanE0 : Boolean;
+  ScanHit : Array[0..255] Of Byte;
+  DIMX, DIMY, DIMBtn : LongInt;
+  { DirectDraw : surface primaire affichee en plein ecran (exclusif) }
+  DDShow, DDDirty : Boolean;
+  DDBuf, DDW, DDH : LongInt;
 
 Procedure SetGate(N, Addr : LongInt);
 Begin
@@ -587,13 +597,15 @@ Begin
 End;
 
 Procedure InitGdt;
+Var I : LongInt;
 Begin
   Gdt[0] := 0;          Gdt[1] := 0;
   Gdt[2] := $0000FFFF;  Gdt[3] := $00CF9A00;
   Gdt[4] := $0000FFFF;  Gdt[5] := $00CF9200;
   Gdt[6] := $0000FFFF;  Gdt[7] := $00CF9200;
   Gdt[8] := 0;          Gdt[9] := 0;
-  GdtPtr.Limit := 5 * 8 - 1;
+  For I := 10 To 17 Do Gdt[I] := 0;
+  GdtPtr.Limit := 9 * 8 - 1;
   GdtPtr.Base := LongInt(@Gdt);
   asm
     lgdt GdtPtr
@@ -662,6 +674,16 @@ Procedure IrqKeyboard; Interrupt;
 Var B, N : LongInt;
 Begin
   B := Port[$60];
+  { etat DirectInput des touches, a l'instant de l'interruption }
+  If B = $E0 Then ScanE0 := True
+  Else
+  Begin
+    N := (B And $7F) + Ord(ScanE0) * $80;
+    ScanDown[N] := Ord((B And $80) = 0) * $80;
+    { appui memorise jusqu'a la prochaine lecture de l'etat }
+    If (B And $80) = 0 Then ScanHit[N] := $80;
+    ScanE0 := False;
+  End;
   N := (KbTail + 1) And 255;
   If N <> KbHead Then
   Begin
@@ -711,7 +733,7 @@ End;
 Procedure InitPic;
 Begin
   Port[$20] := $11; Port[$A0] := $11;
-  Port[$21] := $20; Port[$A1] := $28;
+  Port[$21] := $50; Port[$A1] := $58;
   Port[$21] := $04; Port[$A1] := $02;
   Port[$21] := $01; Port[$A1] := $01;
   Port[$21] := $F8; Port[$A1] := $FF;
@@ -730,11 +752,13 @@ Begin
   SetGate(13, LongInt(@Exc0D)); SetGate(14, LongInt(@Exc0E));
   SetGate(16, LongInt(@Exc10)); SetGate(17, LongInt(@Exc11));
   SetGate(19, LongInt(@Exc13));
-  For I := $20 To $27 Do SetGate(I, LongInt(@IrqMaster));
-  For I := $28 To $2F Do SetGate(I, LongInt(@IrqSlave));
-  SetGate($20, LongInt(@IrqTimer));
-  SetGate($21, LongInt(@IrqKeyboard));
-  SetGate($2C, LongInt(@IrqMouse));
+  { IRQ en 50h-5Fh (comme Windows 95) : 20h-2Fh restent aux appels
+    logiciels des programmes 16 bits (INT 21h, INT 2Fh, INT 31h) }
+  For I := $50 To $57 Do SetGate(I, LongInt(@IrqMaster));
+  For I := $58 To $5F Do SetGate(I, LongInt(@IrqSlave));
+  SetGate($50, LongInt(@IrqTimer));
+  SetGate($51, LongInt(@IrqKeyboard));
+  SetGate($5C, LongInt(@IrqMouse));
   IdtPtr.Limit := 256 * 8 - 1;
   IdtPtr.Base := LongInt(@Idt);
   asm
@@ -935,6 +959,7 @@ Var
   RootLba, RootSize : LongInt;
   VolLabel  : String[32];
   KObjs     : Array[0..MaxKObj - 1] Of TKObj;
+  KObjOwner : Array[0..MaxKObj - 1] Of LongInt;
   RamFiles  : Array[0..MaxRam - 1] Of TRamFile;
   CurDirS   : String[127];
   LastErr0  : LongInt;
@@ -1227,6 +1252,7 @@ Begin
       KObjs[I].F1 := 0; KObjs[I].F2 := 0; KObjs[I].F3 := 0;
       KObjs[I].F4 := 0; KObjs[I].F5 := 0; KObjs[I].F6 := 0;
       KObjs[I].Name := ''; KObjs[I].Mask := '';
+      KObjOwner[I] := HeapOwner;
       KObjNew := I;
       Exit;
     End;
@@ -1320,10 +1346,15 @@ End;
 
 { Repertoires fixes du disque C: }
 Function IsCDir(Path : String) : Boolean;
+Var I : LongInt;
 Begin
   IsCDir := (Path = 'C:\') Or (Path = 'C:\WINDOWS') Or
             (Path = 'C:\WINDOWS\SYSTEM') Or (Path = 'C:\TEMP') Or
             (Path = 'C:\WINDOWS\TEMP');
+  { repertoires crees (entrees d'attribut 10h du disque en memoire) }
+  For I := 0 To MaxRam - 1 Do
+    If RamFiles[I].Used And (RamFiles[I].Attr = $10) And
+       (RamFiles[I].Path = Path) Then IsCDir := True;
 End;
 
 Function RamFind(Path : String) : LongInt;
@@ -2410,8 +2441,18 @@ End;
 
 { Composer la zone modifiee et l'afficher }
 Procedure FlushScreen;
-Var R, C, I : TRect;
+Var R, C, I : TRect; Y : LongInt;
 Begin
+  { DirectDraw en mode exclusif : la surface primaire occupe l'ecran }
+  If DDShow Then
+  Begin
+    If DDDirty Then
+      For Y := 0 To Min(DDH, ScrH) - 1 Do
+        MoveMem(DDBuf + Y * DDW, Lfb + Y * LfbPitch, Min(DDW, ScrW));
+    DDDirty := False;
+    SetR(Dirty, 0, 0, 0, 0);
+    Exit;
+  End;
   If (Dirty.L >= Dirty.R) Or (Dirty.T >= Dirty.B) Then Exit;
   R := Dirty;
   SetR(Dirty, 0, 0, 0, 0);
@@ -2474,6 +2515,12 @@ Var
   MsgQ     : Array[0..MaxThread * MaxQueue - 1] Of TMsgRec;
   CurT     : LongInt;
   FpuArea  : Array[0..MaxThread * 112 - 1] Of Byte;
+  { par tache : pile de l'anneau 0 pour le code 16 bits (TSS.ESP0),
+    proprietaire des blocs memoire (1 Win32, 2 Win16), tache Win16 }
+  ThrEsp0  : Array[0..MaxThread - 1] Of LongInt;
+  ThrOwner : Array[0..MaxThread - 1] Of LongInt;
+  ThrW16   : Array[0..MaxThread - 1] Of Boolean;
+  TssBase  : LongInt;
   SwSave   : LongInt;
   SwNew    : LongInt;
   NextTid  : LongInt;
@@ -2569,11 +2616,12 @@ Begin
   SwSave := LongInt(@Threads[CurT].Esp);
   SwNew := Threads[N].Esp;
   CurT := N;
-  HeapOwner := Ord(Threads[N].IsApp);
+  HeapOwner := ThrOwner[N];
+  If TssBase <> 0 Then MemL[0:TssBase + 4] := ThrEsp0[N];
   ThreadSetFs(N);
   SliceStart := Ticks;
   SwitchCtx;
-  HeapOwner := Ord(Threads[CurT].IsApp);
+  HeapOwner := ThrOwner[CurT];
   A := LongInt(@FpuArea) + CurT * 112;
   asm
     mov eax,A
@@ -2593,8 +2641,10 @@ Begin
   end;
   If (CurT <= 0) Or (Ticks - SliceStart < 20) Then Exit;
   If Not Threads[CurT].IsApp Then Exit;
-  Eip := MemL[0:F + 36];
-  If (Eip >= KImgLo) And (Eip < KImgHi) Then Exit;
+  Eip := MemL[0:F + 44];
+  { code 16 bits (anneau 3) : toujours preemptible }
+  If (MemL[0:F + 48] And 3) <> 3 Then
+    If (Eip >= KImgLo) And (Eip < KImgHi) Then Exit;
   KSchedule;
 End;
 
@@ -2683,6 +2733,9 @@ Begin
   Threads[T].Param := Param;
   Threads[T].ExitCode := 259;
   Threads[T].IsApp := IsApp;
+  ThrOwner[T] := Ord(IsApp);
+  ThrW16[T] := False;
+  ThrEsp0[T] := (Threads[T].Stack + StackSz - 64) And Not 15;
   Threads[T].PaintReq := False;
   Threads[T].KObj := KObjNew(koThread);
   If Threads[T].KObj >= 0 Then KObjs[Threads[T].KObj].F1 := T;
@@ -2894,6 +2947,7 @@ End;
   boites de dialogue...) ont une sorte interne (IKind). }
 
 Const
+  WS_OVERLAPPED = 0;
   WS_POPUP = LongInt($80000000); WS_CHILD = $40000000;
   WS_MINIMIZE = $20000000; WS_VISIBLE = $10000000; WS_DISABLED = $08000000;
   WS_MAXIMIZE = $01000000; WS_CAPTION = $00C00000; WS_BORDER = $00800000;
@@ -3819,10 +3873,12 @@ End;
 
 Procedure InitKeyTables;
 Begin
-  KeyLo := #0#27'1234567890-='#8#9'qwertyuiop[]'#13#0 +
-           'asdfghjkl;''`'#0'\zxcvbnm,./'#0'*'#0' ';
-  KeyHi := #0#27'!@#$%^&*()_+'#8#9'QWERTYUIOP{}'#13#0 +
-           'ASDFGHJKL:"~'#0'|ZXCVBNM<>?'#0'*'#0' ';
+  { #1 : touche sans caractere (WPC concatene les chaines comme des
+    PChar : un #0 couperait la chaine) }
+  KeyLo := #1#27'1234567890-='#8#9'qwertyuiop[]'#13#1 +
+           'asdfghjkl;''`'#1'\zxcvbnm,./'#1'*'#1' ';
+  KeyHi := #1#27'!@#$%^&*()_+'#8#9'QWERTYUIOP{}'#13#1 +
+           'ASDFGHJKL:"~'#1'|ZXCVBNM<>?'#1'*'#1' ';
 End;
 
 Function ScanToVk(Sc : LongInt; Ext : Boolean) : LongInt;
@@ -3869,7 +3925,7 @@ Begin
   Begin
     If Sh Then C := KeyLo[Sc + 1] Else C := KeyHi[Sc + 1];
   End;
-  ScanToChar := Ord(C);
+  If C <> #1 Then ScanToChar := Ord(C);
 End;
 
 { ------------------------------------------------------------------ }
@@ -4183,6 +4239,7 @@ Begin
     Dx := MouQDx[MouHead]; Dy := MouQDy[MouHead]; Bt := MouQBtn[MouHead];
     MouHead := (MouHead + 1) And 255;
     NX := NX + Dx; NY := NY + Dy;
+    DIMX := DIMX + Dx; DIMY := DIMY + Dy; DIMBtn := Bt;
     If NX < 0 Then NX := 0;
     If NY < 0 Then NY := 0;
     If NX > ScrW - 1 Then NX := ScrW - 1;
@@ -4300,7 +4357,8 @@ Const
   mnStart = 1; mnPrograms = 2; mnDocs = 3; mnSettings = 4;
   cmNone = 0; cmExplorer = 1; cmComputer = 2; cmNotepad = 3; cmHelp = 4;
   cmRun = 5; cmAbout = 6; cmShutdown = 7; cmReadme = 8; cmRecycle = 9;
-  cmSafeMode = 10; cmDosMode = 11; cmDocBase = 100; cmExeBase = 200;
+  cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12;
+  cmDocBase = 100; cmExeBase = 200;
   MaxDesk = 12;
 
 Var
@@ -4322,6 +4380,8 @@ Var
 
 Function RunExe(Path, Args : String) : Boolean; Forward;
 Procedure KCommand(Cmd : LongInt); Forward;
+Procedure NetConfigBox; Forward;
+Function NetRunCmd(S : String) : Boolean; Forward;
 
 Function TxtOk : String;
 Begin
@@ -4676,7 +4736,7 @@ Begin
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 3 + ExeCnt;
-    mnSettings : MenuCount := 2;
+    mnSettings : MenuCount := 3;
     mnDocs :
     Begin
       N := 0;
@@ -4761,6 +4821,13 @@ Begin
                'Abgesicherter Modus', 'Modalit'#133' provvisoria',
                'Modo a prueba de fallos');
         Cmd := cmSafeMode; Icon := icDisplay;
+      End
+      Else If I = 2 Then
+      Begin
+        T := L('R'#130'seau (TCP/IP)...', 'Network (TCP/IP)...',
+               'Netzwerk (TCP/IP)...', 'Rete (TCP/IP)...',
+               'Red (TCP/IP)...');
+        Cmd := cmNetwork; Icon := icComputer;
       End
       Else
       Begin
@@ -5613,7 +5680,7 @@ Begin
     S := Trim(Wnds[W].KS);
     DestroyW(W);
     If (B = 0) And (S <> '') Then
-      If Not RunExe(S, '') Then
+      If Not NetRunCmd(S) And Not RunExe(S, '') Then
         MsgBoxOpen(L('Ex'#130'cuter', 'Run', 'Ausf'#129'hren', 'Esegui',
           'Ejecutar'),
           L('Impossible de trouver '#174' ', 'Cannot find "', '"',
@@ -5788,6 +5855,7 @@ Begin
       ShowW(W, True, True);
     End;
     cmNotepad : NoteOpen('');
+    cmNetwork : NetConfigBox;
     cmReadme : NoteOpen('D:\LISEZMOI.TXT');
     cmRecycle :
       MsgBoxOpen(L('Corbeille', 'Recycle Bin', 'Papierkorb', 'Cestino',
@@ -6336,13 +6404,13 @@ Begin
   V := Vec And 255;
   If Vec >= 256 Then
   Begin
-    Err := MemL[0:Frame + 36];
-    Eip := MemL[0:Frame + 40];
+    Err := MemL[0:Frame + 44];
+    Eip := MemL[0:Frame + 48];
   End
   Else
   Begin
     Err := 0;
-    Eip := MemL[0:Frame + 36];
+    Eip := MemL[0:Frame + 44];
   End;
   Case V Of
     0 : Nm := 'Division par zero';
@@ -6353,18 +6421,20 @@ Begin
   Else
     Nm := 'Exception ' + IntStr(V);
   End;
-  S := Nm + ' EIP=' + HexStr(Eip, 8) + ' ERR=' + HexStr(Err, 4) +
-       ' EAX=' + HexStr(MemL[0:Frame + 32], 8) + ' EBX=' +
-       HexStr(MemL[0:Frame + 20], 8) + ' ECX=' + HexStr(MemL[0:Frame + 28], 8)
-       + ' EDX=' + HexStr(MemL[0:Frame + 24], 8) + ' ESI=' +
-       HexStr(MemL[0:Frame + 8], 8) + ' EDI=' + HexStr(MemL[0:Frame + 4], 8)
-       + ' EBP=' + HexStr(MemL[0:Frame], 8) + ' ESP=' +
-       HexStr(Frame + 40 + 4 * Ord(Vec >= 256), 8);
+  S := Nm + ' EIP=' + HexStr(Eip, 8) + ' CS=' +
+       HexStr(MemL[0:Frame + 48 + 4 * Ord(Vec >= 256)], 4)
+       + ' ERR=' + HexStr(Err, 4) +
+       ' EAX=' + HexStr(MemL[0:Frame + 40], 8) + ' EBX=' +
+       HexStr(MemL[0:Frame + 28], 8) + ' ECX=' + HexStr(MemL[0:Frame + 36], 8)
+       + ' EDX=' + HexStr(MemL[0:Frame + 32], 8) + ' ESI=' +
+       HexStr(MemL[0:Frame + 16], 8) + ' EDI=' + HexStr(MemL[0:Frame + 12], 8)
+       + ' EBP=' + HexStr(MemL[0:Frame + 20], 8) + ' ESP=' +
+       HexStr(Frame + 56 + 4 * Ord(Vec >= 256), 8);
   KLog('FAUTE (tache ' + IntStr(CurT) + ') ' + S);
-  X := Frame + 40 + 4 * Ord(Vec >= 256);
-  S := 'Pile :';
-  For V := 0 To 11 Do S := S + ' ' + HexStr(MemL[0:X + V * 4], 8);
-  KLog(S);
+  X := Frame + 56 + 4 * Ord(Vec >= 256);
+  Nm := 'Pile :';
+  For V := 0 To 11 Do Nm := Nm + ' ' + HexStr(MemL[0:X + V * 4], 8);
+  KLog(Nm);
   V := Vec And 255;
   HeapOwner := 0;
   If (CurT > 0) And Threads[CurT].IsApp Then
@@ -7138,6 +7208,59 @@ Begin
   DeleteFileA := 1;
 End;
 
+Function CreateDirectoryA(PName, Sec : LongInt) : LongInt;
+Var S : String; R, Attr, Size, Time, Lba, Ram : LongInt;
+Begin
+  CreateDirectoryA := 0;
+  S := FullPath(PStr(PName));
+  If Length(S) > 3 Then
+    If S[Length(S)] = '\' Then S := Copy(S, 1, Length(S) - 1);
+  If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
+  Begin
+    SetErr(183);
+    Exit;
+  End;
+  If (Copy(S, 1, 2) <> 'C:') Then
+  Begin
+    SetErr(ErrAccessDenied);
+    Exit;
+  End;
+  If Not IsCDir(ParentDir(S)) Then
+  Begin
+    SetErr(ErrPathNotFound);
+    Exit;
+  End;
+  R := RamNew(S);
+  If R < 0 Then
+  Begin
+    SetErr(4);
+    Exit;
+  End;
+  RamFiles[R].Attr := $10;
+  CreateDirectoryA := 1;
+End;
+
+Function RemoveDirectoryA(PName : LongInt) : LongInt;
+Var S : String; R, I : LongInt;
+Begin
+  RemoveDirectoryA := 0;
+  S := FullPath(PStr(PName));
+  R := RamFind(S);
+  If (R < 0) Or (RamFiles[R].Attr <> $10) Then
+  Begin
+    SetErr(ErrPathNotFound);
+    Exit;
+  End;
+  For I := 0 To MaxRam - 1 Do
+    If RamFiles[I].Used And (ParentDir(RamFiles[I].Path) = S) Then
+    Begin
+      SetErr(145);
+      Exit;
+    End;
+  RamFiles[R].Used := False;
+  RemoveDirectoryA := 1;
+End;
+
 Function MoveFileA(PSrc, PDst : LongInt) : LongInt;
 Var R : LongInt;
 Begin
@@ -7247,12 +7370,26 @@ End;
 
 Function GetVolumeInformationA(PRoot, PVol, VolSize, PSerial, PMaxComp,
   PFlags, PFs, FsSize : LongInt) : LongInt;
+Var D : String;
 Begin
-  If PVol <> 0 Then PutPStr(PVol, VolLabel, VolSize);
-  If PSerial <> 0 Then MemL[0:PSerial] := $19950824;
-  If PMaxComp <> 0 Then MemL[0:PMaxComp] := 12;
-  If PFlags <> 0 Then MemL[0:PFlags] := 0;
-  If PFs <> 0 Then PutPStr(PFs, 'CDFS', FsSize);
+  If PRoot <> 0 Then D := UpStr(PStr(PRoot)) Else D := CurDirS;
+  If (D <> '') And (D[1] = 'C') Then
+  Begin
+    { disque en memoire : noms longs (VFAT), casse conservee }
+    If PVol <> 0 Then PutPStr(PVol, 'PASDOWS', VolSize);
+    If PSerial <> 0 Then MemL[0:PSerial] := $19951995;
+    If PMaxComp <> 0 Then MemL[0:PMaxComp] := 255;
+    If PFlags <> 0 Then MemL[0:PFlags] := 2;
+    If PFs <> 0 Then PutPStr(PFs, 'FAT', FsSize);
+  End
+  Else
+  Begin
+    If PVol <> 0 Then PutPStr(PVol, VolLabel, VolSize);
+    If PSerial <> 0 Then MemL[0:PSerial] := $19950824;
+    If PMaxComp <> 0 Then MemL[0:PMaxComp] := 12;
+    If PFlags <> 0 Then MemL[0:PFlags] := 0;
+    If PFs <> 0 Then PutPStr(PFs, 'CDFS', FsSize);
+  End;
   GetVolumeInformationA := 1;
 End;
 
@@ -7393,7 +7530,10 @@ Function OpenFile(PName, POf, Style : LongInt) : LongInt;
 Var S : String; Attr, Size, Time, Lba, Ram, H : LongInt;
 Begin
   OpenFile := -1;
-  S := FullPath(PStr(PName));
+  { OF_REOPEN : chemin pris dans le tampon OFSTRUCT d'une ouverture
+    precedente }
+  If ((Style And $8000) <> 0) And (POf <> 0) Then S := PStr(POf + 8)
+  Else S := FullPath(PStr(PName));
   If POf <> 0 Then
   Begin
     Mem[0:POf] := 136; Mem[0:POf + 1] := 0;
@@ -7413,7 +7553,8 @@ Begin
   End;
   If (Style And $200) <> 0 Then
   Begin
-    OpenFile := DeleteFileA(PName);
+    S := S + #0;
+    OpenFile := DeleteFileA(LongInt(@S[1]));
     Exit;
   End;
   If (Style And $1000) <> 0 Then H := KOpenFile(S, True, 2)
@@ -7920,7 +8061,7 @@ Begin
       Line := Trim(Line);
       If (Length(Line) > 1) And (Line[1] = '[') Then
       Begin
-        Cur := UpStr(Copy(Line, 2, Pos(']', Line) - 2));
+        Cur := UpStr(Trim(Copy(Line, 2, Pos(']', Line) - 2)));
         InSect := Cur = Sect;
       End
       Else If InSect And (Pos('=', Line) > 0) Then
@@ -7938,17 +8079,56 @@ Begin
   KFree(A);
 End;
 
+{ Noms des cles d'une section (ou des sections si Sect = #0), separes
+  par des zeros, double zero final ; nombre d'octets ecrits }
+Function IniEnum(F, Sect : String; Buf, N : LongInt) : LongInt;
+Var A, Size, P, C, O : LongInt; Line, Cur, Nm : String; InSect : Boolean;
+Begin
+  IniEnum := 0;
+  If N < 2 Then Exit;
+  Mem[0:Buf] := 0; Mem[0:Buf + 1] := 0;
+  A := LoadWholeFile(IniPath(F), Size);
+  If A = 0 Then Exit;
+  Sect := UpStr(Sect);
+  InSect := False; Line := ''; O := 0;
+  For P := 0 To Size Do
+  Begin
+    If P < Size Then C := Mem[0:A + P] Else C := 10;
+    If (C = 10) Or (C = 13) Then
+    Begin
+      Line := Trim(Line);
+      Nm := '';
+      If (Length(Line) > 1) And (Line[1] = '[') Then
+      Begin
+        Cur := Trim(Copy(Line, 2, Pos(']', Line) - 2));
+        InSect := UpStr(Cur) = Sect;
+        If Sect = #0 Then Nm := Cur;
+      End
+      Else If InSect And (Pos('=', Line) > 0) And (Line[1] <> ';') Then
+        Nm := Trim(Copy(Line, 1, Pos('=', Line) - 1));
+      If (Nm <> '') And (O + Length(Nm) + 2 <= N) Then
+      Begin
+        For C := 1 To Length(Nm) Do Mem[0:Buf + O + C - 1] := Ord(Nm[C]);
+        O := O + Length(Nm) + 1;
+        Mem[0:Buf + O - 1] := 0;
+        Mem[0:Buf + O] := 0;
+      End;
+      Line := '';
+    End
+    Else If Length(Line) < 250 Then Line := Line + Chr(C);
+  End;
+  KFree(A);
+  IniEnum := O;
+End;
+
 Function GetPrivateProfileStringA(App, Key, Def, Buf, N, F : LongInt)
   : LongInt;
 Var V : String;
 Begin
   If (App = 0) Or (Key = 0) Then
   Begin
-    If N >= 2 Then
-    Begin
-      Mem[0:Buf] := 0; Mem[0:Buf + 1] := 0;
-    End;
-    GetPrivateProfileStringA := 0;
+    If App = 0 Then V := #0 Else V := PStr(App);
+    GetPrivateProfileStringA := IniEnum(PStr(F), V, Buf, N);
     Exit;
   End;
   If Not IniGet(PStr(F), PStr(App), PStr(Key), V) Then V := PStr(Def);
@@ -8107,12 +8287,23 @@ End;
 Function CreateMutexA(Sec, Own, Name : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  { mutex nomme deja cree : meme objet, ERROR_ALREADY_EXISTS }
+  If Name <> 0 Then
+    For I := 0 To MaxKObj - 1 Do
+      If KObjs[I].Used And (KObjs[I].Kind = koMutex) And
+         (KObjs[I].Name = UpStr(PStr(Name))) Then
+      Begin
+        SetErr(183);
+        CreateMutexA := KHandle(I);
+        Exit;
+      End;
   I := KObjNew(koMutex);
   If I < 0 Then
   Begin
     CreateMutexA := 0;
     Exit;
   End;
+  If Name <> 0 Then KObjs[I].Name := UpStr(PStr(Name));
   If Own <> 0 Then
   Begin
     KObjs[I].F1 := ThreadId(CurT); KObjs[I].F2 := 1;
@@ -14121,21 +14312,231 @@ Begin
   ICLocate := 0;
 End;
 
-{ ADVAPI32 (registre : vide) }
-Function RegOpenKeyExA(K, Sub, Opt, Sam, PR : LongInt) : LongInt;
+{ ------------------------------------------------------------------ }
+{ ADVAPI32 : registre en memoire (cles et valeurs), partage avec les   }
+{ programmes 16 bits (SHELL.DLL). Racines : 80000000h CLASSES_ROOT    }
+{ (1 en Win16), ...01h CURRENT_USER, ...02h LOCAL_MACHINE, ...03h     }
+{ USERS, ...05h CURRENT_CONFIG, ...06h DYN_DATA ; autres cles :       }
+{ poignee 00C00000h + indice.                                         }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxRK = 400;
+  MaxRV = 800;
+  HKBase = $00C00000;
+
+Var
+  RKUsed : Array[0..MaxRK - 1] Of Boolean;
+  RKPar : Array[0..MaxRK - 1] Of LongInt;
+  RKNameP : Array[0..MaxRK - 1] Of LongInt;
+  RVUsed : Array[0..MaxRV - 1] Of Boolean;
+  RVKey, RVType, RVData, RVSize : Array[0..MaxRV - 1] Of LongInt;
+  RVNameP : Array[0..MaxRV - 1] Of LongInt;
+
+{ Noms des cles et valeurs : chaines terminees par zero dans le tas }
+Function RegStrNew(S : String) : LongInt;
+Var A : LongInt;
 Begin
-  RegOpenKeyExA := 2;
+  A := KAlloc(Length(S) + 1);
+  PutPStr(A, S, Length(S) + 1);
+  RegStrNew := A;
+End;
+
+Function RKName(I : LongInt) : String;
+Begin
+  If RKNameP[I] = 0 Then RKName := '' Else RKName := PStr(RKNameP[I]);
+End;
+
+Function RVName(I : LongInt) : String;
+Begin
+  If RVNameP[I] = 0 Then RVName := '' Else RVName := PStr(RVNameP[I]);
+End;
+
+Function RegKeyOf(H : LongInt) : LongInt;
+Begin
+  RegKeyOf := -1;
+  If H = 1 Then RegKeyOf := 0
+  Else If (H >= LongInt($80000000)) And (H <= LongInt($80000006)) Then
+  Begin
+    H := H And 7;
+    If H = 4 Then Exit;
+    If H >= 5 Then H := H - 1;
+    RegKeyOf := H;
+  End
+  Else If (H >= HKBase) And (H < HKBase + MaxRK) Then
+    If RKUsed[H - HKBase] Then RegKeyOf := H - HKBase;
+End;
+
+Function RegChild(K : LongInt; Nm : String; Create : Boolean) : LongInt;
+Var I : LongInt; U : String;
+Begin
+  RegChild := -1;
+  U := UpStr(Nm);
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed[I] And (RKPar[I] = K) And (UpStr(RKName(I)) = U) Then
+    Begin
+      RegChild := I;
+      Exit;
+    End;
+  If Not Create Then Exit;
+  For I := 6 To MaxRK - 1 Do
+    If Not RKUsed[I] Then
+    Begin
+      RKUsed[I] := True; RKPar[I] := K; RKNameP[I] := RegStrNew(Nm);
+      RegChild := I;
+      Exit;
+    End;
+End;
+
+{ Cle Path sous K (creee si Create) ; -1 si absente }
+Function RegWalk(K : LongInt; Path : String; Create : Boolean) : LongInt;
+Var P : LongInt; Part : String;
+Begin
+  RegWalk := -1;
+  If K < 0 Then Exit;
+  While Path <> '' Do
+  Begin
+    P := Pos('\', Path);
+    If P > 0 Then
+    Begin
+      Part := Copy(Path, 1, P - 1); Delete(Path, 1, P);
+    End
+    Else
+    Begin
+      Part := Path; Path := '';
+    End;
+    If Part <> '' Then
+    Begin
+      K := RegChild(K, Part, Create);
+      If K < 0 Then Exit;
+    End;
+  End;
+  RegWalk := K;
+End;
+
+Function RegVal(K : LongInt; Nm : String) : LongInt;
+Var I : LongInt; U : String;
+Begin
+  RegVal := -1;
+  U := UpStr(Nm);
+  For I := 0 To MaxRV - 1 Do
+    If RVUsed[I] And (RVKey[I] = K) And (UpStr(RVName(I)) = U) Then
+    Begin
+      RegVal := I;
+      Exit;
+    End;
+End;
+
+Function RegSetK(K : LongInt; Nm : String; Typ, Data, Size : LongInt)
+  : LongInt;
+Var I, J : LongInt;
+Begin
+  RegSetK := 1;
+  If K < 0 Then Exit;
+  I := RegVal(K, Nm);
+  If I < 0 Then
+    For J := MaxRV - 1 DownTo 0 Do
+      If Not RVUsed[J] Then I := J;
+  If I < 0 Then Exit;
+  If RVUsed[I] And (RVData[I] <> 0) Then KFree(RVData[I]);
+  If Not RVUsed[I] Then RVNameP[I] := RegStrNew(Nm);
+  RVUsed[I] := True; RVKey[I] := K; RVType[I] := Typ;
+  If Size < 0 Then Size := 0;
+  RVData[I] := KAlloc(Size + 2);
+  FillMem(RVData[I], Size + 2, 0);
+  If (Data <> 0) And (Size > 0) Then MoveMem(Data, RVData[I], Size);
+  RVSize[I] := Size;
+  RegSetK := 0;
+End;
+
+Procedure RegSetStr(Path, Nm, V : String);
+Var K : LongInt;
+Begin
+  K := RegWalk(2, Path, True);
+  V := V + #0;
+  RegSetK(K, Nm, 1, LongInt(@V[1]), Length(V));
+End;
+
+Procedure RegDelTree(K : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed[I] And (RKPar[I] = K) And (I <> K) Then RegDelTree(I);
+  For I := 0 To MaxRV - 1 Do
+    If RVUsed[I] And (RVKey[I] = K) Then
+    Begin
+      If RVData[I] <> 0 Then KFree(RVData[I]);
+      RVUsed[I] := False;
+    End;
+  If K >= 6 Then RKUsed[K] := False;
+End;
+
+Procedure RegInit;
+Var I : LongInt; S : String;
+Begin
+  For I := 0 To 5 Do
+  Begin
+    RKUsed[I] := True; RKPar[I] := -1; RKNameP[I] := 0;
+  End;
+  S := 'Software\Microsoft\Windows\CurrentVersion';
+  RegSetStr(S, 'ProgramFilesDir', 'C:\Program Files');
+  RegSetStr(S, 'CommonFilesDir', 'C:\Program Files\Common Files');
+  RegSetStr(S, 'SystemRoot', 'C:\WINDOWS');
+  RegSetStr(S, 'Version', 'Windows 95');
+  RegSetStr(S, 'VersionNumber', '4.00.950');
+  RegSetStr(S, 'ProductName', 'Pasdows 95');
+  RegSetStr(S, 'RegisteredOwner', 'Pasdows');
+  RegSetStr(S, 'RegisteredOrganization', '');
+  RegSetStr(S, 'SourcePath', 'D:\');
+  RegSetStr(S, 'DevicePath', 'C:\WINDOWS\INF');
+  RegSetStr(S, 'MediaPath', 'C:\WINDOWS\MEDIA');
+  RegWalk(2, S + '\App Paths', True);
+  RegWalk(2, S + '\Uninstall', True);
+  RegWalk(2, 'System\CurrentControlSet\Control', True);
+  RegWalk(1, 'Software\Microsoft\Windows\CurrentVersion\Explorer', True);
+  RegWalk(1, 'Control Panel\International', True);
+  S := 'C:\Program Files' + #0;
+  CreateDirectoryA(LongInt(@S[1]), 0);
+  S := 'C:\Program Files\Common Files' + #0;
+  CreateDirectoryA(LongInt(@S[1]), 0);
 End;
 
 Function RegOpenKeyA(K, Sub, PR : LongInt) : LongInt;
+Var I : LongInt;
 Begin
   RegOpenKeyA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), False);
+  If I < 0 Then Exit;
+  If PR <> 0 Then MemL[0:PR] := HKBase + I;
+  RegOpenKeyA := 0;
+End;
+
+Function RegOpenKeyExA(K, Sub, Opt, Sam, PR : LongInt) : LongInt;
+Begin
+  RegOpenKeyExA := RegOpenKeyA(K, Sub, PR);
+End;
+
+Function RegCreateKeyExA(K, Sub, Res, Cls, Opt, Sam, Sec, PR, PDisp
+  : LongInt) : LongInt;
+Var I, J : LongInt;
+Begin
+  RegCreateKeyExA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then
+  Begin
+    J := RegWalk(I, PStr(Sub), False);
+    If PDisp <> 0 Then MemL[0:PDisp] := 1 + Ord(J >= 0);
+    I := RegWalk(I, PStr(Sub), True);
+  End;
+  If I < 0 Then Exit;
+  If PR <> 0 Then MemL[0:PR] := HKBase + I;
+  RegCreateKeyExA := 0;
 End;
 
 Function RegCreateKeyA(K, Sub, PR : LongInt) : LongInt;
 Begin
-  If PR <> 0 Then MemL[0:PR] := $4321;
-  RegCreateKeyA := 0;
+  RegCreateKeyA := RegCreateKeyExA(K, Sub, 0, 0, 0, 0, 0, PR, 0);
 End;
 
 Function RegCloseKey(K : LongInt) : LongInt;
@@ -14143,14 +14544,196 @@ Begin
   RegCloseKey := 0;
 End;
 
-Function RegQueryValueExA(K, N, R, PT, PD, PN : LongInt) : LongInt;
+Function RegFlushKey(K : LongInt) : LongInt;
 Begin
-  RegQueryValueExA := 2;
+  RegFlushKey := 0;
+End;
+
+Function RegDeleteKeyA(K, Sub : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RegDeleteKeyA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), False);
+  If I < 6 Then Exit;
+  RegDelTree(I);
+  RegDeleteKeyA := 0;
 End;
 
 Function RegSetValueExA(K, N, R, T, D, Sz : LongInt) : LongInt;
+Var Nm : String;
 Begin
-  RegSetValueExA := 0;
+  If N = 0 Then Nm := '' Else Nm := PStr(N);
+  If (T = 1) Or (T = 2) Then
+    If (Sz = 0) And (D <> 0) Then Sz := StrLenZ(D) + 1;
+  RegSetValueExA := RegSetK(RegKeyOf(K), Nm, T, D, Sz);
+End;
+
+Function RegQueryValueExA(K, N, R, PT, PD, PN : LongInt) : LongInt;
+Var I, V : LongInt; Nm : String;
+Begin
+  RegQueryValueExA := 2;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  If N = 0 Then Nm := '' Else Nm := PStr(N);
+  V := RegVal(I, Nm);
+  If V < 0 Then Exit;
+  If PT <> 0 Then MemL[0:PT] := RVType[V];
+  RegQueryValueExA := 0;
+  If PN = 0 Then Exit;
+  If PD <> 0 Then
+  Begin
+    If MemL[0:PN] < RVSize[V] Then RegQueryValueExA := 234
+    Else MoveMem(RVData[V], PD, RVSize[V]);
+  End;
+  MemL[0:PN] := RVSize[V];
+End;
+
+Function RegSetValueA(K, Sub, T, D, Len : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RegSetValueA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), True);
+  If (I < 0) Or (D = 0) Then Exit;
+  RegSetValueA := RegSetK(I, '', 1, D, StrLenZ(D) + 1);
+End;
+
+Function RegQueryValueA(K, Sub, PD, PN : LongInt) : LongInt;
+Var I, V, N : LongInt;
+Begin
+  RegQueryValueA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), False);
+  If I < 0 Then Exit;
+  V := RegVal(I, '');
+  RegQueryValueA := 0;
+  If V < 0 Then N := 1 Else N := RVSize[V];
+  If (PD <> 0) And (PN <> 0) Then
+  Begin
+    If MemL[0:PN] < N Then RegQueryValueA := 234
+    Else If V < 0 Then Mem[0:PD] := 0
+    Else MoveMem(RVData[V], PD, N);
+  End;
+  If PN <> 0 Then MemL[0:PN] := N;
+End;
+
+Function RegChildN(K, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RegChildN := -1;
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed[I] And (RKPar[I] = K) And (I <> K) Then
+    Begin
+      If N = 0 Then
+      Begin
+        RegChildN := I;
+        Exit;
+      End;
+      Dec(N);
+    End;
+End;
+
+Function RegEnumKeyExA(K, N, Buf, PLen, R, Cls, PCls, PFt : LongInt)
+  : LongInt;
+Var I : LongInt;
+Begin
+  RegEnumKeyExA := 259;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  I := RegChildN(I, N);
+  If I < 0 Then Exit;
+  If PLen <> 0 Then
+  Begin
+    PutPStr(Buf, RKName(I), MemL[0:PLen]);
+    MemL[0:PLen] := Length(RKName(I));
+  End;
+  RegEnumKeyExA := 0;
+End;
+
+Function RegEnumKeyA(K, N, Buf, Len : LongInt) : LongInt;
+Var L : LongInt;
+Begin
+  L := Len;
+  RegEnumKeyA := RegEnumKeyExA(K, N, Buf, LongInt(@L), 0, 0, 0, 0);
+End;
+
+Function RegEnumValueA(K, N, NBuf, PNLen, R, PT, PD, PDLen : LongInt)
+  : LongInt;
+Var I, V : LongInt;
+Begin
+  RegEnumValueA := 259;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  For V := 0 To MaxRV - 1 Do
+    If RVUsed[V] And (RVKey[V] = I) Then
+    Begin
+      If N = 0 Then
+      Begin
+        If PNLen <> 0 Then
+        Begin
+          PutPStr(NBuf, RVName(V), MemL[0:PNLen]);
+          MemL[0:PNLen] := Length(RVName(V));
+        End;
+        If PT <> 0 Then MemL[0:PT] := RVType[V];
+        If (PD <> 0) And (PDLen <> 0) Then
+          MoveMem(RVData[V], PD, Min(RVSize[V], MemL[0:PDLen]));
+        If PDLen <> 0 Then MemL[0:PDLen] := RVSize[V];
+        RegEnumValueA := 0;
+        Exit;
+      End;
+      Dec(N);
+    End;
+End;
+
+Function RegDeleteValueA(K, N : LongInt) : LongInt;
+Var I, V : LongInt; Nm : String;
+Begin
+  RegDeleteValueA := 2;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  If N = 0 Then Nm := '' Else Nm := PStr(N);
+  V := RegVal(I, Nm);
+  If V < 0 Then Exit;
+  KFree(RVData[V]);
+  RVUsed[V] := False;
+  RegDeleteValueA := 0;
+End;
+
+Function RegQueryInfoKeyA(K, Cls, PCls, R, PSub, PMaxSub, PMaxCls, PVal,
+  PMaxVN, PMaxVL, PSec, PFt : LongInt) : LongInt;
+Var I, J, NS, NV, MS, MN, ML : LongInt;
+Begin
+  RegQueryInfoKeyA := 2;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  NS := 0; NV := 0; MS := 0; MN := 0; ML := 0;
+  For J := 0 To MaxRK - 1 Do
+    If RKUsed[J] And (RKPar[J] = I) And (J <> I) Then
+    Begin
+      Inc(NS);
+      MS := Max(MS, Length(RKName(J)));
+    End;
+  For J := 0 To MaxRV - 1 Do
+    If RVUsed[J] And (RVKey[J] = I) Then
+    Begin
+      Inc(NV);
+      MN := Max(MN, Length(RVName(J)));
+      ML := Max(ML, RVSize[J]);
+    End;
+  If PCls <> 0 Then MemL[0:PCls] := 0;
+  If PSub <> 0 Then MemL[0:PSub] := NS;
+  If PMaxSub <> 0 Then MemL[0:PMaxSub] := MS;
+  If PMaxCls <> 0 Then MemL[0:PMaxCls] := 0;
+  If PVal <> 0 Then MemL[0:PVal] := NV;
+  If PMaxVN <> 0 Then MemL[0:PMaxVN] := MN;
+  If PMaxVL <> 0 Then MemL[0:PMaxVL] := ML;
+  If PSec <> 0 Then MemL[0:PSec] := 0;
+  If PFt <> 0 Then
+  Begin
+    MemL[0:PFt] := 0; MemL[0:PFt + 4] := 0;
+  End;
+  RegQueryInfoKeyA := 0;
 End;
 
 { ==================================================================== }
@@ -14167,10 +14750,13 @@ End;
 
 Const
   MaxMod = 16;
-  SysDlls : Array[0..13] Of String[12] = ('KERNEL32.DLL', 'USER32.DLL',
-    'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL', 'OLE32.DLL',
-    'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL', 'COMCTL32.DLL',
-    'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL');
+  SysDllN = 20;
+  SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
+    'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
+    'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
+    'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
+    'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL', 'WS2_32.DLL',
+    'ICMP.DLL');
 
 Type
   TModule = Record
@@ -14307,9 +14893,9 @@ End;
 
 { Trace des appels d'API (journal serie), active par ApiTrace }
 Procedure TraceApi(Name : LongInt);
-Var F, D : LongInt; S : String;
+Var F, D, R : LongInt; S : String;
 Begin
-  If TraceCount < 8000 Then
+  If TraceCount < 60000 Then
   Begin
     Inc(TraceCount);
     asm
@@ -14319,6 +14905,16 @@ Begin
     S := '> ' + PStr(Name) + ' @' + HexStr(MemL[0:F + 44], 8);
     S := S + ' ' + HexStr(MemL[0:F + 48], 8) + ' ' + HexStr(MemL[0:F + 52], 8);
     S := S + ' ' + HexStr(MemL[0:F + 56], 8) + ' ' + HexStr(MemL[0:F + 60], 8);
+    { arguments qui pointent sur du texte }
+    For D := 0 To 3 Do
+    Begin
+      R := MemL[0:F + 48 + D * 4];
+      If (R >= $10000) And (R < MemTop) Then
+        If (Mem[0:R] >= 32) And (Mem[0:R] < 127) And
+           ((Mem[0:R + 1] = 0) Or ((Mem[0:R + 1] >= 32) And
+           (Mem[0:R + 1] < 127))) Then
+          S := S + ' "' + Copy(PStr(R), 1, 50) + '"';
+    End;
     KLog(S);
     { detourner le retour vers TraceRetStub (pile fantome par tache) }
     D := TrDepth[CurT];
@@ -14365,7 +14961,8 @@ Begin
   TraceSkip := ' SETFILEPOINTER ISBADREADPTR GETTICKCOUNT TIMEGETTIME ';
   TraceSkip := TraceSkip + 'GETASYNCKEYSTATE PEEKMESSAGEA SCREENTOCLIENT ';
   TraceSkip := TraceSkip + 'GETCURSORPOS ISBADWRITEPTR LSTRCMPIA ';
-  TraceSkip := TraceSkip + 'GETDEVICECAPS ';
+  TraceSkip := TraceSkip + 'GETDEVICECAPS CHARNEXTA CHARPREVA ISDBCSLEADBYTE ';
+  TraceSkip := TraceSkip + 'LSTRLENA LSTRCMPA ';
 End;
 
 Function MakeTrace(Dll, Name : String; Target : LongInt) : LongInt;
@@ -14402,7 +14999,7 @@ Begin
   IsSysDll := False;
   Name := UpStr(BaseName(Name));
   If Pos('.', Name) = 0 Then Name := Name + '.DLL';
-  For I := 0 To 13 Do
+  For I := 0 To SysDllN - 1 Do
     If SysDlls[I] = Name Then IsSysDll := True;
 End;
 
@@ -14471,14 +15068,24 @@ Begin
   VideoForWindowsVersion := $010A0000;
 End;
 
+Function IsWsDll(Dll : String) : Boolean; Forward;
+Function WsOrdName(N : LongInt) : String; Forward;
+Procedure NetAppExit; Forward;
+
 Function ResolveImport(Dll, Name : String; Ordinal : LongInt) : LongInt;
 Var M, A : LongInt; Nm : String;
 Begin
   A := 0;
+  { Winsock : fonctions WS_nom du noyau (par nom ou par ordinal) }
+  If IsWsDll(Dll) Then
+  Begin
+    If Name = '' Then Name := WsOrdName(Ordinal);
+    If Name <> '' Then A := KernelExport('WS_' + Name);
+  End;
   { importations par ordinal des DLL systeme connues }
   If (Name = '') And (UpStr(BaseName(Dll)) = 'MSVFW32.DLL') And
      (Ordinal = 2) Then Name := 'VideoForWindowsVersion';
-  If Not IsSysDll(Dll) Then
+  If (A = 0) And Not IsSysDll(Dll) Then
   Begin
     M := FindModule(Dll);
     If M < 0 Then M := LoadPE(Dll, True);
@@ -14701,7 +15308,7 @@ Begin
   M := 0;
   Nm := UpStr(BaseName(Nm));
   If Pos('.', Nm) = 0 Then Nm := Nm + '.DLL';
-  For I := 0 To 13 Do
+  For I := 0 To SysDllN - 1 Do
     If SysDlls[I] = Nm Then M := HDllBase + I * $10000;
   If M = 0 Then SetErr(126);
   GetModuleHandleA := M;
@@ -14715,7 +15322,7 @@ Begin
   Begin
     M := ModOfBase(H);
     If M >= 0 Then S := Mods[M].Path
-    Else If (H >= HDllBase) And (H < HDllBase + 14 * $10000) Then
+    Else If (H >= HDllBase) And (H < HDllBase + SysDllN * $10000) Then
       S := 'C:\WINDOWS\SYSTEM\' + SysDlls[(H - HDllBase) Div $10000]
     Else S := AppPath;
   End;
@@ -14750,18 +15357,27 @@ Begin
 End;
 
 Function GetProcAddress(H, P : LongInt) : LongInt;
-Var M, R : LongInt; Nm : String;
+Var M, R : LongInt; Nm : String; Ws : Boolean;
 Begin
   GetProcAddress := 0;
   M := ModOfBase(H);
+  Ws := (M < 0) And (H >= HDllBase) And (H < HDllBase + SysDllN * $10000);
+  If Ws Then Ws := IsWsDll(SysDlls[(H - HDllBase) Div $10000]);
   If (P >= 0) And (P < $10000) Then
   Begin
-    If M >= 0 Then GetProcAddress := ModuleExport(M, '', P);
+    If M >= 0 Then GetProcAddress := ModuleExport(M, '', P)
+    Else If Ws And (WsOrdName(P) <> '') Then
+      GetProcAddress := KernelExport('WS_' + WsOrdName(P));
     Exit;
   End;
   Nm := PStr(P);
-  If M >= 0 Then R := ModuleExport(M, Nm, 0)
-  Else R := KernelExport(Nm);
+  R := 0;
+  If Ws Then R := KernelExport('WS_' + Nm);
+  If R = 0 Then
+  Begin
+    If M >= 0 Then R := ModuleExport(M, Nm, 0)
+    Else R := KernelExport(Nm);
+  End;
   If (R = 0) And (M < 0) And (Length(Nm) > 1) And (Nm[1] = '_') Then
     R := KernelExport(Copy(Nm, 2, 255));
   If R = 0 Then
@@ -14977,21 +15593,24 @@ Procedure KillApp;
 Var I : LongInt;
 Begin
   KillingApp := True;
+  NetAppExit;
   For I := 0 To MaxWnd - 1 Do
     If Wnds[I].Used And (Wnds[I].Thread > 0) And
-       Threads[Wnds[I].Thread].IsApp Then
+       Threads[Wnds[I].Thread].IsApp And Not ThrW16[Wnds[I].Thread] Then
     Begin
       Wnds[I].Proc := 0;
       Wnds[I].IKind := ikStatic;
       DestroyW(I);
     End;
   For I := 1 To MaxThread - 1 Do
-    If Threads[I].Used And Threads[I].IsApp And (I <> CurT) Then
+    If Threads[I].Used And Threads[I].IsApp And (I <> CurT) And
+       Not ThrW16[I] Then
       Threads[I].State := tsDead;
   For I := 0 To MaxTimer - 1 Do WTimers[I].Used := False;
   For I := 0 To MaxMMTimer - 1 Do MMTimers[I].Used := False;
   For I := 0 To MaxKObj - 1 Do
-    If KObjs[I].Used And (KObjs[I].Kind In [koFile, koFind]) Then
+    If KObjs[I].Used And (KObjs[I].Kind In [koFile, koFind]) And
+       (KObjOwner[I] = 1) Then
       KObjs[I].Used := False;
   For I := 0 To MaxDC - 1 Do
     If Dcs[I].Used And (Gdis[Dcs[I].Gdi].Owner = 1) Then DcFree(I);
@@ -15000,13 +15619,15 @@ Begin
   For I := 0 To MaxVBlk - 1 Do VBlks[I].Used := False;
   For I := 0 To MaxMod - 1 Do Mods[I].Used := False;
   For I := 0 To MaxClass - 1 Do
-    If Classes[I].Used And (Classes[I].IKind = ikNone) Then
+    If Classes[I].Used And (Classes[I].IKind = ikNone) And
+       ((Classes[I].Inst <= 0) Or (Classes[I].Inst > $FFFF)) Then
       Classes[I].Used := False;
   KFreeOwner(1);
   StubArea := 0;
   HeapOwner := 0;
   AppRunning := False;
   AppBase := 0;
+  DDShow := False;
   If AppProcObj >= 0 Then KObjs[AppProcObj].F2 := 1;
   CaptureWin := -1;
   CurHide := 0;
@@ -15031,10 +15652,21 @@ Begin
 End;
 
 { Lancer un programme Windows (.EXE du CD-ROM ou du disque virtuel) }
+Function IsNeFile(Path : String) : Boolean; Forward;
+Function RunNe(Path, Args : String; Show : LongInt) : Boolean; Forward;
+
 Function RunExe(Path, Args : String) : Boolean;
 Var M, T, Sub : LongInt; S : String;
 Begin
   RunExe := False;
+  { programme Windows 3.x (NE) : sous-systeme Win16 }
+  S := FindModuleFile(Path);
+  If (S <> '') And IsNeFile(S) Then
+  Begin
+    KLog('Lancement de ' + S + ' (Win16)');
+    RunExe := RunNe(S, Args, 1);
+    Exit;
+  End;
   If AppRunning Then
   Begin
     MsgBoxOpen('Pasdows', L('Un programme Windows est d'#130'j'#133' en ' +
@@ -15093,9 +15725,9614 @@ Begin
   CursorSetShape(0);
 End;
 
+{ ==================================================================== }
+{ Partie 12 bis - Complements Win32 pour les installateurs (ACME)      }
+{ ==================================================================== }
+
+Const
+  koMapping = 9;
+  MaxView = 32;
+
+Var
+  ViewAddr, ViewMap, ViewOfs, ViewSize : Array[0..MaxView - 1] Of LongInt;
+  DdeStr : Array[0..63] Of String[63];
+  DdeData : Array[0..15] Of LongInt;
+
+{ ------------------------------- KERNEL32 ------------------------- }
+
+Procedure RtlMoveMemory(D, S, N : LongInt);
+Begin
+  MoveMem(S, D, N);
+End;
+
+Procedure RtlZeroMemory(D, N : LongInt);
+Begin
+  FillMem(D, N, 0);
+End;
+
+Procedure RtlFillMemory(D, N, V : LongInt);
+Begin
+  FillMem(D, N, V And $FF);
+End;
+
+Function OpenMutexA(Acc, Inh, Name : LongInt) : LongInt;
+Var I : LongInt; S : String;
+Begin
+  OpenMutexA := 0;
+  If Name = 0 Then Exit;
+  S := UpStr(PStr(Name));
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs[I].Used And (KObjs[I].Kind = koMutex) And
+       (KObjs[I].Name = S) Then
+    Begin
+      OpenMutexA := KHandle(I);
+      Exit;
+    End;
+  SetErr(ErrFileNotFound);
+End;
+
+Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
+Var S : String;
+Begin
+  S := PStr(PLong);
+  If (PShort <> 0) And (N > Length(S)) Then PutPStr(PShort, S, N);
+  GetShortPathNameA := Length(S);
+End;
+
+Function GetLogicalDriveStringsA(N, Buf : LongInt) : LongInt;
+Var S : String; I : LongInt;
+Begin
+  { C:\<0>D:\<0><0> (octets ecrits un a un : WPC concatene les chaines
+    comme des PChar) }
+  S := 'C:\ D:\  ';
+  GetLogicalDriveStringsA := 8;
+  If N < 9 Then Exit;
+  For I := 1 To 9 Do
+    If S[I] = ' ' Then Mem[0:Buf + I - 1] := 0
+    Else Mem[0:Buf + I - 1] := Ord(S[I]);
+End;
+
+Function MoveFileExA(PSrc, PDst, Flags : LongInt) : LongInt;
+Begin
+  MoveFileExA := 1;
+  { suppression au redemarrage : sans objet }
+  If PDst = 0 Then Exit;
+  If ((Flags And 1) <> 0) And (GetFileAttributesA(PDst) <> -1) Then
+    DeleteFileA(PDst);
+  MoveFileExA := MoveFileA(PSrc, PDst);
+End;
+
+Function GetTempFileNameA(PPath, PPre, Uniq, Buf : LongInt) : LongInt;
+Var S, P, Pre : String; N, H : LongInt;
+Begin
+  P := PStr(PPath);
+  If (P <> '') And (P[Length(P)] <> '\') Then P := P + '\';
+  Pre := Copy(PStr(PPre), 1, 3);
+  N := Uniq And $FFFF;
+  If N = 0 Then N := (Ticks And $FFF) + 1;
+  Repeat
+    S := P + Pre + HexStr(N, 4) + '.TMP';
+    If Uniq <> 0 Then Break;
+    PutPStr(Buf, S, 260);
+    If GetFileAttributesA(Buf) = -1 Then
+    Begin
+      H := KOpenFile(S, True, 2);
+      If H <> INVALID_HANDLE Then CloseHandle(H);
+      Break;
+    End;
+    N := (N + 1) And $FFFF;
+  Until False;
+  PutPStr(Buf, S, 260);
+  GetTempFileNameA := N;
+End;
+
+Function SearchPathA(PPath, PFile, PExt, N, Buf, PPart : LongInt)
+  : LongInt;
+Var F, S, D : String; K : LongInt;
+Begin
+  SearchPathA := 0;
+  F := PStr(PFile);
+  If (PExt <> 0) And (Pos('.', BaseName(F)) = 0) Then F := F + PStr(PExt);
+  For K := 0 To 5 Do
+  Begin
+    Case K Of
+      0 : If PPath <> 0 Then D := PStr(PPath) Else D := ParentDir(AppPath);
+      1 : D := CurDirS;
+      2 : D := 'C:\WINDOWS\SYSTEM';
+      3 : D := 'C:\WINDOWS';
+      4 : D := 'D:';
+    Else
+      D := '';
+    End;
+    If (Pos('\', F) > 0) Or (Pos(':', F) > 0) Then S := FullPath(F)
+    Else If D = '' Then Continue
+    Else S := FullPath(D + '\' + F);
+    PutPStr(Buf, S, N);
+    If GetFileAttributesA(Buf) <> -1 Then
+    Begin
+      If PPart <> 0 Then
+        MemL[0:PPart] := Buf + Length(S) - Length(BaseName(S));
+      SearchPathA := Length(S);
+      Exit;
+    End;
+    If (Pos('\', F) > 0) Or (Pos(':', F) > 0) Then Break;
+  End;
+  If N > 0 Then Mem[0:Buf] := 0;
+  SetErr(ErrFileNotFound);
+End;
+
+Function SystemTimeToFileTime(St, Ft : LongInt) : LongInt;
+Var Dos : LongInt;
+Begin
+  Dos := ((MemW[0:St] - 1980) Shl 25) Or (MemW[0:St + 2] Shl 21) Or
+         (MemW[0:St + 6] Shl 16) Or (MemW[0:St + 8] Shl 11) Or
+         (MemW[0:St + 10] Shl 5) Or (MemW[0:St + 12] Div 2);
+  DosToFileTime(Dos, Ft);
+  SystemTimeToFileTime := 1;
+End;
+
+{ Valeurs regionales courantes (francais ou anglais) }
+Function GetLocaleInfoA(Lcid, Typ, Buf, N : LongInt) : LongInt;
+Var S : String;
+Begin
+  Case Typ And $FFFF Of
+    1 : S := '040C';
+    2, 4 : S := 'Francais';
+    3 : S := 'FRA';
+    5, 6, 7 : S := 'France';
+    8 : S := '33';
+    $B : S := '850';
+    $C : S := ';';
+    $E : S := ',';
+    $F : S := ' ';
+    $14 : S := 'F';
+    $15 : S := 'FRF';
+    $1D : S := '/';
+    $1E : S := ':';
+    $1F : S := 'dd/MM/yy';
+    $20 : S := 'dddd d MMMM yyyy';
+    $21 : S := '1';
+    $23 : S := '1';
+    $1004 : S := '1252';
+    $5A : S := 'FR';
+  Else
+    S := '0';
+  End;
+  If Language = _English Then
+    Case Typ And $FFFF Of
+      1 : S := '0409';
+      2, 4 : S := 'English';
+      3 : S := 'ENU';
+      5, 6, 7 : S := 'United States';
+      8 : S := '1';
+      $B : S := '437';
+      $C, $E : S := ',';
+      $D : S := '.';
+    End;
+  If (Buf <> 0) And (N > 0) Then PutPStr(Buf, S, N);
+  GetLocaleInfoA := Length(S) + 1;
+End;
+
+{ Projection de fichiers : la vue est une copie du fichier, recrite a
+  UnmapViewOfFile / FlushViewOfFile si elle est modifiable }
+Function CreateFileMappingA(HFile, Sec, Prot, SzHi, SzLo, Name : LongInt)
+  : LongInt;
+Var I, Sz : LongInt;
+Begin
+  CreateFileMappingA := 0;
+  I := KObjNew(koMapping);
+  If I < 0 Then Exit;
+  Sz := SzLo;
+  If (Sz = 0) And (HFile <> -1) Then Sz := GetFileSize(HFile, 0);
+  KObjs[I].F1 := HFile;
+  KObjs[I].F2 := Sz;
+  KObjs[I].F3 := Prot;
+  CreateFileMappingA := KHandle(I);
+End;
+
+Function ViewFlush(V : LongInt) : LongInt;
+Var I, H, N : LongInt;
+Begin
+  ViewFlush := 1;
+  I := KObjOf(ViewMap[V], koMapping);
+  If I < 0 Then Exit;
+  H := KObjs[I].F1;
+  If (H = -1) Or ((KObjs[I].F3 And 4) = 0) Then Exit;
+  SetFilePointer(H, ViewOfs[V], 0, 0);
+  N := KWriteFile(H, ViewAddr[V], ViewSize[V]);
+End;
+
+Function MapViewOfFile(HMap, Acc, OfsHi, OfsLo, N : LongInt) : LongInt;
+Var I, V, A, Got, K : LongInt;
+Begin
+  MapViewOfFile := 0;
+  I := KObjOf(HMap, koMapping);
+  If I < 0 Then Exit;
+  V := -1;
+  For K := MaxView - 1 DownTo 0 Do
+    If ViewAddr[K] = 0 Then V := K;
+  If V < 0 Then Exit;
+  If (N = 0) Or (OfsLo + N > KObjs[I].F2) Then N := KObjs[I].F2 - OfsLo;
+  If N <= 0 Then N := 1;
+  A := KAlloc(N + 4096);
+  If A = 0 Then Exit;
+  FillMem(A, N, 0);
+  If KObjs[I].F1 <> -1 Then
+  Begin
+    SetFilePointer(KObjs[I].F1, OfsLo, 0, 0);
+    KReadFile(KObjs[I].F1, A, N, Got);
+  End;
+  ViewAddr[V] := A; ViewMap[V] := HMap; ViewOfs[V] := OfsLo;
+  ViewSize[V] := N;
+  MapViewOfFile := A;
+End;
+
+Function FlushViewOfFile(A, N : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  FlushViewOfFile := 1;
+  For V := 0 To MaxView - 1 Do
+    If (ViewAddr[V] <> 0) And (A >= ViewAddr[V]) And
+       (A < ViewAddr[V] + ViewSize[V]) Then ViewFlush(V);
+End;
+
+Function UnmapViewOfFile(A : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  UnmapViewOfFile := 0;
+  For V := 0 To MaxView - 1 Do
+    If ViewAddr[V] = A Then
+    Begin
+      ViewFlush(V);
+      KFree(A);
+      ViewAddr[V] := 0;
+      UnmapViewOfFile := 1;
+    End;
+End;
+
+{ --------------------------------- GDI32 --------------------------- }
+
+Function CreateScalableFontResourceA(H, PRes, PFont, PPath : LongInt)
+  : LongInt;
+Begin
+  CreateScalableFontResourceA := 0;
+End;
+
+{ --------------------------------- USER32 -------------------------- }
+
+Function CreateCaret(H, Bmp, W, Ht : LongInt) : LongInt;
+Begin
+  CreateCaret := 1;
+End;
+
+Function DestroyCaret : LongInt;
+Begin
+  DestroyCaret := 1;
+End;
+
+Function SetCaretPos(X, Y : LongInt) : LongInt;
+Begin
+  SetCaretPos := 1;
+End;
+
+Function ShowCaret(H : LongInt) : LongInt;
+Begin
+  ShowCaret := 1;
+End;
+
+Function HideCaret(H : LongInt) : LongInt;
+Begin
+  HideCaret := 1;
+End;
+
+Function ExcludeUpdateRgn(Hdc, H : LongInt) : LongInt;
+Begin
+  ExcludeUpdateRgn := 2;
+End;
+
+Function GetLastActivePopup(H : LongInt) : LongInt;
+Begin
+  GetLastActivePopup := H;
+End;
+
+{ DDE : un Gestionnaire de programmes (PROGMAN) minimal accepte les
+  commandes [CreateGroup(...)], [AddItem(...)]... et les journalise }
+Function DdeInitializeA(PId, Cb, Cmd, Res : LongInt) : LongInt;
+Begin
+  If PId <> 0 Then MemL[0:PId] := 1;
+  DdeInitializeA := 0;
+End;
+
+Function DdeUninitialize(Id : LongInt) : LongInt;
+Begin
+  DdeUninitialize := 1;
+End;
+
+Function DdeCreateStringHandleA(Id, P, Cp : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DdeCreateStringHandleA := 0;
+  For I := 1 To 63 Do
+    If DdeStr[I] = '' Then
+    Begin
+      DdeStr[I] := Copy(PStr(P), 1, 63);
+      If DdeStr[I] = '' Then DdeStr[I] := ' ';
+      DdeCreateStringHandleA := I;
+      Exit;
+    End;
+End;
+
+Function DdeFreeStringHandle(Id, H : LongInt) : LongInt;
+Begin
+  If (H > 0) And (H < 64) Then DdeStr[H] := '';
+  DdeFreeStringHandle := 1;
+End;
+
+Function DdeConnect(Id, HSrv, HTop, PCC : LongInt) : LongInt;
+Begin
+  DdeConnect := 0;
+  If (HSrv > 0) And (HSrv < 64) Then
+  Begin
+    KLog('DDE : connexion a ' + DdeStr[HSrv]);
+    If UpStr(DdeStr[HSrv]) = 'PROGMAN' Then DdeConnect := $5150;
+  End;
+End;
+
+Function DdeDisconnect(H : LongInt) : LongInt;
+Begin
+  DdeDisconnect := 1;
+End;
+
+Function DdeClientTransaction(PData, Cb, HConv, HItem, Fmt, Typ, Tmo,
+  PRes : LongInt) : LongInt;
+Var S : String; A : LongInt;
+Begin
+  DdeClientTransaction := 0;
+  If PRes <> 0 Then MemL[0:PRes] := 0;
+  If HConv <> $5150 Then Exit;
+  Case Typ And $FF Of
+    $50 :
+    Begin
+      { XTYP_EXECUTE }
+      KLog('DDE PROGMAN : ' + Copy(PStr(PData), 1, 200));
+      DdeClientTransaction := 1;
+    End;
+    $B0 :
+    Begin
+      { XTYP_REQUEST (liste des groupes...) : vide }
+      A := KAlloc(16);
+      Mem[0:A] := 0;
+      DdeClientTransaction := A;
+    End;
+  Else
+    DdeClientTransaction := 1;
+  End;
+End;
+
+Function DdeAccessData(H, PSz : LongInt) : LongInt;
+Begin
+  If PSz <> 0 Then MemL[0:PSz] := 1;
+  DdeAccessData := H;
+End;
+
+Function DdeUnaccessData(H : LongInt) : LongInt;
+Begin
+  DdeUnaccessData := 1;
+End;
+
+Function DdeFreeDataHandle(H : LongInt) : LongInt;
+Begin
+  DdeFreeDataHandle := 1;
+End;
+
+Function DdeGetLastError(Id : LongInt) : LongInt;
+Begin
+  DdeGetLastError := 0;
+End;
+
+{ ------------------------------ VERSION ---------------------------- }
+{ Pas d'informations de version : les fichiers sont copies d'apres
+  leur date (comportement documente pour les fichiers sans version) }
+
+Function GetFileVersionInfoSizeA(PFile, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  SetErr(1812);
+  GetFileVersionInfoSizeA := 0;
+End;
+
+Function GetFileVersionInfoA(PFile, H, N, Buf : LongInt) : LongInt;
+Begin
+  GetFileVersionInfoA := 0;
+End;
+
+Function VerQueryValueA(Blk, PSub, PPtr, PLen : LongInt) : LongInt;
+Begin
+  VerQueryValueA := 0;
+End;
+
+Function VerFindFileA(Flags, PFile, PWin, PApp, PCur, PCurLen, PDst,
+  PDstLen : LongInt) : LongInt;
+Begin
+  If (PCur <> 0) And (PCurLen <> 0) And (MemL[0:PCurLen] > 0) Then
+    Mem[0:PCur] := 0;
+  If PCurLen <> 0 Then MemL[0:PCurLen] := 1;
+  If (PDst <> 0) And (PDstLen <> 0) Then
+  Begin
+    If PApp <> 0 Then PutPStr(PDst, PStr(PApp), MemL[0:PDstLen])
+    Else Mem[0:PDst] := 0;
+    MemL[0:PDstLen] := StrLenZ(PDst) + 1;
+  End;
+  VerFindFileA := 0;
+End;
+
+Function VerInstallFileA(Flags, PSrc, PDst, PSrcDir, PDstDir, PCurDir,
+  PTmp, PTmpLen : LongInt) : LongInt;
+Var A, B : String;
+Begin
+  A := PStr(PSrcDir) + '\' + PStr(PSrc) + #0;
+  B := PStr(PDstDir) + '\' + PStr(PDst) + #0;
+  If CopyFileA(LongInt(@A[1]), LongInt(@B[1]), 0) <> 0 Then
+    VerInstallFileA := 0
+  Else VerInstallFileA := $8000;
+End;
+
+Function CopyFileA(PSrc, PDst, FailExist : LongInt) : LongInt;
+Var HS, HD, B, N : LongInt;
+Begin
+  CopyFileA := 0;
+  If (FailExist <> 0) And (GetFileAttributesA(PDst) <> -1) Then
+  Begin
+    SetErr(80);
+    Exit;
+  End;
+  HS := KOpenFile(PStr(PSrc), False, 3);
+  If HS = INVALID_HANDLE Then Exit;
+  HD := KOpenFile(PStr(PDst), True, 2);
+  If HD = INVALID_HANDLE Then
+  Begin
+    CloseHandle(HS);
+    Exit;
+  End;
+  B := KAlloc(16384);
+  Repeat
+    If Not KReadFile(HS, B, 16384, N) Then N := 0;
+    If N > 0 Then KWriteFile(HD, B, N);
+  Until N <= 0;
+  KFree(B);
+  CloseHandle(HS);
+  CloseHandle(HD);
+  CopyFileA := 1;
+End;
+
+{ -------------------------------- LZ32 ----------------------------- }
+
+Function LZOpenFileA(PName, POf, Style : LongInt) : LongInt;
+Begin
+  LZOpenFileA := OpenFile(PName, POf, Style);
+End;
+
+Function LZClose(H : LongInt) : LongInt;
+Begin
+  CloseHandle(H);
+  LZClose := 0;
+End;
+
+Function LZCopy(HSrc, HDst : LongInt) : LongInt;
+Var B, N, T : LongInt;
+Begin
+  B := KAlloc(16384);
+  T := 0;
+  Repeat
+    If Not KReadFile(HSrc, B, 16384, N) Then N := 0;
+    If N > 0 Then
+    Begin
+      KWriteFile(HDst, B, N);
+      T := T + N;
+    End;
+  Until N <= 0;
+  KFree(B);
+  LZCopy := T;
+End;
+
+{ -------------------------------- MPR ------------------------------ }
+{ Pas de reseau }
+
+Function WNetGetConnectionA(PLocal, PRemote, PLen : LongInt) : LongInt;
+Begin
+  WNetGetConnectionA := 2250;
+End;
+
+Function WNetAddConnectionA(PRemote, PPass, PLocal : LongInt) : LongInt;
+Begin
+  WNetAddConnectionA := 1222;
+End;
+
+Function WNetAddConnection2A(PRes, PPass, PUser, Flags : LongInt) : LongInt;
+Begin
+  WNetAddConnection2A := 1222;
+End;
+
+Function WNetCancelConnectionA(PName, Force : LongInt) : LongInt;
+Begin
+  WNetCancelConnectionA := 2250;
+End;
+
+Function WNetCancelConnection2A(PName, Flags, Force : LongInt) : LongInt;
+Begin
+  WNetCancelConnection2A := 2250;
+End;
+
+Function WNetConnectionDialog(H, Typ : LongInt) : LongInt;
+Begin
+  WNetConnectionDialog := 1222;
+End;
+
+Function WNetGetLastErrorA(PErr, PBuf, NBuf, PName, NName : LongInt)
+  : LongInt;
+Begin
+  If PErr <> 0 Then MemL[0:PErr] := 0;
+  WNetGetLastErrorA := 0;
+End;
+
+{ ----------------------- Unicode et parametres regionaux ------------ }
+
+Function GetEnvironmentStringsW : LongInt;
+Var P, N, W, I : LongInt;
+Begin
+  P := GetEnvironmentStringsA;
+  N := 0;
+  While (MemW[0:P + N] <> 0) And (N < 8000) Do Inc(N);
+  W := KAlloc((N + 2) * 2);
+  For I := 0 To N + 1 Do MemW[0:W + I * 2] := Mem[0:P + I];
+  GetEnvironmentStringsW := W;
+End;
+
+Function FreeEnvironmentStringsW(P : LongInt) : LongInt;
+Begin
+  FreeEnvironmentStringsW := 1;
+End;
+
+Function GetLocaleInfoW(Lcid, Typ, Buf, N : LongInt) : LongInt;
+Var T, R, I : LongInt;
+Begin
+  T := KAlloc(256);
+  R := GetLocaleInfoA(Lcid, Typ, T, 256);
+  If (Buf <> 0) And (N > 0) Then
+    For I := 0 To Min(R, N) - 1 Do MemW[0:Buf + I * 2] := Mem[0:T + I];
+  KFree(T);
+  GetLocaleInfoW := R;
+End;
+
+{ CT_CTYPE1 : 1 majuscule, 2 minuscule, 4 chiffre, 8 espace,
+  10h ponctuation, 20h controle, 80h hexadecimal, 100h lettre }
+Function CharType1(C : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  T := 0;
+  If (C >= 65) And (C <= 90) Then T := $101;
+  If (C >= 97) And (C <= 122) Then T := $102;
+  If (C >= 192) And (C <= 255) Then T := $100;
+  If (C >= 48) And (C <= 57) Then T := $84;
+  If ((C >= 65) And (C <= 70)) Or ((C >= 97) And (C <= 102)) Then
+    T := T Or $80;
+  If (C = 32) Or ((C >= 9) And (C <= 13)) Then T := T Or 8;
+  If C = 32 Then T := T Or $40;
+  If C < 32 Then T := T Or $20;
+  If ((C >= 33) And (C <= 47)) Or ((C >= 58) And (C <= 64)) Or
+     ((C >= 91) And (C <= 96)) Or ((C >= 123) And (C <= 126)) Then
+    T := T Or $10;
+  CharType1 := T;
+End;
+
+Function GetStringTypeA(Lcid, Info, Src, N, PType : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Src) + 1;
+  For I := 0 To N - 1 Do
+    If Info = 1 Then MemW[0:PType + I * 2] := CharType1(Mem[0:Src + I])
+    Else MemW[0:PType + I * 2] := 0;
+  GetStringTypeA := 1;
+End;
+
+Function GetStringTypeW(Info, Src, N, PType : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then
+  Begin
+    N := 0;
+    While MemW[0:Src + N * 2] <> 0 Do Inc(N);
+    Inc(N);
+  End;
+  For I := 0 To N - 1 Do
+    If Info = 1 Then
+      MemW[0:PType + I * 2] := CharType1(MemW[0:Src + I * 2] And $FF)
+    Else MemW[0:PType + I * 2] := 0;
+  GetStringTypeW := 1;
+End;
+
+Function MapCaseC(C, Flags : LongInt) : LongInt;
+Begin
+  If ((Flags And $200) <> 0) And (C >= 97) And (C <= 122) Then C := C - 32;
+  If ((Flags And $100) <> 0) And (C >= 65) And (C <= 90) Then C := C + 32;
+  MapCaseC := C;
+End;
+
+Function LCMapStringA(Lcid, Flags, Src, N, Dst, DN : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Src) + 1;
+  LCMapStringA := N;
+  If DN = 0 Then Exit;
+  If N > DN Then N := DN;
+  For I := 0 To N - 1 Do Mem[0:Dst + I] := MapCaseC(Mem[0:Src + I], Flags);
+  LCMapStringA := N;
+End;
+
+Function LCMapStringW(Lcid, Flags, Src, N, Dst, DN : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then
+  Begin
+    N := 0;
+    While MemW[0:Src + N * 2] <> 0 Do Inc(N);
+    Inc(N);
+  End;
+  LCMapStringW := N;
+  If DN = 0 Then Exit;
+  If N > DN Then N := DN;
+  For I := 0 To N - 1 Do
+    MemW[0:Dst + I * 2] := MapCaseC(MemW[0:Src + I * 2], Flags);
+  LCMapStringW := N;
+End;
+
+{ 1 inferieur, 2 egal, 3 superieur ; NORM_IGNORECASE (1) }
+Function CmpChars(A, B, NA, NB, Flags, W : LongInt) : LongInt;
+Var I, CA, CB : LongInt;
+Begin
+  I := 0;
+  Repeat
+    If I < NA Then
+    Begin
+      If W = 2 Then CA := MemW[0:A + I * 2] Else CA := Mem[0:A + I];
+    End
+    Else CA := 0;
+    If I < NB Then
+    Begin
+      If W = 2 Then CB := MemW[0:B + I * 2] Else CB := Mem[0:B + I];
+    End
+    Else CB := 0;
+    If (Flags And 1) <> 0 Then
+    Begin
+      CA := MapCaseC(CA, $200); CB := MapCaseC(CB, $200);
+    End;
+    If CA < CB Then
+    Begin
+      CmpChars := 1;
+      Exit;
+    End;
+    If CA > CB Then
+    Begin
+      CmpChars := 3;
+      Exit;
+    End;
+    Inc(I);
+  Until (I >= NA) And (I >= NB);
+  CmpChars := 2;
+End;
+
+Function CompareStringA(Lcid, Flags, A, NA, B, NB : LongInt) : LongInt;
+Begin
+  If NA < 0 Then NA := StrLenZ(A);
+  If NB < 0 Then NB := StrLenZ(B);
+  CompareStringA := CmpChars(A, B, NA, NB, Flags, 1);
+End;
+
+Function CompareStringW(Lcid, Flags, A, NA, B, NB : LongInt) : LongInt;
+Begin
+  If NA < 0 Then
+  Begin
+    NA := 0;
+    While MemW[0:A + NA * 2] <> 0 Do Inc(NA);
+  End;
+  If NB < 0 Then
+  Begin
+    NB := 0;
+    While MemW[0:B + NB * 2] <> 0 Do Inc(NB);
+  End;
+  CompareStringW := CmpChars(A, B, NA, NB, Flags, 2);
+End;
+
+{ ----------------------------- Divers ------------------------------- }
+
+Function GetMapMode(Hdc : LongInt) : LongInt;
+Begin
+  GetMapMode := 1;
+End;
+
+Function SetMapMode(Hdc, M : LongInt) : LongInt;
+Begin
+  SetMapMode := 1;
+End;
+
+Function MessageBoxIndirectA(P : LongInt) : LongInt;
+Begin
+  MessageBoxIndirectA := MessageBoxA(MemL[0:P + 4], MemL[0:P + 12],
+                                     MemL[0:P + 16], MemL[0:P + 20]);
+End;
+
+Function SetFileTime(H, PC, PA, PW : LongInt) : LongInt;
+Begin
+  SetFileTime := 1;
+End;
+
+Function SetHandleCount(N : LongInt) : LongInt;
+Begin
+  SetHandleCount := N;
+End;
+
+Function DisableThreadLibraryCalls(H : LongInt) : LongInt;
+Begin
+  DisableThreadLibraryCalls := 1;
+End;
+
+Function ExtEscape(Hdc, Esc, NIn, PIn, NOut, POut : LongInt) : LongInt;
+Begin
+  ExtEscape := 0;
+End;
+
+{ Thunks plats 16/32 bits (DSETUP16.DLL...) : non pris en charge, la
+  connexion echoue proprement }
+Function ThunkConnect32(P1, P2, P3, P4, P5, P6 : LongInt) : LongInt;
+Begin
+  ThunkConnect32 := 0;
+End;
+
+Function SMapLS_IP_EBP_12 : LongInt;
+Begin
+  SMapLS_IP_EBP_12 := 0;
+End;
+
+Function SMapLS_IP_EBP_16 : LongInt;
+Begin
+  SMapLS_IP_EBP_16 := 0;
+End;
+
+Function SMapLS_IP_EBP_20 : LongInt;
+Begin
+  SMapLS_IP_EBP_20 := 0;
+End;
+
+Function SMapLS_IP_EBP_24 : LongInt;
+Begin
+  SMapLS_IP_EBP_24 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_12 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_12 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_16 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_16 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_20 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_20 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_24 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_24 := 0;
+End;
+
+Function SHFileOperation(P : LongInt) : LongInt;
+Begin
+  SHFileOperation := 1;
+End;
+
+{ Table des API Win16 : module (K KERNEL, U USER, G GDI, B KEYBOARD,
+  L LZEXPAND, S SHELL, M MMSYSTEM, E WIN87EM, N WING, V VER, C COMMDLG,
+  T TOOLHELP, Y SYSTEM, D DISPLAY, O SOUND), ordinal, arguments dans
+  l'ordre de declaration (W mot, I entier signe, L long, P pointeur
+  lointain converti, S pointeur lointain brut, D double, V variable),
+  resultat (W AX, L DX:AX, R registres) ; =n : constante ; X inconnue.
+  Ordinaux d'apres la documentation de l'API Windows 3.1. }
+
+Const
+  W16ApiN = 1760;
+  W16Apis : Array[0..W16ApiN - 1] Of String[40] = (
+    'K001:X>W FatalExit',
+    'K002:>W ExitKernel',
+    'K003:>L GetVersion',
+    'K004:WWW>W LocalInit',
+    'K005:WW>W LocalAlloc',
+    'K006:WWW>W LocalReAlloc',
+    'K007:W>W LocalFree',
+    'K008:W>L LocalLock',
+    'K009:W>W LocalUnlock',
+    'K010:W>W LocalSize',
+    'K011:W>W LocalHandle',
+    'K012:W>W LocalFlags',
+    'K013:W>W LocalCompact',
+    'K014:L>L LocalNotify',
+    'K015:WL>W GlobalAlloc',
+    'K016:WLW>W GlobalReAlloc',
+    'K017:W>W GlobalFree',
+    'K018:W>L GlobalLock',
+    'K019:W>W GlobalUnlock',
+    'K020:W>L GlobalSize',
+    'K021:W>L GlobalHandle',
+    'K022:W>W GlobalFlags',
+    'K023:W>W LockSegment',
+    'K024:W>W UnlockSegment',
+    'K025:L>L GlobalCompact',
+    'K026:W>W GlobalFreeAll',
+    'K027:WPW>W GetModuleName',
+    'K028:>L GlobalMasterHandle',
+    'K029:>W Yield',
+    'K030:W>W WaitEvent',
+    'K031:W>W PostEvent',
+    'K032:WI>W SetPriority',
+    'K033:W>W LockCurrentTask',
+    'K034:WW>W SetTaskQueue',
+    'K035:W>W GetTaskQueue',
+    'K036:>L GetCurrentTask',
+    'K037:>L GetCurrentPDB',
+    'K038:WS>L SetTaskSignalProc',
+    'K039:X>W SetTaskSwitchProc',
+    'K040:X>W SetTaskInterchange',
+    'K041:>W EnableDos',
+    'K042:>W DisableDos',
+    'K043:X>W IsScreenGrab',
+    'K044:X>W BuildPDB',
+    'K045:PP>W LoadModule',
+    'K046:W>W FreeModule',
+    'K047:S>L GetModuleHandle',
+    'K048:W>W GetModuleUsage',
+    'K049:WPI>W GetModuleFileName',
+    'K050:WP>L GetProcAddress',
+    'K051:SW>L MakeProcInstance',
+    'K052:S>W FreeProcInstance',
+    'K053:X>W CallProcInstance',
+    'K054:WWW>W GetInstanceData',
+    'K055:R>R Catch',
+    'K056:R>R Throw',
+    'K057:PPI>W GetProfileInt',
+    'K058:PPPPW>W GetProfileString',
+    'K059:PPP>W WriteProfileString',
+    'K060:WPP>W FindResource',
+    'K061:WW>W LoadResource',
+    'K062:W>L LockResource',
+    'K063:W>W FreeResource',
+    'K064:WW>W AccessResource',
+    'K065:WW>L SizeofResource',
+    'K066:WWL>W AllocResource',
+    'K067:WPS>L SetResourceHandler',
+    'K068:W>W InitAtomTable',
+    'K069:P>W FindAtom',
+    'K070:P>W AddAtom',
+    'K071:W>W DeleteAtom',
+    'K072:WPW>W GetAtomName',
+    'K073:W>W GetAtomHandle',
+    'K074:PPW>W OpenFile',
+    'K075:X>W OpenPathName',
+    'K076:X>W DeletePathName',
+    'K077:S>L Reserved1',
+    'K078:SS>L Reserved2',
+    'K079:S>L Reserved3',
+    'K080:S>L Reserved4',
+    'K081:W>W _lclose',
+    'K082:WSW>W _lread',
+    'K083:PW>W _lcreat',
+    'K084:WLW>L _llseek',
+    'K085:PW>W _lopen',
+    'K086:WPW>W _lwrite',
+    'K087:PP>W Reserved5',
+    'K088:SP>L lstrcpy',
+    'K089:SP>L lstrcat',
+    'K090:P>W lstrlen',
+    'K091:R>R InitTask',
+    'K092:W>L GetTempDrive',
+    'K093:S>L GetCodeHandle',
+    'K094:W>W DefineHandleTable',
+    'K095:P>W LoadLibrary',
+    'K096:W>W FreeLibrary',
+    'K097:WPWP>W GetTempFileName',
+    'K098:>W GetLastDiskChange',
+    'K099:>L GetLPErrMode',
+    'K100:>W ValidateCodeSegments',
+    'K101:X>W NoHookDosCall',
+    'K102:R>R DOS3Call',
+    'K103:R>R NetBIOSCall',
+    'K104:SP>W GetCodeInfo',
+    'K105:>W GetExeVersion',
+    'K106:W>L SetSwapAreaSize',
+    'K107:W>W SetErrorMode',
+    'K108:WWW>W SwitchStackTo',
+    'K109:R>R SwitchStackBack',
+    'K110:W>L PatchCodeHandle',
+    'K111:W>L GlobalWire',
+    'K112:W>W GlobalUnWire',
+    'K113:=3 __AHSHIFT',
+    'K114:=8 __AHINCR',
+    'K115:P>W OutputDebugString',
+    'K116:X>W InitLib',
+    'K117:>W OldYield',
+    'K118:>W GetTaskQueueDS',
+    'K119:>W GetTaskQueueES',
+    'K120:X>W UndefDynLink',
+    'K121:WW>W LocalShrink',
+    'K122:>W IsTaskLocked',
+    'K123:>W KbdRst',
+    'K124:>W EnableKernel',
+    'K125:>W DisableKernel',
+    'K126:X>W MemoryFreed',
+    'K127:PPIP>W GetPrivateProfileInt',
+    'K128:PPPPWP>W GetPrivateProfileStrin',
+    'K129:PPPP>W WritePrivateProfileStr',
+    'K130:P>L FileCDR',
+    'K131:>L GetDOSEnvironment',
+    'K132:>L GetWinFlags',
+    'K133:W>W GetExePtr',
+    'K134:PW>W GetWindowsDirectory',
+    'K135:PW>W GetSystemDirectory',
+    'K136:W>W GetDriveType',
+    'K137:WP>W FatalAppExit',
+    'K138:W>L GetHeapSpaces',
+    'K139:X>W DoSignal',
+    'K140:SPPWW>W SetSigHandler',
+    'K141:X>W InitTask1',
+    'K142:PW>W GetProfileSectionNames',
+    'K143:PWP>W GetPrivateProfileSecti',
+    'K144:PP>W CreateDirectory',
+    'K145:P>W RemoveDirectory',
+    'K146:P>W DeleteFile',
+    'K147:L>W SetLastError',
+    'K148:>L GetLastError',
+    'K149:P>W GetVersionEx',
+    'K150:W>W DirectedYield',
+    'K151:X>W WinOldApCall',
+    'K152:>W GetNumTasks',
+    'K154:S>W GlobalNotify',
+    'K155:>W GetTaskDS',
+    'K156:L>L LimitEMSPages',
+    'K157:L>L GetCurPID',
+    'K158:W>W IsWinOldApTask',
+    'K159:W>L GlobalHandleNoRIP',
+    'K160:X>W EMSCopy',
+    'K161:>W LocalCountFree',
+    'K162:>W LocalHeapSize',
+    'K163:W>W GlobalLRUOldest',
+    'K164:W>W GlobalLRUNewest',
+    'K165:W>W A20Proc',
+    'K166:PW>W WinExec',
+    'K167:W>W GetExpWinVer',
+    'K168:WWW>W DirectResAlloc',
+    'K169:W>L GetFreeSpace',
+    'K170:W>W AllocCStoDSAlias',
+    'K171:W>W AllocDStoCSAlias',
+    'K172:W>W AllocAlias',
+    'K173:=0 __ROMBIOS',
+    'K174:=0 __A000H',
+    'K175:W>W AllocSelector',
+    'K176:W>W FreeSelector',
+    'K177:WW>W PrestoChangoSelector',
+    'K178:=1043 __WINFLAGS',
+    'K179:=0 __D000H',
+    'K180:LL>W LongPtrAdd',
+    'K181:=0 __B000H',
+    'K182:=0 __B800H',
+    'K183:=0 __0000H',
+    'K184:L>L GlobalDOSAlloc',
+    'K185:W>W GlobalDOSFree',
+    'K186:W>L GetSelectorBase',
+    'K187:WL>W SetSelectorBase',
+    'K188:W>L GetSelectorLimit',
+    'K189:WL>W SetSelectorLimit',
+    'K190:=0 __E000H',
+    'K191:W>W GlobalPageLock',
+    'K192:W>W GlobalPageUnlock',
+    'K193:=0 __0040H',
+    'K194:=0 __F000H',
+    'K195:=0 __C000H',
+    'K196:WWW>W SelectorAccessRights',
+    'K197:W>W GlobalFix',
+    'K198:W>W GlobalUnfix',
+    'K199:W>W SetHandleCount',
+    'K200:>W ValidateFreeSpaces',
+    'K201:X>W ReplaceInst',
+    'K202:X>W RegisterPtrace',
+    'K203:R>R DebugBreak',
+    'K204:X>W SwapRecording',
+    'K205:X>W CVWBreak',
+    'K206:W>W AllocSelectorArray',
+    'K207:W>W IsDBCSLeadByte',
+    'K208:WLLL>L K208',
+    'K209:LLWL>L K209',
+    'K210:LLWLL>L K210',
+    'K211:LLW>L K211',
+    'K213:LLWW>L K213',
+    'K214:LLW>L K214',
+    'K215:LW>L K215',
+    'K216:LLPL>L RegEnumKey',
+    'K217:LPP>L RegOpenKey',
+    'K218:LPP>L RegCreateKey',
+    'K219:LP>L RegDeleteKey',
+    'K220:L>L RegCloseKey',
+    'K221:LPLPL>L RegSetValue',
+    'K222:LP>L RegDeleteValue',
+    'K223:LLPPPPPP>L RegEnumValue',
+    'K224:LPPP>L RegQueryValue',
+    'K225:LPPPPP>L RegQueryValueEx',
+    'K226:LPLLPL>L RegSetValueEx',
+    'K227:L>L RegFlushKey',
+    'K228:W>W K228',
+    'K229:L>W K229',
+    'K230:W>L GlobalSmartPageLock',
+    'K231:W>L GlobalSmartPageUnlock',
+    'K232:X>W RegLoadKey',
+    'K233:X>W RegUnloadKey',
+    'K234:X>W RegSaveKey',
+    'K235:X>W InvalidateNlsCache',
+    'K236:X>W GetProductName',
+    'K237:>W K237',
+    'K262:X>W WOWWaitForMsgAndEvent',
+    'K263:X>W WOWMsgBox',
+    'K273:X>W K273',
+    'K274:PPW>W GetShortPathName',
+    'K310:W>W LocalHandleDelta',
+    'K311:P>L GetSetKernelDOSProc',
+    'K314:X>W DebugDefineSegment',
+    'K315:>W WriteOutProfiles',
+    'K316:>L GetFreeMemInfo',
+    'K318:X>W FatalExitHook',
+    'K319:X>W FlushCachedFileHandle',
+    'K320:W>W IsTask',
+    'K323:W>W IsRomModule',
+    'K324:WP>W LogError',
+    'K325:WPP>W LogParamError',
+    'K326:W>W IsRomFile',
+    'K327:R>R K327',
+    'K328:V>W _DebugOutput',
+    'K329:PW>W K329',
+    'K332:=0 THHOOK',
+    'K334:SW>W IsBadReadPtr',
+    'K335:SW>W IsBadWritePtr',
+    'K336:S>W IsBadCodePtr',
+    'K337:SW>W IsBadStringPtr',
+    'K338:S>W HasGPHandler',
+    'K339:>W DiagQuery',
+    'K340:P>W DiagOutput',
+    'K341:P>L ToolHelpHook',
+    'K342:=0 __GP',
+    'K343:X>W RegisterWinOldApHook',
+    'K344:X>W GetWinOldApHooks',
+    'K345:W>W IsSharedSelector',
+    'K346:SL>W IsBadHugeReadPtr',
+    'K347:SL>W IsBadHugeWritePtr',
+    'K348:PPL>W hmemcpy',
+    'K349:WSL>L _hread',
+    'K350:WPL>L _hwrite',
+    'K351:>W BUNNY_351',
+    'K352:SPW>L lstrcatn',
+    'K353:SPW>L lstrcpyn',
+    'K354:W>L GetAppCompatFlags',
+    'K355:PW>W GetWinDebugInfo',
+    'K356:P>W SetWinDebugInfo',
+    'K357:S>L MapSL',
+    'K358:L>L MapLS',
+    'K359:S>L UnMapLS',
+    'K360:PPW>W OpenFileEx',
+    'K361:>W PIGLET_361',
+    'K362:X>W ThunkTerminateProcess',
+    'K365:R>R GlobalChangeLockCount',
+    'K403:WW>W FarSetOwner',
+    'K404:W>W FarGetOwner',
+    'K406:PPPWP>W WritePrivateProfileStr',
+    'K407:PPPWP>W GetPrivateProfileStruc',
+    'K408:X>W KERNEL_408',
+    'K409:X>W KERNEL_409',
+    'K410:X>W CreateProcessFromWinEx',
+    'K411:LP>L GetCurrentDirectory',
+    'K412:P>W SetCurrentDirectory',
+    'K413:PP>W FindFirstFile',
+    'K414:WP>W FindNextFile',
+    'K415:W>W FindClose',
+    'K416:PPP>W WritePrivateProfileSec',
+    'K417:PP>W WriteProfileSection',
+    'K418:PPWP>W GetPrivateProfileSecti',
+    'K419:PPW>W GetProfileSection',
+    'K420:P>L GetFileAttributes',
+    'K421:PL>W SetFileAttributes',
+    'K422:PPPPP>W GetDiskFreeSpace',
+    'K423:P>W LogApiThk',
+    'K431:PW>W IsPeFormat',
+    'K432:X>W FileTimeToLocalFileTim',
+    'K434:PPW>W UnicodeToAnsi',
+    'K435:X>W GetTaskFlags',
+    'K436:P>W _ConfirmSysLevel',
+    'K437:P>W _CheckNotSysLevel',
+    'K438:PL>W _CreateSysLevel',
+    'K439:P>W _EnterSysLevel',
+    'K440:P>W _LeaveSysLevel',
+    'K441:PLSSLP>L CreateThread16',
+    'K442:>L VWin32_EventCreate',
+    'K443:L>L VWin32_EventDestroy',
+    'K444:PW>W Local32Info',
+    'K445:PW>W Local32First',
+    'K446:P>W Local32Next',
+    'K447:>W WIN32_OldYield',
+    'K448:X>W KERNEL_448',
+    'K449:>L GetpWin16Lock',
+    'K450:L>L VWin32_EventWait',
+    'K451:L>L VWin32_EventSet',
+    'K452:P>L LoadLibrary32',
+    'K453:LP>L GetProcAddress32',
+    'K454:=0 __FLATCS',
+    'K455:=0 __FLATDS',
+    'K456:WWW>L DefResourceHandler',
+    'K457:LL>L CreateW32Event',
+    'K458:L>L SetW32Event',
+    'K459:L>L ResetW32Event',
+    'K460:LL>L WaitForSingleObject',
+    'K461:LPLL>L WaitForMultipleObjects',
+    'K462:>L GetCurrentThreadId',
+    'K463:LW>L SetThreadQueue',
+    'K464:L>L GetThreadQueue',
+    'K465:X>W NukeProcess',
+    'K466:W>W ExitProcess',
+    'K467:X>W WOACreateConsole',
+    'K468:X>W WOASpawnConApp',
+    'K469:X>W WOAGimmeTitle',
+    'K470:X>W WOADestroyConsole',
+    'K471:>L GetCurrentProcessId',
+    'K472:R>R MapHInstLS',
+    'K473:R>R MapHInstSL',
+    'K474:L>L CloseW32Handle',
+    'K475:>W GetTEBSelectorFS',
+    'K476:L>L ConvertToGlobalHandle',
+    'K477:X>W WOAFullScreen',
+    'K478:X>W WOATerminateProcess',
+    'K479:L>L KERNEL_479',
+    'K480:>W _EnterWin16Lock',
+    'K481:>W _LeaveWin16Lock',
+    'K482:P>L LoadSystemLibrary32',
+    'K483:L>L MapProcessHandle',
+    'K484:LIL>L SetProcessDword',
+    'K485:LI>L GetProcessDword',
+    'K486:L>L FreeLibrary32',
+    'K487:LPW>L GetModuleFileName32',
+    'K488:P>L GetModuleHandle32',
+    'K489:X>W KERNEL_489',
+    'K490:W>W KERNEL_490',
+    'K491:LL>L RegisterServiceProcess',
+    'K492:X>W WOAAbort',
+    'K493:LLLL>W UTInit',
+    'K494:X>W KERNEL_494',
+    'K495:LPLLL>L WaitForMultipleObjects',
+    'K500:V>L WOW16Call',
+    'K501:X>W KDDBGOUT',
+    'K502:X>W WOWGETNEXTVDMCOMMAND',
+    'K503:X>W WOWREGISTERSHELLWINDOW',
+    'K504:X>W WOWLOADMODULE',
+    'K505:X>W WOWQUERYPERFORMANCECOU',
+    'K506:X>W WOWCURSORICONOP',
+    'K507:X>W WOWFAILEDEXEC',
+    'K508:X>W WOWCLOSECOMPORT',
+    'K511:X>W WOWKILLREMOTETASK',
+    'K512:X>W WOWQUERYDEBUG',
+    'K513:PLL>L LoadLibraryEx32W',
+    'K514:L>L FreeLibrary32W',
+    'K515:LP>L GetProcAddress32W',
+    'K516:SW>L GetVDMPointer32W',
+    'K517:V>L CallProc32W',
+    'K518:V>L _CallProcEx32W',
+    'K519:X>W EXITKERNELTHUNK',
+    'K520:=4200 __MOD_KERNEL',
+    'K521:=4201 __MOD_DKERNEL',
+    'K522:=4203 __MOD_USER',
+    'K523:=4204 __MOD_DUSER',
+    'K524:=4205 __MOD_GDI',
+    'K525:=4206 __MOD_DGDI',
+    'K526:=4207 __MOD_KEYBOARD',
+    'K527:=4208 __MOD_SOUND',
+    'K528:=4209 __MOD_SHELL',
+    'K529:=4210 __MOD_WINSOCK',
+    'K530:=4211 __MOD_TOOLHELP',
+    'K531:=4212 __MOD_MMEDIA',
+    'K532:=4213 __MOD_COMMDLG',
+    'K541:X>W WOWSETEXITONLASTAPP',
+    'K544:X>W WOWSETCOMPATHANDLE',
+    'K533:X>W ConvertDDEHandleLS',
+    'K534:X>W ConvertDDEHandleSL',
+    'K535:LL>L VWin32_BoostThreadGrou',
+    'K536:LL>L VWin32_BoostThreadStat',
+    'K537:X>W KERNEL_537',
+    'K538:X>W ThunkTheTemplateHandle',
+    'K540:X>W KERNEL_540',
+    'K542:X>W KERNEL_542',
+    'K543:X>W KERNEL_543',
+    'K560:LS>L SetThunkletCallbackGlu',
+    'K561:SL>L AllocLSThunkletCallbac',
+    'K562:LL>L AllocSLThunkletCallbac',
+    'K563:SL>L FindLSThunkletCallback',
+    'K564:LL>L FindSLThunkletCallback',
+    'K566:X>W KERNEL_566',
+    'K567:SLW>L AllocLSThunkletCallbac',
+    'K568:LLW>L AllocSLThunkletCallbac',
+    'K600:X>W AllocCodeAlias',
+    'K601:X>W FreeCodeAlias',
+    'K602:>W GetDummyModuleHandleDS',
+    'K603:X>W KERNEL_603',
+    'K604:R>R CBClientGlueSL',
+    'K605:LL>L AllocSLThunkletCallbac',
+    'K606:SL>L AllocLSThunkletCallbac',
+    'K607:SLL>L AllocLSThunkletSysthun',
+    'K608:LSL>L AllocSLThunkletSysthun',
+    'K609:SL>L FindLSThunkletCallback',
+    'K610:LL>L FindSLThunkletCallback',
+    'K611:LL>W FreeThunklet',
+    'K612:P>W IsSLThunklet',
+    'K613:X>W HugeMapLS',
+    'K614:X>W HugeUnMapLS',
+    'K615:LLL>W ConvertDialog32To16',
+    'K616:LLL>W ConvertMenu32To16',
+    'K617:P>W GetMenu32Size',
+    'K618:P>W GetDialog32Size',
+    'K619:WSL>W RegisterCBClient',
+    'K620:R>R CBClientThunkSL',
+    'K621:R>R CBClientThunkSLEx',
+    'K622:WSL>W UnRegisterCBClient',
+    'K623:L>W InitCBClient',
+    'K624:LL>L SetFastQueue',
+    'K625:>L GetFastQueue',
+    'K626:X>W SmashEnvironment',
+    'K627:SLW>W IsBadFlatReadWritePtr',
+    'K630:R>R C16ThkSL',
+    'K631:R>R C16ThkSL01',
+    'K651:PPWLPPW>L ThunkConnect16',
+    'K652:X>W IsThreadId',
+    'K653:X>W OkWithKernelToChangeUs',
+    'K666:PLPL>L UTGlue16',
+    'K667:WW>L EntryAddrProc',
+    'K668:WWW>L MyAlloc',
+    'K669:LWWWLW>W DllEntryPoint',
+    'K700:>L SSInit',
+    'K701:X>W SSOnBigStack',
+    'K702:X>W SSCall',
+    'K703:X>W CallProc32WFix',
+    'K704:R>R SSConfirmSmallStack',
+    'K901:R>R __wine_vxd_vmm',
+    'K905:R>R __wine_vxd_timer',
+    'K909:R>R __wine_vxd_reboot',
+    'K910:R>R __wine_vxd_vdd',
+    'K912:R>R __wine_vxd_vmd',
+    'K914:R>R __wine_vxd_comm',
+    'K923:R>R __wine_vxd_shell',
+    'K933:R>R __wine_vxd_pagefile',
+    'K938:R>R __wine_vxd_apm',
+    'K939:R>R __wine_vxd_vxdloader',
+    'K945:R>R __wine_vxd_win32s',
+    'K951:R>R __wine_vxd_configmg',
+    'K955:R>R __wine_vxd_enable',
+    'U001:WPPW>W MessageBox',
+    'U002:>W OldExitWindows',
+    'U003:X>W EnableOEMLayer',
+    'U004:X>W DisableOEMLayer',
+    'U005:W>W InitApp',
+    'U006:W>W PostQuitMessage',
+    'U007:LW>W ExitWindows',
+    'U010:WWWS>W SetTimer',
+    'U011:WWWS>W SetSystemTimer',
+    'U012:WW>W KillTimer',
+    'U013:>L GetTickCount',
+    'U014:>L GetTimerResolution',
+    'U015:>L GetCurrentTime',
+    'U016:P>W ClipCursor',
+    'U017:P>W GetCursorPos',
+    'U018:W>W SetCapture',
+    'U019:>W ReleaseCapture',
+    'U020:W>W SetDoubleClickTime',
+    'U021:>W GetDoubleClickTime',
+    'U022:W>W SetFocus',
+    'U023:>W GetFocus',
+    'U024:WP>W RemoveProp',
+    'U025:WP>W GetProp',
+    'U026:WPW>W SetProp',
+    'U027:WS>W EnumProps',
+    'U028:WP>W ClientToScreen',
+    'U029:WP>W ScreenToClient',
+    'U030:L>W WindowFromPoint',
+    'U031:W>W IsIconic',
+    'U032:WP>W GetWindowRect',
+    'U033:WP>W GetClientRect',
+    'U034:WW>W EnableWindow',
+    'U035:W>W IsWindowEnabled',
+    'U036:WSW>W GetWindowText',
+    'U037:WS>W SetWindowText',
+    'U038:W>W GetWindowTextLength',
+    'U039:WP>W BeginPaint',
+    'U040:WP>W EndPaint',
+    'U041:PPLIIIIWWWS>W CreateWindow',
+    'U042:WW>W ShowWindow',
+    'U043:W>W CloseWindow',
+    'U044:W>W OpenIcon',
+    'U045:W>W BringWindowToTop',
+    'U046:W>W GetParent',
+    'U047:W>W IsWindow',
+    'U048:WW>W IsChild',
+    'U049:W>W IsWindowVisible',
+    'U050:PP>W FindWindow',
+    'U051:X>W BEAR51',
+    'U052:>W AnyPopup',
+    'U053:W>W DestroyWindow',
+    'U054:SL>W EnumWindows',
+    'U055:WSL>W EnumChildWindows',
+    'U056:WWWWWW>W MoveWindow',
+    'U057:P>W RegisterClass',
+    'U058:WPW>W GetClassName',
+    'U059:W>W SetActiveWindow',
+    'U060:>W GetActiveWindow',
+    'U061:WIIPP>W ScrollWindow',
+    'U062:WWIW>W SetScrollPos',
+    'U063:WW>W GetScrollPos',
+    'U064:WWIIW>W SetScrollRange',
+    'U065:WWPP>W GetScrollRange',
+    'U066:W>W GetDC',
+    'U067:W>W GetWindowDC',
+    'U068:WW>W ReleaseDC',
+    'U069:W>W SetCursor',
+    'U070:WW>W SetCursorPos',
+    'U071:W>W ShowCursor',
+    'U072:PIIII>W SetRect',
+    'U073:P>W SetRectEmpty',
+    'U074:PP>W CopyRect',
+    'U075:P>W IsRectEmpty',
+    'U076:PL>W PtInRect',
+    'U077:PII>W OffsetRect',
+    'U078:PII>W InflateRect',
+    'U079:PPP>W IntersectRect',
+    'U080:PPP>W UnionRect',
+    'U081:WPW>W FillRect',
+    'U082:WP>W InvertRect',
+    'U083:WPW>W FrameRect',
+    'U084:WIIW>W DrawIcon',
+    'U085:WPIPW>W DrawText',
+    'U086:>L IconSize',
+    'U087:WPWS>W DialogBox',
+    'U088:WI>W EndDialog',
+    'U089:WPWS>W CreateDialog',
+    'U090:WP>W IsDialogMessage',
+    'U091:WW>W GetDlgItem',
+    'U092:WWS>W SetDlgItemText',
+    'U093:WWSW>W GetDlgItemText',
+    'U094:WWWW>W SetDlgItemInt',
+    'U095:WIPW>W GetDlgItemInt',
+    'U096:WWWW>W CheckRadioButton',
+    'U097:WWW>W CheckDlgButton',
+    'U098:WW>W IsDlgButtonChecked',
+    'U099:WPW>W DlgDirSelect',
+    'U100:WPWWW>W DlgDirList',
+    'U101:WWWWL>L SendDlgItemMessage',
+    'U102:PLW>W AdjustWindowRect',
+    'U103:WP>W MapDialogRect',
+    'U104:W>W MessageBeep',
+    'U105:WW>W FlashWindow',
+    'U106:W>W GetKeyState',
+    'U107:WWWL>L DefWindowProc',
+    'U108:PWWW>W GetMessage',
+    'U109:PWWWW>W PeekMessage',
+    'U110:WWWL>W PostMessage',
+    'U111:WWWL>L SendMessage',
+    'U112:>W WaitMessage',
+    'U113:P>W TranslateMessage',
+    'U114:P>L DispatchMessage',
+    'U115:L>W ReplyMessage',
+    'U116:WWWL>W PostAppMessage',
+    'U117:W>W WindowFromDC',
+    'U118:P>W RegisterWindowMessage',
+    'U119:>L GetMessagePos',
+    'U120:>L GetMessageTime',
+    'U121:IS>L SetWindowsHook',
+    'U122:SWWWL>L CallWindowProc',
+    'U123:PI>W CallMsgFilter',
+    'U124:W>W UpdateWindow',
+    'U125:WPW>W InvalidateRect',
+    'U126:WWW>W InvalidateRgn',
+    'U127:WP>W ValidateRect',
+    'U128:WW>W ValidateRgn',
+    'U129:WI>W GetClassWord',
+    'U130:WIW>W SetClassWord',
+    'U131:WI>L GetClassLong',
+    'U132:WIL>L SetClassLong',
+    'U133:WI>W GetWindowWord',
+    'U134:WIW>W SetWindowWord',
+    'U135:WI>L GetWindowLong',
+    'U136:WIL>L SetWindowLong',
+    'U137:W>W OpenClipboard',
+    'U138:>W CloseClipboard',
+    'U139:>W EmptyClipboard',
+    'U140:>W GetClipboardOwner',
+    'U141:WW>W SetClipboardData',
+    'U142:W>W GetClipboardData',
+    'U143:>W CountClipboardFormats',
+    'U144:W>W EnumClipboardFormats',
+    'U145:P>W RegisterClipboardForma',
+    'U146:WPI>W GetClipboardFormatName',
+    'U147:W>W SetClipboardViewer',
+    'U148:>W GetClipboardViewer',
+    'U149:WW>W ChangeClipboardChain',
+    'U150:WP>W LoadMenu',
+    'U151:>W CreateMenu',
+    'U152:W>W DestroyMenu',
+    'U153:WWSWW>W ChangeMenu',
+    'U154:WWW>W CheckMenuItem',
+    'U155:WWW>W EnableMenuItem',
+    'U156:WW>W GetSystemMenu',
+    'U157:W>W GetMenu',
+    'U158:WW>W SetMenu',
+    'U159:WW>W GetSubMenu',
+    'U160:W>W DrawMenuBar',
+    'U161:WWPIW>W GetMenuString',
+    'U162:WWWW>W HiliteMenuItem',
+    'U163:WWWW>W CreateCaret',
+    'U164:>W DestroyCaret',
+    'U165:WW>W SetCaretPos',
+    'U166:W>W HideCaret',
+    'U167:W>W ShowCaret',
+    'U168:W>W SetCaretBlinkTime',
+    'U169:>W GetCaretBlinkTime',
+    'U170:W>W ArrangeIconicWindows',
+    'U171:WPWL>W WinHelp',
+    'U172:WW>W SwitchToThisWindow',
+    'U173:WP>W LoadCursor',
+    'U174:WP>W LoadIcon',
+    'U175:WP>W LoadBitmap',
+    'U176:WWPI>W LoadString',
+    'U177:WP>W LoadAccelerators',
+    'U178:WWP>W TranslateAccelerator',
+    'U179:I>W GetSystemMetrics',
+    'U180:W>L GetSysColor',
+    'U181:WPP>W SetSysColors',
+    'U182:WW>W KillSystemTimer',
+    'U183:P>W GetCaretPos',
+    'U184:X>W QuerySendMessage',
+    'U185:WWSSIIIII>W GrayString',
+    'U186:W>W SwapMouseButton',
+    'U187:>W EndMenu',
+    'U188:W>W SetSysModalWindow',
+    'U189:>W GetSysModalWindow',
+    'U190:WPW>W GetUpdateRect',
+    'U191:WL>W ChildWindowFromPoint',
+    'U192:>W InSendMessage',
+    'U193:W>W IsClipboardFormatAvail',
+    'U194:WPW>W DlgDirSelectComboBox',
+    'U195:WPWWW>W DlgDirListComboBox',
+    'U196:WIIPIIPI>L TabbedTextOut',
+    'U197:WPWWP>L GetTabbedTextExtent',
+    'U198:WW>W CascadeChildWindows',
+    'U199:WW>W TileChildWindows',
+    'U200:PWW>W OpenComm',
+    'U201:P>W SetCommState',
+    'U202:WP>W GetCommState',
+    'U203:WP>W GetCommError',
+    'U204:WPW>W ReadComm',
+    'U205:WPW>W WriteComm',
+    'U206:WW>W TransmitCommChar',
+    'U207:W>W CloseComm',
+    'U208:WW>L SetCommEventMask',
+    'U209:WW>W GetCommEventMask',
+    'U210:W>W SetCommBreak',
+    'U211:W>W ClearCommBreak',
+    'U212:WW>W UngetCommChar',
+    'U213:PP>W BuildCommDCB',
+    'U214:WW>L EscapeCommFunction',
+    'U215:WW>W FlushComm',
+    'U216:WWWW>L UserSeeUserDo',
+    'U217:WI>W LookupMenuHandle',
+    'U218:WWWS>W DialogBoxIndirect',
+    'U219:WPWS>W CreateDialogIndirect',
+    'U220:P>W LoadMenuIndirect',
+    'U221:WIIPPWP>W ScrollDC',
+    'U222:P>W GetKeyboardState',
+    'U223:P>W SetKeyboardState',
+    'U224:W>W GetWindowTask',
+    'U225:WSL>W EnumTaskWindows',
+    'U226:X>W LockInput',
+    'U227:WWW>W GetNextDlgGroupItem',
+    'U228:WWW>W GetNextDlgTabItem',
+    'U229:W>W GetTopWindow',
+    'U230:WW>W GetNextWindow',
+    'U231:>W GetSystemDebugState',
+    'U232:WWWWWWW>W SetWindowPos',
+    'U233:WW>W SetParent',
+    'U234:IS>W UnhookWindowsHook',
+    'U235:IWLP>L DefHookProc',
+    'U236:>W GetCapture',
+    'U237:WWW>W GetUpdateRgn',
+    'U238:WW>W ExcludeUpdateRgn',
+    'U239:WPWSL>W DialogBoxParam',
+    'U240:WWWSL>W DialogBoxIndirectParam',
+    'U241:WPWSL>W CreateDialogParam',
+    'U242:WPWSL>W CreateDialogIndirectPa',
+    'U243:>L GetDialogBaseUnits',
+    'U244:PP>W EqualRect',
+    'U245:IWII>W EnableCommNotification',
+    'U246:PP>W ExitWindowsExec',
+    'U247:>W GetCursor',
+    'U248:>W GetOpenClipboardWindow',
+    'U249:W>W GetAsyncKeyState',
+    'U250:WWW>W GetMenuState',
+    'U251:WWLL>L SendDriverMessage',
+    'U252:PPL>W OpenDriver',
+    'U253:WLL>L CloseDriver',
+    'U254:W>W GetDriverModuleHandle',
+    'U255:LWWLL>L DefDriverProc',
+    'U256:WP>W GetDriverInfo',
+    'U257:WL>W GetNextDriver',
+    'U258:WWPW>W MapWindowPoints',
+    'U259:I>W BeginDeferWindowPos',
+    'U260:WWWIIIIW>W DeferWindowPos',
+    'U261:W>W EndDeferWindowPos',
+    'U262:WW>W GetWindow',
+    'U263:W>W GetMenuItemCount',
+    'U264:WW>W GetMenuItemID',
+    'U265:WW>W ShowOwnedPopups',
+    'U266:W>W SetMessageQueue',
+    'U267:WWW>W ShowScrollBar',
+    'U268:P>W GlobalAddAtom',
+    'U269:W>W GlobalDeleteAtom',
+    'U270:P>W GlobalFindAtom',
+    'U271:WPI>W GlobalGetAtomName',
+    'U272:W>W IsZoomed',
+    'U273:WWP>W ControlPanelInfo',
+    'U274:X>W GetNextQueueWindow',
+    'U275:X>W RepaintScreen',
+    'U276:X>W LockMyTask',
+    'U277:W>W GetDlgCtrlID',
+    'U278:>W GetDesktopHwnd',
+    'U279:>W OldSetDeskPattern',
+    'U280:WW>W SetSystemMenu',
+    'U281:W>W GetSysColorBrush',
+    'U282:WWW>W SelectPalette',
+    'U283:W>W RealizePalette',
+    'U284:W>W GetFreeSystemResources',
+    'U285:P>W SetDeskWallpaper',
+    'U286:>W GetDesktopWindow',
+    'U287:W>W GetLastActivePopup',
+    'U288:>L GetMessageExtraInfo',
+    'U289:R>R keybd_event',
+    'U290:WPWW>W RedrawWindow',
+    'U291:ISWW>L SetWindowsHookEx',
+    'U292:S>W UnhookWindowsHookEx',
+    'U293:SIWL>L CallNextHookEx',
+    'U294:W>W LockWindowUpdate',
+    'U299:R>R mouse_event',
+    'U300:X>W UnloadInstalledDrivers',
+    'U301:X>W EDITWNDPROC',
+    'U302:X>W STATICWNDPROC',
+    'U303:X>W BUTTONWNDPROC',
+    'U304:X>W SBWNDPROC',
+    'U305:X>W DESKTOPWNDPROC',
+    'U306:X>W MENUWNDPROC',
+    'U307:X>W LBOXCTLWNDPROC',
+    'U308:WWWL>L DefDlgProc',
+    'U309:P>W GetClipCursor',
+    'U314:WWWWW>W SignalProc',
+    'U319:WIIPPWPW>W ScrollWindowEx',
+    'U320:X>W SysErrorBox',
+    'U321:S>L SetEventHook',
+    'U322:X>W WinOldAppHackOMatic',
+    'U323:X>W GetMessage2',
+    'U324:WWWW>W FillWindow',
+    'U325:WWWWP>W PaintRect',
+    'U326:WWW>W GetControlBrush',
+    'U331:W>W EnableHardwareInput',
+    'U332:>W UserYield',
+    'U333:>W IsUserIdle',
+    'U334:W>L GetQueueStatus',
+    'U335:>W GetInputState',
+    'U336:WWW>W LoadCursorIconHandler',
+    'U337:>L GetMouseEventProc',
+    'U338:X>W ECGETDS',
+    'U343:X>W GetFilePortName',
+    'U344:X>W COMBOBOXCTLWNDPROC',
+    'U345:X>W BEAR345',
+    'U356:WWW>W LoadDIBCursorHandler',
+    'U357:WWW>W LoadDIBIconHandler',
+    'U358:W>W IsMenu',
+    'U359:WWL>W GetDCEx',
+    'U362:WWLL>W DCHook',
+    'U364:PWWWW>W LookupIconIdFromDirect',
+    'U368:WW>W CopyIcon',
+    'U369:WW>W CopyCursor',
+    'U370:WP>W GetWindowPlacement',
+    'U371:WP>W SetWindowPlacement',
+    'U372:X>W GetInternalIconHeader',
+    'U373:PPP>W SubtractRect',
+    'U374:LWWWLW>W DllEntryPoint',
+    'U375:X>W DrawTextEx',
+    'U376:X>W SetMessageExtraInfo',
+    'U378:X>W SetPropEx',
+    'U379:X>W GetPropEx',
+    'U380:X>W RemovePropEx',
+    'U382:X>W SetWindowContextHelpID',
+    'U383:X>W GetWindowContextHelpID',
+    'U384:WW>W SetMenuContextHelpId',
+    'U385:W>W GetMenuContextHelpId',
+    'U389:WPWWWW>L LoadImage',
+    'U390:WWWWW>W CopyImage',
+    'U391:LLLW>W SignalProc32',
+    'U394:WWWWWWWWW>W DrawIconEx',
+    'U395:WP>W GetIconInfo',
+    'U397:P>W RegisterClassEx',
+    'U398:WSP>W GetClassInfoEx',
+    'U399:WLW>W ChildWindowFromPointEx',
+    'U400:>W FinalUserInit',
+    'U402:PI>W GetPriorityClipboardFo',
+    'U403:PW>W UnregisterClass',
+    'U404:WSP>W GetClassInfo',
+    'U406:WWWWWPP>W CreateCursor',
+    'U407:WWWWWPP>W CreateIcon',
+    'U408:WPPP>W CreateCursorIconIndire',
+    'U409:WW>W InitThreadInput',
+    'U410:WWWWS>W InsertMenu',
+    'U411:WWWS>W AppendMenu',
+    'U412:WWW>W RemoveMenu',
+    'U413:WWW>W DeleteMenu',
+    'U414:WWWWS>W ModifyMenu',
+    'U415:>W CreatePopupMenu',
+    'U416:WWIIIWP>W TrackPopupMenu',
+    'U417:>L GetMenuCheckMarkDimens',
+    'U418:WWWWW>W SetMenuItemBitmaps',
+    'U420:V>W _wsprintf',
+    'U421:PPP>W wvsprintf',
+    'U422:WPWW>W DlgDirSelectEx',
+    'U423:WPWW>W DlgDirSelectComboBoxEx',
+    'U427:WWPP>W FindWindowEx',
+    'U428:X>W TileWindows',
+    'U429:X>W CascadeWindows',
+    'U430:PP>W lstrcmp',
+    'U431:S>L AnsiUpper',
+    'U432:S>L AnsiLower',
+    'U433:W>W IsCharAlpha',
+    'U434:W>W IsCharAlphaNumeric',
+    'U435:W>W IsCharUpper',
+    'U436:W>W IsCharLower',
+    'U437:PW>W AnsiUpperBuff',
+    'U438:PW>W AnsiLowerBuff',
+    'U441:WWWP>W InsertMenuItem',
+    'U443:X>W GetMenuItemInfo',
+    'U445:WWWWL>L DefFrameProc',
+    'U446:X>W SetMenuItemInfo',
+    'U447:WWWL>L DefMDIChildProc',
+    'U448:WWPP>W DrawAnimatedRects',
+    'U449:WWSLWIIIIW>W DrawState',
+    'U450:PLWLWWW>W CreateIconFromResource',
+    'U451:WP>W TranslateMDISysAccel',
+    'U452:LPPLIIIIWWWS>W CreateWindowEx',
+    'U454:PLWL>W AdjustWindowRectEx',
+    'U455:WL>W GetIconID',
+    'U456:WW>W LoadIconHandler',
+    'U457:W>W DestroyIcon',
+    'U458:W>W DestroyCursor',
+    'U459:SPPP>L DumpIcon',
+    'U460:WPP>W GetInternalWindowPos',
+    'U461:WWPP>W SetInternalWindowPos',
+    'U462:WW>W CalcChildScroll',
+    'U463:WWWL>W ScrollChildren',
+    'U464:WWWWWW>L DragObject',
+    'U465:WL>W DragDetect',
+    'U466:WP>W DrawFocusRect',
+    'U470:X>W StringFunc',
+    'U471:PP>W lstrcmpi',
+    'U472:S>L AnsiNext',
+    'U473:PS>L AnsiPrev',
+    'U475:WIPW>W SetScrollInfo',
+    'U476:WIP>W GetScrollInfo',
+    'U477:P>W GetKeyboardLayoutName',
+    'U478:X>W LoadKeyboardLayout',
+    'U479:X>W MenuItemFromPoint',
+    'U480:X>W GetUserLocalObjType',
+    'U482:WWW>W EnableScrollBar',
+    'U483:WWPW>W SystemParametersInfo',
+    'U489:>W USER_489',
+    'U490:>W USER_490',
+    'U492:>W USER_492',
+    'U496:>W USER_496',
+    'U498:X>W BEAR498',
+    'U499:WPW>W WNetErrorText',
+    'U500:X>W FARCALLNETDRIVER',
+    'U501:PPWP>W WNetOpenJob',
+    'U502:WPP>W WNetCloseJob',
+    'U503:PW>W WNetAbortJob',
+    'U504:PW>W WNetHoldJob',
+    'U505:PW>W WNetReleaseJob',
+    'U506:PW>W WNetCancelJob',
+    'U507:PWW>W WNetSetJobCopies',
+    'U508:WPPW>W WNetWatchQueue',
+    'U509:P>W WNetUnwatchQueue',
+    'U510:PPP>W WNetLockQueueData',
+    'U511:P>W WNetUnlockQueueData',
+    'U512:PPP>W WNetGetConnection',
+    'U513:W>W WNetGetCaps',
+    'U514:W>W WNetDeviceMode',
+    'U515:WWP>W WNetBrowseDialog',
+    'U516:PP>W WNetGetUser',
+    'U517:PPP>W WNetAddConnection',
+    'U518:PW>W WNetCancelConnection',
+    'U519:P>W WNetGetError',
+    'U520:WPP>W WNetGetErrorText',
+    'U521:X>W WNetEnable',
+    'U522:X>W WNetDisable',
+    'U523:WP>W WNetRestoreConnection',
+    'U524:WPP>W WNetWriteJob',
+    'U525:WW>W WNetConnectDialog',
+    'U526:WW>W WNetDisconnectDialog',
+    'U527:WW>W WNetConnectionDialog',
+    'U528:WP>W WNetViewQueueDialog',
+    'U529:WWWPW>W WNetPropertyDialog',
+    'U530:PP>W WNetGetDirectoryType',
+    'U531:WPW>W WNetDirectoryNotify',
+    'U532:WWPPWW>W WNetGetPropertyText',
+    'U533:X>W WNetInitialize',
+    'U534:X>W WNetLogon',
+    'U535:X>W WOWWORDBREAKPROC',
+    'U537:X>W MOUSEEVENT',
+    'U538:X>W KEYBDEVENT',
+    'U595:X>W OLDEXITWINDOWS',
+    'U600:>W GetShellWindow',
+    'U601:X>W DoHotkeyStuff',
+    'U602:X>W SetCheckCursorTimer',
+    'U604:X>W BroadcastSystemMessage',
+    'U605:X>W HackTaskMonitor',
+    'U606:LSWWPWP>W FormatMessage',
+    'U608:>W GetForegroundWindow',
+    'U609:W>W SetForegroundWindow',
+    'U610:WW>W DestroyIcon32',
+    'U620:PL>L ChangeDisplaySettings',
+    'U621:PLP>W EnumDisplaySettings',
+    'U640:LPLLL>L MsgWaitForMultipleObje',
+    'U650:X>W ActivateKeyboardLayout',
+    'U651:X>W GetKeyboardLayout',
+    'U652:X>W GetKeyboardLayoutList',
+    'U654:X>W UnloadKeyboardLayout',
+    'U655:X>W PostPostedMessages',
+    'U656:WPWW>W DrawFrameControl',
+    'U657:WWPWWPW>W DrawCaptionTemp',
+    'U658:X>W DispatchInput',
+    'U659:WPWW>W DrawEdge',
+    'U660:WWPW>W DrawCaption',
+    'U661:X>W SetSysColorsTemp',
+    'U662:X>W DrawMenubarTemp',
+    'U663:X>W GetMenuDefaultItem',
+    'U664:X>W SetMenuDefaultItem',
+    'U665:WWWP>W GetMenuItemRect',
+    'U666:WWWWW>W CheckMenuRadioItem',
+    'U667:X>W TrackPopupMenuEx',
+    'U668:WWW>W SetWindowRgn',
+    'U669:X>W GetWindowRgn',
+    'U800:X>W CHOOSEFONT_CALLBACK16',
+    'U801:X>W FINDREPLACE_CALLBACK16',
+    'U802:X>W OPENFILENAME_CALLBACK1',
+    'U803:X>W PRINTDLG_CALLBACK16',
+    'U804:X>W CHOOSECOLOR_CALLBACK16',
+    'U819:PWWWWW>W PeekMessage32',
+    'U820:PWWWW>L GetMessage32',
+    'U821:PW>W TranslateMessage32',
+    'U822:PW>L DispatchMessage32',
+    'U823:PWW>W CallMsgFilter32',
+    'U825:X>W PostMessage32',
+    'U826:X>W PostThreadMessage32',
+    'U827:P>W MessageBoxIndirect',
+    'U851:X>W MsgThkConnectionDataLS',
+    'U853:X>W FT_USRFTHKTHKCONNECTIO',
+    'U854:X>W FT__USRF2THKTHKCONNECT',
+    'U855:X>W Usr32ThkConnectionData',
+    'U890:X>W InstallIMT',
+    'U891:X>W UninstallIMT',
+    'U902:WWPWW>W LoadSystemLanguageStri',
+    'U905:>W ChangeDialogTemplate',
+    'U906:>W GetNumLanguages',
+    'U907:WWPW>W GetLanguageName',
+    'U909:WPW>W SetWindowTextEx',
+    'U910:>W BiDiMessageBoxEx',
+    'U911:WWPW>W SetDlgItemTextEx',
+    'U912:WW>L ChangeKeyboardLanguage',
+    'U913:WW>W GetCodePageSystemFont',
+    'U914:WWWL>W QueryCodePage',
+    'U915:W>L GetAppCodePage',
+    'U916:WPWPLWWPW>W CreateDialogIndirectPa',
+    'U918:WWWPLWWPW>W DialogBoxIndirectParam',
+    'U919:WWWPW>W LoadLanguageString',
+    'U920:WWWW>L SetAppCodePage',
+    'U922:>L GetBaseCodePage',
+    'U923:WPPW>W FindLanguageResource',
+    'U924:WW>L ChangeKeyboardCodePage',
+    'U930:WPPWW>W MessageBoxEx',
+    'G001:WL>L SetBkColor',
+    'G002:WW>W SetBkMode',
+    'G003:WW>W SetMapMode',
+    'G004:WW>W SetROP2',
+    'G005:WW>W SetRelAbs',
+    'G006:WW>W SetPolyFillMode',
+    'G007:WW>W SetStretchBltMode',
+    'G008:WI>W SetTextCharacterExtra',
+    'G009:WL>L SetTextColor',
+    'G010:WII>W SetTextJustification',
+    'G011:WII>L SetWindowOrg',
+    'G012:WII>L SetWindowExt',
+    'G013:WII>L SetViewportOrg',
+    'G014:WII>L SetViewportExt',
+    'G015:WII>L OffsetWindowOrg',
+    'G016:WIIII>L ScaleWindowExt',
+    'G017:WII>L OffsetViewportOrg',
+    'G018:WIIII>L ScaleViewportExt',
+    'G019:WII>W LineTo',
+    'G020:WII>L MoveTo',
+    'G021:WIIII>W ExcludeClipRect',
+    'G022:WIIII>W IntersectClipRect',
+    'G023:WIIIIIIII>W Arc',
+    'G024:WIIII>W Ellipse',
+    'G025:WIIL>W FloodFill',
+    'G026:WIIIIIIII>W Pie',
+    'G027:WIIII>W Rectangle',
+    'G028:WIIIIII>W RoundRect',
+    'G029:WIIIIL>W PatBlt',
+    'G030:W>W SaveDC',
+    'G031:WIIL>L SetPixel',
+    'G032:WII>W OffsetClipRgn',
+    'G033:WIIPW>W TextOut',
+    'G034:WIIIIWIIL>W BitBlt',
+    'G035:WIIIIWIIIIL>W StretchBlt',
+    'G036:>W Polygon',
+    'G037:>W Polyline',
+    'G038:WWWSP>L Escape',
+    'G039:WI>W RestoreDC',
+    'G040:WWW>W FillRgn',
+    'G041:WWWWW>W FrameRgn',
+    'G042:WW>W InvertRgn',
+    'G043:WW>W PaintRgn',
+    'G044:WW>W SelectClipRgn',
+    'G045:WW>W SelectObject',
+    'G046:X>W BITMAPBITS',
+    'G047:WWWI>W CombineRgn',
+    'G048:WWWWP>W CreateBitmap',
+    'G049:P>W CreateBitmapIndirect',
+    'G050:P>W CreateBrushIndirect',
+    'G051:WWW>W CreateCompatibleBitmap',
+    'G052:W>W CreateCompatibleDC',
+    'G053:PPPP>W CreateDC',
+    'G054:IIII>W CreateEllipticRgn',
+    'G055:P>W CreateEllipticRgnIndir',
+    'G056:IIIIIWWWWWWWWP>W CreateFont',
+    'G057:P>W CreateFontIndirect',
+    'G058:WL>W CreateHatchBrush',
+    'G060:W>W CreatePatternBrush',
+    'G061:IIL>W CreatePen',
+    'G062:P>W CreatePenIndirect',
+    'G063:PWW>W CreatePolygonRgn',
+    'G064:IIII>W CreateRectRgn',
+    'G065:P>W CreateRectRgnIndirect',
+    'G066:L>W CreateSolidBrush',
+    'G067:WPI>W DPtoLP',
+    'G068:W>W DeleteDC',
+    'G069:W>W DeleteObject',
+    'G070:WPSL>W EnumFonts',
+    'G071:WWSL>W EnumObjects',
+    'G072:WW>W EqualRgn',
+    'G073:WIIII>W ExcludeVisRect',
+    'G074:WLP>L GetBitmapBits',
+    'G075:W>L GetBkColor',
+    'G076:W>W GetBkMode',
+    'G077:WP>W GetClipBox',
+    'G078:W>L GetCurrentPosition',
+    'G079:W>L GetDCOrg',
+    'G080:WI>W GetDeviceCaps',
+    'G081:W>W GetMapMode',
+    'G082:WIP>W GetObject',
+    'G083:WII>L GetPixel',
+    'G084:W>W GetPolyFillMode',
+    'G085:W>W GetROP2',
+    'G086:W>W GetRelAbs',
+    'G087:W>W GetStockObject',
+    'G088:W>W GetStretchBltMode',
+    'G089:W>W GetTextCharacterExtra',
+    'G090:W>L GetTextColor',
+    'G091:WPI>L GetTextExtent',
+    'G092:WIP>W GetTextFace',
+    'G093:WP>W GetTextMetrics',
+    'G094:W>L GetViewportExt',
+    'G095:W>L GetViewportOrg',
+    'G096:W>L GetWindowExt',
+    'G097:W>L GetWindowOrg',
+    'G098:WIIII>W IntersectVisRect',
+    'G099:WPI>W LPtoDP',
+    'G100:IIIISL>W LineDDA',
+    'G101:WII>W OffsetRgn',
+    'G102:WII>W OffsetVisRgn',
+    'G103:WII>W PtVisible',
+    'G104:WP>W RectVisibleOld',
+    'G105:WW>W SelectVisRgn',
+    'G106:WLP>L SetBitmapBits',
+    'G117:WII>L SetDCOrg',
+    'G118:X>W InternalCreateDC',
+    'G119:P>W AddFontResource',
+    'G120:X>W GetContinuingTextExten',
+    'G121:W>W Death',
+    'G122:WWWWWWW>W Resurrection',
+    'G123:WW>W PlayMetaFile',
+    'G124:P>W GetMetaFile',
+    'G125:P>W CreateMetaFile',
+    'G126:W>W CloseMetaFile',
+    'G127:W>W DeleteMetaFile',
+    'G128:III>W MulDiv',
+    'G129:W>W SaveVisRgn',
+    'G130:W>W RestoreVisRgn',
+    'G131:W>W InquireVisRgn',
+    'G132:PPW>W SetEnvironment',
+    'G133:PPW>W GetEnvironment',
+    'G134:WP>W GetRgnBox',
+    'G136:P>W RemoveFontResource',
+    'G137:X>W GSV',
+    'G138:X>W DPXlate',
+    'G139:X>W SetWinViewExt',
+    'G140:X>W ScaleExt',
+    'G141:X>W WordSet',
+    'G142:X>W RectStuff',
+    'G143:X>W OffsetOrg',
+    'G144:X>W LockDC',
+    'G145:X>W UnlockDC',
+    'G146:X>W LockUnlock',
+    'G147:X>W GDI_FarFrame',
+    'G148:WII>L SetBrushOrg',
+    'G149:W>L GetBrushOrg',
+    'G150:W>W UnrealizeObject',
+    'G151:WP>W CopyMetaFile',
+    'G152:X>W GDIInitApp',
+    'G153:PPPP>W CreateIC',
+    'G154:WL>L GetNearestColor',
+    'G155:WW>W QueryAbort',
+    'G156:WWW>W CreateDiscardableBitma',
+    'G157:X>W CompatibleBitmap',
+    'G158:X>W EnumCallback',
+    'G159:W>W GetMetaFileBits',
+    'G160:W>W SetMetaFileBits',
+    'G161:WII>W PtInRegion',
+    'G162:W>L GetBitmapDimension',
+    'G163:WII>L SetBitmapDimension',
+    'G164:X>W PixToLine',
+    'G169:X>W IsDCDirty',
+    'G170:X>W SetDCStatus',
+    'G171:X>W LVBUNION',
+    'G172:WIIII>W SetRectRgn',
+    'G173:W>W GetClipRgn',
+    'G174:X>W BLOAT',
+    'G175:WWSL>W EnumMetaFile',
+    'G176:WPPW>W PlayMetaFileRecord',
+    'G177:X>W RCOS',
+    'G178:X>W RSIN',
+    'G179:W>W GetDCState',
+    'G180:WW>W SetDCState',
+    'G181:WP>W RectInRegionOld',
+    'G182:X>W REQUESTSEM',
+    'G183:X>W CLEARSEM',
+    'G184:X>W STUFFVISIBLE',
+    'G185:X>W STUFFINREGION',
+    'G186:X>W DELETEABOVELINEFONTS',
+    'G188:X>W GetTextExtentEx',
+    'G190:WSL>W SetDCHook',
+    'G191:WP>L GetDCHook',
+    'G192:WW>W SetHookFlags',
+    'G193:WPW>W SetBoundsRect',
+    'G194:WPW>W GetBoundsRect',
+    'G195:X>W SelectBitmap',
+    'G196:W>W SetMetaFileBitsBetter',
+    'G201:X>W DMBITBLT',
+    'G202:X>W DMCOLORINFO',
+    'G206:X>W dmEnumDFonts',
+    'G207:X>W DMENUMOBJ',
+    'G208:X>W DMOUTPUT',
+    'G209:X>W DMPIXEL',
+    'G210:X>W dmRealizeObject',
+    'G211:X>W DMSTRBLT',
+    'G212:X>W DMSCANLR',
+    'G213:X>W BRUTE',
+    'G214:X>W DMEXTTEXTOUT',
+    'G215:X>W DMGETCHARWIDTH',
+    'G216:X>W DMSTRETCHBLT',
+    'G217:X>W DMDIBBITS',
+    'G218:X>W DMSTRETCHDIBITS',
+    'G219:X>W DMSETDIBTODEV',
+    'G220:X>W DMTRANSPOSE',
+    'G230:W>W CreatePQ',
+    'G231:W>W MinPQ',
+    'G232:W>W ExtractPQ',
+    'G233:WWW>W InsertPQ',
+    'G234:WW>W SizePQ',
+    'G235:W>W DeletePQ',
+    'G240:PPW>W OpenJob',
+    'G241:WPW>W WriteSpool',
+    'G242:WPW>W WriteDialog',
+    'G243:W>W CloseJob',
+    'G244:WW>W DeleteJob',
+    'G245:WP>L GetSpoolJob',
+    'G246:W>W StartSpoolPage',
+    'G247:W>W EndSpoolPage',
+    'G248:X>W QueryJob',
+    'G250:PPW>W Copy',
+    'G253:X>W DeleteSpoolPage',
+    'G254:X>W SpoolFile',
+    'G267:X>W StartDocPrintEra',
+    'G268:X>W StartPagePrinter',
+    'G269:X>W WritePrinter',
+    'G270:X>W EndPagePrinter',
+    'G271:X>W AbortPrinter',
+    'G272:X>W EndDocPrinter',
+    'G274:X>W ClosePrinter',
+    'G280:X>W GetRealDriverInfo',
+    'G281:PPLPL>L DrvSetPrinterData',
+    'G282:PPPPLP>L DrvGetPrinterData',
+    'G299:X>W ENGINEGETCHARWIDTHEX',
+    'G300:PSL>L EngineEnumerateFont',
+    'G301:P>W EngineDeleteFont',
+    'G302:PPP>L EngineRealizeFont',
+    'G303:PWWP>W EngineGetCharWidth',
+    'G304:PW>W EngineSetFontContext',
+    'G305:WPWWPLP>W EngineGetGlyphBMP',
+    'G306:WPP>L EngineMakeFontDir',
+    'G307:WWWP>W GetCharABCWidths',
+    'G308:WWP>W GetOutlineTextMetrics',
+    'G309:WWWPLPP>L GetGlyphOutline',
+    'G310:WPPP>W CreateScalableFontReso',
+    'G311:WLLPL>L GetFontData',
+    'G312:X>W ConvertOutLineFontFile',
+    'G313:PW>W GetRasterizerCaps',
+    'G314:X>W EngineExtTextOut',
+    'G315:LLLL>L EngineRealizeFontExt',
+    'G316:X>W EngineGetCharWidthStr',
+    'G317:X>W EngineGetGlyphBmpExt',
+    'G330:WPSL>W EnumFontFamilies',
+    'G332:WWP>W GetKerningPairs',
+    'G345:W>W GetTextAlign',
+    'G346:WW>W SetTextAlign',
+    'G347:X>W MFDRAWTEXT',
+    'G348:WIIIIIIII>W Chord',
+    'G349:WL>L SetMapperFlags',
+    'G350:WWWP>W GetCharWidth',
+    'G351:WIIWPPWP>W ExtTextOut',
+    'G352:X>W GetPhysicalFontHandle',
+    'G353:X>W GetAspectRatioFilter',
+    'G354:X>W ShrinkGDIHeap',
+    'G355:X>W FTrapping0',
+    'G360:P>W CreatePalette',
+    'G361:WWW>W GDISelectPalette',
+    'G362:W>W GDIRealizePalette',
+    'G363:WWWP>W GetPaletteEntries',
+    'G364:WWWP>W SetPaletteEntries',
+    'G365:W>W RealizeDefaultPalette',
+    'G366:W>W UpdateColors',
+    'G367:WWWP>W AnimatePalette',
+    'G368:WW>W ResizePalette',
+    'G370:WL>W GetNearestPaletteIndex',
+    'G372:WIILW>W ExtFloodFill',
+    'G373:WW>W SetSystemPaletteUse',
+    'G374:W>W GetSystemPaletteUse',
+    'G375:WWWP>W GetSystemPaletteEntrie',
+    'G376:WP>W ResetDC',
+    'G377:WP>W StartDoc',
+    'G378:W>W EndDoc',
+    'G379:W>W StartPage',
+    'G380:W>W EndPage',
+    'G381:WS>W SetAbortProc',
+    'G382:W>W AbortDoc',
+    'G400:WPIIL>W FastWindowFrame',
+    'G401:X>W GDIMOVEBITMAP',
+    'G402:X>W GDIGETBITSGLOBAL',
+    'G403:WW>W GdiInit2',
+    'G404:X>W GetTTGlyphIndexMap',
+    'G405:W>W FinalGdiInit',
+    'G406:X>W CREATEREALBITMAPINDIRE',
+    'G407:WWWWP>W CreateUserBitmap',
+    'G408:X>W CREATEREALBITMAP',
+    'G409:WWW>W CreateUserDiscardableB',
+    'G410:>W IsValidMetaFile',
+    'G411:W>W GetCurLogFont',
+    'G412:W>W IsDCCurrentPalette',
+    'G439:>W StretchDIBits',
+    'G440:WWWWPPW>W SetDIBits',
+    'G441:WWWWPPW>W GetDIBits',
+    'G442:WPLPPW>W CreateDIBitmap',
+    'G443:WIIIIIIWWPPW>W SetDIBitsToDevice',
+    'G444:IIIIII>W CreateRoundRectRgn',
+    'G445:WW>W CreateDIBPatternBrush',
+    'G449:X>W DEVICECOLORMATCH',
+    'G450:WPPW>W PolyPolygon',
+    'G451:PPWW>W CreatePolyPolygonRgn',
+    'G452:WWWW>L GdiSeeGdiDo',
+    'G460:X>W GDITASKTERMINATION',
+    'G461:WW>W SetObjectOwner',
+    'G462:W>W IsGDIObject',
+    'G463:WW>W MakeObjectPrivate',
+    'G464:X>W FIXUPBOGUSPUBLISHERMET',
+    'G465:WP>W RectVisible',
+    'G466:WP>W RectInRegion',
+    'G467:X>W UNICODETOANSI',
+    'G468:WP>W GetBitmapDimensionEx',
+    'G469:WP>W GetBrushOrgEx',
+    'G470:WP>W GetCurrentPositionEx',
+    'G471:WPIP>W GetTextExtentPoint',
+    'G472:WP>W GetViewportExtEx',
+    'G473:WP>W GetViewportOrgEx',
+    'G474:WP>W GetWindowExtEx',
+    'G475:WP>W GetWindowOrgEx',
+    'G476:WIIP>W OffsetViewportOrgEx',
+    'G477:WIIP>W OffsetWindowOrgEx',
+    'G478:WIIP>W SetBitmapDimensionEx',
+    'G479:WIIP>W SetViewportExtEx',
+    'G480:WIIP>W SetViewportOrgEx',
+    'G481:WIIP>W SetWindowExtEx',
+    'G482:WIIP>W SetWindowOrgEx',
+    'G483:WIIP>W MoveToEx',
+    'G484:WIIIIP>W ScaleViewportExtEx',
+    'G485:WIIIIP>W ScaleWindowExtEx',
+    'G486:WP>W GetAspectRatioFilterEx',
+    'G489:WPWPLL>W CreateDIBSection',
+    'G490:X>W CloseEnhMetafile',
+    'G491:X>W CopyEnhMetafile',
+    'G492:X>W CreateEnhMetafile',
+    'G493:X>W DeleteEnhMetafile',
+    'G495:X>W GDIComment',
+    'G496:X>W GetEnhMetafile',
+    'G497:X>W GetEnhMetafileBits',
+    'G498:X>W GetEnhMetafileDescript',
+    'G499:X>W GetEnhMetafileHeader',
+    'G501:X>W GetEnhMetafilePaletteE',
+    'G502:WPW>W PolyBezier',
+    'G503:WPW>W PolyBezierTo',
+    'G504:X>W PlayEnhMetafileRecord',
+    'G505:X>W SetEnhMetafileBits',
+    'G506:X>W SetMetaRgn',
+    'G508:WWW>W ExtSelectClipRgn',
+    'G511:W>W AbortPath',
+    'G512:W>W BeginPath',
+    'G513:W>W CloseFigure',
+    'G514:W>W EndPath',
+    'G515:W>W FillPath',
+    'G516:W>W FlattenPath',
+    'G517:WPPW>W GetPath',
+    'G518:W>W PathToRegion',
+    'G519:WW>W SelectClipPath',
+    'G520:W>W StrokeAndFillPath',
+    'G521:W>W StrokePath',
+    'G522:W>W WidenPath',
+    'G523:X>W ExtCreatePen',
+    'G524:W>W GetArcDirection',
+    'G525:WW>W SetArcDirection',
+    'G526:X>W GetMiterLimit',
+    'G527:X>W SetMiterLimit',
+    'G528:X>W GDIParametersInfo',
+    'G529:W>W CreateHalftonePalette',
+    'G530:>W RawTextOut',
+    'G531:>W RawExtTextOut',
+    'G532:WPW>W RawGetTextExtent',
+    'G536:>W BiDiLayout',
+    'G538:>W BiDiCreateTabString',
+    'G540:>W BiDiGlyphOut',
+    'G543:>W BiDiGetStringExtent',
+    'G555:>W BiDiDeleteString',
+    'G556:>W BiDiSetDefaults',
+    'G558:>W BiDiGetDefaults',
+    'G560:>W BiDiShape',
+    'G561:>W BiDiFontComplement',
+    'G564:>W BiDiSetKashida',
+    'G565:>W BiDiKExtTextOut',
+    'G566:>W BiDiShapeEx',
+    'G569:>W BiDiCreateStringEx',
+    'G571:>W GetTextExtentRtoL',
+    'G572:>W GetHDCCharSet',
+    'G573:>W BiDiLayoutEx',
+    'G602:WWWP>W SetDIBColorTable',
+    'G603:WWWP>W GetDIBColorTable',
+    'G604:WL>W SetSolidBrush',
+    'G605:W>W SysDeleteObject',
+    'G606:WLW>W SetMagicColors',
+    'G607:WLP>L GetRegionData',
+    'G608:X>W ExtCreateRegion',
+    'G609:L>W GdiFreeResources',
+    'G610:LLLW>W GdiSignalProc32',
+    'G611:X>W GetRandomRgn',
+    'G612:W>W GetTextCharset',
+    'G613:WPSLL>W EnumFontFamiliesEx',
+    'G614:X>W AddLpkToGDI',
+    'G615:X>W GetCharacterPlacement',
+    'G616:W>L GetFontLanguageInfo',
+    'G650:X>W BuildInverseTableDIB',
+    'G701:X>W GDITHKCONNECTIONDATALS',
+    'G702:X>W FT_GDIFTHKTHKCONNECTIO',
+    'G703:X>W FDTHKCONNECTIONDATASL',
+    'G704:X>W ICMTHKCONNECTIONDATASL',
+    'G820:X>W ICMCreateTransform',
+    'G821:X>W ICMDeleteTransform',
+    'G822:X>W ICMTranslateRGB',
+    'G823:X>W ICMTranslateRGBs',
+    'G824:X>W ICMCheckColorsInGamut',
+    'B001:P>W Inquire',
+    'B002:SP>W Enable',
+    'B003:>W Disable',
+    'B004:WWPPW>W ToAscii',
+    'B005:PP>W AnsiToOem',
+    'B006:PP>W OemToAnsi',
+    'B007:W>W SetSpeed',
+    'B009:X>W INQUIREEX',
+    'B010:X>W TOASCIIEX',
+    'B011:X>W VKKEYSCANEX',
+    'B012:X>W MAPVIRTUALKEYEX',
+    'B013:X>W NEWTABLEEX',
+    'B014:X>W __EXPORTEDSTUB',
+    'B100:W>L ScreenSwitchEnable',
+    'B128:W>L OemKeyScan',
+    'B129:W>W VkKeyScan',
+    'B130:W>W GetKeyboardType',
+    'B131:WW>W MapVirtualKey',
+    'B132:>W GetKBCodePage',
+    'B133:LPW>W GetKeyNameText',
+    'B134:PPW>W AnsiToOemBuff',
+    'B135:PPW>W OemToAnsiBuff',
+    'L001:WW>L LZCopy',
+    'L002:PPW>W LZOpenFile',
+    'L003:W>W LZInit',
+    'L004:WLW>L LZSeek',
+    'L005:WPW>W LZRead',
+    'L006:W>W LZClose',
+    'L007:>W LZStart',
+    'L008:WW>L CopyLZFile',
+    'L009:>W LZDone',
+    'L010:PP>W GetExpandedName',
+    'S001:LPP>L RegOpenKey',
+    'S002:LPP>L RegCreateKey',
+    'S003:L>L RegCloseKey',
+    'S004:LP>L RegDeleteKey',
+    'S005:LPLPL>L RegSetValue',
+    'S006:LPPP>L RegQueryValue',
+    'S007:LLPL>L RegEnumKey',
+    'S009:WW>W DragAcceptFiles',
+    'S011:WIPI>W DragQueryFile',
+    'S012:W>W DragFinish',
+    'S013:WP>W DragQueryPoint',
+    'S020:WPPPPI>W ShellExecute',
+    'S021:PPP>W FindExecutable',
+    'S022:WPPW>W ShellAbout',
+    'S033:WWWL>W AboutDlgProc',
+    'S034:WPI>W ExtractIcon',
+    'S036:WPP>W ExtractAssociatedIcon',
+    'S037:PW>L DoEnvironmentSubst',
+    'S038:P>L FindEnvironmentString',
+    'S039:WPIW>W InternalExtractIcon',
+    'S040:PWPPW>W ExtractIconEx',
+    'S101:LWWWLW>L DllEntryPoint',
+    'S102:WW>W RegisterShellHook',
+    'S103:WWL>L ShellHookProc',
+    'S157:X>W RESTARTDIALOG',
+    'S262:L>W DriveType',
+    'S401:X>W SHCHECKDRIVE',
+    'M001:WWWP>L WEP',
+    'M002:PW>L sndPlaySound',
+    'M003:PWL>L PlaySound',
+    'M004:LWWWLW>L DllEntryPoint',
+    'M005:>L mmsystemGetVersion',
+    'M006:LWWLL>L DriverProc',
+    'M008:>L WMMMidiRunOnce',
+    'M030:P>W OutputDebugStr',
+    'M031:LWWWLLL>L DriverCallback',
+    'M032:>L StackEnter',
+    'M033:>L StackLeave',
+    'M034:X>W MMDRVINSTALL',
+    'M101:>L joyGetNumDevs',
+    'M102:WPW>L joyGetDevCaps',
+    'M103:WP>L joyGetPos',
+    'M104:WP>L joyGetThreshold',
+    'M105:W>L joyReleaseCapture',
+    'M106:WWWW>L joySetCapture',
+    'M107:WW>L joySetThreshold',
+    'M109:W>L joySetCalibration',
+    'M110:WP>L joyGetPosEx',
+    'M111:X>W JOYCONFIGCHANGED',
+    'M201:>L midiOutGetNumDevs',
+    'M202:WPW>L midiOutGetDevCaps',
+    'M203:WPW>L midiOutGetErrorText',
+    'M204:PWLLL>L midiOutOpen',
+    'M205:W>L midiOutClose',
+    'M206:WSW>L midiOutPrepareHeader',
+    'M207:WSW>L midiOutUnprepareHeader',
+    'M208:WL>L midiOutShortMsg',
+    'M209:WSW>L midiOutLongMsg',
+    'M210:W>L midiOutReset',
+    'M211:WP>L midiOutGetVolume',
+    'M212:WL>L midiOutSetVolume',
+    'M213:WWPW>L midiOutCachePatches',
+    'M214:WWPW>L midiOutCacheDrumPatche',
+    'M215:WP>L midiOutGetID',
+    'M216:WWLL>L midiOutMessage',
+    'M250:WPL>L midiStreamProperty',
+    'M251:PPLLLL>L midiStreamOpen',
+    'M252:W>L midiStreamClose',
+    'M253:WPW>L midiStreamPosition',
+    'M254:WPW>L midiStreamOut',
+    'M255:W>L midiStreamPause',
+    'M256:W>L midiStreamRestart',
+    'M257:W>L midiStreamStop',
+    'M301:>L midiInGetNumDevs',
+    'M302:WPW>L midiInGetDevCaps',
+    'M303:WPW>L midiInGetErrorText',
+    'M304:PWLLL>L midiInOpen',
+    'M305:W>L midiInClose',
+    'M306:WSW>L midiInPrepareHeader',
+    'M307:WSW>L midiInUnprepareHeader',
+    'M308:WSW>L midiInAddBuffer',
+    'M309:W>L midiInStart',
+    'M310:W>L midiInStop',
+    'M311:W>L midiInReset',
+    'M312:WP>L midiInGetID',
+    'M313:WWLL>L midiInMessage',
+    'M350:>L auxGetNumDevs',
+    'M351:WPW>L auxGetDevCaps',
+    'M352:WP>L auxGetVolume',
+    'M353:WL>L auxSetVolume',
+    'M354:WWLL>L auxOutMessage',
+    'M401:>L waveOutGetNumDevs',
+    'M402:WPW>L waveOutGetDevCaps',
+    'M403:WPW>L waveOutGetErrorText',
+    'M404:PWPLLL>L waveOutOpen',
+    'M405:W>L waveOutClose',
+    'M406:WSW>L waveOutPrepareHeader',
+    'M407:WSW>L waveOutUnprepareHeader',
+    'M408:WSW>L waveOutWrite',
+    'M409:W>L waveOutPause',
+    'M410:W>L waveOutRestart',
+    'M411:W>L waveOutReset',
+    'M412:WPW>L waveOutGetPosition',
+    'M413:WP>L waveOutGetPitch',
+    'M414:WL>L waveOutSetPitch',
+    'M415:WP>L waveOutGetVolume',
+    'M416:WL>L waveOutSetVolume',
+    'M417:WP>L waveOutGetPlaybackRate',
+    'M418:WL>L waveOutSetPlaybackRate',
+    'M419:W>L waveOutBreakLoop',
+    'M420:WP>L waveOutGetID',
+    'M421:WWLL>L waveOutMessage',
+    'M501:>L waveInGetNumDevs',
+    'M502:WPW>L waveInGetDevCaps',
+    'M503:WPW>L waveInGetErrorText',
+    'M504:PWPLLL>L waveInOpen',
+    'M505:W>L waveInClose',
+    'M506:WSW>L waveInPrepareHeader',
+    'M507:WSW>L waveInUnprepareHeader',
+    'M508:WSW>L waveInAddBuffer',
+    'M509:W>L waveInStart',
+    'M510:W>L waveInStop',
+    'M511:W>L waveInReset',
+    'M512:WPW>L waveInGetPosition',
+    'M513:WP>L waveInGetID',
+    'M514:WWLL>L waveInMessage',
+    'M601:PW>L timeGetSystemTime',
+    'M602:WWSLW>L timeSetEvent',
+    'M603:W>L timeKillEvent',
+    'M604:PW>L timeGetDevCaps',
+    'M605:W>L timeBeginPeriod',
+    'M606:W>L timeEndPeriod',
+    'M607:>L timeGetTime',
+    'M701:WWLL>L mciSendCommand',
+    'M702:PPWW>L mciSendString',
+    'M703:P>L mciGetDeviceID',
+    'M705:WPW>L mciLoadCommandResource',
+    'M706:LPW>L mciGetErrorString',
+    'M707:WL>L mciSetDriverData',
+    'M708:W>L mciGetDriverData',
+    'M710:W>L mciDriverYield',
+    'M711:WWW>L mciDriverNotify',
+    'M712:P>L mciExecute',
+    'M713:W>L mciFreeCommandResource',
+    'M714:WPL>L mciSetYieldProc',
+    'M715:LP>L mciGetDeviceIDFromElem',
+    'M716:WP>L mciGetYieldProc',
+    'M717:W>L mciGetCreatorTask',
+    'M800:>L mixerGetNumDevs',
+    'M801:WPW>L mixerGetDevCaps',
+    'M802:PWLLL>L mixerOpen',
+    'M803:W>L mixerClose',
+    'M804:WWLL>L mixerMessage',
+    'M805:WPL>L mixerGetLineInfo',
+    'M806:WPL>L mixerGetID',
+    'M807:WPL>L mixerGetLineControls',
+    'M808:WPL>L mixerGetControlDetails',
+    'M809:WPL>L mixerSetControlDetails',
+    'M900:LPL>L mmTaskCreate',
+    'M902:W>L mmTaskBlock',
+    'M903:W>L mmTaskSignal',
+    'M904:>W mmGetCurrentTask',
+    'M905:>L mmTaskYield',
+    'E001:R>R __fpMath',
+    'E003:PW>W __WinEm87Info',
+    'E004:PW>W __WinEm87Restore',
+    'E005:PW>W __WinEm87Save',
+    'V002:PPPP>L GetFileResourceSize',
+    'V003:PPPLLP>L GetFileResource',
+    'V006:PP>L GetFileVersionInfoSize',
+    'V007:PLLP>L GetFileVersionInfo',
+    'V008:WPPPPPPP>L VerFindFile',
+    'V009:WPPPPPPP>L VerInstallFile',
+    'V010:WPW>L VerLanguageName',
+    'V011:SPPP>L VerQueryValue',
+    'V020:X>W GETFILEVERSIONINFORAW',
+    'C001:S>W GetOpenFileName',
+    'C002:S>W GetSaveFileName',
+    'C005:P>W ChooseColor',
+    'C006:WWWL>L FileOpenDlgProc',
+    'C007:WWWL>L FileSaveDlgProc',
+    'C008:WWWL>L ColorDlgProc',
+    'C011:S>W FindText',
+    'C012:S>W ReplaceText',
+    'C013:WWWL>L FindTextDlgProc',
+    'C014:WWWL>L ReplaceTextDlgProc',
+    'C015:P>W ChooseFont',
+    'C016:WWWL>W FormatCharDlgProc',
+    'C018:PPWL>W FontStyleEnumProc',
+    'C019:PPWL>W FontFamilyEnumProc',
+    'C020:P>W PrintDlg',
+    'C021:WWWL>L PrintDlgProc',
+    'C022:WWWL>L PrintSetupDlgProc',
+    'C026:>L CommDlgExtendedError',
+    'C027:PPW>W GetFileTitle',
+    'T050:W>W GlobalHandleToSel',
+    'T051:PW>W GlobalFirst',
+    'T052:PW>W GlobalNext',
+    'T053:P>W GlobalInfo',
+    'T054:PW>W GlobalEntryHandle',
+    'T055:PWW>W GlobalEntryModule',
+    'T056:PW>W LocalInfo',
+    'T057:PW>W LocalFirst',
+    'T058:P>W LocalNext',
+    'T059:P>W ModuleFirst',
+    'T060:P>W ModuleNext',
+    'T061:PP>W ModuleFindName',
+    'T062:PW>W ModuleFindHandle',
+    'T063:P>W TaskFirst',
+    'T064:P>W TaskNext',
+    'T065:PW>W TaskFindHandle',
+    'T066:PW>W StackTraceFirst',
+    'T067:PWWWW>W StackTraceCSIPFirst',
+    'T068:P>W StackTraceNext',
+    'T069:X>W ClassFirst',
+    'T070:X>W ClassNext',
+    'T071:P>W SystemHeapInfo',
+    'T072:P>W MemManInfo',
+    'T073:WSW>W NotifyRegister',
+    'T074:W>W NotifyUnregister',
+    'T075:WS>W InterruptRegister',
+    'T076:W>W InterruptUnRegister',
+    'T077:WW>W TerminateApp',
+    'T078:WLPL>L MemoryRead',
+    'T079:WLPL>L MemoryWrite',
+    'T080:P>W TimerCount',
+    'T081:X>W TASKSETCSIP',
+    'T082:X>W TASKGETCSIP',
+    'T083:X>W TASKSWITCH',
+    'T084:PW>W Local32Info',
+    'T085:PW>W Local32First',
+    'T086:P>W Local32Next',
+    'Y001:WW>L InquireSystem',
+    'Y002:WS>W CreateSystemTimer',
+    'Y003:W>W KillSystemTimer',
+    'Y004:>W EnableSystemTimers',
+    'Y005:>W DisableSystemTimers',
+    'Y006:>L GetSystemMSecCount',
+    'Y007:>W Get80x87SaveSize',
+    'Y008:P>W Save80x87State',
+    'Y009:P>W Restore80x87State',
+    'Y013:X>W INQUIRELONGINTS',
+    'Y020:W>W A20_Proc',
+    'D001:X>W BitBlt',
+    'D002:X>W ColorInfo',
+    'D003:X>W Control',
+    'D004:X>W Disable',
+    'D005:X>W Enable',
+    'D006:X>W EnumFonts',
+    'D007:X>W EnumObj',
+    'D008:X>W Output',
+    'D009:X>W Pixel',
+    'D010:X>W RealizeObject',
+    'D011:X>W StrBlt',
+    'D012:X>W ScanLR',
+    'D013:X>W DeviceMode',
+    'D014:X>W ExtTextOut',
+    'D015:X>W GetCharWidth',
+    'D016:X>W DeviceBitmap',
+    'D017:X>W FastBorder',
+    'D018:X>W SetAttribute',
+    'D019:X>W DeviceBitmapBits',
+    'D020:X>W CreateBitmap',
+    'D021:X>W DIBScreenBlt',
+    'D022:X>W SetPalette',
+    'D023:X>W GetPalette',
+    'D024:X>W SetPaletteTranslate',
+    'D025:X>W GetPaletteTranslate',
+    'D026:X>W UpdateColors',
+    'D027:X>W StretchBlt',
+    'D028:X>W StretchDIBits',
+    'D029:X>W SelectBitmap',
+    'D030:X>W BitmapBits',
+    'D031:X>W ReEnable',
+    'D039:X>W DIBBlt',
+    'D040:X>W CreateDIBitmap',
+    'D041:X>W DIBToDevice',
+    'D090:X>W Do_Polylines',
+    'D091:X>W Do_Scanlines',
+    'D092:X>W SaveScreenBitmap',
+    'D101:P>W Inquire',
+    'D102:P>W SetCursor',
+    'D103:WW>W MoveCursor',
+    'D104:>W CheckCursor',
+    'D400:X>W PExtTextOut',
+    'D401:X>W PStrBlt',
+    'D402:X>W RExtTextOut',
+    'D403:X>W RStrBlt',
+    'D450:WP>L GetDriverResourceID',
+    'D500:W>W UserRepaintDisable',
+    'D501:X>W ORDINAL_ONLY1',
+    'D502:X>W ORDINAL_ONLY2',
+    'D600:X>W InkReady',
+    'D601:X>W GetLPDevice',
+    'O001:>W OpenSound',
+    'O002:>W CloseSound',
+    'O003:WW>W SetVoiceQueueSize',
+    'O004:WWWW>W SetVoiceNote',
+    'O005:WWWWW>W SetVoiceAccent',
+    'O006:WWW>W SetVoiceEnvelope',
+    'O007:WW>W SetSoundNoise',
+    'O008:WLW>W SetVoiceSound',
+    'O009:>W StartSound',
+    'O010:>W StopSound',
+    'O011:W>W WaitSoundState',
+    'O012:>W SyncAllVoices',
+    'O013:W>W CountVoiceNotes',
+    'O014:>L GetThresholdEvent',
+    'O015:>W GetThresholdStatus',
+    'O016:WW>W SetVoiceThreshold',
+    'O017:>W DoBeep',
+    'O018:X>W MYOPENSOUND');
+
+{ ==================================================================== }
+{ Partie 14 - Sous-systeme Win16 : anneau 3, LDT, passerelles, memoire }
+{ ==================================================================== }
+{ Les programmes Windows 3.x (format NE) s'executent comme sous
+  Windows 95 : en mode protege 16 bits, a l'anneau 3, dans des
+  segments decrits par une LDT. Une interruption survenue dans du code
+  16 bits bascule sur la pile de l'anneau 0 de la tache (TSS.ESP0).
+  Les appels d'API passent par une passerelle d'appel (GDT 38h) :
+  chaque fonction importee est une petite souche 16 bits
+  (push n / call far 3Bh:0 / retf taille). Les rappels (procedures de
+  fenetre 16 bits...) sont appeles par Call16 et reviennent par la
+  passerelle 43h.
+  Selecteurs : (indice LDT * 8) + 7 ; increment des blocs > 64 Ko
+  (__AHINCR) : 8. }
+
+Const
+  LdtMax = 4096;
+  SelGateApi = $3B;
+  SelGateCb = $43;
+  W16CbOfs = $FFF0;        { souche de retour des rappels }
+
+Var
+  Ldt : Array[0..LdtMax * 2 - 1] Of LongInt;
+  LdtUsed : Array[0..LdtMax - 1] Of Boolean;
+  { blocs globaux : taille, nombre de tuiles, adresse, proprietaire }
+  GSize, GTiles, GLin, GOwner, GLock : Array[0..LdtMax - 1] Of LongInt;
+  Tss : Array[0..31] Of LongInt;
+  W16ThunkSel, W16ThunkLin : LongInt;
+  EnterStub, ApiGateStub, CbGateStub : LongInt;
+  Ret16Ax, Ret16Dx, W16Cf : LongInt;
+  Ctx16 : Array[0..MaxThread * 16 - 1] Of LongInt;
+  Ctx16N : Array[0..MaxThread - 1] Of LongInt;
+  { pile 16 bits courante de chaque tache (dernier appel d'API) }
+  T16Ss, T16Sp, T16Ds, T16Mod : Array[0..MaxThread - 1] Of LongInt;
+  { bloc de parametres de Call16 }
+  C16 : Array[0..15] Of LongInt;
+  W16Ready : Boolean;
+
+{ ------------------------------------------------------------------ }
+{ Descripteurs                                                       }
+{ ------------------------------------------------------------------ }
+
+{ Acc : $FA code 16 bits, $F2 donnees 16 bits (anneau 3) }
+Procedure DescSet(I, Base, Limit, Acc : LongInt);
+Var G : LongInt;
+Begin
+  G := 0;
+  If Limit > $FFFFF Then
+  Begin
+    Limit := Limit Shr 12;
+    G := $800000;
+  End;
+  Ldt[I * 2] := (Limit And $FFFF) Or ((Base And $FFFF) Shl 16);
+  Ldt[I * 2 + 1] := ((Base Shr 16) And $FF) Or (Acc Shl 8) Or
+                    (Limit And $F0000) Or G Or (Base And LongInt($FF000000));
+End;
+
+Function SelBase(Sel : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  SelBase := 0;
+  If (Sel And 4) = 0 Then Exit;
+  I := (Sel Shr 3) And $1FFF;
+  If I >= LdtMax Then Exit;
+  SelBase := ((Ldt[I * 2] Shr 16) And $FFFF) Or
+             ((Ldt[I * 2 + 1] And $FF) Shl 16) Or
+             (Ldt[I * 2 + 1] And LongInt($FF000000));
+End;
+
+Function SelLimit(Sel : LongInt) : LongInt;
+Var I, L : LongInt;
+Begin
+  SelLimit := 0;
+  If (Sel And 4) = 0 Then Exit;
+  I := (Sel Shr 3) And $1FFF;
+  If I >= LdtMax Then Exit;
+  L := (Ldt[I * 2] And $FFFF) Or (Ldt[I * 2 + 1] And $F0000);
+  If (Ldt[I * 2 + 1] And $800000) <> 0 Then L := (L Shl 12) Or $FFF;
+  SelLimit := L;
+End;
+
+Function SelValid(Sel : LongInt) : Boolean;
+Var I : LongInt;
+Begin
+  I := (Sel Shr 3) And $1FFF;
+  SelValid := ((Sel And 4) <> 0) And (I > 0) And (I < LdtMax) And
+              LdtUsed[I];
+End;
+
+{ N selecteurs consecutifs ; selecteur du premier ou 0 }
+Function SelAlloc(N : LongInt) : LongInt;
+Var I, K, Run : LongInt;
+Begin
+  SelAlloc := 0;
+  Run := 0;
+  For I := 1 To LdtMax - 1 Do
+  Begin
+    If LdtUsed[I] Then Run := 0 Else Inc(Run);
+    If Run = N Then
+    Begin
+      For K := I - N + 1 To I Do
+      Begin
+        LdtUsed[K] := True;
+        GSize[K] := 0; GTiles[K] := 0; GLin[K] := 0; GLock[K] := 0;
+        GOwner[K] := HeapOwner;
+        Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
+      End;
+      SelAlloc := ((I - N + 1) Shl 3) Or 7;
+      Exit;
+    End;
+  End;
+  KLog('Win16 : LDT pleine');
+End;
+
+Procedure SelFree(Sel, N : LongInt);
+Var I, K : LongInt;
+Begin
+  I := (Sel Shr 3) And $1FFF;
+  For K := I To I + N - 1 Do
+    If (K > 0) And (K < LdtMax) Then
+    Begin
+      LdtUsed[K] := False;
+      Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
+      GSize[K] := 0; GTiles[K] := 0;
+    End;
+End;
+
+{ Pointeur 16:16 -> adresse lineaire (0 si nul) }
+Function Lin16(P : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := (P Shr 16) And $FFFF;
+  If S = 0 Then Lin16 := 0
+  Else Lin16 := SelBase(S) + (P And $FFFF);
+End;
+
+Function MakeFar(Sel, Ofs : LongInt) : LongInt;
+Begin
+  MakeFar := ((Sel And $FFFF) Shl 16) Or (Ofs And $FFFF);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Memoire globale 16 bits : poignee = selecteur                     }
+{ ------------------------------------------------------------------ }
+
+Procedure GDescs(I, Lin, Size, Tiles, Acc : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To Tiles - 1 Do
+    DescSet(I + K, Lin + K * $10000, Size - K * $10000 - 1, Acc);
+End;
+
+Function GAlloc16(Size : LongInt; Code : Boolean) : LongInt;
+Var Lin, Tiles, Sel, I, Acc : LongInt;
+Begin
+  GAlloc16 := 0;
+  If Size <= 0 Then Size := 1;
+  Size := (Size + 15) And Not 15;
+  Tiles := (Size + $FFFF) Div $10000;
+  Lin := KAlloc(Size);
+  If Lin = 0 Then Exit;
+  FillMem(Lin, Size, 0);
+  Sel := SelAlloc(Tiles);
+  If Sel = 0 Then
+  Begin
+    KFree(Lin);
+    Exit;
+  End;
+  I := Sel Shr 3;
+  If Code Then Acc := $FA Else Acc := $F2;
+  GDescs(I, Lin, Size, Tiles, Acc);
+  GSize[I] := Size; GTiles[I] := Tiles; GLin[I] := Lin;
+  GAlloc16 := Sel;
+End;
+
+Function GIdx(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GIdx := -1;
+  If Not SelValid(H) Then Exit;
+  I := (H Shr 3) And $1FFF;
+  If GTiles[I] > 0 Then GIdx := I;
+End;
+
+Procedure GFree16(H : LongInt);
+Var I : LongInt;
+Begin
+  I := GIdx(H);
+  If I < 0 Then Exit;
+  KFree(GLin[I]);
+  SelFree(H, GTiles[I]);
+End;
+
+Function GReAlloc16(H, Size : LongInt) : LongInt;
+Var I, Lin, Tiles, Sel, J, Acc : LongInt;
+Begin
+  GReAlloc16 := 0;
+  I := GIdx(H);
+  If I < 0 Then Exit;
+  If Size <= 0 Then Size := 1;
+  Size := (Size + 15) And Not 15;
+  Tiles := (Size + $FFFF) Div $10000;
+  Lin := KAlloc(Size);
+  If Lin = 0 Then Exit;
+  FillMem(Lin, Size, 0);
+  MoveMem(GLin[I], Lin, Min(Size, GSize[I]));
+  KFree(GLin[I]);
+  Acc := (Ldt[I * 2 + 1] Shr 8) And $FF;
+  If Tiles <= GTiles[I] Then
+  Begin
+    If Tiles < GTiles[I] Then
+      SelFree(((I + Tiles) Shl 3) Or 7, GTiles[I] - Tiles);
+    Sel := H;
+    J := I;
+  End
+  Else
+  Begin
+    Sel := SelAlloc(Tiles);
+    If Sel = 0 Then Exit;
+    SelFree(H, GTiles[I]);
+    J := Sel Shr 3;
+  End;
+  GDescs(J, Lin, Size, Tiles, Acc);
+  GSize[J] := Size; GTiles[J] := Tiles; GLin[J] := Lin;
+  GReAlloc16 := Sel;
+End;
+
+{ Liberer les blocs et selecteurs d'un proprietaire (fin de tache) }
+Procedure GFreeOwner(Own : LongInt);
+Var I : LongInt;
+Begin
+  For I := 1 To LdtMax - 1 Do
+    If LdtUsed[I] And (GOwner[I] = Own) Then
+    Begin
+      If GTiles[I] > 0 Then KFree(GLin[I]);
+      LdtUsed[I] := False;
+      Ldt[I * 2] := 0; Ldt[I * 2 + 1] := 0;
+      GTiles[I] := 0;
+    End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Tas local d'un segment de donnees (LocalAlloc) : blocs precedes   }
+{ d'un en-tete (mot taille totale, mot 1 si occupe)                  }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxLHeap = 32;
+
+Var
+  LHSel, LHStart, LHEnd : Array[0..MaxLHeap - 1] Of LongInt;
+
+Function LHeapOf(Sel : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  LHeapOf := -1;
+  For I := 0 To MaxLHeap - 1 Do
+    If (LHSel[I] = (Sel Or 3)) And (LHSel[I] <> 0) Then
+    Begin
+      LHeapOf := I;
+      Exit;
+    End;
+End;
+
+Function LocalInitK(Sel, Start, Stop : LongInt) : Boolean;
+Var I, B : LongInt;
+Begin
+  LocalInitK := False;
+  If Not SelValid(Sel) Then Exit;
+  I := LHeapOf(Sel);
+  If I < 0 Then
+    For B := MaxLHeap - 1 DownTo 0 Do
+      If LHSel[B] = 0 Then I := B;
+  If I < 0 Then Exit;
+  Start := (Start + 3) And Not 3;
+  If Stop > SelLimit(Sel) Then Stop := SelLimit(Sel) + 1;
+  If Stop > $FFF0 Then Stop := $FFF0;
+  If Stop - Start < 16 Then Exit;
+  LHSel[I] := Sel Or 3; LHStart[I] := Start; LHEnd[I] := Stop;
+  B := SelBase(Sel);
+  MemW[0:B + Start] := Stop - Start;
+  MemW[0:B + Start + 2] := 0;
+  { InstanceData : pLocalHeap }
+  MemW[0:B + 6] := Start;
+  LocalInitK := True;
+End;
+
+Function LocalAllocK(Sel, Flags, Size : LongInt) : LongInt;
+Var H, B, P, Sz, Need, R : LongInt;
+Begin
+  LocalAllocK := 0;
+  H := LHeapOf(Sel);
+  If H < 0 Then Exit;
+  B := SelBase(Sel);
+  If Size <= 0 Then Size := 1;
+  Need := ((Size + 3) And Not 3) + 4;
+  { fusion des blocs libres consecutifs puis premier ajuste }
+  P := LHStart[H];
+  While P < LHEnd[H] Do
+  Begin
+    Sz := MemW[0:B + P];
+    If Sz < 4 Then Exit;
+    If MemW[0:B + P + 2] = 0 Then
+    Begin
+      While (P + Sz < LHEnd[H]) And (MemW[0:B + P + Sz + 2] = 0) And
+            (MemW[0:B + P + Sz] >= 4) Do
+      Begin
+        Sz := Sz + MemW[0:B + P + Sz];
+        MemW[0:B + P] := Sz;
+      End;
+      If Sz >= Need Then
+      Begin
+        If Sz - Need >= 8 Then
+        Begin
+          MemW[0:B + P + Need] := Sz - Need;
+          MemW[0:B + P + Need + 2] := 0;
+          MemW[0:B + P] := Need;
+        End;
+        MemW[0:B + P + 2] := 1;
+        R := P + 4;
+        FillMem(B + R, MemW[0:B + P] - 4, 0);
+        LocalAllocK := R;
+        Exit;
+      End;
+    End;
+    P := P + Sz;
+  End;
+End;
+
+Function LocalSizeK(Sel, Hd : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  LocalSizeK := 0;
+  If (Hd < 4) Or (LHeapOf(Sel) < 0) Then Exit;
+  B := SelBase(Sel);
+  LocalSizeK := MemW[0:B + Hd - 4] - 4;
+End;
+
+Procedure LocalFreeK(Sel, Hd : LongInt);
+Begin
+  If (Hd < 4) Or (LHeapOf(Sel) < 0) Then Exit;
+  MemW[0:SelBase(Sel) + Hd - 2] := 0;
+End;
+
+Function LocalReAllocK(Sel, Hd, Size, Flags : LongInt) : LongInt;
+Var N, Old : LongInt;
+Begin
+  LocalReAllocK := 0;
+  If Hd = 0 Then Exit;
+  Old := LocalSizeK(Sel, Hd);
+  If (Size <= Old) And (Size > 0) Then
+  Begin
+    LocalReAllocK := Hd;
+    Exit;
+  End;
+  N := LocalAllocK(Sel, Flags, Size);
+  If N = 0 Then Exit;
+  MoveMem(SelBase(Sel) + Hd, SelBase(Sel) + N, Min(Old, Size));
+  LocalFreeK(Sel, Hd);
+  LocalReAllocK := N;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Passage a l'anneau 3 et retour                                     }
+{ ------------------------------------------------------------------ }
+
+Procedure PutB(Var A : LongInt; B : LongInt);
+Begin
+  Mem[0:A] := B And $FF;
+  Inc(A);
+End;
+
+Procedure PutD(Var A : LongInt; D : LongInt);
+Begin
+  MemL[0:A] := D;
+  A := A + 4;
+End;
+
+Function CbFinish : LongInt;
+Begin
+  CbFinish := Ctx16[CurT * 16 + Ctx16N[CurT] - 1];
+End;
+
+Procedure W16ApiEntry(Frame : LongInt); Forward;
+
+{ Souches en code machine (adresses lineaires, segment de code 08h) }
+Procedure BuildW16Stubs;
+Var A, Ret : LongInt;
+Begin
+  A := KAlloc(512);
+  { EnterStub : EAX = bloc C16 (CS, IP, SS, SP, DS, ES, AX, BX, CX, DX,
+    SI, DI, BP, adresse de sauvegarde d'ESP) }
+  EnterStub := A;
+  PutB(A, $55); PutB(A, $53); PutB(A, $56); PutB(A, $57);
+  PutB(A, $8B); PutB(A, $50); PutB(A, 52);          { mov edx,[eax+52] }
+  Ret := EnterStub + 96;
+  PutB(A, $68); PutD(A, Ret);                       { push Ret }
+  PutB(A, $89); PutB(A, $22);                       { mov [edx],esp }
+  PutB(A, $89); PutB(A, $25); PutD(A, TssBase + 4); { mov [esp0],esp }
+  PutB(A, $8B); PutB(A, $48); PutB(A, 56);          { mov ecx,[eax+56] }
+  PutB(A, $89); PutB(A, $21);                       { mov [ecx],esp }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 8);           { push [eax+8] SS }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 12);          { push [eax+12] SP }
+  PutB(A, $68); PutD(A, $3202);                     { push EFLAGS }
+  PutB(A, $FF); PutB(A, $30);                       { push [eax] CS }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 4);           { push [eax+4] IP }
+  PutB(A, $8B); PutB(A, $58); PutB(A, 28);          { mov ebx,[eax+28] }
+  PutB(A, $8B); PutB(A, $48); PutB(A, 32);          { mov ecx,[eax+32] }
+  PutB(A, $8B); PutB(A, $50); PutB(A, 36);          { mov edx,[eax+36] }
+  PutB(A, $8B); PutB(A, $70); PutB(A, 40);          { mov esi,[eax+40] }
+  PutB(A, $8B); PutB(A, $78); PutB(A, 44);          { mov edi,[eax+44] }
+  PutB(A, $8B); PutB(A, $68); PutB(A, 48);          { mov ebp,[eax+48] }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 20);          { push [eax+20] ES }
+  PutB(A, $FF); PutB(A, $70); PutB(A, 16);          { push [eax+16] DS }
+  PutB(A, $8B); PutB(A, $40); PutB(A, 24);          { mov eax,[eax+24] }
+  PutB(A, $1F); PutB(A, $07);                       { pop ds ; pop es }
+  PutB(A, $CF);                                     { iretd }
+  A := Ret;
+  PutB(A, $5F); PutB(A, $5E); PutB(A, $5B); PutB(A, $5D);
+  PutB(A, $C3);
+  { ApiGateStub : entree de la passerelle d'appel des API }
+  A := EnterStub + 128;
+  ApiGateStub := A;
+  PutB(A, $60); PutB(A, $1E); PutB(A, $06);         { pushad ds es }
+  PutB(A, $66); PutB(A, $B8); PutB(A, $10); PutB(A, 0);
+  PutB(A, $8E); PutB(A, $D8); PutB(A, $8E); PutB(A, $C0);
+  PutB(A, $55); PutB(A, $89); PutB(A, $E5);         { push ebp ; mov }
+  PutB(A, $FC); PutB(A, $55);                       { cld ; push ebp }
+  PutB(A, $B8); PutD(A, LongInt(@W16ApiEntry));
+  PutB(A, $FF); PutB(A, $D0);                       { call eax }
+  PutB(A, $8D); PutB(A, $64); PutB(A, $24); PutB(A, 4); { lea esp,+4 }
+  PutB(A, $5D);                                     { pop ebp }
+  PutB(A, $0F); PutB(A, $BA); PutB(A, $25);         { bt [W16Cf],0 }
+  PutD(A, LongInt(@W16Cf)); PutB(A, 0);
+  PutB(A, $07); PutB(A, $1F); PutB(A, $61);         { pop es ds ; popad }
+  PutB(A, $CB);                                     { retf }
+  { CbGateStub : retour d'un rappel 16 bits }
+  A := EnterStub + 256;
+  CbGateStub := A;
+  PutB(A, $66); PutB(A, $B9); PutB(A, $10); PutB(A, 0);
+  PutB(A, $8E); PutB(A, $D9); PutB(A, $8E); PutB(A, $C1);
+  PutB(A, $A3); PutD(A, LongInt(@Ret16Ax));
+  PutB(A, $89); PutB(A, $15); PutD(A, LongInt(@Ret16Dx));
+  PutB(A, $B8); PutD(A, LongInt(@CbFinish));
+  PutB(A, $FF); PutB(A, $D0);
+  PutB(A, $89); PutB(A, $C4);                       { mov esp,eax }
+  PutB(A, $C3);
+End;
+
+{ Appel d'un code 16 bits CS:IP (anneau 3) ; rend DX:AX.
+  Les registres d'entree sont pris dans C16[6..12]. }
+Function Call16(Cs, Ip, Ss, Sp, Ds, Es : LongInt) : LongInt;
+Var A, OldE, N, S : LongInt;
+Begin
+  Call16 := 0;
+  N := Ctx16N[CurT];
+  If N >= 16 Then
+  Begin
+    KLog('Win16 : rappels trop imbriques');
+    Exit;
+  End;
+  C16[0] := Cs And $FFFF; C16[1] := Ip And $FFFF;
+  C16[2] := Ss And $FFFF; C16[3] := Sp And $FFFF;
+  C16[4] := Ds And $FFFF; C16[5] := Es And $FFFF;
+  C16[13] := LongInt(@Ctx16[CurT * 16 + N]);
+  C16[14] := LongInt(@ThrEsp0[CurT]);
+  Ctx16N[CurT] := N + 1;
+  OldE := ThrEsp0[CurT];
+  A := LongInt(@C16);
+  S := EnterStub;
+  asm
+    mov eax,A
+    mov ecx,S
+    call ecx
+  end;
+  { de retour par la passerelle 43h : ESP0 de nouveau celui d'avant }
+  Ctx16N[CurT] := N;
+  ThrEsp0[CurT] := OldE;
+  MemL[0:TssBase + 4] := OldE;
+  Call16 := (Ret16Ax And $FFFF) Or ((Ret16Dx And $FFFF) Shl 16);
+End;
+
+Procedure InitW16;
+Var B, I, A : LongInt;
+Begin
+  { TSS : pile de l'anneau 0 (SS0 = 10h), pas de table d'E/S }
+  FillMem(LongInt(@Tss), 128, 0);
+  TssBase := LongInt(@Tss);
+  Tss[2] := $10;
+  Tss[25] := 104 Shl 16;
+  B := TssBase;
+  Gdt[10] := 103 Or ((B And $FFFF) Shl 16);
+  Gdt[11] := ((B Shr 16) And $FF) Or $8900 Or (B And LongInt($FF000000));
+  { LDT }
+  B := LongInt(@Ldt);
+  Gdt[12] := ((LdtMax * 8 - 1) And $FFFF) Or ((B And $FFFF) Shl 16);
+  Gdt[13] := ((B Shr 16) And $FF) Or $8200 Or (B And LongInt($FF000000));
+  BuildW16Stubs;
+  { passerelles d'appel 386 de niveau 3 vers le segment de code 08h }
+  Gdt[14] := (ApiGateStub And $FFFF) Or ($08 Shl 16);
+  Gdt[15] := (ApiGateStub And LongInt($FFFF0000)) Or $EC00;
+  Gdt[16] := (CbGateStub And $FFFF) Or ($08 Shl 16);
+  Gdt[17] := (CbGateStub And LongInt($FFFF0000)) Or $EC00;
+  For I := 0 To LdtMax - 1 Do LdtUsed[I] := False;
+  LdtUsed[0] := True;
+  asm
+    mov ax,28h
+    ltr ax
+    mov ax,30h
+    lldt ax
+  end;
+  { segment des souches 16 bits (une souche de 16 octets par API) }
+  W16ThunkSel := GAlloc16($10000, True);
+  W16ThunkLin := SelBase(W16ThunkSel);
+  GOwner[W16ThunkSel Shr 3] := 0;
+  A := W16ThunkLin + W16CbOfs;
+  PutB(A, $9A); PutB(A, 0); PutB(A, 0);             { call far 43h:0 }
+  PutB(A, SelGateCb); PutB(A, 0);
+  { ESP0 de la tache 0 }
+  ThrEsp0[0] := 0;
+  W16Ready := True;
+  KLog('Win16 : LDT ' + IntStr(LdtMax) + ' selecteurs, souches pretes');
+End;
+
+{ ------------------------------------------------------------------ }
+{ Modules NE (executables et DLL Windows 3.x)                         }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxNe = 24;
+  MaxNeSeg = 96;
+  W16SysLet = 'KUGBLSMENVCTYDO';
+  W16SysMods : Array[1..15] Of String[8] = ('KERNEL', 'USER', 'GDI',
+    'KEYBOARD', 'LZEXPAND', 'SHELL', 'MMSYSTEM', 'WIN87EM', 'WING', 'VER',
+    'COMMDLG', 'TOOLHELP', 'SYSTEM', 'DISPLAY', 'SOUND');
+
+Var
+  NeUsed, NeDll, NeInit : Array[0..MaxNe - 1] Of Boolean;
+  NeName : Array[0..MaxNe - 1] Of String[12];
+  NePath : Array[0..MaxNe - 1] Of String[80];
+  NeFile, NeHdr, NeNSeg, NeAuto, NeHMod, NeInst : Array[0..MaxNe - 1]
+    Of LongInt;
+  NeSegSel : Array[0..MaxNe * MaxNeSeg - 1] Of LongInt;
+  { API : module (lettre), ordinal, signature, taille des arguments }
+  ApiLet : Array[0..W16ApiN - 1] Of Char;
+  ApiOrd, ApiArgB, ApiEq : Array[0..W16ApiN - 1] Of LongInt;
+  ApiWarned : Array[0..W16ApiN - 1] Of Boolean;
+  W16Env : LongInt;
+  SysLetS : String;
+  W16ErrMode : LongInt;
+
+{ Parametres d'un appel d'API en cours }
+Var
+  ArgV : Array[1..16] Of LongInt;
+  ArgRaw : Array[1..16] Of LongInt;
+  ArgLin, ArgF, ArgIdx : LongInt;
+
+Function ApiSig(I : LongInt) : String;
+Var S : String; P : LongInt;
+Begin
+  S := W16Apis[I];
+  P := Pos(':', S);
+  S := Copy(S, P + 1, 40);
+  P := Pos('>', S);
+  If P > 0 Then ApiSig := Copy(S, 1, P - 1) Else ApiSig := S;
+End;
+
+Function ApiRet(I : LongInt) : Char;
+Var S : String; P : LongInt;
+Begin
+  S := W16Apis[I];
+  P := Pos('>', S);
+  If P > 0 Then ApiRet := S[P + 1] Else ApiRet := 'W';
+End;
+
+Function ApiName(I : LongInt) : String;
+Var S : String; P : LongInt;
+Begin
+  S := W16Apis[I];
+  P := Pos(' ', S);
+  ApiName := Copy(S, P + 1, 40);
+End;
+
+Function SigBytes(S : String) : LongInt;
+Var I, N : LongInt;
+Begin
+  N := 0;
+  For I := 1 To Length(S) Do
+    Case S[I] Of
+      'W', 'I' : N := N + 2;
+      'L', 'P', 'S' : N := N + 4;
+      'D' : N := N + 8;
+    End;
+  SigBytes := N;
+End;
+
+{ Souches 16 bits : push n / call far 3Bh:0 / retf taille }
+Procedure InitW16Apis;
+Var I, A, V : LongInt; S, Sg : String;
+Begin
+  SysLetS := W16SysLet;
+  For I := 0 To W16ApiN - 1 Do
+  Begin
+    S := W16Apis[I];
+    ApiLet[I] := S[1];
+    Val(Copy(S, 2, 3), ApiOrd[I], V);
+    ApiEq[I] := -1;
+    ApiWarned[I] := False;
+    If S[6] = '=' Then
+    Begin
+      Sg := Copy(S, 7, 20);
+      If Pos(' ', Sg) > 0 Then Sg := Copy(Sg, 1, Pos(' ', Sg) - 1);
+      Val(Sg, ApiEq[I], V);
+      ApiArgB[I] := 0;
+      Continue;
+    End;
+    Sg := ApiSig(I);
+    If (Sg = 'V') Or (Sg = 'R') Or (Sg = 'X') Then ApiArgB[I] := 0
+    Else ApiArgB[I] := SigBytes(Sg);
+    A := W16ThunkLin + I * 16;
+    PutB(A, $68); PutB(A, I And $FF); PutB(A, I Shr 8);
+    PutB(A, $9A); PutB(A, 0); PutB(A, 0); PutB(A, SelGateApi); PutB(A, 0);
+    If ApiArgB[I] = 0 Then PutB(A, $CB)
+    Else
+    Begin
+      PutB(A, $CA); PutB(A, ApiArgB[I] And $FF); PutB(A, ApiArgB[I] Shr 8);
+    End;
+  End;
+  { __WINFLAGS : mode protege, 486, mode etendu, coprocesseur, pagination }
+  For I := 0 To W16ApiN - 1 Do
+    If (ApiLet[I] = 'K') And (ApiOrd[I] = 178) Then ApiEq[I] := $0C29;
+End;
+
+Function ApiFind(Let : Char; Ord : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  ApiFind := -1;
+  For I := 0 To W16ApiN - 1 Do
+    If (ApiLet[I] = Let) And (ApiOrd[I] = Ord) Then
+    Begin
+      ApiFind := I;
+      Exit;
+    End;
+End;
+
+Function SysModLet(Name : String) : Char;
+Var I : LongInt;
+Begin
+  SysModLet := ' ';
+  Name := UpStr(Name);
+  For I := 1 To 15 Do
+    If W16SysMods[I] = Name Then SysModLet := SysLetS[I];
+End;
+
+{ Chaine de N octets a l'adresse A }
+Function PStrN(A, N : LongInt) : String;
+Var S : String; I : LongInt;
+Begin
+  S := '';
+  If N > 255 Then N := 255;
+  For I := 0 To N - 1 Do S := S + Chr(Mem[0:A + I]);
+  PStrN := S;
+End;
+
+Function NeFind(Name : String) : LongInt;
+Var I : LongInt;
+Begin
+  NeFind := -1;
+  Name := UpStr(Name);
+  For I := 0 To MaxNe - 1 Do
+    If NeUsed[I] And (NeName[I] = Name) Then
+    Begin
+      NeFind := I;
+      Exit;
+    End;
+End;
+
+{ Module d'une poignee d'instance, de module ou de segment }
+Function NeOfHandle(H : LongInt) : LongInt;
+Var I, K : LongInt;
+Begin
+  NeOfHandle := -1;
+  H := H Or 3;
+  For I := 0 To MaxNe - 1 Do
+    If NeUsed[I] Then
+    Begin
+      If ((NeHMod[I] Or 3) = H) Or ((NeInst[I] <> 0) And
+         ((NeInst[I] Or 3) = H)) Then
+      Begin
+        NeOfHandle := I;
+        Exit;
+      End;
+      For K := 0 To NeNSeg[I] - 1 Do
+        If (NeSegSel[I * MaxNeSeg + K] Or 3) = H Then
+        Begin
+          NeOfHandle := I;
+          Exit;
+        End;
+    End;
+  If (H = 3) And (CurT >= 0) Then NeOfHandle := T16Mod[CurT];
+End;
+
+{ Entree Ord d'un module : segment (1..n) et deplacement }
+Function NeEntry(M, Ord : LongInt; Var Seg, Ofs : LongInt) : Boolean;
+Var P, N, Ind, Cur, K : LongInt;
+Begin
+  NeEntry := False;
+  P := NeHdr[M] + MemW[0:NeHdr[M] + 4];
+  Cur := 1;
+  Repeat
+    N := Mem[0:P];
+    If N = 0 Then Exit;
+    Ind := Mem[0:P + 1];
+    P := P + 2;
+    If Ind = 0 Then
+    Begin
+      Cur := Cur + N;
+      Continue;
+    End;
+    For K := 0 To N - 1 Do
+    Begin
+      If Cur = Ord Then
+      Begin
+        If Ind = $FF Then
+        Begin
+          Seg := Mem[0:P + 3]; Ofs := MemW[0:P + 4];
+        End
+        Else
+        Begin
+          Seg := Ind; Ofs := MemW[0:P + 1];
+        End;
+        NeEntry := True;
+        Exit;
+      End;
+      If Ind = $FF Then P := P + 6 Else P := P + 3;
+      Inc(Cur);
+    End;
+  Until False;
+End;
+
+{ Ordinal d'un nom exporte (tables des noms residents et non residents) }
+Function NeNameOrd(M : LongInt; Name : String) : LongInt;
+Var P, L, Pass : LongInt; S : String;
+Begin
+  NeNameOrd := 0;
+  Name := UpStr(Name);
+  For Pass := 0 To 1 Do
+  Begin
+    If Pass = 0 Then P := NeHdr[M] + MemW[0:NeHdr[M] + $26]
+    Else
+    Begin
+      If MemL[0:NeHdr[M] + $2C] = 0 Then Exit;
+      P := NeFile[M] + MemL[0:NeHdr[M] + $2C];
+    End;
+    L := Mem[0:P];
+    While L <> 0 Do
+    Begin
+      S := PStrN(P + 1, L);
+      If UpStr(S) = Name Then
+      Begin
+        NeNameOrd := MemW[0:P + 1 + L];
+        Exit;
+      End;
+      P := P + L + 3;
+      L := Mem[0:P];
+    End;
+  End;
+End;
+
+Function NeEntryFar(M, Ord : LongInt) : LongInt;
+Var Sg, Of2 : LongInt;
+Begin
+  NeEntryFar := 0;
+  If NeEntry(M, Ord, Sg, Of2) And (Sg >= 1) And (Sg <= NeNSeg[M]) Then
+    NeEntryFar := MakeFar(NeSegSel[M * MaxNeSeg + Sg - 1], Of2);
+End;
+
+Function LoadNe(Path : String; IsDll : Boolean) : LongInt; Forward;
+
+{ Cible d'une importation : pointeur 16:16 (ou constante si Eq) }
+Function NeImport(M, ModIdx, Ord : LongInt; ByName : String;
+                  Var Eq : Boolean) : LongInt;
+Var Nm : String; L : Char; I, D : LongInt;
+Begin
+  NeImport := 0;
+  Eq := False;
+  I := NeHdr[M] + MemW[0:NeHdr[M] + $2A] +
+       MemW[0:NeHdr[M] + MemW[0:NeHdr[M] + $28] + (ModIdx - 1) * 2];
+  Nm := UpStr(PStrN(I + 1, Mem[0:I]));
+  L := SysModLet(Nm);
+  If L <> ' ' Then
+  Begin
+    If ByName <> '' Then
+    Begin
+      ByName := UpStr(ByName);
+      I := -1;
+      For D := 0 To W16ApiN - 1 Do
+        If (ApiLet[D] = L) And (UpStr(ApiName(D)) = ByName) Then I := D;
+    End
+    Else I := ApiFind(L, Ord);
+    If I < 0 Then
+    Begin
+      KLog('Win16 : ordinal inconnu ' + Nm + '.' + IntStr(Ord));
+      Exit;
+    End;
+    If ApiEq[I] >= 0 Then
+    Begin
+      Eq := True;
+      NeImport := ApiEq[I];
+      Exit;
+    End;
+    NeImport := MakeFar(W16ThunkSel, I * 16);
+    Exit;
+  End;
+  D := NeFind(Nm);
+  If D < 0 Then D := LoadNe(Nm + '.DLL', True);
+  If D < 0 Then
+  Begin
+    KLog('Win16 : module introuvable ' + Nm);
+    Exit;
+  End;
+  If ByName <> '' Then Ord := NeNameOrd(D, ByName);
+  NeImport := NeEntryFar(D, Ord);
+End;
+
+{ Relocations d'un segment }
+Procedure NeRelocate(M, S : LongInt);
+Var Sg, Fl, Lin, R, Cnt, K, Src, Ty, Ofs, A, B, V, Sel, Next, Tgt,
+    Guard : LongInt;
+    Eq, Add : Boolean; Nm : String;
+Begin
+  Sg := NeHdr[M] + MemW[0:NeHdr[M] + $22] + S * 8;
+  Fl := MemW[0:Sg + 4];
+  If (Fl And $100) = 0 Then Exit;
+  R := NeFile[M] + (MemW[0:Sg] Shl MemW[0:NeHdr[M] + $32]);
+  If MemW[0:Sg + 2] = 0 Then R := R + $10000 Else R := R + MemW[0:Sg + 2];
+  Lin := SelBase(NeSegSel[M * MaxNeSeg + S]);
+  Cnt := MemW[0:R];
+  For K := 0 To Cnt - 1 Do
+  Begin
+    Src := Mem[0:R + 2 + K * 8];
+    Ty := Mem[0:R + 3 + K * 8];
+    Ofs := MemW[0:R + 4 + K * 8];
+    A := MemW[0:R + 6 + K * 8];
+    B := MemW[0:R + 8 + K * 8];
+    Add := (Ty And 4) <> 0;
+    Eq := False;
+    Tgt := 0;
+    Case Ty And 3 Of
+      0 :
+        If (A And $FF) = $FF Then Tgt := NeEntryFar(M, B)
+        Else If (A And $FF) <= NeNSeg[M] Then
+          Tgt := MakeFar(NeSegSel[M * MaxNeSeg + (A And $FF) - 1], B);
+      1 : Tgt := NeImport(M, A, B, '', Eq);
+      2 :
+      Begin
+        V := NeHdr[M] + MemW[0:NeHdr[M] + $2A] + B;
+        Nm := PStrN(V + 1, Mem[0:V]);
+        Tgt := NeImport(M, A, 0, Nm, Eq);
+      End;
+      3 : Continue;   { correction du coprocesseur : sans objet }
+    End;
+    Sel := (Tgt Shr 16) And $FFFF;
+    Guard := 0;
+    Repeat
+      Next := MemW[0:Lin + Ofs];
+      Case Src Of
+        0 :
+          If Add Then Mem[0:Lin + Ofs] := (Mem[0:Lin + Ofs] + Tgt) And $FF
+          Else Mem[0:Lin + Ofs] := Tgt And $FF;
+        2 :
+          If Eq Then MemW[0:Lin + Ofs] := Tgt And $FFFF
+          Else If Add Then MemW[0:Lin + Ofs] := MemW[0:Lin + Ofs] + Sel
+          Else MemW[0:Lin + Ofs] := Sel;
+        3 :
+          If Add Then
+            MemW[0:Lin + Ofs] := MemW[0:Lin + Ofs] + (Tgt And $FFFF)
+          Else
+          Begin
+            MemW[0:Lin + Ofs] := Tgt And $FFFF;
+            MemW[0:Lin + Ofs + 2] := Sel;
+          End;
+        5 :
+          If Add Then
+            MemW[0:Lin + Ofs] := MemW[0:Lin + Ofs] + (Tgt And $FFFF)
+          Else MemW[0:Lin + Ofs] := Tgt And $FFFF;
+        11 :
+        Begin
+          MemL[0:Lin + Ofs] := Tgt And $FFFF;
+          MemW[0:Lin + Ofs + 4] := Sel;
+        End;
+        13 :
+          If Add Then MemL[0:Lin + Ofs] := MemL[0:Lin + Ofs] + (Tgt And $FFFF)
+          Else MemL[0:Lin + Ofs] := Tgt And $FFFF;
+      End;
+      If Add Then Break;
+      Ofs := Next;
+      Inc(Guard);
+    Until (Ofs = $FFFF) Or (Guard > 32768);
+  End;
+End;
+
+{ Prologues des fonctions exportees : push ds / pop ax / nop (1E 58 90)
+  ou mov ax,ds / nop (8C D8 90) -> mov ax,DGROUP }
+Procedure NePatchExports(M : LongInt);
+Var P, N, Ind, K, Sg, Of2, Lin : LongInt;
+Begin
+  If NeInst[M] = 0 Then Exit;
+  P := NeHdr[M] + MemW[0:NeHdr[M] + 4];
+  Repeat
+    N := Mem[0:P];
+    If N = 0 Then Exit;
+    Ind := Mem[0:P + 1];
+    P := P + 2;
+    If Ind = 0 Then Continue;
+    For K := 0 To N - 1 Do
+    Begin
+      If Ind = $FF Then
+      Begin
+        Sg := Mem[0:P + 3]; Of2 := MemW[0:P + 4];
+      End
+      Else
+      Begin
+        Sg := Ind; Of2 := MemW[0:P + 1];
+      End;
+      If ((Mem[0:P] And 1) <> 0) And (Sg >= 1) And (Sg <= NeNSeg[M]) Then
+      Begin
+        Lin := SelBase(NeSegSel[M * MaxNeSeg + Sg - 1]) + Of2;
+        If (Mem[0:Lin + 2] = $90) And (((Mem[0:Lin] = $1E) And
+           (Mem[0:Lin + 1] = $58)) Or ((Mem[0:Lin] = $8C) And
+           (Mem[0:Lin + 1] = $D8))) Then
+        Begin
+          Mem[0:Lin] := $B8;
+          MemW[0:Lin + 1] := NeInst[M];
+        End;
+      End;
+      If Ind = $FF Then P := P + 6 Else P := P + 3;
+    End;
+  Until False;
+End;
+
+Function LoadNe(Path : String; IsDll : Boolean) : LongInt;
+Var M, I, F, FSize, Ne, Sg, Off, Len, Fl, Mn, Sz, Sel, Lin, Own,
+    L : LongInt; Nm : String;
+Begin
+  LoadNe := -1;
+  Path := FindModuleFile(Path);
+  If Path = '' Then Exit;
+  M := -1;
+  For I := MaxNe - 1 DownTo 0 Do
+    If Not NeUsed[I] Then M := I;
+  If M < 0 Then Exit;
+  F := LoadWholeFile(Path, FSize);
+  If F = 0 Then Exit;
+  Ne := F + MemW[0:F + $3C];
+  If (MemW[0:F] <> $5A4D) Or (MemW[0:Ne] <> $454E) Then
+  Begin
+    KFree(F);
+    Exit;
+  End;
+  NeUsed[M] := True; NeInit[M] := False;
+  NeFile[M] := F; NeHdr[M] := Ne;
+  NeDll[M] := (MemW[0:Ne + $0C] And $8000) <> 0;
+  NeNSeg[M] := Min(MemW[0:Ne + $1C], MaxNeSeg);
+  NeAuto[M] := MemW[0:Ne + $0E];
+  L := Ne + MemW[0:Ne + $26];
+  NeName[M] := UpStr(PStrN(L + 1, Mem[0:L]));
+  NePath[M] := Path;
+  KLog('Win16 : module ' + NeName[M] + ' (' + Path + '), ' +
+       IntStr(NeNSeg[M]) + ' segments');
+  Own := HeapOwner;
+  NeHMod[M] := GAlloc16(64, False);
+  NeInst[M] := 0;
+  { segments }
+  For I := 0 To NeNSeg[M] - 1 Do
+  Begin
+    Sg := Ne + MemW[0:Ne + $22] + I * 8;
+    Off := MemW[0:Sg] Shl MemW[0:Ne + $32];
+    Len := MemW[0:Sg + 2];
+    Fl := MemW[0:Sg + 4];
+    Mn := MemW[0:Sg + 6];
+    If (Len = 0) And (Off <> 0) Then Len := $10000;
+    If Mn = 0 Then Sz := $10000 Else Sz := Mn;
+    If Sz < Len Then Sz := Len;
+    If I + 1 = NeAuto[M] Then Sz := $10000;
+    Sel := GAlloc16(Sz, (Fl And 1) = 0);
+    NeSegSel[M * MaxNeSeg + I] := Sel;
+    If Sel = 0 Then Exit;
+    Lin := SelBase(Sel);
+    If (Off <> 0) And (Len > 0) Then MoveMem(F + Off, Lin, Len);
+    If I + 1 = NeAuto[M] Then
+    Begin
+      NeInst[M] := Sel;
+      { segment automatique : limite 64 Ko }
+      DescSet(Sel Shr 3, Lin, $FFFF, $F2);
+    End;
+  End;
+  { relocations (les DLL importees se chargent au passage) }
+  For I := 0 To NeNSeg[M] - 1 Do NeRelocate(M, I);
+  NePatchExports(M);
+  HeapOwner := Own;
+  LoadNe := M;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Appel d'une procedure 16 bits avec arguments sur la pile de la     }
+{ tache : Args = mots/longs dans l'ordre Pascal (premier empile en    }
+{ premier, donc a l'adresse la plus haute)                           }
+{ ------------------------------------------------------------------ }
+
+Var
+  CbStkSel : Array[0..MaxThread - 1] Of LongInt;
+  PArgN : LongInt;
+  PArgV, PArgS : Array[0..15] Of LongInt;
+
+Procedure PArgClear;
+Begin
+  PArgN := 0;
+End;
+
+Procedure PArgW(V : LongInt);
+Begin
+  PArgV[PArgN] := V And $FFFF; PArgS[PArgN] := 2; Inc(PArgN);
+End;
+
+Procedure PArgL(V : LongInt);
+Begin
+  PArgV[PArgN] := V; PArgS[PArgN] := 4; Inc(PArgN);
+End;
+
+{ Pile 16 bits a utiliser pour un rappel : celle de la tache appelante
+  (en cours d'appel d'API) ou une pile de secours }
+Procedure CbStack(Var Ss, Sp : LongInt);
+Begin
+  If T16Sp[CurT] <> 0 Then
+  Begin
+    Ss := T16Ss[CurT]; Sp := T16Sp[CurT] And $FFFE;
+    Exit;
+  End;
+  If CbStkSel[CurT] = 0 Then CbStkSel[CurT] := GAlloc16($8000, False);
+  Ss := CbStkSel[CurT]; Sp := $7FF0;
+End;
+
+{ Reserve N octets sur la pile 16 bits ; rend l'adresse 16:16 }
+Function StkReserve(Ss : LongInt; Var Sp : LongInt; N : LongInt)
+  : LongInt;
+Begin
+  Sp := (Sp - N) And $FFFE;
+  StkReserve := MakeFar(Ss, Sp);
+End;
+
+Function CallProc16(Proc, Ds, Ss, Sp : LongInt) : LongInt;
+Var I, B, OS, OP : LongInt;
+Begin
+  B := SelBase(Ss);
+  For I := 0 To PArgN - 1 Do
+  Begin
+    Sp := Sp - PArgS[I];
+    If PArgS[I] = 2 Then MemW[0:B + Sp] := PArgV[I]
+    Else MemL[0:B + Sp] := PArgV[I];
+  End;
+  Sp := Sp - 4;
+  MemW[0:B + Sp] := W16CbOfs;
+  MemW[0:B + Sp + 2] := W16ThunkSel;
+  C16[6] := 0; C16[7] := 0; C16[8] := 0; C16[9] := 0;
+  C16[10] := 0; C16[11] := 0; C16[12] := 0;
+  { pendant le rappel, la pile de la tache est sous Sp }
+  OS := T16Ss[CurT]; OP := T16Sp[CurT];
+  T16Ss[CurT] := Ss; T16Sp[CurT] := Sp;
+  CallProc16 := Call16((Proc Shr 16) And $FFFF, Proc And $FFFF, Ss, Sp,
+                       Ds, Ds);
+  T16Ss[CurT] := OS; T16Sp[CurT] := OP;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Procedures 16 bits vues comme des procedures 32 bits : une souche   }
+{ (pop ecx / push n / push ecx / jmp W16Bridge) par procedure         }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxPr16 = 256;
+
+Var
+  W16Trace : Boolean;
+  Pr16Proc, Pr16Ds, Pr16Stub, Pr16Thr : Array[0..MaxPr16 - 1] Of LongInt;
+  Pr16N : LongInt;
+  BridgeThunk : LongInt;
+  RcTmp : Array[0..15] Of LongInt;
+
+Function MakeBridge(Proc, Ds : LongInt) : LongInt;
+Var I, A : LongInt;
+Begin
+  MakeBridge := 0;
+  If Proc = 0 Then Exit;
+  For I := 0 To Pr16N - 1 Do
+    If (Pr16Proc[I] = Proc) And (Pr16Ds[I] = Ds) Then
+    Begin
+      MakeBridge := Pr16Stub[I];
+      Exit;
+    End;
+  If Pr16N >= MaxPr16 Then Exit;
+  If BridgeThunk = 0 Then BridgeThunk := KernelExport('W16Bridge');
+  I := Pr16N;
+  Inc(Pr16N);
+  A := KAlloc(16);
+  Pr16Proc[I] := Proc; Pr16Ds[I] := Ds; Pr16Stub[I] := A;
+  Pr16Thr[I] := CurT;
+  PutB(A, $59);
+  PutB(A, $68); PutD(A, I);
+  PutB(A, $51);
+  PutB(A, $B8); PutD(A, BridgeThunk);
+  PutB(A, $FF); PutB(A, $E0);
+  MakeBridge := Pr16Stub[I];
+End;
+
+{ Procedure 16 bits d'une souche (0 si procedure 32 bits) }
+Function Proc16Of(A : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  Proc16Of := 0;
+  For I := 0 To Pr16N - 1 Do
+    If Pr16Stub[I] = A Then
+    Begin
+      Proc16Of := Pr16Proc[I];
+      Exit;
+    End;
+End;
+
+Procedure Rect16To32(P16, P32 : LongInt);
+Var K, V : LongInt;
+Begin
+  For K := 0 To 3 Do
+  Begin
+    V := MemW[0:P16 + K * 2];
+    If V >= $8000 Then V := V - $10000;
+    MemL[0:P32 + K * 4] := V;
+  End;
+End;
+
+Procedure Rect32To16(P32, P16 : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To 3 Do MemW[0:P16 + K * 2] := MemL[0:P32 + K * 4] And $FFFF;
+End;
+
+Function SX16(V : LongInt) : LongInt;
+Begin
+  V := V And $FFFF;
+  If V >= $8000 Then V := V - $10000;
+  SX16 := V;
+End;
+
+Function StrToStack(Ss : LongInt; Var Sp : LongInt; P : LongInt)
+  : LongInt;
+Var N, B : LongInt;
+Begin
+  StrToStack := P;
+  If (P = 0) Or ((P Shr 16) = 0) Then Exit;
+  N := StrLenZ(P) + 1;
+  B := SelBase(Ss);
+  StrToStack := StkReserve(Ss, Sp, N);
+  MoveMem(P, B + Sp, N);
+End;
+
+{ Appel d'une procedure de fenetre 16 bits (via sa souche n) }
+Function W16Bridge(Idx, H, M, WP, LP : LongInt) : LongInt;
+Var Ss, Sp, B, M16, W16, L16, R, Post, P16, A, K : LongInt;
+Begin
+  W16Bridge := 0;
+  If (Idx < 0) Or (Idx >= Pr16N) Then Exit;
+  CbStack(Ss, Sp);
+  B := SelBase(Ss);
+  Sp := Sp - 16;
+  M16 := M; W16 := WP And $FFFF; L16 := LP; Post := 0; P16 := 0;
+  Case M Of
+    $111 :
+      L16 := (LP And $FFFF) Or (((WP Shr 16) And $FFFF) Shl 16);
+    $132..$138 :
+    Begin
+      M16 := $19;
+      L16 := (LP And $FFFF) Or ((M - $132) Shl 16);
+    End;
+    $114, $115 :
+      L16 := ((WP Shr 16) And $FFFF) Or ((LP And $FFFF) Shl 16);
+    6 :
+      L16 := (LP And $FFFF) Or (((WP Shr 16) And $FFFF) Shl 16);
+    $113 : L16 := 0;
+    1, $81 :
+      If LP <> 0 Then
+      Begin
+        P16 := StkReserve(Ss, Sp, 34);
+        A := B + Sp;
+        MemL[0:A] := MemL[0:LP];
+        MemW[0:A + 4] := MemL[0:LP + 4];
+        MemW[0:A + 6] := MemL[0:LP + 8];
+        MemW[0:A + 8] := MemL[0:LP + 12];
+        MemW[0:A + 10] := MemL[0:LP + 16];
+        MemW[0:A + 12] := MemL[0:LP + 20];
+        MemW[0:A + 14] := MemL[0:LP + 24];
+        MemW[0:A + 16] := MemL[0:LP + 28];
+        MemL[0:A + 18] := MemL[0:LP + 32];
+        MemL[0:A + 30] := MemL[0:LP + 44];
+        K := StrToStack(Ss, Sp, MemL[0:LP + 36]);
+        MemL[0:B + (P16 And $FFFF) + 22] := K;
+        K := StrToStack(Ss, Sp, MemL[0:LP + 40]);
+        MemL[0:B + (P16 And $FFFF) + 26] := K;
+        L16 := P16;
+      End;
+    $0C : L16 := StrToStack(Ss, Sp, LP);
+    $0D :
+    Begin
+      K := Min(WP, 2048);
+      P16 := StkReserve(Ss, Sp, K + 2);
+      Mem[0:B + Sp] := 0;
+      L16 := P16; Post := 1;
+    End;
+    $24 :
+    Begin
+      P16 := StkReserve(Ss, Sp, 20);
+      For K := 0 To 9 Do MemW[0:B + Sp + K * 2] := MemL[0:LP + K * 4];
+      L16 := P16; Post := 2;
+    End;
+    $46, $47 :
+    Begin
+      P16 := StkReserve(Ss, Sp, 14);
+      For K := 0 To 6 Do MemW[0:B + Sp + K * 2] := MemL[0:LP + K * 4];
+      L16 := P16; Post := 3;
+    End;
+    $83 :
+    Begin
+      P16 := StkReserve(Ss, Sp, 28);
+      For K := 0 To 11 Do
+        MemW[0:B + Sp + K * 2] := MemL[0:LP + K * 4];
+      MemL[0:B + Sp + 24] := 0;
+      L16 := P16; Post := 4;
+    End;
+  End;
+  PArgClear;
+  PArgW(H); PArgW(M16); PArgW(W16); PArgL(L16);
+  R := CallProc16(Pr16Proc[Idx], Pr16Ds[Idx], Ss, Sp);
+  A := B + (P16 And $FFFF);
+  Case Post Of
+    1 :
+    Begin
+      K := Min(WP, 2048);
+      If K > 0 Then
+      Begin
+        MoveMem(A, LP, K);
+        Mem[0:LP + K - 1] := 0;
+      End;
+      R := R And $FFFF;
+    End;
+    2 : For K := 0 To 9 Do MemL[0:LP + K * 4] := SX16(MemW[0:A + K * 2]);
+    3 :
+      If M = $46 Then
+        For K := 2 To 6 Do MemL[0:LP + K * 4] := SX16(MemW[0:A + K * 2]);
+    4 :
+    Begin
+      For K := 0 To 11 Do MemL[0:LP + K * 4] := SX16(MemW[0:A + K * 2]);
+      R := R And $FFFF;
+    End;
+  End;
+  { resultat 16 bits signe pour les messages qui rendent un mot }
+  If (M <> $111) And ((R Shr 16) = 0) And (M <> 1) And (M <> $81) Then
+    R := R And $FFFF;
+  W16Bridge := R;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Messages d'un programme 16 bits vers une fenetre 32 bits           }
+{ ------------------------------------------------------------------ }
+
+Var
+  MFix, MFixP : LongInt;
+
+Procedure Msg16To32(H : LongInt; Var M, WP, LP : LongInt);
+Var W, K, N : LongInt;
+Begin
+  MFix := 0;
+  WP := WP And $FFFF;
+  Case M Of
+    $111 :
+    Begin
+      WP := WP Or (((LP Shr 16) And $FFFF) Shl 16);
+      LP := LP And $FFFF;
+      Exit;
+    End;
+    $19 :
+    Begin
+      M := $132 + ((LP Shr 16) And $FFFF);
+      LP := LP And $FFFF;
+      Exit;
+    End;
+    $114, $115 :
+    Begin
+      WP := WP Or ((LP And $FFFF) Shl 16);
+      LP := (LP Shr 16) And $FFFF;
+      Exit;
+    End;
+    6 :
+    Begin
+      WP := WP Or (((LP Shr 16) And $FFFF) Shl 16);
+      LP := LP And $FFFF;
+      Exit;
+    End;
+    $0C, $0D : LP := Lin16(LP);
+  End;
+  If (M < $400) Or (M > $43F) Then Exit;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  N := M - $400;
+  K := Wnds[W].IKind;
+  If K = ikEdit Then
+  Begin
+    M := $B0 + N;
+    Case N Of
+      1 :
+      Begin
+        WP := LP And $FFFF;
+        LP := (LP Shr 16) And $FFFF;
+      End;
+      2, 3, 4 :
+      Begin
+        MFixP := Lin16(LP);
+        If N > 2 Then Rect16To32(MFixP, LongInt(@RcTmp));
+        LP := LongInt(@RcTmp);
+        If N = 2 Then MFix := 1;
+      End;
+      $12, $14 : LP := Lin16(LP);
+    End;
+  End
+  Else If K = ikButton Then M := $F0 + N
+  Else If K = ikStatic Then M := $170 + N
+  Else If K = ikListBox Then
+  Begin
+    M := $180 + N - 1;
+    If (N = 1) Or (N = 2) Or (N = $A) Or (N = $D) Or (N = $E) Or
+       (N = $10) Or (N = $23) Then LP := Lin16(LP);
+    If N = $19 Then
+    Begin
+      MFixP := Lin16(LP);
+      LP := LongInt(@RcTmp);
+      MFix := 1;
+    End;
+  End
+  Else If K = ikComboBox Then
+  Begin
+    M := $140 + N;
+    If (N = 3) Or (N = 5) Or (N = 8) Or (N = $A) Or (N = $C) Or
+       (N = $D) Or (N = $18) Then LP := Lin16(LP);
+  End;
+End;
+
+Procedure Msg16Fix;
+Begin
+  If MFix = 1 Then Rect32To16(LongInt(@RcTmp), MFixP);
+  MFix := 0;
+End;
+
+{ Message 16 bits vers une fenetre : procedure 16 bits directement,
+  sinon traduction et appel de la procedure 32 bits }
+Function Pr16Of(A : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  Pr16Of := -1;
+  For I := 0 To Pr16N - 1 Do
+    If Pr16Stub[I] = A Then Pr16Of := I;
+End;
+
+{ Message 16 bits vers une procedure : procedure 16 bits appelee
+  directement, sinon traduction et procedure 32 bits (ou defaut) }
+Function CallWnd16(P, H, M, WP, LP : LongInt; Def : Boolean) : LongInt;
+Var I, R, Ss, Sp : LongInt;
+Begin
+  I := Pr16Of(P);
+  If (I >= 0) And Not Def Then
+  Begin
+    CbStack(Ss, Sp);
+    PArgClear;
+    PArgW(H); PArgW(M); PArgW(WP); PArgL(LP);
+    CallWnd16 := CallProc16(Pr16Proc[I], Pr16Ds[I], Ss, Sp - 16);
+    Exit;
+  End;
+  Msg16To32(H, M, WP, LP);
+  If Def Then R := DefWindowProcA(H, M, WP, LP)
+  Else If P <> 0 Then R := CallWindowProcA(P, H, M, WP, LP)
+  Else R := SendMessageA(H, M, WP, LP);
+  Msg16Fix;
+  CallWnd16 := R;
+End;
+
+Function SendMsg16(H, M, WP, LP : LongInt) : LongInt;
+Var W : LongInt;
+Begin
+  W := WndOf(H);
+  If (W >= 0) And (Pr16Of(Wnds[W].Proc) >= 0) Then
+    SendMsg16 := CallWnd16(Wnds[W].Proc, H, M, WP, LP, False)
+  Else SendMsg16 := CallWnd16(0, H, M, WP, LP, False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Entree de la passerelle des API 16 bits                            }
+{ ------------------------------------------------------------------ }
+
+Procedure W16Dispatch(Idx : LongInt); Forward;
+
+Procedure SetAX(V : LongInt);
+Begin
+  MemL[0:ArgF + 40] := (MemL[0:ArgF + 40] And LongInt($FFFF0000)) Or
+                       (V And $FFFF);
+End;
+
+Procedure SetDXAX(V : LongInt);
+Begin
+  SetAX(V);
+  MemL[0:ArgF + 32] := (MemL[0:ArgF + 32] And LongInt($FFFF0000)) Or
+                       ((V Shr 16) And $FFFF);
+End;
+
+Function RegW(Ofs : LongInt) : LongInt;
+Begin
+  RegW := MemL[0:ArgF + Ofs] And $FFFF;
+End;
+
+Procedure SetRegW(Ofs, V : LongInt);
+Begin
+  MemL[0:ArgF + Ofs] := (MemL[0:ArgF + Ofs] And LongInt($FFFF0000)) Or
+                        (V And $FFFF);
+End;
+
+{ Retirer N octets d'arguments de la pile 16 bits (fonctions PASCAL a
+  nombre variable d'arguments) : l'adresse de retour remonte }
+Procedure W16PopArgs(N : LongInt);
+Var Ss, Sp, B : LongInt;
+Begin
+  Ss := MemL[0:ArgF + 56] And $FFFF;
+  Sp := MemL[0:ArgF + 52] And $FFFF;
+  B := SelBase(Ss);
+  MemL[0:B + Sp + N] := MemL[0:B + Sp];
+  MemL[0:ArgF + 52] := (MemL[0:ArgF + 52] And LongInt($FFFF0000)) Or
+                       ((Sp + N) And $FFFF);
+End;
+
+Procedure W16ApiEntry(Frame : LongInt);
+Var Ss, Esp3, Sp, B, Idx, OS, OP, K, Off, N, V, OL, OF2, OI : LongInt;
+    Sv, SvR : Array[1..16] Of LongInt;
+    Sg, S : String;
+Begin
+  Ss := MemL[0:Frame + 56] And $FFFF;
+  Esp3 := MemL[0:Frame + 52];
+  Sp := Esp3 And $FFFF;
+  B := SelBase(Ss);
+  Idx := MemW[0:B + Sp];
+  MemL[0:Frame + 52] := (Esp3 And LongInt($FFFF0000)) Or ((Sp + 2) And $FFFF);
+  For K := 1 To 16 Do
+  Begin
+    Sv[K] := ArgV[K]; SvR[K] := ArgRaw[K];
+  End;
+  OL := ArgLin; OF2 := ArgF; OI := ArgIdx;
+  OS := T16Ss[CurT]; OP := T16Sp[CurT];
+  T16Ss[CurT] := Ss; T16Sp[CurT] := Sp;
+  ArgF := Frame;
+  ArgLin := B + Sp + 6;
+  ArgIdx := Idx;
+  W16Cf := 0;
+  If (Idx >= 0) And (Idx < W16ApiN) Then
+  Begin
+    Sg := ApiSig(Idx);
+    If (Sg <> 'V') And (Sg <> 'R') And (Sg <> 'X') Then
+    Begin
+      N := Length(Sg);
+      Off := 0;
+      For K := N DownTo 1 Do
+      Begin
+        Case Sg[K] Of
+          'W', 'I' :
+          Begin
+            V := MemW[0:ArgLin + Off];
+            If (Sg[K] = 'I') And (V >= $8000) Then V := V - $10000;
+            Off := Off + 2;
+          End;
+          'D' :
+          Begin
+            V := MemL[0:ArgLin + Off];
+            Off := Off + 8;
+          End;
+        Else
+          V := MemL[0:ArgLin + Off];
+          Off := Off + 4;
+        End;
+        If K <= 16 Then
+        Begin
+          ArgRaw[K] := V;
+          If Sg[K] = 'P' Then ArgV[K] := Lin16(V) Else ArgV[K] := V;
+        End;
+      End;
+    End;
+    If W16Trace Then
+    Begin
+      S := '16> ' + ApiName(Idx);
+      If (Sg <> 'V') And (Sg <> 'R') And (Sg <> 'X') Then
+        For K := 1 To Min(Length(Sg), 8) Do
+        Begin
+          S := S + ' ' + HexStr(ArgRaw[K], 4);
+          If (Sg[K] = 'P') And (ArgV[K] <> 0) Then
+            If (Mem[0:ArgV[K]] >= 32) And (Mem[0:ArgV[K]] < 127) Then
+              S := S + '"' + Copy(PStr(ArgV[K]), 1, 40) + '"';
+        End;
+      KLog(S);
+    End;
+    W16Dispatch(Idx);
+    If W16Trace Then
+      KLog('16< ' + ApiName(Idx) + ' = ' + HexStr(RegW(32), 4) + ':' +
+           HexStr(RegW(40), 4));
+  End;
+  T16Ss[CurT] := OS; T16Sp[CurT] := OP;
+  For K := 1 To 16 Do
+  Begin
+    ArgV[K] := Sv[K]; ArgRaw[K] := SvR[K];
+  End;
+  ArgLin := OL; ArgF := OF2; ArgIdx := OI;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Taches Win16                                                       }
+{ ------------------------------------------------------------------ }
+
+Var
+  T16Psp, T16Show : Array[0..MaxThread - 1] Of LongInt;
+  T16Cmd : Array[0..MaxThread - 1] Of String[127];
+  NeSeq : Array[0..MaxNe - 1] Of LongInt;
+  NeSeqN : LongInt;
+
+Procedure W16Terminate(Code : LongInt);
+Var I, M, K, Own : LongInt;
+Begin
+  KLog('Win16 : fin de la tache ' + IntStr(CurT) + ' (' + IntStr(Code) +
+       ')');
+  KillingApp := True;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds[I].Used And (Wnds[I].Thread = CurT) Then
+    Begin
+      Wnds[I].Proc := 0;
+      Wnds[I].IKind := ikStatic;
+      DestroyW(I);
+    End;
+  KillingApp := False;
+  Own := ThrOwner[CurT];
+  For I := 0 To MaxGdi - 1 Do
+    If Gdis[I].Used And (Gdis[I].Owner = Own) And Not Gdis[I].Stock Then
+      Gdis[I].Used := False;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs[I].Used And (KObjOwner[I] = Own) And
+       (KObjs[I].Kind In [koFile, koFind]) Then KObjs[I].Used := False;
+  M := T16Mod[CurT];
+  If (M >= 0) And NeUsed[M] And Not NeDll[M] Then
+  Begin
+    For K := 0 To NeNSeg[M] - 1 Do GFree16(NeSegSel[M * MaxNeSeg + K]);
+    GFree16(NeHMod[M]);
+    KFree(NeFile[M]);
+    NeUsed[M] := False;
+  End;
+  GFreeOwner(Own);
+  T16Mod[CurT] := -1;
+  CbStkSel[CurT] := 0;
+  ExitThreadK(Code);
+End;
+
+Procedure W16InitDll(M, Ss, Sp : LongInt);
+Var Ne, Cs, Ip, Ds : LongInt;
+Begin
+  NeInit[M] := True;
+  Ne := NeHdr[M];
+  Cs := MemW[0:Ne + $16]; Ip := MemW[0:Ne + $14];
+  If (Cs = 0) Or (Cs > NeNSeg[M]) Then Exit;
+  Ds := NeInst[M];
+  KLog('Win16 : initialisation de ' + NeName[M]);
+  C16[6] := 0; C16[7] := 0; C16[8] := MemW[0:Ne + $10]; C16[9] := 0;
+  C16[10] := 0; C16[11] := Ds; C16[12] := 0;
+  If Ds = 0 Then C16[11] := NeHMod[M];
+  Call16(NeSegSel[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, 0);
+End;
+
+Function W16TaskMain(M : LongInt) : LongInt;
+Var Ne, Ds, Ss, Sp, StkSz, Heap, Lin, Cs, Ip, I, J, Best, DataSz,
+    Sg : LongInt; S : String;
+Begin
+  W16TaskMain := 0;
+  T16Mod[CurT] := M;
+  Ne := NeHdr[M];
+  Ds := NeInst[M];
+  StkSz := MemW[0:Ne + $12];
+  If StkSz < $1400 Then StkSz := $1400;
+  Heap := MemW[0:Ne + $10];
+  Sg := Ne + MemW[0:Ne + $22] + (NeAuto[M] - 1) * 8;
+  DataSz := MemW[0:Sg + 6];
+  If DataSz = 0 Then DataSz := MemW[0:Sg + 2];
+  Ss := Ds;
+  If MemW[0:Ne + $1A] <> NeAuto[M] Then
+    Ss := NeSegSel[M * MaxNeSeg + MemW[0:Ne + $1A] - 1];
+  Sp := MemW[0:Ne + $18];
+  If Sp = 0 Then Sp := DataSz + StkSz;
+  If Sp > $FFFE Then Sp := $FFFE;
+  Sp := Sp And $FFFE;
+  { PSP : INT 20h, environnement, ligne de commande }
+  T16Psp[CurT] := GAlloc16(256, False);
+  Lin := SelBase(T16Psp[CurT]);
+  Mem[0:Lin] := $CD; Mem[0:Lin + 1] := $20;
+  MemW[0:Lin + $2C] := W16Env;
+  S := T16Cmd[CurT];
+  If S <> '' Then S := ' ' + S;
+  If Length(S) > 125 Then S := Copy(S, 1, 125);
+  Mem[0:Lin + $80] := Length(S);
+  For I := 1 To Length(S) Do Mem[0:Lin + $80 + I] := Ord(S[I]);
+  Mem[0:Lin + $81 + Length(S)] := 13;
+  { donnees d'instance : pile }
+  Lin := SelBase(Ds);
+  MemW[0:Lin + $0A] := Sp - StkSz + 16;
+  MemW[0:Lin + $0C] := Sp;
+  MemW[0:Lin + $0E] := Sp;
+  T16Ds[CurT] := Ds;
+  { DLL dans l'ordre de fin de chargement }
+  Repeat
+    Best := -1;
+    For J := 0 To MaxNe - 1 Do
+      If NeUsed[J] And NeDll[J] And Not NeInit[J] Then
+        If (Best < 0) Or (NeSeq[J] < NeSeq[Best]) Then Best := J;
+    If Best >= 0 Then W16InitDll(Best, Ss, Sp - 16);
+  Until Best < 0;
+  Cs := MemW[0:Ne + $16]; Ip := MemW[0:Ne + $14];
+  KLog('Win16 : lancement de ' + NeName[M] + ' CS:IP ' + HexStr(Cs, 2) +
+       ':' + HexStr(Ip, 4) + ' SS:SP ' + HexStr(Ss, 4) + ':' + HexStr(Sp, 4));
+  C16[6] := 0; C16[7] := StkSz; C16[8] := Heap; C16[9] := 0;
+  C16[10] := 0; C16[11] := Ds; C16[12] := 0;
+  Call16(NeSegSel[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, T16Psp[CurT]);
+  W16Terminate(0);
+End;
+
+Function IsNeFile(Path : String) : Boolean;
+Var H, Buf, N : LongInt;
+Begin
+  IsNeFile := False;
+  Buf := KAlloc(64);
+  H := KOpenFile(Path, False, 3);
+  If H <> INVALID_HANDLE Then
+  Begin
+    If KReadFile(H, Buf, 64, N) And (N = 64) And (MemW[0:Buf] = $5A4D)
+    Then
+    Begin
+      SetFilePointer(H, MemL[0:Buf + $3C], 0, 0);
+      If KReadFile(H, Buf, 2, N) And (MemW[0:Buf] = $454E) Then
+        IsNeFile := True;
+    End;
+    CloseHandle(H);
+  End;
+  KFree(Buf);
+End;
+
+Function RunNe(Path, Args : String; Show : LongInt) : Boolean;
+Var M, T, J, Own : LongInt;
+Begin
+  RunNe := False;
+  If Not W16Ready Then Exit;
+  Own := HeapOwner;
+  HeapOwner := 2;
+  M := LoadNe(Path, False);
+  If M < 0 Then
+  Begin
+    HeapOwner := Own;
+    Exit;
+  End;
+  For J := 0 To MaxNe - 1 Do
+    If NeUsed[J] And (NeSeq[J] = 0) Then
+    Begin
+      Inc(NeSeqN);
+      NeSeq[J] := NeSeqN;
+    End;
+  T := ThreadNew(LongInt(@W16TaskMain), M, $10000, True);
+  HeapOwner := Own;
+  If T < 0 Then Exit;
+  ThrW16[T] := True;
+  ThrOwner[T] := 16 + T;
+  T16Cmd[T] := Args;
+  T16Show[T] := Show;
+  T16Sp[T] := 0;
+  RunNe := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fichiers DOS des programmes 16 bits : numeros 5..63 (les          }
+{ bibliotheques C 16 bits indexent leurs tables par ce numero)        }
+{ ------------------------------------------------------------------ }
+
+Var
+  DosH : Array[0..63] Of LongInt;
+  T16Dta : Array[0..MaxThread - 1] Of LongInt;
+  RegHN : LongInt;
+
+Function DosHNew(KH : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DosHNew := -1;
+  If KH = INVALID_HANDLE Then Exit;
+  For I := 5 To 63 Do
+    If DosH[I] = 0 Then
+    Begin
+      DosH[I] := KH;
+      DosHNew := I;
+      Exit;
+    End;
+  CloseHandle(KH);
+End;
+
+Function DosHGet(H : LongInt) : LongInt;
+Begin
+  DosHGet := INVALID_HANDLE;
+  H := H And $FFFF;
+  If (H >= 5) And (H <= 63) And (DosH[H] <> 0) Then DosHGet := DosH[H]
+  Else If H <= 4 Then DosHGet := HStdOut;
+End;
+
+Procedure DosHClose(H : LongInt);
+Var I, K : LongInt;
+Begin
+  H := H And $FFFF;
+  If (H >= 5) And (H <= 63) And (DosH[H] <> 0) Then
+  Begin
+    K := DosH[H];
+    DosH[H] := 0;
+    { un numero duplique (45h) partage l'objet fichier }
+    For I := 5 To 63 Do
+      If DosH[I] = K Then Exit;
+    CloseHandle(K);
+  End;
+End;
+
+Function DosHDup(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DosHDup := -1;
+  H := H And $FFFF;
+  If (H < 5) Or (H > 63) Or (DosH[H] = 0) Then Exit;
+  For I := 5 To 63 Do
+    If DosH[I] = 0 Then
+    Begin
+      DosH[I] := DosH[H];
+      DosHDup := I;
+      Exit;
+    End;
+End;
+
+Function T16DtaOf : LongInt;
+Begin
+  If T16Dta[CurT] = 0 Then T16Dta[CurT] := MakeFar(T16Psp[CurT], $80);
+  T16DtaOf := T16Dta[CurT];
+End;
+
+{ Ressource d'un module NE : Typ/Id entiers (bit 15 force) ou noms }
+Function NeRes(M, Typ, Id : LongInt; TName, IName : String;
+               Var Ptr, Len : LongInt) : Boolean;
+Var R, Sh, T, Cnt, K, E, V : LongInt; Ok : Boolean;
+
+  Function RName(Ofs : LongInt) : String;
+  Begin
+    RName := UpStr(PStrN(R + Ofs + 1, Mem[0:R + Ofs]));
+  End;
+
+Begin
+  NeRes := False;
+  If (M < 0) Or Not NeUsed[M] Then Exit;
+  If MemW[0:NeHdr[M] + $24] = MemW[0:NeHdr[M] + $26] Then Exit;
+  R := NeHdr[M] + MemW[0:NeHdr[M] + $24];
+  Sh := MemW[0:R];
+  T := R + 2;
+  While MemW[0:T] <> 0 Do
+  Begin
+    V := MemW[0:T];
+    Cnt := MemW[0:T + 2];
+    If (V And $8000) <> 0 Then Ok := (TName = '') And ((V And $7FFF) = Typ)
+    Else Ok := (TName <> '') And (RName(V) = TName);
+    If Ok Then
+      For K := 0 To Cnt - 1 Do
+      Begin
+        E := T + 8 + K * 12;
+        V := MemW[0:E + 6];
+        If (V And $8000) <> 0 Then Ok := (IName = '') And ((V And $7FFF) = Id)
+        Else Ok := (IName <> '') And (RName(V) = IName);
+        If Ok Then
+        Begin
+          Ptr := NeFile[M] + (MemW[0:E] Shl Sh);
+          Len := MemW[0:E + 2] Shl Sh;
+          NeRes := True;
+          Exit;
+        End;
+      End;
+    T := T + 8 + Cnt * 12;
+  End;
+End;
+
+{ Nom ou entier d'une ressource passee par pointeur 16:16 }
+Procedure ResKey(Raw : LongInt; Var N : LongInt; Var S : String);
+Var E : LongInt;
+Begin
+  S := '';
+  N := Raw And $FFFF;
+  If (Raw Shr 16) <> 0 Then
+  Begin
+    S := UpStr(PStr(Lin16(Raw)));
+    If (Length(S) > 1) And (S[1] = '#') Then
+    Begin
+      Val(Copy(S, 2, 10), N, E);
+      S := '';
+    End;
+  End;
+End;
+
+Function LoadString16(Inst, Id, Buf, Max : LongInt) : LongInt;
+Var M, P, L, K, N : LongInt;
+Begin
+  LoadString16 := 0;
+  M := NeOfHandle(Inst);
+  If Not NeRes(M, 6, (Id Shr 4) + 1, '', '', P, L) Then Exit;
+  For K := 0 To (Id And 15) - 1 Do P := P + 1 + Mem[0:P];
+  N := Mem[0:P];
+  If Max <= 0 Then Exit;
+  If N > Max - 1 Then N := Max - 1;
+  MoveMem(P + 1, Buf, N);
+  Mem[0:Buf + N] := 0;
+  LoadString16 := N;
+End;
+
+{ wsprintf 16 bits : %d %i %u %x %X %c %s (%ld %lu %lx pour les longs) }
+Function WSPrintf16(Dst, Fmt, Va : LongInt) : LongInt;
+Var I, N, V, W, L : LongInt; C : Char; S, Pad : String; Lng, Left,
+    Zero : Boolean;
+Begin
+  N := 0;
+  I := 0;
+  While Mem[0:Fmt + I] <> 0 Do
+  Begin
+    C := Chr(Mem[0:Fmt + I]);
+    Inc(I);
+    If C <> '%' Then
+    Begin
+      Mem[0:Dst + N] := Ord(C);
+      Inc(N);
+      Continue;
+    End;
+    Left := False; Zero := False; W := 0; Lng := False;
+    If Chr(Mem[0:Fmt + I]) = '-' Then Begin Left := True; Inc(I) End;
+    If Chr(Mem[0:Fmt + I]) = '0' Then Begin Zero := True; Inc(I) End;
+    While (Mem[0:Fmt + I] >= 48) And (Mem[0:Fmt + I] <= 57) Do
+    Begin
+      W := W * 10 + Mem[0:Fmt + I] - 48;
+      Inc(I);
+    End;
+    If Chr(Mem[0:Fmt + I]) = '.' Then
+    Begin
+      Inc(I);
+      While (Mem[0:Fmt + I] >= 48) And (Mem[0:Fmt + I] <= 57) Do Inc(I);
+    End;
+    If UpCase(Chr(Mem[0:Fmt + I])) = 'L' Then Begin Lng := True; Inc(I) End;
+    C := Chr(Mem[0:Fmt + I]);
+    Inc(I);
+    S := '';
+    Case C Of
+      'd', 'i', 'u', 'x', 'X' :
+      Begin
+        If Lng Then Begin V := MemL[0:Va]; Va := Va + 4 End
+        Else
+        Begin
+          V := MemW[0:Va]; Va := Va + 2;
+          If (C In ['d', 'i']) And (V >= $8000) Then V := V - $10000;
+        End;
+        If C In ['x', 'X'] Then
+        Begin
+          If Lng Then S := HexStr(V, 8) Else S := HexStr(V, 4);
+          While (Length(S) > 1) And (S[1] = '0') Do Delete(S, 1, 1);
+          If C = 'x' Then
+            For L := 1 To Length(S) Do
+              If S[L] In ['A'..'F'] Then S[L] := Chr(Ord(S[L]) + 32);
+        End
+        Else S := IntStr(V);
+      End;
+      'c' :
+      Begin
+        S := Chr(MemW[0:Va] And $FF); Va := Va + 2;
+      End;
+      's' :
+      Begin
+        S := PStr(Lin16(MemL[0:Va])); Va := Va + 4;
+      End;
+      '%' : S := '%';
+    End;
+    Pad := '';
+    While Length(S) + Length(Pad) < W Do
+      If Zero And Not Left Then Pad := Pad + '0' Else Pad := Pad + ' ';
+    If Left Then S := S + Pad Else S := Pad + S;
+    For L := 1 To Length(S) Do
+    Begin
+      Mem[0:Dst + N] := Ord(S[L]);
+      Inc(N);
+    End;
+  End;
+  Mem[0:Dst + N] := 0;
+  WSPrintf16 := N;
+End;
+
+{ Fenetre de premier niveau d'une classe et/ou d'un titre }
+Function FindWin(Cls, Name : LongInt) : LongInt;
+Var I : LongInt; C, N : String;
+Begin
+  FindWin := 0;
+  C := ''; N := '';
+  If Cls <> 0 Then C := UpStr(PStr(Cls));
+  If Name <> 0 Then N := PStr(Name);
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds[I].Used And Not IsChildW(I) And (Wnds[I].IKind = ikNone) Then
+      If ((C = '') Or (UpStr(Classes[Wnds[I].Cls].Name) = C)) And
+         ((Name = 0) Or (Wnds[I].Text = N)) Then
+      Begin
+        FindWin := HwndOf(I);
+        Exit;
+      End;
+End;
+
+Function FindWindowA(Cls, Name : LongInt) : LongInt;
+Begin
+  If (Cls <> 0) And (Cls < $10000) Then Cls := 0;
+  FindWindowA := FindWin(Cls, Name);
+End;
+
+{ MSG 32 bits (28 octets) <-> MSG 16 bits (18 octets) }
+Procedure Msg32To16(P32, P16 : LongInt);
+Var M, WP, LP : LongInt;
+Begin
+  M := MemL[0:P32 + 4]; WP := MemL[0:P32 + 8]; LP := MemL[0:P32 + 12];
+  Case M Of
+    $111 : LP := (LP And $FFFF) Or (((WP Shr 16) And $FFFF) Shl 16);
+    $114, $115 :
+      LP := ((WP Shr 16) And $FFFF) Or ((LP And $FFFF) Shl 16);
+    $113 : LP := 0;
+  End;
+  MemW[0:P16] := MemL[0:P32];
+  MemW[0:P16 + 2] := M;
+  MemW[0:P16 + 4] := WP;
+  MemL[0:P16 + 6] := LP;
+  MemL[0:P16 + 10] := MemL[0:P32 + 16];
+  MemW[0:P16 + 14] := MemL[0:P32 + 20];
+  MemW[0:P16 + 16] := MemL[0:P32 + 24];
+End;
+
+Procedure Msg16To32P(P16, P32 : LongInt);
+Var H, M, WP, LP : LongInt;
+Begin
+  H := MemW[0:P16]; M := MemW[0:P16 + 2];
+  WP := MemW[0:P16 + 4]; LP := MemL[0:P16 + 6];
+  Msg16To32(H, M, WP, LP);
+  MemL[0:P32] := H; MemL[0:P32 + 4] := M;
+  MemL[0:P32 + 8] := WP; MemL[0:P32 + 12] := LP;
+  MemL[0:P32 + 16] := MemL[0:P16 + 10];
+  MemL[0:P32 + 20] := SX16(MemW[0:P16 + 14]);
+  MemL[0:P32 + 24] := SX16(MemW[0:P16 + 16]);
+End;
+
+{ Appel d'une fonction stdcall 32 bits : N arguments a partir de A
+  (A[0] premier argument) }
+Function CallStd(Proc, A, N : LongInt) : LongInt;
+Var R, P, K : LongInt;
+Begin
+  R := 0;
+  P := A + (N - 1) * 4;
+  asm
+    mov ecx,N
+    mov edx,P
+  @l:
+    test ecx,ecx
+    jz @c
+    push dword ptr [edx]
+    sub edx,4
+    dec ecx
+    jmp @l
+  @c:
+    mov eax,Proc
+    call eax
+    mov R,eax
+  end;
+  CallStd := R;
+End;
+
+Procedure W16Fail(Msg : String);
+Begin
+  MsgBoxOpen('Pasdows', Msg, $10);
+  W16Terminate(1);
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS3Call / INT 21h                                                 }
+{ ------------------------------------------------------------------ }
+
+Var
+  DosIsInt : Boolean;
+  W16Tmp : LongInt;
+
+Procedure DosCF(E : LongInt);
+Begin
+  If DosIsInt Then
+  Begin
+    If E <> 0 Then MemL[0:ArgF + 52] := MemL[0:ArgF + 52] Or 1
+    Else MemL[0:ArgF + 52] := MemL[0:ArgF + 52] And Not 1;
+  End
+  Else W16Cf := Ord(E <> 0);
+  If E <> 0 Then SetAX(E);
+End;
+
+Function DosPtr(SegOfs, Ofs : LongInt) : LongInt;
+Begin
+  DosPtr := SelBase(RegW(SegOfs)) + RegW(Ofs);
+End;
+
+Function DosErr : LongInt;
+Var E : LongInt;
+Begin
+  E := Threads[CurT].LastErr;
+  If (E <= 0) Or (E > 255) Then E := 5;
+  DosErr := E;
+End;
+
+Function DosDrive : LongInt;
+Begin
+  DosDrive := Ord(UpCase(CurDirS[1])) - 65;
+End;
+
+Procedure DosFind(Dta : LongInt; First : Boolean);
+Var H, Fd, Ok, Attr, Mask, D, T : LongInt; S : String;
+Begin
+  Fd := W16Tmp;
+  If First Then
+  Begin
+    Mask := RegW(36);
+    H := FindFirstFileA(DosPtr(8, 32), Fd);
+    If H = INVALID_HANDLE Then
+    Begin
+      DosCF(18);
+      Exit;
+    End;
+    MemL[0:Dta] := H;
+    Mem[0:Dta + 4] := Mask;
+    Ok := 1;
+  End
+  Else
+  Begin
+    H := MemL[0:Dta];
+    Mask := Mem[0:Dta + 4];
+    Ok := FindNextFileA(H, Fd);
+  End;
+  While Ok <> 0 Do
+  Begin
+    Attr := MemL[0:Fd];
+    If ((Attr And $16) And Not Mask) = 0 Then
+    Begin
+      Mem[0:Dta + 21] := Attr;
+      D := 0; T := 0;
+      FileTimeToDosDateTime(Fd + 20, LongInt(@D), LongInt(@T));
+      MemW[0:Dta + 22] := T; MemW[0:Dta + 24] := D;
+      MemL[0:Dta + 26] := MemL[0:Fd + 32];
+      S := UpStr(PStr(Fd + 44));
+      If Length(S) > 12 Then S := Copy(S, 1, 12);
+      PutPStr(Dta + 30, S, 13);
+      DosCF(0);
+      Exit;
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  FindClose(H);
+  DosCF(18);
+End;
+
+Procedure W16Dos;
+Var AH, AL, H, N, R, P, D, T : LongInt; S : String;
+Begin
+  AH := (RegW(40) Shr 8) And $FF;
+  AL := RegW(40) And $FF;
+  If W16Tmp = 0 Then W16Tmp := KAlloc(512);
+  DosCF(0);
+  If W16Trace Then
+  Begin
+    P := DosPtr(8, 32);
+    If (Mem[0:P] >= 32) And (Mem[0:P] < 127) Then S := Copy(PStr(P), 1, 40)
+    Else S := '';
+    KLog('INT 21h AH=' + HexStr(AH, 2) + ' AL=' + HexStr(AL, 2) + ' BX=' +
+         HexStr(RegW(28), 4) + ' CX=' + HexStr(RegW(36), 4) + ' DX=' +
+         HexStr(RegW(32), 4) + ' ' + S);
+  End;
+  Case AH Of
+    $0D : ;
+    $0E :
+    Begin
+      If RegW(32) And $FF = 2 Then CurDirS := 'C:'
+      Else If RegW(32) And $FF = 3 Then CurDirS := 'D:';
+      SetAX((RegW(40) And $FF00) Or 4);
+    End;
+    $19 : SetAX((RegW(40) And $FF00) Or DosDrive);
+    $1A : T16Dta[CurT] := MakeFar(RegW(8), RegW(32));
+    $2F :
+    Begin
+      If T16Dta[CurT] = 0 Then T16Dta[CurT] := MakeFar(T16Psp[CurT], $80);
+      SetRegW(4, (T16Dta[CurT] Shr 16) And $FFFF);
+      SetRegW(28, T16Dta[CurT] And $FFFF);
+    End;
+    $25 : ;
+    $35 :
+    Begin
+      SetRegW(4, 0); SetRegW(28, 0);
+    End;
+    $2A :
+    Begin
+      GetLocalTime(W16Tmp);
+      SetRegW(36, MemW[0:W16Tmp]);
+      SetRegW(32, (MemW[0:W16Tmp + 2] Shl 8) Or MemW[0:W16Tmp + 6]);
+      SetAX((RegW(40) And $FF00) Or MemW[0:W16Tmp + 4]);
+    End;
+    $2C :
+    Begin
+      GetLocalTime(W16Tmp);
+      SetRegW(36, (MemW[0:W16Tmp + 8] Shl 8) Or MemW[0:W16Tmp + 10]);
+      SetRegW(32, (MemW[0:W16Tmp + 12] Shl 8) Or
+                  (MemW[0:W16Tmp + 14] Div 10));
+    End;
+    $30 :
+    Begin
+      SetAX($0007);
+      SetRegW(28, 0); SetRegW(36, 0);
+    End;
+    $33 : SetRegW(32, 0);
+    $36 :
+    Begin
+      S := Chr(64 + (RegW(32) And $FF)) + ':\';
+      If RegW(32) And $FF = 0 Then S := Copy(CurDirS, 1, 2) + '\';
+      PutPStr(W16Tmp + 400, S, 8);
+      If GetDiskFreeSpaceA(W16Tmp + 400, W16Tmp, W16Tmp + 4, W16Tmp + 8,
+                           W16Tmp + 12) <> 0 Then
+      Begin
+        SetAX(MemL[0:W16Tmp]);
+        SetRegW(28, Min(MemL[0:W16Tmp + 8], $FFFF));
+        SetRegW(36, MemL[0:W16Tmp + 4]);
+        SetRegW(32, Min(MemL[0:W16Tmp + 12], $FFFF));
+      End
+      Else SetAX($FFFF);
+    End;
+    $39 : If CreateDirectoryA(DosPtr(8, 32), 0) = 0 Then DosCF(DosErr);
+    $3A : If RemoveDirectoryA(DosPtr(8, 32)) = 0 Then DosCF(DosErr);
+    $3B : If SetCurrentDirectoryA(DosPtr(8, 32)) = 0 Then DosCF(3);
+    $3C, $5B :
+    Begin
+      If AH = $3C Then D := 2 Else D := 1;
+      H := DosHNew(KOpenFile(PStr(DosPtr(8, 32)), True, D));
+      If H < 0 Then DosCF(DosErr) Else SetAX(H);
+    End;
+    $3D :
+    Begin
+      H := DosHNew(KOpenFile(PStr(DosPtr(8, 32)), (AL And 3) <> 0, 3));
+      If H < 0 Then DosCF(DosErr) Else SetAX(H);
+    End;
+    $3E : DosHClose(RegW(28));
+    $3F :
+    Begin
+      H := DosHGet(RegW(28));
+      If (RegW(28) <= 4) Then SetAX(0)
+      Else If KReadFile(H, DosPtr(8, 32), RegW(36), N) Then SetAX(N)
+      Else DosCF(6);
+    End;
+    $40 :
+    Begin
+      H := DosHGet(RegW(28));
+      If RegW(36) = 0 Then
+      Begin
+        SetEndOfFile(H);
+        SetAX(0);
+      End
+      Else
+      Begin
+        N := KWriteFile(H, DosPtr(8, 32), RegW(36));
+        If N < 0 Then DosCF(5) Else SetAX(N);
+      End;
+    End;
+    $41 : If DeleteFileA(DosPtr(8, 32)) = 0 Then DosCF(2);
+    $42 :
+    Begin
+      H := DosHGet(RegW(28));
+      R := SetFilePointer(H, (RegW(36) Shl 16) Or RegW(32), 0, AL);
+      If R = -1 Then DosCF(6)
+      Else
+      Begin
+        SetAX(R); SetRegW(32, (R Shr 16) And $FFFF);
+      End;
+    End;
+    $43 :
+      If AL = 0 Then
+      Begin
+        R := GetFileAttributesA(DosPtr(8, 32));
+        If R = -1 Then DosCF(2) Else SetRegW(36, R);
+      End
+      Else SetFileAttributesA(DosPtr(8, 32), RegW(36));
+    $44 :
+      Case AL Of
+        0 :
+          If RegW(28) <= 4 Then SetRegW(32, $80D3)
+          Else SetRegW(32, DosDrive);
+        8 : SetAX(1);
+        9 :
+          If ((RegW(28) And $FF) = 4) Or
+             (((RegW(28) And $FF) = 0) And (DosDrive = 3)) Then
+            SetRegW(32, $1000)
+          Else SetRegW(32, 0);
+      Else
+        DosCF(1);
+      End;
+    $45 :
+    Begin
+      N := DosHDup(RegW(28));
+      If N < 0 Then DosCF(4) Else SetAX(N);
+    End;
+    $47 :
+    Begin
+      S := CurDirS;
+      If Length(S) > 3 Then S := Copy(S, 4, 255) Else S := '';
+      PutPStr(DosPtr(8, 16), S, 64);
+    End;
+    $48 :
+    Begin
+      H := GAlloc16(RegW(28) * 16, False);
+      If H = 0 Then
+      Begin
+        SetRegW(28, 0);
+        DosCF(8);
+      End
+      Else SetAX(H);
+    End;
+    $49 : GFree16(RegW(4));
+    $4A :
+      If GReAlloc16(RegW(4), RegW(28) * 16) <> (RegW(4) Or 3) Then
+        DosCF(8);
+    $4C : W16Terminate(AL);
+    $4E : DosFind(Lin16(T16DtaOf), True);
+    $4F : DosFind(Lin16(T16DtaOf), False);
+    $50 : ;
+    $51, $62 : SetRegW(28, T16Psp[CurT]);
+    $56 : If MoveFileA(DosPtr(8, 32), DosPtr(4, 12)) = 0 Then DosCF(5);
+    $57 :
+      If AL = 0 Then
+      Begin
+        H := DosHGet(RegW(28));
+        D := 0; T := 0;
+        If GetFileTime(H, 0, 0, W16Tmp) <> 0 Then
+          FileTimeToDosDateTime(W16Tmp, LongInt(@D), LongInt(@T));
+        SetRegW(36, T); SetRegW(32, D);
+      End;
+    $59 :
+    Begin
+      SetAX(DosErr); SetRegW(28, $0D01); SetRegW(36, 0);
+    End;
+    $6C :
+    Begin
+      P := DosPtr(8, 16);
+      D := RegW(32);
+      If GetFileAttributesA(P) <> -1 Then
+      Begin
+        If (D And 3) = 0 Then N := 0
+        Else If (D And 3) = 1 Then
+        Begin
+          N := 3; R := 1;
+        End
+        Else
+        Begin
+          N := 2; R := 3;
+        End;
+      End
+      Else If (D And $10) <> 0 Then
+      Begin
+        N := 1; R := 2;
+      End
+      Else N := -1;
+      If N = 0 Then DosCF(80)
+      Else If N < 0 Then DosCF(2)
+      Else
+      Begin
+        H := DosHNew(KOpenFile(PStr(P), (RegW(28) And 3) <> 0, N));
+        If H < 0 Then DosCF(DosErr)
+        Else
+        Begin
+          SetAX(H);
+          SetRegW(36, R);
+        End;
+      End;
+    End;
+    $71 : DosCF($7100);
+  Else
+    KLog('Win16 : INT 21h AH=' + HexStr(AH, 2) + 'h non gere');
+    DosCF(1);
+  End;
+End;
+
+Procedure Int21Tail;
+Var F, OF2 : LongInt;
+Begin
+  asm
+    mov eax,[ebp]
+    mov F,eax
+    sti
+  end;
+  OF2 := ArgF;
+  ArgF := F;
+  DosIsInt := True;
+  W16Dos;
+  DosIsInt := False;
+  ArgF := OF2;
+End;
+
+Procedure Int21Gate; Interrupt;
+Begin
+  Int21Tail;
+End;
+
+{ INT 2Fh (multiplexage) et INT 31h (DPMI) : rien d'installe }
+Procedure Int2FGate; Interrupt;
+Begin
+End;
+
+{ ------------------------------------------------------------------ }
+{ API Win16 : code = rang du module * 1000 + ordinal                 }
+{ (1 KERNEL, 2 USER, 3 GDI, 4 KEYBOARD, 5 LZEXPAND, 6 SHELL,         }
+{  7 MMSYSTEM, 8 WIN87EM, 9 WING, 10 VER, 11 COMMDLG, 12 TOOLHELP)   }
+{ ------------------------------------------------------------------ }
+
+Var
+  W16Buf : LongInt;
+  WinIni, WinDirZ, SysDirZ : String;
+
+Function A(K : LongInt) : LongInt;
+Begin
+  A := ArgV[K];
+End;
+
+Function W16Inst : LongInt;
+Begin
+  W16Inst := T16Ds[CurT];
+End;
+
+Procedure RetStrCopy(Dst, Src, Max : LongInt);
+Var N : LongInt;
+Begin
+  N := StrLenZ(Src);
+  If N > Max - 1 Then N := Max - 1;
+  If N < 0 Then N := 0;
+  MoveMem(Src, Dst, N);
+  Mem[0:Dst + N] := 0;
+  SetAX(N);
+End;
+
+Procedure W16RegisterClass(P : LongInt);
+Var C : LongInt;
+Begin
+  C := W16Buf;
+  FillMem(C, 48, 0);
+  MemL[0:C] := MemW[0:P];
+  MemL[0:C + 4] := MakeBridge(MemL[0:P + 2], W16Inst);
+  MemL[0:C + 8] := SX16(MemW[0:P + 6]);
+  MemL[0:C + 12] := SX16(MemW[0:P + 8]);
+  MemL[0:C + 16] := MemW[0:P + 10];
+  MemL[0:C + 20] := MemW[0:P + 12];
+  MemL[0:C + 24] := MemW[0:P + 14];
+  MemL[0:C + 28] := MemW[0:P + 16];
+  If (MemL[0:P + 18] Shr 16) <> 0 Then MemL[0:C + 32] := Lin16(MemL[0:P + 18])
+  Else MemL[0:C + 32] := MemW[0:P + 18];
+  If (MemL[0:P + 22] Shr 16) <> 0 Then MemL[0:C + 36] := Lin16(MemL[0:P + 22])
+  Else MemL[0:C + 36] := MemW[0:P + 22];
+  SetAX(RegisterClassA(C));
+End;
+
+Procedure W16WinExec(Cmd : String; Show : LongInt);
+Var P : LongInt; Prog, Args : String;
+Begin
+  Cmd := Trim(Cmd);
+  P := Pos(' ', Cmd);
+  If P > 0 Then
+  Begin
+    Prog := Copy(Cmd, 1, P - 1);
+    Args := Trim(Copy(Cmd, P + 1, 255));
+  End
+  Else
+  Begin
+    Prog := Cmd; Args := '';
+  End;
+  If Pos('.', BaseName(Prog)) = 0 Then Prog := Prog + '.EXE';
+  KLog('WinExec ' + Prog + ' [' + Args + ']');
+  If FindModuleFile(Prog) = '' Then
+  Begin
+    SetAX(2);
+    Exit;
+  End;
+  If IsNeFile(FindModuleFile(Prog)) Then
+  Begin
+    If RunNe(FindModuleFile(Prog), Args, Show) Then SetAX(33) Else SetAX(11);
+  End
+  Else If RunExe(Prog, Args) Then SetAX(33)
+  Else SetAX(11);
+End;
+
+Procedure W16Dispatch(Idx : LongInt);
+Var Code, R, P, K, N, S, H, M, T, F, Ss, Sp : LongInt; Str : String;
+Begin
+  If W16Buf = 0 Then W16Buf := KAlloc(4096);
+  Code := Pos(ApiLet[Idx], SysLetS) * 1000 + ApiOrd[Idx];
+  If ApiSig(Idx) <> 'R' Then SetDXAX(0);
+  Case Code Of
+    { -------------------------------- KERNEL ------------------------ }
+    1001, 1137 :
+    Begin
+      If Code = 1137 Then Str := PStr(A(2)) Else Str := 'FatalExit';
+      W16Fail(NeName[T16Mod[CurT]] + ' : ' + Str);
+    End;
+    1003 : SetDXAX($07005F03);
+    1004 :
+    Begin
+      S := A(1);
+      If S = 0 Then S := RegW(8);
+      SetAX(Ord(LocalInitK(S, A(2), A(3))));
+    End;
+    1005 : SetAX(LocalAllocK(RegW(8), A(1), A(2)));
+    1006 : SetAX(LocalReAllocK(RegW(8), A(1), A(2), A(3)));
+    1007 :
+    Begin
+      LocalFreeK(RegW(8), A(1));
+      SetAX(0);
+    End;
+    1008 : SetDXAX(MakeFar(RegW(8), A(1)));
+    1009 : SetAX(0);
+    1010 : SetAX(LocalSizeK(RegW(8), A(1)));
+    1012 : SetAX(0);
+    1013 : SetDXAX(0);
+    1015 :
+    Begin
+      R := GAlloc16(A(2), False);
+      SetAX(R);
+    End;
+    1016 :
+      If (A(3) And $80) <> 0 Then SetAX(A(1))
+      Else SetAX(GReAlloc16(A(1), A(2)));
+    1017 :
+    Begin
+      GFree16(A(1));
+      SetAX(0);
+    End;
+    1018, 1023 :
+      If GIdx(A(1)) >= 0 Then SetDXAX(MakeFar(A(1), 0))
+      Else If (Code = 1023) And (A(1) = $FFFF) Then SetAX(RegW(8))
+      Else If SelValid(A(1)) Then SetDXAX(MakeFar(A(1), 0));
+    1019, 1024 : SetAX(0);
+    1020 :
+    Begin
+      K := GIdx(A(1));
+      If K >= 0 Then SetDXAX(GSize[K]);
+    End;
+    1021 : SetDXAX(MakeFar(A(1), A(1)));
+    1022 : SetAX(0);
+    1025 : SetDXAX(HeapFreeBytes);
+    1029, 1030 : KYield;
+    1036 : SetDXAX($8000 + CurT);
+    1037 : SetAX(T16Psp[CurT]);
+    1047 :
+    Begin
+      If (ArgRaw[1] Shr 16) = 0 Then
+      Begin
+        M := NeOfHandle(ArgRaw[1]);
+        If M >= 0 Then SetAX(NeHMod[M]);
+        Exit;
+      End;
+      Str := UpStr(PStr(Lin16(ArgRaw[1])));
+      If Pos('.', Str) > 0 Then Str := Copy(Str, 1, Pos('.', Str) - 1);
+      M := NeFind(Str);
+      If M >= 0 Then SetAX(NeHMod[M]);
+    End;
+    1048 :
+    Begin
+      M := NeOfHandle(A(1));
+      If M >= 0 Then SetAX(1);
+    End;
+    1049 :
+    Begin
+      M := NeOfHandle(A(1));
+      If M >= 0 Then RetStrCopy(A(2), LongInt(@NePath[M]) + 1, A(3))
+      Else SetAX(0);
+      If M >= 0 Then PutPStr(A(2), NePath[M], A(3));
+    End;
+    1050 :
+    Begin
+      M := NeOfHandle(A(1));
+      If M >= 0 Then
+      Begin
+        If (ArgRaw[2] Shr 16) = 0 Then N := ArgRaw[2] And $FFFF
+        Else N := NeNameOrd(M, PStr(A(2)));
+        SetDXAX(NeEntryFar(M, N));
+      End;
+    End;
+    1051 : SetDXAX(ArgRaw[1]);
+    1052 : ;
+    1057 : SetAX(GetPrivateProfileIntA(A(1), A(2), A(3), LongInt(@WinIni) + 1));
+    1058 :
+      SetAX(GetPrivateProfileStringA(A(1), A(2), A(3), A(4), A(5),
+                                     LongInt(@WinIni) + 1));
+    1059 :
+      SetAX(WritePrivateProfileStringA(A(1), A(2), A(3),
+                                       LongInt(@WinIni) + 1));
+    1074 :
+    Begin
+      R := OpenFile(A(1), A(2), A(3));
+      If (R = -1) Or (R = 0) And ((A(3) And $4200) = 0) Then SetAX($FFFF)
+      Else If (A(3) And $4200) <> 0 Then
+      Begin
+        If R <> 0 Then CloseHandle(R);
+        SetAX(1);
+      End
+      Else SetAX(DosHNew(R));
+    End;
+    1081 :
+    Begin
+      DosHClose(A(1));
+      SetAX(0);
+    End;
+    1082, 1349 :
+    Begin
+      If KReadFile(DosHGet(A(1)), Lin16(A(2)), A(3), N) Then SetDXAX(N)
+      Else SetDXAX(-1);
+      If Code = 1082 Then SetRegW(32, 0);
+    End;
+    1083 :
+    Begin
+      R := DosHNew(KOpenFile(PStr(A(1)), True, 2));
+      If R < 0 Then SetAX($FFFF) Else SetAX(R);
+    End;
+    1084 :
+    Begin
+      R := SetFilePointer(DosHGet(A(1)), A(2), 0, A(3));
+      SetDXAX(R);
+    End;
+    1085 :
+    Begin
+      R := DosHNew(KOpenFile(PStr(A(1)), (A(2) And 3) <> 0, 3));
+      If R < 0 Then SetAX($FFFF) Else SetAX(R);
+    End;
+    1086, 1350 :
+    Begin
+      R := KWriteFile(DosHGet(A(1)), A(2), A(3));
+      SetDXAX(R);
+      If Code = 1086 Then SetRegW(32, 0);
+    End;
+    1088 :
+    Begin
+      RetStrCopy(Lin16(A(1)), A(2), 65536);
+      SetDXAX(A(1));
+    End;
+    1089 :
+    Begin
+      P := Lin16(A(1));
+      RetStrCopy(P + StrLenZ(P), A(2), 65536);
+      SetDXAX(A(1));
+    End;
+    1090 : SetAX(StrLenZ(A(1)));
+    1091 :
+    Begin
+      { InitTask : tas local, pile, ligne de commande }
+      M := T16Mod[CurT];
+      S := RegW(8);
+      P := SelBase(S);
+      LocalInitK(S, Max(MemW[0:P + $0E], $100), $FFF0);
+      SetAX(1);
+      SetRegW(36, MemW[0:NeHdr[M] + $12]);
+      SetRegW(12, S);
+      SetRegW(16, 0);
+      SetRegW(4, T16Psp[CurT]);
+      SetRegW(28, $81);
+      If T16Show[CurT] = 0 Then T16Show[CurT] := 1;
+      SetRegW(32, T16Show[CurT]);
+    End;
+    1102 : W16Dos;
+    1107 :
+    Begin
+      SetAX(W16ErrMode);
+      W16ErrMode := A(1);
+    End;
+    1127 : SetAX(GetPrivateProfileIntA(A(1), A(2), A(3), A(4)));
+    1128 : SetAX(GetPrivateProfileStringA(A(1), A(2), A(3), A(4), A(5),
+                                          A(6)));
+    1129 : SetAX(WritePrivateProfileStringA(A(1), A(2), A(3), A(4)));
+    1131 : SetDXAX(MakeFar(W16Env, 0));
+    1132 : SetDXAX($0C29);
+    1134 : RetStrCopy(A(1), LongInt(@WinDirZ) + 1, A(2));
+    1135 : RetStrCopy(A(1), LongInt(@SysDirZ) + 1, A(2));
+    1136 :
+      Case A(1) Of
+        2 : SetAX(3);
+        3 : SetAX(4);
+      Else
+        SetAX(0);
+      End;
+    1166 : W16WinExec(PStr(A(1)), A(2));
+    1207 : SetAX(0);
+    1513 : SetDXAX(LoadLibraryA(A(1)));
+    1514 : SetDXAX(1);
+    1515 :
+      If (ArgRaw[2] Shr 16) = 0 Then
+        SetDXAX(GetProcAddress(A(1), ArgRaw[2] And $FFFF))
+      Else SetDXAX(GetProcAddress(A(1), A(2)));
+    1516 : SetDXAX(Lin16(ArgRaw[1]));
+    1517 :
+    Begin
+      { CallProc32W(p1..pN, proc, conversions, N) : PASCAL variable }
+      N := MemL[0:ArgLin];
+      F := MemL[0:ArgLin + 4];
+      P := MemL[0:ArgLin + 8];
+      If N > 32 Then N := 32;
+      For K := 0 To N - 1 Do
+      Begin
+        R := MemL[0:ArgLin + 12 + K * 4];
+        If ((F Shr K) And 1) <> 0 Then R := Lin16(R);
+        MemL[0:W16Buf + (N - 1 - K) * 4] := R;
+      End;
+      R := CallStd(P, W16Buf, N);
+      W16PopArgs(12 + N * 4);
+      SetDXAX(R);
+    End;
+    { --------------------------------- USER ------------------------- }
+    2001 : SetAX(MessageBoxA(A(1), A(2), A(3), A(4)));
+    2005 : SetAX(1);
+    2010 : SetAX(SetTimer(A(1), A(2), A(3), MakeBridge(ArgRaw[4], W16Inst)));
+    2012 : SetAX(KillTimer(A(1), A(2)));
+    2013 : SetDXAX(Ticks);
+    2014 : SetDXAX(Ticks);
+    2015 : SetDXAX(Ticks);
+    2018 : SetAX(SetCapture(A(1)));
+    2019 : ReleaseCapture;
+    2022 : SetAX(SetFocus(A(1)));
+    2023 : SetAX(GetFocus);
+    2024 : SetAX(RemovePropA(A(1), A(2)));
+    2025 : SetAX(GetPropA(A(1), A(2)));
+    2026 : SetAX(SetPropA(A(1), A(2), A(3)));
+    2017 :
+    Begin
+      R := GetCursorPos(W16Buf);
+      MemW[0:A(1)] := MemL[0:W16Buf]; MemW[0:A(1) + 2] := MemL[0:W16Buf + 4];
+    End;
+    2032, 2033 :
+    Begin
+      If Code = 2032 Then R := GetWindowRect(A(1), W16Buf)
+      Else R := GetClientRect(A(1), W16Buf);
+      Rect32To16(W16Buf, A(2));
+    End;
+    2034 : SetAX(EnableWindow(A(1), A(2)));
+    2035 : SetAX(IsWindowEnabled(A(1)));
+    2036 :
+    Begin
+      R := GetWindowTextA(A(1), Lin16(A(2)), A(3));
+      SetAX(R);
+    End;
+    2037 : SetAX(SetWindowTextA(A(1), Lin16(A(2))));
+    2038 : SetAX(GetWindowTextLengthA(A(1)));
+    2039 :
+    Begin
+      R := BeginPaint(A(1), W16Buf);
+      P := A(2);
+      FillMem(P, 32, 0);
+      MemW[0:P] := R;
+      MemW[0:P + 2] := MemL[0:W16Buf + 4];
+      Rect32To16(W16Buf + 8, P + 4);
+      SetAX(R);
+    End;
+    2040 :
+    Begin
+      MemL[0:W16Buf] := MemW[0:A(2)];
+      R := EndPaint(A(1), W16Buf);
+      SetAX(1);
+    End;
+    2041, 2452 :
+    Begin
+      If Code = 2041 Then K := 0 Else K := 1;
+      { CreateWindowEx : style etendu en premier argument }
+      If K = 0 Then T := 0 Else T := A(1);
+      For N := 4 To 7 Do
+        If ArgV[N + K] = -32768 Then ArgV[N + K] := LongInt($80000000);
+      P := A(1 + K);
+      If (ArgRaw[1 + K] Shr 16) = 0 Then P := ArgRaw[1 + K] And $FFFF;
+      R := CreateWindowExA(T, P, A(2 + K), A(3 + K), A(4 + K), A(5 + K),
+                           A(6 + K), A(7 + K), A(8 + K), A(9 + K),
+                           A(10 + K), ArgRaw[11 + K]);
+      SetAX(R);
+    End;
+    2042 : SetAX(ShowWindow(A(1), A(2)));
+    2043 : SetAX(ShowWindow(A(1), 6));
+    2044 : SetAX(ShowWindow(A(1), 9));
+    2045 : SetAX(BringWindowToTop(A(1)));
+    2046 : SetAX(GetParent(A(1)));
+    2047 : SetAX(IsWindow(A(1)));
+    2048 : SetAX(IsChild(A(1), A(2)));
+    2049 : SetAX(IsWindowVisible(A(1)));
+    2050 : SetAX(FindWin(A(1), A(2)));
+    2053 : SetAX(DestroyWindow(A(1)));
+    2056 :
+      SetAX(MoveWindow(A(1), SX16(A(2)), SX16(A(3)), SX16(A(4)), SX16(A(5)),
+                       A(6)));
+    2057 : W16RegisterClass(A(1));
+    2058 : SetAX(GetClassNameA(A(1), A(2), A(3)));
+    2059 : SetAX(SetActiveWindow(A(1)));
+    2060 : SetAX(GetActiveWindow);
+    2066 : SetAX(GetDC(A(1)));
+    2067 : SetAX(GetWindowDC(A(1)));
+    2068 : SetAX(ReleaseDC(A(1), A(2)));
+    2069 : SetAX(SetCursor(A(1)));
+    2071 : SetAX(ShowCursor(A(1)));
+    2076 :
+    Begin
+      Rect16To32(A(1), W16Buf);
+      SetAX(PtInRect(W16Buf, SX16(A(2)), SX16(A(2) Shr 16)));
+    End;
+    2072 :
+    Begin
+      MemL[0:W16Buf] := A(2); MemL[0:W16Buf + 4] := A(3);
+      MemL[0:W16Buf + 8] := A(4); MemL[0:W16Buf + 12] := A(5);
+      Rect32To16(W16Buf, A(1));
+    End;
+    2081 :
+    Begin
+      Rect16To32(A(2), W16Buf);
+      SetAX(FillRect(A(1), W16Buf, A(3)));
+    End;
+    2085 :
+    Begin
+      Rect16To32(A(4), W16Buf);
+      R := DrawTextA(A(1), A(2), A(3), W16Buf, A(5));
+      Rect32To16(W16Buf, A(4));
+      SetAX(R);
+    End;
+    2106 : SetAX(GetKeyState(A(1)));
+    2107 : SetDXAX(CallWnd16(0, A(1), A(2), A(3), A(4), True));
+    2108, 2109 :
+    Begin
+      If Code = 2108 Then R := GetMessageA(W16Buf + 64, A(2), A(3), A(4))
+      Else R := PeekMessageA(W16Buf + 64, A(2), A(3), A(4), A(5));
+      If (R <> 0) Or (Code = 2108) Then Msg32To16(W16Buf + 64, A(1));
+      SetAX(R);
+    End;
+    2110 :
+    Begin
+      H := A(1); M := A(2); P := A(3); R := A(4);
+      Msg16To32(H, M, P, R);
+      SetAX(PostMessageA(H, M, P, R));
+    End;
+    2111 : SetDXAX(SendMsg16(A(1), A(2), A(3), A(4)));
+    2112 : SetAX(WaitMessage);
+    2113 :
+    Begin
+      Msg16To32P(A(1), W16Buf + 64);
+      SetAX(TranslateMessage(W16Buf + 64));
+    End;
+    2114 :
+    Begin
+      P := A(1);
+      H := MemW[0:P];
+      K := WndOf(H);
+      If (K >= 0) And (Pr16Of(Wnds[K].Proc) >= 0) And
+         (MemW[0:P + 2] <> $113) Then
+        SetDXAX(CallWnd16(Wnds[K].Proc, H, MemW[0:P + 2], MemW[0:P + 4],
+                          MemL[0:P + 6], False))
+      Else
+      Begin
+        Msg16To32P(P, W16Buf + 64);
+        SetDXAX(DispatchMessageA(W16Buf + 64));
+      End;
+    End;
+    2118 : SetAX(RegisterWindowMessageA(A(1)));
+    2122 :
+    Begin
+      P := ArgRaw[1];
+      For K := 0 To Pr16N - 1 Do
+        If Pr16Proc[K] = P Then P := Pr16Stub[K];
+      SetDXAX(CallWnd16(P, A(2), A(3), A(4), A(5), False));
+    End;
+    2124 : SetAX(UpdateWindow(A(1)));
+    2125 :
+      If A(2) = 0 Then SetAX(InvalidateRect(A(1), 0, A(3)))
+      Else
+      Begin
+        Rect16To32(A(2), W16Buf);
+        SetAX(InvalidateRect(A(1), W16Buf, A(3)));
+      End;
+    2126 : SetAX(InvalidateRgn(A(1), A(2), A(3)));
+    2127 :
+      If A(2) = 0 Then SetAX(ValidateRect(A(1), 0))
+      Else
+      Begin
+        Rect16To32(A(2), W16Buf);
+        SetAX(ValidateRect(A(1), W16Buf));
+      End;
+    2128 : SetAX(ValidateRect(A(1), 0));
+    2133 : SetAX(GetWindowWord(A(1), A(2)));
+    2134 : SetAX(SetWindowWord(A(1), A(2), A(3)));
+    2135 :
+    Begin
+      R := GetWindowLongA(A(1), A(2));
+      If (A(2) = -4) And (Proc16Of(R) <> 0) Then R := Proc16Of(R);
+      SetDXAX(R);
+    End;
+    2136 :
+    Begin
+      R := A(3);
+      If A(2) = -4 Then R := MakeBridge(ArgRaw[3], W16Inst);
+      R := SetWindowLongA(A(1), A(2), R);
+      If (A(2) = -4) And (Proc16Of(R) <> 0) Then R := Proc16Of(R);
+      SetDXAX(R);
+    End;
+    2150 : SetAX(LoadMenuA(W16Inst, A(2)));
+    2158 : SetAX(SetMenu(A(1), A(2)));
+    2157 : SetAX(GetMenu(A(1)));
+    2173 :
+    Begin
+      If (ArgRaw[2] Shr 16) = 0 Then P := ArgRaw[2] And $FFFF Else P := A(2);
+      If A(1) = 0 Then SetAX(LoadCursorA(0, P))
+      Else SetAX(LoadCursorA(0, $7F00));
+    End;
+    2174 :
+    Begin
+      If (ArgRaw[2] Shr 16) = 0 Then P := ArgRaw[2] And $FFFF Else P := A(2);
+      If A(1) = 0 Then SetAX(LoadIconA(0, P)) Else SetAX(LoadIconA(0, $7F00));
+    End;
+    2176 : SetAX(LoadString16(A(1), A(2), A(3), A(4)));
+    2179 : SetAX(GetSystemMetrics(A(1)));
+    2180 : SetDXAX(GetSysColor(A(1)));
+    2232 :
+      SetAX(SetWindowPos(A(1), A(2), SX16(A(3)), SX16(A(4)), SX16(A(5)),
+                         SX16(A(6)), A(7)));
+    2262 : SetAX(GetWindow(A(1), A(2)));
+    2284 : SetAX(90);
+    2224 :
+    Begin
+      K := WndOf(A(1));
+      If K >= 0 Then SetAX($8000 + Wnds[K].Thread);
+    End;
+    2286 : SetAX(GetDesktopWindow);
+    2420 :
+    Begin
+      R := WSPrintf16(Lin16(MemL[0:ArgLin]), Lin16(MemL[0:ArgLin + 4]),
+                      ArgLin + 8);
+      SetAX(R);
+    End;
+    2421 :
+      SetAX(WSPrintf16(A(1), A(2), Lin16(ArgRaw[3])));
+    2430 : SetAX(lstrcmpA(A(1), A(2)));
+    2431, 2432 :
+    Begin
+      If (ArgRaw[1] Shr 16) = 0 Then
+      Begin
+        R := ArgRaw[1] And $FF;
+        If (Code = 2431) And (R >= 97) And (R <= 122) Then R := R - 32;
+        If (Code = 2432) And (R >= 65) And (R <= 90) Then R := R + 32;
+        SetDXAX(R);
+      End
+      Else
+      Begin
+        P := Lin16(ArgRaw[1]);
+        While Mem[0:P] <> 0 Do
+        Begin
+          R := Mem[0:P];
+          If (Code = 2431) And (R >= 97) And (R <= 122) Then Mem[0:P] := R - 32;
+          If (Code = 2432) And (R >= 65) And (R <= 90) Then Mem[0:P] := R + 32;
+          Inc(P);
+        End;
+        SetDXAX(ArgRaw[1]);
+      End;
+    End;
+    2471 : SetAX(lstrcmpiA(A(1), A(2)));
+    2472 :
+      If Mem[0:Lin16(ArgRaw[1])] <> 0 Then SetDXAX(ArgRaw[1] + 1)
+      Else SetDXAX(ArgRaw[1]);
+    2473 :
+      If Lin16(ArgRaw[2]) > A(1) Then SetDXAX(ArgRaw[2] - 1)
+      Else SetDXAX(ArgRaw[2]);
+    { ---------------------------------- GDI -------------------------- }
+    3001 : SetDXAX(SetBkColor(A(1), A(2)));
+    3002 : SetAX(SetBkMode(A(1), A(2)));
+    3009 : SetDXAX(SetTextColor(A(1), A(2)));
+    3033 : SetAX(TextOutA(A(1), SX16(A(2)), SX16(A(3)), A(4), A(5)));
+    3045 : SetAX(SelectObject(A(1), A(2)));
+    3066 : SetAX(CreateSolidBrush(A(1)));
+    3069 : SetAX(DeleteObject(A(1)));
+    3080 : SetAX(GetDeviceCaps(A(1), A(2)));
+    3087 : SetAX(GetStockObject(A(1)));
+    { ------------------------------- KEYBOARD ------------------------ }
+    4005, 4006 :
+    Begin
+      If A(1) <> A(2) Then RetStrCopy(A(2), A(1), 65536);
+      SetAX(1);
+    End;
+    { ------------------------------- LZEXPAND ------------------------ }
+    5001 :
+    Begin
+      N := 0;
+      Repeat
+        If Not KReadFile(DosHGet(A(1)), W16Buf, 4096, K) Then K := 0;
+        If K > 0 Then
+        Begin
+          KWriteFile(DosHGet(A(2)), W16Buf, K);
+          N := N + K;
+        End;
+      Until K <= 0;
+      SetDXAX(N);
+    End;
+    5002 :
+    Begin
+      R := OpenFile(A(1), A(2), A(3));
+      If R = -1 Then SetAX($FFFF) Else SetAX(DosHNew(R));
+    End;
+    5006 : DosHClose(A(1));
+    { --------------------------------- SHELL ------------------------- }
+    6001 : SetDXAX(RegOpenKeyA(A(1), A(2), A(3)));
+    6002 : SetDXAX(RegCreateKeyA(A(1), A(2), A(3)));
+    6003 : SetDXAX(0);
+    6004 : SetDXAX(RegDeleteKeyA(A(1), A(2)));
+    6005 : SetDXAX(RegSetValueA(A(1), A(2), A(3), A(4), A(5)));
+    6006 : SetDXAX(RegQueryValueA(A(1), A(2), A(3), A(4)));
+    6007 : SetDXAX(RegEnumKeyA(A(1), A(2), A(3), A(4)));
+  Else
+    If Not ApiWarned[Idx] Then
+    Begin
+      ApiWarned[Idx] := True;
+      KLog('Win16 : API non implementee ' + ApiName(Idx) + ' (' +
+           W16SysMods[Pos(ApiLet[Idx], SysLetS)] + '.' +
+           IntStr(ApiOrd[Idx]) + ')');
+    End;
+  End;
+End;
+
+{ Environnement DOS, chemins et portes d'interruption de niveau 3 }
+Procedure W16Init2;
+Var P, N : LongInt;
+Begin
+  W16Trace := False;
+  WinIni := 'C:\WINDOWS\WIN.INI';
+  WinDirZ := 'C:\WINDOWS';
+  SysDirZ := 'C:\WINDOWS\SYSTEM';
+  P := GetEnvironmentStringsA;
+  N := 0;
+  While (MemW[0:P + N] <> 0) And (N < 4000) Do Inc(N);
+  W16Env := GAlloc16(N + 64, False);
+  GOwner[W16Env Shr 3] := 0;
+  MoveMem(P, SelBase(W16Env), N + 2);
+  SetGate($21, LongInt(@Int21Gate));
+  SetGate($2F, LongInt(@Int2FGate));
+  SetGate($31, LongInt(@Int2FGate));
+  Idt[$21].Flags := $EE00;
+  Idt[$2F].Flags := $EE00;
+  Idt[$31].Flags := $EE00;
+End;
+
+{ ==================================================================== }
+{ Partie 15 - DirectX : DirectDraw, DirectSound, DirectInput, DSETUP   }
+{ ==================================================================== }
+{ DirectX est integre au noyau comme les autres DLL systeme (DDRAW.DLL,
+  DSOUND.DLL, DINPUT.DLL, DSETUP.DLL) : les objets COM sont des blocs
+  dont le premier mot pointe sur une table de methodes ; chaque methode
+  est une fonction du noyau exportee en stdcall.
+  Objet : +0 table, +4 references, +8 sorte (1 DirectDraw, 2 vue
+  DirectDraw2, 3 surface, 4 palette, 5 decoupeur, 6 DirectSound,
+  7 tampon de son, 8 DirectInput, 9 peripherique d'entree).
+  DirectDraw : affichage 640x480 en 256 couleurs ; en mode exclusif la
+  surface primaire est copiee telle quelle sur l'ecran (FlushScreen) et
+  sa palette devient la palette materielle. DirectSound : tampons
+  muets dont la position de lecture avance en temps reel (comme la
+  carte son muette). DirectInput : clavier (codes de balayage) et
+  souris (deplacements relatifs). }
+
+Const
+  DD_OK = 0;
+  E_NOTIMPL = LongInt($80004001);
+  E_NOINTERFACE = LongInt($80004002);
+  DDERR_INVALIDPARAMS = LongInt($80070057);
+  DDERR_INVALIDMODE = LongInt($88760078);
+  DDERR_NOTFOUND = LongInt($887600FF);
+  DDERR_WASSTILLDRAWING = LongInt($8876021C);
+
+Var
+  VtDD, VtDD2, VtSurf, VtPal, VtClip, VtDS, VtDSB, VtDI, VtDID : LongInt;
+  DDCoopWnd, DDCoopFl, DDBpp : LongInt;
+  DDPrimary : LongInt;
+
+{ Table de methodes : VtNew puis VtAdd('nom,nom,...') (listes courtes,
+  une chaine Pascal est limitee a 255 caracteres) }
+Var
+  VtCur, VtCnt : LongInt;
+
+Function VtNew : LongInt;
+Begin
+  VtCur := KAlloc(256);
+  VtCnt := 0;
+  VtNew := VtCur;
+End;
+
+Procedure VtAdd(S : String);
+Var P : LongInt; Nm : String;
+Begin
+  While S <> '' Do
+  Begin
+    P := Pos(',', S);
+    If P > 0 Then
+    Begin
+      Nm := Copy(S, 1, P - 1); Delete(S, 1, P);
+    End
+    Else
+    Begin
+      Nm := S; S := '';
+    End;
+    Nm := Trim(Nm);
+    MemL[0:VtCur + VtCnt * 4] := KernelExport(Nm);
+    If MemL[0:VtCur + VtCnt * 4] = 0 Then
+      KLog('DirectX : methode absente ' + Nm);
+    Inc(VtCnt);
+  End;
+End;
+
+Function ComNew(Vt, Kind, Size : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  O := KAlloc(Size);
+  FillMem(O, Size, 0);
+  MemL[0:O] := Vt;
+  MemL[0:O + 4] := 1;
+  MemL[0:O + 8] := Kind;
+  ComNew := O;
+End;
+
+Function GuidIs(P, D1 : LongInt) : Boolean;
+Begin
+  GuidIs := (P <> 0) And (MemL[0:P] = D1);
+End;
+
+{ Methodes non ecrites, selon le nombre d'arguments (This compris) }
+Function DXNI1(T : LongInt) : LongInt;
+Begin
+  DXNI1 := E_NOTIMPL;
+End;
+
+Function DXNI2(T, A : LongInt) : LongInt;
+Begin
+  DXNI2 := E_NOTIMPL;
+End;
+
+Function DXNI3(T, A, B : LongInt) : LongInt;
+Begin
+  DXNI3 := E_NOTIMPL;
+End;
+
+Function DXNI4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DXNI4 := E_NOTIMPL;
+End;
+
+Function DXNI5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DXNI5 := E_NOTIMPL;
+End;
+
+Function DXNI6(T, A, B, C, D, E : LongInt) : LongInt;
+Begin
+  DXNI6 := E_NOTIMPL;
+End;
+
+Function DXOK1(T : LongInt) : LongInt;
+Begin
+  DXOK1 := DD_OK;
+End;
+
+Function DXOK2(T, A : LongInt) : LongInt;
+Begin
+  DXOK2 := DD_OK;
+End;
+
+Function DXOK3(T, A, B : LongInt) : LongInt;
+Begin
+  DXOK3 := DD_OK;
+End;
+
+Function COMAddRef(T : LongInt) : LongInt;
+Begin
+  MemL[0:T + 4] := MemL[0:T + 4] + 1;
+  COMAddRef := MemL[0:T + 4];
+End;
+
+Procedure SurfFreeK(S : LongInt);
+Begin
+  If S = DDPrimary Then
+  Begin
+    DDPrimary := 0;
+    DDShow := False;
+    DefaultPalette;
+    MarkAll;
+  End
+  Else If MemL[0:S + 24] <> 0 Then KFree(MemL[0:S + 24]);
+  If MemL[0:S + 32] <> 0 Then SurfFreeK(MemL[0:S + 32]);
+End;
+
+Function COMRelease(T : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := MemL[0:T + 4] - 1;
+  MemL[0:T + 4] := R;
+  COMRelease := R;
+  If R > 0 Then Exit;
+  If MemL[0:T + 8] = 3 Then SurfFreeK(T);
+  If (MemL[0:T + 8] = 7) And (MemL[0:T + 16] <> 0) Then
+    KFree(MemL[0:T + 16]);
+  If MemL[0:T + 8] = 1 Then
+  Begin
+    DDShow := False;
+    DDCoopFl := 0;
+    MarkAll;
+  End;
+End;
+
+Function COMQIUnk(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  COMQIUnk := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidIs(Riid, 0) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    COMQIUnk := DD_OK;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectDraw                                                         }
+{ ------------------------------------------------------------------ }
+
+Procedure DDInitVt;
+Begin
+  If VtDD <> 0 Then Exit;
+  VtDD := VtNew;
+  VtAdd('DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,');
+  VtAdd('DD_CreatePalette,DD_CreateSurface,DXNI3,DD_EnumDisplayModes,');
+  VtAdd('DXNI5,DD_FlipToGDISurface,DD_GetCaps,DD_GetDisplayMode,DXNI3,');
+  VtAdd('DXNI2,DD_GetMonitorFrequency,DD_GetScanLine,DD_GetVBStatus,');
+  VtAdd('DXOK2,DD_RestoreDisplayMode,DD_SetCooperativeLevel,');
+  VtAdd('DD_SetDisplayMode,DD_WaitForVB');
+  VtDD2 := VtNew;
+  VtAdd('DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,');
+  VtAdd('DD_CreatePalette,DD_CreateSurface,DXNI3,DD_EnumDisplayModes,');
+  VtAdd('DXNI5,DD_FlipToGDISurface,DD_GetCaps,DD_GetDisplayMode,DXNI3,');
+  VtAdd('DXNI2,DD_GetMonitorFrequency,DD_GetScanLine,DD_GetVBStatus,');
+  VtAdd('DXOK2,DD_RestoreDisplayMode,DD_SetCooperativeLevel,');
+  VtAdd('DD_SetDisplayMode2,DD_WaitForVB,DD_GetAvailableVidMem');
+  VtSurf := VtNew;
+  VtAdd('SF_QI,COMAddRef,COMRelease,DXOK2,DXNI2,SF_Blt,');
+  VtAdd('DXNI4,SF_BltFast,DXOK3,DXNI3,DXNI4,SF_Flip,SF_GetAttachedSurface,');
+  VtAdd('DXOK2,SF_GetCaps,DXNI2,SF_GetColorKey,SF_GetDC,DXOK2,DXNI3,');
+  VtAdd('SF_GetPalette,SF_GetPixelFormat,SF_GetSurfaceDesc,DXOK3,DXOK1,');
+  VtAdd('SF_Lock,SF_ReleaseDC,DXOK1,SF_SetClipper,SF_SetColorKey,DXNI3,');
+  VtAdd('SF_SetPalette,SF_Unlock,DXNI6,DXNI2,DXNI3,SF_GetDDInterface,');
+  VtAdd('DXOK2,DXOK2,DXNI3');
+  VtPal := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,PL_GetCaps,');
+  VtAdd('PL_GetEntries,DXOK4,PL_SetEntries');
+  VtClip := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DXNI4,CL_GetHWnd,');
+  VtAdd('DXOK3,CL_IsClipListChanged,DXOK3,CL_SetHWnd');
+End;
+
+Function DXOK4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DXOK4 := DD_OK;
+End;
+
+Function DirectDrawCreate(Guid, PDD, Outer : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  DDInitVt;
+  DirectDrawCreate := DDERR_INVALIDPARAMS;
+  If PDD = 0 Then Exit;
+  O := ComNew(VtDD, 1, 32);
+  MemL[0:PDD] := O;
+  If DDW = 0 Then
+  Begin
+    DDW := 640; DDH := 480; DDBpp := 8;
+  End;
+  KLog('DirectDraw : objet cree');
+  DirectDrawCreate := DD_OK;
+End;
+
+Function DirectDrawEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Var S1, S2 : String;
+Begin
+  S1 := 'Pasdows 95 VESA' + #0;
+  S2 := 'display' + #0;
+  If W16Buf = 0 Then W16Buf := KAlloc(4096);
+  MemL[0:W16Buf] := 0;
+  MemL[0:W16Buf + 4] := LongInt(@S1[1]);
+  MemL[0:W16Buf + 8] := LongInt(@S2[1]);
+  MemL[0:W16Buf + 12] := Ctx;
+  CallStd(Cb, W16Buf, 4);
+  DirectDrawEnumerateA := DD_OK;
+End;
+
+Function DD_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  DD_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidIs(Riid, LongInt($6C14DB80)) Or GuidIs(Riid, 0) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    DD_QI := DD_OK;
+  End
+  Else If GuidIs(Riid, LongInt($B3A6F3E0)) Then
+  Begin
+    O := ComNew(VtDD2, 2, 32);
+    MemL[0:Ppv] := O;
+    DD_QI := DD_OK;
+  End;
+End;
+
+Function DD_SetCooperativeLevel(T, H, Fl : LongInt) : LongInt;
+Begin
+  DDCoopWnd := H;
+  DDCoopFl := Fl;
+  KLog('DirectDraw : niveau de cooperation ' + HexStr(Fl, 4));
+  DD_SetCooperativeLevel := DD_OK;
+End;
+
+Function DD_SetDisplayMode(T, W, H, Bpp : LongInt) : LongInt;
+Begin
+  DD_SetDisplayMode := DDERR_INVALIDMODE;
+  KLog('DirectDraw : mode ' + IntStr(W) + 'x' + IntStr(H) + 'x' +
+       IntStr(Bpp));
+  If (Bpp <> 8) Or (W > ScrW) Or (H > ScrH) Or (W <= 0) Or (H <= 0) Then
+    Exit;
+  DDW := W; DDH := H; DDBpp := 8;
+  DD_SetDisplayMode := DD_OK;
+End;
+
+Function DD_SetDisplayMode2(T, W, H, Bpp, Rate, Fl : LongInt) : LongInt;
+Begin
+  DD_SetDisplayMode2 := DD_SetDisplayMode(T, W, H, Bpp);
+End;
+
+Function DD_RestoreDisplayMode(T : LongInt) : LongInt;
+Begin
+  DDW := 640; DDH := 480;
+  DD_RestoreDisplayMode := DD_OK;
+End;
+
+Function DD_FlipToGDISurface(T : LongInt) : LongInt;
+Begin
+  DD_FlipToGDISurface := DD_OK;
+End;
+
+{ DDSURFACEDESC (108 octets) d'une surface 8 bits }
+Procedure DDFillDesc(P, W, H, Pitch, Bits, Caps : LongInt);
+Begin
+  FillMem(P, 108, 0);
+  MemL[0:P] := 108;
+  MemL[0:P + 4] := $100F Or $800;
+  MemL[0:P + 8] := H;
+  MemL[0:P + 12] := W;
+  MemL[0:P + 16] := Pitch;
+  MemL[0:P + 36] := Bits;
+  MemL[0:P + 72] := 32;
+  MemL[0:P + 76] := $60;
+  MemL[0:P + 84] := 8;
+  MemL[0:P + 104] := Caps;
+End;
+
+Function DD_EnumDisplayModes(T, Fl, PDesc, Ctx, Cb : LongInt) : LongInt;
+Var D, K, W, H : LongInt;
+Begin
+  D := KAlloc(128);
+  For K := 0 To 2 Do
+  Begin
+    Case K Of
+      0 : Begin W := 320; H := 200 End;
+      1 : Begin W := 320; H := 240 End;
+    Else
+      W := 640; H := 480;
+    End;
+    DDFillDesc(D, W, H, W, 0, 0);
+    MemL[0:D + 4] := $1006;
+    If W16Buf = 0 Then W16Buf := KAlloc(4096);
+    MemL[0:W16Buf] := D;
+    MemL[0:W16Buf + 4] := Ctx;
+    If CallStd(Cb, W16Buf, 2) = 0 Then Break;
+  End;
+  KFree(D);
+  DD_EnumDisplayModes := DD_OK;
+End;
+
+Function DD_GetDisplayMode(T, P : LongInt) : LongInt;
+Begin
+  DDFillDesc(P, DDW, DDH, DDW, 0, 0);
+  MemL[0:P + 4] := $100E;
+  DD_GetDisplayMode := DD_OK;
+End;
+
+{ DDCAPS : capacites materielles et logicielles }
+Function DD_GetCaps(T, PHal, PHel : LongInt) : LongInt;
+Var K, P, Sz : LongInt;
+Begin
+  For K := 0 To 1 Do
+  Begin
+    If K = 0 Then P := PHal Else P := PHel;
+    If P = 0 Then Continue;
+    Sz := MemL[0:P];
+    If (Sz <= 0) Or (Sz > 512) Then Sz := 316;
+    FillMem(P + 4, Sz - 4, 0);
+    MemL[0:P + 4] := $40 Or $200 Or $400000 Or $04000000 Or $08000000;
+    MemL[0:P + 16] := $200;
+    MemL[0:P + 28] := 4;
+    MemL[0:P + 60] := 4 * 1024 * 1024;
+    MemL[0:P + 64] := 4 * 1024 * 1024;
+    MemL[0:P + 72] := $240;
+  End;
+  DD_GetCaps := DD_OK;
+End;
+
+Function DD_GetMonitorFrequency(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 60;
+  DD_GetMonitorFrequency := DD_OK;
+End;
+
+Function DD_GetScanLine(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := (Ticks * 31) Mod 525;
+  DD_GetScanLine := DD_OK;
+End;
+
+Function DD_GetVBStatus(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := Ord(Ticks Mod 16 < 2);
+  DD_GetVBStatus := DD_OK;
+End;
+
+Function DD_WaitForVB(T, Fl, Ev : LongInt) : LongInt;
+Begin
+  KSleep(16 - Ticks Mod 16);
+  DD_WaitForVB := DD_OK;
+End;
+
+Function DD_GetAvailableVidMem(T, Caps, PTot, PFree : LongInt) : LongInt;
+Begin
+  If PTot <> 0 Then MemL[0:PTot] := 4 * 1024 * 1024;
+  If PFree <> 0 Then MemL[0:PFree] := 4 * 1024 * 1024;
+  DD_GetAvailableVidMem := DD_OK;
+End;
+
+{ Surface : +12 largeur, +16 hauteur, +20 pas, +24 bits, +28 capacites,
+  +32 tampon arriere attache, +36 palette, +40/+44 cle de couleur
+  source, +48 cle active, +52 DC, +56 decoupeur }
+Function SurfMake(W, H, Caps, Bits : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := ComNew(VtSurf, 3, 64);
+  MemL[0:S + 12] := W; MemL[0:S + 16] := H;
+  MemL[0:S + 20] := (W + 3) And Not 3;
+  If Bits = 0 Then
+  Begin
+    Bits := KAlloc(MemL[0:S + 20] * H + 16);
+    FillMem(Bits, MemL[0:S + 20] * H, 0);
+  End
+  Else MemL[0:S + 20] := W;
+  MemL[0:S + 24] := Bits;
+  MemL[0:S + 28] := Caps;
+  SurfMake := S;
+End;
+
+Function DD_CreateSurface(T, PDesc, PSurf, Outer : LongInt) : LongInt;
+Var Fl, Caps, W, H, S, B, N : LongInt;
+Begin
+  DD_CreateSurface := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PSurf = 0) Then Exit;
+  Fl := MemL[0:PDesc + 4];
+  Caps := 0;
+  If (Fl And 1) <> 0 Then Caps := MemL[0:PDesc + 104];
+  If (Caps And $200) <> 0 Then
+  Begin
+    { surface primaire : l'ecran }
+    If DDBuf = 0 Then DDBuf := KAlloc(ScrW * ScrH + 16);
+    FillMem(DDBuf, ScrW * ScrH, 0);
+    S := SurfMake(DDW, DDH, Caps Or $20 Or $4000, DDBuf);
+    DDPrimary := S;
+    If (DDCoopFl And $11) = $11 Then
+    Begin
+      DDShow := True;
+      DDDirty := True;
+    End;
+    N := 0;
+    If (Fl And $20) <> 0 Then N := MemL[0:PDesc + 20];
+    If N > 0 Then
+    Begin
+      B := SurfMake(DDW, DDH, (Caps And Not $220) Or 4 Or $4000, 0);
+      MemL[0:S + 32] := B;
+    End;
+    KLog('DirectDraw : surface primaire ' + IntStr(DDW) + 'x' +
+         IntStr(DDH) + ', ' + IntStr(N) + ' tampon(s) arriere');
+  End
+  Else
+  Begin
+    W := MemL[0:PDesc + 12]; H := MemL[0:PDesc + 8];
+    If ((Fl And 4) = 0) Or (W <= 0) Then W := DDW;
+    If ((Fl And 2) = 0) Or (H <= 0) Then H := DDH;
+    S := SurfMake(W, H, Caps Or $40, 0);
+    If (Fl And $10000) <> 0 Then
+    Begin
+      MemL[0:S + 40] := MemL[0:PDesc + 64];
+      MemL[0:S + 44] := MemL[0:PDesc + 68];
+      MemL[0:S + 48] := 1;
+    End;
+  End;
+  MemL[0:PSurf] := S;
+  DD_CreateSurface := DD_OK;
+End;
+
+Function DD_CreatePalette(T, Fl, PEnt, PPal, Outer : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := ComNew(VtPal, 4, 16 + 1024);
+  If PEnt <> 0 Then MoveMem(PEnt, P + 16, 1024);
+  MemL[0:P + 12] := Fl;
+  If PPal <> 0 Then MemL[0:PPal] := P;
+  DD_CreatePalette := DD_OK;
+End;
+
+Function DD_CreateClipper(T, Fl, PClip, Outer : LongInt) : LongInt;
+Begin
+  If PClip <> 0 Then MemL[0:PClip] := ComNew(VtClip, 5, 16);
+  DD_CreateClipper := DD_OK;
+End;
+
+{ Palette : +12 drapeaux, +16 entrees ; appliquee a l'ecran si elle est
+  celle de la surface primaire }
+Procedure PalApply(P : LongInt);
+Var I, E : LongInt;
+Begin
+  For I := 0 To 255 Do
+  Begin
+    E := P + 16 + I * 4;
+    SysPalSet(I, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
+  End;
+  Inc(PalVer);
+  DacAll;
+End;
+
+Function PL_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 4 Or $400;
+  PL_GetCaps := DD_OK;
+End;
+
+Function PL_GetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
+Begin
+  If (Start >= 0) And (Start + N <= 256) Then
+    MoveMem(T + 16 + Start * 4, PEnt, N * 4);
+  PL_GetEntries := DD_OK;
+End;
+
+Function PL_SetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
+Begin
+  PL_SetEntries := DDERR_INVALIDPARAMS;
+  If (Start < 0) Or (Start + N > 256) Then Exit;
+  MoveMem(PEnt, T + 16 + Start * 4, N * 4);
+  If (DDPrimary <> 0) And (MemL[0:DDPrimary + 36] = T) Then PalApply(T);
+  PL_SetEntries := DD_OK;
+End;
+
+Function CL_GetHWnd(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 12];
+  CL_GetHWnd := DD_OK;
+End;
+
+Function CL_IsClipListChanged(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  CL_IsClipListChanged := DD_OK;
+End;
+
+Function CL_SetHWnd(T, Fl, H : LongInt) : LongInt;
+Begin
+  MemL[0:T + 12] := H;
+  CL_SetHWnd := DD_OK;
+End;
+
+{ Surfaces }
+
+Function SF_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  SF_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidIs(Riid, 0) Or GuidIs(Riid, LongInt($6C14DB81)) Or
+     GuidIs(Riid, LongInt($57805885)) Or GuidIs(Riid, LongInt($DA044E00))
+  Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    SF_QI := DD_OK;
+  End;
+End;
+
+{ Mise a jour de l'ecran apres un changement de la surface primaire }
+Procedure SurfTouched(S : LongInt);
+Var R : TRect; Y : LongInt;
+Begin
+  If S <> DDPrimary Then Exit;
+  If DDShow Then
+  Begin
+    DDDirty := True;
+    Exit;
+  End;
+  { fenetre : la primaire est l'ecran, recopiee dans le tampon }
+  For Y := 0 To Min(DDH, ScrH) - 1 Do
+    MoveMem(DDBuf + Y * DDW, Back.Bits + Y * Back.Pitch, Min(DDW, ScrW));
+  SetR(R, 0, 0, ScrW, ScrH);
+  MarkDirty(R);
+End;
+
+Function SF_GetSurfaceDesc(T, P : LongInt) : LongInt;
+Begin
+  DDFillDesc(P, MemL[0:T + 12], MemL[0:T + 16], MemL[0:T + 20],
+             MemL[0:T + 24], MemL[0:T + 28]);
+  SF_GetSurfaceDesc := DD_OK;
+End;
+
+Function SF_Lock(T, PRect, PDesc, Fl, Ev : LongInt) : LongInt;
+Begin
+  SF_GetSurfaceDesc(T, PDesc);
+  If PRect <> 0 Then
+    MemL[0:PDesc + 36] := MemL[0:T + 24] + MemL[0:PRect + 4] *
+                          MemL[0:T + 20] + MemL[0:PRect];
+  SF_Lock := DD_OK;
+End;
+
+Function SF_Unlock(T, P : LongInt) : LongInt;
+Begin
+  SurfTouched(T);
+  SF_Unlock := DD_OK;
+End;
+
+Function SF_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 28];
+  SF_GetCaps := DD_OK;
+End;
+
+Function SF_GetPixelFormat(T, P : LongInt) : LongInt;
+Begin
+  FillMem(P, 32, 0);
+  MemL[0:P] := 32; MemL[0:P + 4] := $60; MemL[0:P + 12] := 8;
+  SF_GetPixelFormat := DD_OK;
+End;
+
+Function SF_GetAttachedSurface(T, PCaps, PSurf : LongInt) : LongInt;
+Begin
+  SF_GetAttachedSurface := DDERR_NOTFOUND;
+  If (PSurf = 0) Or (MemL[0:T + 32] = 0) Then Exit;
+  MemL[0:PSurf] := MemL[0:T + 32];
+  COMAddRef(MemL[0:T + 32]);
+  SF_GetAttachedSurface := DD_OK;
+End;
+
+{ Echange des tampons de la chaine primaire / arriere }
+Function SF_Flip(T, Ovr, Fl : LongInt) : LongInt;
+Var B, Tmp : LongInt;
+Begin
+  SF_Flip := DD_OK;
+  B := MemL[0:T + 32];
+  If B = 0 Then Exit;
+  If T = DDPrimary Then
+  Begin
+    { la primaire garde DDBuf : on y recopie le tampon arriere, qui
+      recoit l'ancienne image (echange) }
+    Tmp := KAlloc(DDW * DDH);
+    MoveMem(DDBuf, Tmp, DDW * DDH);
+    MoveMem(MemL[0:B + 24], DDBuf, DDW * DDH);
+    MoveMem(Tmp, MemL[0:B + 24], DDW * DDH);
+    KFree(Tmp);
+    SurfTouched(T);
+  End
+  Else
+  Begin
+    Tmp := MemL[0:T + 24];
+    MemL[0:T + 24] := MemL[0:B + 24];
+    MemL[0:B + 24] := Tmp;
+  End;
+End;
+
+Function SF_GetColorKey(T, Fl, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := MemL[0:T + 40]; MemL[0:P + 4] := MemL[0:T + 44];
+  End;
+  SF_GetColorKey := DD_OK;
+End;
+
+Function SF_SetColorKey(T, Fl, P : LongInt) : LongInt;
+Begin
+  If P = 0 Then MemL[0:T + 48] := 0
+  Else
+  Begin
+    MemL[0:T + 40] := MemL[0:P]; MemL[0:T + 44] := MemL[0:P + 4];
+    MemL[0:T + 48] := 1;
+  End;
+  SF_SetColorKey := DD_OK;
+End;
+
+Function SF_SetPalette(T, P : LongInt) : LongInt;
+Begin
+  MemL[0:T + 36] := P;
+  If P <> 0 Then COMAddRef(P);
+  If (T = DDPrimary) And (P <> 0) And DDShow Then
+  Begin
+    PalApply(P);
+    DDDirty := True;
+  End;
+  SF_SetPalette := DD_OK;
+End;
+
+Function SF_GetPalette(T, PP : LongInt) : LongInt;
+Begin
+  SF_GetPalette := DDERR_NOTFOUND;
+  If (PP = 0) Or (MemL[0:T + 36] = 0) Then Exit;
+  MemL[0:PP] := MemL[0:T + 36];
+  COMAddRef(MemL[0:T + 36]);
+  SF_GetPalette := DD_OK;
+End;
+
+Function SF_SetClipper(T, C : LongInt) : LongInt;
+Begin
+  MemL[0:T + 56] := C;
+  SF_SetClipper := DD_OK;
+End;
+
+Function SF_GetDDInterface(T, P : LongInt) : LongInt;
+Begin
+  SF_GetDDInterface := E_NOTIMPL;
+End;
+
+{ Transfert de SRect (src) vers DRect (dst) avec mise a l'echelle et
+  cle de couleur source eventuelle }
+Procedure SurfBlt(D, DL, DT, DR, DB, S, SL, ST, SR, SB : LongInt;
+                  Key : Boolean);
+Var X, Y, SX, SY, DW, DH, SW, SH, V, K, DA, SA : LongInt;
+Begin
+  If DL < 0 Then DL := 0;
+  If DT < 0 Then DT := 0;
+  If DR > MemL[0:D + 12] Then DR := MemL[0:D + 12];
+  If DB > MemL[0:D + 16] Then DB := MemL[0:D + 16];
+  DW := DR - DL; DH := DB - DT; SW := SR - SL; SH := SB - ST;
+  If (DW <= 0) Or (DH <= 0) Or (SW <= 0) Or (SH <= 0) Then Exit;
+  K := MemL[0:S + 40] And $FF;
+  For Y := 0 To DH - 1 Do
+  Begin
+    SY := ST + (Y * SH) Div DH;
+    If (SY < 0) Or (SY >= MemL[0:S + 16]) Then Continue;
+    DA := MemL[0:D + 24] + (DT + Y) * MemL[0:D + 20] + DL;
+    SA := MemL[0:S + 24] + SY * MemL[0:S + 20];
+    If (DW = SW) And Not Key And (SL >= 0) And
+       (SL + SW <= MemL[0:S + 12]) Then
+    Begin
+      MoveMem(SA + SL, DA, DW);
+      Continue;
+    End;
+    For X := 0 To DW - 1 Do
+    Begin
+      SX := SL + (X * SW) Div DW;
+      If (SX < 0) Or (SX >= MemL[0:S + 12]) Then Continue;
+      V := Mem[0:SA + SX];
+      If Key And (V = K) Then Continue;
+      Mem[0:DA + X] := V;
+    End;
+  End;
+End;
+
+Procedure RectOr(P, W, H : LongInt; Var L, T, R, B : LongInt);
+Begin
+  If P = 0 Then
+  Begin
+    L := 0; T := 0; R := W; B := H;
+  End
+  Else
+  Begin
+    L := MemL[0:P]; T := MemL[0:P + 4];
+    R := MemL[0:P + 8]; B := MemL[0:P + 12];
+  End;
+End;
+
+Function SF_Blt(T, PDst, Src, PSrc, Fl, Fx : LongInt) : LongInt;
+Var DL, DT, DR, DB, SL, ST, SR, SB, Y, C : LongInt;
+Begin
+  RectOr(PDst, MemL[0:T + 12], MemL[0:T + 16], DL, DT, DR, DB);
+  If (Fl And $400) <> 0 Then
+  Begin
+    { DDBLT_COLORFILL }
+    C := 0;
+    If Fx <> 0 Then C := MemL[0:Fx + 80] And $FF;
+    If DL < 0 Then DL := 0;
+    If DT < 0 Then DT := 0;
+    If DR > MemL[0:T + 12] Then DR := MemL[0:T + 12];
+    If DB > MemL[0:T + 16] Then DB := MemL[0:T + 16];
+    For Y := DT To DB - 1 Do
+      If DR > DL Then
+        FillMem(MemL[0:T + 24] + Y * MemL[0:T + 20] + DL, DR - DL, C);
+  End
+  Else If Src <> 0 Then
+  Begin
+    RectOr(PSrc, MemL[0:Src + 12], MemL[0:Src + 16], SL, ST, SR, SB);
+    SurfBlt(T, DL, DT, DR, DB, Src, SL, ST, SR, SB,
+            ((Fl And $8000) <> 0) And (MemL[0:Src + 48] <> 0));
+  End;
+  SurfTouched(T);
+  SF_Blt := DD_OK;
+End;
+
+Function SF_BltFast(T, X, Y, Src, PSrc, Trans : LongInt) : LongInt;
+Var SL, ST, SR, SB : LongInt;
+Begin
+  SF_BltFast := DDERR_INVALIDPARAMS;
+  If Src = 0 Then Exit;
+  RectOr(PSrc, MemL[0:Src + 12], MemL[0:Src + 16], SL, ST, SR, SB);
+  SurfBlt(T, X, Y, X + SR - SL, Y + SB - ST, Src, SL, ST, SR, SB,
+          ((Trans And 1) <> 0) And (MemL[0:Src + 48] <> 0));
+  SurfTouched(T);
+  SF_BltFast := DD_OK;
+End;
+
+{ Contexte GDI sur la surface : DIB 8 bits (haut en bas) partageant la
+  memoire de la surface, table de couleurs = palette systeme }
+Function SF_GetDC(T, PHdc : LongInt) : LongInt;
+Var B, Hdc, I : LongInt;
+Begin
+  SF_GetDC := DDERR_INVALIDPARAMS;
+  If PHdc = 0 Then Exit;
+  B := GdiNew(goBitmap);
+  If B < 0 Then Exit;
+  Gdis[B].I1 := MemL[0:T + 24];
+  Gdis[B].I2 := MemL[0:T + 12]; Gdis[B].I3 := MemL[0:T + 16];
+  Gdis[B].I4 := 8; Gdis[B].I5 := MemL[0:T + 20];
+  Gdis[B].I7 := 1 Or 2 Or 8;
+  Gdis[B].I6 := KAlloc(1024);
+  For I := 0 To 255 Do
+    MemL[0:Gdis[B].I6 + I * 4] := (SysPal[I * 3] Shl 16) Or
+      (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+  Hdc := CreateCompatibleDC(0);
+  SelectObject(Hdc, GdiH(B));
+  MemL[0:T + 52] := Hdc;
+  MemL[0:T + 60] := B;
+  MemL[0:PHdc] := Hdc;
+  SF_GetDC := DD_OK;
+End;
+
+Function SF_ReleaseDC(T, Hdc : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  DeleteDC(Hdc);
+  B := MemL[0:T + 60];
+  If (B >= 0) And (MemL[0:T + 52] = Hdc) Then
+  Begin
+    If Gdis[B].I6 <> 0 Then KFree(Gdis[B].I6);
+    Gdis[B].I6 := 0;
+    Gdis[B].Used := False;
+  End;
+  MemL[0:T + 52] := 0;
+  SurfTouched(T);
+  SF_ReleaseDC := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectSound (muet) : tampon +12 taille, +16 donnees, +20 lecture,  }
+{ +24 en boucle, +28 debut (Ticks), +32 octets/s, +36 position de    }
+{ depart, +40 WAVEFORMATEX, +60 volume, +64 balance, +68 frequence   }
+{ ------------------------------------------------------------------ }
+
+Procedure DSInitVt;
+Begin
+  If VtDS <> 0 Then Exit;
+  VtDS := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DS_CreateSoundBuffer,');
+  VtAdd('DS_GetCaps,DS_DuplicateSoundBuffer,DXOK3,DXOK1,DS_GetSpeakerConfig,');
+  VtAdd('DXOK2,DXOK2');
+  VtDSB := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DSB_GetCaps,');
+  VtAdd('DSB_GetCurrentPosition,DSB_GetFormat,DSB_GetVolume,DSB_GetPan,');
+  VtAdd('DSB_GetFrequency,DSB_GetStatus,DXOK3,DSB_Lock,DSB_Play,');
+  VtAdd('DSB_SetCurrentPosition,DXOK2,DSB_SetVolume,DSB_SetPan,');
+  VtAdd('DSB_SetFrequency,DSB_Stop,DXOK5,DXOK1');
+End;
+
+Function DXOK5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DXOK5 := DD_OK;
+End;
+
+Function DirectSoundCreate(Guid, PDS, Outer : LongInt) : LongInt;
+Begin
+  DSInitVt;
+  DirectSoundCreate := DDERR_INVALIDPARAMS;
+  If PDS = 0 Then Exit;
+  MemL[0:PDS] := ComNew(VtDS, 6, 32);
+  KLog('DirectSound : objet cree (son muet)');
+  DirectSoundCreate := DD_OK;
+End;
+
+Function DirectSoundEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Var S1, S2 : String;
+Begin
+  S1 := 'Pasdows Son' + #0;
+  S2 := '' + #0;
+  If W16Buf = 0 Then W16Buf := KAlloc(4096);
+  MemL[0:W16Buf] := 0;
+  MemL[0:W16Buf + 4] := LongInt(@S1[1]);
+  MemL[0:W16Buf + 8] := LongInt(@S2[1]);
+  MemL[0:W16Buf + 12] := Ctx;
+  CallStd(Cb, W16Buf, 4);
+  DirectSoundEnumerateA := DD_OK;
+End;
+
+Function DS_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    FillMem(P + 4, 92, 0);
+    MemL[0:P + 4] := $F0F;
+    MemL[0:P + 8] := 100; MemL[0:P + 12] := 100000;
+  End;
+  DS_GetCaps := DD_OK;
+End;
+
+Function DS_GetSpeakerConfig(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 4;
+  DS_GetSpeakerConfig := DD_OK;
+End;
+
+Function DS_CreateSoundBuffer(T, PDesc, PBuf, Outer : LongInt) : LongInt;
+Var B, Sz, Fmt : LongInt;
+Begin
+  DS_CreateSoundBuffer := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PBuf = 0) Then Exit;
+  B := ComNew(VtDSB, 7, 96);
+  Sz := MemL[0:PDesc + 8];
+  Fmt := MemL[0:PDesc + 16];
+  If (MemL[0:PDesc + 4] And 1) <> 0 Then Sz := 16384;
+  If Sz <= 0 Then Sz := 4096;
+  MemL[0:B + 12] := Sz;
+  MemL[0:B + 16] := KAlloc(Sz + 16);
+  FillMem(MemL[0:B + 16], Sz, 0);
+  MemL[0:B + 32] := 22050;
+  If Fmt <> 0 Then
+  Begin
+    MoveMem(Fmt, B + 40, 18);
+    If MemL[0:Fmt + 8] > 0 Then MemL[0:B + 32] := MemL[0:Fmt + 8];
+    MemL[0:B + 68] := MemL[0:Fmt + 4];
+  End;
+  MemL[0:PBuf] := B;
+  DS_CreateSoundBuffer := DD_OK;
+End;
+
+Function DS_DuplicateSoundBuffer(T, Src, PDst : LongInt) : LongInt;
+Begin
+  If (Src <> 0) And (PDst <> 0) Then
+  Begin
+    MemL[0:PDst] := Src;
+    COMAddRef(Src);
+  End;
+  DS_DuplicateSoundBuffer := DD_OK;
+End;
+
+{ Position de lecture courante d'un tampon (avance en temps reel) }
+Function DSBPos(B : LongInt) : LongInt;
+Var P, N : LongInt;
+Begin
+  P := MemL[0:B + 36];
+  If MemL[0:B + 20] <> 0 Then
+  Begin
+    N := ((Ticks - MemL[0:B + 28]) Div 10) * (MemL[0:B + 32] Div 100);
+    P := P + N;
+    If P >= MemL[0:B + 12] Then
+    Begin
+      If MemL[0:B + 24] <> 0 Then P := P Mod MemL[0:B + 12]
+      Else
+      Begin
+        P := 0;
+        MemL[0:B + 20] := 0;
+        MemL[0:B + 36] := 0;
+      End;
+    End;
+  End;
+  DSBPos := P;
+End;
+
+Function DSB_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P + 4] := 8; MemL[0:P + 8] := MemL[0:T + 12];
+    MemL[0:P + 12] := 0; MemL[0:P + 16] := 0;
+  End;
+  DSB_GetCaps := DD_OK;
+End;
+
+Function DSB_GetCurrentPosition(T, PPlay, PWrite : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := DSBPos(T);
+  If PPlay <> 0 Then MemL[0:PPlay] := P;
+  If PWrite <> 0 Then MemL[0:PWrite] := (P + 512) Mod MemL[0:T + 12];
+  DSB_GetCurrentPosition := DD_OK;
+End;
+
+Function DSB_GetFormat(T, P, N, PN : LongInt) : LongInt;
+Begin
+  If (P <> 0) And (N >= 16) Then MoveMem(T + 40, P, Min(N, 18));
+  If PN <> 0 Then MemL[0:PN] := 18;
+  DSB_GetFormat := DD_OK;
+End;
+
+Function DSB_GetVolume(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 60];
+  DSB_GetVolume := DD_OK;
+End;
+
+Function DSB_GetPan(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 64];
+  DSB_GetPan := DD_OK;
+End;
+
+Function DSB_GetFrequency(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 68];
+  DSB_GetFrequency := DD_OK;
+End;
+
+Function DSB_GetStatus(T, P : LongInt) : LongInt;
+Begin
+  DSBPos(T);
+  If P <> 0 Then
+    MemL[0:P] := Ord(MemL[0:T + 20] <> 0) Or (Ord(MemL[0:T + 24] <> 0) * 4);
+  DSB_GetStatus := DD_OK;
+End;
+
+Function DSB_Lock(T, Ofs, N, P1, N1, P2, N2, Fl : LongInt) : LongInt;
+Var Sz, A : LongInt;
+Begin
+  Sz := MemL[0:T + 12];
+  If (Fl And 1) <> 0 Then Ofs := (DSBPos(T) + 512) Mod Sz;
+  If (Fl And 2) <> 0 Then
+  Begin
+    Ofs := 0; N := Sz;
+  End;
+  If N > Sz Then N := Sz;
+  Ofs := Ofs Mod Sz;
+  A := Min(N, Sz - Ofs);
+  If P1 <> 0 Then MemL[0:P1] := MemL[0:T + 16] + Ofs;
+  If N1 <> 0 Then MemL[0:N1] := A;
+  If P2 <> 0 Then
+  Begin
+    If N > A Then MemL[0:P2] := MemL[0:T + 16] Else MemL[0:P2] := 0;
+  End;
+  If N2 <> 0 Then MemL[0:N2] := N - A;
+  DSB_Lock := DD_OK;
+End;
+
+Function DSB_Play(T, R1, R2, Fl : LongInt) : LongInt;
+Begin
+  If MemL[0:T + 20] = 0 Then
+  Begin
+    MemL[0:T + 28] := Ticks;
+    MemL[0:T + 20] := 1;
+  End;
+  MemL[0:T + 24] := Fl And 1;
+  DSB_Play := DD_OK;
+End;
+
+Function DSB_Stop(T : LongInt) : LongInt;
+Begin
+  MemL[0:T + 36] := DSBPos(T);
+  MemL[0:T + 20] := 0;
+  DSB_Stop := DD_OK;
+End;
+
+Function DSB_SetCurrentPosition(T, P : LongInt) : LongInt;
+Begin
+  MemL[0:T + 36] := P Mod MemL[0:T + 12];
+  MemL[0:T + 28] := Ticks;
+  DSB_SetCurrentPosition := DD_OK;
+End;
+
+Function DSB_SetVolume(T, V : LongInt) : LongInt;
+Begin
+  MemL[0:T + 60] := V;
+  DSB_SetVolume := DD_OK;
+End;
+
+Function DSB_SetPan(T, V : LongInt) : LongInt;
+Begin
+  MemL[0:T + 64] := V;
+  DSB_SetPan := DD_OK;
+End;
+
+Function DSB_SetFrequency(T, V : LongInt) : LongInt;
+Begin
+  MemL[0:T + 68] := V;
+  If V > 0 Then
+    MemL[0:T + 32] := V * MemW[0:T + 40 + 12];
+  DSB_SetFrequency := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectInput : peripherique +12 sorte (1 clavier, 2 souris)          }
+{ ------------------------------------------------------------------ }
+
+Procedure DIInitVt;
+Begin
+  If VtDI <> 0 Then Exit;
+  VtDI := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DI_CreateDevice,');
+  VtAdd('DI_EnumDevices,DI_GetDeviceStatus,DXOK3,DXOK3');
+  VtDID := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,DID_GetCapabilities,');
+  VtAdd('DXOK4,DXNI3,DXOK3,DXOK1,DXOK1,DID_GetDeviceState,DID_GetDeviceData,');
+  VtAdd('DXOK2,DXOK2,DXOK3,DXNI4,DXNI2,DXOK3,DXOK4');
+End;
+
+Function DirectInputCreateA(Inst, Ver, PDI, Outer : LongInt) : LongInt;
+Begin
+  DIInitVt;
+  DirectInputCreateA := DDERR_INVALIDPARAMS;
+  If PDI = 0 Then Exit;
+  MemL[0:PDI] := ComNew(VtDI, 8, 32);
+  KLog('DirectInput : objet cree');
+  DirectInputCreateA := DD_OK;
+End;
+
+Function DI_CreateDevice(T, Guid, PDev, Outer : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  DI_CreateDevice := DDERR_NOTFOUND;
+  If (PDev = 0) Or (Guid = 0) Then Exit;
+  D := ComNew(VtDID, 9, 32);
+  If MemL[0:Guid] = LongInt($6F1D2B61) Then MemL[0:D + 12] := 1
+  Else If MemL[0:Guid] = LongInt($6F1D2B60) Then MemL[0:D + 12] := 2
+  Else Exit;
+  MemL[0:PDev] := D;
+  DI_CreateDevice := DD_OK;
+End;
+
+Function DI_EnumDevices(T, Typ, Cb, Ctx, Fl : LongInt) : LongInt;
+Begin
+  DI_EnumDevices := DD_OK;
+End;
+
+Function DI_GetDeviceStatus(T, Guid : LongInt) : LongInt;
+Begin
+  DI_GetDeviceStatus := DD_OK;
+End;
+
+Function DID_GetCapabilities(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    FillMem(P + 4, 40, 0);
+    MemL[0:P + 4] := 5;
+    If MemL[0:T + 12] = 1 Then
+    Begin
+      MemL[0:P + 8] := 3; MemL[0:P + 16] := 128;
+    End
+    Else
+    Begin
+      MemL[0:P + 8] := 2; MemL[0:P + 12] := 2; MemL[0:P + 16] := 3;
+    End;
+  End;
+  DID_GetCapabilities := DD_OK;
+End;
+
+Function DID_GetDeviceState(T, N, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If MemL[0:T + 12] = 1 Then
+  Begin
+    For I := 0 To Min(N, 256) - 1 Do
+    Begin
+      Mem[0:P + I] := ScanDown[I] Or ScanHit[I];
+      ScanHit[I] := 0;
+    End;
+  End
+  Else If N >= 16 Then
+  Begin
+    MemL[0:P] := DIMX; MemL[0:P + 4] := DIMY; MemL[0:P + 8] := 0;
+    DIMX := 0; DIMY := 0;
+    Mem[0:P + 12] := Ord((DIMBtn And 1) <> 0) * $80;
+    Mem[0:P + 13] := Ord((DIMBtn And 2) <> 0) * $80;
+    Mem[0:P + 14] := 0; Mem[0:P + 15] := 0;
+  End;
+  DID_GetDeviceState := DD_OK;
+End;
+
+Function DID_GetDeviceData(T, Sz, P, PN, Fl : LongInt) : LongInt;
+Begin
+  If PN <> 0 Then MemL[0:PN] := 0;
+  DID_GetDeviceData := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DSETUP.DLL : DirectX 3 est deja present dans Pasdows               }
+{ ------------------------------------------------------------------ }
+
+Function DirectXSetup(H, Root, Fl : LongInt) : LongInt;
+Begin
+  KLog('DirectXSetup : DirectX integre a Pasdows, rien a installer');
+  DirectXSetup := 0;
+End;
+
+Function DirectXSetupA(H, Root, Fl : LongInt) : LongInt;
+Begin
+  DirectXSetupA := 0;
+End;
+
+Function DirectXDeviceDriverSetup(H, Drv, Dir, Fl : LongInt) : LongInt;
+Begin
+  DirectXDeviceDriverSetup := 0;
+End;
+
+Function DirectXSetupGetVersion(PVer, PRev : LongInt) : LongInt;
+Begin
+  If PVer <> 0 Then MemL[0:PVer] := $00040004;
+  If PRev <> 0 Then MemL[0:PRev] := $00000044;
+  DirectXSetupGetVersion := 1;
+End;
+
+Function DirectXSetupSetCallback(Cb : LongInt) : LongInt;
+Begin
+  DirectXSetupSetCallback := 0;
+End;
+
+Function DirectXRegisterApplication(H, P : LongInt) : LongInt;
+Begin
+  DirectXRegisterApplication := 1;
+End;
+
+Function DirectXUnRegisterApplication(H, P : LongInt) : LongInt;
+Begin
+  DirectXUnRegisterApplication := 1;
+End;
+
+{ ==================================================================== }
+{ Partie 16 - Reseau : pilote NE2000 et pile TCP/IP (ARP, IP, ICMP,    }
+{             UDP, TCP), client DHCP et resolveur DNS                  }
+{ ==================================================================== }
+
+{ Comme Windows 95 avec sa carte ? NE2000 compatible ?, VMM32 pilote une
+  carte DP8390 : RTL8029 PCI (10EC:8029) ou carte ISA en 300h. Les
+  trames sont lues par scrutation (NetPoll), depuis la boucle du systeme
+  et pendant les appels bloquants de Winsock. Les adresses IP sont
+  gardees dans l'ordre du reseau (telles qu'en memoire, MemL), les ports
+  et numeros de sequence dans l'ordre de l'hote. }
+
+Const
+  MaxSock = 32;
+  MaxArp = 16;
+  MaxLoop = 8;
+  SkRxSize = 32768;
+  SkTxSize = 16384;
+  SockBase = $80;                    { premier descripteur de socket }
+  NetMss = 1460;
+  NeTxPage = $40; NeRxStart = $46; NeRxStop = $80;
+  tcClosed = 0; tcListen = 1; tcSynSent = 2; tcSynRcvd = 3; tcEstab = 4;
+  tcFinWait1 = 5; tcFinWait2 = 6; tcCloseWait = 7; tcClosing = 8;
+  tcLastAck = 9; tcTimeWait = 10;
+  { SkFlags }
+  sfNonBlock = 1; sfFinRcvd = 2; sfFinWant = 4; sfFinSent = 8;
+  sfAppClosed = 16; sfBound = 32; sfUdpConn = 64; sfAccepted = 128;
+  { evenements WSAAsyncSelect }
+  FD_READ = 1; FD_WRITE = 2; FD_OOB = 4; FD_ACCEPT = 8; FD_CONNECT = 16;
+  FD_CLOSE = 32;
+  { TCP }
+  thFin = 1; thSyn = 2; thRst = 4; thPsh = 8; thAck = 16;
+
+Var
+  NicBase   : LongInt;                { port de la carte (0 : aucune) }
+  NicPci    : Boolean;
+  NicMac    : Array[0..5] Of Byte;
+  NetIP, NetMask, NetGw, NetDns, NetDhcpSrv, NetLease : LongInt;
+  DhcpState, DhcpNext, DhcpXid, DhcpTries, DhcpOffer : LongInt;
+  NetRx, NetTx, NetAux, NetHdr, NetLoop, NetLoopRx : LongInt;
+  LoopHead, LoopN : LongInt;
+  NetIpId, NetPortNext, NetLastTick, NetIss : LongInt;
+  NetPktIn, NetPktOut : LongInt;
+  NetPolling : Boolean;
+  NetRxTtl : LongInt;
+  ArpIP     : Array[0..MaxArp - 1] Of LongInt;
+  ArpMac    : Array[0..MaxArp * 6 - 1] Of Byte;
+  ArpNext   : LongInt;
+  PingId, PingSeq, PingGotAt, PingTtl, PingFrom, PingData : LongInt;
+  PingLen, PingReq : LongInt;
+  WsBuf     : LongInt;    { structures statiques de Winsock }
+  DnsId, DnsPort, DnsResult : LongInt;
+  DnsBusy   : Boolean;
+  { sockets (tableaux plats) }
+  SkUsed    : Array[0..MaxSock - 1] Of Boolean;
+  SkType, SkLPort, SkRIP, SkRPort, SkState, SkErr : Array[0..MaxSock - 1]
+    Of LongInt;
+  SkRx, SkRxHead, SkRxLen, SkTx, SkTxLen : Array[0..MaxSock - 1] Of LongInt;
+  SkSndUna, SkSndNxt, SkRcvNxt, SkSndWnd : Array[0..MaxSock - 1] Of LongInt;
+  SkRetx, SkRto, SkTries, SkParent, SkBacklog : Array[0..MaxSock - 1]
+    Of LongInt;
+  SkFlags, SkAWnd, SkAMsg, SkAEv, SkASent, SkTimer : Array[0..MaxSock - 1]
+    Of LongInt;
+  SkLastWnd : Array[0..MaxSock - 1] Of LongInt;
+
+{ ------------------------------------------------------------------ }
+{ Outils : ordre des octets, adresses, somme de controle              }
+{ ------------------------------------------------------------------ }
+
+Function NGetW(A : LongInt) : LongInt;
+Begin
+  NGetW := (Mem[0:A] Shl 8) Or Mem[0:A + 1];
+End;
+
+Procedure NPutW(A, V : LongInt);
+Begin
+  Mem[0:A] := (V Shr 8) And $FF;
+  Mem[0:A + 1] := V And $FF;
+End;
+
+Function NGetL(A : LongInt) : LongInt;
+Begin
+  NGetL := (Mem[0:A] Shl 24) Or (Mem[0:A + 1] Shl 16) Or
+           (Mem[0:A + 2] Shl 8) Or Mem[0:A + 3];
+End;
+
+Procedure NPutL(A, V : LongInt);
+Begin
+  Mem[0:A] := (V Shr 24) And $FF;
+  Mem[0:A + 1] := (V Shr 16) And $FF;
+  Mem[0:A + 2] := (V Shr 8) And $FF;
+  Mem[0:A + 3] := V And $FF;
+End;
+
+Function Swap16(V : LongInt) : LongInt;
+Begin
+  Swap16 := ((V And $FF) Shl 8) Or ((V Shr 8) And $FF);
+End;
+
+Function Swap32(V : LongInt) : LongInt;
+Begin
+  Swap32 := ((V And $FF) Shl 24) Or (((V Shr 8) And $FF) Shl 16) Or
+            (((V Shr 16) And $FF) Shl 8) Or ((V Shr 24) And $FF);
+End;
+
+{ Adresse IP (ordre du reseau) en notation pointee }
+Function IpStr(IP : LongInt) : String;
+Begin
+  IpStr := IntStr(IP And $FF) + '.' + IntStr((IP Shr 8) And $FF) + '.' +
+           IntStr((IP Shr 16) And $FF) + '.' + IntStr((IP Shr 24) And $FF);
+End;
+
+{ Notation pointee -> adresse (ordre du reseau) ; False si invalide }
+Function ParseIp(S : String; Var IP : LongInt) : Boolean;
+Var I, N, V, R, Digits : LongInt; C : Char;
+Begin
+  ParseIp := False;
+  R := 0; N := 0; V := 0; Digits := 0;
+  For I := 1 To Length(S) + 1 Do
+  Begin
+    If I > Length(S) Then C := '.' Else C := S[I];
+    If (C >= '0') And (C <= '9') Then
+    Begin
+      V := V * 10 + Ord(C) - 48;
+      Inc(Digits);
+      If (V > 255) Or (Digits > 3) Then Exit;
+    End
+    Else If C = '.' Then
+    Begin
+      If (Digits = 0) Or (N > 3) Then Exit;
+      R := R Or (V Shl (N * 8));
+      Inc(N); V := 0; Digits := 0;
+    End
+    Else Exit;
+  End;
+  If N <> 4 Then Exit;
+  IP := R;
+  ParseIp := True;
+End;
+
+Function MacStr : String;
+Var I : LongInt; S : String;
+Begin
+  S := '';
+  For I := 0 To 5 Do
+  Begin
+    If I > 0 Then S := S + '-';
+    S := S + HexStr(NicMac[I], 2);
+  End;
+  MacStr := S;
+End;
+
+{ Somme de controle de l'Internet (complement a un) }
+Function NetSum(A, N, Init : LongInt) : LongInt;
+Var S, I : LongInt;
+Begin
+  S := Init; I := 0;
+  While I + 1 < N Do
+  Begin
+    S := S + (Mem[0:A + I] Shl 8) + Mem[0:A + I + 1];
+    I := I + 2;
+  End;
+  If I < N Then S := S + (Mem[0:A + I] Shl 8);
+  While (S Shr 16) <> 0 Do S := (S And $FFFF) + (S Shr 16);
+  NetSum := S;
+End;
+
+{ Pseudo-en-tete TCP/UDP }
+Function PseudoSum(Src, Dst, Proto, Len : LongInt) : LongInt;
+Begin
+  PseudoSum := ((Src And $FF) Shl 8) + ((Src Shr 8) And $FF) +
+               (((Src Shr 16) And $FF) Shl 8) + ((Src Shr 24) And $FF) +
+               ((Dst And $FF) Shl 8) + ((Dst Shr 8) And $FF) +
+               (((Dst Shr 16) And $FF) Shl 8) + ((Dst Shr 24) And $FF) +
+               Proto + Len;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Bus PCI (mecanisme de configuration 1)                               }
+{ ------------------------------------------------------------------ }
+
+Function PciRead(Bus, Dev, Fn, Reg : LongInt) : LongInt;
+Var A, R : LongInt;
+Begin
+  A := LongInt($80000000) Or (Bus Shl 16) Or (Dev Shl 11) Or (Fn Shl 8) Or
+       (Reg And $FC);
+  asm
+    mov eax,A
+    mov edx,0CF8h
+    out dx,eax
+    mov edx,0CFCh
+    in eax,dx
+    mov R,eax
+  end;
+  PciRead := R;
+End;
+
+Procedure PciWrite(Bus, Dev, Fn, Reg, V : LongInt);
+Var A : LongInt;
+Begin
+  A := LongInt($80000000) Or (Bus Shl 16) Or (Dev Shl 11) Or (Fn Shl 8) Or
+       (Reg And $FC);
+  asm
+    mov eax,A
+    mov edx,0CF8h
+    out dx,eax
+    mov eax,V
+    mov edx,0CFCh
+    out dx,eax
+  end;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pilote NE2000 (DP8390, transferts en mots de 16 bits)                }
+{ ------------------------------------------------------------------ }
+
+Procedure NeDma(Addr, Count, Cmd : LongInt);
+Begin
+  Port[NicBase + $0A] := Count And $FF;
+  Port[NicBase + $0B] := (Count Shr 8) And $FF;
+  Port[NicBase + $08] := Addr And $FF;
+  Port[NicBase + $09] := (Addr Shr 8) And $FF;
+  Port[NicBase] := Cmd;
+End;
+
+Procedure NeWaitDma;
+Var I : LongInt;
+Begin
+  I := 0;
+  While ((Port[NicBase + 7] And $40) = 0) And (I < 100000) Do Inc(I);
+  Port[NicBase + 7] := $40;
+End;
+
+{ Lire Count octets de la memoire de la carte (arrondi au mot) }
+Procedure NeRead(Addr, Dst, Count : LongInt);
+Var P, N : LongInt;
+Begin
+  N := (Count + 1) And Not 1;
+  NeDma(Addr, N, $0A);
+  P := NicBase + $10;
+  N := N Shr 1;
+  asm
+    push edi
+    mov edi,Dst
+    mov ecx,N
+    mov edx,P
+    cld
+    rep insw
+    pop edi
+  end;
+  NeWaitDma;
+End;
+
+Procedure NeWrite(Addr, Src, Count : LongInt);
+Var P, N : LongInt;
+Begin
+  N := (Count + 1) And Not 1;
+  Port[NicBase + 7] := $40;
+  NeDma(Addr, N, $12);
+  P := NicBase + $10;
+  N := N Shr 1;
+  asm
+    push esi
+    mov esi,Src
+    mov ecx,N
+    mov edx,P
+    cld
+    rep outsw
+    pop esi
+  end;
+  NeWaitDma;
+End;
+
+Function NeReset(B : LongInt) : Boolean;
+Var I, V : LongInt;
+Begin
+  NeReset := False;
+  V := Port[B + $1F];
+  Port[B + $1F] := V;
+  I := 0;
+  While ((Port[B + 7] And $80) = 0) And (I < 200000) Do Inc(I);
+  If (Port[B + 7] And $80) = 0 Then Exit;
+  Port[B + 7] := $FF;
+  NeReset := True;
+End;
+
+Procedure NeInit;
+Var B, I : LongInt;
+Begin
+  B := NicBase;
+  Port[B] := $21;                  { page 0, arret, pas de DMA }
+  Port[B + $0E] := $49;            { DCR : mots, FIFO 8 octets }
+  Port[B + $0A] := 0; Port[B + $0B] := 0;
+  Port[B + $0F] := 0;              { IMR : scrutation }
+  Port[B + 7] := $FF;
+  Port[B + $0C] := $20;            { RCR : moniteur }
+  Port[B + $0D] := $02;            { TCR : boucle interne }
+  { adresse Ethernet : PROM (octets doubles en mode mot) }
+  FillMem(NetHdr, 64, 0);
+  NeRead(0, NetHdr, 32);
+  For I := 0 To 5 Do NicMac[I] := Mem[0:NetHdr + I * 2];
+  Port[B] := $21;
+  Port[B + $01] := NeRxStart;
+  Port[B + $02] := NeRxStop;
+  Port[B + $03] := NeRxStart;
+  Port[B + $04] := NeTxPage;
+  Port[B + 7] := $FF;
+  Port[B] := $61;                  { page 1 }
+  For I := 0 To 5 Do Port[B + 1 + I] := NicMac[I];
+  For I := 0 To 7 Do Port[B + 8 + I] := $FF;
+  Port[B + 7] := NeRxStart + 1;    { CURR }
+  Port[B] := $22;                  { page 0, demarrage }
+  Port[B + 7] := $FF;
+  Port[B + $0D] := 0;              { TCR normal }
+  Port[B + $0C] := $04;            { RCR : diffusion acceptee }
+End;
+
+Function NeProbe : Boolean;
+Var Bus, Dev, Id, Bar, Cmd : LongInt;
+Begin
+  NeProbe := False;
+  NicBase := 0;
+  For Bus := 0 To 3 Do
+    For Dev := 0 To 31 Do
+      If NicBase = 0 Then
+      Begin
+        Id := PciRead(Bus, Dev, 0, 0);
+        If Id = $802910EC Then
+        Begin
+          Bar := PciRead(Bus, Dev, 0, $10);
+          If (Bar And 1) <> 0 Then
+          Begin
+            Cmd := PciRead(Bus, Dev, 0, 4);
+            PciWrite(Bus, Dev, 0, 4, (Cmd And $FFFF) Or 5);
+            NicBase := Bar And $FFFC;
+            NicPci := True;
+          End;
+        End;
+      End;
+  If NicBase = 0 Then
+  Begin
+    { carte ISA a l'adresse habituelle }
+    If (Port[$300] <> $FF) And NeReset($300) Then
+    Begin
+      NicBase := $300;
+      NicPci := False;
+    End;
+  End
+  Else If Not NeReset(NicBase) Then NicBase := 0;
+  If NicBase = 0 Then Exit;
+  NeInit;
+  NeProbe := True;
+End;
+
+Procedure NeSend(Src, Len : LongInt);
+Var I : LongInt;
+Begin
+  If NicBase = 0 Then Exit;
+  If Len < 60 Then
+  Begin
+    FillMem(Src + Len, 60 - Len, 0);
+    Len := 60;
+  End;
+  I := 0;
+  While ((Port[NicBase] And 4) <> 0) And (I < 200000) Do Inc(I);
+  NeWrite(NeTxPage * 256, Src, Len);
+  Port[NicBase + 4] := NeTxPage;
+  Port[NicBase + 5] := Len And $FF;
+  Port[NicBase + 6] := (Len Shr 8) And $FF;
+  Port[NicBase] := $26;
+  Inc(NetPktOut);
+End;
+
+{ Trame recue dans Dst : longueur, ou 0 si aucune }
+Function NeRecv(Dst : LongInt) : LongInt;
+Var B, Curr, Bnry, Nxt, NextPg, Len : LongInt;
+Begin
+  NeRecv := 0;
+  B := NicBase;
+  Port[B] := $62;
+  Curr := Port[B + 7];
+  Port[B] := $22;
+  Bnry := Port[B + 3];
+  Nxt := Bnry + 1;
+  If Nxt >= NeRxStop Then Nxt := NeRxStart;
+  If Nxt = Curr Then
+  Begin
+    If (Port[B + 7] And $10) <> 0 Then Port[B + 7] := $10;
+    Exit;
+  End;
+  NeRead(Nxt * 256, NetHdr, 4);
+  NextPg := Mem[0:NetHdr + 1];
+  Len := MemW[0:NetHdr + 2] - 4;
+  If (NextPg < NeRxStart) Or (NextPg >= NeRxStop) Or (Len > 2000) Then
+  Begin
+    { anneau incoherent : tout abandonner }
+    If Curr - 1 < NeRxStart Then Port[B + 3] := NeRxStop - 1
+    Else Port[B + 3] := Curr - 1;
+    Port[B + 7] := $FF;
+    Exit;
+  End;
+  If (Len > 0) And (Len <= 1536) Then NeRead(Nxt * 256 + 4, Dst, Len)
+  Else Len := 0;
+  If NextPg - 1 < NeRxStart Then Port[B + 3] := NeRxStop - 1
+  Else Port[B + 3] := NextPg - 1;
+  Port[B + 7] := $15;
+  Inc(NetPktIn);
+  If Len = 0 Then Len := -1;
+  NeRecv := Len;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ethernet et ARP                                                      }
+{ ------------------------------------------------------------------ }
+
+Function ArpFind(IP : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := -1;
+  For I := 0 To MaxArp - 1 Do
+    If (ArpIP[I] = IP) And (IP <> 0) Then R := I;
+  ArpFind := R;
+End;
+
+Procedure ArpAdd(IP, Mac : LongInt);
+Var I, K : LongInt;
+Begin
+  If (IP = 0) Or (IP = -1) Then Exit;
+  I := ArpFind(IP);
+  If I < 0 Then
+  Begin
+    I := ArpNext;
+    ArpNext := (ArpNext + 1) Mod MaxArp;
+  End;
+  ArpIP[I] := IP;
+  For K := 0 To 5 Do ArpMac[I * 6 + K] := Mem[0:Mac + K];
+End;
+
+{ En-tete Ethernet en F (destination Mac, 0 : diffusion) }
+Procedure EthHeader(F, Mac, EType : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To 5 Do
+  Begin
+    If Mac = 0 Then Mem[0:F + K] := $FF Else Mem[0:F + K] := Mem[0:Mac + K];
+    Mem[0:F + 6 + K] := NicMac[K];
+  End;
+  NPutW(F + 12, EType);
+End;
+
+Procedure ArpSend(Op, TMac, TIP : LongInt);
+Var F, K : LongInt;
+Begin
+  F := NetAux;
+  EthHeader(F, TMac, $0806);
+  NPutW(F + 14, 1); NPutW(F + 16, $0800);
+  Mem[0:F + 18] := 6; Mem[0:F + 19] := 4;
+  NPutW(F + 20, Op);
+  For K := 0 To 5 Do
+  Begin
+    Mem[0:F + 22 + K] := NicMac[K];
+    If TMac = 0 Then Mem[0:F + 32 + K] := 0
+    Else Mem[0:F + 32 + K] := Mem[0:TMac + K];
+  End;
+  MemL[0:F + 28] := NetIP;
+  MemL[0:F + 38] := TIP;
+  NeSend(F, 42);
+End;
+
+Procedure ArpInput(P, Len : LongInt);
+Var SIP, TIP : LongInt;
+Begin
+  If Len < 28 Then Exit;
+  If (NGetW(P) <> 1) Or (NGetW(P + 2) <> $0800) Then Exit;
+  SIP := MemL[0:P + 14];
+  TIP := MemL[0:P + 24];
+  If (NetIP <> 0) And (TIP = NetIP) Then
+  Begin
+    ArpAdd(SIP, P + 8);
+    If NGetW(P + 6) = 1 Then
+    Begin
+      MoveMem(P + 8, NetHdr + 16, 6);
+      ArpSend(2, NetHdr + 16, SIP);
+    End;
+  End
+  Else If ArpFind(SIP) >= 0 Then ArpAdd(SIP, P + 8);
+End;
+
+Function IsLoop(IP : LongInt) : Boolean;
+Begin
+  IsLoop := ((IP And $FF) = 127) Or ((IP = NetIP) And (IP <> 0));
+End;
+
+{ Prochain saut vers IP (-1 : diffusion) }
+Function NextHop(IP : LongInt) : LongInt;
+Begin
+  If (IP = -1) Or (NetIP = 0) Then NextHop := -1
+  Else If ((IP Xor NetIP) And NetMask) <> 0 Then NextHop := NetGw
+  Else If (IP Or NetMask) = -1 Then NextHop := -1
+  Else NextHop := IP;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IP                                                                   }
+{ ------------------------------------------------------------------ }
+
+{ Emettre le datagramme dont la charge (Len octets) est en NetTx + 34 }
+Function IpSend(Dst, Proto, Len : LongInt) : Boolean;
+Var H, Hop, I, A : LongInt;
+Begin
+  IpSend := False;
+  H := NetTx + 14;
+  Mem[0:H] := $45; Mem[0:H + 1] := 0;
+  NPutW(H + 2, 20 + Len);
+  NPutW(H + 4, NetIpId);
+  NetIpId := (NetIpId + 1) And $FFFF;
+  NPutW(H + 6, 0);
+  Mem[0:H + 8] := 128; Mem[0:H + 9] := Proto;
+  NPutW(H + 10, 0);
+  If IsLoop(Dst) Then MemL[0:H + 12] := Dst Else MemL[0:H + 12] := NetIP;
+  MemL[0:H + 16] := Dst;
+  NPutW(H + 10, (Not NetSum(H, 20, 0)) And $FFFF);
+  If IsLoop(Dst) Then
+  Begin
+    { boucle locale : file traitee par NetPoll }
+    If LoopN >= MaxLoop Then Exit;
+    A := NetLoop + ((LoopHead + LoopN) Mod MaxLoop) * 1600;
+    MemL[0:A] := 20 + Len;
+    MoveMem(H, A + 4, 20 + Len);
+    Inc(LoopN);
+    IpSend := True;
+    Exit;
+  End;
+  If NicBase = 0 Then Exit;
+  Hop := NextHop(Dst);
+  If Hop = -1 Then EthHeader(NetTx, 0, $0800)
+  Else
+  Begin
+    I := ArpFind(Hop);
+    If I < 0 Then
+    Begin
+      ArpSend(1, 0, Hop);
+      Exit;
+    End;
+    EthHeader(NetTx, LongInt(@ArpMac) + I * 6, $0800);
+  End;
+  NeSend(NetTx, 34 + Len);
+  IpSend := True;
+End;
+
+Procedure IcmpInput(Src, P, Len : LongInt); Forward;
+Procedure UdpInput(Src, Dst, P, Len : LongInt); Forward;
+Procedure TcpInput(Src, P, Len : LongInt); Forward;
+
+Procedure IpInput(P, Len : LongInt);
+Var HL, TL, Src, Dst : LongInt;
+Begin
+  If Len < 20 Then Exit;
+  If (Mem[0:P] Shr 4) <> 4 Then Exit;
+  HL := (Mem[0:P] And 15) * 4;
+  TL := NGetW(P + 2);
+  If (TL > Len) Or (TL < HL) Then Exit;
+  If (NGetW(P + 6) And $3FFF) <> 0 Then Exit;   { fragments ignores }
+  Src := MemL[0:P + 12];
+  Dst := MemL[0:P + 16];
+  If NetIP = 0 Then
+  Begin
+    { en attente de DHCP : seulement UDP }
+    If (Mem[0:P + 9] <> 17) And Not IsLoop(Dst) Then Exit;
+  End
+  Else If (Dst <> NetIP) And (Dst <> -1) And Not IsLoop(Dst) And
+          ((Dst Or NetMask) <> -1) Then Exit;
+  NetRxTtl := Mem[0:P + 8];
+  Case Mem[0:P + 9] Of
+    1 : IcmpInput(Src, P + HL, TL - HL);
+    6 : TcpInput(Src, P + HL, TL - HL);
+    17 : UdpInput(Src, Dst, P + HL, TL - HL);
+  End;
+End;
+
+Procedure EthInput(F, Len : LongInt);
+Var T : LongInt;
+Begin
+  If Len < 14 Then Exit;
+  T := NGetW(F + 12);
+  If T = $0806 Then ArpInput(F + 14, Len - 14)
+  Else If T = $0800 Then IpInput(F + 14, Len - 14);
+End;
+
+{ ------------------------------------------------------------------ }
+{ ICMP : echo (ping)                                                   }
+{ ------------------------------------------------------------------ }
+
+Procedure IcmpInput(Src, P, Len : LongInt);
+Var T : LongInt;
+Begin
+  If Len < 8 Then Exit;
+  T := Mem[0:P];
+  If (T = 8) And (Len <= 1472) Then
+  Begin
+    MoveMem(P, NetTx + 34, Len);
+    Mem[0:NetTx + 34] := 0;
+    NPutW(NetTx + 36, 0);
+    NPutW(NetTx + 36, (Not NetSum(NetTx + 34, Len, 0)) And $FFFF);
+    IpSend(Src, 1, Len);
+  End
+  Else If (T = 0) And (NGetW(P + 4) = PingId) And
+          (NGetW(P + 6) = PingSeq) Then
+  Begin
+    PingGotAt := Ticks;
+    PingTtl := NetRxTtl;
+    PingFrom := Src;
+    PingLen := Min(Len - 8, 1024);
+    If PingData <> 0 Then MoveMem(P + 8, PingData, PingLen);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ UDP                                                                  }
+{ ------------------------------------------------------------------ }
+
+{ Emettre un datagramme dont les donnees sont en NetTx + 42 }
+Function UdpOut(SPort, Dst, DPort, Len : LongInt) : Boolean;
+Var U, S, Src : LongInt;
+Begin
+  U := NetTx + 34;
+  NPutW(U, SPort); NPutW(U + 2, DPort);
+  NPutW(U + 4, Len + 8); NPutW(U + 6, 0);
+  If IsLoop(Dst) Then Src := Dst Else Src := NetIP;
+  S := NetSum(U, Len + 8, PseudoSum(Src, Dst, 17, Len + 8));
+  S := (Not S) And $FFFF;
+  If S = 0 Then S := $FFFF;
+  NPutW(U + 6, S);
+  UdpOut := IpSend(Dst, 17, Len + 8);
+End;
+
+Procedure DhcpInput(P, Len : LongInt); Forward;
+Procedure DnsInput(P, Len : LongInt); Forward;
+Procedure NetNotify(S, Ev : LongInt); Forward;
+
+{ Anneau de reception d'un socket }
+Procedure RingPut(S, Src, N : LongInt);
+Var Pos0, K : LongInt;
+Begin
+  Pos0 := (SkRxHead[S] + SkRxLen[S]) Mod SkRxSize;
+  K := Min(N, SkRxSize - Pos0);
+  MoveMem(Src, SkRx[S] + Pos0, K);
+  If N > K Then MoveMem(Src + K, SkRx[S], N - K);
+  SkRxLen[S] := SkRxLen[S] + N;
+End;
+
+Procedure RingGet(S, Dst, N : LongInt; Peek : Boolean);
+Var K : LongInt;
+Begin
+  K := Min(N, SkRxSize - SkRxHead[S]);
+  If Dst <> 0 Then
+  Begin
+    MoveMem(SkRx[S] + SkRxHead[S], Dst, K);
+    If N > K Then MoveMem(SkRx[S], Dst + K, N - K);
+  End;
+  If Not Peek Then
+  Begin
+    SkRxHead[S] := (SkRxHead[S] + N) Mod SkRxSize;
+    SkRxLen[S] := SkRxLen[S] - N;
+  End;
+End;
+
+Procedure UdpInput(Src, Dst, P, Len : LongInt);
+Var SP, DP, UL, D, S, I : LongInt;
+Begin
+  If Len < 8 Then Exit;
+  SP := NGetW(P); DP := NGetW(P + 2); UL := NGetW(P + 4);
+  If (UL < 8) Or (UL > Len) Then Exit;
+  D := P + 8; UL := UL - 8;
+  If (DP = 68) And (DhcpState In [1, 2]) Then
+  Begin
+    DhcpInput(D, UL);
+    Exit;
+  End;
+  If DnsBusy And (DP = DnsPort) And (SP = 53) Then
+  Begin
+    DnsInput(D, UL);
+    Exit;
+  End;
+  S := -1;
+  For I := 0 To MaxSock - 1 Do
+    If SkUsed[I] And (SkType[I] = 2) And (SkLPort[I] = DP) Then
+      If ((SkFlags[I] And sfUdpConn) = 0) Or
+         ((SkRIP[I] = Src) And (SkRPort[I] = SP)) Then S := I;
+  If S < 0 Then Exit;
+  If SkRxLen[S] + UL + 8 > SkRxSize Then Exit;
+  MemL[0:NetHdr] := UL;
+  MemL[0:NetHdr + 4] := Src;
+  MemL[0:NetHdr + 8] := SP;
+  RingPut(S, NetHdr, 12);
+  RingPut(S, D, UL);
+  NetNotify(S, FD_READ);
+End;
+
+{ ------------------------------------------------------------------ }
+{ DHCP (client)                                                        }
+{ ------------------------------------------------------------------ }
+
+Procedure DhcpSend(Typ : LongInt);
+Var D, O, K : LongInt; Hn : String;
+Begin
+  D := NetTx + 42;
+  FillMem(D, 300, 0);
+  Mem[0:D] := 1; Mem[0:D + 1] := 1; Mem[0:D + 2] := 6;
+  NPutL(D + 4, DhcpXid);
+  NPutW(D + 10, $8000);
+  For K := 0 To 5 Do Mem[0:D + 28 + K] := NicMac[K];
+  NPutL(D + 236, $63825363);
+  O := D + 240;
+  Mem[0:O] := 53; Mem[0:O + 1] := 1; Mem[0:O + 2] := Typ; O := O + 3;
+  Mem[0:O] := 61; Mem[0:O + 1] := 7; Mem[0:O + 2] := 1;
+  For K := 0 To 5 Do Mem[0:O + 3 + K] := NicMac[K];
+  O := O + 9;
+  Mem[0:O] := 12; Mem[0:O + 1] := 7;
+  Hn := 'PASDOWS';
+  For K := 1 To 7 Do Mem[0:O + 1 + K] := Ord(Hn[K]);
+  O := O + 9;
+  If Typ = 3 Then
+  Begin
+    Mem[0:O] := 50; Mem[0:O + 1] := 4; MemL[0:O + 2] := DhcpOffer;
+    O := O + 6;
+    Mem[0:O] := 54; Mem[0:O + 1] := 4; MemL[0:O + 2] := NetDhcpSrv;
+    O := O + 6;
+  End;
+  Mem[0:O] := 55; Mem[0:O + 1] := 4; Mem[0:O + 2] := 1; Mem[0:O + 3] := 3;
+  Mem[0:O + 4] := 6; Mem[0:O + 5] := 15;
+  O := O + 6;
+  Mem[0:O] := 255;
+  UdpOut(68, -1, 67, 300);
+End;
+
+Procedure DhcpInput(P, Len : LongInt);
+Var O, E, Typ, C, N, Mask, Gw, Dns, Srv, Lease : LongInt;
+Begin
+  If (Len < 244) Or (Mem[0:P] <> 2) Then Exit;
+  If NGetL(P + 4) <> DhcpXid Then Exit;
+  If NGetL(P + 236) <> $63825363 Then Exit;
+  Typ := 0; Mask := 0; Gw := 0; Dns := 0; Srv := 0; Lease := 0;
+  O := P + 240; E := P + Len;
+  While O < E Do
+  Begin
+    C := Mem[0:O];
+    If C = 255 Then Break;
+    If C = 0 Then
+    Begin
+      Inc(O);
+      Continue;
+    End;
+    N := Mem[0:O + 1];
+    Case C Of
+      53 : Typ := Mem[0:O + 2];
+      1 : Mask := MemL[0:O + 2];
+      3 : Gw := MemL[0:O + 2];
+      6 : Dns := MemL[0:O + 2];
+      51 : Lease := NGetL(O + 2);
+      54 : Srv := MemL[0:O + 2];
+    End;
+    O := O + 2 + N;
+  End;
+  If (Typ = 2) And (DhcpState = 1) Then
+  Begin
+    DhcpOffer := MemL[0:P + 16];
+    NetDhcpSrv := Srv;
+    DhcpState := 2;
+    DhcpNext := Ticks + 3000;
+    DhcpSend(3);
+  End
+  Else If (Typ = 5) And (DhcpState = 2) Then
+  Begin
+    NetIP := MemL[0:P + 16];
+    If Mask <> 0 Then NetMask := Mask Else NetMask := $00FFFFFF;
+    NetGw := Gw; NetDns := Dns; NetLease := Lease;
+    DhcpState := 3;
+    KLog('TCP/IP : adresse ' + IpStr(NetIP) + ' masque ' + IpStr(NetMask) +
+         ' passerelle ' + IpStr(NetGw) + ' DNS ' + IpStr(NetDns) +
+         ' (DHCP ' + IpStr(NetDhcpSrv) + ')');
+  End
+  Else If Typ = 6 Then
+  Begin
+    DhcpState := 1;
+    DhcpNext := Ticks + 1000;
+  End;
+End;
+
+Procedure DhcpTick;
+Begin
+  If (NicBase = 0) Or Not (DhcpState In [1, 2]) Then Exit;
+  If Ticks < DhcpNext Then Exit;
+  Inc(DhcpTries);
+  DhcpState := 1;
+  DhcpXid := DhcpXid + 1;
+  DhcpSend(1);
+  DhcpNext := Ticks + Min(2000 * DhcpTries, 30000);
+End;
+
+{ ------------------------------------------------------------------ }
+{ TCP                                                                  }
+{ ------------------------------------------------------------------ }
+
+Function SkWnd(S : LongInt) : LongInt;
+Begin
+  SkWnd := Min(SkRxSize - SkRxLen[S], 65535);
+End;
+
+{ Segment TCP : Len octets de donnees depuis Data (adresse lineaire) }
+Function TcpRaw(Dst, SP, DP, Seq, Ack, Fl, Wnd, Data, Len : LongInt)
+  : Boolean;
+Var T, HL, S, Src : LongInt;
+Begin
+  T := NetTx + 34;
+  HL := 20;
+  If (Fl And thSyn) <> 0 Then HL := 24;
+  NPutW(T, SP); NPutW(T + 2, DP);
+  NPutL(T + 4, Seq); NPutL(T + 8, Ack);
+  Mem[0:T + 12] := (HL Div 4) Shl 4;
+  Mem[0:T + 13] := Fl;
+  NPutW(T + 14, Wnd);
+  NPutW(T + 16, 0); NPutW(T + 18, 0);
+  If HL = 24 Then
+  Begin
+    Mem[0:T + 20] := 2; Mem[0:T + 21] := 4; NPutW(T + 22, NetMss);
+  End;
+  If Len > 0 Then MoveMem(Data, T + HL, Len);
+  If IsLoop(Dst) Then Src := Dst Else Src := NetIP;
+  S := NetSum(T, HL + Len, PseudoSum(Src, Dst, 6, HL + Len));
+  NPutW(T + 16, (Not S) And $FFFF);
+  TcpRaw := IpSend(Dst, 6, HL + Len);
+End;
+
+Procedure TcpSend(S, Fl, Seq, Off, Len : LongInt);
+Begin
+  If (Fl And thAck) <> 0 Then SkLastWnd[S] := SkWnd(S);
+  TcpRaw(SkRIP[S], SkLPort[S], SkRPort[S], Seq, SkRcvNxt[S], Fl, SkWnd(S),
+         SkTx[S] + Off, Len);
+End;
+
+Procedure TcpArm(S : LongInt);
+Begin
+  If SkRetx[S] = 0 Then SkRetx[S] := Ticks + SkRto[S];
+End;
+
+{ Emettre les donnees en attente et le FIN demande }
+Procedure TcpOutput(S : LongInt);
+Var Off, Avail, N, K, St : LongInt;
+Begin
+  St := SkState[S];
+  If Not (St In [tcEstab, tcCloseWait, tcFinWait1, tcClosing, tcLastAck])
+  Then Exit;
+  If (SkFlags[S] And sfFinSent) = 0 Then
+  Begin
+    Off := SkSndNxt[S] - SkSndUna[S];
+    Avail := Min(SkTxLen[S], SkSndWnd[S]) - Off;
+    K := 0;
+    While (Avail > 0) And (K < 8) Do
+    Begin
+      N := Min(Avail, NetMss);
+      TcpSend(S, thAck Or thPsh, SkSndNxt[S], Off, N);
+      SkSndNxt[S] := SkSndNxt[S] + N;
+      Off := Off + N; Avail := Avail - N;
+      TcpArm(S);
+      Inc(K);
+    End;
+    If ((SkFlags[S] And sfFinWant) <> 0) And (Off = SkTxLen[S]) Then
+    Begin
+      TcpSend(S, thFin Or thAck, SkSndNxt[S], 0, 0);
+      SkSndNxt[S] := SkSndNxt[S] + 1;
+      SkFlags[S] := SkFlags[S] Or sfFinSent;
+      If St = tcEstab Then SkState[S] := tcFinWait1
+      Else If St = tcCloseWait Then SkState[S] := tcLastAck;
+      TcpArm(S);
+    End;
+  End;
+End;
+
+Procedure SockFree(S : LongInt);
+Var HO : LongInt;
+Begin
+  If Not SkUsed[S] Then Exit;
+  HO := HeapOwner;
+  HeapOwner := 0;
+  If SkRx[S] <> 0 Then KFree(SkRx[S]);
+  If SkTx[S] <> 0 Then KFree(SkTx[S]);
+  HeapOwner := HO;
+  SkRx[S] := 0; SkTx[S] := 0;
+  SkUsed[S] := False;
+End;
+
+{ Connexion terminee : liberer le socket si le programme l'a ferme }
+Procedure TcpClosed(S : LongInt);
+Begin
+  SkState[S] := tcClosed;
+  SkRetx[S] := 0;
+  If (SkFlags[S] And sfAppClosed) <> 0 Then SockFree(S)
+  Else If (SkParent[S] >= 0) And ((SkFlags[S] And sfAccepted) = 0) Then
+    SockFree(S)
+  Else NetNotify(S, FD_CLOSE);
+End;
+
+Function SockAlloc(Typ : LongInt) : LongInt; Forward;
+
+Function NewIss : LongInt;
+Begin
+  NetIss := NetIss + 64000 + Ticks * 250;
+  NewIss := NetIss;
+End;
+
+Procedure TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen : LongInt);
+Begin
+  If (Fl And thAck) <> 0 Then
+    TcpRaw(Src, DP, SP, Ack, 0, thRst, 0, 0, 0)
+  Else
+  Begin
+    If (Fl And thSyn) <> 0 Then Inc(DLen);
+    If (Fl And thFin) <> 0 Then Inc(DLen);
+    TcpRaw(Src, DP, SP, 0, Seq + DLen, thRst Or thAck, 0, 0, 0);
+  End;
+End;
+
+Procedure TcpInput(Src, P, Len : LongInt);
+Var SP, DP, Seq, Ack, HL, Fl, Wnd, DLen, D, S, I, C, N, A, Sent,
+    Free0, St, Cnt : LongInt;
+    NeedAck, FinAck : Boolean;
+Begin
+  If Len < 20 Then Exit;
+  SP := NGetW(P); DP := NGetW(P + 2);
+  Seq := NGetL(P + 4); Ack := NGetL(P + 8);
+  HL := (Mem[0:P + 12] Shr 4) * 4;
+  Fl := Mem[0:P + 13];
+  Wnd := NGetW(P + 14);
+  If (HL < 20) Or (HL > Len) Then Exit;
+  D := P + HL; DLen := Len - HL;
+  S := -1;
+  For I := 0 To MaxSock - 1 Do
+    If SkUsed[I] And (SkType[I] = 1) And (SkLPort[I] = DP) And
+       (SkRPort[I] = SP) And (SkRIP[I] = Src) And
+       Not (SkState[I] In [tcClosed, tcListen]) Then S := I;
+  If S < 0 Then
+    For I := 0 To MaxSock - 1 Do
+      If SkUsed[I] And (SkType[I] = 1) And (SkLPort[I] = DP) And
+         (SkState[I] = tcListen) Then S := I;
+  If S < 0 Then
+  Begin
+    If (Fl And thRst) = 0 Then TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+    Exit;
+  End;
+  St := SkState[S];
+  If St = tcListen Then
+  Begin
+    If (Fl And (thSyn Or thAck Or thRst)) <> thSyn Then
+    Begin
+      If (Fl And thRst) = 0 Then TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+      Exit;
+    End;
+    Cnt := 0;
+    For I := 0 To MaxSock - 1 Do
+      If SkUsed[I] And (SkParent[I] = S) And
+         ((SkFlags[I] And sfAccepted) = 0) Then Inc(Cnt);
+    If Cnt >= SkBacklog[S] Then Exit;
+    C := SockAlloc(1);
+    If C < 0 Then Exit;
+    SkParent[C] := S;
+    SkLPort[C] := DP; SkRIP[C] := Src; SkRPort[C] := SP;
+    SkFlags[C] := (SkFlags[S] And sfNonBlock) Or sfBound;
+    SkAWnd[C] := SkAWnd[S]; SkAMsg[C] := SkAMsg[S]; SkAEv[C] := SkAEv[S];
+    SkRcvNxt[C] := Seq + 1;
+    SkSndUna[C] := NewIss;
+    SkSndNxt[C] := SkSndUna[C] + 1;
+    SkSndWnd[C] := Wnd;
+    SkState[C] := tcSynRcvd;
+    TcpSend(C, thSyn Or thAck, SkSndUna[C], 0, 0);
+    TcpArm(C);
+    Exit;
+  End;
+  If St = tcSynSent Then
+  Begin
+    If ((Fl And thAck) <> 0) And (Ack <> SkSndNxt[S]) Then
+    Begin
+      If (Fl And thRst) = 0 Then TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+      Exit;
+    End;
+    If (Fl And thRst) <> 0 Then
+    Begin
+      If (Fl And thAck) <> 0 Then
+      Begin
+        SkErr[S] := 10061;                     { WSAECONNREFUSED }
+        TcpClosed(S);
+      End;
+      Exit;
+    End;
+    If ((Fl And thSyn) <> 0) And ((Fl And thAck) <> 0) Then
+    Begin
+      SkRcvNxt[S] := Seq + 1;
+      SkSndUna[S] := Ack;
+      SkSndWnd[S] := Wnd;
+      SkState[S] := tcEstab;
+      SkRetx[S] := 0; SkTries[S] := 0; SkRto[S] := 500;
+      TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+      NetNotify(S, FD_CONNECT);
+      NetNotify(S, FD_WRITE);
+      TcpOutput(S);
+    End;
+    Exit;
+  End;
+  { etats synchronises }
+  If (Fl And thRst) <> 0 Then
+  Begin
+    If (Seq - SkRcvNxt[S] >= 0) And (Seq - SkRcvNxt[S] < 65536) Then
+    Begin
+      If St In [tcEstab, tcFinWait1, tcFinWait2, tcCloseWait] Then
+        SkErr[S] := 10054;                     { WSAECONNRESET }
+      TcpClosed(S);
+    End;
+    Exit;
+  End;
+  If (Fl And thSyn) <> 0 Then
+  Begin
+    { SYN repete (notre ACK perdu) : le confirmer de nouveau }
+    TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+    Exit;
+  End;
+  If (Fl And thAck) = 0 Then Exit;
+  NeedAck := False;
+  If St = tcSynRcvd Then
+  Begin
+    If Ack <> SkSndNxt[S] Then
+    Begin
+      TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+      Exit;
+    End;
+    SkSndUna[S] := Ack;
+    SkState[S] := tcEstab;
+    St := tcEstab;
+    SkRetx[S] := 0; SkTries[S] := 0; SkRto[S] := 500;
+    If SkParent[S] >= 0 Then NetNotify(SkParent[S], FD_ACCEPT);
+  End;
+  { donnees et FIN confirmes }
+  A := Ack - SkSndUna[S];
+  Sent := SkSndNxt[S] - SkSndUna[S];
+  If (A > 0) And (A <= Sent) Then
+  Begin
+    FinAck := ((SkFlags[S] And sfFinSent) <> 0) And (A = Sent);
+    N := A;
+    If FinAck Then N := A - 1;
+    If N > SkTxLen[S] Then N := SkTxLen[S];
+    If N > 0 Then
+    Begin
+      MoveMem(SkTx[S] + N, SkTx[S], SkTxLen[S] - N);
+      SkTxLen[S] := SkTxLen[S] - N;
+    End;
+    SkSndUna[S] := Ack;
+    SkTries[S] := 0; SkRto[S] := 500;
+    If SkSndUna[S] = SkSndNxt[S] Then SkRetx[S] := 0
+    Else SkRetx[S] := Ticks + SkRto[S];
+    If N > 0 Then NetNotify(S, FD_WRITE);
+    If FinAck Then
+    Begin
+      If St = tcFinWait1 Then
+      Begin
+        SkState[S] := tcFinWait2;
+        St := tcFinWait2;
+        If (SkFlags[S] And sfAppClosed) <> 0 Then SkTimer[S] := Ticks + 30000;
+      End
+      Else If St = tcClosing Then
+      Begin
+        SkState[S] := tcTimeWait;
+        SkTimer[S] := Ticks + 2000;
+        Exit;
+      End
+      Else If St = tcLastAck Then
+      Begin
+        TcpClosed(S);
+        Exit;
+      End;
+    End;
+  End;
+  SkSndWnd[S] := Wnd;
+  { donnees recues }
+  If DLen > 0 Then
+  Begin
+    NeedAck := True;
+    If (St In [tcEstab, tcFinWait1, tcFinWait2]) And (Seq = SkRcvNxt[S])
+    Then
+    Begin
+      Free0 := SkRxSize - SkRxLen[S];
+      N := Min(DLen, Free0);
+      If N > 0 Then
+      Begin
+        RingPut(S, D, N);
+        SkRcvNxt[S] := SkRcvNxt[S] + N;
+        NetNotify(S, FD_READ);
+      End;
+      If N < DLen Then Fl := Fl And Not thFin;
+    End
+    Else Fl := Fl And Not thFin;
+  End;
+  { FIN du correspondant }
+  If ((Fl And thFin) <> 0) And (Seq + DLen = SkRcvNxt[S]) And
+     ((SkFlags[S] And sfFinRcvd) = 0) Then
+  Begin
+    SkRcvNxt[S] := SkRcvNxt[S] + 1;
+    SkFlags[S] := SkFlags[S] Or sfFinRcvd;
+    NeedAck := True;
+    If St = tcEstab Then SkState[S] := tcCloseWait
+    Else If St = tcFinWait1 Then SkState[S] := tcClosing
+    Else If St = tcFinWait2 Then
+    Begin
+      SkState[S] := tcTimeWait;
+      SkTimer[S] := Ticks + 2000;
+    End;
+    NetNotify(S, FD_READ);
+    NetNotify(S, FD_CLOSE);
+  End
+  Else If ((Fl And thFin) <> 0) And ((SkFlags[S] And sfFinRcvd) <> 0) Then
+    NeedAck := True;
+  If NeedAck Then TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+  TcpOutput(S);
+End;
+
+{ Minuteries : retransmission, TIME-WAIT }
+Procedure TcpTimers;
+Var S, St, N : LongInt;
+Begin
+  For S := 0 To MaxSock - 1 Do
+    If SkUsed[S] And (SkType[S] = 1) Then
+    Begin
+      St := SkState[S];
+      If (SkTimer[S] <> 0) And (Ticks >= SkTimer[S]) Then
+      Begin
+        SkTimer[S] := 0;
+        If (St In [tcTimeWait, tcFinWait2]) Or
+           ((SkFlags[S] And sfAppClosed) <> 0) Then
+        Begin
+          If St <> tcTimeWait Then
+            TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+          TcpClosed(S);
+          Continue;
+        End;
+      End;
+      If (SkRetx[S] <> 0) And (Ticks >= SkRetx[S]) Then
+      Begin
+        SkRetx[S] := 0;
+        Inc(SkTries[S]);
+        If (SkTries[S] > 8) Or ((St = tcSynSent) And (SkTries[S] > 3)) Then
+        Begin
+          SkErr[S] := 10060;                   { WSAETIMEDOUT }
+          TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+          TcpClosed(S);
+          Continue;
+        End;
+        SkRto[S] := Min(SkRto[S] * 2, 8000);
+        If St = tcSynSent Then
+          TcpSend(S, thSyn, SkSndUna[S], 0, 0)
+        Else If St = tcSynRcvd Then
+          TcpSend(S, thSyn Or thAck, SkSndUna[S], 0, 0)
+        Else
+        Begin
+          { reprendre a partir du plus ancien octet non confirme }
+          SkSndNxt[S] := SkSndUna[S];
+          SkFlags[S] := SkFlags[S] And Not sfFinSent;
+          If St = tcFinWait1 Then SkState[S] := tcEstab
+          Else If St = tcLastAck Then SkState[S] := tcCloseWait
+          Else If St = tcClosing Then SkState[S] := tcEstab;
+          If (SkSndWnd[S] = 0) And (SkTxLen[S] > 0) Then
+          Begin
+            { sonde de fenetre nulle : un octet }
+            TcpSend(S, thAck, SkSndNxt[S], 0, 1);
+            SkSndNxt[S] := SkSndNxt[S] + 1;
+          End
+          Else TcpOutput(S);
+          If St = tcClosing Then
+          Begin
+            If (SkFlags[S] And sfFinSent) <> 0 Then SkState[S] := tcClosing;
+          End;
+        End;
+        TcpArm(S);
+      End;
+    End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Sockets (communs a Winsock et aux outils de Pasdows)                 }
+{ ------------------------------------------------------------------ }
+
+Function SockAlloc(Typ : LongInt) : LongInt;
+Var I, S, HO : LongInt;
+Begin
+  S := -1;
+  For I := MaxSock - 1 DownTo 0 Do
+    If Not SkUsed[I] Then S := I;
+  SockAlloc := S;
+  If S < 0 Then Exit;
+  HO := HeapOwner;
+  HeapOwner := 0;
+  SkRx[S] := KAlloc(SkRxSize);
+  If Typ = 1 Then SkTx[S] := KAlloc(SkTxSize) Else SkTx[S] := 0;
+  HeapOwner := HO;
+  If (SkRx[S] = 0) Or ((Typ = 1) And (SkTx[S] = 0)) Then
+  Begin
+    SkUsed[S] := True;
+    SockFree(S);
+    SockAlloc := -1;
+    Exit;
+  End;
+  SkUsed[S] := True;
+  SkType[S] := Typ;
+  SkLPort[S] := 0; SkRIP[S] := 0; SkRPort[S] := 0;
+  SkState[S] := tcClosed; SkErr[S] := 0;
+  SkRxHead[S] := 0; SkRxLen[S] := 0; SkTxLen[S] := 0;
+  SkSndUna[S] := 0; SkSndNxt[S] := 0; SkRcvNxt[S] := 0; SkSndWnd[S] := 0;
+  SkRetx[S] := 0; SkRto[S] := 500; SkTries[S] := 0;
+  SkParent[S] := -1; SkBacklog[S] := 0;
+  SkFlags[S] := 0; SkAWnd[S] := 0; SkAMsg[S] := 0; SkAEv[S] := 0;
+  SkASent[S] := 0; SkTimer[S] := 0; SkLastWnd[S] := 0;
+End;
+
+Function PortUsed(Typ, Pt : LongInt) : Boolean;
+Var I : LongInt; R : Boolean;
+Begin
+  R := False;
+  For I := 0 To MaxSock - 1 Do
+    If SkUsed[I] And (SkType[I] = Typ) And (SkLPort[I] = Pt) And
+       ((SkFlags[I] And sfBound) <> 0) And (SkParent[I] < 0) Then R := True;
+  PortUsed := R;
+End;
+
+Function EphemeralPort(Typ : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  N := 0;
+  Repeat
+    Inc(NetPortNext);
+    If (NetPortNext < 1025) Or (NetPortNext > 5000) Then NetPortNext := 1025;
+    Inc(N);
+  Until Not PortUsed(Typ, NetPortNext) Or (N > 4000);
+  EphemeralPort := NetPortNext;
+End;
+
+{ Avis WSAAsyncSelect (une fois par evenement, rearme par l'appel
+  correspondant : recv, send, accept) }
+Procedure NetNotify(S, Ev : LongInt);
+Begin
+  If (S < 0) Or Not SkUsed[S] Then Exit;
+  If (SkAWnd[S] = 0) Or ((SkAEv[S] And Ev) = 0) Then Exit;
+  If (SkASent[S] And Ev) <> 0 Then Exit;
+  SkASent[S] := SkASent[S] Or Ev;
+  PostMessageA(SkAWnd[S], SkAMsg[S], SockBase + S, Ev);
+End;
+
+{ Fermer tous les sockets (fin du programme Win32) }
+Procedure NetAppExit;
+Var S : LongInt;
+Begin
+  For S := 0 To MaxSock - 1 Do
+    If SkUsed[S] Then
+    Begin
+      If (SkType[S] = 1) And Not (SkState[S] In [tcClosed, tcListen,
+         tcTimeWait]) Then TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+      SockFree(S);
+    End;
+  DnsBusy := False;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Scrutation                                                           }
+{ ------------------------------------------------------------------ }
+
+Procedure NetPoll;
+Var N, K, A : LongInt;
+Begin
+  If NetPolling Or (NetRx = 0) Then Exit;
+  NetPolling := True;
+  K := 0;
+  While (NicBase <> 0) And (K < 32) Do
+  Begin
+    N := NeRecv(NetRx);
+    If N = 0 Then Break;
+    If N > 0 Then EthInput(NetRx, N);
+    Inc(K);
+  End;
+  K := 0;
+  While (LoopN > 0) And (K < 16) Do
+  Begin
+    A := NetLoop + LoopHead * 1600;
+    LoopHead := (LoopHead + 1) Mod MaxLoop;
+    Dec(LoopN);
+    MoveMem(A + 4, NetLoopRx, MemL[0:A]);
+    IpInput(NetLoopRx, MemL[0:A]);
+    Inc(K);
+  End;
+  If Ticks - NetLastTick >= 10 Then
+  Begin
+    NetLastTick := Ticks;
+    DhcpTick;
+    TcpTimers;
+  End;
+  NetPolling := False;
+End;
+
+{ Attendre un peu en laissant tourner le reste du systeme }
+Procedure NetWait;
+Begin
+  NetPoll;
+  If CurT = 0 Then Idle Else KSleep(1);
+End;
+
+{ Attendre la configuration DHCP (au plus Ms millisecondes) }
+Function NetReady(Ms : LongInt) : Boolean;
+Var T : LongInt;
+Begin
+  T := Ticks;
+  While (NicBase <> 0) And (DhcpState <> 3) And (Ticks - T < Ms) Do
+    NetWait;
+  NetReady := DhcpState = 3;
+End;
+
+{ S'assurer que l'adresse Ethernet du prochain saut est connue }
+Function NetResolve(IP : LongInt) : Boolean;
+Var Hop, T, K : LongInt;
+Begin
+  NetResolve := True;
+  If IsLoop(IP) Then Exit;
+  NetResolve := False;
+  If NicBase = 0 Then Exit;
+  If Not NetReady(5000) Then Exit;
+  Hop := NextHop(IP);
+  NetResolve := True;
+  If (Hop = -1) Or (ArpFind(Hop) >= 0) Then Exit;
+  For K := 1 To 3 Do
+  Begin
+    ArpSend(1, 0, Hop);
+    T := Ticks;
+    While Ticks - T < 1000 Do
+    Begin
+      NetWait;
+      If ArpFind(Hop) >= 0 Then Exit;
+    End;
+  End;
+  NetResolve := False;
+End;
+
+{ Echo ICMP : True si reponse (Rtt en ms) }
+Function NetPing(IP, Size, Timeout : LongInt; Var Rtt : LongInt) : Boolean;
+Var T0, K : LongInt;
+Begin
+  NetPing := False;
+  Rtt := 0;
+  If Not NetResolve(IP) Then Exit;
+  If Size > 1024 Then Size := 1024;
+  Inc(PingSeq);
+  PingSeq := PingSeq And $FFFF;
+  PingGotAt := 0;
+  Mem[0:NetTx + 34] := 8; Mem[0:NetTx + 35] := 0;
+  NPutW(NetTx + 36, 0);
+  NPutW(NetTx + 38, PingId); NPutW(NetTx + 40, PingSeq);
+  If PingReq <> 0 Then MoveMem(PingReq, NetTx + 42, Size)
+  Else
+    For K := 0 To Size - 1 Do Mem[0:NetTx + 42 + K] := 97 + K Mod 23;
+  NPutW(NetTx + 36, (Not NetSum(NetTx + 34, Size + 8, 0)) And $FFFF);
+  T0 := Ticks;
+  IpSend(IP, 1, Size + 8);
+  While (PingGotAt = 0) And (Ticks - T0 < Timeout) Do NetWait;
+  If PingGotAt = 0 Then Exit;
+  Rtt := PingGotAt - T0;
+  NetPing := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DNS (resolveur)                                                      }
+{ ------------------------------------------------------------------ }
+
+Function DnsSkipName(P : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  Repeat
+    B := Mem[0:P];
+    If B = 0 Then
+    Begin
+      DnsSkipName := P + 1;
+      Exit;
+    End;
+    If (B And $C0) = $C0 Then
+    Begin
+      DnsSkipName := P + 2;
+      Exit;
+    End;
+    P := P + 1 + B;
+  Until False;
+End;
+
+Procedure DnsInput(P, Len : LongInt);
+Var QD, AN, I, Q, Typ, RL, E : LongInt;
+Begin
+  If (Len < 12) Or (NGetW(P) <> DnsId) Then Exit;
+  If (Mem[0:P + 3] And 15) <> 0 Then
+  Begin
+    DnsResult := -2;
+    Exit;
+  End;
+  QD := NGetW(P + 4); AN := NGetW(P + 6);
+  Q := P + 12; E := P + Len;
+  For I := 1 To QD Do Q := DnsSkipName(Q) + 4;
+  For I := 1 To AN Do
+  Begin
+    If Q >= E Then Break;
+    Q := DnsSkipName(Q);
+    Typ := NGetW(Q); RL := NGetW(Q + 8);
+    If (Typ = 1) And (RL = 4) And (NGetW(Q + 2) = 1) Then
+    Begin
+      DnsResult := MemL[0:Q + 10];
+      Exit;
+    End;
+    Q := Q + 10 + RL;
+  End;
+  DnsResult := -2;
+End;
+
+{ Nom -> adresse IP ; False si introuvable }
+Function NetLookup(Name : String; Var IP : LongInt) : Boolean;
+Var D, O, I, K, N, T, Try0 : LongInt; Lb : String; U : String;
+Begin
+  NetLookup := True;
+  If ParseIp(Name, IP) Then Exit;
+  U := UpStr(Name);
+  If (U = 'LOCALHOST') Or (U = '') Then
+  Begin
+    IP := $0100007F;
+    Exit;
+  End;
+  If (U = 'PASDOWS') And (NetIP <> 0) Then
+  Begin
+    IP := NetIP;
+    Exit;
+  End;
+  NetLookup := False;
+  If (NicBase = 0) Or DnsBusy Then Exit;
+  If Not NetReady(5000) Or (NetDns = 0) Then Exit;
+  If Not NetResolve(NetDns) Then Exit;
+  DnsBusy := True;
+  For Try0 := 1 To 3 Do
+  Begin
+    DnsId := (DnsId + 1) And $FFFF;
+    DnsPort := EphemeralPort(2);
+    D := NetTx + 42;
+    NPutW(D, DnsId); NPutW(D + 2, $0100);
+    NPutW(D + 4, 1); NPutW(D + 6, 0); NPutW(D + 8, 0); NPutW(D + 10, 0);
+    O := D + 12;
+    Lb := Name + '.';
+    K := 1;
+    For I := 1 To Length(Lb) Do
+      If Lb[I] = '.' Then
+      Begin
+        N := I - K;
+        If N > 0 Then
+        Begin
+          Mem[0:O] := N;
+          For T := 0 To N - 1 Do Mem[0:O + 1 + T] := Ord(Lb[K + T]);
+          O := O + 1 + N;
+        End;
+        K := I + 1;
+      End;
+    Mem[0:O] := 0;
+    NPutW(O + 1, 1); NPutW(O + 3, 1);
+    O := O + 5;
+    DnsResult := 0;
+    UdpOut(DnsPort, NetDns, 53, O - D);
+    T := Ticks;
+    While (DnsResult = 0) And (Ticks - T < 2000) Do NetWait;
+    If DnsResult <> 0 Then Break;
+  End;
+  DnsBusy := False;
+  If (DnsResult = 0) Or (DnsResult = -2) Then Exit;
+  IP := DnsResult;
+  NetLookup := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Demarrage                                                            }
+{ ------------------------------------------------------------------ }
+
+Procedure NetInit;
+Var I, HO : LongInt;
+Begin
+  HO := HeapOwner;
+  HeapOwner := 0;
+  NetRx := KAlloc(2048);
+  NetTx := KAlloc(2048);
+  NetAux := KAlloc(2048);
+  NetHdr := KAlloc(128);
+  NetLoop := KAlloc(MaxLoop * 1600);
+  NetLoopRx := KAlloc(1600);
+  WsBuf := KAlloc(512);
+  HeapOwner := HO;
+  For I := 0 To MaxSock - 1 Do SkUsed[I] := False;
+  For I := 0 To MaxArp - 1 Do ArpIP[I] := 0;
+  NetIpId := Ticks And $FFFF;
+  NetIss := Ticks * 7919;
+  NetPortNext := 1024 + Ticks Mod 1000;
+  PingId := $0200;
+  DnsId := Ticks And $FFFF;
+  NetMask := $00FFFFFF;
+  If Not NeProbe Then
+  Begin
+    KLog('Reseau : aucune carte NE2000 (TCP/IP en boucle locale seulement)');
+    Exit;
+  End;
+  If NicPci Then
+    KLog('Reseau : carte NE2000 PCI (RTL8029) en ' + HexStr(NicBase, 4) +
+         'h, adresse ' + MacStr)
+  Else
+    KLog('Reseau : carte NE2000 ISA en ' + HexStr(NicBase, 4) +
+         'h, adresse ' + MacStr);
+  DhcpXid := (NicMac[3] Shl 24) Or (NicMac[4] Shl 16) Or (NicMac[5] Shl 8) Or
+             (Ticks And $FF);
+  DhcpState := 1;
+  DhcpTries := 0;
+  DhcpNext := Ticks;
+End;
+{ ==================================================================== }
+{ Partie 16b - Winsock 1.1 (WSOCK32.DLL, WS2_32.DLL), ICMP.DLL et       }
+{              outils TCP/IP de Pasdows (ping, winipcfg)               }
+{ ==================================================================== }
+
+{ Les fonctions Winsock sont ecrites WS_nom : ResolveImport et
+  GetProcAddress ajoutent le prefixe pour les DLL Winsock (importations
+  par nom ou par ordinal), ce qui evite les conflits avec les noms du
+  noyau (send, select, connect...). }
+
+Var
+  WsaErr     : LongInt;
+  WsAsyncN   : LongInt;
+
+Const
+  FIONBIO = LongInt($8004667E);
+  FIONREAD = $4004667F;
+  SIOCATMARK = $40047307;
+
+{ Nom Winsock d'un ordinal de WSOCK32.DLL / WS2_32.DLL }
+Function WsOrdName(N : LongInt) : String;
+Var S : String;
+Begin
+  S := '';
+  Case N Of
+    1 : S := 'accept'; 2 : S := 'bind'; 3 : S := 'closesocket';
+    4 : S := 'connect'; 5 : S := 'getpeername'; 6 : S := 'getsockname';
+    7 : S := 'getsockopt'; 8 : S := 'htonl'; 9 : S := 'htons';
+    10 : S := 'inet_addr'; 11 : S := 'inet_ntoa'; 12 : S := 'ioctlsocket';
+    13 : S := 'listen'; 14 : S := 'ntohl'; 15 : S := 'ntohs';
+    16 : S := 'recv'; 17 : S := 'recvfrom'; 18 : S := 'select';
+    19 : S := 'send'; 20 : S := 'sendto'; 21 : S := 'setsockopt';
+    22 : S := 'shutdown'; 23 : S := 'socket';
+    51 : S := 'gethostbyaddr'; 52 : S := 'gethostbyname';
+    53 : S := 'getprotobyname'; 54 : S := 'getprotobynumber';
+    55 : S := 'getservbyname'; 56 : S := 'getservbyport';
+    57 : S := 'gethostname';
+    101 : S := 'WSAAsyncSelect'; 102 : S := 'WSAAsyncGetHostByAddr';
+    103 : S := 'WSAAsyncGetHostByName'; 104 : S := 'WSAAsyncGetProtoByNumber';
+    105 : S := 'WSAAsyncGetProtoByName'; 106 : S := 'WSAAsyncGetServByPort';
+    107 : S := 'WSAAsyncGetServByName'; 108 : S := 'WSACancelAsyncRequest';
+    109 : S := 'WSASetBlockingHook'; 110 : S := 'WSAUnhookBlockingHook';
+    111 : S := 'WSAGetLastError'; 112 : S := 'WSASetLastError';
+    113 : S := 'WSACancelBlockingCall'; 114 : S := 'WSAIsBlocking';
+    115 : S := 'WSAStartup'; 116 : S := 'WSACleanup';
+    151 : S := '__WSAFDIsSet'; 1107 : S := 'WSARecvEx';
+  End;
+  WsOrdName := S;
+End;
+
+Function IsWsDll(Dll : String) : Boolean;
+Begin
+  Dll := UpStr(BaseName(Dll));
+  IsWsDll := (Dll = 'WSOCK32.DLL') Or (Dll = 'WS2_32.DLL') Or
+             (Dll = 'WSOCK32') Or (Dll = 'WS2_32');
+End;
+
+Function WsSock(H : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := H - SockBase;
+  If (S < 0) Or (S >= MaxSock) Then S := -1
+  Else If Not SkUsed[S] Or ((SkFlags[S] And sfAppClosed) <> 0) Then S := -1;
+  If S < 0 Then WsaErr := 10038;                   { WSAENOTSOCK }
+  WsSock := S;
+End;
+
+Function WsFail(E : LongInt) : LongInt;
+Begin
+  WsaErr := E;
+  WsFail := -1;
+End;
+
+Procedure WsAutoBind(S : LongInt);
+Begin
+  If (SkFlags[S] And sfBound) <> 0 Then Exit;
+  SkLPort[S] := EphemeralPort(SkType[S]);
+  SkFlags[S] := SkFlags[S] Or sfBound;
+End;
+
+{ sockaddr_in : famille, port (ordre du reseau), adresse }
+Procedure WsPutAddr(A, LenP, IP, Pt : LongInt);
+Begin
+  If A = 0 Then Exit;
+  If LenP <> 0 Then
+    If MemL[0:LenP] < 16 Then Exit;
+  FillMem(A, 16, 0);
+  MemW[0:A] := 2;
+  MemW[0:A + 2] := Swap16(Pt);
+  MemL[0:A + 4] := IP;
+  If LenP <> 0 Then MemL[0:LenP] := 16;
+End;
+
+Function WS_WSAStartup(Ver, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    FillMem(P, 400, 0);
+    If (Ver And $FF) >= 2 Then MemW[0:P] := $0202
+    Else MemW[0:P] := Ver And $FFFF;
+    MemW[0:P + 2] := $0202;
+    PutPStr(P + 4, 'Pasdows 95 TCP/IP (Winsock 1.1)', 256);
+    PutPStr(P + 261, 'Running', 128);
+    MemW[0:P + 390] := MaxSock;
+    MemW[0:P + 392] := 1472;
+  End;
+  WS_WSAStartup := 0;
+End;
+
+Function WS_WSACleanup : LongInt;
+Begin
+  WS_WSACleanup := 0;
+End;
+
+Function WS_WSAGetLastError : LongInt;
+Begin
+  WS_WSAGetLastError := WsaErr;
+End;
+
+Procedure WS_WSASetLastError(E : LongInt);
+Begin
+  WsaErr := E;
+End;
+
+Function WS_socket(Af, Typ, Proto : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_socket := -1;
+  If Af <> 2 Then
+  Begin
+    WsaErr := 10047;                              { WSAEAFNOSUPPORT }
+    Exit;
+  End;
+  If (Typ <> 1) And (Typ <> 2) Then
+  Begin
+    WsaErr := 10044;                              { WSAESOCKTNOSUPPORT }
+    Exit;
+  End;
+  S := SockAlloc(Typ);
+  If S < 0 Then
+  Begin
+    WsaErr := 10024;                              { WSAEMFILE }
+    Exit;
+  End;
+  WS_socket := SockBase + S;
+End;
+
+Function WS_closesocket(H : LongInt) : LongInt;
+Var S, I : LongInt;
+Begin
+  WS_closesocket := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  WS_closesocket := 0;
+  SkAWnd[S] := 0;
+  If SkType[S] = 2 Then
+  Begin
+    SockFree(S);
+    Exit;
+  End;
+  Case SkState[S] Of
+    tcListen :
+    Begin
+      For I := 0 To MaxSock - 1 Do
+        If SkUsed[I] And (SkParent[I] = S) And
+           ((SkFlags[I] And sfAccepted) = 0) Then
+        Begin
+          If SkState[I] <> tcClosed Then
+            TcpSend(I, thRst Or thAck, SkSndNxt[I], 0, 0);
+          SockFree(I);
+        End;
+      SockFree(S);
+    End;
+    tcClosed, tcSynSent : SockFree(S);
+    tcSynRcvd :
+    Begin
+      TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+      SockFree(S);
+    End;
+    tcEstab, tcCloseWait :
+    Begin
+      SkFlags[S] := SkFlags[S] Or sfFinWant Or sfAppClosed;
+      SkTimer[S] := Ticks + 60000;
+      TcpOutput(S);
+    End;
+  Else
+    SkFlags[S] := SkFlags[S] Or sfAppClosed;
+  End;
+End;
+
+Function WS_bind(H, A, Len : LongInt) : LongInt;
+Var S, Pt : LongInt;
+Begin
+  WS_bind := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (A = 0) Or (Len < 8) Then
+  Begin
+    WsaErr := 10014;                              { WSAEFAULT }
+    Exit;
+  End;
+  If (SkFlags[S] And sfBound) <> 0 Then
+  Begin
+    WsaErr := 10022;                              { WSAEINVAL }
+    Exit;
+  End;
+  Pt := Swap16(MemW[0:A + 2]);
+  If Pt = 0 Then Pt := EphemeralPort(SkType[S])
+  Else If PortUsed(SkType[S], Pt) Then
+  Begin
+    WsaErr := 10048;                              { WSAEADDRINUSE }
+    Exit;
+  End;
+  SkLPort[S] := Pt;
+  SkFlags[S] := SkFlags[S] Or sfBound;
+  WS_bind := 0;
+End;
+
+Function WS_listen(H, Bl : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_listen := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] <> 1 Then
+  Begin
+    WsaErr := 10045;                              { WSAEOPNOTSUPP }
+    Exit;
+  End;
+  If Not (SkState[S] In [tcClosed, tcListen]) Then
+  Begin
+    WsaErr := 10056;                              { WSAEISCONN }
+    Exit;
+  End;
+  WsAutoBind(S);
+  SkState[S] := tcListen;
+  If (Bl < 1) Or (Bl > 5) Then Bl := 5;
+  SkBacklog[S] := Bl;
+  WS_listen := 0;
+End;
+
+Function WsPending(S : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := -1;
+  For I := MaxSock - 1 DownTo 0 Do
+    If SkUsed[I] And (SkParent[I] = S) And
+       ((SkFlags[I] And sfAccepted) = 0) And
+       (SkState[I] In [tcEstab, tcCloseWait]) Then R := I;
+  WsPending := R;
+End;
+
+Function WS_accept(H, A, LenP : LongInt) : LongInt;
+Var S, C : LongInt;
+Begin
+  WS_accept := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkState[S] <> tcListen Then
+  Begin
+    WsaErr := 10022;
+    Exit;
+  End;
+  Repeat
+    NetPoll;
+    C := WsPending(S);
+    If C >= 0 Then Break;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      SkASent[S] := SkASent[S] And Not FD_ACCEPT;
+      WsaErr := 10035;                            { WSAEWOULDBLOCK }
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Or (SkState[S] <> tcListen) Then
+    Begin
+      WsaErr := 10004;                            { WSAEINTR }
+      Exit;
+    End;
+  Until False;
+  SkFlags[C] := SkFlags[C] Or sfAccepted;
+  WsPutAddr(A, LenP, SkRIP[C], SkRPort[C]);
+  SkASent[S] := SkASent[S] And Not FD_ACCEPT;
+  If WsPending(S) >= 0 Then NetNotify(S, FD_ACCEPT);
+  If SkRxLen[C] > 0 Then NetNotify(C, FD_READ);
+  NetNotify(C, FD_WRITE);
+  WS_accept := SockBase + C;
+End;
+
+Function WS_connect(H, A, Len : LongInt) : LongInt;
+Var S, IP, Pt : LongInt;
+Begin
+  WS_connect := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (A = 0) Or (Len < 8) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  IP := MemL[0:A + 4];
+  Pt := Swap16(MemW[0:A + 2]);
+  If SkType[S] = 2 Then
+  Begin
+    WsAutoBind(S);
+    SkRIP[S] := IP; SkRPort[S] := Pt;
+    If IP = 0 Then SkFlags[S] := SkFlags[S] And Not sfUdpConn
+    Else SkFlags[S] := SkFlags[S] Or sfUdpConn;
+    WS_connect := 0;
+    Exit;
+  End;
+  If SkState[S] = tcSynSent Then
+  Begin
+    WsaErr := 10037;                              { WSAEALREADY }
+    Exit;
+  End;
+  If SkState[S] <> tcClosed Then
+  Begin
+    WsaErr := 10056;
+    Exit;
+  End;
+  If (IP = 0) Or (Pt = 0) Then
+  Begin
+    WsaErr := 10049;                              { WSAEADDRNOTAVAIL }
+    Exit;
+  End;
+  If Not NetResolve(IP) Then
+  Begin
+    If NicBase = 0 Then WsaErr := 10050           { WSAENETDOWN }
+    Else WsaErr := 10065;                         { WSAEHOSTUNREACH }
+    Exit;
+  End;
+  WsAutoBind(S);
+  SkRIP[S] := IP; SkRPort[S] := Pt; SkErr[S] := 0;
+  SkFlags[S] := SkFlags[S] And (sfNonBlock Or sfBound);
+  SkRxHead[S] := 0; SkRxLen[S] := 0; SkTxLen[S] := 0;
+  SkSndUna[S] := NewIss;
+  SkSndNxt[S] := SkSndUna[S] + 1;
+  SkState[S] := tcSynSent;
+  SkRto[S] := 1000; SkTries[S] := 0; SkRetx[S] := 0;
+  TcpSend(S, thSyn, SkSndUna[S], 0, 0);
+  TcpArm(S);
+  If (SkFlags[S] And sfNonBlock) <> 0 Then
+  Begin
+    WsaErr := 10035;
+    Exit;
+  End;
+  While SkState[S] = tcSynSent Do NetWait;
+  If SkState[S] In [tcEstab, tcCloseWait] Then WS_connect := 0
+  Else
+  Begin
+    WsaErr := SkErr[S];
+    If WsaErr = 0 Then WsaErr := 10061;
+  End;
+End;
+
+Function WS_sendto(H, Buf, Len, Fl, ToA, ToLen : LongInt) : LongInt;
+  Forward;
+Function WS_recvfrom(H, Buf, Len, Fl, FromA, FromLenP : LongInt) : LongInt;
+  Forward;
+
+Function WS_send(H, Buf, Len, Fl : LongInt) : LongInt;
+Var S, N, Done : LongInt;
+Begin
+  WS_send := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 2 Then
+  Begin
+    WS_send := WS_sendto(H, Buf, Len, Fl, 0, 0);
+    Exit;
+  End;
+  Done := 0;
+  Repeat
+    If SkErr[S] <> 0 Then
+    Begin
+      WsaErr := SkErr[S];
+      If Done > 0 Then WS_send := Done;
+      Exit;
+    End;
+    If Not (SkState[S] In [tcEstab, tcCloseWait]) Then
+    Begin
+      WsaErr := 10057;                            { WSAENOTCONN }
+      If Done > 0 Then WS_send := Done;
+      Exit;
+    End;
+    If (SkFlags[S] And sfFinWant) <> 0 Then
+    Begin
+      WsaErr := 10058;                            { WSAESHUTDOWN }
+      Exit;
+    End;
+    N := Min(Len - Done, SkTxSize - SkTxLen[S]);
+    If N > 0 Then
+    Begin
+      MoveMem(Buf + Done, SkTx[S] + SkTxLen[S], N);
+      SkTxLen[S] := SkTxLen[S] + N;
+      Done := Done + N;
+      TcpOutput(S);
+    End;
+    If Done >= Len Then Break;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      If Done > 0 Then Break;
+      SkASent[S] := SkASent[S] And Not FD_WRITE;
+      WsaErr := 10035;
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Then Exit;
+  Until False;
+  WS_send := Done;
+End;
+
+Function WS_recv(H, Buf, Len, Fl : LongInt) : LongInt;
+Var S, N : LongInt;
+Begin
+  WS_recv := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 2 Then
+  Begin
+    WS_recv := WS_recvfrom(H, Buf, Len, Fl, 0, 0);
+    Exit;
+  End;
+  Repeat
+    NetPoll;
+    If (SkRxLen[S] > 0) And (Len > 0) Then
+    Begin
+      N := Min(Len, SkRxLen[S]);
+      RingGet(S, Buf, N, (Fl And 2) <> 0);
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      If SkRxLen[S] > 0 Then NetNotify(S, FD_READ);
+      { fenetre rouverte : le dire au correspondant }
+      If (SkState[S] In [tcEstab, tcFinWait1, tcFinWait2]) And
+         (SkWnd(S) - SkLastWnd[S] >= 2 * NetMss) Then
+        TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+      WS_recv := N;
+      Exit;
+    End;
+    If (SkFlags[S] And sfFinRcvd) <> 0 Then
+    Begin
+      WS_recv := 0;
+      Exit;
+    End;
+    If SkErr[S] <> 0 Then
+    Begin
+      WsaErr := SkErr[S];
+      Exit;
+    End;
+    If Not (SkState[S] In [tcSynSent, tcSynRcvd, tcEstab, tcFinWait1,
+                           tcFinWait2]) Then
+    Begin
+      If SkState[S] = tcClosed Then WsaErr := 10057
+      Else WsaErr := 10022;
+      Exit;
+    End;
+    If Len <= 0 Then
+    Begin
+      WS_recv := 0;
+      Exit;
+    End;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      WsaErr := 10035;
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Then Exit;
+  Until False;
+End;
+
+Function WS_sendto(H, Buf, Len, Fl, ToA, ToLen : LongInt) : LongInt;
+Var S, IP, Pt : LongInt;
+Begin
+  WS_sendto := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 1 Then
+  Begin
+    WS_sendto := WS_send(H, Buf, Len, Fl);
+    Exit;
+  End;
+  If ToA <> 0 Then
+  Begin
+    If ToLen < 8 Then
+    Begin
+      WsaErr := 10014;
+      Exit;
+    End;
+    IP := MemL[0:ToA + 4];
+    Pt := Swap16(MemW[0:ToA + 2]);
+  End
+  Else If (SkFlags[S] And sfUdpConn) <> 0 Then
+  Begin
+    IP := SkRIP[S]; Pt := SkRPort[S];
+  End
+  Else
+  Begin
+    WsaErr := 10039;                              { WSAEDESTADDRREQ }
+    Exit;
+  End;
+  If (Len < 0) Or (Len > 1472) Then
+  Begin
+    WsaErr := 10040;                              { WSAEMSGSIZE }
+    Exit;
+  End;
+  If (IP = 0) Or (Pt = 0) Then
+  Begin
+    WsaErr := 10049;
+    Exit;
+  End;
+  If Not NetResolve(IP) Then
+  Begin
+    If NicBase = 0 Then WsaErr := 10050 Else WsaErr := 10065;
+    Exit;
+  End;
+  WsAutoBind(S);
+  If Len > 0 Then MoveMem(Buf, NetTx + 42, Len);
+  UdpOut(SkLPort[S], IP, Pt, Len);
+  WS_sendto := Len;
+End;
+
+Function WS_recvfrom(H, Buf, Len, Fl, FromA, FromLenP : LongInt) : LongInt;
+Var S, N, DL, IP, Pt, OH, OL, R : LongInt;
+Begin
+  WS_recvfrom := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 1 Then
+  Begin
+    R := WS_recv(H, Buf, Len, Fl);
+    If R >= 0 Then WsPutAddr(FromA, FromLenP, SkRIP[S], SkRPort[S]);
+    WS_recvfrom := R;
+    Exit;
+  End;
+  Repeat
+    NetPoll;
+    If SkRxLen[S] >= 12 Then
+    Begin
+      OH := SkRxHead[S]; OL := SkRxLen[S];
+      RingGet(S, NetHdr + 32, 12, False);
+      DL := MemL[0:NetHdr + 32];
+      IP := MemL[0:NetHdr + 36];
+      Pt := MemL[0:NetHdr + 40];
+      N := Min(Len, DL);
+      If N > 0 Then RingGet(S, Buf, N, False);
+      If DL > N Then RingGet(S, 0, DL - N, False);
+      If (Fl And 2) <> 0 Then
+      Begin
+        SkRxHead[S] := OH; SkRxLen[S] := OL;
+      End;
+      WsPutAddr(FromA, FromLenP, IP, Pt);
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      If SkRxLen[S] > 0 Then NetNotify(S, FD_READ);
+      If DL > Len Then WsaErr := 10040 Else WS_recvfrom := N;
+      Exit;
+    End;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      WsaErr := 10035;
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Then Exit;
+  Until False;
+End;
+
+Function WS_shutdown(H, How : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_shutdown := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (SkType[S] = 1) And ((How = 1) Or (How = 2)) Then
+  Begin
+    SkFlags[S] := SkFlags[S] Or sfFinWant;
+    TcpOutput(S);
+  End;
+  WS_shutdown := 0;
+End;
+
+Function WS_ioctlsocket(H, Cmd, Arg : LongInt) : LongInt;
+Var S, N : LongInt;
+Begin
+  WS_ioctlsocket := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If Arg = 0 Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  NetPoll;
+  If Cmd = FIONBIO Then
+  Begin
+    If MemL[0:Arg] <> 0 Then SkFlags[S] := SkFlags[S] Or sfNonBlock
+    Else SkFlags[S] := SkFlags[S] And Not sfNonBlock;
+  End
+  Else If Cmd = FIONREAD Then
+  Begin
+    N := SkRxLen[S];
+    If SkType[S] = 2 Then
+    Begin
+      If N >= 12 Then
+      Begin
+        RingGet(S, NetHdr + 32, 4, True);
+        N := MemL[0:NetHdr + 32];
+      End
+      Else N := 0;
+    End;
+    MemL[0:Arg] := N;
+  End
+  Else If Cmd = SIOCATMARK Then MemL[0:Arg] := 1
+  Else
+  Begin
+    WsaErr := 10022;
+    Exit;
+  End;
+  WS_ioctlsocket := 0;
+End;
+
+Function WS_setsockopt(H, Lvl, Opt, Val, Len : LongInt) : LongInt;
+Begin
+  WS_setsockopt := -1;
+  If WsSock(H) < 0 Then Exit;
+  WS_setsockopt := 0;
+End;
+
+Function WS_getsockopt(H, Lvl, Opt, Val, LenP : LongInt) : LongInt;
+Var S, V : LongInt;
+Begin
+  WS_getsockopt := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (Val = 0) Or (LenP = 0) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  V := 0;
+  If Lvl = $FFFF Then
+    Case Opt Of
+      $1007 :
+      Begin
+        V := SkErr[S];
+        SkErr[S] := 0;
+      End;
+      $1008 : V := SkType[S];
+      $1001 : V := SkTxSize;
+      $1002 : V := SkRxSize;
+      2 : V := Ord(SkState[S] = tcListen);
+    End;
+  If MemL[0:LenP] >= 4 Then
+  Begin
+    MemL[0:Val] := V;
+    MemL[0:LenP] := 4;
+  End
+  Else If MemL[0:LenP] >= 1 Then Mem[0:Val] := V;
+  WS_getsockopt := 0;
+End;
+
+Function WS_getpeername(H, A, LenP : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_getpeername := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If ((SkType[S] = 1) And Not (SkState[S] In [tcEstab, tcCloseWait,
+     tcFinWait1, tcFinWait2])) Or
+     ((SkType[S] = 2) And ((SkFlags[S] And sfUdpConn) = 0)) Then
+  Begin
+    WsaErr := 10057;
+    Exit;
+  End;
+  WsPutAddr(A, LenP, SkRIP[S], SkRPort[S]);
+  WS_getpeername := 0;
+End;
+
+Function WS_getsockname(H, A, LenP : LongInt) : LongInt;
+Var S, IP : LongInt;
+Begin
+  WS_getsockname := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (SkFlags[S] And sfBound) = 0 Then
+  Begin
+    WsaErr := 10022;
+    Exit;
+  End;
+  IP := 0;
+  If (SkType[S] = 1) And (SkState[S] <> tcListen) And
+     (SkState[S] <> tcClosed) Then
+  Begin
+    If IsLoop(SkRIP[S]) Then IP := SkRIP[S] Else IP := NetIP;
+  End;
+  WsPutAddr(A, LenP, IP, SkLPort[S]);
+  WS_getsockname := 0;
+End;
+
+Function WS_htons(V : LongInt) : LongInt;
+Begin
+  WS_htons := Swap16(V);
+End;
+
+Function WS_ntohs(V : LongInt) : LongInt;
+Begin
+  WS_ntohs := Swap16(V);
+End;
+
+Function WS_htonl(V : LongInt) : LongInt;
+Begin
+  WS_htonl := Swap32(V);
+End;
+
+Function WS_ntohl(V : LongInt) : LongInt;
+Begin
+  WS_ntohl := Swap32(V);
+End;
+
+Function WS_inet_addr(P : LongInt) : LongInt;
+Var IP : LongInt;
+Begin
+  If (P <> 0) And ParseIp(Trim(PStr(P)), IP) Then WS_inet_addr := IP
+  Else WS_inet_addr := -1;
+End;
+
+Function WS_inet_ntoa(IP : LongInt) : LongInt;
+Begin
+  PutPStr(WsBuf + 288, IpStr(IP), 31);
+  WS_inet_ntoa := WsBuf + 288;
+End;
+
+{ hostent en B : nom, alias (aucun), AF_INET, 4 octets, une adresse }
+Function WsMakeHost(B : LongInt; Const Nm : String; IP : LongInt)
+  : LongInt;
+Begin
+  MemL[0:B] := B + 32; MemL[0:B + 4] := B + 16;
+  MemW[0:B + 8] := 2; MemW[0:B + 10] := 4;
+  MemL[0:B + 12] := B + 20;
+  MemL[0:B + 16] := 0;
+  MemL[0:B + 20] := B + 28; MemL[0:B + 24] := 0;
+  MemL[0:B + 28] := IP;
+  PutPStr(B + 32, Nm, 255);
+  WsMakeHost := 33 + Length(Nm);
+End;
+
+Function WS_gethostbyname(P : LongInt) : LongInt;
+Var Nm : String; IP : LongInt;
+Begin
+  WS_gethostbyname := 0;
+  If P = 0 Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  Nm := Trim(PStr(P));
+  If Not NetLookup(Nm, IP) Then
+  Begin
+    WsaErr := 11001;                              { WSAHOST_NOT_FOUND }
+    Exit;
+  End;
+  WsMakeHost(WsBuf, Nm, IP);
+  WS_gethostbyname := WsBuf;
+End;
+
+Function WsAddrName(IP : LongInt) : String;
+Begin
+  If (IP And $FF) = 127 Then WsAddrName := 'localhost'
+  Else If (IP = NetIP) And (IP <> 0) Then WsAddrName := 'pasdows'
+  Else WsAddrName := IpStr(IP);
+End;
+
+Function WS_gethostbyaddr(A, Len, Typ : LongInt) : LongInt;
+Var IP : LongInt;
+Begin
+  WS_gethostbyaddr := 0;
+  If (A = 0) Or (Len < 4) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  IP := MemL[0:A];
+  WsMakeHost(WsBuf, WsAddrName(IP), IP);
+  WS_gethostbyaddr := WsBuf;
+End;
+
+Function WS_gethostname(Buf, Len : LongInt) : LongInt;
+Begin
+  WS_gethostname := -1;
+  If (Buf = 0) Or (Len < 8) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  PutPStr(Buf, 'pasdows', Len);
+  WS_gethostname := 0;
+End;
+
+{ Services connus (etc\services) }
+Function WsServ(I : LongInt; Var Pt : LongInt) : String;
+Var S : String;
+Begin
+  S := ''; Pt := 0;
+  Case I Of
+    0 : Begin S := 'echo'; Pt := 7 End;
+    1 : Begin S := 'discard'; Pt := 9 End;
+    2 : Begin S := 'daytime'; Pt := 13 End;
+    3 : Begin S := 'ftp-data'; Pt := 20 End;
+    4 : Begin S := 'ftp'; Pt := 21 End;
+    5 : Begin S := 'telnet'; Pt := 23 End;
+    6 : Begin S := 'smtp'; Pt := 25 End;
+    7 : Begin S := 'time'; Pt := 37 End;
+    8 : Begin S := 'domain'; Pt := 53 End;
+    9 : Begin S := 'gopher'; Pt := 70 End;
+    10 : Begin S := 'finger'; Pt := 79 End;
+    11 : Begin S := 'http'; Pt := 80 End;
+    12 : Begin S := 'www'; Pt := 80 End;
+    13 : Begin S := 'pop3'; Pt := 110 End;
+    14 : Begin S := 'nntp'; Pt := 119 End;
+    15 : Begin S := 'ntp'; Pt := 123 End;
+    16 : Begin S := 'irc'; Pt := 194 End;
+  End;
+  WsServ := S;
+End;
+
+{ servent en B (16 octets + chaines) }
+Function WsMakeServ(B : LongInt; Const Nm, Pr : String; Pt : LongInt)
+  : LongInt;
+Begin
+  MemL[0:B] := B + 24; MemL[0:B + 4] := B + 16;
+  MemW[0:B + 8] := Swap16(Pt); MemW[0:B + 10] := 0;
+  MemL[0:B + 12] := B + 56;
+  MemL[0:B + 16] := 0;
+  PutPStr(B + 24, Nm, 31);
+  PutPStr(B + 56, Pr, 15);
+  WsMakeServ := 72;
+End;
+
+Function WsFindServ(Nm : String; Pt : LongInt; Var RNm : String;
+                    Var RPt : LongInt) : Boolean;
+Var I, P : LongInt; S : String;
+Begin
+  WsFindServ := False;
+  Nm := UpStr(Nm);
+  For I := 0 To 16 Do
+  Begin
+    S := WsServ(I, P);
+    If ((Nm <> '') And (UpStr(S) = Nm)) Or ((Nm = '') And (P = Pt)) Then
+    Begin
+      RNm := S; RPt := P;
+      WsFindServ := True;
+      Exit;
+    End;
+  End;
+End;
+
+Function WsProtoStr(P : LongInt) : String;
+Begin
+  If P = 0 Then WsProtoStr := 'tcp' Else WsProtoStr := PStr(P);
+End;
+
+Function WS_getservbyname(NmP, PrP : LongInt) : LongInt;
+Var S : String; Pt : LongInt;
+Begin
+  WS_getservbyname := 0;
+  If (NmP = 0) Or Not WsFindServ(PStr(NmP), 0, S, Pt) Then
+  Begin
+    WsaErr := 11004;                              { WSANO_DATA }
+    Exit;
+  End;
+  WsMakeServ(WsBuf + 320, S, WsProtoStr(PrP), Pt);
+  WS_getservbyname := WsBuf + 320;
+End;
+
+Function WS_getservbyport(Pt, PrP : LongInt) : LongInt;
+Var S : String; P : LongInt;
+Begin
+  WS_getservbyport := 0;
+  If Not WsFindServ('', Swap16(Pt), S, P) Then
+  Begin
+    WsaErr := 11004;
+    Exit;
+  End;
+  WsMakeServ(WsBuf + 320, S, WsProtoStr(PrP), P);
+  WS_getservbyport := WsBuf + 320;
+End;
+
+Function WsProtoNum(Nm : String) : LongInt;
+Begin
+  Nm := UpStr(Nm);
+  If Nm = 'IP' Then WsProtoNum := 0
+  Else If Nm = 'ICMP' Then WsProtoNum := 1
+  Else If Nm = 'TCP' Then WsProtoNum := 6
+  Else If Nm = 'UDP' Then WsProtoNum := 17
+  Else WsProtoNum := -1;
+End;
+
+Function WsMakeProto(N : LongInt) : LongInt;
+Var B : LongInt; S : String;
+Begin
+  WsMakeProto := 0;
+  Case N Of
+    0 : S := 'ip';
+    1 : S := 'icmp';
+    6 : S := 'tcp';
+    17 : S := 'udp';
+  Else
+    WsaErr := 11004;
+    Exit;
+  End;
+  B := WsBuf + 400;
+  MemL[0:B] := B + 16; MemL[0:B + 4] := B + 12;
+  MemW[0:B + 8] := N; MemW[0:B + 10] := 0;
+  MemL[0:B + 12] := 0;
+  PutPStr(B + 16, S, 15);
+  WsMakeProto := B;
+End;
+
+Function WS_getprotobyname(P : LongInt) : LongInt;
+Begin
+  If P = 0 Then WS_getprotobyname := 0
+  Else WS_getprotobyname := WsMakeProto(WsProtoNum(PStr(P)));
+End;
+
+Function WS_getprotobynumber(N : LongInt) : LongInt;
+Begin
+  WS_getprotobynumber := WsMakeProto(N);
+End;
+
+{ select : etat d'un socket (0 lecture, 1 ecriture, 2 exception) }
+Function WsReady(S, Kind : LongInt) : Boolean;
+Var R : Boolean;
+Begin
+  R := False;
+  If SkType[S] = 2 Then
+  Begin
+    If Kind = 0 Then R := SkRxLen[S] > 0
+    Else If Kind = 1 Then R := True;
+  End
+  Else If Kind = 0 Then
+  Begin
+    If SkState[S] = tcListen Then R := WsPending(S) >= 0
+    Else R := (SkRxLen[S] > 0) Or ((SkFlags[S] And sfFinRcvd) <> 0) Or
+              (SkErr[S] <> 0);
+  End
+  Else If Kind = 1 Then
+    R := (SkState[S] In [tcEstab, tcCloseWait]) And (SkTxLen[S] < SkTxSize)
+  Else
+    R := (SkState[S] = tcClosed) And (SkErr[S] <> 0);
+  WsReady := R;
+End;
+
+Function WsSelCount(P, Kind : LongInt; Var Bad : Boolean) : LongInt;
+Var I, N, S, C : LongInt;
+Begin
+  C := 0;
+  If P <> 0 Then
+  Begin
+    N := Min(MemL[0:P], 64);
+    For I := 0 To N - 1 Do
+    Begin
+      S := MemL[0:P + 4 + I * 4] - SockBase;
+      If (S < 0) Or (S >= MaxSock) Then Bad := True
+      Else If Not SkUsed[S] Then Bad := True
+      Else If WsReady(S, Kind) Then Inc(C);
+    End;
+  End;
+  WsSelCount := C;
+End;
+
+Procedure WsSelFilter(P, Kind : LongInt);
+Var I, N, K, H : LongInt;
+Begin
+  If P = 0 Then Exit;
+  N := Min(MemL[0:P], 64);
+  K := 0;
+  For I := 0 To N - 1 Do
+  Begin
+    H := MemL[0:P + 4 + I * 4];
+    If WsReady(H - SockBase, Kind) Then
+    Begin
+      MemL[0:P + 4 + K * 4] := H;
+      Inc(K);
+    End;
+  End;
+  MemL[0:P] := K;
+End;
+
+Function WS_select(N, R, W, E, Tv : LongInt) : LongInt;
+Var T0, Ms, C : LongInt; Bad : Boolean;
+Begin
+  WS_select := -1;
+  If Tv = 0 Then Ms := -1
+  Else Ms := MemL[0:Tv] * 1000 + MemL[0:Tv + 4] Div 1000;
+  T0 := Ticks;
+  Repeat
+    NetPoll;
+    Bad := False;
+    C := WsSelCount(R, 0, Bad) + WsSelCount(W, 1, Bad) +
+         WsSelCount(E, 2, Bad);
+    If Bad Then
+    Begin
+      WsaErr := 10038;
+      Exit;
+    End;
+    If (C > 0) Or ((Ms >= 0) And (Ticks - T0 >= Ms)) Then Break;
+    NetWait;
+  Until False;
+  WsSelFilter(R, 0);
+  WsSelFilter(W, 1);
+  WsSelFilter(E, 2);
+  WS_select := C;
+End;
+
+Function WS___WSAFDIsSet(H, P : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := 0;
+  If P <> 0 Then
+    For I := 0 To Min(MemL[0:P], 64) - 1 Do
+      If MemL[0:P + 4 + I * 4] = H Then R := 1;
+  WS___WSAFDIsSet := R;
+End;
+
+Function WS_WSAAsyncSelect(H, Wnd, Msg, Ev : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_WSAAsyncSelect := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  SkAWnd[S] := Wnd; SkAMsg[S] := Msg; SkAEv[S] := Ev;
+  SkASent[S] := 0;
+  If Ev = 0 Then SkAWnd[S] := 0;
+  SkFlags[S] := SkFlags[S] Or sfNonBlock;
+  WS_WSAAsyncSelect := 0;
+  If SkAWnd[S] = 0 Then Exit;
+  NetPoll;
+  If (SkType[S] = 1) And (SkState[S] = tcListen) Then
+  Begin
+    If WsPending(S) >= 0 Then NetNotify(S, FD_ACCEPT);
+  End
+  Else If WsReady(S, 0) Then NetNotify(S, FD_READ);
+  If WsReady(S, 1) Then NetNotify(S, FD_WRITE);
+  If (SkType[S] = 1) And ((SkFlags[S] And sfFinRcvd) <> 0) Then
+    NetNotify(S, FD_CLOSE);
+End;
+
+Function WS_WSAAsyncGetHostByName(Wnd, Msg, NmP, Buf, BufLen : LongInt)
+  : LongInt;
+Var Nm : String; IP, N : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetHostByName := WsAsyncN;
+  Nm := Trim(PStr(NmP));
+  If (Buf <> 0) And (BufLen >= 34 + Length(Nm)) And NetLookup(Nm, IP) Then
+  Begin
+    N := WsMakeHost(Buf, Nm, IP);
+    PostMessageA(Wnd, Msg, WsAsyncN, N);
+  End
+  Else PostMessageA(Wnd, Msg, WsAsyncN, LongInt(11001) Shl 16);
+End;
+
+Function WS_WSAAsyncGetHostByAddr(Wnd, Msg, A, Len, Typ, Buf, BufLen
+  : LongInt) : LongInt;
+Var Nm : String; N, IP : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetHostByAddr := WsAsyncN;
+  If (A = 0) Or (Buf = 0) Or (BufLen < 64) Then
+  Begin
+    PostMessageA(Wnd, Msg, WsAsyncN, LongInt(10014) Shl 16);
+    Exit;
+  End;
+  IP := MemL[0:A];
+  Nm := WsAddrName(IP);
+  N := WsMakeHost(Buf, Nm, IP);
+  PostMessageA(Wnd, Msg, WsAsyncN, N);
+End;
+
+Function WS_WSAAsyncGetServByName(Wnd, Msg, NmP, PrP, Buf, BufLen
+  : LongInt) : LongInt;
+Var S : String; Pt : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetServByName := WsAsyncN;
+  If (Buf <> 0) And (BufLen >= 72) And (NmP <> 0) And
+     WsFindServ(PStr(NmP), 0, S, Pt) Then
+    PostMessageA(Wnd, Msg, WsAsyncN, WsMakeServ(Buf, S, WsProtoStr(PrP), Pt))
+  Else PostMessageA(Wnd, Msg, WsAsyncN, LongInt(11004) Shl 16);
+End;
+
+Function WS_WSAAsyncGetServByPort(Wnd, Msg, Pt, PrP, Buf, BufLen
+  : LongInt) : LongInt;
+Var S : String; P : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetServByPort := WsAsyncN;
+  If (Buf <> 0) And (BufLen >= 72) And WsFindServ('', Swap16(Pt), S, P) Then
+    PostMessageA(Wnd, Msg, WsAsyncN, WsMakeServ(Buf, S, WsProtoStr(PrP), P))
+  Else PostMessageA(Wnd, Msg, WsAsyncN, LongInt(11004) Shl 16);
+End;
+
+Function WS_WSACancelAsyncRequest(H : LongInt) : LongInt;
+Begin
+  WS_WSACancelAsyncRequest := 0;
+End;
+
+Function WS_WSASetBlockingHook(P : LongInt) : LongInt;
+Begin
+  WS_WSASetBlockingHook := 0;
+End;
+
+Function WS_WSAUnhookBlockingHook : LongInt;
+Begin
+  WS_WSAUnhookBlockingHook := 0;
+End;
+
+Function WS_WSACancelBlockingCall : LongInt;
+Begin
+  WS_WSACancelBlockingCall := 0;
+End;
+
+Function WS_WSAIsBlocking : LongInt;
+Begin
+  WS_WSAIsBlocking := 0;
+End;
+
+Function WS_WSARecvEx(H, Buf, Len, FlP : LongInt) : LongInt;
+Begin
+  If FlP <> 0 Then MemL[0:FlP] := 0;
+  WS_WSARecvEx := WS_recv(H, Buf, Len, 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ ICMP.DLL : IcmpSendEcho (utilise par PING.EXE)                       }
+{ ------------------------------------------------------------------ }
+
+Function IcmpCreateFile : LongInt;
+Begin
+  IcmpCreateFile := $1C3;
+End;
+
+Function IcmpCloseHandle(H : LongInt) : LongInt;
+Begin
+  IcmpCloseHandle := 1;
+End;
+
+Function IcmpSendEcho(H, Dst, Req, ReqSize, Opts, Reply, ReplySize,
+                      Timeout : LongInt) : LongInt;
+Var Rtt : LongInt; Ok : Boolean;
+Begin
+  IcmpSendEcho := 0;
+  If (Reply = 0) Or (ReplySize < 28) Then Exit;
+  If ReplySize >= 28 + ReqSize Then PingData := Reply + 28
+  Else PingData := 0;
+  PingReq := Req;
+  Ok := NetPing(Dst, ReqSize, Max(Timeout, 100), Rtt);
+  PingReq := 0;
+  PingData := 0;
+  FillMem(Reply, 28, 0);
+  If Ok Then
+  Begin
+    MemL[0:Reply] := PingFrom;
+    MemL[0:Reply + 8] := Rtt;
+    If ReplySize >= 28 + ReqSize Then MemW[0:Reply + 12] := PingLen;
+    MemL[0:Reply + 16] := Reply + 28;
+    Mem[0:Reply + 20] := PingTtl;
+    IcmpSendEcho := 1;
+  End
+  Else
+  Begin
+    MemL[0:Reply] := Dst;
+    MemL[0:Reply + 4] := 11010;                   { IP_REQ_TIMED_OUT }
+    SetErr(11010);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Outils de Pasdows : configuration IP (winipcfg) et ping              }
+{ ------------------------------------------------------------------ }
+
+Function NetTitle : String;
+Begin
+  NetTitle := L('Configuration IP', 'IP Configuration', 'IP-Konfiguration',
+                'Configurazione IP', 'Configuraci'#162'n IP');
+End;
+
+Procedure NetConfigBox;
+Var S, A : String;
+Begin
+  NetPoll;
+  If NicBase = 0 Then
+  Begin
+    MsgBoxOpen(NetTitle, L('Aucune carte r'#130'seau NE2000 n''a ' +
+      #130't'#130' d'#130'tect'#130'e. TCP/IP fonctionne seulement en boucle ' +
+      'locale ' +
+      '(127.0.0.1).', 'No NE2000 network adapter was detected. TCP/IP ' +
+      'only works on the loopback address (127.0.0.1).',
+      'Keine NE2000-Netzwerkkarte gefunden. TCP/IP nur lokal ' +
+      '(127.0.0.1).', 'Nessuna scheda di rete NE2000 rilevata. TCP/IP ' +
+      'solo in locale (127.0.0.1).', 'No se detect'#162' ning'#163'n ' +
+      'adaptador NE2000. TCP/IP s'#162'lo en local (127.0.0.1).'), $30);
+    Exit;
+  End;
+  If NicPci Then A := 'NE2000 PCI' Else A := 'NE2000 ISA';
+  S := L('Carte', 'Adapter', 'Karte', 'Scheda', 'Adaptador') + ' : ' + A +
+       '|' + L('Adresse de la carte', 'Adapter address', 'Kartenadresse',
+       'Indirizzo scheda', 'Direcci'#162'n') + ' : ' + MacStr + '|' +
+       L('Adresse IP', 'IP address', 'IP-Adresse', 'Indirizzo IP',
+       'Direcci'#162'n IP') + ' : ' + IpStr(NetIP) + '|' +
+       L('Masque de sous-r'#130'seau', 'Subnet mask', 'Subnetzmaske',
+       'Subnet mask', 'M'#160'scara') + ' : ' + IpStr(NetMask) + '|' +
+       L('Passerelle', 'Gateway', 'Gateway', 'Gateway', 'Puerta') + ' : ' +
+       IpStr(NetGw) + '|DNS : ' + IpStr(NetDns) + '|';
+  If DhcpState = 3 Then
+    S := S + 'DHCP : ' + IpStr(NetDhcpSrv)
+  Else
+    S := S + L('DHCP en cours...', 'DHCP in progress...', 'DHCP l'#132'uft...',
+               'DHCP in corso...', 'DHCP en curso...');
+  MsgBoxOpen(NetTitle, S, $40);
+End;
+
+Procedure NetPingBox(Host : String);
+Var IP, I, Ok, Rtt, Mn, Mx, Sum, Ttl : LongInt; S : String;
+Begin
+  If Not NetLookup(Host, IP) Then
+  Begin
+    MsgBoxOpen('Ping', L('H'#147'te inconnu : ', 'Unknown host: ',
+               'Unbekannter Host: ', 'Host sconosciuto: ',
+               'Host desconocido: ') + Host, $10);
+    Exit;
+  End;
+  Ok := 0; Mn := 999999; Mx := 0; Sum := 0; Ttl := 0;
+  For I := 1 To 4 Do
+    If NetPing(IP, 32, 1000, Rtt) Then
+    Begin
+      Inc(Ok);
+      Mn := Min(Mn, Rtt); Mx := Max(Mx, Rtt); Sum := Sum + Rtt;
+      Ttl := PingTtl;
+    End;
+  S := 'Ping ' + Host + ' [' + IpStr(IP) + '] : 32 ' +
+       L('octets', 'bytes', 'Bytes', 'byte', 'bytes') + '||';
+  If Ok > 0 Then
+    S := S + L('R'#130'ponse de ', 'Reply from ', 'Antwort von ',
+               'Risposta da ', 'Respuesta desde ') + IpStr(IP) +
+         ' : TTL=' + IntStr(Ttl) + '|' +
+         L('Dur'#130'e', 'Time', 'Zeit', 'Tempo', 'Tiempo') + ' : min ' +
+         IntStr(Mn) + ' ms, max ' + IntStr(Mx) + ' ms, ' +
+         L('moyenne', 'average', 'Mittel', 'media', 'media') + ' ' +
+         IntStr(Sum Div Ok) + ' ms|'
+  Else
+    S := S + L('D'#130'lai d''attente d'#130'pass'#130'.', 'Request timed out.',
+               'Zeit'#129'berschreitung.', 'Richiesta scaduta.',
+               'Tiempo agotado.') + '|';
+  S := S + L('Paquets : envoy'#130's = 4, re'#135'us = ',
+             'Packets: sent = 4, ' +
+             'received = ', 'Pakete: gesendet = 4, empfangen = ',
+             'Pacchetti: inviati = 4, ricevuti = ',
+             'Paquetes: enviados = 4, recibidos = ') + IntStr(Ok);
+  If Ok > 0 Then I := $40 Else I := $30;
+  MsgBoxOpen('Ping', S, I);
+End;
+
+{ Commandes TCP/IP de la boite Executer }
+Function NetRunCmd(S : String) : Boolean;
+Var U : String;
+Begin
+  NetRunCmd := True;
+  S := Trim(S);
+  U := UpStr(S);
+  If (U = 'WINIPCFG') Or (U = 'WINIPCFG.EXE') Or (U = 'IPCONFIG') Or
+     (U = 'IPCONFIG.EXE') Then NetConfigBox
+  Else If (Copy(U, 1, 5) = 'PING ') And (Length(Trim(Copy(S, 6, 255))) > 0)
+  Then NetPingBox(Trim(Copy(S, 6, 255)))
+  Else NetRunCmd := False;
+End;
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
 exports VideoForWindowsVersion,
+  WS_WSAStartup, WS_WSACleanup, WS_WSAGetLastError, WS_WSASetLastError,
+  WS_socket, WS_closesocket, WS_bind, WS_listen, WS_accept, WS_connect,
+  WS_sendto, WS_recvfrom, WS_send, WS_recv, WS_shutdown, WS_ioctlsocket,
+  WS_setsockopt, WS_getsockopt, WS_getpeername, WS_getsockname, WS_htons,
+  WS_ntohs, WS_htonl, WS_ntohl, WS_inet_addr, WS_inet_ntoa, WS_gethostbyname,
+  WS_gethostbyaddr, WS_gethostname, WS_getservbyname, WS_getservbyport,
+  WS_getprotobyname, WS_getprotobynumber, WS_select, WS___WSAFDIsSet,
+  WS_WSAAsyncSelect, WS_WSAAsyncGetHostByName, WS_WSAAsyncGetHostByAddr,
+  WS_WSAAsyncGetServByName, WS_WSAAsyncGetServByPort,
+  WS_WSACancelAsyncRequest, WS_WSASetBlockingHook, WS_WSAUnhookBlockingHook,
+  WS_WSACancelBlockingCall, WS_WSAIsBlocking, WS_WSARecvEx, IcmpCreateFile,
+  IcmpCloseHandle, IcmpSendEcho,
+  DXNI1, DXNI2, DXNI3, DXNI4, DXNI5, DXNI6, DXOK1, DXOK2, DXOK3, COMAddRef,
+  COMRelease, COMQIUnk, DXOK4, DirectDrawCreate, DirectDrawEnumerateA, DD_QI,
+  DD_SetCooperativeLevel, DD_SetDisplayMode, DD_SetDisplayMode2,
+  DD_RestoreDisplayMode, DD_FlipToGDISurface, DD_EnumDisplayModes,
+  DD_GetDisplayMode, DD_GetCaps, DD_GetMonitorFrequency, DD_GetScanLine,
+  DD_GetVBStatus, DD_WaitForVB, DD_GetAvailableVidMem, DD_CreateSurface,
+  DD_CreatePalette, DD_CreateClipper, PL_GetCaps, PL_GetEntries,
+  PL_SetEntries, CL_GetHWnd, CL_IsClipListChanged, CL_SetHWnd, SF_QI,
+  SF_GetSurfaceDesc, SF_Lock, SF_Unlock, SF_GetCaps, SF_GetPixelFormat,
+  SF_GetAttachedSurface, SF_Flip, SF_GetColorKey, SF_SetColorKey,
+  SF_SetPalette, SF_GetPalette, SF_SetClipper, SF_GetDDInterface, SF_Blt,
+  SF_BltFast, SF_GetDC, SF_ReleaseDC, DXOK5, DirectSoundCreate,
+  DirectSoundEnumerateA, DS_GetCaps, DS_GetSpeakerConfig,
+  DS_CreateSoundBuffer, DS_DuplicateSoundBuffer, DSB_GetCaps,
+  DSB_GetCurrentPosition, DSB_GetFormat, DSB_GetVolume, DSB_GetPan,
+  DSB_GetFrequency, DSB_GetStatus, DSB_Lock, DSB_Play, DSB_Stop,
+  DSB_SetCurrentPosition, DSB_SetVolume, DSB_SetPan, DSB_SetFrequency,
+  DirectInputCreateA, DI_CreateDevice, DI_EnumDevices, DI_GetDeviceStatus,
+  DID_GetCapabilities, DID_GetDeviceState, DID_GetDeviceData, DirectXSetup,
+  DirectXSetupA, DirectXDeviceDriverSetup, DirectXSetupGetVersion,
+  DirectXSetupSetCallback, DirectXRegisterApplication,
+  DirectXUnRegisterApplication,
+  GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
+  CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
+  SetHandleCount, DisableThreadLibraryCalls, ExtEscape, ThunkConnect32,
+  SMapLS_IP_EBP_12, SMapLS_IP_EBP_16, SMapLS_IP_EBP_20, SMapLS_IP_EBP_24,
+  SUnMapLS_IP_EBP_12, SUnMapLS_IP_EBP_16, SUnMapLS_IP_EBP_20,
+  SUnMapLS_IP_EBP_24, SHFileOperation, W16Bridge, CreateDirectoryA,
+  RemoveDirectoryA, FindWindowA, RegCreateKeyExA, RegFlushKey,
+  RegDeleteKeyA, RegSetValueA, RegQueryValueA, RegEnumKeyExA, RegEnumKeyA,
+  RegEnumValueA, RegDeleteValueA, RegQueryInfoKeyA,
+  RtlMoveMemory, RtlZeroMemory, RtlFillMemory, OpenMutexA, GetShortPathNameA,
+  GetLogicalDriveStringsA, MoveFileExA, GetTempFileNameA, SearchPathA,
+  SystemTimeToFileTime, GetLocaleInfoA, CreateFileMappingA, MapViewOfFile,
+  FlushViewOfFile, UnmapViewOfFile, CreateScalableFontResourceA, CreateCaret,
+  DestroyCaret, SetCaretPos, ShowCaret, HideCaret, ExcludeUpdateRgn,
+  GetLastActivePopup, DdeInitializeA, DdeUninitialize,
+  DdeCreateStringHandleA, DdeFreeStringHandle, DdeConnect, DdeDisconnect,
+  DdeClientTransaction, DdeAccessData, DdeUnaccessData, DdeFreeDataHandle,
+  DdeGetLastError, GetFileVersionInfoSizeA, GetFileVersionInfoA,
+  VerQueryValueA, VerFindFileA, VerInstallFileA, CopyFileA,
+  LZOpenFileA, LZClose,
+  LZCopy, WNetGetConnectionA, WNetAddConnectionA, WNetAddConnection2A,
+  WNetCancelConnectionA, WNetCancelConnection2A, WNetConnectionDialog,
+  WNetGetLastErrorA,
   GetEnvironmentVariableA, SetEnvironmentVariableA,
   GetEnvironmentStrings, GetEnvironmentStringsA, FreeEnvironmentStringsA,
   GetVersion, GetVersionExA, GetSystemInfo, GetCommandLineA, GetStartupInfoA,
@@ -15253,6 +25490,7 @@ Var I : LongInt; Busy : Boolean;
 Begin
   Repeat
     ProcessInput;
+    NetPoll;
     RunMMTimers;
     RunWave;
     KPaintAll;
@@ -15284,7 +25522,14 @@ BEGIN
   MemTop := $100000 + MemL[0:BootInfo + $18] * 1024;
   If MemTop > $40000000 Then MemTop := $40000000;
   HeapInit(HeapBase, MemTop);
-  Language := TLanguage(Mem[0:BootInfo + 3] Mod 5);
+  Case Mem[0:BootInfo + 3] Mod 5 Of
+    1 : Language := _English;
+    2 : Language := _Germany;
+    3 : Language := _Italian;
+    4 : Language := _Spain;
+  Else
+    Language := _French;
+  End;
   OptFlags := MemL[0:BootInfo + $30];
   Lfb := MemL[0:BootInfo + $0C];
   LfbPitch := MemW[0:BootInfo + $10];
@@ -15315,6 +25560,11 @@ BEGIN
   InitGdi;
   InitExports;
   If ApiTrace Then TraceInit;
+  RegInit;
+  InitW16;
+  InitW16Apis;
+  W16Init2;
+  NetInit;
   AppProcObj := -1;
   DeskBuild;
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,
