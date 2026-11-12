@@ -1,7 +1,8 @@
 /* DDTEST : essai de DirectDraw, DirectSound et DirectInput */
 /* Compilation (MinGW) :
-   i686-w64-mingw32-gcc -O1 -nostdlib -e _start@0 -mwindows -x c -o DDTEST.EXE
-     DDTEST.C -lkernel32 -luser32 -lgdi32 -lddraw -ldsound -ldinput -ldxguid */
+   i686-w64-mingw32-gcc -march=i386 -O1 -nostdlib -e _start@0 -mwindows -x c
+     -o DDTEST.EXE DDTEST.C -lkernel32 -luser32 -lgdi32 -lddraw -ldsound
+     -ldinput -ldxguid */
 #define INITGUID
 #define DIRECTINPUT_VERSION 0x0300
 #include <windows.h>
