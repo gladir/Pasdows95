@@ -31,6 +31,7 @@ Pasdows 95 est un clone de Windows 95 écrit en Turbo Pascal / Free Pascal et co
 	<li><b>Programmes Windows 95</b> : chargeur PE (relocalisations, importations, ressources, DLL), tâches Win32 préemptives avec TIB et sauvegarde du coprocesseur, files de messages, fenêtres, classes, dialogues et contrôles (BUTTON, EDIT, LISTBOX, COMBOBOX, SCROLLBAR, STATIC), GDI avec palettes logiques, DIB et sections DIB, fichiers sur le CD-ROM (D:) et disque virtuel en mémoire (C:), minuteries multimédia et carte son muette (waveOut). Essayé avec un projecteur Macromedia Director 5 et son film, qui se déroule entièrement.</li>
 	<li><b>Programmes Windows 3.1</b> (Win16) : chargeur NE, segments de code en anneau 3 dans la LDT, passerelles d'appel vers l'API 16 bits de KERNEL, USER, GDI, SHELL, VER, LZEXPAND, TOOLHELP... (essayé avec un programme d'installation Microsoft ACME).</li>
 	<li><b>DirectX</b> (version 4.04.0068 annoncée) : objets COM de <b>DDRAW.DLL</b> (DirectDrawCreate, mode plein écran 320x200, 320x240 ou 640x480 en 256 couleurs, surface primaire et tampons arrière avec Flip, Lock/Unlock, Blt avec remplissage, couleur transparente et étirement, BltFast, GetDC pour écrire avec GDI, palettes et clippers), <b>DSOUND.DLL</b> (DirectSound muet dont les tampons avancent en temps réel), <b>DINPUT.DLL</b> (clavier et souris, GetDeviceState) et <b>DSETUP.DLL</b>. Exemple : <b>EXEMPLES/DDTEST.C</b> (DDTEST.EXE sur le CD-ROM).</li>
+	<li><b>Disques durs et FAT32</b> : pilote de disque IDE/ATA (PIO, LBA 28 bits), table de partitions (primaires et logiques) et systèmes de fichiers <b>FAT32</b>, FAT16 et FAT12 en lecture et en écriture, avec les <b>noms longs</b> (VFAT, casse conservée, noms courts NOM~1.EXT générés), FSInfo et les deux copies de la FAT. Le premier volume FAT devient <b>C:</b> (les suivants E:, F:... ; D: reste le CD-ROM) : les programmes y créent, lisent, renomment et suppriment fichiers et répertoires (CreateFile, FindFirstFile, MoveFile, GetDiskFreeSpaceEx, GetVolumeInformation « FAT32 »...), et le Poste de travail parcourt le disque. Un disque vierge peut être formaté en FAT32 depuis le Poste de travail. Sans disque dur, C: reste un disque virtuel en mémoire. Exemple : <b>EXEMPLES/FATTEST.C</b> (FATTEST.EXE sur le CD-ROM).</li>
 	<li><b>Réseau TCP/IP</b> : pilote de carte <b>NE2000</b> (PCI RTL8029 ou ISA en 300h, comme la « NE2000 compatible » de Windows 95), pile TCP/IP écrite en Pascal (ARP, IP, ICMP, UDP, TCP avec retransmission et fenêtres, boucle locale 127.0.0.1), client <b>DHCP</b> et résolveur <b>DNS</b>. Les programmes utilisent <b>WSOCK32.DLL</b> / <b>WS2_32.DLL</b> (Winsock 1.1 par nom ou par ordinal : socket, connect, bind, listen, accept, send, recv, sendto, recvfrom, select, ioctlsocket, gethostbyname, WSAAsyncSelect...) et <b>ICMP.DLL</b> (IcmpSendEcho). Dans Pasdows : <i>Démarrer, Paramètres, Réseau (TCP/IP)</i> ou <i>Exécuter</i> <b>winipcfg</b> affiche la configuration IP, <b>ping</b> <i>hôte</i> envoie des échos ICMP. Exemple : <b>EXEMPLES/NETTEST.C</b> (NETTEST.EXE sur le CD-ROM : TCP et UDP locaux, ping, DNS, HTTP).</li>
 	<li>Interface graphique (palette de Windows 95) : écran d'accueil, bureau et icônes (dont les .EXE du CD-ROM), barre des tâches avec horloge, menu Démarrer et sous-menus, fenêtres en relief déplaçables, boutons Réduire / Agrandir / Fermer, souris PS/2 et clavier.</li>
 	<li>Applications : Poste de travail et Explorateur (navigation sur le CD-ROM), Bloc-notes, Calculatrice, Paint, Invite MS-DOS (CLS, DATE, DIR, ECHO, EXIT, HELP, MEM, SET, TIME, TYPE, VER, VOL, WIN...), Panneau de configuration (Affichage, Date/Heure, Paramètres régionaux, Système), Corbeille, Aide, Exécuter, À propos, Bienvenue.</li>
@@ -62,6 +63,16 @@ cd KERNEL
 
 ```bash
 qemu-system-i386 -m 64 -cdrom IMAGE/PASDOWS.ISO -boot d -nic user,model=ne2k_pci
+```
+
+Avec un disque dur FAT32 (un disque vierge se formate depuis le Poste de travail) :
+
+```bash
+qemu-img create -f raw disque.img 1G
+```
+
+```bash
+qemu-system-i386 -m 64 -cdrom IMAGE/PASDOWS.ISO -boot d -hda disque.img -nic user,model=ne2k_pci
 ```
 
 L'option <b>-nic user,model=ne2k_pci</b> donne à Pasdows une carte réseau NE2000 (qemu fournit l'adresse IP par DHCP ; l'hôte est joignable en 10.0.2.2). Sans elle, TCP/IP ne fonctionne qu'en boucle locale.

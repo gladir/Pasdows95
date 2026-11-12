@@ -926,7 +926,8 @@ End;
 { Partie 3 - CD-ROM ATAPI, ISO 9660, objets du noyau et fichiers       }
 { ==================================================================== }
 { D: est le CD-ROM d'amorcage (lecture seule), C: un disque virtuel en
-  memoire (C:\WINDOWS, C:\TEMP...) ou les programmes peuvent ecrire. }
+  memoire (C:\WINDOWS, C:\TEMP...) ou les programmes peuvent ecrire,
+  sauf si un disque dur porte un volume FAT (partie 3b). }
 
 Const
   CacheSlots = 64;
@@ -1344,10 +1345,22 @@ Begin
   BaseName := Copy(Path, P + 1, 255);
 End;
 
+Function FatVolOf(Const Path : String) : LongInt; Forward;
+Function FatPathInfo(Const Path : String; Var Attr, Size, Time : LongInt)
+  : Boolean; Forward;
+Function FatLoad(Const Path : String; Var Size : LongInt) : LongInt;
+  Forward;
+
 { Repertoires fixes du disque C: }
 Function IsCDir(Path : String) : Boolean;
-Var I : LongInt;
+Var I, Attr, Size, Time : LongInt;
 Begin
+  If FatVolOf(Path) >= 0 Then
+  Begin
+    IsCDir := FatPathInfo(Path, Attr, Size, Time) And
+              ((Attr And $10) <> 0);
+    Exit;
+  End;
   IsCDir := (Path = 'C:\') Or (Path = 'C:\WINDOWS') Or
             (Path = 'C:\WINDOWS\SYSTEM') Or (Path = 'C:\TEMP') Or
             (Path = 'C:\WINDOWS\TEMP');
@@ -1418,7 +1431,13 @@ Function PathInfo(Path : String; Var Attr, Size, Time, Lba, Ram : LongInt)
 Var Fl : LongInt;
 Begin
   PathInfo := False;
-  Lba := -1; Size := 0; Time := 0; Attr := 0;
+  Lba := -1; Size := 0; Time := 0; Attr := 0; Ram := -1;
+  { volume FAT d'un disque dur }
+  If FatVolOf(Path) >= 0 Then
+  Begin
+    PathInfo := FatPathInfo(Path, Attr, Size, Time);
+    Exit;
+  End;
   Ram := RamFind(Path);
   If Ram >= 0 Then
   Begin
@@ -1490,6 +1509,11 @@ Var Attr, Time, Lba, Ram, A : LongInt;
 Begin
   LoadWholeFile := 0;
   Path := FullPath(Path);
+  If FatVolOf(Path) >= 0 Then
+  Begin
+    LoadWholeFile := FatLoad(Path, Size);
+    Exit;
+  End;
   If Not PathInfo(Path, Attr, Size, Time, Lba, Ram) Then Exit;
   If (Attr And $10) <> 0 Then Exit;
   A := KAlloc(Size + 16);
@@ -1503,6 +1527,1672 @@ Begin
   LoadWholeFile := A;
 End;
 
+{ ==================================================================== }
+{ Partie 3b - Disques durs ATA et systemes de fichiers FAT12, FAT16 et  }
+{             FAT32 (noms longs VFAT), en lecture et en ecriture       }
+{ ==================================================================== }
+
+{ Comme Windows 95 OSR2, VMM32 lit et ecrit les volumes FAT32 (et FAT12
+  / FAT16) des disques durs IDE : table de partitions (primaires et
+  logiques) ou disque sans partition. Le premier volume FAT devient C:
+  (il remplace alors le disque virtuel en memoire), les suivants E:,
+  F:... (D: reste le CD-ROM). Disques ATA en PIO, LBA 28 bits (128 Go).
+  Les secteurs passent par un petit cache a ecriture immediate. }
+
+Const
+  MaxDisk = 4;
+  MaxVol = 4;
+  MaxFo = 32;
+  SecSlots = 64;
+  FatEoc = $0FFFFFFF;
+
+Var
+  DiskN     : LongInt;
+  DiskBase, DiskCtrl, DiskSecs : Array[0..MaxDisk - 1] Of LongInt;
+  DiskSlave : Array[0..MaxDisk - 1] Of Boolean;
+  VolN      : LongInt;
+  VolDisk, VolStart, VolSecs, VolType, VolSpc, VolRsvd, VolNFats,
+  VolFatSz, VolRootClus, VolRootSec, VolRootCnt, VolData, VolClus,
+  VolFree, VolNext, VolFsInfo, VolSerial, VolLetter, VolActFat
+    : Array[0..MaxVol - 1] Of LongInt;
+  VolFsDirty : Array[0..MaxVol - 1] Of Boolean;
+  VolLab    : Array[0..MaxVol - 1] Of String[11];
+  SecLba, SecDisk, SecBuf, SecAge : Array[0..SecSlots - 1] Of LongInt;
+  SecTick   : LongInt;
+  FatIoErr  : Boolean;
+  FatScratch, FatZero : LongInt;
+  { derniere entree trouvee (FatResolve, DirNext, DirCreate) }
+  FfName, FfShort : String;
+  FfAttr, FfClus, FfSize, FfTime, FfDirClus, FfIdx, FfNEnt : LongInt;
+  { fichiers ouverts }
+  FoUsed    : Array[0..MaxFo - 1] Of Boolean;
+  FoVol, FoClus, FoSize, FoDir, FoIdx, FoCIdx, FoCClus, FoTime
+    : Array[0..MaxFo - 1] Of LongInt;
+  FoDirty   : Array[0..MaxFo - 1] Of Boolean;
+  { parcours de repertoire (cache du dernier cluster) }
+  DcVol, DcDir, DcK, DcClus : LongInt;
+  LfnBuf    : Array[0..259] Of LongInt;
+
+{ ------------------------------------------------------------------ }
+{ Disques ATA (PIO, LBA 28 bits)                                       }
+{ ------------------------------------------------------------------ }
+
+Function HdWait(B : LongInt) : LongInt;
+Var N, St : LongInt;
+Begin
+  N := 0;
+  Repeat
+    St := Port[B + 7];
+    If (St And $80) = 0 Then
+    Begin
+      HdWait := St;
+      Exit;
+    End;
+    Inc(N);
+  Until N > 3000000;
+  HdWait := -1;
+End;
+
+{ Attendre DRQ (donnees pretes) ; False si erreur }
+Function HdDrq(B : LongInt) : Boolean;
+Var N, St : LongInt;
+Begin
+  HdDrq := False;
+  N := 0;
+  Repeat
+    St := Port[B + 7];
+    If (St And $80) = 0 Then
+    Begin
+      If (St And $21) <> 0 Then Exit;
+      If (St And 8) <> 0 Then
+      Begin
+        HdDrq := True;
+        Exit;
+      End;
+    End;
+    Inc(N);
+  Until N > 3000000;
+End;
+
+Procedure HdSetup(D, Lba, Cnt, Cmd : LongInt);
+Var B, I, X : LongInt;
+Begin
+  B := DiskBase[D];
+  HdWait(B);
+  Port[B + 6] := $E0 Or (Ord(DiskSlave[D]) Shl 4) Or ((Lba Shr 24) And $0F);
+  For I := 1 To 4 Do X := Port[DiskCtrl[D]];
+  HdWait(B);
+  Port[B + 1] := 0;
+  Port[B + 2] := Cnt And $FF;
+  Port[B + 3] := Lba And $FF;
+  Port[B + 4] := (Lba Shr 8) And $FF;
+  Port[B + 5] := (Lba Shr 16) And $FF;
+  Port[B + 7] := Cmd;
+  For I := 1 To 4 Do X := Port[DiskCtrl[D]];
+End;
+
+{ Lire Cnt secteurs (1..128) a l'adresse Dst }
+Function HdRead(D, Lba, Cnt, Dst : LongInt) : Boolean;
+Var B, K, A : LongInt;
+Begin
+  HdRead := False;
+  If (Lba < 0) Or (Lba + Cnt > DiskSecs[D]) Then Exit;
+  B := DiskBase[D];
+  HdSetup(D, Lba, Cnt, $20);
+  For K := 0 To Cnt - 1 Do
+  Begin
+    If Not HdDrq(B) Then Exit;
+    A := Dst + K * 512;
+    asm
+      push edi
+      mov edi,A
+      mov ecx,256
+      mov edx,B
+      cld
+      rep insw
+      pop edi
+    end;
+  End;
+  HdRead := True;
+End;
+
+Function HdWrite(D, Lba, Cnt, Src : LongInt) : Boolean;
+Var B, K, A : LongInt;
+Begin
+  HdWrite := False;
+  If (Lba < 0) Or (Lba + Cnt > DiskSecs[D]) Then Exit;
+  B := DiskBase[D];
+  HdSetup(D, Lba, Cnt, $30);
+  For K := 0 To Cnt - 1 Do
+  Begin
+    If Not HdDrq(B) Then Exit;
+    A := Src + K * 512;
+    asm
+      push esi
+      mov esi,A
+      mov ecx,256
+      mov edx,B
+      cld
+      rep outsw
+      pop esi
+    end;
+  End;
+  If HdWait(B) < 0 Then Exit;
+  HdWrite := (Port[B + 7] And $21) = 0;
+End;
+
+{ Vider le cache d'ecriture du disque }
+Procedure HdFlush(D : LongInt);
+Begin
+  HdSetup(D, 0, 0, $E7);
+  HdWait(DiskBase[D]);
+End;
+
+{ IDENTIFY DEVICE : disque ATA (pas ATAPI) present ? }
+Function HdIdentify(Base, Ctrl : LongInt; Slave : Boolean) : Boolean;
+Var St, I, A : LongInt;
+Begin
+  HdIdentify := False;
+  If Port[Base + 7] = $FF Then Exit;
+  If AtaFound And (AtaBase = Base) And (AtaSlave = Slave) Then Exit;
+  Port[Ctrl] := 2;                       { pas d'interruptions }
+  If Slave Then Port[Base + 6] := $B0 Else Port[Base + 6] := $A0;
+  For I := 1 To 4 Do St := Port[Ctrl];
+  Port[Base + 2] := 0; Port[Base + 3] := 0;
+  Port[Base + 4] := 0; Port[Base + 5] := 0;
+  Port[Base + 7] := $EC;
+  For I := 1 To 4 Do St := Port[Ctrl];
+  If Port[Base + 7] = 0 Then Exit;
+  If HdWait(Base) < 0 Then Exit;
+  If (Port[Base + 4] <> 0) Or (Port[Base + 5] <> 0) Then Exit;  { ATAPI }
+  If Not HdDrq(Base) Then Exit;
+  A := FatScratch;
+  asm
+    push edi
+    mov edi,A
+    mov ecx,256
+    mov edx,Base
+    cld
+    rep insw
+    pop edi
+  end;
+  If DiskN >= MaxDisk Then Exit;
+  DiskBase[DiskN] := Base; DiskCtrl[DiskN] := Ctrl;
+  DiskSlave[DiskN] := Slave;
+  DiskSecs[DiskN] := MemL[0:A + 120];    { mots 60-61 : secteurs LBA28 }
+  If DiskSecs[DiskN] <= 0 Then Exit;
+  Inc(DiskN);
+  HdIdentify := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Cache de secteurs (ecriture immediate)                               }
+{ ------------------------------------------------------------------ }
+
+Function SecFind(D, Lba : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := -1;
+  For I := 0 To SecSlots - 1 Do
+    If (SecLba[I] = Lba) And (SecDisk[I] = D) Then R := I;
+  SecFind := R;
+End;
+
+{ Adresse du secteur Lba (absolu) du disque D dans le cache }
+Function SecGet(D, Lba : LongInt) : LongInt;
+Var I, Best : LongInt;
+Begin
+  Inc(SecTick);
+  I := SecFind(D, Lba);
+  If I < 0 Then
+  Begin
+    Best := 0;
+    For I := 1 To SecSlots - 1 Do
+      If SecAge[I] < SecAge[Best] Then Best := I;
+    I := Best;
+    SecLba[I] := -1;
+    If Not HdRead(D, Lba, 1, SecBuf[I]) Then
+    Begin
+      FatIoErr := True;
+      FillMem(FatScratch, 512, 0);
+      SecGet := FatScratch;
+      Exit;
+    End;
+    SecLba[I] := Lba; SecDisk[I] := D;
+  End;
+  SecAge[I] := SecTick;
+  SecGet := SecBuf[I];
+End;
+
+{ Ecrire sur le disque le secteur modifie dans le cache }
+Procedure SecPut(D, Lba : LongInt);
+Var I : LongInt;
+Begin
+  I := SecFind(D, Lba);
+  If I < 0 Then Exit;
+  If Not HdWrite(D, Lba, 1, SecBuf[I]) Then FatIoErr := True;
+End;
+
+Procedure SecInval(D, Lba, Cnt : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To SecSlots - 1 Do
+    If (SecDisk[I] = D) And (SecLba[I] >= Lba) And (SecLba[I] < Lba + Cnt)
+    Then SecLba[I] := -1;
+End;
+
+{ Secteur relatif au volume }
+Function VSec(V, S : LongInt) : LongInt;
+Begin
+  VSec := SecGet(VolDisk[V], VolStart[V] + S);
+End;
+
+Procedure VPut(V, S : LongInt);
+Begin
+  SecPut(VolDisk[V], VolStart[V] + S);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Table d'allocation (FAT)                                             }
+{ ------------------------------------------------------------------ }
+
+Function FatByte(V, F, Off : LongInt) : LongInt;
+Begin
+  FatByte := Mem[0:VSec(V, VolRsvd[V] + F * VolFatSz[V] + Off Div 512) +
+                 Off Mod 512];
+End;
+
+Procedure FatPutByte(V, F, Off, B : LongInt);
+Var S : LongInt;
+Begin
+  S := VolRsvd[V] + F * VolFatSz[V] + Off Div 512;
+  Mem[0:VSec(V, S) + Off Mod 512] := B;
+  VPut(V, S);
+End;
+
+{ Entree C de la FAT (FatEoc pour une fin de chaine) }
+Function FatGet(V, C : LongInt) : LongInt;
+Var F, Off, R, A : LongInt;
+Begin
+  F := VolActFat[V];
+  If F < 0 Then F := 0;
+  Case VolType[V] Of
+    32 :
+    Begin
+      Off := C * 4;
+      A := VSec(V, VolRsvd[V] + F * VolFatSz[V] + Off Div 512);
+      R := MemL[0:A + Off Mod 512] And $0FFFFFFF;
+      If R >= $0FFFFFF8 Then R := FatEoc;
+    End;
+    16 :
+    Begin
+      Off := C * 2;
+      A := VSec(V, VolRsvd[V] + F * VolFatSz[V] + Off Div 512);
+      R := MemW[0:A + Off Mod 512];
+      If R >= $FFF8 Then R := FatEoc
+      Else If R = $FFF7 Then R := $0FFFFFF7;
+    End;
+  Else
+    Off := C + C Div 2;
+    R := FatByte(V, F, Off) Or (FatByte(V, F, Off + 1) Shl 8);
+    If (C And 1) <> 0 Then R := R Shr 4 Else R := R And $FFF;
+    If R >= $FF8 Then R := FatEoc
+    Else If R = $FF7 Then R := $0FFFFFF7;
+  End;
+  FatGet := R;
+End;
+
+Procedure FatSet(V, C, Val : LongInt);
+Var F, Off, A, S, Old : LongInt;
+Begin
+  For F := 0 To VolNFats[V] - 1 Do
+  Begin
+    If (VolActFat[V] >= 0) And (F <> VolActFat[V]) Then Continue;
+    Case VolType[V] Of
+      32 :
+      Begin
+        Off := C * 4;
+        S := VolRsvd[V] + F * VolFatSz[V] + Off Div 512;
+        A := VSec(V, S) + Off Mod 512;
+        MemL[0:A] := (MemL[0:A] And LongInt($F0000000)) Or
+                     (Val And $0FFFFFFF);
+        VPut(V, S);
+      End;
+      16 :
+      Begin
+        Off := C * 2;
+        S := VolRsvd[V] + F * VolFatSz[V] + Off Div 512;
+        A := VSec(V, S) + Off Mod 512;
+        MemW[0:A] := Val And $FFFF;
+        VPut(V, S);
+      End;
+    Else
+      Off := C + C Div 2;
+      Val := Val And $FFF;
+      If (C And 1) <> 0 Then
+      Begin
+        Old := FatByte(V, F, Off);
+        FatPutByte(V, F, Off, (Old And $0F) Or ((Val And $0F) Shl 4));
+        FatPutByte(V, F, Off + 1, (Val Shr 4) And $FF);
+      End
+      Else
+      Begin
+        FatPutByte(V, F, Off, Val And $FF);
+        Old := FatByte(V, F, Off + 1);
+        FatPutByte(V, F, Off + 1, (Old And $F0) Or ((Val Shr 8) And $0F));
+      End;
+    End;
+  End;
+End;
+
+Function ClusOk(V, C : LongInt) : Boolean;
+Begin
+  ClusOk := (C >= 2) And (C < VolClus[V] + 2);
+End;
+
+Function ClusSec(V, C : LongInt) : LongInt;
+Begin
+  ClusSec := VolData[V] + (C - 2) * VolSpc[V];
+End;
+
+Function ClusBytes(V : LongInt) : LongInt;
+Begin
+  ClusBytes := VolSpc[V] * 512;
+End;
+
+{ Compter les clusters libres (si FSInfo ne le dit pas) }
+Procedure FatCountFree(V : LongInt);
+Var C, N : LongInt;
+Begin
+  N := 0;
+  For C := 2 To VolClus[V] + 1 Do
+    If FatGet(V, C) = 0 Then Inc(N);
+  VolFree[V] := N;
+End;
+
+{ Ecrire des zeros dans Cnt secteurs relatifs au volume }
+Procedure VZero(V, S, Cnt : LongInt);
+Var K : LongInt;
+Begin
+  While Cnt > 0 Do
+  Begin
+    K := Min(Cnt, 64);
+    If Not HdWrite(VolDisk[V], VolStart[V] + S, K, FatZero) Then
+      FatIoErr := True;
+    SecInval(VolDisk[V], VolStart[V] + S, K);
+    S := S + K; Cnt := Cnt - K;
+  End;
+End;
+
+{ Nouveau cluster (fin de chaine), chaine apres Prev ; 0 si plein }
+Function FatAlloc(V, Prev : LongInt; Zero : Boolean) : LongInt;
+Var C, K, N, R : LongInt;
+Begin
+  R := 0;
+  N := VolClus[V];
+  C := VolNext[V];
+  If Not ClusOk(V, C) Then C := 2;
+  For K := 0 To N - 1 Do
+  Begin
+    If FatGet(V, C) = 0 Then
+    Begin
+      R := C;
+      Break;
+    End;
+    Inc(C);
+    If C >= N + 2 Then C := 2;
+  End;
+  FatAlloc := R;
+  If R = 0 Then Exit;
+  FatSet(V, R, FatEoc);
+  If Prev <> 0 Then FatSet(V, Prev, R);
+  VolNext[V] := R + 1;
+  If VolFree[V] > 0 Then Dec(VolFree[V]);
+  VolFsDirty[V] := True;
+  If Zero Then VZero(V, ClusSec(V, R), VolSpc[V]);
+End;
+
+Procedure FatFreeChain(V, C : LongInt);
+Var N, K : LongInt;
+Begin
+  K := 0;
+  While ClusOk(V, C) And (K <= VolClus[V]) Do
+  Begin
+    N := FatGet(V, C);
+    FatSet(V, C, 0);
+    If VolFree[V] >= 0 Then Inc(VolFree[V]);
+    C := N;
+    Inc(K);
+  End;
+  VolFsDirty[V] := True;
+End;
+
+{ Lire / ecrire N octets a la position Off du cluster C }
+Procedure ClusIo(V, C, Off, N, Buf : LongInt; Wr : Boolean);
+Var S, SO, K, Run, A, D : LongInt;
+Begin
+  D := VolDisk[V];
+  S := VolStart[V] + ClusSec(V, C) + Off Div 512;
+  SO := Off Mod 512;
+  While N > 0 Do
+  Begin
+    If (SO = 0) And (N >= 512) Then
+    Begin
+      { secteurs entiers : transfert direct }
+      Run := N Div 512;
+      If Wr Then
+      Begin
+        If Not HdWrite(D, S, Run, Buf) Then FatIoErr := True;
+        SecInval(D, S, Run);
+      End
+      Else
+      Begin
+        If Not HdRead(D, S, Run, Buf) Then FatIoErr := True;
+      End;
+      S := S + Run; Buf := Buf + Run * 512; N := N - Run * 512;
+    End
+    Else
+    Begin
+      K := Min(N, 512 - SO);
+      A := SecGet(D, S);
+      If Wr Then
+      Begin
+        MoveMem(Buf, A + SO, K);
+        SecPut(D, S);
+      End
+      Else MoveMem(A + SO, Buf, K);
+      Inc(S); SO := 0; Buf := Buf + K; N := N - K;
+    End;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Repertoires et noms longs                                            }
+{ ------------------------------------------------------------------ }
+
+{ Cluster de la racine (0 : racine fixe de FAT12/16) }
+Function RootOf(V : LongInt) : LongInt;
+Begin
+  If VolType[V] = 32 Then RootOf := VolRootClus[V] Else RootOf := 0;
+End;
+
+{ Adresse (cache) de l'entree Idx du repertoire Dir ; Sec : secteur
+  relatif. 0 apres la fin (Grow : agrandir le repertoire). }
+Function DirEnt(V, Dir, Idx : LongInt; Var Sec : LongInt; Grow : Boolean)
+  : LongInt;
+Var EPC, K, I, C, N : LongInt;
+Begin
+  DirEnt := 0;
+  If Idx < 0 Then Exit;
+  If Dir = 0 Then
+  Begin
+    If Idx >= VolRootCnt[V] Then Exit;
+    Sec := VolRootSec[V] + Idx Div 16;
+  End
+  Else
+  Begin
+    EPC := VolSpc[V] * 16;
+    K := Idx Div EPC;
+    If (DcVol = V) And (DcDir = Dir) And (DcK <= K) And (DcK >= 0) Then
+    Begin
+      I := DcK; C := DcClus;
+    End
+    Else
+    Begin
+      I := 0; C := Dir;
+    End;
+    While I < K Do
+    Begin
+      N := FatGet(V, C);
+      If Not ClusOk(V, N) Then
+      Begin
+        If Not Grow Then Exit;
+        N := FatAlloc(V, C, True);
+        If N = 0 Then Exit;
+      End;
+      C := N;
+      Inc(I);
+    End;
+    DcVol := V; DcDir := Dir; DcK := K; DcClus := C;
+    Sec := ClusSec(V, C) + (Idx Mod EPC) Div 16;
+  End;
+  DirEnt := VSec(V, Sec) + (Idx Mod 16) * 32;
+End;
+
+Function LfnSum(Const SN : String) : LongInt;
+Var I, S : LongInt;
+Begin
+  S := 0;
+  For I := 1 To 11 Do
+    S := ((((S And 1) Shl 7) + (S Shr 1)) + Ord(SN[I])) And $FF;
+  LfnSum := S;
+End;
+
+{ Nom court affichable (NOM.EXT) d'une entree }
+Function ShortOf(A : LongInt; Var Raw : String) : String;
+Var I, C : LongInt; B, E : String;
+Begin
+  Raw := '';
+  For I := 0 To 10 Do Raw := Raw + Chr(Mem[0:A + I]);
+  If Raw[1] = #5 Then Raw[1] := #229;
+  B := ''; E := '';
+  For I := 1 To 8 Do
+    If Raw[I] <> ' ' Then
+    Begin
+      C := Ord(Raw[I]);
+      If ((Mem[0:A + 12] And 8) <> 0) And (C >= 65) And (C <= 90) Then
+        C := C + 32;
+      B := B + Chr(C);
+    End;
+  For I := 9 To 11 Do
+    If Raw[I] <> ' ' Then
+    Begin
+      C := Ord(Raw[I]);
+      If ((Mem[0:A + 12] And 16) <> 0) And (C >= 65) And (C <= 90) Then
+        C := C + 32;
+      E := E + Chr(C);
+    End;
+  If E <> '' Then ShortOf := B + '.' + E Else ShortOf := B;
+End;
+
+{ Entree suivante (a partir de Idx) : Ff* ; False a la fin }
+Function DirNext(V, Dir : LongInt; Var Idx : LongInt) : Boolean;
+Var A, Sec, B, Seq, K, W, LN, LStart, Ck, P, N : LongInt;
+    Raw, Nm : String; Ok : Boolean;
+Begin
+  DirNext := False;
+  LN := 0; LStart := -1; Ck := -1;
+  Repeat
+    A := DirEnt(V, Dir, Idx, Sec, False);
+    If A = 0 Then Exit;
+    B := Mem[0:A];
+    If B = 0 Then Exit;
+    Inc(Idx);
+    If B = $E5 Then
+    Begin
+      LN := 0;
+      Continue;
+    End;
+    If Mem[0:A + 11] = $0F Then
+    Begin
+      Seq := B And $1F;
+      If (B And $40) <> 0 Then
+      Begin
+        LN := Seq; LStart := Idx - 1; Ck := Mem[0:A + 13];
+        For K := 0 To 259 Do LfnBuf[K] := 0;
+      End;
+      If (LN = 0) Or (Seq < 1) Or (Seq > 20) Or (Mem[0:A + 13] <> Ck) Then
+      Begin
+        LN := 0;
+        Continue;
+      End;
+      P := (Seq - 1) * 13;
+      For K := 0 To 12 Do
+      Begin
+        If K < 5 Then W := MemW[0:A + 1 + K * 2]
+        Else If K < 11 Then W := MemW[0:A + 14 + (K - 5) * 2]
+        Else W := MemW[0:A + 28 + (K - 11) * 2];
+        If P + K < 260 Then LfnBuf[P + K] := W;
+      End;
+      Continue;
+    End;
+    If (Mem[0:A + 11] And 8) <> 0 Then
+    Begin
+      LN := 0;                       { etiquette de volume }
+      Continue;
+    End;
+    FfShort := ShortOf(A, Raw);
+    Nm := '';
+    Ok := (LN > 0) And (LfnSum(Raw) = Ck) And (Idx - 1 - LStart = LN);
+    If Ok Then
+    Begin
+      N := 0;
+      While (N < 255) And (LfnBuf[N] <> 0) And (LfnBuf[N] <> $FFFF) Do
+      Begin
+        If LfnBuf[N] < 256 Then Nm := Nm + Chr(LfnBuf[N])
+        Else Nm := Nm + '_';
+        Inc(N);
+      End;
+    End;
+    If Nm = '' Then
+    Begin
+      FfName := FfShort;
+      FfNEnt := 1;
+    End
+    Else
+    Begin
+      FfName := Nm;
+      FfNEnt := LN + 1;
+    End;
+    FfAttr := Mem[0:A + 11];
+    FfClus := MemW[0:A + 26];
+    If VolType[V] = 32 Then FfClus := FfClus Or (MemW[0:A + 20] Shl 16);
+    FfSize := MemL[0:A + 28];
+    FfTime := (MemW[0:A + 24] Shl 16) Or MemW[0:A + 22];
+    FfDirClus := Dir;
+    FfIdx := Idx - 1;
+    DirNext := True;
+    Exit;
+  Until False;
+End;
+
+{ Chercher Name (majuscules) dans le repertoire Dir }
+Function DirFind(V, Dir : LongInt; Const Name : String) : Boolean;
+Var Idx : LongInt;
+Begin
+  DirFind := False;
+  Idx := 0;
+  While DirNext(V, Dir, Idx) Do
+    If (UpStr(FfName) = Name) Or (UpStr(FfShort) = Name) Then
+    Begin
+      DirFind := True;
+      Exit;
+    End;
+End;
+
+{ Volume FAT d'un chemin complet (X:\...) ; -1 sinon }
+Function FatVolOf(Const Path : String) : LongInt;
+Var V, R : LongInt;
+Begin
+  R := -1;
+  If Length(Path) >= 2 Then
+    For V := 0 To VolN - 1 Do
+      If Ord(Path[1]) = VolLetter[V] Then R := V;
+  FatVolOf := R;
+End;
+
+{ Resoudre un chemin complet : Ff* decrit l'objet (la racine : Ff Idx
+  -1) ; False s'il n'existe pas }
+Function FatResolve(V : LongInt; Path : String) : Boolean;
+Var Cur, P : LongInt; Part : String;
+Begin
+  FatResolve := False;
+  Path := Copy(Path, 4, 255);
+  Cur := RootOf(V);
+  FfName := Chr(VolLetter[V]) + ':\'; FfShort := FfName;
+  FfAttr := $10; FfClus := Cur; FfSize := 0; FfTime := 0;
+  FfDirClus := -1; FfIdx := -1; FfNEnt := 0;
+  While Path <> '' Do
+  Begin
+    P := Pos('\', Path);
+    If P > 0 Then
+    Begin
+      Part := Copy(Path, 1, P - 1);
+      Delete(Path, 1, P);
+    End
+    Else
+    Begin
+      Part := Path;
+      Path := '';
+    End;
+    If Part = '' Then Continue;
+    If Not DirFind(V, Cur, Part) Then Exit;
+    If (Path <> '') And ((FfAttr And $10) = 0) Then Exit;
+    Cur := FfClus;
+    If ((FfAttr And $10) <> 0) And (Cur = 0) Then Cur := RootOf(V);
+  End;
+  FatResolve := True;
+End;
+
+{ Cluster du repertoire Path (-1 s'il n'existe pas) }
+Function FatDirClus(V : LongInt; Const Path : String) : LongInt;
+Begin
+  FatDirClus := -1;
+  If Not FatResolve(V, Path) Then Exit;
+  If (FfAttr And $10) = 0 Then Exit;
+  If FfIdx < 0 Then FatDirClus := RootOf(V)
+  Else If FfClus = 0 Then FatDirClus := RootOf(V)
+  Else FatDirClus := FfClus;
+End;
+
+{ Mettre a jour cluster, taille et date d'une entree }
+Procedure EntSet(V, Dir, Idx, Clus, Size : LongInt; Touch : Boolean);
+Var A, Sec, T : LongInt;
+Begin
+  A := DirEnt(V, Dir, Idx, Sec, False);
+  If A = 0 Then Exit;
+  MemW[0:A + 26] := Clus And $FFFF;
+  If VolType[V] = 32 Then MemW[0:A + 20] := (Clus Shr 16) And $FFFF;
+  MemL[0:A + 28] := Size;
+  If Touch Then
+  Begin
+    T := DosNow;
+    MemW[0:A + 22] := T And $FFFF;
+    MemW[0:A + 24] := (T Shr 16) And $FFFF;
+    MemW[0:A + 18] := (T Shr 16) And $FFFF;
+  End;
+  VPut(V, Sec);
+End;
+
+Function Valid83Ch(C : Char) : Boolean;
+Var S : String; I : LongInt; R : Boolean;
+Begin
+  R := ((C >= 'A') And (C <= 'Z')) Or ((C >= '0') And (C <= '9')) Or
+       (Ord(C) >= 128);
+  S := '!#$%&''()-@^_`{}~';
+  For I := 1 To Length(S) Do If S[I] = C Then R := True;
+  Valid83Ch := R;
+End;
+
+{ Nom 8.3 deja present dans le repertoire ? (SN : 11 caracteres) }
+Function ShortTaken(V, Dir : LongInt; Const SN : String) : Boolean;
+Var Idx, A, Sec, I : LongInt; Same : Boolean;
+Begin
+  ShortTaken := False;
+  Idx := 0;
+  Repeat
+    A := DirEnt(V, Dir, Idx, Sec, False);
+    If (A = 0) Or (Mem[0:A] = 0) Then Exit;
+    If (Mem[0:A] <> $E5) And (Mem[0:A + 11] <> $0F) Then
+    Begin
+      Same := True;
+      For I := 0 To 10 Do
+        If Mem[0:A + I] <> Ord(SN[I + 1]) Then Same := False;
+      If Same Then
+      Begin
+        ShortTaken := True;
+        Exit;
+      End;
+    End;
+    Inc(Idx);
+  Until False;
+End;
+
+{ Nom 8.3 (11 caracteres) pour Disp ; NeedLfn si un nom long est requis }
+Function MakeShort(V, Dir : LongInt; Const Disp : String;
+                   Var NeedLfn : Boolean) : String;
+Var U, B, E, SN, T : String; I, P, N : LongInt; Ok : Boolean;
+Begin
+  U := UpStr(Disp);
+  P := 0;
+  For I := 1 To Length(U) Do If U[I] = '.' Then P := I;
+  If P > 0 Then
+  Begin
+    B := Copy(U, 1, P - 1); E := Copy(U, P + 1, 255);
+  End
+  Else
+  Begin
+    B := U; E := '';
+  End;
+  Ok := (U = Disp) And (Length(B) >= 1) And (Length(B) <= 8) And
+        (Length(E) <= 3) And Not ((P > 0) And (E = ''));
+  For I := 1 To Length(B) Do If Not Valid83Ch(B[I]) Then Ok := False;
+  For I := 1 To Length(E) Do If Not Valid83Ch(E[I]) Then Ok := False;
+  NeedLfn := Not Ok;
+  If Ok Then
+  Begin
+    SN := B;
+    While Length(SN) < 8 Do SN := SN + ' ';
+    SN := SN + E;
+    While Length(SN) < 11 Do SN := SN + ' ';
+    MakeShort := SN;
+    Exit;
+  End;
+  { base : caracteres valides, sans espaces ni points }
+  T := '';
+  For I := 1 To Length(B) Do
+    If (B[I] <> ' ') And (B[I] <> '.') Then
+      If Valid83Ch(B[I]) Then T := T + B[I] Else T := T + '_';
+  If T = '' Then T := 'FICHIER';
+  B := T;
+  T := '';
+  For I := 1 To Length(E) Do
+    If (E[I] <> ' ') And (Length(T) < 3) Then
+      If Valid83Ch(E[I]) Then T := T + E[I] Else T := T + '_';
+  E := T;
+  While Length(E) < 3 Do E := E + ' ';
+  N := 1;
+  Repeat
+    T := '~' + IntStr(N);
+    SN := Copy(B, 1, 8 - Length(T)) + T;
+    While Length(SN) < 8 Do SN := SN + ' ';
+    SN := SN + E;
+    Inc(N);
+  Until Not ShortTaken(V, Dir, SN) Or (N > 99999);
+  MakeShort := SN;
+End;
+
+{ Creer l'entree Disp (casse conservee) dans Dir ; Ff* la decrit }
+Function DirCreate(V, Dir : LongInt; Const Disp : String;
+                   Attr, Clus : LongInt) : Boolean;
+Var SN : String; NeedLfn : Boolean;
+    Cnt, Idx, Run, Start, A, Sec, K, Seq, P, W, Ck, T, J : LongInt;
+Begin
+  DirCreate := False;
+  SN := MakeShort(V, Dir, Disp, NeedLfn);
+  Cnt := 1;
+  If NeedLfn Then Cnt := (Length(Disp) + 12) Div 13 + 1;
+  Idx := 0; Run := 0; Start := -1;
+  Repeat
+    A := DirEnt(V, Dir, Idx, Sec, True);
+    If A = 0 Then Exit;                  { racine pleine ou disque plein }
+    If (Mem[0:A] = 0) Or (Mem[0:A] = $E5) Then
+    Begin
+      Inc(Run);
+      If Run = Cnt Then Start := Idx - Cnt + 1;
+    End
+    Else Run := 0;
+    Inc(Idx);
+  Until Start >= 0;
+  Ck := LfnSum(SN);
+  { entrees du nom long (ordre inverse) }
+  For Seq := 1 To Cnt - 1 Do
+  Begin
+    A := DirEnt(V, Dir, Start + Cnt - 1 - Seq, Sec, False);
+    FillMem(A, 32, 0);
+    If Seq = Cnt - 1 Then Mem[0:A] := Seq Or $40 Else Mem[0:A] := Seq;
+    Mem[0:A + 11] := $0F;
+    Mem[0:A + 13] := Ck;
+    For K := 0 To 12 Do
+    Begin
+      P := (Seq - 1) * 13 + K;
+      If P < Length(Disp) Then W := Ord(Disp[P + 1])
+      Else If P = Length(Disp) Then W := 0
+      Else W := $FFFF;
+      If K < 5 Then J := A + 1 + K * 2
+      Else If K < 11 Then J := A + 14 + (K - 5) * 2
+      Else J := A + 28 + (K - 11) * 2;
+      MemW[0:J] := W;
+    End;
+    VPut(V, Sec);
+  End;
+  { entree 8.3 }
+  A := DirEnt(V, Dir, Start + Cnt - 1, Sec, False);
+  FillMem(A, 32, 0);
+  For K := 1 To 11 Do Mem[0:A + K - 1] := Ord(SN[K]);
+  If Mem[0:A] = $E5 Then Mem[0:A] := 5;
+  Mem[0:A + 11] := Attr;
+  T := DosNow;
+  MemW[0:A + 14] := T And $FFFF; MemW[0:A + 16] := (T Shr 16) And $FFFF;
+  MemW[0:A + 18] := (T Shr 16) And $FFFF;
+  MemW[0:A + 22] := T And $FFFF; MemW[0:A + 24] := (T Shr 16) And $FFFF;
+  MemW[0:A + 26] := Clus And $FFFF;
+  If VolType[V] = 32 Then MemW[0:A + 20] := (Clus Shr 16) And $FFFF;
+  VPut(V, Sec);
+  FfName := Disp; FfShort := ShortOf(A, SN);
+  FfAttr := Attr; FfClus := Clus; FfSize := 0; FfTime := T;
+  FfDirClus := Dir; FfIdx := Start + Cnt - 1; FfNEnt := Cnt;
+  DirCreate := True;
+End;
+
+{ Effacer l'entree Idx et ses NEnt - 1 entrees de nom long }
+Procedure DirErase(V, Dir, Idx, NEnt : LongInt);
+Var K, A, Sec : LongInt;
+Begin
+  For K := Idx - NEnt + 1 To Idx Do
+  Begin
+    A := DirEnt(V, Dir, K, Sec, False);
+    If A <> 0 Then
+    Begin
+      Mem[0:A] := $E5;
+      VPut(V, Sec);
+    End;
+  End;
+End;
+
+{ Repertoire vide (hors . et ..) ? }
+Function DirEmpty(V, Dir : LongInt) : Boolean;
+Var Idx : LongInt;
+Begin
+  DirEmpty := True;
+  Idx := 0;
+  While DirNext(V, Dir, Idx) Do
+    If (FfShort <> '.') And (FfShort <> '..') Then
+    Begin
+      DirEmpty := False;
+      Exit;
+    End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Montage                                                              }
+{ ------------------------------------------------------------------ }
+
+{ Secteur d'amorce FAT valide en A ? }
+Function BpbOk(A : LongInt) : Boolean;
+Var Spc : LongInt;
+Begin
+  Spc := Mem[0:A + 13];
+  BpbOk := (MemW[0:A + 11] = 512) And (Spc > 0) And
+           ((Spc And (Spc - 1)) = 0) And (Mem[0:A + 16] >= 1) And
+           (Mem[0:A + 16] <= 2) And (MemW[0:A + 14] >= 1) And
+           (Mem[0:A + 21] >= $F0);
+End;
+
+Function VolMount(D, Start, Secs : LongInt) : Boolean;
+Var V, A, Tot, FatSz, RootSecs, DataSecs, K : LongInt; S : String;
+Begin
+  VolMount := False;
+  If VolN >= MaxVol Then Exit;
+  V := VolN;
+  VolDisk[V] := D; VolStart[V] := Start;
+  A := SecGet(D, Start);
+  If FatIoErr Or Not BpbOk(A) Then
+  Begin
+    FatIoErr := False;
+    Exit;
+  End;
+  VolSpc[V] := Mem[0:A + 13];
+  VolRsvd[V] := MemW[0:A + 14];
+  VolNFats[V] := Mem[0:A + 16];
+  VolRootCnt[V] := MemW[0:A + 17];
+  Tot := MemW[0:A + 19];
+  If Tot = 0 Then Tot := MemL[0:A + 32];
+  FatSz := MemW[0:A + 22];
+  If FatSz = 0 Then FatSz := MemL[0:A + 36];
+  If (Tot <= 0) Or (FatSz <= 0) Then Exit;
+  If (Secs > 0) And (Tot > Secs) Then Tot := Secs;
+  VolSecs[V] := Tot;
+  VolFatSz[V] := FatSz;
+  RootSecs := (VolRootCnt[V] * 32 + 511) Div 512;
+  VolRootSec[V] := VolRsvd[V] + VolNFats[V] * FatSz;
+  VolData[V] := VolRootSec[V] + RootSecs;
+  DataSecs := Tot - VolData[V];
+  If DataSecs <= 0 Then Exit;
+  VolClus[V] := DataSecs Div VolSpc[V];
+  If VolClus[V] < 4085 Then VolType[V] := 12
+  Else If VolClus[V] < 65525 Then VolType[V] := 16
+  Else VolType[V] := 32;
+  VolActFat[V] := -1;
+  VolFree[V] := -1; VolNext[V] := 2; VolFsInfo[V] := 0;
+  VolRootClus[V] := 0;
+  If VolType[V] = 32 Then
+  Begin
+    VolRootClus[V] := MemL[0:A + 44];
+    If (MemW[0:A + 40] And $80) <> 0 Then
+      VolActFat[V] := MemW[0:A + 40] And 15;
+    VolFsInfo[V] := MemW[0:A + 48];
+    VolSerial[V] := MemL[0:A + 67];
+    S := '';
+    For K := 0 To 10 Do S := S + Chr(Mem[0:A + 71 + K]);
+  End
+  Else
+  Begin
+    VolSerial[V] := MemL[0:A + 39];
+    S := '';
+    For K := 0 To 10 Do S := S + Chr(Mem[0:A + 43 + K]);
+  End;
+  If Mem[0:A + 38 + 28 * Ord(VolType[V] = 32)] <> $29 Then S := '';
+  If S = 'NO NAME    ' Then S := '';
+  VolLab[V] := Trim(S);
+  If (VolType[V] = 32) And (VolFsInfo[V] > 0) And
+     (VolFsInfo[V] < VolRsvd[V]) Then
+  Begin
+    A := VSec(V, VolFsInfo[V]);
+    If (MemL[0:A] = $41615252) And (MemL[0:A + 484] = $61417272) Then
+    Begin
+      If (MemL[0:A + 488] >= 0) And (MemL[0:A + 488] <= VolClus[V]) Then
+        VolFree[V] := MemL[0:A + 488];
+      If ClusOk(V, MemL[0:A + 492]) Then VolNext[V] := MemL[0:A + 492];
+    End;
+  End;
+  VolFsDirty[V] := False;
+  If VolN = 0 Then VolLetter[V] := Ord('C')
+  Else VolLetter[V] := Ord('D') + VolN;
+  Inc(VolN);
+  { etiquette dans la racine (prioritaire, comme Windows) }
+  K := 0;
+  Repeat
+    A := DirEnt(V, RootOf(V), K, FatSz, False);
+    If (A = 0) Or (Mem[0:A] = 0) Then Break;
+    If (Mem[0:A] <> $E5) And (Mem[0:A + 11] And $1F = 8) Then
+    Begin
+      S := '';
+      For FatSz := 0 To 10 Do S := S + Chr(Mem[0:A + FatSz]);
+      VolLab[V] := Trim(S);
+      Break;
+    End;
+    Inc(K);
+  Until K > 64;
+  KLog('FAT' + IntStr(VolType[V]) + ' : ' + Chr(VolLetter[V]) +
+       ': disque ' + IntStr(D) + ' secteur ' + IntStr(Start) + ', ' +
+       IntStr(VolClus[V]) + ' clusters de ' + IntStr(VolSpc[V] * 512) +
+       ' octets, etiquette ' + VolLab[V]);
+  VolMount := True;
+End;
+
+Function IsFatPart(T : LongInt) : Boolean;
+Begin
+  IsFatPart := (T = $01) Or (T = $04) Or (T = $06) Or (T = $0B) Or
+               (T = $0C) Or (T = $0E);
+End;
+
+{ Partitions d'un disque : primaires puis logiques ; sans table de
+  partitions, le disque entier }
+Procedure DiskScan(D : LongInt);
+Var A, I, T, St, Sz, Ext, Ebr, N : LongInt; Found : Boolean;
+    PT, PS, PZ : Array[0..3] Of LongInt;
+Begin
+  A := SecGet(D, 0);
+  If FatIoErr Then
+  Begin
+    FatIoErr := False;
+    Exit;
+  End;
+  If MemW[0:A + 510] <> $AA55 Then Exit;
+  Found := False;
+  For I := 0 To 3 Do
+  Begin
+    PT[I] := Mem[0:A + 446 + I * 16 + 4];
+    PS[I] := MemL[0:A + 446 + I * 16 + 8];
+    PZ[I] := MemL[0:A + 446 + I * 16 + 12];
+    If (PT[I] <> 0) And ((Mem[0:A + 446 + I * 16] And $7F) <> 0) Then
+      PT[I] := -1;                       { pas une table de partitions }
+  End;
+  If BpbOk(A) And ((PT[0] < 0) Or (PT[0] = 0) Or (PS[0] = 0)) Then
+  Begin
+    VolMount(D, 0, DiskSecs[D]);
+    Exit;
+  End;
+  Ext := 0;
+  For I := 0 To 3 Do
+  Begin
+    T := PT[I];
+    If IsFatPart(T) And (PS[I] > 0) Then
+      If VolMount(D, PS[I], PZ[I]) Then Found := True;
+    If (T = $05) Or (T = $0F) Or (T = $85) Then Ext := PS[I];
+  End;
+  { partitions logiques de la partition etendue }
+  Ebr := Ext; N := 0;
+  While (Ext > 0) And (Ebr > 0) And (N < 16) Do
+  Begin
+    A := SecGet(D, Ebr);
+    If FatIoErr Or (MemW[0:A + 510] <> $AA55) Then Break;
+    T := Mem[0:A + 446 + 4];
+    St := MemL[0:A + 446 + 8];
+    Sz := MemL[0:A + 446 + 12];
+    I := MemL[0:A + 446 + 16 + 8];
+    If (Mem[0:A + 446 + 16 + 4] = 0) Or (I = 0) Then I := -1;
+    If IsFatPart(T) And (St > 0) Then VolMount(D, Ebr + St, Sz);
+    If I < 0 Then Ebr := 0 Else Ebr := Ext + I;
+    Inc(N);
+  End;
+  FatIoErr := False;
+End;
+
+{ Ecrire FSInfo et vider les caches des disques }
+Procedure FatFlush;
+Var V, A, D : LongInt;
+Begin
+  For V := 0 To VolN - 1 Do
+    If VolFsDirty[V] Then
+    Begin
+      VolFsDirty[V] := False;
+      If (VolType[V] = 32) And (VolFsInfo[V] > 0) Then
+      Begin
+        A := VSec(V, VolFsInfo[V]);
+        If MemL[0:A] = $41615252 Then
+        Begin
+          MemL[0:A + 488] := VolFree[V];
+          MemL[0:A + 492] := VolNext[V];
+          VPut(V, VolFsInfo[V]);
+        End;
+      End;
+    End;
+  For D := 0 To DiskN - 1 Do HdFlush(D);
+End;
+
+Function FatMkDirIn(V, Parent : LongInt; Const Disp : String) : Boolean;
+  Forward;
+
+{ Repertoires de Windows sur C: (crees s'ils manquent) }
+Procedure FatWinDirs;
+Var R, W : LongInt;
+Begin
+  If (VolN = 0) Or (VolLetter[0] <> Ord('C')) Then Exit;
+  R := RootOf(0);
+  If Not DirFind(0, R, 'WINDOWS') Then
+  Begin
+    FatMkDirIn(0, R, 'WINDOWS');
+    KLog('FAT : C:\WINDOWS cree');
+  End;
+  W := FatDirClus(0, 'C:\WINDOWS');
+  If W >= 0 Then
+  Begin
+    If Not DirFind(0, W, 'SYSTEM') Then FatMkDirIn(0, W, 'SYSTEM');
+    If Not DirFind(0, W, 'TEMP') Then FatMkDirIn(0, W, 'TEMP');
+  End;
+  If Not DirFind(0, R, 'TEMP') Then FatMkDirIn(0, R, 'TEMP');
+  FatFlush;
+End;
+
+Procedure FatInit;
+Var I, HO : LongInt;
+Begin
+  HO := HeapOwner;
+  HeapOwner := 0;
+  FatScratch := KAlloc(1024);
+  FatZero := KAlloc(64 * 512);
+  For I := 0 To SecSlots - 1 Do
+  Begin
+    SecBuf[I] := KAlloc(512);
+    SecLba[I] := -1; SecDisk[I] := -1; SecAge[I] := 0;
+  End;
+  HeapOwner := HO;
+  FillMem(FatZero, 64 * 512, 0);
+  For I := 0 To MaxFo - 1 Do FoUsed[I] := False;
+  DcVol := -1;
+  DiskN := 0; VolN := 0;
+  HdIdentify($1F0, $3F6, False);
+  HdIdentify($1F0, $3F6, True);
+  HdIdentify($170, $376, False);
+  HdIdentify($170, $376, True);
+  For I := 0 To DiskN - 1 Do
+  Begin
+    KLog('Disque ' + IntStr(I) + ' : ' + HexStr(DiskBase[I], 3) +
+         ' esclave=' + IntStr(Ord(DiskSlave[I])) + ', ' +
+         IntStr(DiskSecs[I] Div 2048) + ' Mo');
+    DiskScan(I);
+  End;
+  FatWinDirs;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Operations sur les fichiers (appelees par l'API Win32)               }
+{ ------------------------------------------------------------------ }
+
+{ Informations sur un chemin complet d'un volume FAT }
+Function FatPathInfo(Const Path : String; Var Attr, Size, Time : LongInt)
+  : Boolean;
+Var V : LongInt;
+Begin
+  FatPathInfo := False;
+  V := FatVolOf(Path);
+  If (V < 0) Or Not FatResolve(V, Path) Then Exit;
+  Attr := FfAttr And $37;
+  If Attr = 0 Then Attr := $80;
+  Size := FfSize; Time := FfTime;
+  If (FfAttr And $10) <> 0 Then Size := 0;
+  FatPathInfo := True;
+End;
+
+Function FatMkDirIn(V, Parent : LongInt; Const Disp : String) : Boolean;
+Var C, A, Sec, T, PC : LongInt;
+Begin
+  FatMkDirIn := False;
+  C := FatAlloc(V, 0, True);
+  If C = 0 Then Exit;
+  { . et .. }
+  A := DirEnt(V, C, 0, Sec, False);
+  T := DosNow;
+  FillMem(A, 64, 0);
+  FillMem(A, 11, 32); Mem[0:A] := 46;
+  FillMem(A + 32, 11, 32); Mem[0:A + 32] := 46; Mem[0:A + 33] := 46;
+  If Parent = RootOf(V) Then PC := 0 Else PC := Parent;
+  Mem[0:A + 11] := $10; Mem[0:A + 43] := $10;
+  MemW[0:A + 22] := T And $FFFF; MemW[0:A + 24] := (T Shr 16) And $FFFF;
+  MemW[0:A + 54] := T And $FFFF; MemW[0:A + 56] := (T Shr 16) And $FFFF;
+  MemW[0:A + 26] := C And $FFFF; MemW[0:A + 58] := PC And $FFFF;
+  If VolType[V] = 32 Then
+  Begin
+    MemW[0:A + 20] := (C Shr 16) And $FFFF;
+    MemW[0:A + 52] := (PC Shr 16) And $FFFF;
+  End;
+  VPut(V, Sec);
+  If Not DirCreate(V, Parent, Disp, $10, C) Then
+  Begin
+    FatFreeChain(V, C);
+    Exit;
+  End;
+  FatMkDirIn := True;
+End;
+
+{ Nom affiche : base d'origine (casse conservee) si elle correspond }
+Function DispName(Const Path, Orig : String) : String;
+Var B : String;
+Begin
+  B := BaseName(Path);
+  If (Orig <> '') And (UpStr(Orig) = B) Then DispName := Orig
+  Else DispName := B;
+End;
+
+{ Codes d'erreur Win32 : 0 succes }
+Function FatMkDir(Const Path, Orig : String) : LongInt;
+Var V, P : LongInt;
+Begin
+  FatMkDir := 3;                                   { chemin introuvable }
+  V := FatVolOf(Path);
+  If (V < 0) Or (Length(Path) <= 3) Then Exit;
+  If FatResolve(V, Path) Then
+  Begin
+    FatMkDir := 183;                               { existe deja }
+    Exit;
+  End;
+  P := FatDirClus(V, ParentDir(Path));
+  If P < 0 Then Exit;
+  If FatMkDirIn(V, P, DispName(Path, Orig)) Then FatMkDir := 0
+  Else FatMkDir := 112;                            { disque plein }
+  FatFlush;
+End;
+
+Function FatRmDir(Const Path : String) : LongInt;
+Var V, C : LongInt;
+Begin
+  FatRmDir := 3;
+  V := FatVolOf(Path);
+  If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
+  If (FfAttr And $10) = 0 Then Exit;
+  C := FfClus;
+  If Not DirEmpty(V, C) Then
+  Begin
+    FatRmDir := 145;                               { pas vide }
+    Exit;
+  End;
+  FatResolve(V, Path);
+  DirErase(V, FfDirClus, FfIdx, FfNEnt);
+  FatFreeChain(V, C);
+  DcVol := -1;
+  FatFlush;
+  FatRmDir := 0;
+End;
+
+Function FatDelete(Const Path : String) : LongInt;
+Var V, I : LongInt;
+Begin
+  FatDelete := 2;                                  { introuvable }
+  V := FatVolOf(Path);
+  If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
+  If (FfAttr And $10) <> 0 Then
+  Begin
+    FatDelete := 5;
+    Exit;
+  End;
+  For I := 0 To MaxFo - 1 Do
+    If FoUsed[I] And (FoVol[I] = V) And (FoDir[I] = FfDirClus) And
+       (FoIdx[I] = FfIdx) Then
+    Begin
+      FatDelete := 32;                             { fichier ouvert }
+      Exit;
+    End;
+  DirErase(V, FfDirClus, FfIdx, FfNEnt);
+  FatFreeChain(V, FfClus);
+  FatFlush;
+  FatDelete := 0;
+End;
+
+{ Renommer / deplacer (meme volume) }
+Function FatRename(Const Src, Dst, Orig : String) : LongInt;
+Var V, P, Attr, Clus, Size, Time, Dir, Idx, NEnt, A, Sec : LongInt;
+Begin
+  FatRename := 2;
+  V := FatVolOf(Src);
+  If (V < 0) Or (FatVolOf(Dst) <> V) Then
+  Begin
+    If V >= 0 Then FatRename := 17;                { autre volume }
+    Exit;
+  End;
+  If Not FatResolve(V, Src) Or (FfIdx < 0) Then Exit;
+  Attr := FfAttr; Clus := FfClus; Size := FfSize; Time := FfTime;
+  Dir := FfDirClus; Idx := FfIdx; NEnt := FfNEnt;
+  If FatResolve(V, Dst) Then
+  Begin
+    FatRename := 183;
+    Exit;
+  End;
+  P := FatDirClus(V, ParentDir(Dst));
+  If P < 0 Then
+  Begin
+    FatRename := 3;
+    Exit;
+  End;
+  If Not DirCreate(V, P, DispName(Dst, Orig), Attr, Clus) Then
+  Begin
+    FatRename := 112;
+    Exit;
+  End;
+  EntSet(V, FfDirClus, FfIdx, Clus, Size, False);
+  A := DirEnt(V, FfDirClus, FfIdx, Sec, False);
+  MemW[0:A + 22] := Time And $FFFF; MemW[0:A + 24] := (Time Shr 16) And $FFFF;
+  VPut(V, Sec);
+  DirErase(V, Dir, Idx, NEnt);
+  { repertoire deplace : mettre a jour son entree .. }
+  If ((Attr And $10) <> 0) And (Dir <> P) And ClusOk(V, Clus) Then
+  Begin
+    A := DirEnt(V, Clus, 1, Sec, False);
+    If (A <> 0) And (Mem[0:A] = 46) And (Mem[0:A + 1] = 46) Then
+    Begin
+      If P = RootOf(V) Then P := 0;
+      MemW[0:A + 26] := P And $FFFF;
+      If VolType[V] = 32 Then MemW[0:A + 20] := (P Shr 16) And $FFFF;
+      VPut(V, Sec);
+    End;
+  End;
+  DcVol := -1;
+  FatFlush;
+  FatRename := 0;
+End;
+
+{ Ouvrir un fichier : indice de fichier ouvert, ou -1 (Err) }
+Function FatOpen(Const Path, Orig : String; Wr : Boolean;
+                 Disp : LongInt; Var Err : LongInt) : LongInt;
+Var V, F, I, P : LongInt; Ex : Boolean;
+Begin
+  FatOpen := -1;
+  V := FatVolOf(Path);
+  Err := 3;
+  If V < 0 Then Exit;
+  Ex := FatResolve(V, Path);
+  If Ex And ((FfAttr And $10) <> 0) Then
+  Begin
+    Err := 5;
+    Exit;
+  End;
+  If Ex And (Disp = 1) Then
+  Begin
+    Err := 80;                                     { existe deja }
+    Exit;
+  End;
+  If Not Ex And ((Disp = 3) Or (Disp = 5)) Then
+  Begin
+    Err := 2;
+    If FatDirClus(V, ParentDir(Path)) < 0 Then Err := 3;
+    Exit;
+  End;
+  If Ex And Wr And ((FfAttr And 1) <> 0) Then
+  Begin
+    Err := 5;                                      { lecture seule }
+    Exit;
+  End;
+  F := -1;
+  For I := MaxFo - 1 DownTo 0 Do If Not FoUsed[I] Then F := I;
+  If F < 0 Then
+  Begin
+    Err := 4;
+    Exit;
+  End;
+  If Not Ex Then
+  Begin
+    P := FatDirClus(V, ParentDir(Path));
+    If P < 0 Then Exit;
+    If Not DirCreate(V, P, DispName(Path, Orig), $20, 0) Then
+    Begin
+      Err := 112;
+      Exit;
+    End;
+  End;
+  FoUsed[F] := True;
+  FoVol[F] := V; FoClus[F] := FfClus; FoSize[F] := FfSize;
+  FoDir[F] := FfDirClus; FoIdx[F] := FfIdx; FoTime[F] := FfTime;
+  FoCIdx[F] := -1; FoCClus[F] := 0;
+  FoDirty[F] := Not Ex;
+  If Ex And ((Disp = 2) Or (Disp = 5)) And (FoSize[F] > 0) Then
+  Begin
+    FatFreeChain(V, FoClus[F]);
+    FoClus[F] := 0; FoSize[F] := 0;
+    EntSet(V, FoDir[F], FoIdx[F], 0, 0, True);
+    FoDirty[F] := True;
+  End;
+  Err := 0;
+  FatOpen := F;
+End;
+
+{ Cluster d'indice K du fichier F (Grow : allonger la chaine) ; 0 sinon }
+Function FoClusAt(F, K : LongInt; Grow : Boolean) : LongInt;
+Var V, I, C, N : LongInt;
+Begin
+  FoClusAt := 0;
+  V := FoVol[F];
+  If FoClus[F] = 0 Then
+  Begin
+    If Not Grow Then Exit;
+    C := FatAlloc(V, 0, False);
+    If C = 0 Then Exit;
+    FoClus[F] := C;
+    EntSet(V, FoDir[F], FoIdx[F], C, FoSize[F], True);
+  End;
+  If (FoCIdx[F] >= 0) And (FoCIdx[F] <= K) Then
+  Begin
+    I := FoCIdx[F]; C := FoCClus[F];
+  End
+  Else
+  Begin
+    I := 0; C := FoClus[F];
+  End;
+  While I < K Do
+  Begin
+    N := FatGet(V, C);
+    If Not ClusOk(V, N) Then
+    Begin
+      If Not Grow Then Exit;
+      N := FatAlloc(V, C, False);
+      If N = 0 Then Exit;
+    End;
+    C := N;
+    Inc(I);
+  End;
+  FoCIdx[F] := K; FoCClus[F] := C;
+  FoClusAt := C;
+End;
+
+Function FatRead(F, Pos0, N, Dst : LongInt) : LongInt;
+Var CB, Done, K, Off, L, C : LongInt;
+Begin
+  If Pos0 + N > FoSize[F] Then N := FoSize[F] - Pos0;
+  If N < 0 Then N := 0;
+  CB := ClusBytes(FoVol[F]);
+  Done := 0;
+  While Done < N Do
+  Begin
+    K := (Pos0 + Done) Div CB;
+    Off := (Pos0 + Done) Mod CB;
+    L := Min(N - Done, CB - Off);
+    C := FoClusAt(F, K, False);
+    If C = 0 Then Break;
+    ClusIo(FoVol[F], C, Off, L, Dst + Done, False);
+    Done := Done + L;
+  End;
+  FatRead := Done;
+End;
+
+Function FatWrite(F, Pos0, N, Src : LongInt) : LongInt;
+Var CB, Done, K, Off, L, C, Z : LongInt;
+Begin
+  FatWrite := -1;
+  { ecriture au-dela de la fin : remplir l'intervalle de zeros }
+  While FoSize[F] < Pos0 Do
+  Begin
+    Z := Min(Pos0 - FoSize[F], 32768);
+    If FatWrite(F, FoSize[F], Z, FatZero) < Z Then Exit;
+  End;
+  CB := ClusBytes(FoVol[F]);
+  Done := 0;
+  While Done < N Do
+  Begin
+    K := (Pos0 + Done) Div CB;
+    Off := (Pos0 + Done) Mod CB;
+    L := Min(N - Done, CB - Off);
+    C := FoClusAt(F, K, True);
+    If C = 0 Then Break;
+    ClusIo(FoVol[F], C, Off, L, Src + Done, True);
+    Done := Done + L;
+  End;
+  If Pos0 + Done > FoSize[F] Then FoSize[F] := Pos0 + Done;
+  EntSet(FoVol[F], FoDir[F], FoIdx[F], FoClus[F], FoSize[F], True);
+  FoDirty[F] := True;
+  FatWrite := Done;
+End;
+
+{ Fixer la taille du fichier (troncature ou extension) }
+Function FatSetSize(F, NewSize : LongInt) : Boolean;
+Var V, CB, K, C, N : LongInt;
+Begin
+  FatSetSize := True;
+  If NewSize = FoSize[F] Then Exit;
+  If NewSize > FoSize[F] Then
+  Begin
+    FatSetSize := FatWrite(F, NewSize, 0, FatZero) >= 0;
+    Exit;
+  End;
+  V := FoVol[F];
+  CB := ClusBytes(V);
+  K := (NewSize + CB - 1) Div CB;
+  If K = 0 Then
+  Begin
+    FatFreeChain(V, FoClus[F]);
+    FoClus[F] := 0;
+  End
+  Else
+  Begin
+    C := FoClusAt(F, K - 1, False);
+    If C <> 0 Then
+    Begin
+      N := FatGet(V, C);
+      FatSet(V, C, FatEoc);
+      If ClusOk(V, N) Then FatFreeChain(V, N);
+    End;
+  End;
+  FoCIdx[F] := -1;
+  FoSize[F] := NewSize;
+  EntSet(V, FoDir[F], FoIdx[F], FoClus[F], NewSize, True);
+  FoDirty[F] := True;
+End;
+
+Procedure FatClose(F : LongInt);
+Begin
+  If (F < 0) Or (F >= MaxFo) Or Not FoUsed[F] Then Exit;
+  FoUsed[F] := False;
+  If FoDirty[F] Then FatFlush;
+End;
+
+{ Fichier entier dans un bloc du tas (0 si erreur) }
+Function FatLoad(Const Path : String; Var Size : LongInt) : LongInt;
+Var F, E, A : LongInt;
+Begin
+  FatLoad := 0;
+  F := FatOpen(Path, '', False, 3, E);
+  If F < 0 Then Exit;
+  Size := FoSize[F];
+  A := KAlloc(Size + 16);
+  If A <> 0 Then
+    If FatRead(F, 0, Size, A) <> Size Then
+    Begin
+      KFree(A);
+      A := 0;
+    End;
+  FoUsed[F] := False;
+  FatLoad := A;
+End;
+
+{ Entree N d'un repertoire (hors . et ..) pour FindFirstFile et
+  l'Explorateur }
+Function FatDirEntry(Const Dir : String; N : LongInt; Var Idx : LongInt)
+  : Boolean;
+Var V, C, K : LongInt;
+Begin
+  FatDirEntry := False;
+  V := FatVolOf(Dir);
+  If V < 0 Then Exit;
+  C := FatDirClus(V, Dir);
+  If C < 0 Then Exit;
+  K := 0;
+  While DirNext(V, C, Idx) Do
+    If (FfShort <> '.') And (FfShort <> '..') Then
+    Begin
+      FatDirEntry := True;
+      Exit;
+    End;
+End;
+
+{ Espace libre et total d'un volume (en clusters) }
+Procedure FatSpace(V : LongInt; Var Free0, Total, Spc : LongInt);
+Begin
+  If VolFree[V] < 0 Then FatCountFree(V);
+  Free0 := VolFree[V]; Total := VolClus[V]; Spc := VolSpc[V];
+End;
+
+{ ------------------------------------------------------------------ }
+{ Formatage FAT32 d'un disque vierge (une partition sur tout le disque) }
+{ ------------------------------------------------------------------ }
+
+Function FatFormat(D : LongInt; Const Lab : String) : Boolean;
+Var Start, Secs, Spc, Rsvd, FatSz, A, B, K, T, Mb : LongInt; S : String;
+Begin
+  FatFormat := False;
+  Start := 2048;
+  Secs := DiskSecs[D] - Start;
+  Mb := DiskSecs[D] Div 2048;
+  If Mb < 40 Then Exit;
+  If Mb <= 260 Then Spc := 1
+  Else If Mb <= 8192 Then Spc := 8
+  Else If Mb <= 16384 Then Spc := 16
+  Else If Mb <= 32768 Then Spc := 32
+  Else Spc := 64;
+  Rsvd := 32;
+  T := (256 * Spc + 2) Div 2;
+  FatSz := (Secs - Rsvd + T - 1) Div T;
+  KLog('FAT32 : formatage du disque ' + IntStr(D) + ' (' + IntStr(Mb) +
+       ' Mo, clusters de ' + IntStr(Spc * 512) + ' octets)');
+  A := FatScratch;
+  { table de partitions : une partition FAT32 (LBA) active }
+  FillMem(A, 512, 0);
+  Mem[0:A] := $CD; Mem[0:A + 1] := $18;              { int 18h }
+  B := A + 446;
+  Mem[0:B] := $80; Mem[0:B + 1] := $FE; Mem[0:B + 2] := $FF;
+  Mem[0:B + 3] := $FF; Mem[0:B + 4] := $0C; Mem[0:B + 5] := $FE;
+  Mem[0:B + 6] := $FF; Mem[0:B + 7] := $FF;
+  MemL[0:B + 8] := Start; MemL[0:B + 12] := Secs;
+  MemW[0:A + 510] := $AA55;
+  If Not HdWrite(D, 0, 1, A) Then Exit;
+  { zones reservees et FAT }
+  K := 0;
+  While K < Rsvd + 2 * FatSz + Spc Do
+  Begin
+    T := Min(64, Rsvd + 2 * FatSz + Spc - K);
+    If Not HdWrite(D, Start + K, T, FatZero) Then Exit;
+    K := K + T;
+  End;
+  { secteur d'amorce (BPB FAT32) }
+  FillMem(A, 512, 0);
+  Mem[0:A] := $EB; Mem[0:A + 1] := $58; Mem[0:A + 2] := $90;
+  S := 'MSWIN4.1';
+  For K := 1 To 8 Do Mem[0:A + 2 + K] := Ord(S[K]);
+  MemW[0:A + 11] := 512; Mem[0:A + 13] := Spc; MemW[0:A + 14] := Rsvd;
+  Mem[0:A + 16] := 2; Mem[0:A + 21] := $F8;
+  MemW[0:A + 24] := 63; MemW[0:A + 26] := 255;
+  MemL[0:A + 28] := Start; MemL[0:A + 32] := Secs;
+  MemL[0:A + 36] := FatSz; MemL[0:A + 44] := 2;
+  MemW[0:A + 48] := 1; MemW[0:A + 50] := 6;
+  Mem[0:A + 64] := $80; Mem[0:A + 66] := $29;
+  MemL[0:A + 67] := DosNow;
+  FillMem(A + 71, 11, 32);
+  For K := 1 To Min(Length(Lab), 11) Do Mem[0:A + 70 + K] := Ord(Lab[K]);
+  S := 'FAT32   ';
+  For K := 1 To 8 Do Mem[0:A + 81 + K] := Ord(S[K]);
+  Mem[0:A + 90] := $CD; Mem[0:A + 91] := $18;        { int 18h }
+  MemW[0:A + 510] := $AA55;
+  If Not HdWrite(D, Start, 1, A) Then Exit;
+  If Not HdWrite(D, Start + 6, 1, A) Then Exit;
+  { FSInfo }
+  FillMem(A, 512, 0);
+  MemL[0:A] := $41615252; MemL[0:A + 484] := $61417272;
+  MemL[0:A + 488] := (Secs - Rsvd - 2 * FatSz) Div Spc - 1;
+  MemL[0:A + 492] := 3;
+  MemW[0:A + 510] := $AA55;
+  If Not HdWrite(D, Start + 1, 1, A) Then Exit;
+  If Not HdWrite(D, Start + 7, 1, A) Then Exit;
+  { FAT : entrees 0, 1 et racine (cluster 2) }
+  FillMem(A, 512, 0);
+  MemL[0:A] := $0FFFFFF8; MemL[0:A + 4] := $0FFFFFFF;
+  MemL[0:A + 8] := $0FFFFFFF;
+  If Not HdWrite(D, Start + Rsvd, 1, A) Then Exit;
+  If Not HdWrite(D, Start + Rsvd + FatSz, 1, A) Then Exit;
+  { etiquette dans la racine }
+  If Lab <> '' Then
+  Begin
+    FillMem(A, 512, 0);
+    FillMem(A, 11, 32);
+    For K := 1 To Min(Length(Lab), 11) Do Mem[0:A + K - 1] := Ord(Lab[K]);
+    Mem[0:A + 11] := 8;
+    T := DosNow;
+    MemW[0:A + 22] := T And $FFFF; MemW[0:A + 24] := (T Shr 16) And $FFFF;
+    If Not HdWrite(D, Start + Rsvd + 2 * FatSz, 1, A) Then Exit;
+  End;
+  HdFlush(D);
+  SecInval(D, 0, DiskSecs[D]);
+  DiskScan(D);
+  FatWinDirs;
+  FatFormat := VolN > 0;
+End;
 { ==================================================================== }
 { Partie 4 - Graphisme 8 bits, palette, police, composition, pointeur  }
 { ==================================================================== }
@@ -5128,8 +6818,37 @@ Begin
   End;
 End;
 
+Var
+  FmtAskW : LongInt;          { boite ? formater le disque ? ? }
+
+{ Formater le disque dur 0 en FAT32 (reponse Oui) }
+Procedure FormatDisk0;
+Var I : LongInt;
+Begin
+  If FatFormat(0, 'PASDOWS') Then
+    MsgBoxOpen(L('Formatage', 'Format', 'Formatieren', 'Formattazione',
+      'Formatear'), L('Le disque C: est format'#130' (FAT32).',
+      'Drive C: has been formatted (FAT32).',
+      'Laufwerk C: wurde formatiert (FAT32).',
+      'L''unit'#133' C: '#138' stata formattata (FAT32).',
+      'La unidad C: ha sido formateada (FAT32).'), $40)
+  Else
+    MsgBoxOpen(L('Formatage', 'Format', 'Formatieren', 'Formattazione',
+      'Formatear'), L('Impossible de formater le disque.',
+      'Unable to format the disk.', 'Formatieren nicht m'#148'glich.',
+      'Impossibile formattare il disco.',
+      'No se puede formatear el disco.'), $10);
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds[I].Used And (Wnds[I].IKind = ikExplorer) Then KRepaint(I);
+End;
+
 Procedure MsgBoxEnd(W, Res : LongInt);
 Begin
+  If (W = FmtAskW) And (FmtAskW >= 0) Then
+  Begin
+    FmtAskW := -1;
+    If Res = IDYES Then FormatDisk0;
+  End;
   Wnds[W].K1 := Res;
   Wnds[W].DlgEnded := True;
   ShowW(W, False, False);
@@ -5218,21 +6937,62 @@ Begin
   ExpDirLba := IsoLookup(Copy(Wnds[W].KS, 3, 255), Lba, Size, Fl, Tm);
 End;
 
+Var
+  ExpCW, ExpCI, ExpCIdx : LongInt;      { parcours FAT en cours }
+  ExpCS : String[127];
+
 Function ExpEntry(W, I : LongInt; Var Nm : String; Var Fl, Size : LongInt)
   : Boolean;
-Var DL, DS, Lba, Tm : LongInt;
+Var DL, DS, Lba, Tm, V, Idx, K : LongInt; Ok : Boolean;
 Begin
   ExpEntry := False;
   If Wnds[W].KS = '' Then
   Begin
+    { lecteurs : C:, D: (CD-ROM), puis les autres volumes FAT }
+    Fl := 2; Size := 0;
     If I = 0 Then
     Begin
-      Nm := '(C:)'; Fl := 2; Size := 0; ExpEntry := True;
+      If VolN > 0 Then Nm := Trim(VolLab[0] + ' (C:)') Else Nm := '(C:)';
+      ExpEntry := True;
     End
     Else If I = 1 Then
     Begin
-      Nm := VolLabel + ' (D:)'; Fl := 2; Size := 0; ExpEntry := True;
+      Nm := VolLabel + ' (D:)'; ExpEntry := True;
+    End
+    Else If I < VolN + 1 Then
+    Begin
+      V := I - 1;
+      Nm := Trim(VolLab[V] + ' (' + Chr(VolLetter[V]) + ':)');
+      ExpEntry := True;
     End;
+    Exit;
+  End;
+  If FatVolOf(Wnds[W].KS) >= 0 Then
+  Begin
+    { volume FAT : reprendre le parcours precedent si possible }
+    If (ExpCW = W) And (ExpCS = Wnds[W].KS) And (ExpCI < I) Then
+    Begin
+      K := ExpCI; Idx := ExpCIdx;
+    End
+    Else
+    Begin
+      K := -1; Idx := 0;
+    End;
+    Ok := True;
+    While Ok And (K < I) Do
+    Begin
+      Ok := FatDirEntry(Wnds[W].KS, 0, Idx);
+      Inc(K);
+    End;
+    If Not Ok Then
+    Begin
+      ExpCW := -1;
+      Exit;
+    End;
+    ExpCW := W; ExpCS := Wnds[W].KS; ExpCI := I; ExpCIdx := Idx;
+    Nm := FfName; Size := FfSize;
+    If (FfAttr And $10) <> 0 Then Fl := 2 Else Fl := 0;
+    ExpEntry := True;
     Exit;
   End;
   If Not ExpDirLba(W, DL, DS) Then Exit;
@@ -5242,9 +7002,10 @@ End;
 Function ExpIcon(Nm : String; Fl : LongInt) : LongInt;
 Var E : String;
 Begin
-  E := Copy(Nm, Pos('.', Nm) + 1, 3);
-  If Nm = '(C:)' Then ExpIcon := icHardDisk
-  Else If Pos('(D:)', Nm) > 0 Then ExpIcon := icCdrom
+  E := UpStr(Copy(Nm, Pos('.', Nm) + 1, 3));
+  If Pos('(D:)', Nm) > 0 Then ExpIcon := icCdrom
+  Else If (Pos(':)', Nm) > 0) And (Nm[Length(Nm)] = ')') Then
+    ExpIcon := icHardDisk
   Else If (Fl And 2) <> 0 Then ExpIcon := icFolder
   Else If (E = 'EXE') Or (E = 'COM') Then ExpIcon := icApp
   Else If (E = 'TXT') Or (E = 'BAT') Or (E = 'INI') Or (E = 'SYS') Then
@@ -5302,7 +7063,26 @@ Begin
   If Not ExpEntry(W, I, Nm, Fl, Size) Then Exit;
   If Wnds[W].KS = '' Then
   Begin
-    If I = 0 Then
+    If (I = 0) And (VolN = 0) And (DiskN > 0) Then
+    Begin
+      { disque dur sans volume FAT : proposer de le formater }
+      FmtAskW := MsgBoxOpen(L('Poste de travail', 'My Computer',
+        'Arbeitsplatz', 'Risorse del computer', 'Mi PC'), L(
+        'Le disque dur (' + IntStr(DiskSecs[0] Div 2048) + ' Mo) n''est ' +
+        'pas format'#130'. Voulez-vous le formater en FAT32 ? Toutes ses ' +
+        'donn'#130'es seront effac'#130'es.',
+        'The hard disk (' + IntStr(DiskSecs[0] Div 2048) + ' MB) is not ' +
+        'formatted. Do you want to format it (FAT32)? All data on it ' +
+        'will be erased.',
+        'Die Festplatte ist nicht formatiert. Jetzt mit FAT32 ' +
+        'formatieren? Alle Daten werden gel'#148'scht.',
+        'Il disco non '#138' formattato. Formattarlo in FAT32? Tutti i dati ' +
+        'verranno cancellati.',
+        'El disco no est'#160' formateado. '#168'Desea formatearlo en FAT32? ' +
+        'Se borrar'#160'n todos los datos.'), $34);
+      Exit;
+    End;
+    If (I = 0) And (VolN = 0) Then
     Begin
       MsgBoxOpen(L('Poste de travail', 'My Computer', 'Arbeitsplatz',
                    'Risorse del computer', 'Mi PC'), L(
@@ -5313,7 +7093,9 @@ Begin
         'C: es un disco virtual en memoria.'), $40);
       Exit;
     End;
-    Wnds[W].KS := 'D:';
+    If I = 0 Then Wnds[W].KS := 'C:'
+    Else If I = 1 Then Wnds[W].KS := 'D:'
+    Else Wnds[W].KS := Chr(VolLetter[I - 1]) + ':';
   End
   Else
   Begin
@@ -5797,6 +7579,7 @@ End;
 Procedure DoShutdown(Mode : LongInt);
 Var A, B : String;
 Begin
+  FatFlush;
   CursorErase;
   SetTarget(Back, 0, 0);
   FBar(0, 0, ScrW - 1, ScrH - 1, cBlack);
@@ -6921,8 +8704,24 @@ End;
 
 { Ouvrir un fichier ; Disp : 1 CREATE_NEW 2 CREATE_ALWAYS 3 OPEN_EXISTING
   4 OPEN_ALWAYS 5 TRUNCATE_EXISTING ; poignee ou -1 }
+{ Nom de base tel que le programme l'a ecrit (casse conservee) }
+Function OrigBase(Const Name : String) : String;
+Var P, E, I : LongInt; R : String;
+Begin
+  E := Length(Name);
+  While (E > 0) And ((Name[E] <= ' ') Or (Name[E] = '\') Or
+        (Name[E] = '/')) Do Dec(E);
+  P := E;
+  While (P > 0) And (Name[P] <> '\') And (Name[P] <> '/') And
+        (Name[P] <> ':') Do Dec(P);
+  R := '';
+  For I := P + 1 To E Do R := R + Name[I];
+  OrigBase := R;
+End;
+
 Function KOpenFile(Name : String; Wr : Boolean; Disp : LongInt) : LongInt;
-Var Path : String; Attr, Size, Time, Lba, Ram, I : LongInt; Ex : Boolean;
+Var Path, Ob : String; Attr, Size, Time, Lba, Ram, I, F, E : LongInt;
+    Ex : Boolean;
 Begin
   KOpenFile := INVALID_HANDLE;
   If (UpStr(Name) = 'CON') Or (UpStr(Name) = 'CONOUT$') Then
@@ -6930,8 +8729,46 @@ Begin
     KOpenFile := HStdOut;
     Exit;
   End;
-  If (UpStr(Name) = 'NUL') Then Name := 'C:\NUL';
+  If (UpStr(Name) = 'NUL') Or (UpStr(Name) = 'C:\NUL') Then
+  Begin
+    { peripherique nul : lectures vides, ecritures ignorees }
+    I := KObjNew(koFile);
+    If I < 0 Then Exit;
+    KObjs[I].F1 := -1; KObjs[I].F4 := -2; KObjs[I].F5 := 1;
+    KObjs[I].Name := 'NUL';
+    KOpenFile := KHandle(I);
+    Exit;
+  End;
   Path := FullPath(Name);
+  If FatVolOf(Path) >= 0 Then
+  Begin
+    { volume FAT d'un disque dur }
+    Ob := OrigBase(Name);
+    F := FatOpen(Path, Ob, Wr, Disp, E);
+    If ApiTrace Then KLog('Fichier FAT : ' + Path + ' -> ' + IntStr(F));
+    If F < 0 Then
+    Begin
+      SetErr(E);
+      Exit;
+    End;
+    I := KObjNew(koFile);
+    If I < 0 Then
+    Begin
+      FatClose(F);
+      SetErr(4);
+      Exit;
+    End;
+    KObjs[I].F1 := -1;
+    KObjs[I].F2 := FoSize[F];
+    KObjs[I].F3 := 0;
+    KObjs[I].F4 := -1000 - F;
+    KObjs[I].F5 := Ord(Wr);
+    KObjs[I].F6 := FoTime[F];
+    KObjs[I].Name := Path;
+    If (Disp = 4) And Not FoDirty[F] Then SetErr(183) Else SetErr(0);
+    KOpenFile := KHandle(I);
+    Exit;
+  End;
   Ex := PathInfo(Path, Attr, Size, Time, Lba, Ram);
   If ApiTrace Then KLog('Fichier : ' + Path + ' existe=' + IntStr(Ord(Ex)));
   If Ex And ((Attr And $10) <> 0) Then
@@ -7023,6 +8860,8 @@ Begin
     { la tache continue ; l'objet sera libere a sa fin }
     If (KObjs[I].F1 >= 0) And Threads[KObjs[I].F1].Used Then Exit;
   End;
+  If (KObjs[I].Kind = koFile) And (KObjs[I].F4 <= -1000) Then
+    FatClose(-1000 - KObjs[I].F4);
   KObjs[I].Used := False;
 End;
 
@@ -7037,6 +8876,17 @@ Begin
     Exit;
   End;
   If N < 0 Then N := 0;
+  If KObjs[I].F4 <= -1000 Then
+  Begin
+    R := -1000 - KObjs[I].F4;
+    FatIoErr := False;
+    Got := FatRead(R, KObjs[I].F3, N, Buf);
+    KObjs[I].F3 := KObjs[I].F3 + Got;
+    KObjs[I].F2 := FoSize[R];
+    If FatIoErr Then SetErr(30);
+    KReadFile := Not FatIoErr;
+    Exit;
+  End;
   If KObjs[I].F3 + N > KObjs[I].F2 Then N := KObjs[I].F2 - KObjs[I].F3;
   If N < 0 Then N := 0;
   R := KObjs[I].F4;
@@ -7073,6 +8923,27 @@ Begin
     Exit;
   End;
   I := KObjOf(H, koFile);
+  If (I >= 0) And (KObjs[I].F4 = -2) Then
+  Begin
+    KWriteFile := N;                               { NUL }
+    Exit;
+  End;
+  If (I >= 0) And (KObjs[I].F4 <= -1000) And (KObjs[I].F5 <> 0) Then
+  Begin
+    R := -1000 - KObjs[I].F4;
+    FatIoErr := False;
+    E := FatWrite(R, KObjs[I].F3, N, Buf);
+    If E < 0 Then E := 0;
+    KObjs[I].F3 := KObjs[I].F3 + E;
+    KObjs[I].F2 := FoSize[R];
+    If (E < N) Or FatIoErr Then
+    Begin
+      If FatIoErr Then SetErr(29) Else SetErr(112);
+      If E = 0 Then Exit;
+    End;
+    KWriteFile := E;
+    Exit;
+  End;
   If (I < 0) Or (KObjs[I].F4 < 0) Then
   Begin
     SetErr(ErrAccessDenied);
@@ -7143,6 +9014,17 @@ Var I : LongInt;
 Begin
   SetEndOfFile := 0;
   I := KObjOf(H, koFile);
+  If (I >= 0) And (KObjs[I].F4 <= -1000) And (KObjs[I].F5 <> 0) Then
+  Begin
+    If Not FatSetSize(-1000 - KObjs[I].F4, KObjs[I].F3) Then
+    Begin
+      SetErr(112);
+      Exit;
+    End;
+    KObjs[I].F2 := KObjs[I].F3;
+    SetEndOfFile := 1;
+    Exit;
+  End;
   If (I < 0) Or (KObjs[I].F4 < 0) Then Exit;
   RamFiles[KObjs[I].F4].Size := KObjs[I].F3;
   KObjs[I].F2 := KObjs[I].F3;
@@ -7194,10 +9076,17 @@ Begin
 End;
 
 Function DeleteFileA(PName : LongInt) : LongInt;
-Var R : LongInt;
+Var R : LongInt; S : String;
 Begin
   DeleteFileA := 0;
-  R := RamFind(FullPath(PStr(PName)));
+  S := FullPath(PStr(PName));
+  If FatVolOf(S) >= 0 Then
+  Begin
+    R := FatDelete(S);
+    If R <> 0 Then SetErr(R) Else DeleteFileA := 1;
+    Exit;
+  End;
+  R := RamFind(S);
   If R < 0 Then
   Begin
     SetErr(ErrFileNotFound);
@@ -7209,12 +9098,20 @@ Begin
 End;
 
 Function CreateDirectoryA(PName, Sec : LongInt) : LongInt;
-Var S : String; R, Attr, Size, Time, Lba, Ram : LongInt;
+Var S, Ob : String; R, Attr, Size, Time, Lba, Ram : LongInt;
 Begin
   CreateDirectoryA := 0;
   S := FullPath(PStr(PName));
   If Length(S) > 3 Then
     If S[Length(S)] = '\' Then S := Copy(S, 1, Length(S) - 1);
+  If FatVolOf(S) >= 0 Then
+  Begin
+    Ob := PStr(PName);
+    Ob := OrigBase(Ob);
+    R := FatMkDir(S, Ob);
+    If R <> 0 Then SetErr(R) Else CreateDirectoryA := 1;
+    Exit;
+  End;
   If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
   Begin
     SetErr(183);
@@ -7245,6 +9142,12 @@ Var S : String; R, I : LongInt;
 Begin
   RemoveDirectoryA := 0;
   S := FullPath(PStr(PName));
+  If FatVolOf(S) >= 0 Then
+  Begin
+    R := FatRmDir(S);
+    If R <> 0 Then SetErr(R) Else RemoveDirectoryA := 1;
+    Exit;
+  End;
   R := RamFind(S);
   If (R < 0) Or (RamFiles[R].Attr <> $10) Then
   Begin
@@ -7262,16 +9165,58 @@ Begin
 End;
 
 Function MoveFileA(PSrc, PDst : LongInt) : LongInt;
-Var R : LongInt;
+Var R, A, Size, H, V : LongInt; S, D, Ob : String;
 Begin
   MoveFileA := 0;
-  R := RamFind(FullPath(PStr(PSrc)));
+  S := FullPath(PStr(PSrc)); D := FullPath(PStr(PDst));
+  V := FatVolOf(S);
+  If (V >= 0) And (FatVolOf(D) = V) Then
+  Begin
+    Ob := PStr(PDst);
+    Ob := OrigBase(Ob);
+    R := FatRename(S, D, Ob);
+    If R <> 0 Then SetErr(R) Else MoveFileA := 1;
+    Exit;
+  End;
+  If (V >= 0) Or (FatVolOf(D) >= 0) Then
+  Begin
+    { d'un volume a l'autre : copier puis supprimer }
+    A := LoadWholeFile(S, Size);
+    If A = 0 Then
+    Begin
+      SetErr(ErrFileNotFound);
+      Exit;
+    End;
+    H := KOpenFile(PStr(PDst), True, 1);
+    If H <> INVALID_HANDLE Then
+    Begin
+      R := KWriteFile(H, A, Size);
+      CloseHandle(H);
+      If R = Size Then
+      Begin
+        If V >= 0 Then FatDelete(S)
+        Else
+        Begin
+          R := RamFind(S);
+          If R >= 0 Then
+          Begin
+            If RamFiles[R].Data <> 0 Then KFree(RamFiles[R].Data);
+            RamFiles[R].Used := False;
+          End;
+        End;
+        MoveFileA := 1;
+      End;
+    End;
+    KFree(A);
+    Exit;
+  End;
+  R := RamFind(S);
   If R < 0 Then
   Begin
     SetErr(ErrAccessDenied);
     Exit;
   End;
-  RamFiles[R].Path := FullPath(PStr(PDst));
+  RamFiles[R].Path := D;
   MoveFileA := 1;
 End;
 
@@ -7322,9 +9267,32 @@ Begin
   SetCurrentDirectoryA := 1;
 End;
 
+{ Volume FAT de la racine PRoot (0 : repertoire courant) ; -1 sinon }
+Function RootVol(PRoot : LongInt) : LongInt;
+Var S : String;
+Begin
+  If PRoot = 0 Then S := CurDirS Else S := UpStr(PStr(PRoot));
+  If S = '' Then S := CurDirS;
+  RootVol := FatVolOf(Copy(S, 1, 1) + ':');
+End;
+
 Function GetDiskFreeSpaceA(PRoot, PSpc, PBps, PFree, PTotal : LongInt)
   : LongInt;
+Var V, Fr, Tot, Spc, Mx : LongInt;
 Begin
+  V := RootVol(PRoot);
+  If V >= 0 Then
+  Begin
+    FatSpace(V, Fr, Tot, Spc);
+    { comme Windows 95 : au plus 2 Go annonces }
+    Mx := $7FFF8000 Div (Spc * 512);
+    If PSpc <> 0 Then MemL[0:PSpc] := Spc;
+    If PBps <> 0 Then MemL[0:PBps] := 512;
+    If PFree <> 0 Then MemL[0:PFree] := Min(Fr, Mx);
+    If PTotal <> 0 Then MemL[0:PTotal] := Min(Tot, Mx);
+    GetDiskFreeSpaceA := 1;
+    Exit;
+  End;
   If PSpc <> 0 Then MemL[0:PSpc] := 8;
   If PBps <> 0 Then MemL[0:PBps] := 512;
   If PFree <> 0 Then MemL[0:PFree] := HeapFreeBytes Div 4096;
@@ -7332,11 +9300,48 @@ Begin
   GetDiskFreeSpaceA := 1;
 End;
 
+{ Octets d'un nombre de clusters (64 bits) en P }
+Procedure PutBytes64(P, Clus, Spc : LongInt);
+Var Sh, B : LongInt;
+Begin
+  If P = 0 Then Exit;
+  Sh := 9; B := Spc;
+  While B > 1 Do
+  Begin
+    Inc(Sh);
+    B := B Shr 1;
+  End;
+  MemL[0:P] := Clus Shl Sh;
+  MemL[0:P + 4] := Clus Shr (32 - Sh);
+End;
+
+{ GetDiskFreeSpaceExA (Windows 95 OSR2) : tailles sur 64 bits }
+Function GetDiskFreeSpaceExA(PRoot, PAvail, PTotal, PFree : LongInt)
+  : LongInt;
+Var V, Fr, Tot, Spc : LongInt;
+Begin
+  V := RootVol(PRoot);
+  If V >= 0 Then FatSpace(V, Fr, Tot, Spc)
+  Else
+  Begin
+    Spc := 8; Fr := HeapFreeBytes Div 4096; Tot := MemTop Div 4096;
+  End;
+  PutBytes64(PAvail, Fr, Spc);
+  PutBytes64(PTotal, Tot, Spc);
+  PutBytes64(PFree, Fr, Spc);
+  GetDiskFreeSpaceExA := 1;
+End;
+
 Function GetDriveTypeA(PRoot : LongInt) : LongInt;
 Var S : String;
 Begin
   If PRoot = 0 Then S := CurDirS Else S := UpStr(PStr(PRoot));
   If S = '' Then S := CurDirS;
+  If FatVolOf(Copy(S, 1, 1) + ':') >= 0 Then
+  Begin
+    GetDriveTypeA := 3;
+    Exit;
+  End;
   Case S[1] Of
     'C' : GetDriveTypeA := 3;
     'D' : GetDriveTypeA := 5;
@@ -7346,8 +9351,11 @@ Begin
 End;
 
 Function GetLogicalDrives : LongInt;
+Var V, R : LongInt;
 Begin
-  GetLogicalDrives := 12;
+  R := 12;
+  For V := 0 To VolN - 1 Do R := R Or (1 Shl (VolLetter[V] - 65));
+  GetLogicalDrives := R;
 End;
 
 Function GetWindowsDirectoryA(Buf, N : LongInt) : LongInt;
@@ -7370,10 +9378,22 @@ End;
 
 Function GetVolumeInformationA(PRoot, PVol, VolSize, PSerial, PMaxComp,
   PFlags, PFs, FsSize : LongInt) : LongInt;
-Var D : String;
+Var D : String; V : LongInt;
 Begin
   If PRoot <> 0 Then D := UpStr(PStr(PRoot)) Else D := CurDirS;
-  If (D <> '') And (D[1] = 'C') Then
+  V := FatVolOf(Copy(D, 1, 1) + ':');
+  If V >= 0 Then
+  Begin
+    { volume FAT : noms longs, casse conservee, Unicode sur le disque }
+    If PVol <> 0 Then PutPStr(PVol, VolLab[V], VolSize);
+    If PSerial <> 0 Then MemL[0:PSerial] := VolSerial[V];
+    If PMaxComp <> 0 Then MemL[0:PMaxComp] := 255;
+    If PFlags <> 0 Then MemL[0:PFlags] := 6;
+    If PFs <> 0 Then
+      If VolType[V] = 32 Then PutPStr(PFs, 'FAT32', FsSize)
+      Else PutPStr(PFs, 'FAT', FsSize);
+  End
+  Else If (D <> '') And (D[1] = 'C') Then
   Begin
     { disque en memoire : noms longs (VFAT), casse conservee }
     If PVol <> 0 Then PutPStr(PVol, 'PASDOWS', VolSize);
@@ -7396,9 +9416,36 @@ End;
 { Recherche : F1 position, F2 0 = CD, 1 = disque virtuel ; Name chemin
   du repertoire, Mask masque }
 Function FindStep(I, P : LongInt) : Boolean;
-Var Nm : String; Lba, Size, Fl, Tm, DL, DS, Attr, R : LongInt;
+Var Nm : String; Lba, Size, Fl, Tm, DL, DS, Attr, R, Idx : LongInt;
 Begin
   FindStep := False;
+  If KObjs[I].F2 = 2 Then
+  Begin
+    { volume FAT : noms longs et noms courts }
+    Idx := KObjs[I].F1;
+    While FatDirEntry(KObjs[I].Name, 0, Idx) Do
+    Begin
+      KObjs[I].F1 := Idx;
+      If MatchMask(UpStr(FfName), KObjs[I].Mask) Or
+         MatchMask(UpStr(FfShort), KObjs[I].Mask) Then
+      Begin
+        FillMem(P, 318, 0);
+        Attr := FfAttr And $37;
+        If Attr = 0 Then Attr := $80;
+        MemL[0:P] := Attr;
+        DosToFileTime(FfTime, P + 4);
+        DosToFileTime(FfTime, P + 12);
+        DosToFileTime(FfTime, P + 20);
+        If (FfAttr And $10) = 0 Then MemL[0:P + 32] := FfSize;
+        PutPStr(P + 44, FfName, 260);
+        If FfShort <> FfName Then PutPStr(P + 304, FfShort, 14);
+        FindStep := True;
+        Exit;
+      End;
+    End;
+    KObjs[I].F1 := Idx;
+    Exit;
+  End;
   If KObjs[I].F2 = 0 Then
   Begin
     If Copy(KObjs[I].Name, 1, 2) = 'D:' Then
@@ -7456,6 +9503,7 @@ Begin
   If Length(KObjs[I].Name) = 3 Then
     KObjs[I].Name := Copy(KObjs[I].Name, 1, 2) + '\';
   If KObjs[I].Name = 'D:\' Then KObjs[I].Name := 'D:';
+  If FatVolOf(KObjs[I].Name) >= 0 Then KObjs[I].F2 := 2;
   If FindStep(I, P) Then FindFirstFileA := KHandle(I)
   Else
   Begin
@@ -15780,16 +17828,24 @@ Begin
 End;
 
 Function GetLogicalDriveStringsA(N, Buf : LongInt) : LongInt;
-Var S : String; I : LongInt;
+Var M, I, K : LongInt;
 Begin
-  { C:\<0>D:\<0><0> (octets ecrits un a un : WPC concatene les chaines
-    comme des PChar) }
-  S := 'C:\ D:\  ';
-  GetLogicalDriveStringsA := 8;
-  If N < 9 Then Exit;
-  For I := 1 To 9 Do
-    If S[I] = ' ' Then Mem[0:Buf + I - 1] := 0
-    Else Mem[0:Buf + I - 1] := Ord(S[I]);
+  { X:\<0> pour chaque lecteur, puis <0> }
+  M := GetLogicalDrives;
+  K := 0;
+  For I := 0 To 25 Do
+    If (M And (1 Shl I)) <> 0 Then K := K + 4;
+  GetLogicalDriveStringsA := K;
+  If N < K + 1 Then Exit;
+  K := 0;
+  For I := 0 To 25 Do
+    If (M And (1 Shl I)) <> 0 Then
+    Begin
+      Mem[0:Buf + K] := 65 + I; Mem[0:Buf + K + 1] := 58;
+      Mem[0:Buf + K + 2] := 92; Mem[0:Buf + K + 3] := 0;
+      K := K + 4;
+    End;
+  Mem[0:Buf + K] := 0;
 End;
 
 Function MoveFileExA(PSrc, PDst, Flags : LongInt) : LongInt;
@@ -25274,7 +27330,7 @@ Begin
 End;
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
-exports VideoForWindowsVersion,
+exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   WS_WSAStartup, WS_WSACleanup, WS_WSAGetLastError, WS_WSASetLastError,
   WS_socket, WS_closesocket, WS_bind, WS_listen, WS_accept, WS_connect,
   WS_sendto, WS_recvfrom, WS_send, WS_recv, WS_shutdown, WS_ioctlsocket,
@@ -25546,6 +27602,8 @@ BEGIN
   CurX := ScrW Div 2; CurY := ScrH Div 2;
   AtaInit;
   CdInit;
+  FmtAskW := -1; ExpCW := -1;
+  FatInit;
   CurDirS := 'D:';
   { ApiTrace := True journalise chaque appel d'API d'un programme Win32
     (nom, appelant, arguments, resultat) sur le port serie COM1 }
