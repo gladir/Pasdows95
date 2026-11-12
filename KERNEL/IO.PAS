@@ -6652,7 +6652,7 @@ Begin
   Idx := CdFind('VMM32.VXD');
   If Idx < 0 Then Exit;
   NSectors := (CdFiles[Idx].Size + 2047) Div 2048;
-  If NSectors > 1536 Then Exit;
+  If NSectors > 3072 Then Exit;
   Sector := 0;
   While Sector < NSectors Do
   Begin

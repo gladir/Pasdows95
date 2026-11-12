@@ -86,7 +86,7 @@ Const
   { Tables }
   MaxWnd      = 256;
   MaxClass    = 64;
-  MaxGdi      = 2048;
+  MaxGdi      = 1024;
   MaxKObj     = 256;
   MaxThread   = 16;
   MaxQueue    = 256;
@@ -2918,6 +2918,7 @@ End;
   boites de dialogue...) ont une sorte interne (IKind). }
 
 Const
+  WS_OVERLAPPED = 0;
   WS_POPUP = LongInt($80000000); WS_CHILD = $40000000;
   WS_MINIMIZE = $20000000; WS_VISIBLE = $10000000; WS_DISABLED = $08000000;
   WS_MAXIMIZE = $01000000; WS_CAPTION = $00C00000; WS_BORDER = $00800000;
@@ -8229,12 +8230,23 @@ End;
 Function CreateMutexA(Sec, Own, Name : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  { mutex nomme deja cree : meme objet, ERROR_ALREADY_EXISTS }
+  If Name <> 0 Then
+    For I := 0 To MaxKObj - 1 Do
+      If KObjs[I].Used And (KObjs[I].Kind = koMutex) And
+         (KObjs[I].Name = UpStr(PStr(Name))) Then
+      Begin
+        SetErr(183);
+        CreateMutexA := KHandle(I);
+        Exit;
+      End;
   I := KObjNew(koMutex);
   If I < 0 Then
   Begin
     CreateMutexA := 0;
     Exit;
   End;
+  If Name <> 0 Then KObjs[I].Name := UpStr(PStr(Name));
   If Own <> 0 Then
   Begin
     KObjs[I].F1 := ThreadId(CurT); KObjs[I].F2 := 1;
@@ -14243,21 +14255,231 @@ Begin
   ICLocate := 0;
 End;
 
-{ ADVAPI32 (registre : vide) }
-Function RegOpenKeyExA(K, Sub, Opt, Sam, PR : LongInt) : LongInt;
+{ ------------------------------------------------------------------ }
+{ ADVAPI32 : registre en memoire (cles et valeurs), partage avec les   }
+{ programmes 16 bits (SHELL.DLL). Racines : 80000000h CLASSES_ROOT    }
+{ (1 en Win16), ...01h CURRENT_USER, ...02h LOCAL_MACHINE, ...03h     }
+{ USERS, ...05h CURRENT_CONFIG, ...06h DYN_DATA ; autres cles :       }
+{ poignee 00C00000h + indice.                                         }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxRK = 400;
+  MaxRV = 800;
+  HKBase = $00C00000;
+
+Var
+  RKUsed : Array[0..MaxRK - 1] Of Boolean;
+  RKPar : Array[0..MaxRK - 1] Of LongInt;
+  RKNameP : Array[0..MaxRK - 1] Of LongInt;
+  RVUsed : Array[0..MaxRV - 1] Of Boolean;
+  RVKey, RVType, RVData, RVSize : Array[0..MaxRV - 1] Of LongInt;
+  RVNameP : Array[0..MaxRV - 1] Of LongInt;
+
+{ Noms des cles et valeurs : chaines terminees par zero dans le tas }
+Function RegStrNew(S : String) : LongInt;
+Var A : LongInt;
 Begin
-  RegOpenKeyExA := 2;
+  A := KAlloc(Length(S) + 1);
+  PutPStr(A, S, Length(S) + 1);
+  RegStrNew := A;
+End;
+
+Function RKName(I : LongInt) : String;
+Begin
+  If RKNameP[I] = 0 Then RKName := '' Else RKName := PStr(RKNameP[I]);
+End;
+
+Function RVName(I : LongInt) : String;
+Begin
+  If RVNameP[I] = 0 Then RVName := '' Else RVName := PStr(RVNameP[I]);
+End;
+
+Function RegKeyOf(H : LongInt) : LongInt;
+Begin
+  RegKeyOf := -1;
+  If H = 1 Then RegKeyOf := 0
+  Else If (H >= LongInt($80000000)) And (H <= LongInt($80000006)) Then
+  Begin
+    H := H And 7;
+    If H = 4 Then Exit;
+    If H >= 5 Then H := H - 1;
+    RegKeyOf := H;
+  End
+  Else If (H >= HKBase) And (H < HKBase + MaxRK) Then
+    If RKUsed[H - HKBase] Then RegKeyOf := H - HKBase;
+End;
+
+Function RegChild(K : LongInt; Nm : String; Create : Boolean) : LongInt;
+Var I : LongInt; U : String;
+Begin
+  RegChild := -1;
+  U := UpStr(Nm);
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed[I] And (RKPar[I] = K) And (UpStr(RKName(I)) = U) Then
+    Begin
+      RegChild := I;
+      Exit;
+    End;
+  If Not Create Then Exit;
+  For I := 6 To MaxRK - 1 Do
+    If Not RKUsed[I] Then
+    Begin
+      RKUsed[I] := True; RKPar[I] := K; RKNameP[I] := RegStrNew(Nm);
+      RegChild := I;
+      Exit;
+    End;
+End;
+
+{ Cle Path sous K (creee si Create) ; -1 si absente }
+Function RegWalk(K : LongInt; Path : String; Create : Boolean) : LongInt;
+Var P : LongInt; Part : String;
+Begin
+  RegWalk := -1;
+  If K < 0 Then Exit;
+  While Path <> '' Do
+  Begin
+    P := Pos('\', Path);
+    If P > 0 Then
+    Begin
+      Part := Copy(Path, 1, P - 1); Delete(Path, 1, P);
+    End
+    Else
+    Begin
+      Part := Path; Path := '';
+    End;
+    If Part <> '' Then
+    Begin
+      K := RegChild(K, Part, Create);
+      If K < 0 Then Exit;
+    End;
+  End;
+  RegWalk := K;
+End;
+
+Function RegVal(K : LongInt; Nm : String) : LongInt;
+Var I : LongInt; U : String;
+Begin
+  RegVal := -1;
+  U := UpStr(Nm);
+  For I := 0 To MaxRV - 1 Do
+    If RVUsed[I] And (RVKey[I] = K) And (UpStr(RVName(I)) = U) Then
+    Begin
+      RegVal := I;
+      Exit;
+    End;
+End;
+
+Function RegSetK(K : LongInt; Nm : String; Typ, Data, Size : LongInt)
+  : LongInt;
+Var I, J : LongInt;
+Begin
+  RegSetK := 1;
+  If K < 0 Then Exit;
+  I := RegVal(K, Nm);
+  If I < 0 Then
+    For J := MaxRV - 1 DownTo 0 Do
+      If Not RVUsed[J] Then I := J;
+  If I < 0 Then Exit;
+  If RVUsed[I] And (RVData[I] <> 0) Then KFree(RVData[I]);
+  If Not RVUsed[I] Then RVNameP[I] := RegStrNew(Nm);
+  RVUsed[I] := True; RVKey[I] := K; RVType[I] := Typ;
+  If Size < 0 Then Size := 0;
+  RVData[I] := KAlloc(Size + 2);
+  FillMem(RVData[I], Size + 2, 0);
+  If (Data <> 0) And (Size > 0) Then MoveMem(Data, RVData[I], Size);
+  RVSize[I] := Size;
+  RegSetK := 0;
+End;
+
+Procedure RegSetStr(Path, Nm, V : String);
+Var K : LongInt;
+Begin
+  K := RegWalk(2, Path, True);
+  V := V + #0;
+  RegSetK(K, Nm, 1, LongInt(@V[1]), Length(V));
+End;
+
+Procedure RegDelTree(K : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed[I] And (RKPar[I] = K) And (I <> K) Then RegDelTree(I);
+  For I := 0 To MaxRV - 1 Do
+    If RVUsed[I] And (RVKey[I] = K) Then
+    Begin
+      If RVData[I] <> 0 Then KFree(RVData[I]);
+      RVUsed[I] := False;
+    End;
+  If K >= 6 Then RKUsed[K] := False;
+End;
+
+Procedure RegInit;
+Var I : LongInt; S : String;
+Begin
+  For I := 0 To 5 Do
+  Begin
+    RKUsed[I] := True; RKPar[I] := -1; RKNameP[I] := 0;
+  End;
+  S := 'Software\Microsoft\Windows\CurrentVersion';
+  RegSetStr(S, 'ProgramFilesDir', 'C:\Program Files');
+  RegSetStr(S, 'CommonFilesDir', 'C:\Program Files\Common Files');
+  RegSetStr(S, 'SystemRoot', 'C:\WINDOWS');
+  RegSetStr(S, 'Version', 'Windows 95');
+  RegSetStr(S, 'VersionNumber', '4.00.950');
+  RegSetStr(S, 'ProductName', 'Pasdows 95');
+  RegSetStr(S, 'RegisteredOwner', 'Pasdows');
+  RegSetStr(S, 'RegisteredOrganization', '');
+  RegSetStr(S, 'SourcePath', 'D:\');
+  RegSetStr(S, 'DevicePath', 'C:\WINDOWS\INF');
+  RegSetStr(S, 'MediaPath', 'C:\WINDOWS\MEDIA');
+  RegWalk(2, S + '\App Paths', True);
+  RegWalk(2, S + '\Uninstall', True);
+  RegWalk(2, 'System\CurrentControlSet\Control', True);
+  RegWalk(1, 'Software\Microsoft\Windows\CurrentVersion\Explorer', True);
+  RegWalk(1, 'Control Panel\International', True);
+  S := 'C:\Program Files' + #0;
+  CreateDirectoryA(LongInt(@S[1]), 0);
+  S := 'C:\Program Files\Common Files' + #0;
+  CreateDirectoryA(LongInt(@S[1]), 0);
 End;
 
 Function RegOpenKeyA(K, Sub, PR : LongInt) : LongInt;
+Var I : LongInt;
 Begin
   RegOpenKeyA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), False);
+  If I < 0 Then Exit;
+  If PR <> 0 Then MemL[0:PR] := HKBase + I;
+  RegOpenKeyA := 0;
+End;
+
+Function RegOpenKeyExA(K, Sub, Opt, Sam, PR : LongInt) : LongInt;
+Begin
+  RegOpenKeyExA := RegOpenKeyA(K, Sub, PR);
+End;
+
+Function RegCreateKeyExA(K, Sub, Res, Cls, Opt, Sam, Sec, PR, PDisp
+  : LongInt) : LongInt;
+Var I, J : LongInt;
+Begin
+  RegCreateKeyExA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then
+  Begin
+    J := RegWalk(I, PStr(Sub), False);
+    If PDisp <> 0 Then MemL[0:PDisp] := 1 + Ord(J >= 0);
+    I := RegWalk(I, PStr(Sub), True);
+  End;
+  If I < 0 Then Exit;
+  If PR <> 0 Then MemL[0:PR] := HKBase + I;
+  RegCreateKeyExA := 0;
 End;
 
 Function RegCreateKeyA(K, Sub, PR : LongInt) : LongInt;
 Begin
-  If PR <> 0 Then MemL[0:PR] := $4321;
-  RegCreateKeyA := 0;
+  RegCreateKeyA := RegCreateKeyExA(K, Sub, 0, 0, 0, 0, 0, PR, 0);
 End;
 
 Function RegCloseKey(K : LongInt) : LongInt;
@@ -14265,14 +14487,196 @@ Begin
   RegCloseKey := 0;
 End;
 
-Function RegQueryValueExA(K, N, R, PT, PD, PN : LongInt) : LongInt;
+Function RegFlushKey(K : LongInt) : LongInt;
 Begin
-  RegQueryValueExA := 2;
+  RegFlushKey := 0;
+End;
+
+Function RegDeleteKeyA(K, Sub : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RegDeleteKeyA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), False);
+  If I < 6 Then Exit;
+  RegDelTree(I);
+  RegDeleteKeyA := 0;
 End;
 
 Function RegSetValueExA(K, N, R, T, D, Sz : LongInt) : LongInt;
+Var Nm : String;
 Begin
-  RegSetValueExA := 0;
+  If N = 0 Then Nm := '' Else Nm := PStr(N);
+  If (T = 1) Or (T = 2) Then
+    If (Sz = 0) And (D <> 0) Then Sz := StrLenZ(D) + 1;
+  RegSetValueExA := RegSetK(RegKeyOf(K), Nm, T, D, Sz);
+End;
+
+Function RegQueryValueExA(K, N, R, PT, PD, PN : LongInt) : LongInt;
+Var I, V : LongInt; Nm : String;
+Begin
+  RegQueryValueExA := 2;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  If N = 0 Then Nm := '' Else Nm := PStr(N);
+  V := RegVal(I, Nm);
+  If V < 0 Then Exit;
+  If PT <> 0 Then MemL[0:PT] := RVType[V];
+  RegQueryValueExA := 0;
+  If PN = 0 Then Exit;
+  If PD <> 0 Then
+  Begin
+    If MemL[0:PN] < RVSize[V] Then RegQueryValueExA := 234
+    Else MoveMem(RVData[V], PD, RVSize[V]);
+  End;
+  MemL[0:PN] := RVSize[V];
+End;
+
+Function RegSetValueA(K, Sub, T, D, Len : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RegSetValueA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), True);
+  If (I < 0) Or (D = 0) Then Exit;
+  RegSetValueA := RegSetK(I, '', 1, D, StrLenZ(D) + 1);
+End;
+
+Function RegQueryValueA(K, Sub, PD, PN : LongInt) : LongInt;
+Var I, V, N : LongInt;
+Begin
+  RegQueryValueA := 2;
+  I := RegKeyOf(K);
+  If (I >= 0) And (Sub <> 0) Then I := RegWalk(I, PStr(Sub), False);
+  If I < 0 Then Exit;
+  V := RegVal(I, '');
+  RegQueryValueA := 0;
+  If V < 0 Then N := 1 Else N := RVSize[V];
+  If (PD <> 0) And (PN <> 0) Then
+  Begin
+    If MemL[0:PN] < N Then RegQueryValueA := 234
+    Else If V < 0 Then Mem[0:PD] := 0
+    Else MoveMem(RVData[V], PD, N);
+  End;
+  If PN <> 0 Then MemL[0:PN] := N;
+End;
+
+Function RegChildN(K, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RegChildN := -1;
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed[I] And (RKPar[I] = K) And (I <> K) Then
+    Begin
+      If N = 0 Then
+      Begin
+        RegChildN := I;
+        Exit;
+      End;
+      Dec(N);
+    End;
+End;
+
+Function RegEnumKeyExA(K, N, Buf, PLen, R, Cls, PCls, PFt : LongInt)
+  : LongInt;
+Var I : LongInt;
+Begin
+  RegEnumKeyExA := 259;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  I := RegChildN(I, N);
+  If I < 0 Then Exit;
+  If PLen <> 0 Then
+  Begin
+    PutPStr(Buf, RKName(I), MemL[0:PLen]);
+    MemL[0:PLen] := Length(RKName(I));
+  End;
+  RegEnumKeyExA := 0;
+End;
+
+Function RegEnumKeyA(K, N, Buf, Len : LongInt) : LongInt;
+Var L : LongInt;
+Begin
+  L := Len;
+  RegEnumKeyA := RegEnumKeyExA(K, N, Buf, LongInt(@L), 0, 0, 0, 0);
+End;
+
+Function RegEnumValueA(K, N, NBuf, PNLen, R, PT, PD, PDLen : LongInt)
+  : LongInt;
+Var I, V : LongInt;
+Begin
+  RegEnumValueA := 259;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  For V := 0 To MaxRV - 1 Do
+    If RVUsed[V] And (RVKey[V] = I) Then
+    Begin
+      If N = 0 Then
+      Begin
+        If PNLen <> 0 Then
+        Begin
+          PutPStr(NBuf, RVName(V), MemL[0:PNLen]);
+          MemL[0:PNLen] := Length(RVName(V));
+        End;
+        If PT <> 0 Then MemL[0:PT] := RVType[V];
+        If (PD <> 0) And (PDLen <> 0) Then
+          MoveMem(RVData[V], PD, Min(RVSize[V], MemL[0:PDLen]));
+        If PDLen <> 0 Then MemL[0:PDLen] := RVSize[V];
+        RegEnumValueA := 0;
+        Exit;
+      End;
+      Dec(N);
+    End;
+End;
+
+Function RegDeleteValueA(K, N : LongInt) : LongInt;
+Var I, V : LongInt; Nm : String;
+Begin
+  RegDeleteValueA := 2;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  If N = 0 Then Nm := '' Else Nm := PStr(N);
+  V := RegVal(I, Nm);
+  If V < 0 Then Exit;
+  KFree(RVData[V]);
+  RVUsed[V] := False;
+  RegDeleteValueA := 0;
+End;
+
+Function RegQueryInfoKeyA(K, Cls, PCls, R, PSub, PMaxSub, PMaxCls, PVal,
+  PMaxVN, PMaxVL, PSec, PFt : LongInt) : LongInt;
+Var I, J, NS, NV, MS, MN, ML : LongInt;
+Begin
+  RegQueryInfoKeyA := 2;
+  I := RegKeyOf(K);
+  If I < 0 Then Exit;
+  NS := 0; NV := 0; MS := 0; MN := 0; ML := 0;
+  For J := 0 To MaxRK - 1 Do
+    If RKUsed[J] And (RKPar[J] = I) And (J <> I) Then
+    Begin
+      Inc(NS);
+      MS := Max(MS, Length(RKName(J)));
+    End;
+  For J := 0 To MaxRV - 1 Do
+    If RVUsed[J] And (RVKey[J] = I) Then
+    Begin
+      Inc(NV);
+      MN := Max(MN, Length(RVName(J)));
+      ML := Max(ML, RVSize[J]);
+    End;
+  If PCls <> 0 Then MemL[0:PCls] := 0;
+  If PSub <> 0 Then MemL[0:PSub] := NS;
+  If PMaxSub <> 0 Then MemL[0:PMaxSub] := MS;
+  If PMaxCls <> 0 Then MemL[0:PMaxCls] := 0;
+  If PVal <> 0 Then MemL[0:PVal] := NV;
+  If PMaxVN <> 0 Then MemL[0:PMaxVN] := MN;
+  If PMaxVL <> 0 Then MemL[0:PMaxVL] := ML;
+  If PSec <> 0 Then MemL[0:PSec] := 0;
+  If PFt <> 0 Then
+  Begin
+    MemL[0:PFt] := 0; MemL[0:PFt + 4] := 0;
+  End;
+  RegQueryInfoKeyA := 0;
 End;
 
 { ==================================================================== }
@@ -15227,6 +15631,810 @@ Begin
   AppMainT := T;
   HeapOwner := 0;
   CursorSetShape(0);
+End;
+
+{ ==================================================================== }
+{ Partie 12 bis - Complements Win32 pour les installateurs (ACME)      }
+{ ==================================================================== }
+
+Const
+  koMapping = 9;
+  MaxView = 32;
+
+Var
+  ViewAddr, ViewMap, ViewOfs, ViewSize : Array[0..MaxView - 1] Of LongInt;
+  DdeStr : Array[0..63] Of String[63];
+  DdeData : Array[0..15] Of LongInt;
+
+{ ------------------------------- KERNEL32 ------------------------- }
+
+Procedure RtlMoveMemory(D, S, N : LongInt);
+Begin
+  MoveMem(S, D, N);
+End;
+
+Procedure RtlZeroMemory(D, N : LongInt);
+Begin
+  FillMem(D, N, 0);
+End;
+
+Procedure RtlFillMemory(D, N, V : LongInt);
+Begin
+  FillMem(D, N, V And $FF);
+End;
+
+Function OpenMutexA(Acc, Inh, Name : LongInt) : LongInt;
+Var I : LongInt; S : String;
+Begin
+  OpenMutexA := 0;
+  If Name = 0 Then Exit;
+  S := UpStr(PStr(Name));
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs[I].Used And (KObjs[I].Kind = koMutex) And
+       (KObjs[I].Name = S) Then
+    Begin
+      OpenMutexA := KHandle(I);
+      Exit;
+    End;
+  SetErr(ErrFileNotFound);
+End;
+
+Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
+Var S : String;
+Begin
+  S := PStr(PLong);
+  If (PShort <> 0) And (N > Length(S)) Then PutPStr(PShort, S, N);
+  GetShortPathNameA := Length(S);
+End;
+
+Function GetLogicalDriveStringsA(N, Buf : LongInt) : LongInt;
+Var S : String; I : LongInt;
+Begin
+  S := 'C:\' + #0 + 'D:\' + #0 + #0;
+  GetLogicalDriveStringsA := 8;
+  If N < 9 Then Exit;
+  For I := 1 To 9 Do Mem[0:Buf + I - 1] := Ord(S[I]);
+End;
+
+Function MoveFileExA(PSrc, PDst, Flags : LongInt) : LongInt;
+Begin
+  MoveFileExA := 1;
+  { suppression au redemarrage : sans objet }
+  If PDst = 0 Then Exit;
+  If ((Flags And 1) <> 0) And (GetFileAttributesA(PDst) <> -1) Then
+    DeleteFileA(PDst);
+  MoveFileExA := MoveFileA(PSrc, PDst);
+End;
+
+Function GetTempFileNameA(PPath, PPre, Uniq, Buf : LongInt) : LongInt;
+Var S, P, Pre : String; N, H : LongInt;
+Begin
+  P := PStr(PPath);
+  If (P <> '') And (P[Length(P)] <> '\') Then P := P + '\';
+  Pre := Copy(PStr(PPre), 1, 3);
+  N := Uniq And $FFFF;
+  If N = 0 Then N := (Ticks And $FFF) + 1;
+  Repeat
+    S := P + Pre + HexStr(N, 4) + '.TMP';
+    If Uniq <> 0 Then Break;
+    PutPStr(Buf, S, 260);
+    If GetFileAttributesA(Buf) = -1 Then
+    Begin
+      H := KOpenFile(S, True, 2);
+      If H <> INVALID_HANDLE Then CloseHandle(H);
+      Break;
+    End;
+    N := (N + 1) And $FFFF;
+  Until False;
+  PutPStr(Buf, S, 260);
+  GetTempFileNameA := N;
+End;
+
+Function SearchPathA(PPath, PFile, PExt, N, Buf, PPart : LongInt)
+  : LongInt;
+Var F, S, D : String; K : LongInt;
+Begin
+  SearchPathA := 0;
+  F := PStr(PFile);
+  If (PExt <> 0) And (Pos('.', BaseName(F)) = 0) Then F := F + PStr(PExt);
+  For K := 0 To 5 Do
+  Begin
+    Case K Of
+      0 : If PPath <> 0 Then D := PStr(PPath) Else D := ParentDir(AppPath);
+      1 : D := CurDirS;
+      2 : D := 'C:\WINDOWS\SYSTEM';
+      3 : D := 'C:\WINDOWS';
+      4 : D := 'D:';
+    Else
+      D := '';
+    End;
+    If (Pos('\', F) > 0) Or (Pos(':', F) > 0) Then S := FullPath(F)
+    Else If D = '' Then Continue
+    Else S := FullPath(D + '\' + F);
+    PutPStr(Buf, S, N);
+    If GetFileAttributesA(Buf) <> -1 Then
+    Begin
+      If PPart <> 0 Then
+        MemL[0:PPart] := Buf + Length(S) - Length(BaseName(S));
+      SearchPathA := Length(S);
+      Exit;
+    End;
+    If (Pos('\', F) > 0) Or (Pos(':', F) > 0) Then Break;
+  End;
+  If N > 0 Then Mem[0:Buf] := 0;
+  SetErr(ErrFileNotFound);
+End;
+
+Function SystemTimeToFileTime(St, Ft : LongInt) : LongInt;
+Var Dos : LongInt;
+Begin
+  Dos := ((MemW[0:St] - 1980) Shl 25) Or (MemW[0:St + 2] Shl 21) Or
+         (MemW[0:St + 6] Shl 16) Or (MemW[0:St + 8] Shl 11) Or
+         (MemW[0:St + 10] Shl 5) Or (MemW[0:St + 12] Div 2);
+  DosToFileTime(Dos, Ft);
+  SystemTimeToFileTime := 1;
+End;
+
+{ Valeurs regionales courantes (francais ou anglais) }
+Function GetLocaleInfoA(Lcid, Typ, Buf, N : LongInt) : LongInt;
+Var S : String;
+Begin
+  Case Typ And $FFFF Of
+    1 : S := '040C';
+    2, 4 : S := 'Francais';
+    3 : S := 'FRA';
+    5, 6, 7 : S := 'France';
+    8 : S := '33';
+    $B : S := '850';
+    $C : S := ';';
+    $E : S := ',';
+    $F : S := ' ';
+    $14 : S := 'F';
+    $15 : S := 'FRF';
+    $1D : S := '/';
+    $1E : S := ':';
+    $1F : S := 'dd/MM/yy';
+    $20 : S := 'dddd d MMMM yyyy';
+    $21 : S := '1';
+    $23 : S := '1';
+    $1004 : S := '1252';
+    $5A : S := 'FR';
+  Else
+    S := '0';
+  End;
+  If Language = _English Then
+    Case Typ And $FFFF Of
+      1 : S := '0409';
+      2, 4 : S := 'English';
+      3 : S := 'ENU';
+      5, 6, 7 : S := 'United States';
+      8 : S := '1';
+      $B : S := '437';
+      $C, $E : S := ',';
+      $D : S := '.';
+    End;
+  If (Buf <> 0) And (N > 0) Then PutPStr(Buf, S, N);
+  GetLocaleInfoA := Length(S) + 1;
+End;
+
+{ Projection de fichiers : la vue est une copie du fichier, recrite a
+  UnmapViewOfFile / FlushViewOfFile si elle est modifiable }
+Function CreateFileMappingA(HFile, Sec, Prot, SzHi, SzLo, Name : LongInt)
+  : LongInt;
+Var I, Sz : LongInt;
+Begin
+  CreateFileMappingA := 0;
+  I := KObjNew(koMapping);
+  If I < 0 Then Exit;
+  Sz := SzLo;
+  If (Sz = 0) And (HFile <> -1) Then Sz := GetFileSize(HFile, 0);
+  KObjs[I].F1 := HFile;
+  KObjs[I].F2 := Sz;
+  KObjs[I].F3 := Prot;
+  CreateFileMappingA := KHandle(I);
+End;
+
+Function ViewFlush(V : LongInt) : LongInt;
+Var I, H, N : LongInt;
+Begin
+  ViewFlush := 1;
+  I := KObjOf(ViewMap[V], koMapping);
+  If I < 0 Then Exit;
+  H := KObjs[I].F1;
+  If (H = -1) Or ((KObjs[I].F3 And 4) = 0) Then Exit;
+  SetFilePointer(H, ViewOfs[V], 0, 0);
+  N := KWriteFile(H, ViewAddr[V], ViewSize[V]);
+End;
+
+Function MapViewOfFile(HMap, Acc, OfsHi, OfsLo, N : LongInt) : LongInt;
+Var I, V, A, Got, K : LongInt;
+Begin
+  MapViewOfFile := 0;
+  I := KObjOf(HMap, koMapping);
+  If I < 0 Then Exit;
+  V := -1;
+  For K := MaxView - 1 DownTo 0 Do
+    If ViewAddr[K] = 0 Then V := K;
+  If V < 0 Then Exit;
+  If (N = 0) Or (OfsLo + N > KObjs[I].F2) Then N := KObjs[I].F2 - OfsLo;
+  If N <= 0 Then N := 1;
+  A := KAlloc(N + 4096);
+  If A = 0 Then Exit;
+  FillMem(A, N, 0);
+  If KObjs[I].F1 <> -1 Then
+  Begin
+    SetFilePointer(KObjs[I].F1, OfsLo, 0, 0);
+    KReadFile(KObjs[I].F1, A, N, Got);
+  End;
+  ViewAddr[V] := A; ViewMap[V] := HMap; ViewOfs[V] := OfsLo;
+  ViewSize[V] := N;
+  MapViewOfFile := A;
+End;
+
+Function FlushViewOfFile(A, N : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  FlushViewOfFile := 1;
+  For V := 0 To MaxView - 1 Do
+    If (ViewAddr[V] <> 0) And (A >= ViewAddr[V]) And
+       (A < ViewAddr[V] + ViewSize[V]) Then ViewFlush(V);
+End;
+
+Function UnmapViewOfFile(A : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  UnmapViewOfFile := 0;
+  For V := 0 To MaxView - 1 Do
+    If ViewAddr[V] = A Then
+    Begin
+      ViewFlush(V);
+      KFree(A);
+      ViewAddr[V] := 0;
+      UnmapViewOfFile := 1;
+    End;
+End;
+
+{ --------------------------------- GDI32 --------------------------- }
+
+Function CreateScalableFontResourceA(H, PRes, PFont, PPath : LongInt)
+  : LongInt;
+Begin
+  CreateScalableFontResourceA := 0;
+End;
+
+{ --------------------------------- USER32 -------------------------- }
+
+Function CreateCaret(H, Bmp, W, Ht : LongInt) : LongInt;
+Begin
+  CreateCaret := 1;
+End;
+
+Function DestroyCaret : LongInt;
+Begin
+  DestroyCaret := 1;
+End;
+
+Function SetCaretPos(X, Y : LongInt) : LongInt;
+Begin
+  SetCaretPos := 1;
+End;
+
+Function ShowCaret(H : LongInt) : LongInt;
+Begin
+  ShowCaret := 1;
+End;
+
+Function HideCaret(H : LongInt) : LongInt;
+Begin
+  HideCaret := 1;
+End;
+
+Function ExcludeUpdateRgn(Hdc, H : LongInt) : LongInt;
+Begin
+  ExcludeUpdateRgn := 2;
+End;
+
+Function GetLastActivePopup(H : LongInt) : LongInt;
+Begin
+  GetLastActivePopup := H;
+End;
+
+{ DDE : un Gestionnaire de programmes (PROGMAN) minimal accepte les
+  commandes [CreateGroup(...)], [AddItem(...)]... et les journalise }
+Function DdeInitializeA(PId, Cb, Cmd, Res : LongInt) : LongInt;
+Begin
+  If PId <> 0 Then MemL[0:PId] := 1;
+  DdeInitializeA := 0;
+End;
+
+Function DdeUninitialize(Id : LongInt) : LongInt;
+Begin
+  DdeUninitialize := 1;
+End;
+
+Function DdeCreateStringHandleA(Id, P, Cp : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DdeCreateStringHandleA := 0;
+  For I := 1 To 63 Do
+    If DdeStr[I] = '' Then
+    Begin
+      DdeStr[I] := Copy(PStr(P), 1, 63);
+      If DdeStr[I] = '' Then DdeStr[I] := ' ';
+      DdeCreateStringHandleA := I;
+      Exit;
+    End;
+End;
+
+Function DdeFreeStringHandle(Id, H : LongInt) : LongInt;
+Begin
+  If (H > 0) And (H < 64) Then DdeStr[H] := '';
+  DdeFreeStringHandle := 1;
+End;
+
+Function DdeConnect(Id, HSrv, HTop, PCC : LongInt) : LongInt;
+Begin
+  DdeConnect := 0;
+  If (HSrv > 0) And (HSrv < 64) Then
+  Begin
+    KLog('DDE : connexion a ' + DdeStr[HSrv]);
+    If UpStr(DdeStr[HSrv]) = 'PROGMAN' Then DdeConnect := $5150;
+  End;
+End;
+
+Function DdeDisconnect(H : LongInt) : LongInt;
+Begin
+  DdeDisconnect := 1;
+End;
+
+Function DdeClientTransaction(PData, Cb, HConv, HItem, Fmt, Typ, Tmo,
+  PRes : LongInt) : LongInt;
+Var S : String; A : LongInt;
+Begin
+  DdeClientTransaction := 0;
+  If PRes <> 0 Then MemL[0:PRes] := 0;
+  If HConv <> $5150 Then Exit;
+  Case Typ And $FF Of
+    $50 :
+    Begin
+      { XTYP_EXECUTE }
+      KLog('DDE PROGMAN : ' + Copy(PStr(PData), 1, 200));
+      DdeClientTransaction := 1;
+    End;
+    $B0 :
+    Begin
+      { XTYP_REQUEST (liste des groupes...) : vide }
+      A := KAlloc(16);
+      Mem[0:A] := 0;
+      DdeClientTransaction := A;
+    End;
+  Else
+    DdeClientTransaction := 1;
+  End;
+End;
+
+Function DdeAccessData(H, PSz : LongInt) : LongInt;
+Begin
+  If PSz <> 0 Then MemL[0:PSz] := 1;
+  DdeAccessData := H;
+End;
+
+Function DdeUnaccessData(H : LongInt) : LongInt;
+Begin
+  DdeUnaccessData := 1;
+End;
+
+Function DdeFreeDataHandle(H : LongInt) : LongInt;
+Begin
+  DdeFreeDataHandle := 1;
+End;
+
+Function DdeGetLastError(Id : LongInt) : LongInt;
+Begin
+  DdeGetLastError := 0;
+End;
+
+{ ------------------------------ VERSION ---------------------------- }
+{ Pas d'informations de version : les fichiers sont copies d'apres
+  leur date (comportement documente pour les fichiers sans version) }
+
+Function GetFileVersionInfoSizeA(PFile, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  SetErr(1812);
+  GetFileVersionInfoSizeA := 0;
+End;
+
+Function GetFileVersionInfoA(PFile, H, N, Buf : LongInt) : LongInt;
+Begin
+  GetFileVersionInfoA := 0;
+End;
+
+Function VerQueryValueA(Blk, PSub, PPtr, PLen : LongInt) : LongInt;
+Begin
+  VerQueryValueA := 0;
+End;
+
+Function VerFindFileA(Flags, PFile, PWin, PApp, PCur, PCurLen, PDst,
+  PDstLen : LongInt) : LongInt;
+Begin
+  If (PCur <> 0) And (PCurLen <> 0) And (MemL[0:PCurLen] > 0) Then
+    Mem[0:PCur] := 0;
+  If PCurLen <> 0 Then MemL[0:PCurLen] := 1;
+  If (PDst <> 0) And (PDstLen <> 0) Then
+  Begin
+    If PApp <> 0 Then PutPStr(PDst, PStr(PApp), MemL[0:PDstLen])
+    Else Mem[0:PDst] := 0;
+    MemL[0:PDstLen] := StrLenZ(PDst) + 1;
+  End;
+  VerFindFileA := 0;
+End;
+
+Function VerInstallFileA(Flags, PSrc, PDst, PSrcDir, PDstDir, PCurDir,
+  PTmp, PTmpLen : LongInt) : LongInt;
+Var A, B : String;
+Begin
+  A := PStr(PSrcDir) + '\' + PStr(PSrc) + #0;
+  B := PStr(PDstDir) + '\' + PStr(PDst) + #0;
+  If CopyFileA(LongInt(@A[1]), LongInt(@B[1]), 0) <> 0 Then
+    VerInstallFileA := 0
+  Else VerInstallFileA := $8000;
+End;
+
+Function CopyFileA(PSrc, PDst, FailExist : LongInt) : LongInt;
+Var HS, HD, B, N : LongInt;
+Begin
+  CopyFileA := 0;
+  If (FailExist <> 0) And (GetFileAttributesA(PDst) <> -1) Then
+  Begin
+    SetErr(80);
+    Exit;
+  End;
+  HS := KOpenFile(PStr(PSrc), False, 3);
+  If HS = INVALID_HANDLE Then Exit;
+  HD := KOpenFile(PStr(PDst), True, 2);
+  If HD = INVALID_HANDLE Then
+  Begin
+    CloseHandle(HS);
+    Exit;
+  End;
+  B := KAlloc(16384);
+  Repeat
+    If Not KReadFile(HS, B, 16384, N) Then N := 0;
+    If N > 0 Then KWriteFile(HD, B, N);
+  Until N <= 0;
+  KFree(B);
+  CloseHandle(HS);
+  CloseHandle(HD);
+  CopyFileA := 1;
+End;
+
+{ -------------------------------- LZ32 ----------------------------- }
+
+Function LZOpenFileA(PName, POf, Style : LongInt) : LongInt;
+Begin
+  LZOpenFileA := OpenFile(PName, POf, Style);
+End;
+
+Function LZClose(H : LongInt) : LongInt;
+Begin
+  CloseHandle(H);
+  LZClose := 0;
+End;
+
+Function LZCopy(HSrc, HDst : LongInt) : LongInt;
+Var B, N, T : LongInt;
+Begin
+  B := KAlloc(16384);
+  T := 0;
+  Repeat
+    If Not KReadFile(HSrc, B, 16384, N) Then N := 0;
+    If N > 0 Then
+    Begin
+      KWriteFile(HDst, B, N);
+      T := T + N;
+    End;
+  Until N <= 0;
+  KFree(B);
+  LZCopy := T;
+End;
+
+{ -------------------------------- MPR ------------------------------ }
+{ Pas de reseau }
+
+Function WNetGetConnectionA(PLocal, PRemote, PLen : LongInt) : LongInt;
+Begin
+  WNetGetConnectionA := 2250;
+End;
+
+Function WNetAddConnectionA(PRemote, PPass, PLocal : LongInt) : LongInt;
+Begin
+  WNetAddConnectionA := 1222;
+End;
+
+Function WNetAddConnection2A(PRes, PPass, PUser, Flags : LongInt) : LongInt;
+Begin
+  WNetAddConnection2A := 1222;
+End;
+
+Function WNetCancelConnectionA(PName, Force : LongInt) : LongInt;
+Begin
+  WNetCancelConnectionA := 2250;
+End;
+
+Function WNetCancelConnection2A(PName, Flags, Force : LongInt) : LongInt;
+Begin
+  WNetCancelConnection2A := 2250;
+End;
+
+Function WNetConnectionDialog(H, Typ : LongInt) : LongInt;
+Begin
+  WNetConnectionDialog := 1222;
+End;
+
+Function WNetGetLastErrorA(PErr, PBuf, NBuf, PName, NName : LongInt)
+  : LongInt;
+Begin
+  If PErr <> 0 Then MemL[0:PErr] := 0;
+  WNetGetLastErrorA := 0;
+End;
+
+{ ----------------------- Unicode et parametres regionaux ------------ }
+
+Function GetEnvironmentStringsW : LongInt;
+Var P, N, W, I : LongInt;
+Begin
+  P := GetEnvironmentStringsA;
+  N := 0;
+  While (MemW[0:P + N] <> 0) And (N < 8000) Do Inc(N);
+  W := KAlloc((N + 2) * 2);
+  For I := 0 To N + 1 Do MemW[0:W + I * 2] := Mem[0:P + I];
+  GetEnvironmentStringsW := W;
+End;
+
+Function FreeEnvironmentStringsW(P : LongInt) : LongInt;
+Begin
+  FreeEnvironmentStringsW := 1;
+End;
+
+Function GetLocaleInfoW(Lcid, Typ, Buf, N : LongInt) : LongInt;
+Var T, R, I : LongInt;
+Begin
+  T := KAlloc(256);
+  R := GetLocaleInfoA(Lcid, Typ, T, 256);
+  If (Buf <> 0) And (N > 0) Then
+    For I := 0 To Min(R, N) - 1 Do MemW[0:Buf + I * 2] := Mem[0:T + I];
+  KFree(T);
+  GetLocaleInfoW := R;
+End;
+
+{ CT_CTYPE1 : 1 majuscule, 2 minuscule, 4 chiffre, 8 espace,
+  10h ponctuation, 20h controle, 80h hexadecimal, 100h lettre }
+Function CharType1(C : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  T := 0;
+  If (C >= 65) And (C <= 90) Then T := $101;
+  If (C >= 97) And (C <= 122) Then T := $102;
+  If (C >= 192) And (C <= 255) Then T := $100;
+  If (C >= 48) And (C <= 57) Then T := $84;
+  If ((C >= 65) And (C <= 70)) Or ((C >= 97) And (C <= 102)) Then
+    T := T Or $80;
+  If (C = 32) Or ((C >= 9) And (C <= 13)) Then T := T Or 8;
+  If C = 32 Then T := T Or $40;
+  If C < 32 Then T := T Or $20;
+  If ((C >= 33) And (C <= 47)) Or ((C >= 58) And (C <= 64)) Or
+     ((C >= 91) And (C <= 96)) Or ((C >= 123) And (C <= 126)) Then
+    T := T Or $10;
+  CharType1 := T;
+End;
+
+Function GetStringTypeA(Lcid, Info, Src, N, PType : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Src) + 1;
+  For I := 0 To N - 1 Do
+    If Info = 1 Then MemW[0:PType + I * 2] := CharType1(Mem[0:Src + I])
+    Else MemW[0:PType + I * 2] := 0;
+  GetStringTypeA := 1;
+End;
+
+Function GetStringTypeW(Info, Src, N, PType : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then
+  Begin
+    N := 0;
+    While MemW[0:Src + N * 2] <> 0 Do Inc(N);
+    Inc(N);
+  End;
+  For I := 0 To N - 1 Do
+    If Info = 1 Then
+      MemW[0:PType + I * 2] := CharType1(MemW[0:Src + I * 2] And $FF)
+    Else MemW[0:PType + I * 2] := 0;
+  GetStringTypeW := 1;
+End;
+
+Function MapCaseC(C, Flags : LongInt) : LongInt;
+Begin
+  If ((Flags And $200) <> 0) And (C >= 97) And (C <= 122) Then C := C - 32;
+  If ((Flags And $100) <> 0) And (C >= 65) And (C <= 90) Then C := C + 32;
+  MapCaseC := C;
+End;
+
+Function LCMapStringA(Lcid, Flags, Src, N, Dst, DN : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Src) + 1;
+  LCMapStringA := N;
+  If DN = 0 Then Exit;
+  If N > DN Then N := DN;
+  For I := 0 To N - 1 Do Mem[0:Dst + I] := MapCaseC(Mem[0:Src + I], Flags);
+  LCMapStringA := N;
+End;
+
+Function LCMapStringW(Lcid, Flags, Src, N, Dst, DN : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If N < 0 Then
+  Begin
+    N := 0;
+    While MemW[0:Src + N * 2] <> 0 Do Inc(N);
+    Inc(N);
+  End;
+  LCMapStringW := N;
+  If DN = 0 Then Exit;
+  If N > DN Then N := DN;
+  For I := 0 To N - 1 Do
+    MemW[0:Dst + I * 2] := MapCaseC(MemW[0:Src + I * 2], Flags);
+  LCMapStringW := N;
+End;
+
+{ 1 inferieur, 2 egal, 3 superieur ; NORM_IGNORECASE (1) }
+Function CmpChars(A, B, NA, NB, Flags, W : LongInt) : LongInt;
+Var I, CA, CB : LongInt;
+Begin
+  I := 0;
+  Repeat
+    If I < NA Then
+    Begin
+      If W = 2 Then CA := MemW[0:A + I * 2] Else CA := Mem[0:A + I];
+    End
+    Else CA := 0;
+    If I < NB Then
+    Begin
+      If W = 2 Then CB := MemW[0:B + I * 2] Else CB := Mem[0:B + I];
+    End
+    Else CB := 0;
+    If (Flags And 1) <> 0 Then
+    Begin
+      CA := MapCaseC(CA, $200); CB := MapCaseC(CB, $200);
+    End;
+    If CA < CB Then
+    Begin
+      CmpChars := 1;
+      Exit;
+    End;
+    If CA > CB Then
+    Begin
+      CmpChars := 3;
+      Exit;
+    End;
+    Inc(I);
+  Until (I >= NA) And (I >= NB);
+  CmpChars := 2;
+End;
+
+Function CompareStringA(Lcid, Flags, A, NA, B, NB : LongInt) : LongInt;
+Begin
+  If NA < 0 Then NA := StrLenZ(A);
+  If NB < 0 Then NB := StrLenZ(B);
+  CompareStringA := CmpChars(A, B, NA, NB, Flags, 1);
+End;
+
+Function CompareStringW(Lcid, Flags, A, NA, B, NB : LongInt) : LongInt;
+Begin
+  If NA < 0 Then
+  Begin
+    NA := 0;
+    While MemW[0:A + NA * 2] <> 0 Do Inc(NA);
+  End;
+  If NB < 0 Then
+  Begin
+    NB := 0;
+    While MemW[0:B + NB * 2] <> 0 Do Inc(NB);
+  End;
+  CompareStringW := CmpChars(A, B, NA, NB, Flags, 2);
+End;
+
+{ ----------------------------- Divers ------------------------------- }
+
+Function GetMapMode(Hdc : LongInt) : LongInt;
+Begin
+  GetMapMode := 1;
+End;
+
+Function SetMapMode(Hdc, M : LongInt) : LongInt;
+Begin
+  SetMapMode := 1;
+End;
+
+Function MessageBoxIndirectA(P : LongInt) : LongInt;
+Begin
+  MessageBoxIndirectA := MessageBoxA(MemL[0:P + 4], MemL[0:P + 12],
+                                     MemL[0:P + 16], MemL[0:P + 20]);
+End;
+
+Function SetFileTime(H, PC, PA, PW : LongInt) : LongInt;
+Begin
+  SetFileTime := 1;
+End;
+
+Function SetHandleCount(N : LongInt) : LongInt;
+Begin
+  SetHandleCount := N;
+End;
+
+Function DisableThreadLibraryCalls(H : LongInt) : LongInt;
+Begin
+  DisableThreadLibraryCalls := 1;
+End;
+
+Function ExtEscape(Hdc, Esc, NIn, PIn, NOut, POut : LongInt) : LongInt;
+Begin
+  ExtEscape := 0;
+End;
+
+{ Thunks plats 16/32 bits (DSETUP16.DLL...) : non pris en charge, la
+  connexion echoue proprement }
+Function ThunkConnect32(P1, P2, P3, P4, P5, P6 : LongInt) : LongInt;
+Begin
+  ThunkConnect32 := 0;
+End;
+
+Function SMapLS_IP_EBP_12 : LongInt;
+Begin
+  SMapLS_IP_EBP_12 := 0;
+End;
+
+Function SMapLS_IP_EBP_16 : LongInt;
+Begin
+  SMapLS_IP_EBP_16 := 0;
+End;
+
+Function SMapLS_IP_EBP_20 : LongInt;
+Begin
+  SMapLS_IP_EBP_20 := 0;
+End;
+
+Function SMapLS_IP_EBP_24 : LongInt;
+Begin
+  SMapLS_IP_EBP_24 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_12 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_12 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_16 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_16 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_20 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_20 := 0;
+End;
+
+Function SUnMapLS_IP_EBP_24 : LongInt;
+Begin
+  SUnMapLS_IP_EBP_24 := 0;
+End;
+
+Function SHFileOperation(P : LongInt) : LongInt;
+Begin
+  SHFileOperation := 1;
 End;
 
 { Table des API Win16 : module (K KERNEL, U USER, G GDI, B KEYBOARD,
@@ -19924,16 +21132,13 @@ Begin
     End;
     5006 : DosHClose(A(1));
     { --------------------------------- SHELL ------------------------- }
-    6001 : SetDXAX(2);
-    6002 :
-    Begin
-      Inc(RegHN);
-      If A(3) <> 0 Then MemL[0:A(3)] := $4000 + RegHN;
-      SetDXAX(0);
-    End;
-    6003, 6004, 6005 : SetDXAX(0);
-    6006 : SetDXAX(2);
-    6007 : SetDXAX(259);
+    6001 : SetDXAX(RegOpenKeyA(A(1), A(2), A(3)));
+    6002 : SetDXAX(RegCreateKeyA(A(1), A(2), A(3)));
+    6003 : SetDXAX(0);
+    6004 : SetDXAX(RegDeleteKeyA(A(1), A(2)));
+    6005 : SetDXAX(RegSetValueA(A(1), A(2), A(3), A(4), A(5)));
+    6006 : SetDXAX(RegQueryValueA(A(1), A(2), A(3), A(4)));
+    6007 : SetDXAX(RegEnumKeyA(A(1), A(2), A(3), A(4)));
   Else
     If Not ApiWarned[Idx] Then
     Begin
@@ -19969,8 +21174,31 @@ End;
 
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
-exports VideoForWindowsVersion, W16Bridge, CreateDirectoryA,
-  RemoveDirectoryA, FindWindowA,
+exports VideoForWindowsVersion,
+  GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
+  CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
+  SetHandleCount, DisableThreadLibraryCalls, ExtEscape, ThunkConnect32,
+  SMapLS_IP_EBP_12, SMapLS_IP_EBP_16, SMapLS_IP_EBP_20, SMapLS_IP_EBP_24,
+  SUnMapLS_IP_EBP_12, SUnMapLS_IP_EBP_16, SUnMapLS_IP_EBP_20,
+  SUnMapLS_IP_EBP_24, SHFileOperation, W16Bridge, CreateDirectoryA,
+  RemoveDirectoryA, FindWindowA, RegCreateKeyExA, RegFlushKey,
+  RegDeleteKeyA, RegSetValueA, RegQueryValueA, RegEnumKeyExA, RegEnumKeyA,
+  RegEnumValueA, RegDeleteValueA, RegQueryInfoKeyA,
+  RtlMoveMemory, RtlZeroMemory, RtlFillMemory, OpenMutexA, GetShortPathNameA,
+  GetLogicalDriveStringsA, MoveFileExA, GetTempFileNameA, SearchPathA,
+  SystemTimeToFileTime, GetLocaleInfoA, CreateFileMappingA, MapViewOfFile,
+  FlushViewOfFile, UnmapViewOfFile, CreateScalableFontResourceA, CreateCaret,
+  DestroyCaret, SetCaretPos, ShowCaret, HideCaret, ExcludeUpdateRgn,
+  GetLastActivePopup, DdeInitializeA, DdeUninitialize,
+  DdeCreateStringHandleA, DdeFreeStringHandle, DdeConnect, DdeDisconnect,
+  DdeClientTransaction, DdeAccessData, DdeUnaccessData, DdeFreeDataHandle,
+  DdeGetLastError, GetFileVersionInfoSizeA, GetFileVersionInfoA,
+  VerQueryValueA, VerFindFileA, VerInstallFileA, CopyFileA,
+  LZOpenFileA, LZClose,
+  LZCopy, WNetGetConnectionA, WNetAddConnectionA, WNetAddConnection2A,
+  WNetCancelConnectionA, WNetCancelConnection2A, WNetConnectionDialog,
+  WNetGetLastErrorA,
   GetEnvironmentVariableA, SetEnvironmentVariableA,
   GetEnvironmentStrings, GetEnvironmentStringsA, FreeEnvironmentStringsA,
   GetVersion, GetVersionExA, GetSystemInfo, GetCommandLineA, GetStartupInfoA,
@@ -20159,7 +21387,14 @@ BEGIN
   MemTop := $100000 + MemL[0:BootInfo + $18] * 1024;
   If MemTop > $40000000 Then MemTop := $40000000;
   HeapInit(HeapBase, MemTop);
-  Language := TLanguage(Mem[0:BootInfo + 3] Mod 5);
+  Case Mem[0:BootInfo + 3] Mod 5 Of
+    1 : Language := _English;
+    2 : Language := _Germany;
+    3 : Language := _Italian;
+    4 : Language := _Spain;
+  Else
+    Language := _French;
+  End;
   OptFlags := MemL[0:BootInfo + $30];
   Lfb := MemL[0:BootInfo + $0C];
   LfbPitch := MemW[0:BootInfo + $10];
@@ -20190,6 +21425,7 @@ BEGIN
   InitGdi;
   InitExports;
   If ApiTrace Then TraceInit;
+  RegInit;
   InitW16;
   InitW16Apis;
   W16Init2;

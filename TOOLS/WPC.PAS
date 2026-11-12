@@ -42139,6 +42139,26 @@ Begin
 End;
 
 { --- Resolution des fixups (code relatif + donnees absolues) --- }
+{ Reference a une variable ou un sous-programme jamais defini : le
+  source utilise un identificateur inconnu (erreur de compilation) }
+Var
+  BcUnresN : LongInt;
+  BcUnresList : TString;
+
+Procedure BcUnresolved(Const Lbl : TString);
+Var U : TString;
+Begin
+  U := '';
+  If Copy(Lbl, 1, Length(TP_VAR_PFX)) = TP_VAR_PFX Then
+    U := Copy(Lbl, Length(TP_VAR_PFX) + 1, 255)
+  Else If Copy(Lbl, 1, Length(TP_FUNC_PFX)) = TP_FUNC_PFX Then
+    U := Copy(Lbl, Length(TP_FUNC_PFX) + 1, 255);
+  If U = '' Then Exit;
+  If Pos(' ' + U + ' ', ' ' + BcUnresList + ' ') > 0 Then Exit;
+  Inc(BcUnresN);
+  If Length(BcUnresList) < 200 Then BcUnresList := BcUnresList + U + ' ';
+End;
+
 Procedure BcResolveFixups(DataVA: LongInt);
 Var
   I: LongInt;
@@ -42146,6 +42166,8 @@ Var
   Val: LongInt;
   Nm: TString;
 Begin
+  BcUnresN := 0;
+  BcUnresList := '';
   { Adresses dans la section .data (constantes typees : PChar, @variable, @procedure) }
   For I := 0 To BcDFixCnt - 1 Do
   Begin
@@ -42193,7 +42215,8 @@ Begin
           BcCode[FixOfs + 1] := Byte(Val Shr 8);
           BcCode[FixOfs + 2] := Byte(Val Shr 16);
           BcCode[FixOfs + 3] := Byte(Val Shr 24);
-        End;
+        End
+        Else BcUnresolved(BcFixups[I].LblName);
       End;
       BC_FIX_ABS32_DATA:
       Begin
@@ -42212,6 +42235,7 @@ Begin
           Else
           Begin
             Val := DataVA;
+            BcUnresolved(BcFixups[I].LblName);
           End;
         End;
         BcCode[FixOfs] := Byte(Val);
@@ -42241,6 +42265,8 @@ Begin
       End;
     End; { case }
   End;
+  If BcUnresN > 0 Then
+    FatalError('identificateur(s) inconnu(s) : ' + BcUnresList);
 End;
 
 { --- BcResolveFixups6502 : resoudre les fixups pour cibles 6502 (LE) --- }
