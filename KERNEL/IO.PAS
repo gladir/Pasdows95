@@ -277,6 +277,10 @@ Var
   { Divers }
   MemConv, MemExt : Word;
   CpuType     : Integer;
+  { pourquoi le noyau 32 bits n'a pas demarre (voir StartVmm32) :
+    0 non tente (mode sans echec), 1 processeur, 2 VMM32.VXD absent,
+    3 memoire, 4 chargement, 5 carte video VESA }
+  Vmm32Why    : Integer;
 
 { ================================================================== }
 { Utilitaires                                                        }
@@ -626,6 +630,7 @@ Begin
     mov T,bx
   end;
   MemConv := C; MemExt := E; CpuType := T;
+  Vmm32Why := 0;
 End;
 
 Procedure Sound(Hz : Word);
@@ -798,6 +803,122 @@ Begin
     Inc(Sector);
   End;
   CdLoad := Word(N);
+End;
+
+{ Programme du CD designe par son nom, avec ou sans extension }
+Function ProgFind(U : String) : Integer;
+Var I : Integer;
+Begin
+  U := UpStr(Trim(U));
+  If Copy(U, 1, 3) = 'D:\' Then Delete(U, 1, 3);
+  I := CdFind(U);
+  If I < 0 Then I := CdFind(U + '.EXE');
+  If I < 0 Then I := CdFind(U + '.COM');
+  ProgFind := I;
+End;
+
+{ Genre d'un fichier du CD : 0 autre, 1 MS-DOS, 2 Windows 16 bits (NE),
+  3 Windows 32 bits (PE) }
+Function ProgKind(I : Integer) : Integer;
+Var N : String; Len, Ofs : Word;
+Begin
+  ProgKind := 0;
+  If I < 0 Then Exit;
+  N := CdFiles[I].Name;
+  If Copy(N, Length(N) - 3, 4) = '.COM' Then
+  Begin
+    ProgKind := 1;
+    Exit;
+  End;
+  If Copy(N, Length(N) - 3, 4) <> '.EXE' Then Exit;
+  ProgKind := 1;
+  Len := CdLoad(I, TmpSeg, 2048);
+  If (Len < 64) Or (MemW[TmpSeg:0] <> $5A4D) Then Exit;
+  Ofs := MemW[TmpSeg:$3C];
+  If Ofs > Len - 4 Then Exit;
+  If MemW[TmpSeg:Ofs] = $4550 Then ProgKind := 3
+  Else If MemW[TmpSeg:Ofs] = $454E Then ProgKind := 2;
+End;
+
+Function Vmm32WhyText : String;
+Begin
+  Case Vmm32Why Of
+    1 : Vmm32WhyText := L('processeur 80386 requis',
+                          '80386 processor required',
+                          '80386-Prozessor erforderlich',
+                          'processore 80386 richiesto',
+                          'se requiere un procesador 80386');
+    2 : Vmm32WhyText := L('VMM32.VXD introuvable', 'VMM32.VXD not found',
+                          'VMM32.VXD nicht gefunden',
+                          'VMM32.VXD non trovato',
+                          'no se encuentra VMM32.VXD');
+    3 : Vmm32WhyText := L('16 Mo de m'#130'moire requis',
+                          '16 MB of memory required',
+                          '16 MB Speicher erforderlich',
+                          '16 MB di memoria richiesti',
+                          'se requieren 16 MB de memoria');
+    4 : Vmm32WhyText := L('chargement de VMM32.VXD impossible',
+                          'cannot load VMM32.VXD',
+                          'VMM32.VXD kann nicht geladen werden',
+                          'impossibile caricare VMM32.VXD',
+                          'no se puede cargar VMM32.VXD');
+    5 : Vmm32WhyText := L('carte vid'#130'o VESA requise (mode 101h, ' +
+                          'm'#130'moire lin'#130'aire)',
+                          'VESA video card required (mode 101h, ' +
+                          'linear frame buffer)',
+                          'VESA-Grafikkarte erforderlich (Modus 101h)',
+                          'scheda video VESA richiesta (modo 101h)',
+                          'se requiere una tarjeta VESA (modo 101h)');
+  Else
+    Vmm32WhyText := L('mode sans '#130'chec', 'safe mode',
+                      'abgesicherter Modus', 'modalit'#133' provvisoria',
+                      'modo a prueba de fallos');
+  End;
+End;
+
+{ Explication (lignes separees par |) pour un programme du CD que cette
+  interface 16 couleurs ne peut pas lancer : les programmes Windows
+  demandent le noyau 32 bits (VMM32.VXD). }
+Function ProgMsg(I, K : Integer) : String;
+Var N : String;
+Begin
+  N := CdFiles[I].Name;
+  If K = 1 Then
+    ProgMsg := N + L(' est un programme MS-DOS.|Pasdows ne peut pas le ' +
+                     'lancer depuis cette interface.',
+                     ' is an MS-DOS program.|Pasdows cannot start it ' +
+                     'from this interface.',
+                     ' ist ein MS-DOS-Programm.|Es kann hier nicht ' +
+                     'gestartet werden.',
+                     ' '#138' un programma MS-DOS.|Non pu'#149' essere ' +
+                     'avviato da qui.',
+                     ' es un programa MS-DOS.|No se puede iniciar ' +
+                     'desde aqu'#161'.')
+  Else
+  Begin
+    If K = 3 Then
+      N := N + L(' est un programme Windows 32 bits.',
+                 ' is a 32-bit Windows program.',
+                 ' ist ein 32-Bit-Windows-Programm.',
+                 ' '#138' un programma Windows a 32 bit.',
+                 ' es un programa de Windows de 32 bits.')
+    Else
+      N := N + L(' est un programme Windows 16 bits.',
+                 ' is a 16-bit Windows program.',
+                 ' ist ein 16-Bit-Windows-Programm.',
+                 ' '#138' un programma Windows a 16 bit.',
+                 ' es un programa de Windows de 16 bits.');
+    ProgMsg := N + L('|Il n'#130'cessite le noyau 32 bits de Pasdows 95 ' +
+                     '(VMM32.VXD), qui n''a pas d'#130'marr'#130' : ',
+                     '|It requires the Pasdows 95 32-bit kernel ' +
+                     '(VMM32.VXD), which did not start: ',
+                     '|Es ben'#148'tigt den 32-Bit-Kern (VMM32.VXD), der ' +
+                     'nicht gestartet wurde: ',
+                     '|Richiede il nucleo a 32 bit (VMM32.VXD), che non ' +
+                     #138' stato avviato: ',
+                     '|Requiere el n'#163'cleo de 32 bits (VMM32.VXD), que ' +
+                     'no se ha iniciado: ') + Vmm32WhyText + '.';
+  End;
 End;
 
 Function IsTextFile(Const Name : String) : Boolean;
@@ -3321,6 +3442,8 @@ Begin
   Else If I < CdCount Then
   Begin
     If IsTextFile(CdFiles[I].Name) Then NoteOpenFile(I)
+    Else If ProgKind(I) > 0 Then
+      MessageBox(CdFiles[I].Name, ProgMsg(I, ProgKind(I)), icWarn)
     Else
       MessageBox(CdFiles[I].Name, CdFiles[I].Name + ' : ' +
                  FmtNum(CdFiles[I].Size) + ' ' + TxtBytes + '.|' +
@@ -4433,6 +4556,43 @@ End;
 
 Procedure LanguageChanged; Forward;
 
+{ Programme du CD tape a l'invite : explication au lieu de "Commande ou
+  nom de fichier incorrect" (NETTEST, HELLO... sont des programmes
+  Windows 32 bits). Faux si Line ne designe pas un programme du CD. }
+Function ConProgRun(Line : String) : Boolean;
+Var I, K, P : Integer; S : String;
+Begin
+  ConProgRun := False;
+  Line := Trim(Line);
+  P := Pos(' ', Line);
+  If P > 0 Then Line := Copy(Line, 1, P - 1);
+  I := ProgFind(Line);
+  K := ProgKind(I);
+  If K = 0 Then Exit;
+  ConProgRun := True;
+  If ConText And (K > 1) Then
+    S := L('Ce programme ne peut pas '#136'tre ex'#130'cut'#130' en mode ' +
+           'MS-DOS.|Tapez WIN pour d'#130'marrer Pasdows 95.',
+           'This program cannot be run in MS-DOS mode.|Type WIN to ' +
+           'start Pasdows 95.',
+           'Dieses Programm kann nicht im MS-DOS-Modus ausgef'#129'hrt ' +
+           'werden.|Geben Sie WIN ein.',
+           'Impossibile eseguire il programma in modalit'#133' MS-DOS.|' +
+           'Digitare WIN.',
+           'Este programa no se puede ejecutar en modo MS-DOS.|' +
+           'Escriba WIN.')
+  Else
+    S := ProgMsg(I, K);
+  S := S + '|';
+  P := Pos('|', S);
+  While P > 0 Do
+  Begin
+    ConWriteLn(Copy(S, 1, P - 1));
+    Delete(S, 1, P);
+    P := Pos('|', S);
+  End;
+End;
+
 Procedure ConExec(Line : String);
 Var Cmd, Arg, U : String; P, I : Integer; H, M, S : Integer;
     OldLang : TLanguage;
@@ -4523,6 +4683,7 @@ Begin
                       'Pasdows '#138' gi'#133' in esecuzione.',
                       'Pasdows ya se est'#160' ejecutando.'));
   End
+  Else If ConProgRun(Line) Then
   Else If ConText Then
     ConWriteLn(L('Commande ou nom de fichier incorrect',
                'Bad command or file name',
@@ -5163,9 +5324,11 @@ Begin
   Else If (U = 'WELCOME') Or (U = 'TOUR') Then Execute(cmWelcome)
   Else
   Begin
-    I := CdFind(U);
+    I := ProgFind(U);
     If I < 0 Then RunProgram := False
-    Else If IsTextFile(U) Then NoteOpenFile(I)
+    Else If IsTextFile(CdFiles[I].Name) Then NoteOpenFile(I)
+    Else If ProgKind(I) > 0 Then
+      MessageBox(CdFiles[I].Name, ProgMsg(I, ProgKind(I)), icWarn)
     Else
       MessageBox(U, U + ' : ' + FmtNum(CdFiles[I].Size) + ' ' +
                  TxtBytes + '.', icInfo);
@@ -6743,8 +6906,15 @@ End;
 Procedure StartVmm32;
 Var Flags : Byte;
 Begin
+  { 32 bits : 80386 au moins (sur un 286, LoadVmm32 et la bascule
+    executeraient des instructions 32 bits) }
+  Vmm32Why := 1;
+  If CpuType < 2 Then Exit;
+  Vmm32Why := 2;
   If CdFind('VMM32.VXD') < 0 Then Exit;
+  Vmm32Why := 3;
   If ExtMemKb < 15 * 1024 Then Exit;
+  Vmm32Why := 4;
   TextMode;
   TClear;
   TWrite(0, 0, L('Chargement de Pasdows 95 (VMM32.VXD)...',
@@ -6767,6 +6937,7 @@ Begin
   Flags := 2;
   If OptLogo Then Flags := Flags Or 1;
   PutInfoD($30, Flags);
+  Vmm32Why := 5;
   If Not VbeSetup Then
   Begin
     TextMode;
