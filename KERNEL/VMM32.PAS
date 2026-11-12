@@ -7327,12 +7327,26 @@ End;
 
 Function GetVolumeInformationA(PRoot, PVol, VolSize, PSerial, PMaxComp,
   PFlags, PFs, FsSize : LongInt) : LongInt;
+Var D : String;
 Begin
-  If PVol <> 0 Then PutPStr(PVol, VolLabel, VolSize);
-  If PSerial <> 0 Then MemL[0:PSerial] := $19950824;
-  If PMaxComp <> 0 Then MemL[0:PMaxComp] := 12;
-  If PFlags <> 0 Then MemL[0:PFlags] := 0;
-  If PFs <> 0 Then PutPStr(PFs, 'CDFS', FsSize);
+  If PRoot <> 0 Then D := UpStr(PStr(PRoot)) Else D := CurDirS;
+  If (D <> '') And (D[1] = 'C') Then
+  Begin
+    { disque en memoire : noms longs (VFAT), casse conservee }
+    If PVol <> 0 Then PutPStr(PVol, 'PASDOWS', VolSize);
+    If PSerial <> 0 Then MemL[0:PSerial] := $19951995;
+    If PMaxComp <> 0 Then MemL[0:PMaxComp] := 255;
+    If PFlags <> 0 Then MemL[0:PFlags] := 2;
+    If PFs <> 0 Then PutPStr(PFs, 'FAT', FsSize);
+  End
+  Else
+  Begin
+    If PVol <> 0 Then PutPStr(PVol, VolLabel, VolSize);
+    If PSerial <> 0 Then MemL[0:PSerial] := $19950824;
+    If PMaxComp <> 0 Then MemL[0:PMaxComp] := 12;
+    If PFlags <> 0 Then MemL[0:PFlags] := 0;
+    If PFs <> 0 Then PutPStr(PFs, 'CDFS', FsSize);
+  End;
   GetVolumeInformationA := 1;
 End;
 
@@ -14833,9 +14847,9 @@ End;
 
 { Trace des appels d'API (journal serie), active par ApiTrace }
 Procedure TraceApi(Name : LongInt);
-Var F, D : LongInt; S : String;
+Var F, D, R : LongInt; S : String;
 Begin
-  If TraceCount < 8000 Then
+  If TraceCount < 60000 Then
   Begin
     Inc(TraceCount);
     asm
@@ -14845,6 +14859,16 @@ Begin
     S := '> ' + PStr(Name) + ' @' + HexStr(MemL[0:F + 44], 8);
     S := S + ' ' + HexStr(MemL[0:F + 48], 8) + ' ' + HexStr(MemL[0:F + 52], 8);
     S := S + ' ' + HexStr(MemL[0:F + 56], 8) + ' ' + HexStr(MemL[0:F + 60], 8);
+    { arguments qui pointent sur du texte }
+    For D := 0 To 3 Do
+    Begin
+      R := MemL[0:F + 48 + D * 4];
+      If (R >= $10000) And (R < MemTop) Then
+        If (Mem[0:R] >= 32) And (Mem[0:R] < 127) And
+           ((Mem[0:R + 1] = 0) Or ((Mem[0:R + 1] >= 32) And
+           (Mem[0:R + 1] < 127))) Then
+          S := S + ' "' + Copy(PStr(R), 1, 50) + '"';
+    End;
     KLog(S);
     { detourner le retour vers TraceRetStub (pile fantome par tache) }
     D := TrDepth[CurT];
@@ -14891,7 +14915,8 @@ Begin
   TraceSkip := ' SETFILEPOINTER ISBADREADPTR GETTICKCOUNT TIMEGETTIME ';
   TraceSkip := TraceSkip + 'GETASYNCKEYSTATE PEEKMESSAGEA SCREENTOCLIENT ';
   TraceSkip := TraceSkip + 'GETCURSORPOS ISBADWRITEPTR LSTRCMPIA ';
-  TraceSkip := TraceSkip + 'GETDEVICECAPS ';
+  TraceSkip := TraceSkip + 'GETDEVICECAPS CHARNEXTA CHARPREVA ISDBCSLEADBYTE ';
+  TraceSkip := TraceSkip + 'LSTRLENA LSTRCMPA ';
 End;
 
 Function MakeTrace(Dll, Name : String; Target : LongInt) : LongInt;
@@ -21154,7 +21179,7 @@ End;
 Procedure W16Init2;
 Var P, N : LongInt;
 Begin
-  W16Trace := ApiTrace;
+  W16Trace := False;
   WinIni := 'C:\WINDOWS\WIN.INI';
   WinDirZ := 'C:\WINDOWS';
   SysDirZ := 'C:\WINDOWS\SYSTEM';
