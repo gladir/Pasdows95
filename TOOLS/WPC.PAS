@@ -14216,7 +14216,15 @@ Begin
             ParseExpr(PI);
             CoerceCharArray;
             If LastExprIsPascalStr Then
+              EmitInstr('INC EAX')
+            Else If TypeIsString(LastVarTypeIdx) Then
+            Begin
+              { chaine temporaire (STRBUF1 d une concatenation) : la copier
+                dans l anneau STRRING, sinon l evaluation de S l ecrase }
+              EmitInstr('MOV ESI,EAX');
+              EmitInstr('CALL ' + TP_RT_PFX + 'STRRET');
               EmitInstr('INC EAX');
+            End;
             EmitInstr('PUSH EAX');
             EPMatch(',');
             ParseExpr(PI);
@@ -18963,6 +18971,11 @@ Begin
     Up := StrUpperCase(TokenPool[EP].Val);
   ParsePrimaryInner(PI);
   If Up = '' Then Exit;
+  { une variable locale, un parametre ou une variable d une procedure
+    englobante masque tout sous-programme homonyme (meme une fonction
+    imbriquee d une autre procedure) : le type est deja pose }
+  If (PI >= 0) And ((FindLocal(PI, Up) >= 0) Or (FindParam(PI, Up) >= 0) Or
+     IsOuterVarName(PI, Up)) Then Exit;
   SI := SymFind(Up);
   If (SI < 0) Or (SymTab[SI].Kind <> SK_FUNC) Then Exit;
   If SymTab[SI].IsExternal Then
