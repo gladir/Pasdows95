@@ -1736,6 +1736,72 @@ Begin
 End;
 
 { ------------------------------------------------------------ }
+{ LexLitTail : suite de segments #nn, #$nn et 'xxx' concatenes  }
+{ (ex. #0#27'abc'#8#9'def'#13'ghi')                              }
+{ ------------------------------------------------------------ }
+
+Procedure LexLitTail(Var S : TString);
+Var
+  V  : LongInt;
+  Ch : Char;
+Begin
+  While (LexColNo <= Length(LexLine)) And
+        ((LexLine[LexColNo] = '#') Or (LexLine[LexColNo] = '''')) Do
+  Begin
+    If LexLine[LexColNo] = '#' Then
+    Begin
+      Inc(LexColNo); { sauter '#' }
+      V := 0;
+      If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
+      Begin
+        Inc(LexColNo);
+        While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
+        Begin
+          V := V * 16 + HexVal(LexLine[LexColNo]);
+          Inc(LexColNo);
+        End;
+      End
+      Else
+      Begin
+        While (LexColNo <= Length(LexLine)) And
+              (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
+        Begin
+          V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
+          Inc(LexColNo);
+        End;
+      End;
+      If Length(S) < MAX_STR Then
+        S := S + Chr(V And $FF);
+    End
+    Else
+    Begin
+      Inc(LexColNo); { sauter la quote ouvrante }
+      While LexColNo <= Length(LexLine) Do
+      Begin
+        Ch := LexLine[LexColNo];
+        If Ch = '''' Then
+        Begin
+          Inc(LexColNo);
+          If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
+          Begin
+            If Length(S) < MAX_STR Then S := S + '''';
+            Inc(LexColNo);
+          End
+          Else
+            Break;
+        End
+        Else
+        Begin
+          If Length(S) < MAX_STR Then
+            S := S + Ch;
+          Inc(LexColNo);
+        End;
+      End;
+    End;
+  End;
+End;
+
+{ ------------------------------------------------------------ }
 { LexScanString : chaine Pascal entre apostrophes              }
 { Gere le doublement de quote : 'l''echo' -> l'echo            }
 { ------------------------------------------------------------ }
@@ -1772,60 +1838,8 @@ Begin
     End;
   End;
 
-  { Concatenation implicite : 'abc'#13#10'def' }
-  { Si suivi de #nn, concatener }
-  While (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '#') Do
-  Begin
-    Inc(LexColNo); { sauter '#' }
-    V := 0;
-    If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
-    Begin
-      Inc(LexColNo);
-      While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
-      Begin
-        V := V * 16 + HexVal(LexLine[LexColNo]);
-        Inc(LexColNo);
-      End;
-    End
-    Else
-    Begin
-      While (LexColNo <= Length(LexLine)) And
-            (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
-      Begin
-        V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
-        Inc(LexColNo);
-      End;
-    End;
-    If Length(S) < MAX_STR Then
-      S := S + Chr(V And $FF);
-
-    { Si encore suivi d une chaine 'xxx', concatener aussi }
-    If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-    Begin
-      Inc(LexColNo);
-      While LexColNo <= Length(LexLine) Do
-      Begin
-        Ch := LexLine[LexColNo];
-        If Ch = '''' Then
-        Begin
-          Inc(LexColNo);
-          If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-          Begin
-            If Length(S) < MAX_STR Then S := S + '''';
-            Inc(LexColNo);
-          End
-          Else
-            Break;
-        End
-        Else
-        Begin
-          If Length(S) < MAX_STR Then
-            S := S + Ch;
-          Inc(LexColNo);
-        End;
-      End;
-    End;
-  End;
+  { Concatenation implicite : 'abc'#13#10'def'#9'ghi'... }
+  LexLitTail(S);
 
   CurToken.Kind    := TK_STRING;
   CurToken.Val     := S;
@@ -1848,85 +1862,8 @@ Var
   Ch : Char;
 Begin
   S := '';
-  { Scanner une sequence de #nn segments et concatener }
-  While (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '#') Do
-  Begin
-    Inc(LexColNo); { sauter '#' }
-    V := 0;
-    If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
-    Begin
-      Inc(LexColNo); { sauter '$' }
-      While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
-      Begin
-        V := V * 16 + HexVal(LexLine[LexColNo]);
-        Inc(LexColNo);
-      End;
-    End
-    Else
-    Begin
-      While (LexColNo <= Length(LexLine)) And
-            (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
-      Begin
-        V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
-        Inc(LexColNo);
-      End;
-    End;
-    If Length(S) < MAX_STR Then
-      S := S + Chr(V And $FF);
-  End;
-
-  { Si suivi d une chaine 'xxx', concatener }
-  If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-  Begin
-    Inc(LexColNo); { sauter quote ouvrante }
-    While LexColNo <= Length(LexLine) Do
-    Begin
-      Ch := LexLine[LexColNo];
-      If Ch = '''' Then
-      Begin
-        Inc(LexColNo);
-        If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '''') Then
-        Begin
-          If Length(S) < MAX_STR Then S := S + '''';
-          Inc(LexColNo);
-        End
-        Else
-          Break;
-      End
-      Else
-      Begin
-        If Length(S) < MAX_STR Then
-          S := S + Ch;
-        Inc(LexColNo);
-      End;
-    End;
-    { Peut etre suivi d un autre #nn }
-    While (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '#') Do
-    Begin
-      Inc(LexColNo);
-      V := 0;
-      If (LexColNo <= Length(LexLine)) And (LexLine[LexColNo] = '$') Then
-      Begin
-        Inc(LexColNo);
-        While (LexColNo <= Length(LexLine)) And IsHexDigit(LexLine[LexColNo]) Do
-        Begin
-          V := V * 16 + HexVal(LexLine[LexColNo]);
-          Inc(LexColNo);
-        End;
-      End
-      Else
-      Begin
-        While (LexColNo <= Length(LexLine)) And
-              (LexLine[LexColNo] >= '0') And (LexLine[LexColNo] <= '9') Do
-        Begin
-          V := V * 10 + (Ord(LexLine[LexColNo]) - Ord('0'));
-          Inc(LexColNo);
-        End;
-      End;
-      If Length(S) < MAX_STR Then
-        S := S + Chr(V And $FF);
-    End;
-  End;
+  { Scanner une suite de segments #nn et 'xxx' et les concatener }
+  LexLitTail(S);
 
   { Si un seul caractere -> TK_CHAR, sinon TK_STRING }
   If Length(S) = 1 Then
@@ -22149,6 +22086,7 @@ Var
   LblEnd  : TString;
   LblNext : TString;
   LblHit  : TString;
+  LblSkip : TString;
   Up      : TString;
   CaseVal : LongInt;
   RangeHi : LongInt;
@@ -22232,12 +22170,14 @@ Begin
       Begin
         Inc(EP);  { consommer .. }
         RangeHi := ConstTokExprAt(EP);
+        { hors de cette plage : essayer la valeur suivante de la branche }
+        LblSkip := LabelGen;
         EmitInstr('MOV EAX,DWORD PTR [ESP]');
         EmitInstr('CMP EAX,' + IntToStr_(CaseVal));
-        EmitInstr('JL ' + LblNext);
+        EmitInstr('JL ' + LblSkip);
         EmitInstr('CMP EAX,' + IntToStr_(RangeHi));
         EmitInstr('JLE ' + LblHit);
-        EmitInstr('JMP ' + LblNext);
+        EmitLabel(LblSkip);
       End
       Else
       Begin

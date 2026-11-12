@@ -3873,10 +3873,12 @@ End;
 
 Procedure InitKeyTables;
 Begin
-  KeyLo := #0#27'1234567890-='#8#9'qwertyuiop[]'#13#0 +
-           'asdfghjkl;''`'#0'\zxcvbnm,./'#0'*'#0' ';
-  KeyHi := #0#27'!@#$%^&*()_+'#8#9'QWERTYUIOP{}'#13#0 +
-           'ASDFGHJKL:"~'#0'|ZXCVBNM<>?'#0'*'#0' ';
+  { #1 : touche sans caractere (WPC concatene les chaines comme des
+    PChar : un #0 couperait la chaine) }
+  KeyLo := #1#27'1234567890-='#8#9'qwertyuiop[]'#13#1 +
+           'asdfghjkl;''`'#1'\zxcvbnm,./'#1'*'#1' ';
+  KeyHi := #1#27'!@#$%^&*()_+'#8#9'QWERTYUIOP{}'#13#1 +
+           'ASDFGHJKL:"~'#1'|ZXCVBNM<>?'#1'*'#1' ';
 End;
 
 Function ScanToVk(Sc : LongInt; Ext : Boolean) : LongInt;
@@ -3923,7 +3925,7 @@ Begin
   Begin
     If Sh Then C := KeyLo[Sc + 1] Else C := KeyHi[Sc + 1];
   End;
-  ScanToChar := Ord(C);
+  If C <> #1 Then ScanToChar := Ord(C);
 End;
 
 { ------------------------------------------------------------------ }
@@ -4355,7 +4357,8 @@ Const
   mnStart = 1; mnPrograms = 2; mnDocs = 3; mnSettings = 4;
   cmNone = 0; cmExplorer = 1; cmComputer = 2; cmNotepad = 3; cmHelp = 4;
   cmRun = 5; cmAbout = 6; cmShutdown = 7; cmReadme = 8; cmRecycle = 9;
-  cmSafeMode = 10; cmDosMode = 11; cmDocBase = 100; cmExeBase = 200;
+  cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12;
+  cmDocBase = 100; cmExeBase = 200;
   MaxDesk = 12;
 
 Var
@@ -4377,6 +4380,8 @@ Var
 
 Function RunExe(Path, Args : String) : Boolean; Forward;
 Procedure KCommand(Cmd : LongInt); Forward;
+Procedure NetConfigBox; Forward;
+Function NetRunCmd(S : String) : Boolean; Forward;
 
 Function TxtOk : String;
 Begin
@@ -4731,7 +4736,7 @@ Begin
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 3 + ExeCnt;
-    mnSettings : MenuCount := 2;
+    mnSettings : MenuCount := 3;
     mnDocs :
     Begin
       N := 0;
@@ -4816,6 +4821,13 @@ Begin
                'Abgesicherter Modus', 'Modalit'#133' provvisoria',
                'Modo a prueba de fallos');
         Cmd := cmSafeMode; Icon := icDisplay;
+      End
+      Else If I = 2 Then
+      Begin
+        T := L('R'#130'seau (TCP/IP)...', 'Network (TCP/IP)...',
+               'Netzwerk (TCP/IP)...', 'Rete (TCP/IP)...',
+               'Red (TCP/IP)...');
+        Cmd := cmNetwork; Icon := icComputer;
       End
       Else
       Begin
@@ -5668,7 +5680,7 @@ Begin
     S := Trim(Wnds[W].KS);
     DestroyW(W);
     If (B = 0) And (S <> '') Then
-      If Not RunExe(S, '') Then
+      If Not NetRunCmd(S) And Not RunExe(S, '') Then
         MsgBoxOpen(L('Ex'#130'cuter', 'Run', 'Ausf'#129'hren', 'Esegui',
           'Ejecutar'),
           L('Impossible de trouver '#174' ', 'Cannot find "', '"',
@@ -5843,6 +5855,7 @@ Begin
       ShowW(W, True, True);
     End;
     cmNotepad : NoteOpen('');
+    cmNetwork : NetConfigBox;
     cmReadme : NoteOpen('D:\LISEZMOI.TXT');
     cmRecycle :
       MsgBoxOpen(L('Corbeille', 'Recycle Bin', 'Papierkorb', 'Cestino',
@@ -14737,12 +14750,13 @@ End;
 
 Const
   MaxMod = 16;
-  SysDllN = 18;
+  SysDllN = 20;
   SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
     'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
     'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
     'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
-    'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL');
+    'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL', 'WS2_32.DLL',
+    'ICMP.DLL');
 
 Type
   TModule = Record
@@ -15054,14 +15068,24 @@ Begin
   VideoForWindowsVersion := $010A0000;
 End;
 
+Function IsWsDll(Dll : String) : Boolean; Forward;
+Function WsOrdName(N : LongInt) : String; Forward;
+Procedure NetAppExit; Forward;
+
 Function ResolveImport(Dll, Name : String; Ordinal : LongInt) : LongInt;
 Var M, A : LongInt; Nm : String;
 Begin
   A := 0;
+  { Winsock : fonctions WS_nom du noyau (par nom ou par ordinal) }
+  If IsWsDll(Dll) Then
+  Begin
+    If Name = '' Then Name := WsOrdName(Ordinal);
+    If Name <> '' Then A := KernelExport('WS_' + Name);
+  End;
   { importations par ordinal des DLL systeme connues }
   If (Name = '') And (UpStr(BaseName(Dll)) = 'MSVFW32.DLL') And
      (Ordinal = 2) Then Name := 'VideoForWindowsVersion';
-  If Not IsSysDll(Dll) Then
+  If (A = 0) And Not IsSysDll(Dll) Then
   Begin
     M := FindModule(Dll);
     If M < 0 Then M := LoadPE(Dll, True);
@@ -15298,7 +15322,7 @@ Begin
   Begin
     M := ModOfBase(H);
     If M >= 0 Then S := Mods[M].Path
-    Else If (H >= HDllBase) And (H < HDllBase + 14 * $10000) Then
+    Else If (H >= HDllBase) And (H < HDllBase + SysDllN * $10000) Then
       S := 'C:\WINDOWS\SYSTEM\' + SysDlls[(H - HDllBase) Div $10000]
     Else S := AppPath;
   End;
@@ -15333,18 +15357,27 @@ Begin
 End;
 
 Function GetProcAddress(H, P : LongInt) : LongInt;
-Var M, R : LongInt; Nm : String;
+Var M, R : LongInt; Nm : String; Ws : Boolean;
 Begin
   GetProcAddress := 0;
   M := ModOfBase(H);
+  Ws := (M < 0) And (H >= HDllBase) And (H < HDllBase + SysDllN * $10000);
+  If Ws Then Ws := IsWsDll(SysDlls[(H - HDllBase) Div $10000]);
   If (P >= 0) And (P < $10000) Then
   Begin
-    If M >= 0 Then GetProcAddress := ModuleExport(M, '', P);
+    If M >= 0 Then GetProcAddress := ModuleExport(M, '', P)
+    Else If Ws And (WsOrdName(P) <> '') Then
+      GetProcAddress := KernelExport('WS_' + WsOrdName(P));
     Exit;
   End;
   Nm := PStr(P);
-  If M >= 0 Then R := ModuleExport(M, Nm, 0)
-  Else R := KernelExport(Nm);
+  R := 0;
+  If Ws Then R := KernelExport('WS_' + Nm);
+  If R = 0 Then
+  Begin
+    If M >= 0 Then R := ModuleExport(M, Nm, 0)
+    Else R := KernelExport(Nm);
+  End;
   If (R = 0) And (M < 0) And (Length(Nm) > 1) And (Nm[1] = '_') Then
     R := KernelExport(Copy(Nm, 2, 255));
   If R = 0 Then
@@ -15560,6 +15593,7 @@ Procedure KillApp;
 Var I : LongInt;
 Begin
   KillingApp := True;
+  NetAppExit;
   For I := 0 To MaxWnd - 1 Do
     If Wnds[I].Used And (Wnds[I].Thread > 0) And
        Threads[Wnds[I].Thread].IsApp And Not ThrW16[Wnds[I].Thread] Then
@@ -15748,10 +15782,14 @@ End;
 Function GetLogicalDriveStringsA(N, Buf : LongInt) : LongInt;
 Var S : String; I : LongInt;
 Begin
-  S := 'C:\' + #0 + 'D:\' + #0 + #0;
+  { C:\<0>D:\<0><0> (octets ecrits un a un : WPC concatene les chaines
+    comme des PChar) }
+  S := 'C:\ D:\  ';
   GetLogicalDriveStringsA := 8;
   If N < 9 Then Exit;
-  For I := 1 To 9 Do Mem[0:Buf + I - 1] := Ord(S[I]);
+  For I := 1 To 9 Do
+    If S[I] = ' ' Then Mem[0:Buf + I - 1] := 0
+    Else Mem[0:Buf + I - 1] := Ord(S[I]);
 End;
 
 Function MoveFileExA(PSrc, PDst, Flags : LongInt) : LongInt;
@@ -22434,9 +22472,2821 @@ Begin
   DirectXUnRegisterApplication := 1;
 End;
 
+{ ==================================================================== }
+{ Partie 16 - Reseau : pilote NE2000 et pile TCP/IP (ARP, IP, ICMP,    }
+{             UDP, TCP), client DHCP et resolveur DNS                  }
+{ ==================================================================== }
+
+{ Comme Windows 95 avec sa carte ? NE2000 compatible ?, VMM32 pilote une
+  carte DP8390 : RTL8029 PCI (10EC:8029) ou carte ISA en 300h. Les
+  trames sont lues par scrutation (NetPoll), depuis la boucle du systeme
+  et pendant les appels bloquants de Winsock. Les adresses IP sont
+  gardees dans l'ordre du reseau (telles qu'en memoire, MemL), les ports
+  et numeros de sequence dans l'ordre de l'hote. }
+
+Const
+  MaxSock = 32;
+  MaxArp = 16;
+  MaxLoop = 8;
+  SkRxSize = 32768;
+  SkTxSize = 16384;
+  SockBase = $80;                    { premier descripteur de socket }
+  NetMss = 1460;
+  NeTxPage = $40; NeRxStart = $46; NeRxStop = $80;
+  tcClosed = 0; tcListen = 1; tcSynSent = 2; tcSynRcvd = 3; tcEstab = 4;
+  tcFinWait1 = 5; tcFinWait2 = 6; tcCloseWait = 7; tcClosing = 8;
+  tcLastAck = 9; tcTimeWait = 10;
+  { SkFlags }
+  sfNonBlock = 1; sfFinRcvd = 2; sfFinWant = 4; sfFinSent = 8;
+  sfAppClosed = 16; sfBound = 32; sfUdpConn = 64; sfAccepted = 128;
+  { evenements WSAAsyncSelect }
+  FD_READ = 1; FD_WRITE = 2; FD_OOB = 4; FD_ACCEPT = 8; FD_CONNECT = 16;
+  FD_CLOSE = 32;
+  { TCP }
+  thFin = 1; thSyn = 2; thRst = 4; thPsh = 8; thAck = 16;
+
+Var
+  NicBase   : LongInt;                { port de la carte (0 : aucune) }
+  NicPci    : Boolean;
+  NicMac    : Array[0..5] Of Byte;
+  NetIP, NetMask, NetGw, NetDns, NetDhcpSrv, NetLease : LongInt;
+  DhcpState, DhcpNext, DhcpXid, DhcpTries, DhcpOffer : LongInt;
+  NetRx, NetTx, NetAux, NetHdr, NetLoop, NetLoopRx : LongInt;
+  LoopHead, LoopN : LongInt;
+  NetIpId, NetPortNext, NetLastTick, NetIss : LongInt;
+  NetPktIn, NetPktOut : LongInt;
+  NetPolling : Boolean;
+  NetRxTtl : LongInt;
+  ArpIP     : Array[0..MaxArp - 1] Of LongInt;
+  ArpMac    : Array[0..MaxArp * 6 - 1] Of Byte;
+  ArpNext   : LongInt;
+  PingId, PingSeq, PingGotAt, PingTtl, PingFrom, PingData : LongInt;
+  PingLen, PingReq : LongInt;
+  WsBuf     : LongInt;    { structures statiques de Winsock }
+  DnsId, DnsPort, DnsResult : LongInt;
+  DnsBusy   : Boolean;
+  { sockets (tableaux plats) }
+  SkUsed    : Array[0..MaxSock - 1] Of Boolean;
+  SkType, SkLPort, SkRIP, SkRPort, SkState, SkErr : Array[0..MaxSock - 1]
+    Of LongInt;
+  SkRx, SkRxHead, SkRxLen, SkTx, SkTxLen : Array[0..MaxSock - 1] Of LongInt;
+  SkSndUna, SkSndNxt, SkRcvNxt, SkSndWnd : Array[0..MaxSock - 1] Of LongInt;
+  SkRetx, SkRto, SkTries, SkParent, SkBacklog : Array[0..MaxSock - 1]
+    Of LongInt;
+  SkFlags, SkAWnd, SkAMsg, SkAEv, SkASent, SkTimer : Array[0..MaxSock - 1]
+    Of LongInt;
+  SkLastWnd : Array[0..MaxSock - 1] Of LongInt;
+
+{ ------------------------------------------------------------------ }
+{ Outils : ordre des octets, adresses, somme de controle              }
+{ ------------------------------------------------------------------ }
+
+Function NGetW(A : LongInt) : LongInt;
+Begin
+  NGetW := (Mem[0:A] Shl 8) Or Mem[0:A + 1];
+End;
+
+Procedure NPutW(A, V : LongInt);
+Begin
+  Mem[0:A] := (V Shr 8) And $FF;
+  Mem[0:A + 1] := V And $FF;
+End;
+
+Function NGetL(A : LongInt) : LongInt;
+Begin
+  NGetL := (Mem[0:A] Shl 24) Or (Mem[0:A + 1] Shl 16) Or
+           (Mem[0:A + 2] Shl 8) Or Mem[0:A + 3];
+End;
+
+Procedure NPutL(A, V : LongInt);
+Begin
+  Mem[0:A] := (V Shr 24) And $FF;
+  Mem[0:A + 1] := (V Shr 16) And $FF;
+  Mem[0:A + 2] := (V Shr 8) And $FF;
+  Mem[0:A + 3] := V And $FF;
+End;
+
+Function Swap16(V : LongInt) : LongInt;
+Begin
+  Swap16 := ((V And $FF) Shl 8) Or ((V Shr 8) And $FF);
+End;
+
+Function Swap32(V : LongInt) : LongInt;
+Begin
+  Swap32 := ((V And $FF) Shl 24) Or (((V Shr 8) And $FF) Shl 16) Or
+            (((V Shr 16) And $FF) Shl 8) Or ((V Shr 24) And $FF);
+End;
+
+{ Adresse IP (ordre du reseau) en notation pointee }
+Function IpStr(IP : LongInt) : String;
+Begin
+  IpStr := IntStr(IP And $FF) + '.' + IntStr((IP Shr 8) And $FF) + '.' +
+           IntStr((IP Shr 16) And $FF) + '.' + IntStr((IP Shr 24) And $FF);
+End;
+
+{ Notation pointee -> adresse (ordre du reseau) ; False si invalide }
+Function ParseIp(S : String; Var IP : LongInt) : Boolean;
+Var I, N, V, R, Digits : LongInt; C : Char;
+Begin
+  ParseIp := False;
+  R := 0; N := 0; V := 0; Digits := 0;
+  For I := 1 To Length(S) + 1 Do
+  Begin
+    If I > Length(S) Then C := '.' Else C := S[I];
+    If (C >= '0') And (C <= '9') Then
+    Begin
+      V := V * 10 + Ord(C) - 48;
+      Inc(Digits);
+      If (V > 255) Or (Digits > 3) Then Exit;
+    End
+    Else If C = '.' Then
+    Begin
+      If (Digits = 0) Or (N > 3) Then Exit;
+      R := R Or (V Shl (N * 8));
+      Inc(N); V := 0; Digits := 0;
+    End
+    Else Exit;
+  End;
+  If N <> 4 Then Exit;
+  IP := R;
+  ParseIp := True;
+End;
+
+Function MacStr : String;
+Var I : LongInt; S : String;
+Begin
+  S := '';
+  For I := 0 To 5 Do
+  Begin
+    If I > 0 Then S := S + '-';
+    S := S + HexStr(NicMac[I], 2);
+  End;
+  MacStr := S;
+End;
+
+{ Somme de controle de l'Internet (complement a un) }
+Function NetSum(A, N, Init : LongInt) : LongInt;
+Var S, I : LongInt;
+Begin
+  S := Init; I := 0;
+  While I + 1 < N Do
+  Begin
+    S := S + (Mem[0:A + I] Shl 8) + Mem[0:A + I + 1];
+    I := I + 2;
+  End;
+  If I < N Then S := S + (Mem[0:A + I] Shl 8);
+  While (S Shr 16) <> 0 Do S := (S And $FFFF) + (S Shr 16);
+  NetSum := S;
+End;
+
+{ Pseudo-en-tete TCP/UDP }
+Function PseudoSum(Src, Dst, Proto, Len : LongInt) : LongInt;
+Begin
+  PseudoSum := ((Src And $FF) Shl 8) + ((Src Shr 8) And $FF) +
+               (((Src Shr 16) And $FF) Shl 8) + ((Src Shr 24) And $FF) +
+               ((Dst And $FF) Shl 8) + ((Dst Shr 8) And $FF) +
+               (((Dst Shr 16) And $FF) Shl 8) + ((Dst Shr 24) And $FF) +
+               Proto + Len;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Bus PCI (mecanisme de configuration 1)                               }
+{ ------------------------------------------------------------------ }
+
+Function PciRead(Bus, Dev, Fn, Reg : LongInt) : LongInt;
+Var A, R : LongInt;
+Begin
+  A := LongInt($80000000) Or (Bus Shl 16) Or (Dev Shl 11) Or (Fn Shl 8) Or
+       (Reg And $FC);
+  asm
+    mov eax,A
+    mov edx,0CF8h
+    out dx,eax
+    mov edx,0CFCh
+    in eax,dx
+    mov R,eax
+  end;
+  PciRead := R;
+End;
+
+Procedure PciWrite(Bus, Dev, Fn, Reg, V : LongInt);
+Var A : LongInt;
+Begin
+  A := LongInt($80000000) Or (Bus Shl 16) Or (Dev Shl 11) Or (Fn Shl 8) Or
+       (Reg And $FC);
+  asm
+    mov eax,A
+    mov edx,0CF8h
+    out dx,eax
+    mov eax,V
+    mov edx,0CFCh
+    out dx,eax
+  end;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pilote NE2000 (DP8390, transferts en mots de 16 bits)                }
+{ ------------------------------------------------------------------ }
+
+Procedure NeDma(Addr, Count, Cmd : LongInt);
+Begin
+  Port[NicBase + $0A] := Count And $FF;
+  Port[NicBase + $0B] := (Count Shr 8) And $FF;
+  Port[NicBase + $08] := Addr And $FF;
+  Port[NicBase + $09] := (Addr Shr 8) And $FF;
+  Port[NicBase] := Cmd;
+End;
+
+Procedure NeWaitDma;
+Var I : LongInt;
+Begin
+  I := 0;
+  While ((Port[NicBase + 7] And $40) = 0) And (I < 100000) Do Inc(I);
+  Port[NicBase + 7] := $40;
+End;
+
+{ Lire Count octets de la memoire de la carte (arrondi au mot) }
+Procedure NeRead(Addr, Dst, Count : LongInt);
+Var P, N : LongInt;
+Begin
+  N := (Count + 1) And Not 1;
+  NeDma(Addr, N, $0A);
+  P := NicBase + $10;
+  N := N Shr 1;
+  asm
+    push edi
+    mov edi,Dst
+    mov ecx,N
+    mov edx,P
+    cld
+    rep insw
+    pop edi
+  end;
+  NeWaitDma;
+End;
+
+Procedure NeWrite(Addr, Src, Count : LongInt);
+Var P, N : LongInt;
+Begin
+  N := (Count + 1) And Not 1;
+  Port[NicBase + 7] := $40;
+  NeDma(Addr, N, $12);
+  P := NicBase + $10;
+  N := N Shr 1;
+  asm
+    push esi
+    mov esi,Src
+    mov ecx,N
+    mov edx,P
+    cld
+    rep outsw
+    pop esi
+  end;
+  NeWaitDma;
+End;
+
+Function NeReset(B : LongInt) : Boolean;
+Var I, V : LongInt;
+Begin
+  NeReset := False;
+  V := Port[B + $1F];
+  Port[B + $1F] := V;
+  I := 0;
+  While ((Port[B + 7] And $80) = 0) And (I < 200000) Do Inc(I);
+  If (Port[B + 7] And $80) = 0 Then Exit;
+  Port[B + 7] := $FF;
+  NeReset := True;
+End;
+
+Procedure NeInit;
+Var B, I : LongInt;
+Begin
+  B := NicBase;
+  Port[B] := $21;                  { page 0, arret, pas de DMA }
+  Port[B + $0E] := $49;            { DCR : mots, FIFO 8 octets }
+  Port[B + $0A] := 0; Port[B + $0B] := 0;
+  Port[B + $0F] := 0;              { IMR : scrutation }
+  Port[B + 7] := $FF;
+  Port[B + $0C] := $20;            { RCR : moniteur }
+  Port[B + $0D] := $02;            { TCR : boucle interne }
+  { adresse Ethernet : PROM (octets doubles en mode mot) }
+  FillMem(NetHdr, 64, 0);
+  NeRead(0, NetHdr, 32);
+  For I := 0 To 5 Do NicMac[I] := Mem[0:NetHdr + I * 2];
+  Port[B] := $21;
+  Port[B + $01] := NeRxStart;
+  Port[B + $02] := NeRxStop;
+  Port[B + $03] := NeRxStart;
+  Port[B + $04] := NeTxPage;
+  Port[B + 7] := $FF;
+  Port[B] := $61;                  { page 1 }
+  For I := 0 To 5 Do Port[B + 1 + I] := NicMac[I];
+  For I := 0 To 7 Do Port[B + 8 + I] := $FF;
+  Port[B + 7] := NeRxStart + 1;    { CURR }
+  Port[B] := $22;                  { page 0, demarrage }
+  Port[B + 7] := $FF;
+  Port[B + $0D] := 0;              { TCR normal }
+  Port[B + $0C] := $04;            { RCR : diffusion acceptee }
+End;
+
+Function NeProbe : Boolean;
+Var Bus, Dev, Id, Bar, Cmd : LongInt;
+Begin
+  NeProbe := False;
+  NicBase := 0;
+  For Bus := 0 To 3 Do
+    For Dev := 0 To 31 Do
+      If NicBase = 0 Then
+      Begin
+        Id := PciRead(Bus, Dev, 0, 0);
+        If Id = $802910EC Then
+        Begin
+          Bar := PciRead(Bus, Dev, 0, $10);
+          If (Bar And 1) <> 0 Then
+          Begin
+            Cmd := PciRead(Bus, Dev, 0, 4);
+            PciWrite(Bus, Dev, 0, 4, (Cmd And $FFFF) Or 5);
+            NicBase := Bar And $FFFC;
+            NicPci := True;
+          End;
+        End;
+      End;
+  If NicBase = 0 Then
+  Begin
+    { carte ISA a l'adresse habituelle }
+    If (Port[$300] <> $FF) And NeReset($300) Then
+    Begin
+      NicBase := $300;
+      NicPci := False;
+    End;
+  End
+  Else If Not NeReset(NicBase) Then NicBase := 0;
+  If NicBase = 0 Then Exit;
+  NeInit;
+  NeProbe := True;
+End;
+
+Procedure NeSend(Src, Len : LongInt);
+Var I : LongInt;
+Begin
+  If NicBase = 0 Then Exit;
+  If Len < 60 Then
+  Begin
+    FillMem(Src + Len, 60 - Len, 0);
+    Len := 60;
+  End;
+  I := 0;
+  While ((Port[NicBase] And 4) <> 0) And (I < 200000) Do Inc(I);
+  NeWrite(NeTxPage * 256, Src, Len);
+  Port[NicBase + 4] := NeTxPage;
+  Port[NicBase + 5] := Len And $FF;
+  Port[NicBase + 6] := (Len Shr 8) And $FF;
+  Port[NicBase] := $26;
+  Inc(NetPktOut);
+End;
+
+{ Trame recue dans Dst : longueur, ou 0 si aucune }
+Function NeRecv(Dst : LongInt) : LongInt;
+Var B, Curr, Bnry, Nxt, NextPg, Len : LongInt;
+Begin
+  NeRecv := 0;
+  B := NicBase;
+  Port[B] := $62;
+  Curr := Port[B + 7];
+  Port[B] := $22;
+  Bnry := Port[B + 3];
+  Nxt := Bnry + 1;
+  If Nxt >= NeRxStop Then Nxt := NeRxStart;
+  If Nxt = Curr Then
+  Begin
+    If (Port[B + 7] And $10) <> 0 Then Port[B + 7] := $10;
+    Exit;
+  End;
+  NeRead(Nxt * 256, NetHdr, 4);
+  NextPg := Mem[0:NetHdr + 1];
+  Len := MemW[0:NetHdr + 2] - 4;
+  If (NextPg < NeRxStart) Or (NextPg >= NeRxStop) Or (Len > 2000) Then
+  Begin
+    { anneau incoherent : tout abandonner }
+    If Curr - 1 < NeRxStart Then Port[B + 3] := NeRxStop - 1
+    Else Port[B + 3] := Curr - 1;
+    Port[B + 7] := $FF;
+    Exit;
+  End;
+  If (Len > 0) And (Len <= 1536) Then NeRead(Nxt * 256 + 4, Dst, Len)
+  Else Len := 0;
+  If NextPg - 1 < NeRxStart Then Port[B + 3] := NeRxStop - 1
+  Else Port[B + 3] := NextPg - 1;
+  Port[B + 7] := $15;
+  Inc(NetPktIn);
+  If Len = 0 Then Len := -1;
+  NeRecv := Len;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ethernet et ARP                                                      }
+{ ------------------------------------------------------------------ }
+
+Function ArpFind(IP : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := -1;
+  For I := 0 To MaxArp - 1 Do
+    If (ArpIP[I] = IP) And (IP <> 0) Then R := I;
+  ArpFind := R;
+End;
+
+Procedure ArpAdd(IP, Mac : LongInt);
+Var I, K : LongInt;
+Begin
+  If (IP = 0) Or (IP = -1) Then Exit;
+  I := ArpFind(IP);
+  If I < 0 Then
+  Begin
+    I := ArpNext;
+    ArpNext := (ArpNext + 1) Mod MaxArp;
+  End;
+  ArpIP[I] := IP;
+  For K := 0 To 5 Do ArpMac[I * 6 + K] := Mem[0:Mac + K];
+End;
+
+{ En-tete Ethernet en F (destination Mac, 0 : diffusion) }
+Procedure EthHeader(F, Mac, EType : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To 5 Do
+  Begin
+    If Mac = 0 Then Mem[0:F + K] := $FF Else Mem[0:F + K] := Mem[0:Mac + K];
+    Mem[0:F + 6 + K] := NicMac[K];
+  End;
+  NPutW(F + 12, EType);
+End;
+
+Procedure ArpSend(Op, TMac, TIP : LongInt);
+Var F, K : LongInt;
+Begin
+  F := NetAux;
+  EthHeader(F, TMac, $0806);
+  NPutW(F + 14, 1); NPutW(F + 16, $0800);
+  Mem[0:F + 18] := 6; Mem[0:F + 19] := 4;
+  NPutW(F + 20, Op);
+  For K := 0 To 5 Do
+  Begin
+    Mem[0:F + 22 + K] := NicMac[K];
+    If TMac = 0 Then Mem[0:F + 32 + K] := 0
+    Else Mem[0:F + 32 + K] := Mem[0:TMac + K];
+  End;
+  MemL[0:F + 28] := NetIP;
+  MemL[0:F + 38] := TIP;
+  NeSend(F, 42);
+End;
+
+Procedure ArpInput(P, Len : LongInt);
+Var SIP, TIP : LongInt;
+Begin
+  If Len < 28 Then Exit;
+  If (NGetW(P) <> 1) Or (NGetW(P + 2) <> $0800) Then Exit;
+  SIP := MemL[0:P + 14];
+  TIP := MemL[0:P + 24];
+  If (NetIP <> 0) And (TIP = NetIP) Then
+  Begin
+    ArpAdd(SIP, P + 8);
+    If NGetW(P + 6) = 1 Then
+    Begin
+      MoveMem(P + 8, NetHdr + 16, 6);
+      ArpSend(2, NetHdr + 16, SIP);
+    End;
+  End
+  Else If ArpFind(SIP) >= 0 Then ArpAdd(SIP, P + 8);
+End;
+
+Function IsLoop(IP : LongInt) : Boolean;
+Begin
+  IsLoop := ((IP And $FF) = 127) Or ((IP = NetIP) And (IP <> 0));
+End;
+
+{ Prochain saut vers IP (-1 : diffusion) }
+Function NextHop(IP : LongInt) : LongInt;
+Begin
+  If (IP = -1) Or (NetIP = 0) Then NextHop := -1
+  Else If ((IP Xor NetIP) And NetMask) <> 0 Then NextHop := NetGw
+  Else If (IP Or NetMask) = -1 Then NextHop := -1
+  Else NextHop := IP;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IP                                                                   }
+{ ------------------------------------------------------------------ }
+
+{ Emettre le datagramme dont la charge (Len octets) est en NetTx + 34 }
+Function IpSend(Dst, Proto, Len : LongInt) : Boolean;
+Var H, Hop, I, A : LongInt;
+Begin
+  IpSend := False;
+  H := NetTx + 14;
+  Mem[0:H] := $45; Mem[0:H + 1] := 0;
+  NPutW(H + 2, 20 + Len);
+  NPutW(H + 4, NetIpId);
+  NetIpId := (NetIpId + 1) And $FFFF;
+  NPutW(H + 6, 0);
+  Mem[0:H + 8] := 128; Mem[0:H + 9] := Proto;
+  NPutW(H + 10, 0);
+  If IsLoop(Dst) Then MemL[0:H + 12] := Dst Else MemL[0:H + 12] := NetIP;
+  MemL[0:H + 16] := Dst;
+  NPutW(H + 10, (Not NetSum(H, 20, 0)) And $FFFF);
+  If IsLoop(Dst) Then
+  Begin
+    { boucle locale : file traitee par NetPoll }
+    If LoopN >= MaxLoop Then Exit;
+    A := NetLoop + ((LoopHead + LoopN) Mod MaxLoop) * 1600;
+    MemL[0:A] := 20 + Len;
+    MoveMem(H, A + 4, 20 + Len);
+    Inc(LoopN);
+    IpSend := True;
+    Exit;
+  End;
+  If NicBase = 0 Then Exit;
+  Hop := NextHop(Dst);
+  If Hop = -1 Then EthHeader(NetTx, 0, $0800)
+  Else
+  Begin
+    I := ArpFind(Hop);
+    If I < 0 Then
+    Begin
+      ArpSend(1, 0, Hop);
+      Exit;
+    End;
+    EthHeader(NetTx, LongInt(@ArpMac) + I * 6, $0800);
+  End;
+  NeSend(NetTx, 34 + Len);
+  IpSend := True;
+End;
+
+Procedure IcmpInput(Src, P, Len : LongInt); Forward;
+Procedure UdpInput(Src, Dst, P, Len : LongInt); Forward;
+Procedure TcpInput(Src, P, Len : LongInt); Forward;
+
+Procedure IpInput(P, Len : LongInt);
+Var HL, TL, Src, Dst : LongInt;
+Begin
+  If Len < 20 Then Exit;
+  If (Mem[0:P] Shr 4) <> 4 Then Exit;
+  HL := (Mem[0:P] And 15) * 4;
+  TL := NGetW(P + 2);
+  If (TL > Len) Or (TL < HL) Then Exit;
+  If (NGetW(P + 6) And $3FFF) <> 0 Then Exit;   { fragments ignores }
+  Src := MemL[0:P + 12];
+  Dst := MemL[0:P + 16];
+  If NetIP = 0 Then
+  Begin
+    { en attente de DHCP : seulement UDP }
+    If (Mem[0:P + 9] <> 17) And Not IsLoop(Dst) Then Exit;
+  End
+  Else If (Dst <> NetIP) And (Dst <> -1) And Not IsLoop(Dst) And
+          ((Dst Or NetMask) <> -1) Then Exit;
+  NetRxTtl := Mem[0:P + 8];
+  Case Mem[0:P + 9] Of
+    1 : IcmpInput(Src, P + HL, TL - HL);
+    6 : TcpInput(Src, P + HL, TL - HL);
+    17 : UdpInput(Src, Dst, P + HL, TL - HL);
+  End;
+End;
+
+Procedure EthInput(F, Len : LongInt);
+Var T : LongInt;
+Begin
+  If Len < 14 Then Exit;
+  T := NGetW(F + 12);
+  If T = $0806 Then ArpInput(F + 14, Len - 14)
+  Else If T = $0800 Then IpInput(F + 14, Len - 14);
+End;
+
+{ ------------------------------------------------------------------ }
+{ ICMP : echo (ping)                                                   }
+{ ------------------------------------------------------------------ }
+
+Procedure IcmpInput(Src, P, Len : LongInt);
+Var T : LongInt;
+Begin
+  If Len < 8 Then Exit;
+  T := Mem[0:P];
+  If (T = 8) And (Len <= 1472) Then
+  Begin
+    MoveMem(P, NetTx + 34, Len);
+    Mem[0:NetTx + 34] := 0;
+    NPutW(NetTx + 36, 0);
+    NPutW(NetTx + 36, (Not NetSum(NetTx + 34, Len, 0)) And $FFFF);
+    IpSend(Src, 1, Len);
+  End
+  Else If (T = 0) And (NGetW(P + 4) = PingId) And
+          (NGetW(P + 6) = PingSeq) Then
+  Begin
+    PingGotAt := Ticks;
+    PingTtl := NetRxTtl;
+    PingFrom := Src;
+    PingLen := Min(Len - 8, 1024);
+    If PingData <> 0 Then MoveMem(P + 8, PingData, PingLen);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ UDP                                                                  }
+{ ------------------------------------------------------------------ }
+
+{ Emettre un datagramme dont les donnees sont en NetTx + 42 }
+Function UdpOut(SPort, Dst, DPort, Len : LongInt) : Boolean;
+Var U, S, Src : LongInt;
+Begin
+  U := NetTx + 34;
+  NPutW(U, SPort); NPutW(U + 2, DPort);
+  NPutW(U + 4, Len + 8); NPutW(U + 6, 0);
+  If IsLoop(Dst) Then Src := Dst Else Src := NetIP;
+  S := NetSum(U, Len + 8, PseudoSum(Src, Dst, 17, Len + 8));
+  S := (Not S) And $FFFF;
+  If S = 0 Then S := $FFFF;
+  NPutW(U + 6, S);
+  UdpOut := IpSend(Dst, 17, Len + 8);
+End;
+
+Procedure DhcpInput(P, Len : LongInt); Forward;
+Procedure DnsInput(P, Len : LongInt); Forward;
+Procedure NetNotify(S, Ev : LongInt); Forward;
+
+{ Anneau de reception d'un socket }
+Procedure RingPut(S, Src, N : LongInt);
+Var Pos0, K : LongInt;
+Begin
+  Pos0 := (SkRxHead[S] + SkRxLen[S]) Mod SkRxSize;
+  K := Min(N, SkRxSize - Pos0);
+  MoveMem(Src, SkRx[S] + Pos0, K);
+  If N > K Then MoveMem(Src + K, SkRx[S], N - K);
+  SkRxLen[S] := SkRxLen[S] + N;
+End;
+
+Procedure RingGet(S, Dst, N : LongInt; Peek : Boolean);
+Var K : LongInt;
+Begin
+  K := Min(N, SkRxSize - SkRxHead[S]);
+  If Dst <> 0 Then
+  Begin
+    MoveMem(SkRx[S] + SkRxHead[S], Dst, K);
+    If N > K Then MoveMem(SkRx[S], Dst + K, N - K);
+  End;
+  If Not Peek Then
+  Begin
+    SkRxHead[S] := (SkRxHead[S] + N) Mod SkRxSize;
+    SkRxLen[S] := SkRxLen[S] - N;
+  End;
+End;
+
+Procedure UdpInput(Src, Dst, P, Len : LongInt);
+Var SP, DP, UL, D, S, I : LongInt;
+Begin
+  If Len < 8 Then Exit;
+  SP := NGetW(P); DP := NGetW(P + 2); UL := NGetW(P + 4);
+  If (UL < 8) Or (UL > Len) Then Exit;
+  D := P + 8; UL := UL - 8;
+  If (DP = 68) And (DhcpState In [1, 2]) Then
+  Begin
+    DhcpInput(D, UL);
+    Exit;
+  End;
+  If DnsBusy And (DP = DnsPort) And (SP = 53) Then
+  Begin
+    DnsInput(D, UL);
+    Exit;
+  End;
+  S := -1;
+  For I := 0 To MaxSock - 1 Do
+    If SkUsed[I] And (SkType[I] = 2) And (SkLPort[I] = DP) Then
+      If ((SkFlags[I] And sfUdpConn) = 0) Or
+         ((SkRIP[I] = Src) And (SkRPort[I] = SP)) Then S := I;
+  If S < 0 Then Exit;
+  If SkRxLen[S] + UL + 8 > SkRxSize Then Exit;
+  MemL[0:NetHdr] := UL;
+  MemL[0:NetHdr + 4] := Src;
+  MemL[0:NetHdr + 8] := SP;
+  RingPut(S, NetHdr, 12);
+  RingPut(S, D, UL);
+  NetNotify(S, FD_READ);
+End;
+
+{ ------------------------------------------------------------------ }
+{ DHCP (client)                                                        }
+{ ------------------------------------------------------------------ }
+
+Procedure DhcpSend(Typ : LongInt);
+Var D, O, K : LongInt; Hn : String;
+Begin
+  D := NetTx + 42;
+  FillMem(D, 300, 0);
+  Mem[0:D] := 1; Mem[0:D + 1] := 1; Mem[0:D + 2] := 6;
+  NPutL(D + 4, DhcpXid);
+  NPutW(D + 10, $8000);
+  For K := 0 To 5 Do Mem[0:D + 28 + K] := NicMac[K];
+  NPutL(D + 236, $63825363);
+  O := D + 240;
+  Mem[0:O] := 53; Mem[0:O + 1] := 1; Mem[0:O + 2] := Typ; O := O + 3;
+  Mem[0:O] := 61; Mem[0:O + 1] := 7; Mem[0:O + 2] := 1;
+  For K := 0 To 5 Do Mem[0:O + 3 + K] := NicMac[K];
+  O := O + 9;
+  Mem[0:O] := 12; Mem[0:O + 1] := 7;
+  Hn := 'PASDOWS';
+  For K := 1 To 7 Do Mem[0:O + 1 + K] := Ord(Hn[K]);
+  O := O + 9;
+  If Typ = 3 Then
+  Begin
+    Mem[0:O] := 50; Mem[0:O + 1] := 4; MemL[0:O + 2] := DhcpOffer;
+    O := O + 6;
+    Mem[0:O] := 54; Mem[0:O + 1] := 4; MemL[0:O + 2] := NetDhcpSrv;
+    O := O + 6;
+  End;
+  Mem[0:O] := 55; Mem[0:O + 1] := 4; Mem[0:O + 2] := 1; Mem[0:O + 3] := 3;
+  Mem[0:O + 4] := 6; Mem[0:O + 5] := 15;
+  O := O + 6;
+  Mem[0:O] := 255;
+  UdpOut(68, -1, 67, 300);
+End;
+
+Procedure DhcpInput(P, Len : LongInt);
+Var O, E, Typ, C, N, Mask, Gw, Dns, Srv, Lease : LongInt;
+Begin
+  If (Len < 244) Or (Mem[0:P] <> 2) Then Exit;
+  If NGetL(P + 4) <> DhcpXid Then Exit;
+  If NGetL(P + 236) <> $63825363 Then Exit;
+  Typ := 0; Mask := 0; Gw := 0; Dns := 0; Srv := 0; Lease := 0;
+  O := P + 240; E := P + Len;
+  While O < E Do
+  Begin
+    C := Mem[0:O];
+    If C = 255 Then Break;
+    If C = 0 Then
+    Begin
+      Inc(O);
+      Continue;
+    End;
+    N := Mem[0:O + 1];
+    Case C Of
+      53 : Typ := Mem[0:O + 2];
+      1 : Mask := MemL[0:O + 2];
+      3 : Gw := MemL[0:O + 2];
+      6 : Dns := MemL[0:O + 2];
+      51 : Lease := NGetL(O + 2);
+      54 : Srv := MemL[0:O + 2];
+    End;
+    O := O + 2 + N;
+  End;
+  If (Typ = 2) And (DhcpState = 1) Then
+  Begin
+    DhcpOffer := MemL[0:P + 16];
+    NetDhcpSrv := Srv;
+    DhcpState := 2;
+    DhcpNext := Ticks + 3000;
+    DhcpSend(3);
+  End
+  Else If (Typ = 5) And (DhcpState = 2) Then
+  Begin
+    NetIP := MemL[0:P + 16];
+    If Mask <> 0 Then NetMask := Mask Else NetMask := $00FFFFFF;
+    NetGw := Gw; NetDns := Dns; NetLease := Lease;
+    DhcpState := 3;
+    KLog('TCP/IP : adresse ' + IpStr(NetIP) + ' masque ' + IpStr(NetMask) +
+         ' passerelle ' + IpStr(NetGw) + ' DNS ' + IpStr(NetDns) +
+         ' (DHCP ' + IpStr(NetDhcpSrv) + ')');
+  End
+  Else If Typ = 6 Then
+  Begin
+    DhcpState := 1;
+    DhcpNext := Ticks + 1000;
+  End;
+End;
+
+Procedure DhcpTick;
+Begin
+  If (NicBase = 0) Or Not (DhcpState In [1, 2]) Then Exit;
+  If Ticks < DhcpNext Then Exit;
+  Inc(DhcpTries);
+  DhcpState := 1;
+  DhcpXid := DhcpXid + 1;
+  DhcpSend(1);
+  DhcpNext := Ticks + Min(2000 * DhcpTries, 30000);
+End;
+
+{ ------------------------------------------------------------------ }
+{ TCP                                                                  }
+{ ------------------------------------------------------------------ }
+
+Function SkWnd(S : LongInt) : LongInt;
+Begin
+  SkWnd := Min(SkRxSize - SkRxLen[S], 65535);
+End;
+
+{ Segment TCP : Len octets de donnees depuis Data (adresse lineaire) }
+Function TcpRaw(Dst, SP, DP, Seq, Ack, Fl, Wnd, Data, Len : LongInt)
+  : Boolean;
+Var T, HL, S, Src : LongInt;
+Begin
+  T := NetTx + 34;
+  HL := 20;
+  If (Fl And thSyn) <> 0 Then HL := 24;
+  NPutW(T, SP); NPutW(T + 2, DP);
+  NPutL(T + 4, Seq); NPutL(T + 8, Ack);
+  Mem[0:T + 12] := (HL Div 4) Shl 4;
+  Mem[0:T + 13] := Fl;
+  NPutW(T + 14, Wnd);
+  NPutW(T + 16, 0); NPutW(T + 18, 0);
+  If HL = 24 Then
+  Begin
+    Mem[0:T + 20] := 2; Mem[0:T + 21] := 4; NPutW(T + 22, NetMss);
+  End;
+  If Len > 0 Then MoveMem(Data, T + HL, Len);
+  If IsLoop(Dst) Then Src := Dst Else Src := NetIP;
+  S := NetSum(T, HL + Len, PseudoSum(Src, Dst, 6, HL + Len));
+  NPutW(T + 16, (Not S) And $FFFF);
+  TcpRaw := IpSend(Dst, 6, HL + Len);
+End;
+
+Procedure TcpSend(S, Fl, Seq, Off, Len : LongInt);
+Begin
+  If (Fl And thAck) <> 0 Then SkLastWnd[S] := SkWnd(S);
+  TcpRaw(SkRIP[S], SkLPort[S], SkRPort[S], Seq, SkRcvNxt[S], Fl, SkWnd(S),
+         SkTx[S] + Off, Len);
+End;
+
+Procedure TcpArm(S : LongInt);
+Begin
+  If SkRetx[S] = 0 Then SkRetx[S] := Ticks + SkRto[S];
+End;
+
+{ Emettre les donnees en attente et le FIN demande }
+Procedure TcpOutput(S : LongInt);
+Var Off, Avail, N, K, St : LongInt;
+Begin
+  St := SkState[S];
+  If Not (St In [tcEstab, tcCloseWait, tcFinWait1, tcClosing, tcLastAck])
+  Then Exit;
+  If (SkFlags[S] And sfFinSent) = 0 Then
+  Begin
+    Off := SkSndNxt[S] - SkSndUna[S];
+    Avail := Min(SkTxLen[S], SkSndWnd[S]) - Off;
+    K := 0;
+    While (Avail > 0) And (K < 8) Do
+    Begin
+      N := Min(Avail, NetMss);
+      TcpSend(S, thAck Or thPsh, SkSndNxt[S], Off, N);
+      SkSndNxt[S] := SkSndNxt[S] + N;
+      Off := Off + N; Avail := Avail - N;
+      TcpArm(S);
+      Inc(K);
+    End;
+    If ((SkFlags[S] And sfFinWant) <> 0) And (Off = SkTxLen[S]) Then
+    Begin
+      TcpSend(S, thFin Or thAck, SkSndNxt[S], 0, 0);
+      SkSndNxt[S] := SkSndNxt[S] + 1;
+      SkFlags[S] := SkFlags[S] Or sfFinSent;
+      If St = tcEstab Then SkState[S] := tcFinWait1
+      Else If St = tcCloseWait Then SkState[S] := tcLastAck;
+      TcpArm(S);
+    End;
+  End;
+End;
+
+Procedure SockFree(S : LongInt);
+Var HO : LongInt;
+Begin
+  If Not SkUsed[S] Then Exit;
+  HO := HeapOwner;
+  HeapOwner := 0;
+  If SkRx[S] <> 0 Then KFree(SkRx[S]);
+  If SkTx[S] <> 0 Then KFree(SkTx[S]);
+  HeapOwner := HO;
+  SkRx[S] := 0; SkTx[S] := 0;
+  SkUsed[S] := False;
+End;
+
+{ Connexion terminee : liberer le socket si le programme l'a ferme }
+Procedure TcpClosed(S : LongInt);
+Begin
+  SkState[S] := tcClosed;
+  SkRetx[S] := 0;
+  If (SkFlags[S] And sfAppClosed) <> 0 Then SockFree(S)
+  Else If (SkParent[S] >= 0) And ((SkFlags[S] And sfAccepted) = 0) Then
+    SockFree(S)
+  Else NetNotify(S, FD_CLOSE);
+End;
+
+Function SockAlloc(Typ : LongInt) : LongInt; Forward;
+
+Function NewIss : LongInt;
+Begin
+  NetIss := NetIss + 64000 + Ticks * 250;
+  NewIss := NetIss;
+End;
+
+Procedure TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen : LongInt);
+Begin
+  If (Fl And thAck) <> 0 Then
+    TcpRaw(Src, DP, SP, Ack, 0, thRst, 0, 0, 0)
+  Else
+  Begin
+    If (Fl And thSyn) <> 0 Then Inc(DLen);
+    If (Fl And thFin) <> 0 Then Inc(DLen);
+    TcpRaw(Src, DP, SP, 0, Seq + DLen, thRst Or thAck, 0, 0, 0);
+  End;
+End;
+
+Procedure TcpInput(Src, P, Len : LongInt);
+Var SP, DP, Seq, Ack, HL, Fl, Wnd, DLen, D, S, I, C, N, A, Sent,
+    Free0, St, Cnt : LongInt;
+    NeedAck, FinAck : Boolean;
+Begin
+  If Len < 20 Then Exit;
+  SP := NGetW(P); DP := NGetW(P + 2);
+  Seq := NGetL(P + 4); Ack := NGetL(P + 8);
+  HL := (Mem[0:P + 12] Shr 4) * 4;
+  Fl := Mem[0:P + 13];
+  Wnd := NGetW(P + 14);
+  If (HL < 20) Or (HL > Len) Then Exit;
+  D := P + HL; DLen := Len - HL;
+  S := -1;
+  For I := 0 To MaxSock - 1 Do
+    If SkUsed[I] And (SkType[I] = 1) And (SkLPort[I] = DP) And
+       (SkRPort[I] = SP) And (SkRIP[I] = Src) And
+       Not (SkState[I] In [tcClosed, tcListen]) Then S := I;
+  If S < 0 Then
+    For I := 0 To MaxSock - 1 Do
+      If SkUsed[I] And (SkType[I] = 1) And (SkLPort[I] = DP) And
+         (SkState[I] = tcListen) Then S := I;
+  If S < 0 Then
+  Begin
+    If (Fl And thRst) = 0 Then TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+    Exit;
+  End;
+  St := SkState[S];
+  If St = tcListen Then
+  Begin
+    If (Fl And (thSyn Or thAck Or thRst)) <> thSyn Then
+    Begin
+      If (Fl And thRst) = 0 Then TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+      Exit;
+    End;
+    Cnt := 0;
+    For I := 0 To MaxSock - 1 Do
+      If SkUsed[I] And (SkParent[I] = S) And
+         ((SkFlags[I] And sfAccepted) = 0) Then Inc(Cnt);
+    If Cnt >= SkBacklog[S] Then Exit;
+    C := SockAlloc(1);
+    If C < 0 Then Exit;
+    SkParent[C] := S;
+    SkLPort[C] := DP; SkRIP[C] := Src; SkRPort[C] := SP;
+    SkFlags[C] := (SkFlags[S] And sfNonBlock) Or sfBound;
+    SkAWnd[C] := SkAWnd[S]; SkAMsg[C] := SkAMsg[S]; SkAEv[C] := SkAEv[S];
+    SkRcvNxt[C] := Seq + 1;
+    SkSndUna[C] := NewIss;
+    SkSndNxt[C] := SkSndUna[C] + 1;
+    SkSndWnd[C] := Wnd;
+    SkState[C] := tcSynRcvd;
+    TcpSend(C, thSyn Or thAck, SkSndUna[C], 0, 0);
+    TcpArm(C);
+    Exit;
+  End;
+  If St = tcSynSent Then
+  Begin
+    If ((Fl And thAck) <> 0) And (Ack <> SkSndNxt[S]) Then
+    Begin
+      If (Fl And thRst) = 0 Then TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+      Exit;
+    End;
+    If (Fl And thRst) <> 0 Then
+    Begin
+      If (Fl And thAck) <> 0 Then
+      Begin
+        SkErr[S] := 10061;                     { WSAECONNREFUSED }
+        TcpClosed(S);
+      End;
+      Exit;
+    End;
+    If ((Fl And thSyn) <> 0) And ((Fl And thAck) <> 0) Then
+    Begin
+      SkRcvNxt[S] := Seq + 1;
+      SkSndUna[S] := Ack;
+      SkSndWnd[S] := Wnd;
+      SkState[S] := tcEstab;
+      SkRetx[S] := 0; SkTries[S] := 0; SkRto[S] := 500;
+      TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+      NetNotify(S, FD_CONNECT);
+      NetNotify(S, FD_WRITE);
+      TcpOutput(S);
+    End;
+    Exit;
+  End;
+  { etats synchronises }
+  If (Fl And thRst) <> 0 Then
+  Begin
+    If (Seq - SkRcvNxt[S] >= 0) And (Seq - SkRcvNxt[S] < 65536) Then
+    Begin
+      If St In [tcEstab, tcFinWait1, tcFinWait2, tcCloseWait] Then
+        SkErr[S] := 10054;                     { WSAECONNRESET }
+      TcpClosed(S);
+    End;
+    Exit;
+  End;
+  If (Fl And thSyn) <> 0 Then
+  Begin
+    { SYN repete (notre ACK perdu) : le confirmer de nouveau }
+    TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+    Exit;
+  End;
+  If (Fl And thAck) = 0 Then Exit;
+  NeedAck := False;
+  If St = tcSynRcvd Then
+  Begin
+    If Ack <> SkSndNxt[S] Then
+    Begin
+      TcpRst(Src, DP, SP, Seq, Ack, Fl, DLen);
+      Exit;
+    End;
+    SkSndUna[S] := Ack;
+    SkState[S] := tcEstab;
+    St := tcEstab;
+    SkRetx[S] := 0; SkTries[S] := 0; SkRto[S] := 500;
+    If SkParent[S] >= 0 Then NetNotify(SkParent[S], FD_ACCEPT);
+  End;
+  { donnees et FIN confirmes }
+  A := Ack - SkSndUna[S];
+  Sent := SkSndNxt[S] - SkSndUna[S];
+  If (A > 0) And (A <= Sent) Then
+  Begin
+    FinAck := ((SkFlags[S] And sfFinSent) <> 0) And (A = Sent);
+    N := A;
+    If FinAck Then N := A - 1;
+    If N > SkTxLen[S] Then N := SkTxLen[S];
+    If N > 0 Then
+    Begin
+      MoveMem(SkTx[S] + N, SkTx[S], SkTxLen[S] - N);
+      SkTxLen[S] := SkTxLen[S] - N;
+    End;
+    SkSndUna[S] := Ack;
+    SkTries[S] := 0; SkRto[S] := 500;
+    If SkSndUna[S] = SkSndNxt[S] Then SkRetx[S] := 0
+    Else SkRetx[S] := Ticks + SkRto[S];
+    If N > 0 Then NetNotify(S, FD_WRITE);
+    If FinAck Then
+    Begin
+      If St = tcFinWait1 Then
+      Begin
+        SkState[S] := tcFinWait2;
+        St := tcFinWait2;
+        If (SkFlags[S] And sfAppClosed) <> 0 Then SkTimer[S] := Ticks + 30000;
+      End
+      Else If St = tcClosing Then
+      Begin
+        SkState[S] := tcTimeWait;
+        SkTimer[S] := Ticks + 2000;
+        Exit;
+      End
+      Else If St = tcLastAck Then
+      Begin
+        TcpClosed(S);
+        Exit;
+      End;
+    End;
+  End;
+  SkSndWnd[S] := Wnd;
+  { donnees recues }
+  If DLen > 0 Then
+  Begin
+    NeedAck := True;
+    If (St In [tcEstab, tcFinWait1, tcFinWait2]) And (Seq = SkRcvNxt[S])
+    Then
+    Begin
+      Free0 := SkRxSize - SkRxLen[S];
+      N := Min(DLen, Free0);
+      If N > 0 Then
+      Begin
+        RingPut(S, D, N);
+        SkRcvNxt[S] := SkRcvNxt[S] + N;
+        NetNotify(S, FD_READ);
+      End;
+      If N < DLen Then Fl := Fl And Not thFin;
+    End
+    Else Fl := Fl And Not thFin;
+  End;
+  { FIN du correspondant }
+  If ((Fl And thFin) <> 0) And (Seq + DLen = SkRcvNxt[S]) And
+     ((SkFlags[S] And sfFinRcvd) = 0) Then
+  Begin
+    SkRcvNxt[S] := SkRcvNxt[S] + 1;
+    SkFlags[S] := SkFlags[S] Or sfFinRcvd;
+    NeedAck := True;
+    If St = tcEstab Then SkState[S] := tcCloseWait
+    Else If St = tcFinWait1 Then SkState[S] := tcClosing
+    Else If St = tcFinWait2 Then
+    Begin
+      SkState[S] := tcTimeWait;
+      SkTimer[S] := Ticks + 2000;
+    End;
+    NetNotify(S, FD_READ);
+    NetNotify(S, FD_CLOSE);
+  End
+  Else If ((Fl And thFin) <> 0) And ((SkFlags[S] And sfFinRcvd) <> 0) Then
+    NeedAck := True;
+  If NeedAck Then TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+  TcpOutput(S);
+End;
+
+{ Minuteries : retransmission, TIME-WAIT }
+Procedure TcpTimers;
+Var S, St, N : LongInt;
+Begin
+  For S := 0 To MaxSock - 1 Do
+    If SkUsed[S] And (SkType[S] = 1) Then
+    Begin
+      St := SkState[S];
+      If (SkTimer[S] <> 0) And (Ticks >= SkTimer[S]) Then
+      Begin
+        SkTimer[S] := 0;
+        If (St In [tcTimeWait, tcFinWait2]) Or
+           ((SkFlags[S] And sfAppClosed) <> 0) Then
+        Begin
+          If St <> tcTimeWait Then
+            TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+          TcpClosed(S);
+          Continue;
+        End;
+      End;
+      If (SkRetx[S] <> 0) And (Ticks >= SkRetx[S]) Then
+      Begin
+        SkRetx[S] := 0;
+        Inc(SkTries[S]);
+        If (SkTries[S] > 8) Or ((St = tcSynSent) And (SkTries[S] > 3)) Then
+        Begin
+          SkErr[S] := 10060;                   { WSAETIMEDOUT }
+          TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+          TcpClosed(S);
+          Continue;
+        End;
+        SkRto[S] := Min(SkRto[S] * 2, 8000);
+        If St = tcSynSent Then
+          TcpSend(S, thSyn, SkSndUna[S], 0, 0)
+        Else If St = tcSynRcvd Then
+          TcpSend(S, thSyn Or thAck, SkSndUna[S], 0, 0)
+        Else
+        Begin
+          { reprendre a partir du plus ancien octet non confirme }
+          SkSndNxt[S] := SkSndUna[S];
+          SkFlags[S] := SkFlags[S] And Not sfFinSent;
+          If St = tcFinWait1 Then SkState[S] := tcEstab
+          Else If St = tcLastAck Then SkState[S] := tcCloseWait
+          Else If St = tcClosing Then SkState[S] := tcEstab;
+          If (SkSndWnd[S] = 0) And (SkTxLen[S] > 0) Then
+          Begin
+            { sonde de fenetre nulle : un octet }
+            TcpSend(S, thAck, SkSndNxt[S], 0, 1);
+            SkSndNxt[S] := SkSndNxt[S] + 1;
+          End
+          Else TcpOutput(S);
+          If St = tcClosing Then
+          Begin
+            If (SkFlags[S] And sfFinSent) <> 0 Then SkState[S] := tcClosing;
+          End;
+        End;
+        TcpArm(S);
+      End;
+    End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Sockets (communs a Winsock et aux outils de Pasdows)                 }
+{ ------------------------------------------------------------------ }
+
+Function SockAlloc(Typ : LongInt) : LongInt;
+Var I, S, HO : LongInt;
+Begin
+  S := -1;
+  For I := MaxSock - 1 DownTo 0 Do
+    If Not SkUsed[I] Then S := I;
+  SockAlloc := S;
+  If S < 0 Then Exit;
+  HO := HeapOwner;
+  HeapOwner := 0;
+  SkRx[S] := KAlloc(SkRxSize);
+  If Typ = 1 Then SkTx[S] := KAlloc(SkTxSize) Else SkTx[S] := 0;
+  HeapOwner := HO;
+  If (SkRx[S] = 0) Or ((Typ = 1) And (SkTx[S] = 0)) Then
+  Begin
+    SkUsed[S] := True;
+    SockFree(S);
+    SockAlloc := -1;
+    Exit;
+  End;
+  SkUsed[S] := True;
+  SkType[S] := Typ;
+  SkLPort[S] := 0; SkRIP[S] := 0; SkRPort[S] := 0;
+  SkState[S] := tcClosed; SkErr[S] := 0;
+  SkRxHead[S] := 0; SkRxLen[S] := 0; SkTxLen[S] := 0;
+  SkSndUna[S] := 0; SkSndNxt[S] := 0; SkRcvNxt[S] := 0; SkSndWnd[S] := 0;
+  SkRetx[S] := 0; SkRto[S] := 500; SkTries[S] := 0;
+  SkParent[S] := -1; SkBacklog[S] := 0;
+  SkFlags[S] := 0; SkAWnd[S] := 0; SkAMsg[S] := 0; SkAEv[S] := 0;
+  SkASent[S] := 0; SkTimer[S] := 0; SkLastWnd[S] := 0;
+End;
+
+Function PortUsed(Typ, Pt : LongInt) : Boolean;
+Var I : LongInt; R : Boolean;
+Begin
+  R := False;
+  For I := 0 To MaxSock - 1 Do
+    If SkUsed[I] And (SkType[I] = Typ) And (SkLPort[I] = Pt) And
+       ((SkFlags[I] And sfBound) <> 0) And (SkParent[I] < 0) Then R := True;
+  PortUsed := R;
+End;
+
+Function EphemeralPort(Typ : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  N := 0;
+  Repeat
+    Inc(NetPortNext);
+    If (NetPortNext < 1025) Or (NetPortNext > 5000) Then NetPortNext := 1025;
+    Inc(N);
+  Until Not PortUsed(Typ, NetPortNext) Or (N > 4000);
+  EphemeralPort := NetPortNext;
+End;
+
+{ Avis WSAAsyncSelect (une fois par evenement, rearme par l'appel
+  correspondant : recv, send, accept) }
+Procedure NetNotify(S, Ev : LongInt);
+Begin
+  If (S < 0) Or Not SkUsed[S] Then Exit;
+  If (SkAWnd[S] = 0) Or ((SkAEv[S] And Ev) = 0) Then Exit;
+  If (SkASent[S] And Ev) <> 0 Then Exit;
+  SkASent[S] := SkASent[S] Or Ev;
+  PostMessageA(SkAWnd[S], SkAMsg[S], SockBase + S, Ev);
+End;
+
+{ Fermer tous les sockets (fin du programme Win32) }
+Procedure NetAppExit;
+Var S : LongInt;
+Begin
+  For S := 0 To MaxSock - 1 Do
+    If SkUsed[S] Then
+    Begin
+      If (SkType[S] = 1) And Not (SkState[S] In [tcClosed, tcListen,
+         tcTimeWait]) Then TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+      SockFree(S);
+    End;
+  DnsBusy := False;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Scrutation                                                           }
+{ ------------------------------------------------------------------ }
+
+Procedure NetPoll;
+Var N, K, A : LongInt;
+Begin
+  If NetPolling Or (NetRx = 0) Then Exit;
+  NetPolling := True;
+  K := 0;
+  While (NicBase <> 0) And (K < 32) Do
+  Begin
+    N := NeRecv(NetRx);
+    If N = 0 Then Break;
+    If N > 0 Then EthInput(NetRx, N);
+    Inc(K);
+  End;
+  K := 0;
+  While (LoopN > 0) And (K < 16) Do
+  Begin
+    A := NetLoop + LoopHead * 1600;
+    LoopHead := (LoopHead + 1) Mod MaxLoop;
+    Dec(LoopN);
+    MoveMem(A + 4, NetLoopRx, MemL[0:A]);
+    IpInput(NetLoopRx, MemL[0:A]);
+    Inc(K);
+  End;
+  If Ticks - NetLastTick >= 10 Then
+  Begin
+    NetLastTick := Ticks;
+    DhcpTick;
+    TcpTimers;
+  End;
+  NetPolling := False;
+End;
+
+{ Attendre un peu en laissant tourner le reste du systeme }
+Procedure NetWait;
+Begin
+  NetPoll;
+  If CurT = 0 Then Idle Else KSleep(1);
+End;
+
+{ Attendre la configuration DHCP (au plus Ms millisecondes) }
+Function NetReady(Ms : LongInt) : Boolean;
+Var T : LongInt;
+Begin
+  T := Ticks;
+  While (NicBase <> 0) And (DhcpState <> 3) And (Ticks - T < Ms) Do
+    NetWait;
+  NetReady := DhcpState = 3;
+End;
+
+{ S'assurer que l'adresse Ethernet du prochain saut est connue }
+Function NetResolve(IP : LongInt) : Boolean;
+Var Hop, T, K : LongInt;
+Begin
+  NetResolve := True;
+  If IsLoop(IP) Then Exit;
+  NetResolve := False;
+  If NicBase = 0 Then Exit;
+  If Not NetReady(5000) Then Exit;
+  Hop := NextHop(IP);
+  NetResolve := True;
+  If (Hop = -1) Or (ArpFind(Hop) >= 0) Then Exit;
+  For K := 1 To 3 Do
+  Begin
+    ArpSend(1, 0, Hop);
+    T := Ticks;
+    While Ticks - T < 1000 Do
+    Begin
+      NetWait;
+      If ArpFind(Hop) >= 0 Then Exit;
+    End;
+  End;
+  NetResolve := False;
+End;
+
+{ Echo ICMP : True si reponse (Rtt en ms) }
+Function NetPing(IP, Size, Timeout : LongInt; Var Rtt : LongInt) : Boolean;
+Var T0, K : LongInt;
+Begin
+  NetPing := False;
+  Rtt := 0;
+  If Not NetResolve(IP) Then Exit;
+  If Size > 1024 Then Size := 1024;
+  Inc(PingSeq);
+  PingSeq := PingSeq And $FFFF;
+  PingGotAt := 0;
+  Mem[0:NetTx + 34] := 8; Mem[0:NetTx + 35] := 0;
+  NPutW(NetTx + 36, 0);
+  NPutW(NetTx + 38, PingId); NPutW(NetTx + 40, PingSeq);
+  If PingReq <> 0 Then MoveMem(PingReq, NetTx + 42, Size)
+  Else
+    For K := 0 To Size - 1 Do Mem[0:NetTx + 42 + K] := 97 + K Mod 23;
+  NPutW(NetTx + 36, (Not NetSum(NetTx + 34, Size + 8, 0)) And $FFFF);
+  T0 := Ticks;
+  IpSend(IP, 1, Size + 8);
+  While (PingGotAt = 0) And (Ticks - T0 < Timeout) Do NetWait;
+  If PingGotAt = 0 Then Exit;
+  Rtt := PingGotAt - T0;
+  NetPing := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DNS (resolveur)                                                      }
+{ ------------------------------------------------------------------ }
+
+Function DnsSkipName(P : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  Repeat
+    B := Mem[0:P];
+    If B = 0 Then
+    Begin
+      DnsSkipName := P + 1;
+      Exit;
+    End;
+    If (B And $C0) = $C0 Then
+    Begin
+      DnsSkipName := P + 2;
+      Exit;
+    End;
+    P := P + 1 + B;
+  Until False;
+End;
+
+Procedure DnsInput(P, Len : LongInt);
+Var QD, AN, I, Q, Typ, RL, E : LongInt;
+Begin
+  If (Len < 12) Or (NGetW(P) <> DnsId) Then Exit;
+  If (Mem[0:P + 3] And 15) <> 0 Then
+  Begin
+    DnsResult := -2;
+    Exit;
+  End;
+  QD := NGetW(P + 4); AN := NGetW(P + 6);
+  Q := P + 12; E := P + Len;
+  For I := 1 To QD Do Q := DnsSkipName(Q) + 4;
+  For I := 1 To AN Do
+  Begin
+    If Q >= E Then Break;
+    Q := DnsSkipName(Q);
+    Typ := NGetW(Q); RL := NGetW(Q + 8);
+    If (Typ = 1) And (RL = 4) And (NGetW(Q + 2) = 1) Then
+    Begin
+      DnsResult := MemL[0:Q + 10];
+      Exit;
+    End;
+    Q := Q + 10 + RL;
+  End;
+  DnsResult := -2;
+End;
+
+{ Nom -> adresse IP ; False si introuvable }
+Function NetLookup(Name : String; Var IP : LongInt) : Boolean;
+Var D, O, I, K, N, T, Try0 : LongInt; Lb : String; U : String;
+Begin
+  NetLookup := True;
+  If ParseIp(Name, IP) Then Exit;
+  U := UpStr(Name);
+  If (U = 'LOCALHOST') Or (U = '') Then
+  Begin
+    IP := $0100007F;
+    Exit;
+  End;
+  If (U = 'PASDOWS') And (NetIP <> 0) Then
+  Begin
+    IP := NetIP;
+    Exit;
+  End;
+  NetLookup := False;
+  If (NicBase = 0) Or DnsBusy Then Exit;
+  If Not NetReady(5000) Or (NetDns = 0) Then Exit;
+  If Not NetResolve(NetDns) Then Exit;
+  DnsBusy := True;
+  For Try0 := 1 To 3 Do
+  Begin
+    DnsId := (DnsId + 1) And $FFFF;
+    DnsPort := EphemeralPort(2);
+    D := NetTx + 42;
+    NPutW(D, DnsId); NPutW(D + 2, $0100);
+    NPutW(D + 4, 1); NPutW(D + 6, 0); NPutW(D + 8, 0); NPutW(D + 10, 0);
+    O := D + 12;
+    Lb := Name + '.';
+    K := 1;
+    For I := 1 To Length(Lb) Do
+      If Lb[I] = '.' Then
+      Begin
+        N := I - K;
+        If N > 0 Then
+        Begin
+          Mem[0:O] := N;
+          For T := 0 To N - 1 Do Mem[0:O + 1 + T] := Ord(Lb[K + T]);
+          O := O + 1 + N;
+        End;
+        K := I + 1;
+      End;
+    Mem[0:O] := 0;
+    NPutW(O + 1, 1); NPutW(O + 3, 1);
+    O := O + 5;
+    DnsResult := 0;
+    UdpOut(DnsPort, NetDns, 53, O - D);
+    T := Ticks;
+    While (DnsResult = 0) And (Ticks - T < 2000) Do NetWait;
+    If DnsResult <> 0 Then Break;
+  End;
+  DnsBusy := False;
+  If (DnsResult = 0) Or (DnsResult = -2) Then Exit;
+  IP := DnsResult;
+  NetLookup := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Demarrage                                                            }
+{ ------------------------------------------------------------------ }
+
+Procedure NetInit;
+Var I, HO : LongInt;
+Begin
+  HO := HeapOwner;
+  HeapOwner := 0;
+  NetRx := KAlloc(2048);
+  NetTx := KAlloc(2048);
+  NetAux := KAlloc(2048);
+  NetHdr := KAlloc(128);
+  NetLoop := KAlloc(MaxLoop * 1600);
+  NetLoopRx := KAlloc(1600);
+  WsBuf := KAlloc(512);
+  HeapOwner := HO;
+  For I := 0 To MaxSock - 1 Do SkUsed[I] := False;
+  For I := 0 To MaxArp - 1 Do ArpIP[I] := 0;
+  NetIpId := Ticks And $FFFF;
+  NetIss := Ticks * 7919;
+  NetPortNext := 1024 + Ticks Mod 1000;
+  PingId := $0200;
+  DnsId := Ticks And $FFFF;
+  NetMask := $00FFFFFF;
+  If Not NeProbe Then
+  Begin
+    KLog('Reseau : aucune carte NE2000 (TCP/IP en boucle locale seulement)');
+    Exit;
+  End;
+  If NicPci Then
+    KLog('Reseau : carte NE2000 PCI (RTL8029) en ' + HexStr(NicBase, 4) +
+         'h, adresse ' + MacStr)
+  Else
+    KLog('Reseau : carte NE2000 ISA en ' + HexStr(NicBase, 4) +
+         'h, adresse ' + MacStr);
+  DhcpXid := (NicMac[3] Shl 24) Or (NicMac[4] Shl 16) Or (NicMac[5] Shl 8) Or
+             (Ticks And $FF);
+  DhcpState := 1;
+  DhcpTries := 0;
+  DhcpNext := Ticks;
+End;
+{ ==================================================================== }
+{ Partie 16b - Winsock 1.1 (WSOCK32.DLL, WS2_32.DLL), ICMP.DLL et       }
+{              outils TCP/IP de Pasdows (ping, winipcfg)               }
+{ ==================================================================== }
+
+{ Les fonctions Winsock sont ecrites WS_nom : ResolveImport et
+  GetProcAddress ajoutent le prefixe pour les DLL Winsock (importations
+  par nom ou par ordinal), ce qui evite les conflits avec les noms du
+  noyau (send, select, connect...). }
+
+Var
+  WsaErr     : LongInt;
+  WsAsyncN   : LongInt;
+
+Const
+  FIONBIO = LongInt($8004667E);
+  FIONREAD = $4004667F;
+  SIOCATMARK = $40047307;
+
+{ Nom Winsock d'un ordinal de WSOCK32.DLL / WS2_32.DLL }
+Function WsOrdName(N : LongInt) : String;
+Var S : String;
+Begin
+  S := '';
+  Case N Of
+    1 : S := 'accept'; 2 : S := 'bind'; 3 : S := 'closesocket';
+    4 : S := 'connect'; 5 : S := 'getpeername'; 6 : S := 'getsockname';
+    7 : S := 'getsockopt'; 8 : S := 'htonl'; 9 : S := 'htons';
+    10 : S := 'inet_addr'; 11 : S := 'inet_ntoa'; 12 : S := 'ioctlsocket';
+    13 : S := 'listen'; 14 : S := 'ntohl'; 15 : S := 'ntohs';
+    16 : S := 'recv'; 17 : S := 'recvfrom'; 18 : S := 'select';
+    19 : S := 'send'; 20 : S := 'sendto'; 21 : S := 'setsockopt';
+    22 : S := 'shutdown'; 23 : S := 'socket';
+    51 : S := 'gethostbyaddr'; 52 : S := 'gethostbyname';
+    53 : S := 'getprotobyname'; 54 : S := 'getprotobynumber';
+    55 : S := 'getservbyname'; 56 : S := 'getservbyport';
+    57 : S := 'gethostname';
+    101 : S := 'WSAAsyncSelect'; 102 : S := 'WSAAsyncGetHostByAddr';
+    103 : S := 'WSAAsyncGetHostByName'; 104 : S := 'WSAAsyncGetProtoByNumber';
+    105 : S := 'WSAAsyncGetProtoByName'; 106 : S := 'WSAAsyncGetServByPort';
+    107 : S := 'WSAAsyncGetServByName'; 108 : S := 'WSACancelAsyncRequest';
+    109 : S := 'WSASetBlockingHook'; 110 : S := 'WSAUnhookBlockingHook';
+    111 : S := 'WSAGetLastError'; 112 : S := 'WSASetLastError';
+    113 : S := 'WSACancelBlockingCall'; 114 : S := 'WSAIsBlocking';
+    115 : S := 'WSAStartup'; 116 : S := 'WSACleanup';
+    151 : S := '__WSAFDIsSet'; 1107 : S := 'WSARecvEx';
+  End;
+  WsOrdName := S;
+End;
+
+Function IsWsDll(Dll : String) : Boolean;
+Begin
+  Dll := UpStr(BaseName(Dll));
+  IsWsDll := (Dll = 'WSOCK32.DLL') Or (Dll = 'WS2_32.DLL') Or
+             (Dll = 'WSOCK32') Or (Dll = 'WS2_32');
+End;
+
+Function WsSock(H : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := H - SockBase;
+  If (S < 0) Or (S >= MaxSock) Then S := -1
+  Else If Not SkUsed[S] Or ((SkFlags[S] And sfAppClosed) <> 0) Then S := -1;
+  If S < 0 Then WsaErr := 10038;                   { WSAENOTSOCK }
+  WsSock := S;
+End;
+
+Function WsFail(E : LongInt) : LongInt;
+Begin
+  WsaErr := E;
+  WsFail := -1;
+End;
+
+Procedure WsAutoBind(S : LongInt);
+Begin
+  If (SkFlags[S] And sfBound) <> 0 Then Exit;
+  SkLPort[S] := EphemeralPort(SkType[S]);
+  SkFlags[S] := SkFlags[S] Or sfBound;
+End;
+
+{ sockaddr_in : famille, port (ordre du reseau), adresse }
+Procedure WsPutAddr(A, LenP, IP, Pt : LongInt);
+Begin
+  If A = 0 Then Exit;
+  If LenP <> 0 Then
+    If MemL[0:LenP] < 16 Then Exit;
+  FillMem(A, 16, 0);
+  MemW[0:A] := 2;
+  MemW[0:A + 2] := Swap16(Pt);
+  MemL[0:A + 4] := IP;
+  If LenP <> 0 Then MemL[0:LenP] := 16;
+End;
+
+Function WS_WSAStartup(Ver, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    FillMem(P, 400, 0);
+    If (Ver And $FF) >= 2 Then MemW[0:P] := $0202
+    Else MemW[0:P] := Ver And $FFFF;
+    MemW[0:P + 2] := $0202;
+    PutPStr(P + 4, 'Pasdows 95 TCP/IP (Winsock 1.1)', 256);
+    PutPStr(P + 261, 'Running', 128);
+    MemW[0:P + 390] := MaxSock;
+    MemW[0:P + 392] := 1472;
+  End;
+  WS_WSAStartup := 0;
+End;
+
+Function WS_WSACleanup : LongInt;
+Begin
+  WS_WSACleanup := 0;
+End;
+
+Function WS_WSAGetLastError : LongInt;
+Begin
+  WS_WSAGetLastError := WsaErr;
+End;
+
+Procedure WS_WSASetLastError(E : LongInt);
+Begin
+  WsaErr := E;
+End;
+
+Function WS_socket(Af, Typ, Proto : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_socket := -1;
+  If Af <> 2 Then
+  Begin
+    WsaErr := 10047;                              { WSAEAFNOSUPPORT }
+    Exit;
+  End;
+  If (Typ <> 1) And (Typ <> 2) Then
+  Begin
+    WsaErr := 10044;                              { WSAESOCKTNOSUPPORT }
+    Exit;
+  End;
+  S := SockAlloc(Typ);
+  If S < 0 Then
+  Begin
+    WsaErr := 10024;                              { WSAEMFILE }
+    Exit;
+  End;
+  WS_socket := SockBase + S;
+End;
+
+Function WS_closesocket(H : LongInt) : LongInt;
+Var S, I : LongInt;
+Begin
+  WS_closesocket := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  WS_closesocket := 0;
+  SkAWnd[S] := 0;
+  If SkType[S] = 2 Then
+  Begin
+    SockFree(S);
+    Exit;
+  End;
+  Case SkState[S] Of
+    tcListen :
+    Begin
+      For I := 0 To MaxSock - 1 Do
+        If SkUsed[I] And (SkParent[I] = S) And
+           ((SkFlags[I] And sfAccepted) = 0) Then
+        Begin
+          If SkState[I] <> tcClosed Then
+            TcpSend(I, thRst Or thAck, SkSndNxt[I], 0, 0);
+          SockFree(I);
+        End;
+      SockFree(S);
+    End;
+    tcClosed, tcSynSent : SockFree(S);
+    tcSynRcvd :
+    Begin
+      TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+      SockFree(S);
+    End;
+    tcEstab, tcCloseWait :
+    Begin
+      SkFlags[S] := SkFlags[S] Or sfFinWant Or sfAppClosed;
+      SkTimer[S] := Ticks + 60000;
+      TcpOutput(S);
+    End;
+  Else
+    SkFlags[S] := SkFlags[S] Or sfAppClosed;
+  End;
+End;
+
+Function WS_bind(H, A, Len : LongInt) : LongInt;
+Var S, Pt : LongInt;
+Begin
+  WS_bind := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (A = 0) Or (Len < 8) Then
+  Begin
+    WsaErr := 10014;                              { WSAEFAULT }
+    Exit;
+  End;
+  If (SkFlags[S] And sfBound) <> 0 Then
+  Begin
+    WsaErr := 10022;                              { WSAEINVAL }
+    Exit;
+  End;
+  Pt := Swap16(MemW[0:A + 2]);
+  If Pt = 0 Then Pt := EphemeralPort(SkType[S])
+  Else If PortUsed(SkType[S], Pt) Then
+  Begin
+    WsaErr := 10048;                              { WSAEADDRINUSE }
+    Exit;
+  End;
+  SkLPort[S] := Pt;
+  SkFlags[S] := SkFlags[S] Or sfBound;
+  WS_bind := 0;
+End;
+
+Function WS_listen(H, Bl : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_listen := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] <> 1 Then
+  Begin
+    WsaErr := 10045;                              { WSAEOPNOTSUPP }
+    Exit;
+  End;
+  If Not (SkState[S] In [tcClosed, tcListen]) Then
+  Begin
+    WsaErr := 10056;                              { WSAEISCONN }
+    Exit;
+  End;
+  WsAutoBind(S);
+  SkState[S] := tcListen;
+  If (Bl < 1) Or (Bl > 5) Then Bl := 5;
+  SkBacklog[S] := Bl;
+  WS_listen := 0;
+End;
+
+Function WsPending(S : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := -1;
+  For I := MaxSock - 1 DownTo 0 Do
+    If SkUsed[I] And (SkParent[I] = S) And
+       ((SkFlags[I] And sfAccepted) = 0) And
+       (SkState[I] In [tcEstab, tcCloseWait]) Then R := I;
+  WsPending := R;
+End;
+
+Function WS_accept(H, A, LenP : LongInt) : LongInt;
+Var S, C : LongInt;
+Begin
+  WS_accept := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkState[S] <> tcListen Then
+  Begin
+    WsaErr := 10022;
+    Exit;
+  End;
+  Repeat
+    NetPoll;
+    C := WsPending(S);
+    If C >= 0 Then Break;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      SkASent[S] := SkASent[S] And Not FD_ACCEPT;
+      WsaErr := 10035;                            { WSAEWOULDBLOCK }
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Or (SkState[S] <> tcListen) Then
+    Begin
+      WsaErr := 10004;                            { WSAEINTR }
+      Exit;
+    End;
+  Until False;
+  SkFlags[C] := SkFlags[C] Or sfAccepted;
+  WsPutAddr(A, LenP, SkRIP[C], SkRPort[C]);
+  SkASent[S] := SkASent[S] And Not FD_ACCEPT;
+  If WsPending(S) >= 0 Then NetNotify(S, FD_ACCEPT);
+  If SkRxLen[C] > 0 Then NetNotify(C, FD_READ);
+  NetNotify(C, FD_WRITE);
+  WS_accept := SockBase + C;
+End;
+
+Function WS_connect(H, A, Len : LongInt) : LongInt;
+Var S, IP, Pt : LongInt;
+Begin
+  WS_connect := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (A = 0) Or (Len < 8) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  IP := MemL[0:A + 4];
+  Pt := Swap16(MemW[0:A + 2]);
+  If SkType[S] = 2 Then
+  Begin
+    WsAutoBind(S);
+    SkRIP[S] := IP; SkRPort[S] := Pt;
+    If IP = 0 Then SkFlags[S] := SkFlags[S] And Not sfUdpConn
+    Else SkFlags[S] := SkFlags[S] Or sfUdpConn;
+    WS_connect := 0;
+    Exit;
+  End;
+  If SkState[S] = tcSynSent Then
+  Begin
+    WsaErr := 10037;                              { WSAEALREADY }
+    Exit;
+  End;
+  If SkState[S] <> tcClosed Then
+  Begin
+    WsaErr := 10056;
+    Exit;
+  End;
+  If (IP = 0) Or (Pt = 0) Then
+  Begin
+    WsaErr := 10049;                              { WSAEADDRNOTAVAIL }
+    Exit;
+  End;
+  If Not NetResolve(IP) Then
+  Begin
+    If NicBase = 0 Then WsaErr := 10050           { WSAENETDOWN }
+    Else WsaErr := 10065;                         { WSAEHOSTUNREACH }
+    Exit;
+  End;
+  WsAutoBind(S);
+  SkRIP[S] := IP; SkRPort[S] := Pt; SkErr[S] := 0;
+  SkFlags[S] := SkFlags[S] And (sfNonBlock Or sfBound);
+  SkRxHead[S] := 0; SkRxLen[S] := 0; SkTxLen[S] := 0;
+  SkSndUna[S] := NewIss;
+  SkSndNxt[S] := SkSndUna[S] + 1;
+  SkState[S] := tcSynSent;
+  SkRto[S] := 1000; SkTries[S] := 0; SkRetx[S] := 0;
+  TcpSend(S, thSyn, SkSndUna[S], 0, 0);
+  TcpArm(S);
+  If (SkFlags[S] And sfNonBlock) <> 0 Then
+  Begin
+    WsaErr := 10035;
+    Exit;
+  End;
+  While SkState[S] = tcSynSent Do NetWait;
+  If SkState[S] In [tcEstab, tcCloseWait] Then WS_connect := 0
+  Else
+  Begin
+    WsaErr := SkErr[S];
+    If WsaErr = 0 Then WsaErr := 10061;
+  End;
+End;
+
+Function WS_sendto(H, Buf, Len, Fl, ToA, ToLen : LongInt) : LongInt;
+  Forward;
+Function WS_recvfrom(H, Buf, Len, Fl, FromA, FromLenP : LongInt) : LongInt;
+  Forward;
+
+Function WS_send(H, Buf, Len, Fl : LongInt) : LongInt;
+Var S, N, Done : LongInt;
+Begin
+  WS_send := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 2 Then
+  Begin
+    WS_send := WS_sendto(H, Buf, Len, Fl, 0, 0);
+    Exit;
+  End;
+  Done := 0;
+  Repeat
+    If SkErr[S] <> 0 Then
+    Begin
+      WsaErr := SkErr[S];
+      If Done > 0 Then WS_send := Done;
+      Exit;
+    End;
+    If Not (SkState[S] In [tcEstab, tcCloseWait]) Then
+    Begin
+      WsaErr := 10057;                            { WSAENOTCONN }
+      If Done > 0 Then WS_send := Done;
+      Exit;
+    End;
+    If (SkFlags[S] And sfFinWant) <> 0 Then
+    Begin
+      WsaErr := 10058;                            { WSAESHUTDOWN }
+      Exit;
+    End;
+    N := Min(Len - Done, SkTxSize - SkTxLen[S]);
+    If N > 0 Then
+    Begin
+      MoveMem(Buf + Done, SkTx[S] + SkTxLen[S], N);
+      SkTxLen[S] := SkTxLen[S] + N;
+      Done := Done + N;
+      TcpOutput(S);
+    End;
+    If Done >= Len Then Break;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      If Done > 0 Then Break;
+      SkASent[S] := SkASent[S] And Not FD_WRITE;
+      WsaErr := 10035;
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Then Exit;
+  Until False;
+  WS_send := Done;
+End;
+
+Function WS_recv(H, Buf, Len, Fl : LongInt) : LongInt;
+Var S, N : LongInt;
+Begin
+  WS_recv := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 2 Then
+  Begin
+    WS_recv := WS_recvfrom(H, Buf, Len, Fl, 0, 0);
+    Exit;
+  End;
+  Repeat
+    NetPoll;
+    If (SkRxLen[S] > 0) And (Len > 0) Then
+    Begin
+      N := Min(Len, SkRxLen[S]);
+      RingGet(S, Buf, N, (Fl And 2) <> 0);
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      If SkRxLen[S] > 0 Then NetNotify(S, FD_READ);
+      { fenetre rouverte : le dire au correspondant }
+      If (SkState[S] In [tcEstab, tcFinWait1, tcFinWait2]) And
+         (SkWnd(S) - SkLastWnd[S] >= 2 * NetMss) Then
+        TcpSend(S, thAck, SkSndNxt[S], 0, 0);
+      WS_recv := N;
+      Exit;
+    End;
+    If (SkFlags[S] And sfFinRcvd) <> 0 Then
+    Begin
+      WS_recv := 0;
+      Exit;
+    End;
+    If SkErr[S] <> 0 Then
+    Begin
+      WsaErr := SkErr[S];
+      Exit;
+    End;
+    If Not (SkState[S] In [tcSynSent, tcSynRcvd, tcEstab, tcFinWait1,
+                           tcFinWait2]) Then
+    Begin
+      If SkState[S] = tcClosed Then WsaErr := 10057
+      Else WsaErr := 10022;
+      Exit;
+    End;
+    If Len <= 0 Then
+    Begin
+      WS_recv := 0;
+      Exit;
+    End;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      WsaErr := 10035;
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Then Exit;
+  Until False;
+End;
+
+Function WS_sendto(H, Buf, Len, Fl, ToA, ToLen : LongInt) : LongInt;
+Var S, IP, Pt : LongInt;
+Begin
+  WS_sendto := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 1 Then
+  Begin
+    WS_sendto := WS_send(H, Buf, Len, Fl);
+    Exit;
+  End;
+  If ToA <> 0 Then
+  Begin
+    If ToLen < 8 Then
+    Begin
+      WsaErr := 10014;
+      Exit;
+    End;
+    IP := MemL[0:ToA + 4];
+    Pt := Swap16(MemW[0:ToA + 2]);
+  End
+  Else If (SkFlags[S] And sfUdpConn) <> 0 Then
+  Begin
+    IP := SkRIP[S]; Pt := SkRPort[S];
+  End
+  Else
+  Begin
+    WsaErr := 10039;                              { WSAEDESTADDRREQ }
+    Exit;
+  End;
+  If (Len < 0) Or (Len > 1472) Then
+  Begin
+    WsaErr := 10040;                              { WSAEMSGSIZE }
+    Exit;
+  End;
+  If (IP = 0) Or (Pt = 0) Then
+  Begin
+    WsaErr := 10049;
+    Exit;
+  End;
+  If Not NetResolve(IP) Then
+  Begin
+    If NicBase = 0 Then WsaErr := 10050 Else WsaErr := 10065;
+    Exit;
+  End;
+  WsAutoBind(S);
+  If Len > 0 Then MoveMem(Buf, NetTx + 42, Len);
+  UdpOut(SkLPort[S], IP, Pt, Len);
+  WS_sendto := Len;
+End;
+
+Function WS_recvfrom(H, Buf, Len, Fl, FromA, FromLenP : LongInt) : LongInt;
+Var S, N, DL, IP, Pt, OH, OL, R : LongInt;
+Begin
+  WS_recvfrom := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If SkType[S] = 1 Then
+  Begin
+    R := WS_recv(H, Buf, Len, Fl);
+    If R >= 0 Then WsPutAddr(FromA, FromLenP, SkRIP[S], SkRPort[S]);
+    WS_recvfrom := R;
+    Exit;
+  End;
+  Repeat
+    NetPoll;
+    If SkRxLen[S] >= 12 Then
+    Begin
+      OH := SkRxHead[S]; OL := SkRxLen[S];
+      RingGet(S, NetHdr + 32, 12, False);
+      DL := MemL[0:NetHdr + 32];
+      IP := MemL[0:NetHdr + 36];
+      Pt := MemL[0:NetHdr + 40];
+      N := Min(Len, DL);
+      If N > 0 Then RingGet(S, Buf, N, False);
+      If DL > N Then RingGet(S, 0, DL - N, False);
+      If (Fl And 2) <> 0 Then
+      Begin
+        SkRxHead[S] := OH; SkRxLen[S] := OL;
+      End;
+      WsPutAddr(FromA, FromLenP, IP, Pt);
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      If SkRxLen[S] > 0 Then NetNotify(S, FD_READ);
+      If DL > Len Then WsaErr := 10040 Else WS_recvfrom := N;
+      Exit;
+    End;
+    If (SkFlags[S] And sfNonBlock) <> 0 Then
+    Begin
+      SkASent[S] := SkASent[S] And Not FD_READ;
+      WsaErr := 10035;
+      Exit;
+    End;
+    NetWait;
+    If Not SkUsed[S] Then Exit;
+  Until False;
+End;
+
+Function WS_shutdown(H, How : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_shutdown := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (SkType[S] = 1) And ((How = 1) Or (How = 2)) Then
+  Begin
+    SkFlags[S] := SkFlags[S] Or sfFinWant;
+    TcpOutput(S);
+  End;
+  WS_shutdown := 0;
+End;
+
+Function WS_ioctlsocket(H, Cmd, Arg : LongInt) : LongInt;
+Var S, N : LongInt;
+Begin
+  WS_ioctlsocket := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If Arg = 0 Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  NetPoll;
+  If Cmd = FIONBIO Then
+  Begin
+    If MemL[0:Arg] <> 0 Then SkFlags[S] := SkFlags[S] Or sfNonBlock
+    Else SkFlags[S] := SkFlags[S] And Not sfNonBlock;
+  End
+  Else If Cmd = FIONREAD Then
+  Begin
+    N := SkRxLen[S];
+    If SkType[S] = 2 Then
+    Begin
+      If N >= 12 Then
+      Begin
+        RingGet(S, NetHdr + 32, 4, True);
+        N := MemL[0:NetHdr + 32];
+      End
+      Else N := 0;
+    End;
+    MemL[0:Arg] := N;
+  End
+  Else If Cmd = SIOCATMARK Then MemL[0:Arg] := 1
+  Else
+  Begin
+    WsaErr := 10022;
+    Exit;
+  End;
+  WS_ioctlsocket := 0;
+End;
+
+Function WS_setsockopt(H, Lvl, Opt, Val, Len : LongInt) : LongInt;
+Begin
+  WS_setsockopt := -1;
+  If WsSock(H) < 0 Then Exit;
+  WS_setsockopt := 0;
+End;
+
+Function WS_getsockopt(H, Lvl, Opt, Val, LenP : LongInt) : LongInt;
+Var S, V : LongInt;
+Begin
+  WS_getsockopt := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (Val = 0) Or (LenP = 0) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  V := 0;
+  If Lvl = $FFFF Then
+    Case Opt Of
+      $1007 :
+      Begin
+        V := SkErr[S];
+        SkErr[S] := 0;
+      End;
+      $1008 : V := SkType[S];
+      $1001 : V := SkTxSize;
+      $1002 : V := SkRxSize;
+      2 : V := Ord(SkState[S] = tcListen);
+    End;
+  If MemL[0:LenP] >= 4 Then
+  Begin
+    MemL[0:Val] := V;
+    MemL[0:LenP] := 4;
+  End
+  Else If MemL[0:LenP] >= 1 Then Mem[0:Val] := V;
+  WS_getsockopt := 0;
+End;
+
+Function WS_getpeername(H, A, LenP : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_getpeername := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If ((SkType[S] = 1) And Not (SkState[S] In [tcEstab, tcCloseWait,
+     tcFinWait1, tcFinWait2])) Or
+     ((SkType[S] = 2) And ((SkFlags[S] And sfUdpConn) = 0)) Then
+  Begin
+    WsaErr := 10057;
+    Exit;
+  End;
+  WsPutAddr(A, LenP, SkRIP[S], SkRPort[S]);
+  WS_getpeername := 0;
+End;
+
+Function WS_getsockname(H, A, LenP : LongInt) : LongInt;
+Var S, IP : LongInt;
+Begin
+  WS_getsockname := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  If (SkFlags[S] And sfBound) = 0 Then
+  Begin
+    WsaErr := 10022;
+    Exit;
+  End;
+  IP := 0;
+  If (SkType[S] = 1) And (SkState[S] <> tcListen) And
+     (SkState[S] <> tcClosed) Then
+  Begin
+    If IsLoop(SkRIP[S]) Then IP := SkRIP[S] Else IP := NetIP;
+  End;
+  WsPutAddr(A, LenP, IP, SkLPort[S]);
+  WS_getsockname := 0;
+End;
+
+Function WS_htons(V : LongInt) : LongInt;
+Begin
+  WS_htons := Swap16(V);
+End;
+
+Function WS_ntohs(V : LongInt) : LongInt;
+Begin
+  WS_ntohs := Swap16(V);
+End;
+
+Function WS_htonl(V : LongInt) : LongInt;
+Begin
+  WS_htonl := Swap32(V);
+End;
+
+Function WS_ntohl(V : LongInt) : LongInt;
+Begin
+  WS_ntohl := Swap32(V);
+End;
+
+Function WS_inet_addr(P : LongInt) : LongInt;
+Var IP : LongInt;
+Begin
+  If (P <> 0) And ParseIp(Trim(PStr(P)), IP) Then WS_inet_addr := IP
+  Else WS_inet_addr := -1;
+End;
+
+Function WS_inet_ntoa(IP : LongInt) : LongInt;
+Begin
+  PutPStr(WsBuf + 288, IpStr(IP), 31);
+  WS_inet_ntoa := WsBuf + 288;
+End;
+
+{ hostent en B : nom, alias (aucun), AF_INET, 4 octets, une adresse }
+Function WsMakeHost(B : LongInt; Const Nm : String; IP : LongInt)
+  : LongInt;
+Begin
+  MemL[0:B] := B + 32; MemL[0:B + 4] := B + 16;
+  MemW[0:B + 8] := 2; MemW[0:B + 10] := 4;
+  MemL[0:B + 12] := B + 20;
+  MemL[0:B + 16] := 0;
+  MemL[0:B + 20] := B + 28; MemL[0:B + 24] := 0;
+  MemL[0:B + 28] := IP;
+  PutPStr(B + 32, Nm, 255);
+  WsMakeHost := 33 + Length(Nm);
+End;
+
+Function WS_gethostbyname(P : LongInt) : LongInt;
+Var Nm : String; IP : LongInt;
+Begin
+  WS_gethostbyname := 0;
+  If P = 0 Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  Nm := Trim(PStr(P));
+  If Not NetLookup(Nm, IP) Then
+  Begin
+    WsaErr := 11001;                              { WSAHOST_NOT_FOUND }
+    Exit;
+  End;
+  WsMakeHost(WsBuf, Nm, IP);
+  WS_gethostbyname := WsBuf;
+End;
+
+Function WsAddrName(IP : LongInt) : String;
+Begin
+  If (IP And $FF) = 127 Then WsAddrName := 'localhost'
+  Else If (IP = NetIP) And (IP <> 0) Then WsAddrName := 'pasdows'
+  Else WsAddrName := IpStr(IP);
+End;
+
+Function WS_gethostbyaddr(A, Len, Typ : LongInt) : LongInt;
+Var IP : LongInt;
+Begin
+  WS_gethostbyaddr := 0;
+  If (A = 0) Or (Len < 4) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  IP := MemL[0:A];
+  WsMakeHost(WsBuf, WsAddrName(IP), IP);
+  WS_gethostbyaddr := WsBuf;
+End;
+
+Function WS_gethostname(Buf, Len : LongInt) : LongInt;
+Begin
+  WS_gethostname := -1;
+  If (Buf = 0) Or (Len < 8) Then
+  Begin
+    WsaErr := 10014;
+    Exit;
+  End;
+  PutPStr(Buf, 'pasdows', Len);
+  WS_gethostname := 0;
+End;
+
+{ Services connus (etc\services) }
+Function WsServ(I : LongInt; Var Pt : LongInt) : String;
+Var S : String;
+Begin
+  S := ''; Pt := 0;
+  Case I Of
+    0 : Begin S := 'echo'; Pt := 7 End;
+    1 : Begin S := 'discard'; Pt := 9 End;
+    2 : Begin S := 'daytime'; Pt := 13 End;
+    3 : Begin S := 'ftp-data'; Pt := 20 End;
+    4 : Begin S := 'ftp'; Pt := 21 End;
+    5 : Begin S := 'telnet'; Pt := 23 End;
+    6 : Begin S := 'smtp'; Pt := 25 End;
+    7 : Begin S := 'time'; Pt := 37 End;
+    8 : Begin S := 'domain'; Pt := 53 End;
+    9 : Begin S := 'gopher'; Pt := 70 End;
+    10 : Begin S := 'finger'; Pt := 79 End;
+    11 : Begin S := 'http'; Pt := 80 End;
+    12 : Begin S := 'www'; Pt := 80 End;
+    13 : Begin S := 'pop3'; Pt := 110 End;
+    14 : Begin S := 'nntp'; Pt := 119 End;
+    15 : Begin S := 'ntp'; Pt := 123 End;
+    16 : Begin S := 'irc'; Pt := 194 End;
+  End;
+  WsServ := S;
+End;
+
+{ servent en B (16 octets + chaines) }
+Function WsMakeServ(B : LongInt; Const Nm, Pr : String; Pt : LongInt)
+  : LongInt;
+Begin
+  MemL[0:B] := B + 24; MemL[0:B + 4] := B + 16;
+  MemW[0:B + 8] := Swap16(Pt); MemW[0:B + 10] := 0;
+  MemL[0:B + 12] := B + 56;
+  MemL[0:B + 16] := 0;
+  PutPStr(B + 24, Nm, 31);
+  PutPStr(B + 56, Pr, 15);
+  WsMakeServ := 72;
+End;
+
+Function WsFindServ(Nm : String; Pt : LongInt; Var RNm : String;
+                    Var RPt : LongInt) : Boolean;
+Var I, P : LongInt; S : String;
+Begin
+  WsFindServ := False;
+  Nm := UpStr(Nm);
+  For I := 0 To 16 Do
+  Begin
+    S := WsServ(I, P);
+    If ((Nm <> '') And (UpStr(S) = Nm)) Or ((Nm = '') And (P = Pt)) Then
+    Begin
+      RNm := S; RPt := P;
+      WsFindServ := True;
+      Exit;
+    End;
+  End;
+End;
+
+Function WsProtoStr(P : LongInt) : String;
+Begin
+  If P = 0 Then WsProtoStr := 'tcp' Else WsProtoStr := PStr(P);
+End;
+
+Function WS_getservbyname(NmP, PrP : LongInt) : LongInt;
+Var S : String; Pt : LongInt;
+Begin
+  WS_getservbyname := 0;
+  If (NmP = 0) Or Not WsFindServ(PStr(NmP), 0, S, Pt) Then
+  Begin
+    WsaErr := 11004;                              { WSANO_DATA }
+    Exit;
+  End;
+  WsMakeServ(WsBuf + 320, S, WsProtoStr(PrP), Pt);
+  WS_getservbyname := WsBuf + 320;
+End;
+
+Function WS_getservbyport(Pt, PrP : LongInt) : LongInt;
+Var S : String; P : LongInt;
+Begin
+  WS_getservbyport := 0;
+  If Not WsFindServ('', Swap16(Pt), S, P) Then
+  Begin
+    WsaErr := 11004;
+    Exit;
+  End;
+  WsMakeServ(WsBuf + 320, S, WsProtoStr(PrP), P);
+  WS_getservbyport := WsBuf + 320;
+End;
+
+Function WsProtoNum(Nm : String) : LongInt;
+Begin
+  Nm := UpStr(Nm);
+  If Nm = 'IP' Then WsProtoNum := 0
+  Else If Nm = 'ICMP' Then WsProtoNum := 1
+  Else If Nm = 'TCP' Then WsProtoNum := 6
+  Else If Nm = 'UDP' Then WsProtoNum := 17
+  Else WsProtoNum := -1;
+End;
+
+Function WsMakeProto(N : LongInt) : LongInt;
+Var B : LongInt; S : String;
+Begin
+  WsMakeProto := 0;
+  Case N Of
+    0 : S := 'ip';
+    1 : S := 'icmp';
+    6 : S := 'tcp';
+    17 : S := 'udp';
+  Else
+    WsaErr := 11004;
+    Exit;
+  End;
+  B := WsBuf + 400;
+  MemL[0:B] := B + 16; MemL[0:B + 4] := B + 12;
+  MemW[0:B + 8] := N; MemW[0:B + 10] := 0;
+  MemL[0:B + 12] := 0;
+  PutPStr(B + 16, S, 15);
+  WsMakeProto := B;
+End;
+
+Function WS_getprotobyname(P : LongInt) : LongInt;
+Begin
+  If P = 0 Then WS_getprotobyname := 0
+  Else WS_getprotobyname := WsMakeProto(WsProtoNum(PStr(P)));
+End;
+
+Function WS_getprotobynumber(N : LongInt) : LongInt;
+Begin
+  WS_getprotobynumber := WsMakeProto(N);
+End;
+
+{ select : etat d'un socket (0 lecture, 1 ecriture, 2 exception) }
+Function WsReady(S, Kind : LongInt) : Boolean;
+Var R : Boolean;
+Begin
+  R := False;
+  If SkType[S] = 2 Then
+  Begin
+    If Kind = 0 Then R := SkRxLen[S] > 0
+    Else If Kind = 1 Then R := True;
+  End
+  Else If Kind = 0 Then
+  Begin
+    If SkState[S] = tcListen Then R := WsPending(S) >= 0
+    Else R := (SkRxLen[S] > 0) Or ((SkFlags[S] And sfFinRcvd) <> 0) Or
+              (SkErr[S] <> 0);
+  End
+  Else If Kind = 1 Then
+    R := (SkState[S] In [tcEstab, tcCloseWait]) And (SkTxLen[S] < SkTxSize)
+  Else
+    R := (SkState[S] = tcClosed) And (SkErr[S] <> 0);
+  WsReady := R;
+End;
+
+Function WsSelCount(P, Kind : LongInt; Var Bad : Boolean) : LongInt;
+Var I, N, S, C : LongInt;
+Begin
+  C := 0;
+  If P <> 0 Then
+  Begin
+    N := Min(MemL[0:P], 64);
+    For I := 0 To N - 1 Do
+    Begin
+      S := MemL[0:P + 4 + I * 4] - SockBase;
+      If (S < 0) Or (S >= MaxSock) Then Bad := True
+      Else If Not SkUsed[S] Then Bad := True
+      Else If WsReady(S, Kind) Then Inc(C);
+    End;
+  End;
+  WsSelCount := C;
+End;
+
+Procedure WsSelFilter(P, Kind : LongInt);
+Var I, N, K, H : LongInt;
+Begin
+  If P = 0 Then Exit;
+  N := Min(MemL[0:P], 64);
+  K := 0;
+  For I := 0 To N - 1 Do
+  Begin
+    H := MemL[0:P + 4 + I * 4];
+    If WsReady(H - SockBase, Kind) Then
+    Begin
+      MemL[0:P + 4 + K * 4] := H;
+      Inc(K);
+    End;
+  End;
+  MemL[0:P] := K;
+End;
+
+Function WS_select(N, R, W, E, Tv : LongInt) : LongInt;
+Var T0, Ms, C : LongInt; Bad : Boolean;
+Begin
+  WS_select := -1;
+  If Tv = 0 Then Ms := -1
+  Else Ms := MemL[0:Tv] * 1000 + MemL[0:Tv + 4] Div 1000;
+  T0 := Ticks;
+  Repeat
+    NetPoll;
+    Bad := False;
+    C := WsSelCount(R, 0, Bad) + WsSelCount(W, 1, Bad) +
+         WsSelCount(E, 2, Bad);
+    If Bad Then
+    Begin
+      WsaErr := 10038;
+      Exit;
+    End;
+    If (C > 0) Or ((Ms >= 0) And (Ticks - T0 >= Ms)) Then Break;
+    NetWait;
+  Until False;
+  WsSelFilter(R, 0);
+  WsSelFilter(W, 1);
+  WsSelFilter(E, 2);
+  WS_select := C;
+End;
+
+Function WS___WSAFDIsSet(H, P : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  R := 0;
+  If P <> 0 Then
+    For I := 0 To Min(MemL[0:P], 64) - 1 Do
+      If MemL[0:P + 4 + I * 4] = H Then R := 1;
+  WS___WSAFDIsSet := R;
+End;
+
+Function WS_WSAAsyncSelect(H, Wnd, Msg, Ev : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  WS_WSAAsyncSelect := -1;
+  S := WsSock(H);
+  If S < 0 Then Exit;
+  SkAWnd[S] := Wnd; SkAMsg[S] := Msg; SkAEv[S] := Ev;
+  SkASent[S] := 0;
+  If Ev = 0 Then SkAWnd[S] := 0;
+  SkFlags[S] := SkFlags[S] Or sfNonBlock;
+  WS_WSAAsyncSelect := 0;
+  If SkAWnd[S] = 0 Then Exit;
+  NetPoll;
+  If (SkType[S] = 1) And (SkState[S] = tcListen) Then
+  Begin
+    If WsPending(S) >= 0 Then NetNotify(S, FD_ACCEPT);
+  End
+  Else If WsReady(S, 0) Then NetNotify(S, FD_READ);
+  If WsReady(S, 1) Then NetNotify(S, FD_WRITE);
+  If (SkType[S] = 1) And ((SkFlags[S] And sfFinRcvd) <> 0) Then
+    NetNotify(S, FD_CLOSE);
+End;
+
+Function WS_WSAAsyncGetHostByName(Wnd, Msg, NmP, Buf, BufLen : LongInt)
+  : LongInt;
+Var Nm : String; IP, N : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetHostByName := WsAsyncN;
+  Nm := Trim(PStr(NmP));
+  If (Buf <> 0) And (BufLen >= 34 + Length(Nm)) And NetLookup(Nm, IP) Then
+  Begin
+    N := WsMakeHost(Buf, Nm, IP);
+    PostMessageA(Wnd, Msg, WsAsyncN, N);
+  End
+  Else PostMessageA(Wnd, Msg, WsAsyncN, LongInt(11001) Shl 16);
+End;
+
+Function WS_WSAAsyncGetHostByAddr(Wnd, Msg, A, Len, Typ, Buf, BufLen
+  : LongInt) : LongInt;
+Var Nm : String; N, IP : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetHostByAddr := WsAsyncN;
+  If (A = 0) Or (Buf = 0) Or (BufLen < 64) Then
+  Begin
+    PostMessageA(Wnd, Msg, WsAsyncN, LongInt(10014) Shl 16);
+    Exit;
+  End;
+  IP := MemL[0:A];
+  Nm := WsAddrName(IP);
+  N := WsMakeHost(Buf, Nm, IP);
+  PostMessageA(Wnd, Msg, WsAsyncN, N);
+End;
+
+Function WS_WSAAsyncGetServByName(Wnd, Msg, NmP, PrP, Buf, BufLen
+  : LongInt) : LongInt;
+Var S : String; Pt : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetServByName := WsAsyncN;
+  If (Buf <> 0) And (BufLen >= 72) And (NmP <> 0) And
+     WsFindServ(PStr(NmP), 0, S, Pt) Then
+    PostMessageA(Wnd, Msg, WsAsyncN, WsMakeServ(Buf, S, WsProtoStr(PrP), Pt))
+  Else PostMessageA(Wnd, Msg, WsAsyncN, LongInt(11004) Shl 16);
+End;
+
+Function WS_WSAAsyncGetServByPort(Wnd, Msg, Pt, PrP, Buf, BufLen
+  : LongInt) : LongInt;
+Var S : String; P : LongInt;
+Begin
+  Inc(WsAsyncN);
+  WS_WSAAsyncGetServByPort := WsAsyncN;
+  If (Buf <> 0) And (BufLen >= 72) And WsFindServ('', Swap16(Pt), S, P) Then
+    PostMessageA(Wnd, Msg, WsAsyncN, WsMakeServ(Buf, S, WsProtoStr(PrP), P))
+  Else PostMessageA(Wnd, Msg, WsAsyncN, LongInt(11004) Shl 16);
+End;
+
+Function WS_WSACancelAsyncRequest(H : LongInt) : LongInt;
+Begin
+  WS_WSACancelAsyncRequest := 0;
+End;
+
+Function WS_WSASetBlockingHook(P : LongInt) : LongInt;
+Begin
+  WS_WSASetBlockingHook := 0;
+End;
+
+Function WS_WSAUnhookBlockingHook : LongInt;
+Begin
+  WS_WSAUnhookBlockingHook := 0;
+End;
+
+Function WS_WSACancelBlockingCall : LongInt;
+Begin
+  WS_WSACancelBlockingCall := 0;
+End;
+
+Function WS_WSAIsBlocking : LongInt;
+Begin
+  WS_WSAIsBlocking := 0;
+End;
+
+Function WS_WSARecvEx(H, Buf, Len, FlP : LongInt) : LongInt;
+Begin
+  If FlP <> 0 Then MemL[0:FlP] := 0;
+  WS_WSARecvEx := WS_recv(H, Buf, Len, 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ ICMP.DLL : IcmpSendEcho (utilise par PING.EXE)                       }
+{ ------------------------------------------------------------------ }
+
+Function IcmpCreateFile : LongInt;
+Begin
+  IcmpCreateFile := $1C3;
+End;
+
+Function IcmpCloseHandle(H : LongInt) : LongInt;
+Begin
+  IcmpCloseHandle := 1;
+End;
+
+Function IcmpSendEcho(H, Dst, Req, ReqSize, Opts, Reply, ReplySize,
+                      Timeout : LongInt) : LongInt;
+Var Rtt : LongInt; Ok : Boolean;
+Begin
+  IcmpSendEcho := 0;
+  If (Reply = 0) Or (ReplySize < 28) Then Exit;
+  If ReplySize >= 28 + ReqSize Then PingData := Reply + 28
+  Else PingData := 0;
+  PingReq := Req;
+  Ok := NetPing(Dst, ReqSize, Max(Timeout, 100), Rtt);
+  PingReq := 0;
+  PingData := 0;
+  FillMem(Reply, 28, 0);
+  If Ok Then
+  Begin
+    MemL[0:Reply] := PingFrom;
+    MemL[0:Reply + 8] := Rtt;
+    If ReplySize >= 28 + ReqSize Then MemW[0:Reply + 12] := PingLen;
+    MemL[0:Reply + 16] := Reply + 28;
+    Mem[0:Reply + 20] := PingTtl;
+    IcmpSendEcho := 1;
+  End
+  Else
+  Begin
+    MemL[0:Reply] := Dst;
+    MemL[0:Reply + 4] := 11010;                   { IP_REQ_TIMED_OUT }
+    SetErr(11010);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Outils de Pasdows : configuration IP (winipcfg) et ping              }
+{ ------------------------------------------------------------------ }
+
+Function NetTitle : String;
+Begin
+  NetTitle := L('Configuration IP', 'IP Configuration', 'IP-Konfiguration',
+                'Configurazione IP', 'Configuraci'#162'n IP');
+End;
+
+Procedure NetConfigBox;
+Var S, A : String;
+Begin
+  NetPoll;
+  If NicBase = 0 Then
+  Begin
+    MsgBoxOpen(NetTitle, L('Aucune carte r'#130'seau NE2000 n''a ' +
+      #130't'#130' d'#130'tect'#130'e. TCP/IP fonctionne seulement en boucle ' +
+      'locale ' +
+      '(127.0.0.1).', 'No NE2000 network adapter was detected. TCP/IP ' +
+      'only works on the loopback address (127.0.0.1).',
+      'Keine NE2000-Netzwerkkarte gefunden. TCP/IP nur lokal ' +
+      '(127.0.0.1).', 'Nessuna scheda di rete NE2000 rilevata. TCP/IP ' +
+      'solo in locale (127.0.0.1).', 'No se detect'#162' ning'#163'n ' +
+      'adaptador NE2000. TCP/IP s'#162'lo en local (127.0.0.1).'), $30);
+    Exit;
+  End;
+  If NicPci Then A := 'NE2000 PCI' Else A := 'NE2000 ISA';
+  S := L('Carte', 'Adapter', 'Karte', 'Scheda', 'Adaptador') + ' : ' + A +
+       '|' + L('Adresse de la carte', 'Adapter address', 'Kartenadresse',
+       'Indirizzo scheda', 'Direcci'#162'n') + ' : ' + MacStr + '|' +
+       L('Adresse IP', 'IP address', 'IP-Adresse', 'Indirizzo IP',
+       'Direcci'#162'n IP') + ' : ' + IpStr(NetIP) + '|' +
+       L('Masque de sous-r'#130'seau', 'Subnet mask', 'Subnetzmaske',
+       'Subnet mask', 'M'#160'scara') + ' : ' + IpStr(NetMask) + '|' +
+       L('Passerelle', 'Gateway', 'Gateway', 'Gateway', 'Puerta') + ' : ' +
+       IpStr(NetGw) + '|DNS : ' + IpStr(NetDns) + '|';
+  If DhcpState = 3 Then
+    S := S + 'DHCP : ' + IpStr(NetDhcpSrv)
+  Else
+    S := S + L('DHCP en cours...', 'DHCP in progress...', 'DHCP l'#132'uft...',
+               'DHCP in corso...', 'DHCP en curso...');
+  MsgBoxOpen(NetTitle, S, $40);
+End;
+
+Procedure NetPingBox(Host : String);
+Var IP, I, Ok, Rtt, Mn, Mx, Sum, Ttl : LongInt; S : String;
+Begin
+  If Not NetLookup(Host, IP) Then
+  Begin
+    MsgBoxOpen('Ping', L('H'#147'te inconnu : ', 'Unknown host: ',
+               'Unbekannter Host: ', 'Host sconosciuto: ',
+               'Host desconocido: ') + Host, $10);
+    Exit;
+  End;
+  Ok := 0; Mn := 999999; Mx := 0; Sum := 0; Ttl := 0;
+  For I := 1 To 4 Do
+    If NetPing(IP, 32, 1000, Rtt) Then
+    Begin
+      Inc(Ok);
+      Mn := Min(Mn, Rtt); Mx := Max(Mx, Rtt); Sum := Sum + Rtt;
+      Ttl := PingTtl;
+    End;
+  S := 'Ping ' + Host + ' [' + IpStr(IP) + '] : 32 ' +
+       L('octets', 'bytes', 'Bytes', 'byte', 'bytes') + '||';
+  If Ok > 0 Then
+    S := S + L('R'#130'ponse de ', 'Reply from ', 'Antwort von ',
+               'Risposta da ', 'Respuesta desde ') + IpStr(IP) +
+         ' : TTL=' + IntStr(Ttl) + '|' +
+         L('Dur'#130'e', 'Time', 'Zeit', 'Tempo', 'Tiempo') + ' : min ' +
+         IntStr(Mn) + ' ms, max ' + IntStr(Mx) + ' ms, ' +
+         L('moyenne', 'average', 'Mittel', 'media', 'media') + ' ' +
+         IntStr(Sum Div Ok) + ' ms|'
+  Else
+    S := S + L('D'#130'lai d''attente d'#130'pass'#130'.', 'Request timed out.',
+               'Zeit'#129'berschreitung.', 'Richiesta scaduta.',
+               'Tiempo agotado.') + '|';
+  S := S + L('Paquets : envoy'#130's = 4, re'#135'us = ',
+             'Packets: sent = 4, ' +
+             'received = ', 'Pakete: gesendet = 4, empfangen = ',
+             'Pacchetti: inviati = 4, ricevuti = ',
+             'Paquetes: enviados = 4, recibidos = ') + IntStr(Ok);
+  If Ok > 0 Then I := $40 Else I := $30;
+  MsgBoxOpen('Ping', S, I);
+End;
+
+{ Commandes TCP/IP de la boite Executer }
+Function NetRunCmd(S : String) : Boolean;
+Var U : String;
+Begin
+  NetRunCmd := True;
+  S := Trim(S);
+  U := UpStr(S);
+  If (U = 'WINIPCFG') Or (U = 'WINIPCFG.EXE') Or (U = 'IPCONFIG') Or
+     (U = 'IPCONFIG.EXE') Then NetConfigBox
+  Else If (Copy(U, 1, 5) = 'PING ') And (Length(Trim(Copy(S, 6, 255))) > 0)
+  Then NetPingBox(Trim(Copy(S, 6, 255)))
+  Else NetRunCmd := False;
+End;
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
 exports VideoForWindowsVersion,
+  WS_WSAStartup, WS_WSACleanup, WS_WSAGetLastError, WS_WSASetLastError,
+  WS_socket, WS_closesocket, WS_bind, WS_listen, WS_accept, WS_connect,
+  WS_sendto, WS_recvfrom, WS_send, WS_recv, WS_shutdown, WS_ioctlsocket,
+  WS_setsockopt, WS_getsockopt, WS_getpeername, WS_getsockname, WS_htons,
+  WS_ntohs, WS_htonl, WS_ntohl, WS_inet_addr, WS_inet_ntoa, WS_gethostbyname,
+  WS_gethostbyaddr, WS_gethostname, WS_getservbyname, WS_getservbyport,
+  WS_getprotobyname, WS_getprotobynumber, WS_select, WS___WSAFDIsSet,
+  WS_WSAAsyncSelect, WS_WSAAsyncGetHostByName, WS_WSAAsyncGetHostByAddr,
+  WS_WSAAsyncGetServByName, WS_WSAAsyncGetServByPort,
+  WS_WSACancelAsyncRequest, WS_WSASetBlockingHook, WS_WSAUnhookBlockingHook,
+  WS_WSACancelBlockingCall, WS_WSAIsBlocking, WS_WSARecvEx, IcmpCreateFile,
+  IcmpCloseHandle, IcmpSendEcho,
   DXNI1, DXNI2, DXNI3, DXNI4, DXNI5, DXNI6, DXOK1, DXOK2, DXOK3, COMAddRef,
   COMRelease, COMQIUnk, DXOK4, DirectDrawCreate, DirectDrawEnumerateA, DD_QI,
   DD_SetCooperativeLevel, DD_SetDisplayMode, DD_SetDisplayMode2,
@@ -22640,6 +25490,7 @@ Var I : LongInt; Busy : Boolean;
 Begin
   Repeat
     ProcessInput;
+    NetPoll;
     RunMMTimers;
     RunWave;
     KPaintAll;
@@ -22713,6 +25564,7 @@ BEGIN
   InitW16;
   InitW16Apis;
   W16Init2;
+  NetInit;
   AppProcObj := -1;
   DeskBuild;
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,

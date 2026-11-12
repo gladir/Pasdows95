@@ -29,6 +29,11 @@ PROGRAMMES WINDOWS 95
   DINPUT.DLL (clavier, souris) et DSETUP.DLL. Exemple : DDTEST.EXE
   (Echap pour quitter).
 
+  Reseau TCP/IP : carte NE2000 (PCI ou ISA en 300h), adresse IP par
+  DHCP, DNS, WSOCK32.DLL et WS2_32.DLL (Winsock 1.1), ICMP.DLL.
+  Demarrer, Parametres, Reseau (TCP/IP) affiche la configuration IP ;
+  dans Executer, tapez WINIPCFG ou PING hote. Exemple : NETTEST.EXE.
+
   Les programmes Windows 3.1 (16 bits, format NE) sont aussi
   pris en charge (KERNEL, USER, GDI, SHELL, VER, LZEXPAND...).
 
@@ -80,5 +85,6 @@ MATERIEL
   lecteur de CD-ROM ATAPI. Sans VMM32.VXD, avec moins de 16 Mo ou
   sans VESA, IO.SYS demarre son interface 16 couleurs (8086 et VGA).
   Essai : qemu-system-i386 -m 64 -cdrom PASDOWS.ISO -boot d
+          -nic user,model=ne2k_pci        (carte reseau NE2000)
 
 https://www.gladir.com/pasdows95
