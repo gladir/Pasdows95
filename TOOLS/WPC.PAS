@@ -239,6 +239,10 @@ Type
 Var
   { Options }
   Opts : TOptions;
+  { -CVMM32 : API Win32 exportees par le noyau (clause exports) }
+  KrnExpCount : Integer;
+  KrnExpNames : Array[0..1023] Of String[63];
+  KrnVmm32    : Boolean;
 
   { Compteurs generaux }
   ErrorCount : Integer;
@@ -456,6 +460,8 @@ Begin
   Opts.Sane        := False;
   Opts.DestTarget  := DEST_OS2;
   Opts.Os2Flat     := OS2F_NONE;
+  KrnVmm32         := False;
+  KrnExpCount      := 0;
 End;
 
 { ------------------------------------------------------------ }
@@ -496,6 +502,8 @@ Begin
   WriteLn('  -COS2KRNL      Noyau OS2KRNL (80386 mode protege, PE a 1 Mo)');
   WriteLn('  -COS2LDR       Chargeur OS2LDR (8086 mode reel, binaire en 2000:0000)');
   WriteLn('  -COS2BOOT      Secteur d''amorce OS2BOOT (8086, El Torito, 07C0:0000)');
+  WriteLn('  -CVMM32        Noyau VMM32.VXD de Pasdows 95 (80386, PE a 1 Mo,');
+  WriteLn('                 API Win32 de la clause exports)');
   WriteLn('  -CW95IO        Noyau IO.SYS de Pasdows 95 (8086, El Torito,');
   WriteLn('                 auto-chargeant en 07C0:0000)');
   WriteLn;
@@ -630,6 +638,11 @@ Begin
       Opts.DestTarget := DEST_OS2
     Else If (UA = '-COS2KRNL') Then
       Opts.DestTarget := DEST_OS2KRNL
+    Else If (UA = '-CVMM32') Then
+    Begin
+      Opts.DestTarget := DEST_OS2KRNL;
+      KrnVmm32 := True;
+    End
     Else If (UA = '-COS2LDR') Then
     Begin
       Opts.DestTarget := DEST_DOSR;
@@ -22966,6 +22979,26 @@ Begin
       Exit;
     End;
 
+    { Resultat de fonction (NomFonction := expr) : prioritaire sur les  }
+    { sous-programmes predefinis homonymes (Ellipse, Rectangle, LineTo) }
+    If (PI >= 0) And ProcTab[PI].IsFunction And (ProcTab[PI].Name = Up) And
+       (EP + 1 < EPEnd) And (TokenPool[EP + 1].Kind = TK_OP) And
+       (TokenPool[EP + 1].Val = ':=') And
+       (Not Is68kTarget) And (Opts.DestTarget <> DEST_CRAY1) And
+       (Not Opts.Dos16Mode) Then
+    Begin
+      Inc(EP, 2);
+      WantCharLit := (ProcTab[PI].RetTypeIdx = TY_IDX_CHAR);
+      ParseExpr(PI);
+      WantCharLit := False;
+      GenRangeCheckAssign(ProcTab[PI].RetTypeIdx);
+      GenStoreVar(PI, VName);
+      If (Not EPAtEnd) And (TokenPool[EP].Kind = TK_PUNCT) And
+         (TokenPool[EP].Val = ';') Then
+        Inc(EP);
+      Exit;
+    End;
+
     { INC/DEC/NEW/DISPOSE/GETMEM/FREEMEM/MOVE/FILLCHAR/MARK/RELEASE/SETTEXTBUF/CHDIR/MKDIR/RMDIR/GETDIR/INCLUDE/EXCLUDE }
     If (Up = 'INC') Or (Up = 'DEC') Or (Up = 'NEW') Or
        (Up = 'DISPOSE') Or (Up = 'GETMEM') Or (Up = 'FREEMEM') Or
@@ -24989,6 +25022,14 @@ Begin
             EPMatch(',');
             ParseExpr(PI);  EmitInstr('PUSH EAX');  { Path }
             EPMatch(')');
+            { la routine attend Gd en [EBP+8], Gm en [EBP+12] (ordre   }
+            { de SetGraphMode) : inverser Gd et Path                   }
+            EmitInstr('POP EAX');
+            EmitInstr('POP EBX');
+            EmitInstr('POP ECX');
+            EmitInstr('PUSH EAX');
+            EmitInstr('PUSH EBX');
+            EmitInstr('PUSH ECX');
             EmitInstr('CALL ' + TP_RT_PFX + 'INITGRAPH');
             EmitInstr('ADD ESP,12');
           End;
@@ -25556,7 +25597,13 @@ Begin
         EPMatch(',');
         ParseExpr(PI);  EmitInstr('PUSH EAX');
         EPMatch(',');
-        ParseExpr(PI);  EmitInstr('PUSH EAX');
+        ParseExpr(PI);
+        If (Not LastExprIsPascalStr) Then
+        Begin
+          GenStrSourceESI;
+          EmitInstr('CALL ' + TP_RT_PFX + 'STRRET');
+        End;
+        EmitInstr('PUSH EAX');
         EPMatch(')');
       End;
       EmitInstr('CALL ' + TP_RT_PFX + 'OUTTEXTXY');
@@ -25573,6 +25620,11 @@ Begin
       If EPMatch('(') Then
       Begin
         ParseExpr(PI);
+        If (Not LastExprIsPascalStr) Then
+        Begin
+          GenStrSourceESI;
+          EmitInstr('CALL ' + TP_RT_PFX + 'STRRET');
+        End;
         EPMatch(')');
       End;
       EmitInstr('PUSH EAX');
@@ -38240,6 +38292,8 @@ Var
     If Mnem = 'FLDL2T' Then Begin BcEmitB($D9); BcEmitB($E9); Exit; End;
     If Mnem = 'FLDLG2' Then Begin BcEmitB($D9); BcEmitB($EC); Exit; End;
     If Mnem = 'FNINIT' Then Begin BcEmitB($DB); BcEmitB($E3); Exit; End;
+    If Mnem = 'FINIT' Then
+    Begin BcEmitB($9B); BcEmitB($DB); BcEmitB($E3); Exit; End;
     If Mnem = 'FWAIT' Then Begin BcEmitB($9B); Exit; End;
     If Mnem = 'FXCH' Then
     Begin
@@ -38326,6 +38380,10 @@ Var
     If Mnem = 'FLDCW' Then Begin EmitMem($D9, 5); Exit; End;
     If Mnem = 'FNSTCW' Then Begin EmitMem($D9, 7); Exit; End;
     If Mnem = 'FSTCW' Then Begin BcEmitB($9B); EmitMem($D9, 7); Exit; End;
+    { sauvegarde / restauration de l etat complet du coprocesseur }
+    If Mnem = 'FNSAVE' Then Begin EmitMem($DD, 6); Exit; End;
+    If Mnem = 'FSAVE' Then Begin BcEmitB($9B); EmitMem($DD, 6); Exit; End;
+    If Mnem = 'FRSTOR' Then Begin EmitMem($DD, 4); Exit; End;
     AssembleX87 := False;
   End;
 
@@ -58257,7 +58315,43 @@ Begin
     TokenPool[0].Kind := TK_KEYWORD;
     TokenPool[0].Val := 'program';
   End;
-  If Not IsLibrary Then Exit;
+  If Not IsLibrary Then
+  Begin
+    { noyau (-COS2KRNL, -CVMM32) : clause exports a, b, ... ; les noms
+      s ajoutent a la couche API exportee (thunks stdcall -> Pascal) }
+    If Opts.DestTarget <> DEST_OS2KRNL Then Exit;
+    I := 0;
+    While I < TokenCount Do
+    Begin
+      If ((TokenPool[I].Kind = TK_IDENT) Or (TokenPool[I].Kind = TK_KEYWORD)) And
+         (StrUpperCase(TokenPool[I].Val) = 'EXPORTS') Then
+      Begin
+        Start := I;
+        J := I + 1;
+        While (J < TokenCount) And Not ((TokenPool[J].Kind = TK_PUNCT) And (TokenPool[J].Val = ';')) Do
+        Begin
+          If ((TokenPool[J].Kind = TK_IDENT) Or (TokenPool[J].Kind = TK_KEYWORD)) And
+             (KrnExpCount < 1023) Then
+          Begin
+            KrnExpNames[KrnExpCount] := TokenPool[J].Val;
+            Inc(KrnExpCount);
+          End;
+          Inc(J);
+        End;
+        Removed := J - Start + 1;
+        If J >= TokenCount Then Removed := TokenCount - Start;
+        For J := Start To TokenCount - Removed - 1 Do TokenPool[J] := TokenPool[J + Removed];
+        TokenCount := TokenCount - Removed;
+        For J := 0 To IoSwitchCnt - 1 Do
+          If IoSwitchPos[J] > Start Then IoSwitchPos[J] := IoSwitchPos[J] - Removed;
+        For J := 0 To RangeSwitchCnt - 1 Do
+          If RangeSwitchPos[J] > Start Then RangeSwitchPos[J] := RangeSwitchPos[J] - Removed;
+        Continue;
+      End;
+      Inc(I);
+    End;
+    Exit;
+  End;
   I := 0;
   While I < TokenCount Do
   Begin
@@ -58401,6 +58495,15 @@ Begin
       If StrUpperCase(BcImports[K].ApiName) = U Then Found := K;
     If Found < 0 Then K := BcFindOrAddImport(OS2_API_NAMES[I]);
   End;
+  { -CVMM32 : API supplementaires de la clause exports }
+  For I := 0 To KrnExpCount - 1 Do
+  Begin
+    U := StrUpperCase(KrnExpNames[I]);
+    Found := -1;
+    For K := 0 To BcImportCnt - 1 Do
+      If StrUpperCase(BcImports[K].ApiName) = U Then Found := K;
+    If Found < 0 Then K := BcFindOrAddImport(KrnExpNames[I]);
+  End;
   EmitBlankLine;
   EmitComment('=== Couche API du noyau OS/2-0 (thunks stdcall -> Pascal) ===');
   Missing := 0;
@@ -58408,8 +58511,11 @@ Begin
   Begin
     Nm := BcImports[I].ApiName;
     U := StrUpperCase(Nm);
-    Cdecl := (U = 'SPRINTF') Or (U = 'STRTOD');
+    Cdecl := (U = 'SPRINTF') Or (U = 'STRTOD') Or (U = 'WSPRINTFA') Or
+             (U = 'WSPRINTFW') Or (U = 'DBGPRINT');
     PI := Os2FindProc(U);
+    { _lopen, _lread... : le nom d API a perdu son '_' initial }
+    If (PI < 0) And KrnVmm32 Then PI := Os2FindProc('_' + U);
     EmitLabel('_TPX_' + Nm);
     If PI >= 0 Then
     Begin
@@ -58447,6 +58553,10 @@ Begin
     End;
   End;
   If Not Opts.Quiet Then
+    If KrnVmm32 Then
+    WriteLn('VMM32 : ', BcImportCnt, ' API exportees (', BcImportCnt - Missing,
+            ' ecrites en Pascal, ', Missing, ' non disponibles)')
+    Else
     WriteLn('Noyau OS/2 : ', BcImportCnt, ' API exportees (', BcImportCnt - Missing,
             ' ecrites en Pascal, ', Missing, ' non disponibles)');
 End;

@@ -3,16 +3,18 @@
 #
 #  1. compile les outils avec Free Pascal : TOOLS/WPC.PAS (Windows 95
 #     Pascal Compiler) et TOOLS/MAKEISO.PAS ;
-#  2. compile le noyau avec WPC :
-#        WPC -CW95IO IO.PAS IO.SYS   (IO.SYS amorcable, El Torito)
-#  3. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec les
-#     fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
-#     LISEZMOI.TXT) ;
-#  4. recopie IO.SYS dans IMAGE/CDROM.
+#  2. compile le systeme avec WPC :
+#        WPC -CW95IO IO.PAS IO.SYS         (IO.SYS amorcable, El Torito)
+#        WPC -CVMM32 VMM32.PAS VMM32.VXD   (noyau 32 bits et Win32)
+#  3. compile les exemples Win32 (EXEMPLES/*.PAS, WPC -CW32) ;
+#  4. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec tous
+#     les fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
+#     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) ;
+#  5. recopie IO.SYS, VMM32.VXD et les exemples dans IMAGE/CDROM.
 #
 # Variables : FPC (compilateur Free Pascal, defaut fpc), W (dossier de
 # travail, defaut BUILD a la racine du depot).
-# Test : qemu-system-i386 -m 32 -cdrom IMAGE/PASDOWS.ISO -boot d
+# Test : qemu-system-i386 -m 64 -cdrom IMAGE/PASDOWS.ISO -boot d
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
@@ -24,14 +26,24 @@ echo "== Outils (Free Pascal)"
 "$FPC" -O1 -FU"$W/obj" -o"$W/wpc" "$ROOT/TOOLS/WPC.PAS" > "$W/wpc.log" || { cat "$W/wpc.log"; exit 1; }
 "$FPC" -FU"$W/obj" -o"$W/makeiso" "$ROOT/TOOLS/MAKEISO.PAS" > "$W/makeiso.log" || { cat "$W/makeiso.log"; exit 1; }
 
-echo "== Noyau IO.SYS (WPC -CW95IO)"
+echo "== Contenu du CD-ROM"
 rm -f "$W"/cd/*
+cp "$ROOT"/IMAGE/CDROM/* "$W/cd/"
+
+echo "== IO.SYS (WPC -CW95IO)"
 "$W/wpc" -CW95IO "$HERE/IO.PAS" "$W/cd/IO.SYS"
 
-echo "== CD-ROM amorcable"
-for F in AUTOEXEC.BAT CONFIG.SYS MSDOS.SYS LISEZMOI.TXT; do
-  cp "$ROOT/IMAGE/CDROM/$F" "$W/cd/$F"
+echo "== VMM32.VXD (WPC -CVMM32)"
+"$W/wpc" -CVMM32 "$HERE/VMM32.PAS" "$W/cd/VMM32.VXD"
+
+echo "== Exemples Win32 (WPC -CW32)"
+for P in "$ROOT"/EXEMPLES/*.PAS; do
+  N=$(basename "$P" .PAS)
+  "$W/wpc" -CW32 "$P" "$W/cd/$N.EXE"
+  cp "$W/cd/$N.EXE" "$ROOT/IMAGE/CDROM/$N.EXE"
 done
+
+echo "== CD-ROM amorcable"
 "$W/makeiso" "$ROOT/IMAGE/PASDOWS.ISO" /BOOT:"$W/cd/IO.SYS" /LABEL:PASDOWS95 "$W/cd/*"
-cp "$W/cd/IO.SYS" "$ROOT/IMAGE/CDROM/IO.SYS"
+cp "$W/cd/IO.SYS" "$W/cd/VMM32.VXD" "$ROOT/IMAGE/CDROM/"
 echo "Termine : $ROOT/IMAGE/PASDOWS.ISO"

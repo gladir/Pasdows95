@@ -6385,6 +6385,377 @@ Begin
 End;
 
 { ================================================================== }
+{ Chargement du noyau 32 bits VMM32.VXD (mode protege)               }
+{ ================================================================== }
+
+{ Comme le IO.SYS de Windows 95, IO.SYS prepare la machine puis passe
+  la main au gestionnaire de machine virtuelle 32 bits VMM32.VXD
+  (KERNEL/VMM32.PAS, WPC -CVMM32) qui contient l'interface graphique
+  256 couleurs et le sous-systeme Win32 (programmes Windows 95). Le
+  mode sans echec reste l'interface 16 couleurs d'IO.SYS.
+
+  Bloc d'information pour VMM32 (0000:0500) :
+    +00 mot 'PW'           +02 unite d'amorcage   +03 langue
+    +04 LBA racine CD      +08 taille racine      +0C memoire video
+    +10 octets par ligne   +12 largeur            +14 hauteur
+    +16 bits par point     +18 memoire etendue (Ko)
+    +1C base du noyau      +20 taille de l'image  +24 point d'entree
+    +28 police 8x16 (0000:2000)  +2C environnement (0000:3000)
+    +30 options : bit 0 ecran d'accueil, bit 1 son
+  GDT temporaire en 0000:0A00, GDTR en 0000:0A20, transition 32 bits en
+  0000:0A40, zone de transit du fichier en 00400000h. }
+
+Const
+  VInfo     = $0500;
+  VGdt      = $0A00;
+  VGdtr     = $0A20;
+  VTramp    = $0A40;
+  VFont     = $2000;
+  VEnv      = $3000;
+  VStaging  = $00400000;
+  CmosDosFlag = $7E;
+
+Var
+  MoveGdt   : Array[0..47] Of Byte;
+  VbeBuf    : Array[0..255] Of Byte;
+  VEntry    : LongInt;
+
+Function CmosRead(R : Byte) : Byte;
+Begin
+  Port[$70] := R;
+  CmosRead := Port[$71];
+End;
+
+Procedure CmosWrite(R, V : Byte);
+Begin
+  Port[$70] := R;
+  Port[$71] := V;
+End;
+
+Procedure SetDesc(Ofs : Integer; Base : LongInt);
+Begin
+  MoveGdt[Ofs] := $FF; MoveGdt[Ofs + 1] := $FF;
+  MoveGdt[Ofs + 2] := Base And $FF;
+  MoveGdt[Ofs + 3] := (Base Shr 8) And $FF;
+  MoveGdt[Ofs + 4] := (Base Shr 16) And $FF;
+  MoveGdt[Ofs + 5] := $93;
+  MoveGdt[Ofs + 6] := 0;
+  MoveGdt[Ofs + 7] := (Base Shr 24) And $FF;
+End;
+
+{ Copie en memoire etendue (INT 15h AH=87h), Bytes <= 65536 }
+Function ExtCopy(Src, Dst, Bytes : LongInt) : Boolean;
+Var I : Integer; Words : Word; Err : Byte;
+Begin
+  For I := 0 To 47 Do MoveGdt[I] := 0;
+  SetDesc(16, Src);
+  SetDesc(24, Dst);
+  Words := Word((Bytes + 1) Div 2);
+  asm
+    push es
+    push si
+    push ds
+    pop es
+    lea si,MoveGdt
+    mov cx,Words
+    mov ah,87h
+    int 15h
+    mov al,0
+    adc al,0
+    mov Err,al
+    pop si
+    pop es
+  end;
+  ExtCopy := Err = 0;
+End;
+
+Function BigCopy(Src, Dst, Bytes : LongInt) : Boolean;
+Var N : LongInt;
+Begin
+  BigCopy := False;
+  While Bytes > 0 Do
+  Begin
+    If Bytes > 16384 Then N := 16384 Else N := Bytes;
+    If Not ExtCopy(Src, Dst, N) Then Exit;
+    Src := Src + N; Dst := Dst + N; Bytes := Bytes - N;
+  End;
+  BigCopy := True;
+End;
+
+Procedure EnableA20;
+Begin
+  asm
+    mov ax,2401h
+    int 15h
+    in al,92h
+    or al,2
+    and al,0FEh
+    out 92h,al
+  end;
+End;
+
+{ Memoire etendue en Ko (INT 15h E801h, sinon 88h) }
+Function ExtMemKb : LongInt;
+Var W1, W2 : Word; Ok : Byte;
+Begin
+  W1 := 0; W2 := 0; Ok := 0;
+  asm
+    mov ax,0E801h
+    int 15h
+    jc @no801
+    or ax,ax
+    jnz @use
+    mov ax,cx
+    mov bx,dx
+  @use:
+    mov W1,ax
+    mov W2,bx
+    mov Ok,1
+  @no801:
+  end;
+  If Ok <> 0 Then ExtMemKb := LongInt(W1) + LongInt(W2) * 64
+  Else ExtMemKb := MemExt;
+End;
+
+Function VGetD(Seg, Ofs : Word) : LongInt;
+Begin
+  VGetD := LongInt(MemW[Seg:Ofs]) + LongInt(MemW[Seg:Ofs + 2]) * 65536;
+End;
+
+Procedure PutInfoD(Ofs : Word; V : LongInt);
+Begin
+  MemW[0:VInfo + Ofs] := Word(V);
+  MemW[0:VInfo + Ofs + 2] := Word(V Shr 16);
+End;
+
+{ Mode VESA 101h (640x480, 256 couleurs) avec memoire lineaire }
+Function VbeSetup : Boolean;
+Var R : Word; Lfb : LongInt; I : Integer;
+Begin
+  VbeSetup := False;
+  For I := 0 To 255 Do VbeBuf[I] := 0;
+  asm
+    push es
+    push di
+    push ds
+    pop es
+    lea di,VbeBuf
+    mov ax,4F01h
+    mov cx,0101h
+    int 10h
+    mov R,ax
+    pop di
+    pop es
+  end;
+  If R <> $004F Then Exit;
+  If (VbeBuf[0] And $81) <> $81 Then Exit;
+  Lfb := LongInt(VbeBuf[$28]) + LongInt(VbeBuf[$29]) Shl 8 +
+         LongInt(VbeBuf[$2A]) Shl 16 + LongInt(VbeBuf[$2B]) Shl 24;
+  If Lfb = 0 Then Exit;
+  asm
+    mov ax,4F02h
+    mov bx,4101h
+    int 10h
+    mov R,ax
+  end;
+  If R <> $004F Then Exit;
+  PutInfoD($0C, Lfb);
+  MemW[0:VInfo + $10] := VbeBuf[$10] + Word(VbeBuf[$11]) Shl 8;
+  MemW[0:VInfo + $12] := 640;
+  MemW[0:VInfo + $14] := 480;
+  MemW[0:VInfo + $16] := 8;
+  VbeSetup := True;
+End;
+
+{ Police 8x16 du BIOS recopiee en 0000:2000 }
+Procedure CopyFont;
+Var FSg, FOf, I : Word;
+Begin
+  asm
+    push bp
+    push es
+    mov ax,1130h
+    mov bh,6
+    int 10h
+    mov ax,es
+    mov dx,bp
+    pop es
+    pop bp
+    mov FSg,ax
+    mov FOf,dx
+  end;
+  For I := 0 To 4095 Do Mem[0:VFont + I] := Mem[FSg:FOf + I];
+End;
+
+{ Environnement (chaines ASCIIZ NOM=VALEUR, terminees par 0) }
+Procedure CopyEnv;
+Var I, J : Integer; P : Word;
+Begin
+  P := VEnv;
+  For I := 1 To EnvCnt Do
+    If P + Length(EnvStr[I]) + 2 < VEnv + 2040 Then
+    Begin
+      For J := 1 To Length(EnvStr[I]) Do
+      Begin
+        Mem[0:P] := Ord(EnvStr[I][J]);
+        Inc(P);
+      End;
+      Mem[0:P] := 0;
+      Inc(P);
+    End;
+  Mem[0:P] := 0;
+End;
+
+Procedure PutB(Var P : Word; B : Byte);
+Begin
+  Mem[0:P] := B;
+  Inc(P);
+End;
+
+Procedure PutDW(Var P : Word; D : LongInt);
+Begin
+  PutB(P, D And $FF); PutB(P, (D Shr 8) And $FF);
+  PutB(P, (D Shr 16) And $FF); PutB(P, (D Shr 24) And $FF);
+End;
+
+{ GDT plate et code de transition 32 bits (pile 00090000h) }
+Procedure BuildGdt;
+Var P : Word;
+Begin
+  P := VGdt;
+  PutDW(P, 0); PutDW(P, 0);
+  PutDW(P, $0000FFFF); PutDW(P, $00CF9A00);
+  PutDW(P, $0000FFFF); PutDW(P, $00CF9200);
+  MemW[0:VGdtr] := 3 * 8 - 1;
+  MemW[0:VGdtr + 2] := VGdt;
+  MemW[0:VGdtr + 4] := 0;
+  P := VTramp;
+  PutB(P, $66); PutB(P, $B8); PutB(P, $10); PutB(P, $00);
+  PutB(P, $8E); PutB(P, $D8);
+  PutB(P, $8E); PutB(P, $C0);
+  PutB(P, $8E); PutB(P, $E0);
+  PutB(P, $8E); PutB(P, $E8);
+  PutB(P, $8E); PutB(P, $D0);
+  PutB(P, $BC); PutDW(P, $00090000);
+  PutB(P, $BB); PutDW(P, VInfo);
+  PutB(P, $B8); PutDW(P, VEntry);
+  PutB(P, $FF); PutB(P, $E0);
+End;
+
+{ Lire VMM32.VXD et le placer a son adresse ; False si impossible }
+Function LoadVmm32 : Boolean;
+Var Idx, I, NSect, OptSize : Integer; Sector, NSectors : LongInt;
+    PeOfs, SO : Word; KBase, KImg, KHdr, VSize, VAddr, RawSize,
+    RawPtr, N : LongInt;
+Begin
+  LoadVmm32 := False;
+  Idx := CdFind('VMM32.VXD');
+  If Idx < 0 Then Exit;
+  NSectors := (CdFiles[Idx].Size + 2047) Div 2048;
+  If NSectors > 1536 Then Exit;
+  Sector := 0;
+  While Sector < NSectors Do
+  Begin
+    If Not CdRead(CdFiles[Idx].Lba + Sector, CdSeg) Then Exit;
+    If Not ExtCopy(LongInt(CdSeg) * 16, VStaging + Sector * 2048, 2048)
+    Then Exit;
+    If (Sector And 15) = 0 Then TWrite(Integer(Sector Div 16) Mod 80, 2,
+                                       #219, $07);
+    Inc(Sector);
+  End;
+  If Not ExtCopy(VStaging, LongInt(TmpSeg) * 16, 4096) Then Exit;
+  If MemW[TmpSeg:0] <> $5A4D Then Exit;
+  PeOfs := MemW[TmpSeg:$3C];
+  If (MemW[TmpSeg:PeOfs] <> $4550) Or (MemW[TmpSeg:PeOfs + 4] <> $014C)
+  Then Exit;
+  NSect := MemW[TmpSeg:PeOfs + 6];
+  OptSize := MemW[TmpSeg:PeOfs + 20];
+  VEntry := VGetD(TmpSeg, PeOfs + 24 + 16);
+  KBase := VGetD(TmpSeg, PeOfs + 24 + 28);
+  KImg := VGetD(TmpSeg, PeOfs + 24 + 56);
+  KHdr := VGetD(TmpSeg, PeOfs + 24 + 60);
+  If (KBase < $00100000) Or (KBase + KImg > VStaging) Then Exit;
+  { mise a zero de l'image (tampon de zeros en CdSeg) }
+  For I := 0 To 1023 Do MemW[CdSeg:I * 2] := 0;
+  N := 0;
+  While N < KImg Do
+  Begin
+    If Not ExtCopy(LongInt(CdSeg) * 16, KBase + N, 2048) Then Exit;
+    N := N + 2048;
+  End;
+  If Not BigCopy(VStaging, KBase, KHdr) Then Exit;
+  SO := PeOfs + 24 + OptSize;
+  For I := 0 To NSect - 1 Do
+  Begin
+    VSize := VGetD(TmpSeg, SO + 8);
+    VAddr := VGetD(TmpSeg, SO + 12);
+    RawSize := VGetD(TmpSeg, SO + 16);
+    RawPtr := VGetD(TmpSeg, SO + 20);
+    If RawSize > VSize Then N := VSize Else N := RawSize;
+    If N > 0 Then
+      If Not BigCopy(VStaging + RawPtr, KBase + VAddr, N) Then Exit;
+    SO := SO + 40;
+  End;
+  PutInfoD($1C, KBase);
+  PutInfoD($20, KImg);
+  VEntry := KBase + VEntry;
+  PutInfoD($24, VEntry);
+  LoadVmm32 := True;
+End;
+
+{ Demarrer Pasdows en mode protege ; ne revient qu'en cas d'echec }
+Procedure StartVmm32;
+Var Flags : Byte;
+Begin
+  If CdFind('VMM32.VXD') < 0 Then Exit;
+  If ExtMemKb < 15 * 1024 Then Exit;
+  TextMode;
+  TClear;
+  TWrite(0, 0, L('Chargement de Pasdows 95 (VMM32.VXD)...',
+         'Loading Pasdows 95 (VMM32.VXD)...',
+         'Pasdows 95 wird geladen (VMM32.VXD)...',
+         'Caricamento di Pasdows 95 (VMM32.VXD)...',
+         'Cargando Pasdows 95 (VMM32.VXD)...'), $07);
+  EnableA20;
+  If Not LoadVmm32 Then Exit;
+  CopyFont;
+  CopyEnv;
+  MemW[0:VInfo] := $5750;
+  Mem[0:VInfo + 2] := BootDrive;
+  Mem[0:VInfo + 3] := Ord(Language);
+  PutInfoD($04, RootLba);
+  PutInfoD($08, RootSize);
+  PutInfoD($18, ExtMemKb);
+  PutInfoD($28, VFont);
+  PutInfoD($2C, VEnv);
+  Flags := 2;
+  If OptLogo Then Flags := Flags Or 1;
+  PutInfoD($30, Flags);
+  If Not VbeSetup Then
+  Begin
+    TextMode;
+    Exit;
+  End;
+  BuildGdt;
+  asm
+    cli
+    mov al,0FFh
+    out 0A1h,al
+    out 21h,al
+    xor ax,ax
+    mov ds,ax
+    db 0Fh,01h,16h
+    dw 0A20h
+    db 0Fh,20h,0C0h
+    db 0Ch,01h
+    db 0Fh,22h,0C0h
+    db 0EAh
+    dw 0A40h
+    dw 0008h
+  end;
+End;
+
+{ ================================================================== }
 { Programme principal                                                }
 { ================================================================== }
 
@@ -6430,11 +6801,23 @@ BEGIN
   ReadAutoexec;
   ApplyLanguage;
   InitState;
-  Mode := BootScreen;
+  If CmosRead(CmosDosFlag) = $D0 Then
+  Begin
+    { Redemarrer en mode MS-DOS (demande par VMM32) }
+    CmosWrite(CmosDosFlag, 0);
+    Mode := 2;
+  End
+  Else
+    Mode := BootScreen;
   If (Mode = 0) And Not OptBootGUI Then Mode := 2;
   If Mode = 3 Then Reboot;
+  If Mode = 0 Then StartVmm32;
   InitInput;
-  If Mode = 2 Then TextConsole;
+  If Mode = 2 Then
+  Begin
+    TextConsole;
+    StartVmm32;
+  End;
   SafeMode := Mode = 1;
   If SafeMode Then DeskColor := cBlack;
   GraphMode;
