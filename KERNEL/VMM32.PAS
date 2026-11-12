@@ -3239,6 +3239,18 @@ Type
 
 Var
   Lfb, LfbPitch : LongInt;
+  { VGA 16 couleurs (mode 12h, 4 plans) quand IO.SYS n'a pas trouve de
+    mode VESA : l'ecran 256 couleurs (Back) est converti a la copie }
+  VgaPlanar : Boolean;
+  VgaMapChanged : Boolean;
+  VgaMap    : Array[0..255] Of Byte;     { indice -> couleur VGA 0..15 }
+  VgaP0, VgaP1, VgaP2, VgaP3 : Array[0..79] Of Byte;
+  VgaTmp    : Array[0..47] Of Byte;
+  { VgaTab[K * 256 + I] : bits des 4 plans (un octet par plan) du pixel
+    d'indice I en position K (0 = bit 7) d'un octet ; refaite quand
+    VgaMap change }
+  VgaTab    : Array[0..2047] Of LongInt;
+  VgaTabOk  : Boolean;
   Back      : TSurf;
   SysPal    : Array[0..767] Of Byte;       { R, G, B (8 bits) }
   PalVer    : LongInt;
@@ -3274,8 +3286,125 @@ End;
 { Palette systeme                                                    }
 { ------------------------------------------------------------------ }
 
+Const
+  { couleurs du pilote VGA de Windows (ordre IRGB du VGA) }
+  VgaRGB : Array[0..15] Of LongInt = (
+    $000000, $000080, $008000, $008080, $800000, $800080, $808000,
+    $C0C0C0, $808080, $0000FF, $00FF00, $00FFFF, $FF0000, $FF00FF,
+    $FFFF00, $FFFFFF);
+
+Procedure VgaInit;
+Var I, B : LongInt;
+Begin
+  { attributs : plan i -> registre DAC i ; DAC 0..15 = couleurs VGA }
+  B := Port[$3DA];
+  For I := 0 To 15 Do
+  Begin
+    Port[$3C0] := I;
+    Port[$3C0] := I;
+  End;
+  Port[$3C0] := $14;
+  Port[$3C0] := 0;
+  Port[$3C0] := $20;
+  For I := 0 To 15 Do
+  Begin
+    Port[$3C8] := I;
+    Port[$3C9] := ((VgaRGB[I] Shr 16) And 255) Shr 2;
+    Port[$3C9] := ((VgaRGB[I] Shr 8) And 255) Shr 2;
+    Port[$3C9] := (VgaRGB[I] And 255) Shr 2;
+  End;
+  { mode d'ecriture 0, sans Set/Reset ni rotation, tous les bits }
+  Port[$3CE] := 1; Port[$3CF] := 0;
+  Port[$3CE] := 3; Port[$3CF] := 0;
+  Port[$3CE] := 5; Port[$3CF] := 0;
+  Port[$3CE] := 8; Port[$3CF] := $FF;
+  VgaMapChanged := True;
+  VgaTabOk := False;
+End;
+
+{ Couleur VGA la plus proche de l'entree I de la palette systeme }
+Procedure VgaMapSet(I : LongInt);
+Var K, Best, D, BestD, DR, DG, DB : LongInt;
+Begin
+  Best := 0; BestD := $7FFFFFFF;
+  For K := 0 To 15 Do
+  Begin
+    DR := SysPal[I * 3] - ((VgaRGB[K] Shr 16) And 255);
+    DG := SysPal[I * 3 + 1] - ((VgaRGB[K] Shr 8) And 255);
+    DB := SysPal[I * 3 + 2] - (VgaRGB[K] And 255);
+    D := DR * DR + DG * DG + DB * DB;
+    If D < BestD Then
+    Begin
+      BestD := D; Best := K;
+    End;
+  End;
+  If VgaMap[I] <> Best Then
+  Begin
+    VgaMap[I] := Best;
+    VgaMapChanged := True;
+    VgaTabOk := False;
+  End;
+End;
+
+Procedure VgaTabBuild;
+Var K, I, C, Bit, V : LongInt;
+Begin
+  For K := 0 To 7 Do
+  Begin
+    Bit := $80 Shr K;
+    For I := 0 To 255 Do
+    Begin
+      C := VgaMap[I]; V := 0;
+      If (C And 1) <> 0 Then V := V Or Bit;
+      If (C And 2) <> 0 Then V := V Or (Bit Shl 8);
+      If (C And 4) <> 0 Then V := V Or (Bit Shl 16);
+      If (C And 8) <> 0 Then V := V Or (Bit Shl 24);
+      VgaTab[K * 256 + I] := V;
+    End;
+  End;
+  VgaTabOk := True;
+End;
+
+{ Ecrire la ligne Y, octets B0..B1 (pixels B0*8..B1*8+7), depuis Src :
+  pixels 8 bits a partir de B0*8 }
+Procedure VgaWriteRow(Y, B0, B1, Src : LongInt);
+Var B, V, S, A : LongInt;
+Begin
+  If B0 < 0 Then B0 := 0;
+  If B1 > 79 Then B1 := 79;
+  If (B0 > B1) Or (Y < 0) Or (Y >= ScrH) Then Exit;
+  If Not VgaTabOk Then VgaTabBuild;
+  S := Src;
+  For B := B0 To B1 Do
+  Begin
+    V := VgaTab[Mem[0:S]] Or VgaTab[256 + Mem[0:S + 1]] Or
+         VgaTab[512 + Mem[0:S + 2]] Or VgaTab[768 + Mem[0:S + 3]] Or
+         VgaTab[1024 + Mem[0:S + 4]] Or VgaTab[1280 + Mem[0:S + 5]] Or
+         VgaTab[1536 + Mem[0:S + 6]] Or VgaTab[1792 + Mem[0:S + 7]];
+    VgaP0[B] := V And 255; VgaP1[B] := (V Shr 8) And 255;
+    VgaP2[B] := (V Shr 16) And 255; VgaP3[B] := (V Shr 24) And 255;
+    S := S + 8;
+  End;
+  A := Lfb + Y * LfbPitch;
+  Port[$3C4] := 2;
+  Port[$3C5] := 1;
+  For B := B0 To B1 Do Mem[0:A + B] := VgaP0[B];
+  Port[$3C5] := 2;
+  For B := B0 To B1 Do Mem[0:A + B] := VgaP1[B];
+  Port[$3C5] := 4;
+  For B := B0 To B1 Do Mem[0:A + B] := VgaP2[B];
+  Port[$3C5] := 8;
+  For B := B0 To B1 Do Mem[0:A + B] := VgaP3[B];
+  Port[$3C5] := $0F;
+End;
+
 Procedure DacSet(I : LongInt);
 Begin
+  If VgaPlanar Then
+  Begin
+    VgaMapSet(I);
+    Exit;
+  End;
   Port[$3C8] := I;
   Port[$3C9] := SysPal[I * 3] Shr 2;
   Port[$3C9] := SysPal[I * 3 + 1] Shr 2;
@@ -4047,6 +4176,13 @@ Begin
   If R.R > ScrW Then R.R := ScrW;
   If R.B > ScrH Then R.B := ScrH;
   If (R.L >= R.R) Or (R.T >= R.B) Then Exit;
+  If VgaPlanar Then
+  Begin
+    For Y := R.T To R.B - 1 Do
+      VgaWriteRow(Y, R.L Shr 3, (R.R - 1) Shr 3,
+                  Back.Bits + Y * Back.Pitch + (R.L And Not 7));
+    Exit;
+  End;
   N := R.R - R.L;
   S := Back.Bits + R.T * Back.Pitch + R.L;
   D := Lfb + R.T * LfbPitch + R.L;
@@ -4088,10 +4224,50 @@ Begin
        CurY - CurHotY + CurHh);
 End;
 
+{ Pointeur en VGA 16 couleurs : ligne recomposee (fond de Back puis
+  pointeur) dans VgaTmp, puis ecrite dans les 4 plans }
+Procedure CursorDrawVga;
+Var X, Y, PX, PY, V, X0, B0, B1, I : LongInt;
+Begin
+  X0 := CurX - CurHotX;
+  B0 := X0; If B0 < 0 Then B0 := 0;
+  B0 := B0 Shr 3;
+  B1 := X0 + CurW - 1; If B1 > ScrW - 1 Then B1 := ScrW - 1;
+  If B1 < 0 Then Exit;
+  B1 := B1 Shr 3;
+  For Y := 0 To CurHh - 1 Do
+  Begin
+    PY := CurY - CurHotY + Y;
+    If (PY >= 0) And (PY < ScrH) Then
+    Begin
+      For I := 0 To (B1 - B0 + 1) * 8 - 1 Do
+        VgaTmp[I] := Mem[0:Back.Bits + PY * Back.Pitch + B0 * 8 + I];
+      For X := 0 To CurW - 1 Do
+      Begin
+        PX := X0 + X;
+        V := CurMap[Y * 32 + X];
+        If (V <> 0) And (PX >= B0 * 8) And (PX < (B1 + 1) * 8) Then
+        Begin
+          If V = 1 Then VgaTmp[PX - B0 * 8] := cBlack
+          Else If V = 2 Then VgaTmp[PX - B0 * 8] := cWhite
+          Else VgaTmp[PX - B0 * 8] := VgaTmp[PX - B0 * 8] Xor 255;
+        End;
+      End;
+      VgaWriteRow(PY, B0, B1, LongInt(@VgaTmp));
+    End;
+  End;
+  CurShownB := True;
+End;
+
 Procedure CursorDraw;
 Var X, Y, PX, PY, V, A : LongInt;
 Begin
   If CurHide < 0 Then Exit;
+  If VgaPlanar Then
+  Begin
+    CursorDrawVga;
+    Exit;
+  End;
   For Y := 0 To CurHh - 1 Do
   Begin
     PY := CurY - CurHotY + Y;
@@ -4133,12 +4309,27 @@ End;
 Procedure FlushScreen;
 Var R, C, I : TRect; Y : LongInt;
 Begin
+  { VGA 16 couleurs : palette changee, tout l'ecran a reconvertir }
+  If VgaPlanar And VgaMapChanged Then
+  Begin
+    VgaMapChanged := False;
+    If DDShow Then DDDirty := True
+    Else
+    Begin
+      SetR(R, 0, 0, ScrW, ScrH);
+      LfbCopy(R);
+      If CurShownB Then CursorDraw;
+    End;
+  End;
   { DirectDraw en mode exclusif : la surface primaire occupe l'ecran }
   If DDShow Then
   Begin
     If DDDirty Then
       For Y := 0 To Min(DDH, ScrH) - 1 Do
-        MoveMem(DDBuf + Y * DDW, Lfb + Y * LfbPitch, Min(DDW, ScrW));
+        If VgaPlanar Then
+          VgaWriteRow(Y, 0, (Min(DDW, ScrW) - 1) Shr 3, DDBuf + Y * DDW)
+        Else
+          MoveMem(DDBuf + Y * DDW, Lfb + Y * LfbPitch, Min(DDW, ScrW));
     DDDirty := False;
     SetR(Dirty, 0, 0, 0, 0);
     Exit;
@@ -27589,6 +27780,8 @@ BEGIN
   OptFlags := MemL[0:BootInfo + $30];
   Lfb := MemL[0:BootInfo + $0C];
   LfbPitch := MemW[0:BootInfo + $10];
+  VgaPlanar := MemW[0:BootInfo + $16] = 4;
+  If VgaPlanar Then VgaInit;
   ThreadInit0;
   KImgLo := $100000;
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
