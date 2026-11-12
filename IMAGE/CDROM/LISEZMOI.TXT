@@ -1,16 +1,37 @@
 PASDOWS 95 - LISEZ-MOI
 ======================
 
-Pasdows 95 est un clone de Windows 95 ecrit en Pascal. Tout le
-systeme tient dans un seul fichier, IO.SYS, compile par WPC
-(Windows 95 Pascal Compiler) a partir de KERNEL\IO.PAS. IO.SYS est
-amorcable directement depuis ce CD-ROM (El Torito, sans emulation).
+Pasdows 95 est un clone de Windows 95 ecrit en Pascal et compile par
+WPC (Windows 95 Pascal Compiler). Il se compose de deux fichiers :
+
+  IO.SYS      Amorce et systeme 16 bits (KERNEL\IO.PAS) : demarrage
+              depuis ce CD-ROM (El Torito), menu F8, MSDOS.SYS,
+              AUTOEXEC.BAT, mode MS-DOS et interface 16 couleurs du
+              mode sans echec.
+  VMM32.VXD   Noyau 32 bits (KERNEL\VMM32.PAS) charge par IO.SYS :
+              mode protege, interface 256 couleurs (VESA 640x480),
+              taches preemptives et chargeur de programmes Windows 95
+              (PE Win32) avec KERNEL32, USER32, GDI32, WINMM, ADVAPI32,
+              SHELL32, COMDLG32, OLE32...
+
+PROGRAMMES WINDOWS 95
+---------------------
+  Pasdows execute de vrais programmes Windows 95 32 bits : copiez le
+  fichier .EXE (et ses fichiers de donnees) dans IMAGE\CDROM, puis
+  reconstruisez le CD-ROM avec KERNEL\BUILD.BAT ou KERNEL/BUILD.sh.
+  L'icone du programme apparait sur le bureau ; double-cliquez-la
+  (ou Demarrer, Executer). Exemple fourni : HELLO.EXE, compile par
+  WPC -CW32 a partir de EXEMPLES\HELLO.PAS. Un projecteur Macromedia
+  Director 5 avec son film (.DIR) a ete essaye avec succes.
+
+  Le son est emule par une carte son muette : les programmes
+  synchronises sur le son avancent normalement, sans l'entendre.
 
 DEMARRAGE
 ---------
   F8        Menu de demarrage (Normal, Mode sans echec, Invite de
             commandes seulement, Redemarrer).
-  F5        Mode sans echec.
+  F5        Mode sans echec (interface 16 couleurs d'IO.SYS).
   Maj+F5    Invite de commandes seulement (tapez WIN pour lancer
             l'interface graphique).
 
@@ -25,17 +46,12 @@ UTILISATION
   Alt+Tab                     Passer a une autre fenetre.
   F1                          Aide de Pasdows.
 
-PROGRAMMES
-----------
-  Poste de travail, Explorateur, Bloc-notes (F5 = heure et date),
-  Calculatrice, Paint, Invite MS-DOS, Panneau de configuration
-  (Affichage, Date/Heure, Parametres regionaux, Systeme),
-  Corbeille, Aide, Executer et Arreter Pasdows (arret, redemarrage
-  ou mode MS-DOS).
-
-  Commandes de l'Invite MS-DOS : CLS, DATE, DIR [/W], ECHO, EXIT,
-  HELP, MEM, SET, TIME, TYPE, VER, VOL, WIN ainsi que CALC, CONTROL,
-  EXPLORER, NOTEPAD, PAINT et WINVER.
+PROGRAMMES INTEGRES
+-------------------
+  Poste de travail, Explorateur, Bloc-notes, Calculatrice, Paint,
+  Invite MS-DOS, Panneau de configuration (Affichage, Date/Heure,
+  Parametres regionaux, Systeme), Corbeille, Aide, Executer et
+  Arreter Pasdows (arret, redemarrage ou mode MS-DOS).
 
 LANGUE
 ------
@@ -43,15 +59,18 @@ LANGUE
   LANGUAGE choisit une autre langue : LANGUAGE=EN (anglais),
   LANGUAGE=GR (allemand), LANGUAGE=IT (italien), LANGUAGE=SP
   (espagnol). Elle se fixe dans AUTOEXEC.BAT, avec SET dans l'Invite
-  MS-DOS ou dans Parametres regionaux ; le changement est immediat.
+  MS-DOS ou dans Parametres regionaux.
 
-  The default language is French. Type SET LANGUAGE=EN in the MS-DOS
-  Prompt (or use Regional Settings) to switch Pasdows to English.
+  The default language is French. Put SET LANGUAGE=EN in AUTOEXEC.BAT
+  (or use Regional Settings) to switch Pasdows to English.
 
 MATERIEL
 --------
-  Processeur 8086 ou superieur, carte VGA, clavier et souris PS/2,
-  lecteur de CD-ROM amorcable (BIOS avec INT 13h etendue).
-  Essai : qemu-system-i386 -m 32 -cdrom PASDOWS.ISO -boot d
+  VMM32 : processeur 80386 ou superieur, 16 Mo de memoire au moins
+  (64 Mo conseilles pour les gros programmes), carte VESA 2.0 avec
+  tampon lineaire (640x480, 256 couleurs), clavier et souris PS/2,
+  lecteur de CD-ROM ATAPI. Sans VMM32.VXD, avec moins de 16 Mo ou
+  sans VESA, IO.SYS demarre son interface 16 couleurs (8086 et VGA).
+  Essai : qemu-system-i386 -m 64 -cdrom PASDOWS.ISO -boot d
 
 https://www.gladir.com/pasdows95
