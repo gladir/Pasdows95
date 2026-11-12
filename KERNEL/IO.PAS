@@ -862,13 +862,11 @@ Begin
                           'VMM32.VXD kann nicht geladen werden',
                           'impossibile caricare VMM32.VXD',
                           'no se puede cargar VMM32.VXD');
-    5 : Vmm32WhyText := L('carte vid'#130'o VESA requise (mode 101h, ' +
-                          'm'#130'moire lin'#130'aire)',
-                          'VESA video card required (mode 101h, ' +
-                          'linear frame buffer)',
-                          'VESA-Grafikkarte erforderlich (Modus 101h)',
-                          'scheda video VESA richiesta (modo 101h)',
-                          'se requiere una tarjeta VESA (modo 101h)');
+    5 : Vmm32WhyText := L('carte vid'#130'o VGA ou VESA requise',
+                          'VGA or VESA video card required',
+                          'VGA- oder VESA-Grafikkarte erforderlich',
+                          'scheda video VGA o VESA richiesta',
+                          'se requiere una tarjeta VGA o VESA');
   Else
     Vmm32WhyText := L('mode sans '#130'chec', 'safe mode',
                       'abgesicherter Modus', 'modalit'#133' provvisoria',
@@ -6766,6 +6764,32 @@ Begin
   VbeSetup := True;
 End;
 
+{ Sans VESA : VGA 640x480 16 couleurs (mode 12h, 4 plans en A0000h),
+  comme le pilote VGA standard de Windows 95. VMM32 convertit son ecran
+  256 couleurs (profondeur 4 annoncee en +16h). }
+Function VgaSetup : Boolean;
+Var R : Byte;
+Begin
+  VgaSetup := False;
+  asm
+    mov ax,1A00h
+    int 10h
+    mov R,al
+  end;
+  If R <> $1A Then Exit;
+  asm
+    mov ax,0012h
+    int 10h
+  end;
+  If Mem[$40:$49] <> $12 Then Exit;
+  PutInfoD($0C, $A0000);
+  MemW[0:VInfo + $10] := 80;
+  MemW[0:VInfo + $12] := 640;
+  MemW[0:VInfo + $14] := 480;
+  MemW[0:VInfo + $16] := 4;
+  VgaSetup := True;
+End;
+
 { Police 8x16 du BIOS recopiee en 0000:2000 }
 Procedure CopyFont;
 Var FSg, FOf, I : Word;
@@ -6939,10 +6963,11 @@ Begin
   PutInfoD($30, Flags);
   Vmm32Why := 5;
   If Not VbeSetup Then
-  Begin
-    TextMode;
-    Exit;
-  End;
+    If Not VgaSetup Then
+    Begin
+      TextMode;
+      Exit;
+    End;
   BuildGdt;
   asm
     cli
