@@ -23,6 +23,10 @@ Program IO;
   controleur clavier 8042, souris PS/2, haut-parleur).
 
     - ecran de demarrage texte, menu de demarrage (F8) ;
+    - demarrage depuis le disque dur quand Pasdows y a ete installe
+      par INSTALL (secteur d'amorce FAT32 qui charge C:\IO.SYS) :
+      lecture de la FAT32 (racine et C:\WINDOWS), VMM32 recoit le
+      drapeau 4 (dossier systeme C:\WINDOWS) ;
     - lecture du CD-ROM ISO 9660 (INT 13h etendue), des options de
       MSDOS.SYS ([Options] BootMenu, BootGUI, Logo, BootDelay) et
       execution des commandes SET de AUTOEXEC.BAT (variables
@@ -45,6 +49,7 @@ Program IO;
     60000h-64FFFh  toile de Paint (256x160, 4 bits par pixel)
     70000h-7FFFFh  texte du Bloc-notes
     80000h-807FFh  tampon d'un secteur du CD-ROM
+    80800h-80BFFh  secteur de FAT et secteur de repertoire (disque dur)
     81000h-887FFh  lecture des fichiers (30 Ko)                     }
 
 {$S-,R-,I-}
@@ -57,6 +62,8 @@ Const
   NoteSeg   = $7000;
   CdSeg     = $8000;
   TmpSeg    = $8100;
+  FatSeg    = $8080;
+  DirSeg    = $80A0;
   NoteMax   = 60000;
   TmpMax    = 30720;
   Version   = '4.00.950';
@@ -235,6 +242,14 @@ Var
   CdFiles     : Array[0..CdMax - 1] Of TCdFile;
   CdCount     : Integer;
   CdOk        : Boolean;
+  { Disque dur FAT32 (Pasdows installe par INSTALL) : premiers secteurs
+    de la FAT et des donnees, grappe de la racine, secteurs par grappe,
+    secteur de FAT en cache et position dans la chaine du fichier lu }
+  HdBoot      : Boolean;
+  FatLba, DataLba, RootClus, FatCached : LongInt;
+  SecPerClus  : Integer;
+  ChIdx       : Integer;
+  ChClus, ChNum : LongInt;
   { Horloge }
   LastMin     : Integer;
   LastSec     : Integer;
@@ -769,6 +784,195 @@ Begin
   End;
 End;
 
+
+{ ================================================================== }
+{ Disque dur FAT32 (demarrage de Pasdows installe par INSTALL)       }
+{ ================================================================== }
+
+{ Lire N secteurs de 512 octets du disque d'amorcage en Seg:0000 }
+Function HdRead(Lba : LongInt; BSeg : Word; N : Integer) : Boolean;
+Var Drv, Err, Tries : Byte;
+Begin
+  Tries := 0;
+  Repeat
+    Dap.Size := 16; Dap.Res := 0; Dap.Count := N;
+    Dap.BufOfs := 0; Dap.BufSg := BSeg;
+    Dap.LbaLo := Lba; Dap.LbaHi := 0;
+    Drv := BootDrive;
+    asm
+      push si
+      mov ah,42h
+      mov dl,Drv
+      lea si,Dap
+      int 13h
+      mov al,0
+      adc al,0
+      mov Err,al
+      pop si
+    end;
+    If Err = 0 Then
+    Begin
+      HdRead := True;
+      Exit;
+    End;
+    asm
+      xor ah,ah
+      mov dl,Drv
+      int 13h
+    end;
+    Inc(Tries);
+  Until Tries >= 3;
+  HdRead := False;
+End;
+
+Function ClusLba(C : LongInt) : LongInt;
+Begin
+  ClusLba := DataLba + (C - 2) * SecPerClus;
+End;
+
+{ Grappe suivante de C (FFFFFFFh en fin de chaine ou en cas d'erreur) }
+Function FatNext(C : LongInt) : LongInt;
+Var Sec : LongInt; Ofs : Word;
+Begin
+  FatNext := $0FFFFFFF;
+  Sec := FatLba + (C Shr 7);
+  Ofs := (C And 127) * 4;
+  If Sec <> FatCached Then
+  Begin
+    If Not HdRead(Sec, FatSeg, 1) Then Exit;
+    FatCached := Sec;
+  End;
+  FatNext := GetD(FatSeg, Ofs) And $0FFFFFFF;
+End;
+
+{ Ajouter les entrees du repertoire commencant a la grappe C ; retourne
+  la grappe du sous-repertoire Sub (0 si absent) }
+Function FatDir(C : LongInt; Const Sub : String) : LongInt;
+Var I, K, Ofs : Integer; Sec : LongInt; Nm, Ext : String; A : Byte;
+    Hops : Integer;
+Begin
+  FatDir := 0;
+  Hops := 0;
+  While (C >= 2) And (C < $0FFFFFF8) And (Hops < 4096) Do
+  Begin
+    For I := 0 To SecPerClus - 1 Do
+    Begin
+      Sec := ClusLba(C) + I;
+      If Not HdRead(Sec, DirSeg, 1) Then Exit;
+      For K := 0 To 15 Do
+      Begin
+        Ofs := K * 32;
+        If Mem[DirSeg:Ofs] = 0 Then Exit;
+        A := Mem[DirSeg:Ofs + 11];
+        If (Mem[DirSeg:Ofs] <> $E5) And (A <> $0F) And
+           (Mem[DirSeg:Ofs] <> Ord('.')) Then
+        Begin
+          Nm := ''; Ext := '';
+          For Ofs := K * 32 To K * 32 + 7 Do
+            If Mem[DirSeg:Ofs] <> 32 Then Nm := Nm + Chr(Mem[DirSeg:Ofs]);
+          For Ofs := K * 32 + 8 To K * 32 + 10 Do
+            If Mem[DirSeg:Ofs] <> 32 Then Ext := Ext + Chr(Mem[DirSeg:Ofs]);
+          Ofs := K * 32;
+          If (A And 8) <> 0 Then
+          Begin
+            If VolLabel = '' Then VolLabel := Trim(Nm + Ext);
+          End
+          Else
+          Begin
+            If Ext <> '' Then Nm := Nm + '.' + Ext;
+            If ((A And $10) <> 0) And (Nm = Sub) Then
+              FatDir := LongInt(MemW[DirSeg:Ofs + 26]) +
+                        LongInt(MemW[DirSeg:Ofs + 20]) * 65536;
+            If CdCount < CdMax Then
+            Begin
+              CdFiles[CdCount].Name := Copy(Nm, 1, 12);
+              CdFiles[CdCount].Lba := LongInt(MemW[DirSeg:Ofs + 26]) +
+                                      LongInt(MemW[DirSeg:Ofs + 20]) * 65536;
+              CdFiles[CdCount].Size := GetD(DirSeg, Ofs + 28);
+              CdFiles[CdCount].Dir := (A And $10) <> 0;
+              CdFiles[CdCount].Yr := 80 + (MemW[DirSeg:Ofs + 24] Shr 9);
+              CdFiles[CdCount].Mo := (MemW[DirSeg:Ofs + 24] Shr 5) And 15;
+              CdFiles[CdCount].Dy := MemW[DirSeg:Ofs + 24] And 31;
+              CdFiles[CdCount].Hr := MemW[DirSeg:Ofs + 22] Shr 11;
+              CdFiles[CdCount].Mi := (MemW[DirSeg:Ofs + 22] Shr 5) And 63;
+              Inc(CdCount);
+            End;
+          End;
+        End;
+      End;
+    End;
+    C := FatNext(C);
+    Inc(Hops);
+  End;
+End;
+
+{ Volume FAT32 du disque d'amorcage : la partition active (ou la
+  premiere partition FAT32) ; liste la racine puis C:\WINDOWS }
+Procedure FatScan;
+Var I, Ofs : Integer; Start : LongInt; T : Byte; W : LongInt;
+Begin
+  HdBoot := False;
+  If BootDrive < $80 Then Exit;
+  If Not HdRead(0, CdSeg, 1) Then Exit;
+  If MemW[CdSeg:510] <> $AA55 Then Exit;
+  Start := -1;
+  For I := 0 To 3 Do
+  Begin
+    Ofs := 446 + I * 16;
+    T := Mem[CdSeg:Ofs + 4];
+    If ((T = $0B) Or (T = $0C)) And
+       ((Start < 0) Or (Mem[CdSeg:Ofs] = $80)) Then
+      Start := GetD(CdSeg, Ofs + 8);
+  End;
+  If Start < 0 Then Exit;
+  If Not HdRead(Start, CdSeg, 1) Then Exit;
+  If (MemW[CdSeg:11] <> 512) Or (Mem[CdSeg:13] = 0) Or
+     (MemW[CdSeg:22] <> 0) Then Exit;
+  SecPerClus := Mem[CdSeg:13];
+  FatLba := Start + MemW[CdSeg:14];
+  DataLba := FatLba + LongInt(Mem[CdSeg:16]) * GetD(CdSeg, 36);
+  RootClus := GetD(CdSeg, 44);
+  FatCached := -1; ChIdx := -1;
+  CdCount := 0; VolLabel := '';
+  W := FatDir(RootClus, 'WINDOWS');
+  If W >= 2 Then FatDir(W, '');
+  If VolLabel = '' Then
+    For I := 0 To 10 Do VolLabel := VolLabel + Chr(Mem[CdSeg:71 + I]);
+  VolLabel := Trim(VolLabel);
+  HdBoot := True;
+  RootLba := 0; RootSize := 0;
+End;
+
+{ Lire le bloc K (2 Ko) du fichier Idx en Seg:0000 }
+Function FileRead(Idx : Integer; K : LongInt; BSeg : Word) : Boolean;
+Var J : Integer; S, Ci : LongInt;
+Begin
+  If Not HdBoot Then
+  Begin
+    FileRead := CdRead(CdFiles[Idx].Lba + K, BSeg);
+    Exit;
+  End;
+  FileRead := False;
+  For J := 0 To 3 Do
+  Begin
+    S := K * 4 + J;
+    Ci := S Div SecPerClus;
+    If (ChIdx <> Idx) Or (Ci < ChNum) Then
+    Begin
+      ChIdx := Idx; ChClus := CdFiles[Idx].Lba; ChNum := 0;
+    End;
+    While (ChNum < Ci) And (ChClus >= 2) And (ChClus < $0FFFFFF8) Do
+    Begin
+      ChClus := FatNext(ChClus);
+      Inc(ChNum);
+    End;
+    If (ChClus >= 2) And (ChClus < $0FFFFFF8) Then
+      If Not HdRead(ClusLba(ChClus) + S Mod SecPerClus, BSeg + J * 32, 1)
+      Then Exit;
+  End;
+  FileRead := True;
+End;
+
 Function CdFind(Name : String) : Integer;
 Var I : Integer;
 Begin
@@ -795,7 +999,7 @@ Begin
   Sector := 0;
   While Sector < NSect Do
   Begin
-    If Not CdRead(CdFiles[Idx].Lba + Sector, Seg + Word(Sector) * 128) Then
+    If Not FileRead(Idx, Sector, Seg + Word(Sector) * 128) Then
     Begin
       CdLoad := Word(Sector * 2048);
       Exit;
@@ -1940,7 +2144,8 @@ End;
 
 Function DriveLabel : String;
 Begin
-  If VolLabel = '' Then DriveLabel := 'CD-ROM (D:)'
+  If HdBoot Then DriveLabel := VolLabel + ' (C:)'
+  Else If VolLabel = '' Then DriveLabel := 'CD-ROM (D:)'
   Else DriveLabel := VolLabel + ' (D:)';
 End;
 
@@ -7080,7 +7285,7 @@ Begin
   Sector := 0;
   While Sector < NSectors Do
   Begin
-    If Not CdRead(CdFiles[Idx].Lba + Sector, CdSeg) Then Exit;
+    If Not FileRead(Idx, Sector, CdSeg) Then Exit;
     If Not ExtCopy(LongInt(CdSeg) * 16, VStaging + Sector * 2048, 2048)
     Then Exit;
     If (Sector And 15) = 0 Then TWrite(Integer(Sector Div 16) Mod 80, 2,
@@ -7171,6 +7376,7 @@ Begin
   PutInfoD($2C, VEnv);
   Flags := 2;
   If OptLogo Then Flags := Flags Or 1;
+  If HdBoot Then Flags := Flags Or 4;          { systeme sur C:\WINDOWS }
   PutInfoD($30, Flags);
   Vmm32Why := 5;
   If Not VbeSetup(Vga) Then
@@ -7240,6 +7446,13 @@ BEGIN
   SetEnv('PROMPT', '$P$G');
   SetEnv('WINDIR', 'D:\');
   CdScan;
+  If Not CdOk Then FatScan;
+  If HdBoot Then
+  Begin
+    SetEnv('PATH', 'C:\WINDOWS;C:\');
+    SetEnv('COMSPEC', 'C:\COMMAND.EXE');
+    SetEnv('WINDIR', 'C:\WINDOWS');
+  End;
   ReadMsdosSys;
   ReadAutoexec;
   ApplyLanguage;

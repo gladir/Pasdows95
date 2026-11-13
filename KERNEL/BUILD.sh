@@ -12,11 +12,15 @@
 #  4. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec tous
 #     les fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
 #     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) ;
-#  5. recopie IO.SYS, VMM32.VXD et les exemples dans IMAGE/CDROM.
+#  5. recopie IO.SYS, VMM32.VXD et les exemples dans IMAGE/CDROM ;
+#  6. compile le programme d'installation (WPC -CW95IO SETUP/INSTALL.PAS
+#     INSTALL.SYS) et fabrique le CD-ROM d'installation IMAGE/INSTALL.ISO
+#     (amorce INSTALL.SYS, memes fichiers que PASDOWS.ISO).
 #
 # Variables : FPC (compilateur Free Pascal, defaut fpc), W (dossier de
 # travail, defaut BUILD a la racine du depot).
 # Test : qemu-system-i386 -m 64 -cdrom IMAGE/PASDOWS.ISO -boot d
+#        qemu-system-i386 -m 64 -cdrom IMAGE/INSTALL.ISO -hda disque.img -boot d
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
@@ -49,3 +53,11 @@ echo "== CD-ROM amorcable"
 "$W/makeiso" "$ROOT/IMAGE/PASDOWS.ISO" /BOOT:"$W/cd/IO.SYS" /LABEL:PASDOWS95 "$W/cd/*"
 cp "$W/cd/IO.SYS" "$W/cd/VMM32.VXD" "$ROOT/IMAGE/CDROM/"
 echo "Termine : $ROOT/IMAGE/PASDOWS.ISO"
+
+echo "== Programme d'installation (WPC -CW95IO) et CD-ROM d'installation"
+mkdir -p "$W/cdi"
+rm -f "$W"/cdi/*
+cp "$W"/cd/* "$W/cdi/"
+"$W/wpc" -CW95IO "$ROOT/SETUP/INSTALL.PAS" "$W/cdi/INSTALL.SYS"
+"$W/makeiso" "$ROOT/IMAGE/INSTALL.ISO" /BOOT:"$W/cdi/INSTALL.SYS" /LABEL:PASDOWS95 "$W/cdi/*"
+echo "Termine : $ROOT/IMAGE/INSTALL.ISO"
