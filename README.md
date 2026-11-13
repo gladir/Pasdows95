@@ -23,6 +23,7 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>WIN64/MAKEISO.EXE</b></td><td>MAKEISO compilé pour Windows 64 bits.</td></tr>
 	<tr><td><b>IMAGE/PASDOWS.ISO</b></td><td>Image du CD-ROM amorçable de Pasdows 95.</td></tr>
 	<tr><td><b>IMAGE/CDROM</b></td><td>Contenu du CD-ROM : IO.SYS, VMM32.VXD, HELLO.EXE, MSDOS.SYS, CONFIG.SYS, AUTOEXEC.BAT et LISEZMOI.TXT. Tout programme Windows 95 déposé ici est mis sur le CD-ROM par BUILD.</td></tr>
+	<tr><td><b>IMAGE/SCREENSHOTS</b></td><td>Captures d'écran de Pasdows 95 (QEMU, 640x480 en 256 couleurs) reprises dans ce document.</td></tr>
 </table>
 
 <h2>Fonctionnalités</h2>
@@ -46,6 +47,16 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<li>Arrêter Pasdows : arrêt de l'ordinateur (APM), redémarrage ou redémarrage en mode MS-DOS (texte 80x25, <b>EXIT</b> ou <b>WIN</b> pour revenir).</li>
 	<li>Raccourcis : Ctrl+Échap (menu Démarrer), Alt+F4, Alt+Tab, F1, double-clic.</li>
 </ul>
+
+<h2>Captures d'écran</h2>
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_DEMARRER.png" width="320" alt="Menu Démarrer, sous-menu Paramètres"><br><i>Menu Démarrer, sous-menu Paramètres</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/BLOC_NOTES.png" width="320" alt="Bloc-notes et son menu Fichier"><br><i>Bloc-notes et son menu Fichier</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/ENREGISTRER_SOUS.png" width="320" alt="Boîte Enregistrer sous (disque dur C:)"><br><i>Boîte Enregistrer sous (disque dur C:)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/GESTIONNAIRE_PERIPHERIQUES.png" width="320" alt="Gestionnaire de périphériques"><br><i>Gestionnaire de périphériques</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PROPRIETES_PERIPHERIQUE.png" width="320" alt="Propriétés de la Sound Blaster 16 (ressources)"><br><i>Propriétés de la Sound Blaster 16 (ressources)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CONTROLE_VOLUME.png" width="320" alt="Contrôle du volume (mixeur de la carte son)"><br><i>Contrôle du volume (mixeur de la carte son)</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_VOLUME.png" width="320" alt="Menu contextuel de l'icône de volume"><br><i>Menu contextuel de l'icône de volume</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/DATE_HEURE.png" width="320" alt="Propriétés de Date/Heure (clic sur l'horloge)"><br><i>Propriétés de Date/Heure (clic sur l'horloge)</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/AFFICHAGE.png" width="320" alt="Propriétés d'affichage (modes VESA)"><br><i>Propriétés d'affichage (modes VESA)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/INVITE_MSDOS.png" width="320" alt="Invite MS-DOS (COMMAND.EXE)"><br><i>Invite MS-DOS (COMMAND.EXE)</i></td></tr>
+</table>
 
 <h2>Langue</h2>
 
