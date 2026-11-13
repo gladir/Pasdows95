@@ -848,11 +848,43 @@ Begin
   RtcSec := Bcd(CmosRead($00));
   RtcMin := Bcd(CmosRead($02));
   RtcHour := Bcd(CmosRead($04) And $7F);
+  { horloge en mode 12 heures (registre B, bit 1 a 0) : bit 7 = PM }
+  If (CmosRead($0B) And 2) = 0 Then
+  Begin
+    If RtcHour = 12 Then RtcHour := 0;
+    If (CmosRead($04) And $80) <> 0 Then RtcHour := RtcHour + 12;
+  End;
   RtcDay := Bcd(CmosRead($07));
   RtcMonth := Bcd(CmosRead($08));
   RtcYear := Bcd(CmosRead($09)) + 2000;
   If (RtcMonth < 1) Or (RtcMonth > 12) Then RtcMonth := 1;
   If (RtcDay < 1) Or (RtcDay > 31) Then RtcDay := 1;
+End;
+
+{ Valeur V au format de l'horloge (BCD ou binaire selon le registre B) }
+Function RtcEnc(V, B : LongInt) : LongInt;
+Begin
+  If (B And 4) <> 0 Then RtcEnc := V
+  Else RtcEnc := ((V Div 10) Shl 4) Or (V Mod 10);
+End;
+
+{ Ecrire la date et l'heure dans l'horloge temps reel (CMOS), bit SET
+  du registre B pendant la mise a jour ; mode 12 ou 24 heures respecte }
+Procedure WriteRtc(Y, M, D, H, Mi, S : LongInt);
+Var B : LongInt;
+Begin
+  B := CmosRead($0B);
+  CmosWrite($0B, B Or $80);
+  CmosWrite($00, RtcEnc(S, B)); CmosWrite($02, RtcEnc(Mi, B));
+  If (B And 2) <> 0 Then CmosWrite($04, RtcEnc(H, B))
+  Else If H = 0 Then CmosWrite($04, RtcEnc(12, B))
+  Else If H < 12 Then CmosWrite($04, RtcEnc(H, B))
+  Else If H = 12 Then CmosWrite($04, RtcEnc(12, B) Or $80)
+  Else CmosWrite($04, RtcEnc(H - 12, B) Or $80);
+  CmosWrite($07, RtcEnc(D, B)); CmosWrite($08, RtcEnc(M, B));
+  CmosWrite($09, RtcEnc(Y Mod 100, B));
+  CmosWrite($32, RtcEnc(Y Div 100, B));
+  CmosWrite($0B, B And $7F);
 End;
 
 Function DayOfWeek(Y, M, D : LongInt) : LongInt;
@@ -5117,7 +5149,7 @@ Const
   { sortes internes de fenetres }
   ikNone = 0; ikTaskbar = 1; ikMenu = 2; ikExplorer = 3; ikMsgBox = 4;
   ikAbout = 5; ikRun = 6; ikShutdown = 7; ikHelp = 8; ikWelcome = 9;
-  ikNotepad = 10; ikConsole = 11; ikDisplay = 12;
+  ikNotepad = 10; ikConsole = 11; ikDisplay = 12; ikDateTime = 13;
   ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
   ikMdiClient = 27;
@@ -6512,13 +6544,49 @@ Const
   cmRun = 5; cmAbout = 6; cmShutdown = 7; cmReadme = 8; cmRecycle = 9;
   cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
   cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
-  cmIconOpen = 18;
+  cmIconOpen = 18; cmDateTime = 19;
   cmGray = 99;                       { element de menu grise }
   cmDocBase = 100; cmExeBase = 200;
   cmColorBase = 400;                 { + bits par point (Affichage) }
+  cmMonthBase = 500;                 { + mois 1..12 (Date/Heure) }
+  cmTzBase = 520;                    { + fuseau horaire (Date/Heure) }
   { menus contextuels : bureau, Reorganiser les icones, palette de
     couleurs (Affichage), icone du bureau }
   mnDesk = 5; mnArrange = 6; mnColors = 7; mnIcon = 8;
+  mnMonths = 9; mnTz = 10;
+  TzCount = 18;
+  { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
+  TzOfs : Array[0..TzCount - 1] Of LongInt = (
+    -600, -540, -480, -420, -360, -300, -240, -210, -180, -60, 0, 60,
+    120, 180, 330, 480, 540, 600);
+  { carte du monde (Fuseau horaire) : 60 colonnes de 6 degres de
+    longitude, de 180 O a 180 E ; 18 lignes de 80 N a 60 S }
+  WorldMap : Array[0..17] Of String[60] = (
+    '            #####    ######                 #######         ',
+    '  ###  ############# ######    #### ####################### ',
+    ' ###################  ####    ##############################',
+    '   #### #############       ## ############################ ',
+    '         ############        #############################  ',
+    '         ##########          ######################## #     ',
+    '          ########         ######################### #      ',
+    '           #####           ################## #####         ',
+    '              ###          ############  #### ####          ',
+    '               ########     ##########    ##   ##           ',
+    '                ########       #######        #######       ',
+    '                #########       ######           ######     ',
+    '                 #######        ######          ########    ',
+    '                  #####         #####          #########    ',
+    '                   ###           ###           #########    ',
+    '                   ##                             #####   # ',
+    '                  ##                                      # ',
+    '                  ##                                        ');
+  { sinus x 1000 des 60 positions du cadran (6 degres) }
+  ClkSin : Array[0..59] Of LongInt = (
+    0, 105, 208, 309, 407, 500, 588, 669, 743, 809, 866, 914, 951, 978,
+    995, 1000, 995, 978, 951, 914, 866, 809, 743, 669, 588, 500, 407,
+    309, 208, 105, 0, -105, -208, -309, -407, -500, -588, -669, -743,
+    -809, -866, -914, -951, -978, -995, -1000, -995, -978, -951, -914,
+    -866, -809, -743, -669, -588, -500, -407, -309, -208, -105);
   MaxDesk = 12;
 
 Var
@@ -6530,6 +6598,15 @@ Var
   ResN      : LongInt;
   ResW, ResH : Array[0..MaxVm - 1] Of LongInt;
   RebootAskW : LongInt;
+  { Proprietes de Date/Heure : boite, onglet, date et heure choisies,
+    modifiees a la main ou non, fuseau horaire, heure d'ete, bouton
+    pressee (compteurs) }
+  DtW, DtTab, DtY, DtM, DtD, DtH, DtMi, DtS, DtPress : LongInt;
+  DtTimeSet, DtDateSet : Boolean;
+  DtTz, DtSec : LongInt;
+  DtDst : Boolean;
+  TzCur : LongInt;                         { fuseau horaire du systeme }
+  TzDst : Boolean;
   DispiOk   : Boolean;                     { interface Bochs/QEMU (1CEh) }
   KClass    : Array[0..31] Of LongInt;     { classe interne par sorte }
   TaskbarW  : LongInt;
@@ -6868,6 +6945,12 @@ Begin
     Exit;
   End;
   CloseMenus(0);
+  If InRect(X, Y, TrayX, TaskY + 4, ScrW - 4, TaskY + 25) Then
+  Begin
+    { horloge : Proprietes de Date/Heure }
+    KCommand(cmDateTime);
+    Exit;
+  End;
   N := TaskCount;
   For I := 0 To N - 1 Do
   Begin
@@ -6926,6 +7009,82 @@ Begin
   Else
     DepthName := 'True Color (32 bits)';
   End;
+End;
+
+{ Nom du mois M (1..12) }
+Function MonthName(M : LongInt) : String;
+Begin
+  Case M Of
+    1 : MonthName := L('Janvier', 'January', 'Januar', 'Gennaio', 'Enero');
+    2 : MonthName := L('F'#130'vrier', 'February', 'Februar', 'Febbraio',
+                       'Febrero');
+    3 : MonthName := L('Mars', 'March', 'M'#132'rz', 'Marzo', 'Marzo');
+    4 : MonthName := L('Avril', 'April', 'April', 'Aprile', 'Abril');
+    5 : MonthName := L('Mai', 'May', 'Mai', 'Maggio', 'Mayo');
+    6 : MonthName := L('Juin', 'June', 'Juni', 'Giugno', 'Junio');
+    7 : MonthName := L('Juillet', 'July', 'Juli', 'Luglio', 'Julio');
+    8 : MonthName := L('Ao'#150't', 'August', 'August', 'Agosto', 'Agosto');
+    9 : MonthName := L('Septembre', 'September', 'September', 'Settembre',
+                       'Septiembre');
+    10 : MonthName := L('Octobre', 'October', 'Oktober', 'Ottobre',
+                        'Octubre');
+    11 : MonthName := L('Novembre', 'November', 'November', 'Novembre',
+                        'Noviembre');
+  Else
+    MonthName := L('D'#130'cembre', 'December', 'Dezember', 'Dicembre',
+                   'Diciembre');
+  End;
+End;
+
+{ Nom du fuseau horaire I, comme Windows 95 : (GMT+hh:mm) villes }
+Function TzName(I : LongInt) : String;
+Var O, A : LongInt; S : String;
+Begin
+  O := TzOfs[I];
+  If O < 0 Then S := '(GMT-' Else S := '(GMT+';
+  A := Abs(O);
+  S := S + Pad2(A Div 60) + ':' + Pad2(A Mod 60) + ') ';
+  Case I Of
+    0 : S := S + L('Hawa'#139, 'Hawaii', 'Hawaii', 'Hawaii', 'Hawai');
+    1 : S := S + 'Alaska';
+    2 : S := S + L('Pacifique (EU et Canada)', 'Pacific (US & Canada)',
+                   'Pazifik (USA, Kanada)', 'Pacifico (USA e Canada)',
+                   'Pac'#161'fico (EE.UU. y Canad'#160')');
+    3 : S := S + L('Rocheuses (EU et Canada)', 'Mountain (US & Canada)',
+                   'Mountain (USA, Kanada)', 'Montagne (USA e Canada)',
+                   'Monta'#164'a (EE.UU. y Canad'#160')');
+    4 : S := S + L('Centre (EU et Canada)', 'Central (US & Canada)',
+                   'Central (USA, Kanada)', 'Centrale (USA e Canada)',
+                   'Centro (EE.UU. y Canad'#160')');
+    5 : S := S + L('Est (EU et Canada)', 'Eastern (US & Canada)',
+                   'Eastern (USA, Kanada)', 'Orientale (USA e Canada)',
+                   'Este (EE.UU. y Canad'#160')');
+    6 : S := S + L('Atlantique (Canada)', 'Atlantic (Canada)',
+                   'Atlantik (Kanada)', 'Atlantico (Canada)',
+                   'Atl'#160'ntico (Canad'#160')');
+    7 : S := S + L('Terre-Neuve', 'Newfoundland', 'Neufundland',
+                   'Terranova', 'Terranova');
+    8 : S := S + 'Brasilia, Buenos Aires';
+    9 : S := S + L('A'#135'ores', 'Azores', 'Azoren', 'Azzorre', 'Azores');
+    10 : S := S + L('Greenwich : Londres, Lisbonne',
+                    'Greenwich: London, Lisbon', 'London, Lissabon',
+                    'Londra, Lisbona', 'Londres, Lisboa');
+    11 : S := S + L('Paris, Madrid, Rome, Berlin',
+                    'Paris, Madrid, Rome, Berlin', 'Berlin, Paris, Rom',
+                    'Roma, Parigi, Berlino', 'Madrid, Par'#161's, Roma');
+    12 : S := S + L('Ath'#138'nes, Le Caire', 'Athens, Cairo',
+                    'Athen, Kairo', 'Atene, Il Cairo', 'Atenas, El Cairo');
+    13 : S := S + L('Moscou', 'Moscow', 'Moskau', 'Mosca', 'Mosc'#163);
+    14 : S := S + 'Bombay, New Delhi';
+    15 : S := S + L('P'#130'kin, Hong Kong', 'Beijing, Hong Kong',
+                    'Peking, Hongkong', 'Pechino, Hong Kong',
+                    'Pek'#161'n, Hong Kong');
+    16 : S := S + 'Tokyo, Osaka';
+  Else
+    S := S + L('Sydney, Melbourne', 'Sydney, Melbourne', 'Sydney',
+               'Sydney', 'Sidney');
+  End;
+  TzName := S;
 End;
 
 { Profondeurs disponibles : VGA 16 couleurs, puis celles des modes VESA }
@@ -6990,7 +7149,9 @@ Begin
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 4 + ExeCnt;
-    mnSettings : MenuCount := 5;
+    mnSettings : MenuCount := 6;
+    mnMonths : MenuCount := 12;
+    mnTz : MenuCount := TzCount;
     mnDesk : MenuCount := 9;
     mnArrange : MenuCount := 2;
     mnColors : MenuCount := DepN;
@@ -7086,19 +7247,25 @@ Begin
       End
       Else If I = 1 Then
       Begin
+        T := L('Date/Heure...', 'Date/Time...', 'Datum/Uhrzeit...',
+               'Data/ora...', 'Fecha/hora...');
+        Cmd := cmDateTime; Icon := icDisplay;
+      End
+      Else If I = 2 Then
+      Begin
         T := L('R'#130'seau (TCP/IP)...', 'Network (TCP/IP)...',
                'Netzwerk (TCP/IP)...', 'Rete (TCP/IP)...',
                'Red (TCP/IP)...');
         Cmd := cmNetwork; Icon := icComputer;
       End
-      Else If I = 3 Then
+      Else If I = 4 Then
       Begin
         T := L('Mode sans '#130'chec (16 couleurs)', 'Safe mode (16 colors)',
                'Abgesicherter Modus', 'Modalit'#133' provvisoria',
                'Modo a prueba de fallos');
         Cmd := cmSafeMode; Icon := icDisplay;
       End
-      Else If I = 4 Then
+      Else If I = 5 Then
       Begin
         T := L('Mode MS-DOS', 'MS-DOS mode', 'MS-DOS-Modus',
                'Modalit'#133' MS-DOS', 'Modo MS-DOS');
@@ -7154,6 +7321,16 @@ Begin
       Begin
         T := DepthName(DepBpp[I]);
         Cmd := cmColorBase + DepBpp[I];
+      End;
+    mnMonths :
+      Begin
+        T := MonthName(I + 1);
+        Cmd := cmMonthBase + I + 1;
+      End;
+    mnTz :
+      Begin
+        T := TzName(I);
+        Cmd := cmTzBase + I;
       End;
     mnIcon :
       If I = 0 Then
@@ -8691,6 +8868,511 @@ Begin
   End;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Proprietes de Date/Heure (clic sur l'horloge de la barre des taches) }
+{ ------------------------------------------------------------------ }
+{ Comme celle de WINDOWS95-0 et de Windows 95 : onglets Date et heure
+  (mois, annee, calendrier, horloge analogique, heure/minute/seconde)
+  et Fuseau horaire (liste, carte du monde, heure d'ete). OK et
+  Appliquer ecrivent l'horloge temps reel (CMOS) ; le fuseau est garde
+  dans le CMOS (79h : numero + 1, bit 7 = sans heure d'ete). }
+
+Function DaysIn(Y, M : LongInt) : LongInt;
+Begin
+  Case M Of
+    4, 6, 9, 11 : DaysIn := 30;
+    2 : If (Y Mod 4 = 0) And ((Y Mod 100 <> 0) Or (Y Mod 400 = 0)) Then
+          DaysIn := 29 Else DaysIn := 28;
+  Else
+    DaysIn := 31;
+  End;
+End;
+
+{ Fuseau horaire du systeme (CMOS 79h), Est (Canada) par defaut }
+Procedure TzLoad;
+Var V : LongInt;
+Begin
+  V := CmosRead($79);
+  If ((V And $7F) >= 1) And ((V And $7F) <= TzCount) Then
+  Begin
+    TzCur := (V And $7F) - 1;
+    TzDst := (V And $80) = 0;
+  End
+  Else
+  Begin
+    TzCur := 5; TzDst := True;
+  End;
+End;
+
+{ Lire l'heure du systeme dans la boite (sauf ce qui a ete modifie) }
+Procedure DtSync;
+Begin
+  ReadRtc;
+  If Not DtTimeSet Then
+  Begin
+    DtH := RtcHour; DtMi := RtcMin; DtS := RtcSec;
+  End;
+  If Not DtDateSet Then
+  Begin
+    DtY := RtcYear; DtM := RtcMonth; DtD := RtcDay;
+  End;
+End;
+
+Procedure DtOpen;
+Begin
+  If (DtW >= 0) And Wnds[DtW].Used And (Wnds[DtW].IKind = ikDateTime) Then
+  Begin
+    ActivateW(DtW);
+    Exit;
+  End;
+  DtTab := 0; DtPress := -1;
+  DtTimeSet := False; DtDateSet := False;
+  DtTz := TzCur; DtDst := TzDst;
+  DtSync;
+  DtW := KCreate(ikDateTime, L('Propri'#130't'#130's de Date/Heure',
+                 'Date/Time Properties', 'Eigenschaften von Datum/Uhrzeit',
+                 'Propriet'#133' - Data/ora', 'Propiedades de Fecha y hora'),
+                 icDisplay, Max(0, (ScrW - 450) Div 2),
+                 Max(0, (TaskY - 362) Div 2), 450, 362,
+                 WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+  If DtW >= 0 Then ShowW(DtW, True, True);
+End;
+
+{ Compteur heure (0), minute (1) ou seconde (2) : zone du nombre et
+  boutons + (haut) et - (bas), coordonnees ecran }
+Procedure DtSpinRect(W, K : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 244 + K * 62; Y1 := CY1 + 214;
+  X2 := X1 + 40; Y2 := Y1 + 20;
+End;
+
+{ Cellule (Lig, Col) du calendrier }
+Procedure DtCell(W, Lig, Col : LongInt; Var X1, Y1 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 28 + Col * 27; Y1 := CY1 + 116 + Lig * 19;
+End;
+
+{ Aiguille de l'horloge : position P (0..59) du cadran, longueur R,
+  epaisseur E }
+Procedure ClkHand(CX, CY, P, R, E, C : LongInt);
+Var X, Y, K : LongInt;
+Begin
+  X := CX + (R * ClkSin[P Mod 60]) Div 1000;
+  Y := CY - (R * ClkSin[(P + 15) Mod 60]) Div 1000;
+  For K := -E To E Do
+  Begin
+    DLine(CX + K, CY, X, Y, C);
+    DLine(CX, CY + K, X, Y, C);
+  End;
+End;
+
+Procedure PaintClock(CX, CY, R, H, M, S : LongInt);
+Var I, X, Y : LongInt;
+Begin
+  Disc(CX + 2, CY + 2, R, cGray);
+  Disc(CX, CY, R, cWhite);
+  Circ(CX, CY, R, cBlack);
+  For I := 0 To 59 Do
+  Begin
+    X := CX + ((R - 5) * ClkSin[I]) Div 1000;
+    Y := CY - ((R - 5) * ClkSin[(I + 15) Mod 60]) Div 1000;
+    If I Mod 5 = 0 Then Disc(X, Y, 2, cNavy) Else Pix(X, Y, cGray);
+  End;
+  OutTxt(CX - 8, CY - R + 9, '12', cBlack);
+  OutTxt(CX + R - 22, CY - 8, '3', cBlack);
+  OutTxt(CX - 4, CY + R - 27, '6', cBlack);
+  OutTxt(CX - R + 14, CY - 8, '9', cBlack);
+  ClkHand(CX, CY, (H Mod 12) * 5 + M Div 12, (R * 5) Div 10, 1, cBlack);
+  ClkHand(CX, CY, M, (R * 8) Div 10, 0, cBlack);
+  ClkHand(CX, CY, S, (R * 85) Div 100, 0, cRed);
+  Disc(CX, CY, 3, cBlack);
+End;
+
+Procedure PaintSpin(X1, Y1, X2, Y2, V : LongInt; PUp, PDn : Boolean);
+Begin
+  Sunken(X1, Y1, X2, Y2, cWhite);
+  OutTxt(X1 + 8, Y1 + 2, Pad2(V), cBlack);
+  Raised(X2 + 2, Y1, X2 + 13, Y1 + 9, PUp);
+  Arrow(X2 + 4, Y1 + 3, 2, cBlack);
+  Raised(X2 + 2, Y1 + 11, X2 + 13, Y2, PDn);
+  Arrow(X2 + 4, Y1 + 13, 1, cBlack);
+End;
+
+Procedure CheckBox(X, Y : LongInt; Const S : String; On : Boolean);
+Begin
+  Sunken(X, Y + 1, X + 12, Y + 13, cWhite);
+  If On Then
+  Begin
+    DLine(X + 3, Y + 6, X + 5, Y + 9, cBlack);
+    DLine(X + 3, Y + 7, X + 5, Y + 10, cBlack);
+    DLine(X + 5, Y + 9, X + 9, Y + 4, cBlack);
+    DLine(X + 5, Y + 10, X + 9, Y + 5, cBlack);
+  End;
+  OutTxt(X + 18, Y, S, cBlack);
+End;
+
+{ Onglet I : rectangle (coordonnees ecran) }
+Procedure DtTabRect(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  Y1 := CY1 + 4; Y2 := CY1 + 26;
+  If I = 0 Then
+  Begin
+    X1 := CX1 + 6; X2 := CX1 + 128;
+  End
+  Else
+  Begin
+    X1 := CX1 + 130; X2 := CX1 + 252;
+  End;
+End;
+
+Procedure PaintDateTime(W : LongInt);
+Var X1, Y1, X2, Y2, I, J, D, F, N, TX1, TY1, TX2, TY2, BX1, BY1, BX2,
+    BY2, Ocean, Land, OceanH, LandH, Z0, Z1, C, MW : LongInt; T : String;
+    Ch : Char;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  { panneau et onglets }
+  Edge(X1 + 6, Y1 + 26, X2 - 6, Y2 - 40, cWhite, cBlack);
+  Edge(X1 + 7, Y1 + 27, X2 - 7, Y2 - 41, cSilver, cGray);
+  For I := 0 To 1 Do
+  Begin
+    DtTabRect(W, I, TX1, TY1, TX2, TY2);
+    If I = DtTab Then
+    Begin
+      TY1 := TY1 - 2;
+      FBar(TX1, TY1, TX2, TY2 + 1, cSilver);
+    End;
+    HLine(TX1 + 2, TX2 - 2, TY1, cWhite);
+    VLine(TX1, TY1 + 2, TY2, cWhite);
+    Pix(TX1 + 1, TY1 + 1, cWhite);
+    VLine(TX2, TY1 + 2, TY2, cBlack);
+    VLine(TX2 - 1, TY1 + 1, TY2, cGray);
+    If I = 0 Then
+      T := L('Date et heure', 'Date & Time', 'Datum & Uhrzeit',
+             'Data e ora', 'Fecha y hora')
+    Else
+      T := L('Fuseau horaire', 'Time Zone', 'Zeitzone', 'Fuso orario',
+             'Zona horaria');
+    OutCenter(TX1, TX2, TY1 + 4, T, cBlack);
+  End;
+  If DtTab = 0 Then
+  Begin
+    { date : mois, annee, calendrier }
+    GroupBox(X1 + 16, Y1 + 44, X1 + 222, Y1 + 264, 'Date');
+    Sunken(X1 + 26, Y1 + 62, X1 + 136, Y1 + 84, cWhite);
+    OutTxt(X1 + 30, Y1 + 65, MonthName(DtM), cBlack);
+    Raised(X1 + 118, Y1 + 64, X1 + 134, Y1 + 82, False);
+    Arrow(X1 + 123, Y1 + 71, 1, cBlack);
+    PaintSpin(X1 + 144, Y1 + 62, X1 + 196, Y1 + 84, 0, DtPress = 10,
+              DtPress = 11);
+    FBar(X1 + 147, Y1 + 65, X1 + 194, Y1 + 81, cWhite);
+    OutTxt(X1 + 152, Y1 + 65, IntStr(DtY), cBlack);
+    Sunken(X1 + 26, Y1 + 92, X1 + 216, Y1 + 254, cWhite);
+    T := L('DLMMJVS', 'SMTWTFS', 'SMDMDFS', 'DLMMGVS', 'DLMXJVS');
+    For J := 0 To 6 Do
+    Begin
+      DtCell(W, 0, J, TX1, TY1);
+      FBar(TX1 - 2, Y1 + 95, TX1 + 24, Y1 + 112, cGray);
+      OutTxt(TX1 + 8, Y1 + 96, T[J + 1], cWhite);
+    End;
+    F := DayOfWeek(DtY, DtM, 1);
+    N := DaysIn(DtY, DtM);
+    If DtD > N Then DtD := N;
+    For D := 1 To N Do
+    Begin
+      I := (D - 1 + F) Div 7; J := (D - 1 + F) Mod 7;
+      DtCell(W, I, J, TX1, TY1);
+      T := IntStr(D);
+      If D = DtD Then
+      Begin
+        FBar(TX1, TY1, TX1 + 23, TY1 + 17, cNavy);
+        OutCenter(TX1, TX1 + 23, TY1 + 1, T, cWhite);
+      End
+      Else OutCenter(TX1, TX1 + 23, TY1 + 1, T, cBlack);
+    End;
+    { heure : horloge et compteurs }
+    GroupBox(X1 + 232, Y1 + 44, X2 - 16, Y1 + 264,
+             L('Heure', 'Time', 'Uhrzeit', 'Ora', 'Hora'));
+    PaintClock((X1 + 232 + X2 - 16) Div 2, Y1 + 130, 64, DtH, DtMi, DtS);
+    For I := 0 To 2 Do
+    Begin
+      DtSpinRect(W, I, TX1, TY1, TX2, TY2);
+      Case I Of
+        0 : Begin T := L('Heure', 'Hour', 'Std.', 'Ore', 'Hora'); N := DtH;
+            End;
+        1 : Begin T := 'Min'; N := DtMi; End;
+      Else
+        Begin T := L('Sec', 'Sec', 'Sek', 'Sec', 'Seg'); N := DtS; End;
+      End;
+      OutTxt(TX1, TY1 - 18, T, cBlack);
+      PaintSpin(TX1, TY1, TX2, TY2, N, DtPress = I * 2,
+                DtPress = I * 2 + 1);
+    End;
+    T := L('Fuseau horaire actuel : ', 'Current time zone: ', 'Zeitzone: ',
+           'Fuso orario: ', 'Zona horaria: ');
+    OutTxt(X1 + 16, Y1 + 272, T + Fit(TzName(DtTz), X2 - X1 - 24 - TextW(T)),
+           cBlack);
+  End
+  Else
+  Begin
+    { fuseau horaire : liste et carte du monde }
+    Sunken(X1 + 16, Y1 + 40, X2 - 16, Y1 + 62, cWhite);
+    OutTxt(X1 + 21, Y1 + 43, Fit(TzName(DtTz), X2 - X1 - 60), cBlack);
+    Raised(X2 - 34, Y1 + 42, X2 - 18, Y1 + 60, False);
+    Arrow(X2 - 29, Y1 + 49, 1, cBlack);
+    Sunken(X1 + 16, Y1 + 70, X2 - 16, Y1 + 252, cNavy);
+    MW := X2 - X1 - 37;
+    Ocean := NearestIdx(0, 64, 160); Land := NearestIdx(0, 144, 0);
+    OceanH := NearestIdx(64, 128, 224); LandH := NearestIdx(160, 224, 64);
+    { colonnes du fuseau : 15 degres par heure = 2,5 colonnes }
+    Z0 := 30 + (TzOfs[DtTz] * 25 - 375) Div 600;
+    Z1 := Z0 + 2;
+    For I := 0 To 17 Do
+      For J := 0 To 59 Do
+      Begin
+        Ch := WorldMap[I][J + 1];
+        If (J >= Z0) And (J <= Z1) Then
+        Begin
+          If Ch = '#' Then C := LandH Else C := OceanH;
+        End
+        Else If Ch = '#' Then C := Land Else C := Ocean;
+        FBar(X1 + 19 + (J * MW) Div 60, Y1 + 73 + I * 10,
+             X1 + 18 + ((J + 1) * MW) Div 60, Y1 + 82 + I * 10, C);
+      End;
+    CheckBox(X1 + 16, Y1 + 262, L('Ajuster automatiquement pour l''heure ' +
+             'd'''#130't'#130, 'Automatically adjust for daylight saving',
+             'Sommerzeit automatisch anpassen', 'Ora legale automatica',
+             'Ajustar para horario de verano'), DtDst);
+  End;
+  For I := 0 To 2 Do
+  Begin
+    DlgBtnRect(W, I, 3, BX1, BY1, BX2, BY2);
+    Case I Of
+      0 : T := TxtOk;
+      1 : T := TxtCancel;
+    Else
+      T := L('Appliquer', 'Apply', #154'bernehmen', 'Applica', 'Aplicar');
+    End;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+{ Appliquer : horloge temps reel et fuseau horaire }
+Procedure DtApply;
+Var V : LongInt;
+Begin
+  ReadRtc;
+  If DtTimeSet Or DtDateSet Then
+  Begin
+    If Not DtTimeSet Then
+    Begin
+      DtH := RtcHour; DtMi := RtcMin; DtS := RtcSec;
+    End;
+    WriteRtc(DtY, DtM, DtD, DtH, DtMi, DtS);
+    KLog('Date/Heure : ' + IntStr(DtY) + '-' + Pad2(DtM) + '-' + Pad2(DtD) +
+         ' ' + Pad2(DtH) + ':' + Pad2(DtMi) + ':' + Pad2(DtS));
+  End;
+  TzCur := DtTz; TzDst := DtDst;
+  V := DtTz + 1;
+  If Not DtDst Then V := V Or $80;
+  CmosWrite($79, V);
+  DtTimeSet := False; DtDateSet := False;
+  LastMinute := -1;
+  TaskbarChanged;
+End;
+
+{ Compteur K (0..5 heure+, heure-, minute+...) }
+Procedure DtStep(K : LongInt);
+Var D : LongInt;
+Begin
+  If K Mod 2 = 0 Then D := 1 Else D := -1;
+  Case K Div 2 Of
+    0 : DtH := (DtH + D + 24) Mod 24;
+    1 : DtMi := (DtMi + D + 60) Mod 60;
+  Else
+    DtS := (DtS + D + 60) Mod 60;
+  End;
+  DtTimeSet := True;
+End;
+
+Procedure DateTimeMouse(W, Msg, X, Y : LongInt);
+Var I, J, X1, Y1, X2, Y2, CX1, CY1, CX2, CY2, D, F : LongInt;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  KClient(W, CX1, CY1, CX2, CY2);
+  If (Msg = WM_LBUTTONUP) And (DtPress >= 0) Then
+  Begin
+    DtPress := -1;
+    CaptureWin := -1;
+    KRepaint(W);
+  End;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    For I := 0 To 1 Do
+    Begin
+      DtTabRect(W, I, X1, Y1, X2, Y2);
+      If InRect(X, Y, X1, Y1, X2, Y2) Then
+      Begin
+        DtTab := I;
+        KRepaint(W);
+        Exit;
+      End;
+    End;
+    If DtTab = 0 Then
+    Begin
+      { mois : liste deroulante ; annee : compteur }
+      If InRect(X, Y, CX1 + 26, CY1 + 62, CX1 + 136, CY1 + 84) Then
+      Begin
+        OpenMenu(0, mnMonths, CX1 + 26, CY1 + 85, False);
+        Exit;
+      End;
+      If InRect(X, Y, CX1 + 198, CY1 + 62, CX1 + 209, CY1 + 84) Then
+      Begin
+        If Y <= CY1 + 71 Then
+        Begin
+          If DtY < 2099 Then Inc(DtY);
+          DtPress := 10;
+        End
+        Else
+        Begin
+          If DtY > 2000 Then Dec(DtY);
+          DtPress := 11;
+        End;
+        DtDateSet := True;
+        CaptureWin := W;
+        KRepaint(W);
+        Exit;
+      End;
+      { jour du calendrier }
+      F := DayOfWeek(DtY, DtM, 1);
+      For D := 1 To DaysIn(DtY, DtM) Do
+      Begin
+        I := (D - 1 + F) Div 7; J := (D - 1 + F) Mod 7;
+        DtCell(W, I, J, X1, Y1);
+        If InRect(X, Y, X1, Y1, X1 + 23, Y1 + 17) Then
+        Begin
+          DtD := D; DtDateSet := True;
+          KRepaint(W);
+          Exit;
+        End;
+      End;
+      { compteurs heure, minute, seconde }
+      For I := 0 To 2 Do
+      Begin
+        DtSpinRect(W, I, X1, Y1, X2, Y2);
+        If InRect(X, Y, X2 + 2, Y1, X2 + 13, Y2) Then
+        Begin
+          If Y <= Y1 + 9 Then J := I * 2 Else J := I * 2 + 1;
+          DtStep(J);
+          DtPress := J;
+          CaptureWin := W;
+          KRepaint(W);
+          Exit;
+        End;
+      End;
+    End
+    Else
+    Begin
+      If InRect(X, Y, CX1 + 16, CY1 + 40, CX2 - 16, CY1 + 62) Then
+      Begin
+        OpenMenu(0, mnTz, CX1 + 16, CY1 + 63, False);
+        Exit;
+      End;
+      If InRect(X, Y, CX1 + 16, CY1 + 262, CX2 - 16, CY1 + 276) Then
+      Begin
+        DtDst := Not DtDst;
+        KRepaint(W);
+        Exit;
+      End;
+      { clic sur la carte : fuseau le plus proche de la longitude }
+      If InRect(X, Y, CX1 + 19, CY1 + 73, CX2 - 19, CY1 + 252) Then
+      Begin
+        D := (((X - CX1 - 19) * 60) Div (CX2 - CX1 - 37)) * 24 - 720;
+        J := 0;
+        For I := 1 To TzCount - 1 Do
+          If Abs(TzOfs[I] - D) < Abs(TzOfs[J] - D) Then J := I;
+        DtTz := J;
+        KRepaint(W);
+        Exit;
+      End;
+    End;
+  End;
+  For I := 0 To 2 Do
+  Begin
+    DlgBtnRect(W, I, 3, X1, Y1, X2, Y2);
+    If InRect(X, Y, X1, Y1, X2, Y2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        If I <> 1 Then DtApply;
+        If I = 2 Then KRepaint(W)
+        Else
+        Begin
+          DestroyW(W);
+          DtW := -1;
+        End;
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure DateTimeKey(W, VK : LongInt);
+Begin
+  If VK = $0D Then
+  Begin
+    DtApply;
+    DestroyW(W);
+    DtW := -1;
+  End
+  Else If VK = $1B Then
+  Begin
+    DestroyW(W);
+    DtW := -1;
+  End
+  Else If VK = 9 Then
+  Begin
+    DtTab := 1 - DtTab;
+    KRepaint(W);
+  End;
+End;
+
+{ Chaque seconde (tache 0) : l'horloge de la boite suit l'heure }
+Procedure DtTick;
+Begin
+  If (DtW < 0) Or Not Wnds[DtW].Used Or (Wnds[DtW].IKind <> ikDateTime) Then
+    Exit;
+  If DtTimeSet Or (DtTab <> 0) Then Exit;
+  If RtcSec = DtSec Then Exit;
+  DtSec := RtcSec;
+  DtSync;
+  KRepaint(DtW);
+End;
+
 { Reorganiser les icones du bureau (Poste de travail et Corbeille
   restent en tete, comme sous Windows 95) : par nom ou par type }
 Procedure DeskArrange(ByType : Boolean);
@@ -8724,8 +9406,22 @@ Begin
     DispSetDepth(Cmd - cmColorBase);
     Exit;
   End;
+  If (Cmd > cmMonthBase) And (Cmd <= cmMonthBase + 12) Then
+  Begin
+    DtM := Cmd - cmMonthBase; DtDateSet := True;
+    If DtD > DaysIn(DtY, DtM) Then DtD := DaysIn(DtY, DtM);
+    If DtW >= 0 Then KRepaint(DtW);
+    Exit;
+  End;
+  If (Cmd >= cmTzBase) And (Cmd < cmTzBase + TzCount) Then
+  Begin
+    DtTz := Cmd - cmTzBase;
+    If DtW >= 0 Then KRepaint(DtW);
+    Exit;
+  End;
   Case Cmd Of
     cmDisplay : DispOpen;
+    cmDateTime : DtOpen;
     cmAlign : MarkAll;
     cmArrName : DeskArrange(False);
     cmArrType : DeskArrange(True);
@@ -8864,6 +9560,7 @@ Begin
     ikExplorer : ExpMouse(W, Msg, X, Y);
     ikAbout, ikRun, ikShutdown : DialogMouse(W, Msg, X, Y);
     ikDisplay : DisplayMouse(W, Msg, X, Y);
+    ikDateTime : DateTimeMouse(W, Msg, X, Y);
   End;
 End;
 
@@ -9277,6 +9974,7 @@ Begin
       End;
     ikAbout : If (VK = $0D) Or (VK = $1B) Then DestroyW(W);
     ikDisplay : DisplayKey(W, VK);
+    ikDateTime : DateTimeKey(W, VK);
     ikNotepad : NoteKey(W, VK, Ch);
     ikConsole : ConKeyIn(VK, Ch);
     ikExplorer :
@@ -9318,6 +10016,7 @@ Begin
     ikExplorer : PaintExplorer(W);
     ikAbout, ikRun, ikShutdown : PaintDialog(W);
     ikDisplay : PaintDisplay(W);
+    ikDateTime : PaintDateTime(W);
     ikHelp : PaintHelp(W);
     ikNotepad : PaintNotepad(W);
     ikConsole : PaintConsole(W);
@@ -9358,6 +10057,7 @@ Begin
       Else If Wnds[I].NeedNc Then NcPaint(I);
     End;
   ReadRtc;
+  DtTick;
   If RtcMin <> LastMinute Then
   Begin
     LastMinute := RtcMin;
@@ -10162,10 +10862,28 @@ Begin
   GetLocalTime(P);
 End;
 
+{ TIME_ZONE_INFORMATION : Bias (UTC = heure locale + Bias, en minutes),
+  noms Unicode, heure d'ete (-60 min) ; fuseau de Date/Heure }
 Function GetTimeZoneInformation(P : LongInt) : LongInt;
+Var S : String; I : LongInt;
 Begin
   FillMem(P, 172, 0);
-  GetTimeZoneInformation := 0;
+  MemL[0:P] := -TzOfs[TzCur];
+  S := TzName(TzCur);
+  For I := 1 To Min(Length(S), 31) Do
+  Begin
+    MemW[0:P + 4 + (I - 1) * 2] := Ord(S[I]);
+    MemW[0:P + 88 + (I - 1) * 2] := Ord(S[I]);
+  End;
+  If TzDst Then
+  Begin
+    { Amerique du Nord : 1er dimanche d'avril, dernier d'octobre (1995) }
+    MemW[0:P + 70] := 10; MemW[0:P + 74] := 5; MemW[0:P + 76] := 2;
+    MemW[0:P + 154] := 4; MemW[0:P + 158] := 1; MemW[0:P + 160] := 2;
+    MemL[0:P + 168] := -60;
+    GetTimeZoneInformation := 1;              { TIME_ZONE_ID_STANDARD }
+  End
+  Else GetTimeZoneInformation := 0;           { TIME_ZONE_ID_UNKNOWN }
 End;
 
 { ------------------------------------------------------------------ }
@@ -29551,6 +30269,7 @@ Begin
   KClass[ikAbout] := ClassAdd('#About', 0, ikAbout, 0);
   KClass[ikRun] := ClassAdd('#Run', 0, ikRun, 0);
   KClass[ikDisplay] := ClassAdd('#Display', 0, ikDisplay, 0);
+  KClass[ikDateTime] := ClassAdd('#DateTime', 0, ikDateTime, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
@@ -29681,7 +30400,8 @@ BEGIN
   OptFlags := MemL[0:BootInfo + $30];
   VideoFromBoot;
   DispiDetect;
-  DispW := -1; RebootAskW := -1;
+  DispW := -1; RebootAskW := -1; DtW := -1;
+  TzLoad;
   ThreadInit0;
   KImgLo := $100000;
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
