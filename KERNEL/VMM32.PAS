@@ -1081,7 +1081,7 @@ End;
 
 { Secteur Lba (antememoire) ; adresse des 2048 octets ou 0 }
 Function CdSector(Lba : LongInt) : LongInt;
-Var I : LongInt;
+Var I, Own : LongInt;
 Begin
   For I := 0 To CacheSlots - 1 Do
     If (CacheLba[I] = Lba) And (CacheData[I] <> 0) Then
@@ -1091,7 +1091,16 @@ Begin
     End;
   I := CacheNext;
   CacheNext := (CacheNext + 1) Mod CacheSlots;
-  If CacheData[I] = 0 Then CacheData[I] := KAlloc(2048);
+  { tampon du noyau (proprietaire 0) : alloue pendant qu'un programme
+    tourne, il etait libere a la fin de celui-ci (KFreeOwner) alors que
+    l'antememoire continuait de s'en servir, ecrasant le bloc suivant
+    (fichier .EXE relu au retour a l'Invite MS-DOS) }
+  If CacheData[I] = 0 Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    CacheData[I] := KAlloc(2048);
+    HeapOwner := Own;
+  End;
   CacheLba[I] := -1;
   If AtaReadSector(Lba, CacheData[I]) Then
   Begin
@@ -4927,7 +4936,7 @@ Const
   { sortes internes de fenetres }
   ikNone = 0; ikTaskbar = 1; ikMenu = 2; ikExplorer = 3; ikMsgBox = 4;
   ikAbout = 5; ikRun = 6; ikShutdown = 7; ikHelp = 8; ikWelcome = 9;
-  ikNotepad = 10; ikButton = 20; ikStatic = 21; ikEdit = 22;
+  ikNotepad = 10; ikConsole = 11; ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
   ikMdiClient = 27;
 
@@ -5003,6 +5012,8 @@ Var
   DeskColor : LongInt;
   { saisie }
   KeyState : Array[0..255] Of Byte;
+  KeyScan    : LongInt;   { code de balayage de la touche en cours }
+  KeyExt     : Boolean;   { touche etendue (prefixe E0h) }
   KExt     : Boolean;
   LastClickT, LastClickW, LastClickX, LastClickY : LongInt;
   MouseBtn : LongInt;
@@ -5493,15 +5504,25 @@ End;
 
 { (Re)allouer la surface d'une fenetre de premier niveau }
 Procedure WndSurf(W : LongInt);
-Var WW, HH : LongInt;
+Var WW, HH, Own, T : LongInt;
 Begin
   If IsChildW(W) Then Exit;
   WW := Max(1, Wnds[W].W); HH := Max(1, Wnds[W].H);
   If (Wnds[W].Surf.Bits <> 0) And (Wnds[W].Surf.W = WW) And
      (Wnds[W].Surf.H = HH) Then Exit;
   SurfFree(Wnds[W].Surf);
+  { la surface appartient au fil de la fenetre, pas au programme en
+    cours : une fenetre du noyau (Invite MS-DOS...) creee ou agrandie
+    pendant qu'un programme tourne perdait sa surface a la fin de
+    celui-ci (KFreeOwner), puis la reutilisait par-dessus d'autres
+    blocs (ligne de commande du programme suivant remplie de 07h) }
+  Own := HeapOwner;
+  T := Wnds[W].Thread;
+  If (T >= 0) And (T < MaxThread) Then HeapOwner := ThrOwner[T]
+  Else HeapOwner := 0;
   If SurfNew(Wnds[W].Surf, WW, HH) Then
     FillMem(Wnds[W].Surf.Bits, Wnds[W].Surf.Pitch * HH, cSilver);
+  HeapOwner := Own;
   Wnds[W].NeedNc := True;
 End;
 
@@ -5641,6 +5662,13 @@ End;
 Procedure DestroyW(W : LongInt);
 Var I, T : LongInt;
 Begin
+  { fenetre de la console fermee : arreter son programme (tache 0) }
+  If (W = ConW) And (ConW >= 0) Then
+  Begin
+    ConW := -1;
+    ChainExec := ''; ChainRet := ''; ConKeep := False;
+    If AppRunning And AppConsole Then ConKillReq := True;
+  End;
   If (W < 0) Or Not Wnds[W].Used Or Wnds[W].Destroying Then Exit;
   Wnds[W].Destroying := True;
   If Wnds[W].Visible And Not IsChildW(W) Then DirtyWnd(W);
@@ -6135,6 +6163,7 @@ Begin
   If Up Then Lp := Lp Or LongInt($C0000000);
   Ch := 0;
   If Not Up Then Ch := ScanToChar(Sc);
+  KeyScan := Sc; KeyExt := Ext;
   { raccourcis du systeme }
   If Not Up Then
   Begin
@@ -6299,7 +6328,7 @@ Const
   mnStart = 1; mnPrograms = 2; mnDocs = 3; mnSettings = 4;
   cmNone = 0; cmExplorer = 1; cmComputer = 2; cmNotepad = 3; cmHelp = 4;
   cmRun = 5; cmAbout = 6; cmShutdown = 7; cmReadme = 8; cmRecycle = 9;
-  cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12;
+  cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
   cmDocBase = 100; cmExeBase = 200;
   MaxDesk = 12;
 
@@ -6413,6 +6442,13 @@ End;
 
 { Icones du bureau : Poste de travail, Corbeille, Lisez-moi et les
   programmes .EXE de la racine du CD-ROM }
+Function PromptName : String;
+Begin
+  PromptName := L('Invite MS-DOS', 'MS-DOS Prompt',
+                  'MS-DOS-Eingabeaufforderung', 'Prompt di MS-DOS',
+                  'S'#161'mbolo de MS-DOS');
+End;
+
 Procedure DeskBuild;
 Var I, Lba, Size, Fl, Tm : LongInt; Nm : String;
 Begin
@@ -6423,11 +6459,13 @@ Begin
             'Papelera de reciclaje'), icRecycle, cmRecycle, '');
   DeskAdd(L('Lisez-moi', 'Read Me', 'Liesmich', 'Leggimi', 'L'#130'ame'),
           icText, cmReadme, '');
+  If IsoLookup('\COMMAND.EXE', Lba, Size, Fl, Tm) Then
+    DeskAdd(PromptName, icDos, cmPrompt, 'D:\COMMAND.EXE');
   I := 0;
   While IsoDirEntry(RootLba, RootSize, I, Nm, Lba, Size, Fl, Tm) Do
   Begin
     If ((Fl And 2) = 0) And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
-       (ExeCnt < 16) Then
+       (Nm <> 'COMMAND.EXE') And (ExeCnt < 16) Then
     Begin
       ExePaths[ExeCnt] := 'D:\' + Nm;
       DeskAdd(Copy(Nm, 1, Length(Nm) - 4), icApp, cmExeBase + ExeCnt,
@@ -6677,7 +6715,7 @@ Var N : LongInt; S : String;
 Begin
   Case M Of
     mnStart : MenuCount := 8;
-    mnPrograms : MenuCount := 3 + ExeCnt;
+    mnPrograms : MenuCount := 4 + ExeCnt;
     mnSettings : MenuCount := 3;
     mnDocs :
     Begin
@@ -6749,12 +6787,17 @@ Begin
       End
       Else If I = 2 Then
       Begin
+        T := PromptName;
+        Cmd := cmPrompt; Icon := icDos;
+      End
+      Else If I = 3 Then
+      Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 3]);
-        Cmd := cmExeBase + I - 3; Icon := icApp;
+        T := BaseName(ExePaths[I - 4]);
+        Cmd := cmExeBase + I - 4; Icon := icApp;
       End;
     mnSettings :
       If I = 0 Then
@@ -7890,6 +7933,7 @@ Begin
       ShowW(W, True, True);
     End;
     cmNotepad : NoteOpen('');
+    cmPrompt : RunExe('D:\COMMAND.EXE', '');
     cmNetwork : NetConfigBox;
     cmReadme : NoteOpen('D:\LISEZMOI.TXT');
     cmRecycle :
@@ -7989,6 +8033,327 @@ Begin
   End;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Console Win32 (programmes du sous-systeme console, Invite MS-DOS)   }
+{ ------------------------------------------------------------------ }
+{ Une seule console, 80 x 25, dans une fenetre interne (ikConsole) :
+  cellules de 7 x 16 pixels (police 8x16 sans sa 8e colonne, comme la
+  fenetre MS-DOS de Windows 95 en 640x480). Les touches frappees
+  deviennent des evenements KEY_EVENT (ReadConsoleInput) ou une ligne
+  (ReadFile/ReadConsole en mode ligne). }
+
+Const
+  ConCols = 80; ConRows = 25;
+  ConCW = 7; ConChH = 16;
+  ConQMax = 64;
+  { couleurs de la console (ordre des attributs : bit 0 bleu, 1 vert,
+    2 rouge, 3 intensite) }
+  ConRGB : Array[0..15] Of LongInt = (
+    $000000, $000080, $008000, $008080, $800000, $800080, $808000,
+    $C0C0C0, $808080, $0000FF, $00FF00, $00FFFF, $FF0000, $FF00FF,
+    $FFFF00, $FFFFFF);
+
+Var
+  ConW : LongInt;                        { fenetre (-1 : aucune) }
+  ConCh, ConAt : Array[0..ConCols * ConRows - 1] Of Byte;
+  ConX, ConY, ConAttr : LongInt;
+  ConInMode : LongInt;                   { modes de l'entree standard }
+  ConCurVis : Boolean;
+  ConFull : Boolean;                     { tout repeindre }
+  ConDLo, ConDHi : LongInt;              { lignes a repeindre }
+  ConRowsDue : Boolean;                  { lignes a repeindre seules }
+  ConPR0, ConPR1 : LongInt;              { lignes repeintes }
+  ConPal : Array[0..15] Of LongInt;      { couleurs -> indices systeme }
+  ConPalVer : LongInt;                   { PalVer de ConPal (-1 : a faire) }
+  ConLastCY : LongInt;                   { ligne du curseur dessine }
+  ConQVk, ConQCh, ConQCtl : Array[0..ConQMax - 1] Of LongInt;
+  ConQHead, ConQLen : LongInt;
+  ConPend : String;                      { reste d'une ligne lue }
+  ConKeep : Boolean;                     { garder la console a la fin du
+                                           programme (retour a l'Invite) }
+  ConKillReq : Boolean;                  { fenetre fermee : arreter le
+                                           programme (tache 0) }
+  ConTitle : String[79];
+  AppConsole : Boolean;                  { programme du sous-systeme console }
+  { programme lance depuis l'Invite (CreateProcessA), puis retour }
+  ChainExec, ChainArgs, ChainRet, ChainRetArgs, ChainDir : String;
+  ChainObj : LongInt;
+
+{ Mot signe 16 bits (SMALL_RECT, COORD) }
+Function ConS16(V : LongInt) : LongInt;
+Begin
+  V := V And $FFFF;
+  If V >= $8000 Then V := V - $10000;
+  ConS16 := V;
+End;
+
+Procedure ConDirty(R : LongInt);
+Begin
+  If R < ConDLo Then ConDLo := R;
+  If R > ConDHi Then ConDHi := R;
+  ConRowsDue := True;
+End;
+
+Procedure ConClear;
+Var I : LongInt;
+Begin
+  For I := 0 To ConCols * ConRows - 1 Do
+  Begin
+    ConCh[I] := 32; ConAt[I] := ConAttr;
+  End;
+  ConX := 0; ConY := 0;
+  ConFull := True;
+  ConRowsDue := True;
+End;
+
+Procedure ConEnsure;
+Var X1, Y1, X2, Y2, DW, DH : LongInt;
+Begin
+  If ConW >= 0 Then Exit;
+  ConAttr := 7; ConInMode := 7; ConCurVis := True;
+  ConQHead := 0; ConQLen := 0; ConPend := '';
+  ConDLo := 0; ConDHi := ConRows - 1;
+  If ConTitle = '' Then
+    ConTitle := PromptName;
+  ConW := KCreate(ikConsole, ConTitle, icDos, 24, 16, 600, 440,
+                  WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or
+                  WS_MINIMIZEBOX, 0);
+  If ConW < 0 Then Exit;
+  { zone cliente exacte : 80 x 25 cellules }
+  KClient(ConW, X1, Y1, X2, Y2);
+  DW := ConCols * ConCW - (X2 - X1 + 1);
+  DH := ConRows * ConChH - (Y2 - Y1 + 1);
+  If (DW <> 0) Or (DH <> 0) Then
+    MoveW(ConW, Wnds[ConW].X, Wnds[ConW].Y, Wnds[ConW].W + DW,
+          Wnds[ConW].H + DH, False);
+  ConClear;
+  ShowW(ConW, True, True);
+End;
+
+Procedure ConScrollUp;
+Var I : LongInt;
+Begin
+  MoveMem(LongInt(@ConCh) + ConCols, LongInt(@ConCh),
+          ConCols * (ConRows - 1));
+  MoveMem(LongInt(@ConAt) + ConCols, LongInt(@ConAt),
+          ConCols * (ConRows - 1));
+  For I := ConCols * (ConRows - 1) To ConCols * ConRows - 1 Do
+  Begin
+    ConCh[I] := 32; ConAt[I] := ConAttr;
+  End;
+  ConFull := True;
+  ConRowsDue := True;
+End;
+
+Procedure ConNewLine;
+Begin
+  ConDirty(ConY);
+  ConX := 0;
+  Inc(ConY);
+  If ConY >= ConRows Then
+  Begin
+    ConScrollUp;
+    ConY := ConRows - 1;
+  End;
+  ConDirty(ConY);
+End;
+
+{ Un caractere (sortie traitee : CR, LF, BS, TAB, BEL) }
+Procedure ConPutC(C : LongInt);
+Begin
+  Case C Of
+    7 : ;
+    8 :
+      If ConX > 0 Then
+      Begin
+        Dec(ConX); ConDirty(ConY);
+      End;
+    9 :
+      Repeat
+        ConCh[ConY * ConCols + ConX] := 32;
+        ConAt[ConY * ConCols + ConX] := ConAttr;
+        Inc(ConX);
+        If ConX >= ConCols Then ConNewLine;
+      Until (ConX Mod 8) = 0;
+    10 : ConNewLine;
+    13 :
+      Begin
+        ConX := 0; ConDirty(ConY);
+      End;
+  Else
+    ConCh[ConY * ConCols + ConX] := C And 255;
+    ConAt[ConY * ConCols + ConX] := ConAttr;
+    ConDirty(ConY);
+    Inc(ConX);
+    If ConX >= ConCols Then ConNewLine;
+  End;
+End;
+
+Procedure ConWrite(Buf, N : LongInt);
+Var I : LongInt;
+Begin
+  ConEnsure;
+  For I := 0 To N - 1 Do ConPutC(Mem[0:Buf + I]);
+End;
+
+Procedure ConWriteS(Const S : String);
+Var I : LongInt;
+Begin
+  For I := 1 To Length(S) Do ConPutC(Ord(S[I]));
+End;
+
+{ Une cellule de la console : 16 lignes de 7 pixels (police 8x16 sans
+  sa 8e colonne), couleur Fg sur Bg, en A (surface de pas Pitch). En
+  assembleur : la version Pascal (112 tests et ecritures par cellule)
+  prenait pres de 300 ms pour un ecran sous l'emulateur de DEVENV, et le
+  programme console attendait pendant ce temps (DIR, echo du clavier). }
+Procedure ConCell(A, F, Pitch, Fg, Bg : LongInt);
+Begin
+  asm
+    push esi
+    push edi
+    push ebx
+    mov eax,Pitch
+    sub eax,7
+    push eax
+    mov edi,A
+    mov esi,F
+    mov edx,Fg
+    mov eax,Bg
+    mov dh,al
+    mov ecx,16
+  @row:
+    mov bl,[esi]
+    inc esi
+    mov al,dh
+    test bl,80h
+    jz @p1
+    mov al,dl
+  @p1:
+    mov [edi],al
+    mov al,dh
+    test bl,40h
+    jz @p2
+    mov al,dl
+  @p2:
+    mov [edi+1],al
+    mov al,dh
+    test bl,20h
+    jz @p3
+    mov al,dl
+  @p3:
+    mov [edi+2],al
+    mov al,dh
+    test bl,10h
+    jz @p4
+    mov al,dl
+  @p4:
+    mov [edi+3],al
+    mov al,dh
+    test bl,8
+    jz @p5
+    mov al,dl
+  @p5:
+    mov [edi+4],al
+    mov al,dh
+    test bl,4
+    jz @p6
+    mov al,dl
+  @p6:
+    mov [edi+5],al
+    mov al,dh
+    test bl,2
+    jz @p7
+    mov al,dl
+  @p7:
+    mov [edi+6],al
+    add edi,7
+    add edi,[esp]
+    dec ecx
+    jnz @row
+    pop eax
+    pop ebx
+    pop edi
+    pop esi
+  end;
+End;
+
+Procedure PaintConsole(W : LongInt);
+Var X1, Y1, X2, Y2, R, C, I, A, P, F, Fg, Bg, R0, R1, NC, NR : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  NC := Min(ConCols, (X2 - X1 + 1) Div ConCW);
+  NR := Min(ConRows, (Y2 - Y1 + 1) Div ConChH);
+  If ConPalVer <> PalVer Then
+  Begin
+    For I := 0 To 15 Do
+      ConPal[I] := NearestIdx((ConRGB[I] Shr 16) And 255,
+                              (ConRGB[I] Shr 8) And 255, ConRGB[I] And 255);
+    ConPalVer := PalVer;
+  End;
+  If ConFull Then
+  Begin
+    FBar(X1, Y1, X2, Y2, ConPal[0]);
+    R0 := 0; R1 := NR - 1;
+  End
+  Else
+  Begin
+    If (ConLastCY >= 0) And (ConLastCY < ConDLo) Then ConDLo := ConLastCY;
+    If ConLastCY > ConDHi Then ConDHi := ConLastCY;
+    R0 := Max(ConDLo, 0); R1 := Min(ConDHi, NR - 1);
+  End;
+  ConFull := False; ConRowsDue := False;
+  ConDLo := ConRows; ConDHi := -1;
+  ConPR0 := R0; ConPR1 := R1;
+  ConLastCY := ConY;
+  For R := R0 To R1 Do
+    For C := 0 To NC - 1 Do
+    Begin
+      I := R * ConCols + C;
+      Fg := ConPal[ConAt[I] And 15]; Bg := ConPal[(ConAt[I] Shr 4) And 15];
+      F := FontAddr + ConCh[I] * 16;
+      A := DS.Bits + (Y1 + R * ConChH - DOY) * DS.Pitch +
+           (X1 + C * ConCW - DOX);
+      ConCell(A, F, DS.Pitch, Fg, Bg);
+      { curseur : soulignement, fenetre active seulement }
+      If ConCurVis And (R = ConY) And (C = ConX) And (W = ActiveWin) Then
+      Begin
+        P := A + 13 * DS.Pitch;
+        FillMem(P, ConCW, Fg);
+        FillMem(P + DS.Pitch, ConCW, Fg);
+      End;
+    End;
+End;
+
+{ Touche frappee dans la fenetre de la console }
+Procedure ConKeyIn(VK, Ch : LongInt);
+Var I, Ctl : LongInt;
+Begin
+  If ConQLen >= ConQMax Then Exit;
+  Ctl := 0;
+  If (KeyState[$10] And $80) <> 0 Then Ctl := Ctl Or $10;
+  If (KeyState[$11] And $80) <> 0 Then Ctl := Ctl Or $08;
+  If (KeyState[$12] And $80) <> 0 Then Ctl := Ctl Or $02;
+  { Ctrl+lettre : caractere de controle, comme Windows }
+  If ((Ctl And $08) <> 0) And (VK >= $41) And (VK <= $5A) Then
+    Ch := VK - $40;
+  { ENHANCED_KEY, et le code de balayage (wVirtualScanCode) range dans
+    les bits 16-23, inutilises par dwControlKeyState (voir ConPutRec) :
+    ReadKey en a besoin pour les fleches et les touches de fonction }
+  If KeyExt Then Ctl := Ctl Or $100;
+  Ctl := Ctl Or ((KeyScan And 255) Shl 16);
+  I := (ConQHead + ConQLen) Mod ConQMax;
+  ConQVk[I] := VK; ConQCh[I] := Ch And 255; ConQCtl[I] := Ctl;
+  Inc(ConQLen);
+End;
+
+Procedure ConQPop(Var VK, Ch, Ctl : LongInt);
+Begin
+  VK := ConQVk[ConQHead]; Ch := ConQCh[ConQHead]; Ctl := ConQCtl[ConQHead];
+  ConQHead := (ConQHead + 1) Mod ConQMax;
+  Dec(ConQLen);
+End;
+
 Procedure KKey(W, Msg, VK, Ch : LongInt);
 Var I : LongInt;
 Begin
@@ -8078,6 +8443,7 @@ Begin
       End;
     ikAbout : If (VK = $0D) Or (VK = $1B) Then DestroyW(W);
     ikNotepad : NoteKey(W, VK, Ch);
+    ikConsole : ConKeyIn(VK, Ch);
     ikExplorer :
       If VK = 8 Then ExpUp(W)
       Else If (VK = $0D) And (Wnds[W].K1 >= 0) Then ExpOpenItem(W, Wnds[W].K1);
@@ -8118,15 +8484,34 @@ Begin
     ikAbout, ikRun, ikShutdown : PaintDialog(W);
     ikHelp : PaintHelp(W);
     ikNotepad : PaintNotepad(W);
+    ikConsole : PaintConsole(W);
     ikDialog : PaintDlgBack(W);
   End;
   DirtyWnd(W);
+End;
+
+{ Console : repeindre seulement les lignes de texte modifiees (sans le
+  cadre) et ne recopier que cette bande a l'ecran. Repeindre et recopier
+  toute la fenetre a chaque ligne affichee rendait DIR tres lent. }
+Procedure ConPaintRows;
+Var X1, Y1, X2, Y2 : LongInt;
+Begin
+  If (ConW < 0) Or Not Wnds[ConW].Used Or (Wnds[ConW].Surf.Bits = 0) Then
+    Exit;
+  SetTarget(Wnds[ConW].Surf, Wnds[ConW].X, Wnds[ConW].Y);
+  PaintConsole(ConW);
+  If ConPR1 < ConPR0 Then Exit;
+  KClient(ConW, X1, Y1, X2, Y2);
+  MarkDirty(X1, Y1 + ConPR0 * ConChH, X2 + 1,
+            Min(Y2 + 1, Y1 + (ConPR1 + 1) * ConChH));
 End;
 
 { Fenetres internes a repeindre (tache 0) }
 Procedure KPaintAll;
 Var I : LongInt;
 Begin
+  If ConRowsDue And (ConW >= 0) And Wnds[ConW].Used And
+     Not Wnds[ConW].KNeedPaint And Wnds[ConW].Visible Then ConPaintRows;
   For I := 0 To MaxWnd - 1 Do
     If Wnds[I].Used And Not IsChildW(I) Then
     Begin
@@ -8855,7 +9240,7 @@ End;
 
 { FILETIME -> SYSTEMTIME }
 Function FileTimeToSystemTime(Ft, St : LongInt) : LongInt;
-Var FT2, LoR, Sec : Real; Days, Rem, Y, M, Dim : LongInt;
+Var FT2, LoR, Sec : Real; Days, Rem, Y, M, Dim, N : LongInt;
 Begin
   LoR := MemL[0:Ft];
   If LoR < 0 Then LoR := LoR + 4294967296.0;
@@ -8863,14 +9248,16 @@ Begin
   Sec := Int(FT2 / 10000000.0);
   Days := Trunc(Int(Sec / 86400.0));
   Rem := Trunc(Sec - Days * 86400.0);
-  Y := 1601;
-  While Days >= 365 + Ord((Y Mod 4 = 0) And ((Y Mod 100 <> 0) Or
-        (Y Mod 400 = 0))) Do
-  Begin
-    Days := Days - 365 - Ord((Y Mod 4 = 0) And ((Y Mod 100 <> 0) Or
-            (Y Mod 400 = 0)));
-    Inc(Y);
-  End;
+  { annee : cycles de 400, 100, 4 et 1 ans depuis 1601 (debut d'un cycle
+    gregorien de 400 ans). La boucle annee par annee (plus de 400 tours a
+    3 divisions) rendait DIR tres lent dans un emulateur. }
+  N := Days Div 146097; Days := Days Mod 146097;
+  Y := 1601 + N * 400;
+  N := Days Div 36524; If N > 3 Then N := 3;
+  Days := Days - N * 36524; Y := Y + N * 100;
+  N := Days Div 1461; Days := Days Mod 1461; Y := Y + N * 4;
+  N := Days Div 365; If N > 3 Then N := 3;
+  Days := Days - N * 365; Y := Y + N;
   M := 1;
   Repeat
     Case M Of
@@ -8952,6 +9339,369 @@ End;
 Function IsConsoleH(H : LongInt) : Boolean;
 Begin
   IsConsoleH := (H = HStdIn) Or (H = HStdOut) Or (H = HStdErr);
+End;
+
+{ ------------------------------- Console Win32 -------------------- }
+
+{ Attendre au moins une touche (tache du programme) }
+Procedure ConWaitKey;
+Begin
+  ConEnsure;
+  While ConQLen = 0 Do
+  Begin
+    If ConW < 0 Then Exit;
+    KSleep(15);
+  End;
+End;
+
+{ Lecture en mode ligne (ENABLE_LINE_INPUT) : edition, echo, CR LF }
+Function ConReadLine(Buf, N : LongInt) : LongInt;
+Var VK, Ch, Ctl, I : LongInt; Done : Boolean;
+Begin
+  If ConPend = '' Then
+  Begin
+    Done := False;
+    Repeat
+      ConWaitKey;
+      If ConW < 0 Then
+      Begin
+        ConReadLine := 0;
+        Exit;
+      End;
+      ConQPop(VK, Ch, Ctl);
+      If Ch = 13 Then
+      Begin
+        If (ConInMode And 4) <> 0 Then ConWriteS(#13#10);
+        ConPend := ConPend + #13#10;
+        Done := True;
+      End
+      Else If Ch = 8 Then
+      Begin
+        If Length(ConPend) > 0 Then
+        Begin
+          Delete(ConPend, Length(ConPend), 1);
+          If (ConInMode And 4) <> 0 Then ConWriteS(#8' '#8);
+        End;
+      End
+      Else If (Ch = 26) Or (Ch = 3) Then
+      Begin
+        ConPend := ConPend + Chr(Ch);
+        Done := True;
+      End
+      Else If (Ch >= 32) And (Length(ConPend) < 250) Then
+      Begin
+        ConPend := ConPend + Chr(Ch);
+        If (ConInMode And 4) <> 0 Then ConPutC(Ch);
+      End;
+    Until Done;
+  End;
+  I := Min(N, Length(ConPend));
+  If I > 0 Then PutPStr(Buf, ConPend, I + 1);
+  Delete(ConPend, 1, I);
+  ConReadLine := I;
+End;
+
+{ Lecture sans mode ligne : caracteres frappes, au moins un }
+Function ConReadRaw(Buf, N : LongInt) : LongInt;
+Var VK, Ch, Ctl, I : LongInt;
+Begin
+  I := 0;
+  ConWaitKey;
+  While (ConQLen > 0) And (I < N) Do
+  Begin
+    ConQPop(VK, Ch, Ctl);
+    If Ch <> 0 Then
+    Begin
+      Mem[0:Buf + I] := Ch;
+      Inc(I);
+    End;
+  End;
+  ConReadRaw := I;
+End;
+
+Function ConReadIn(Buf, N : LongInt) : LongInt;
+Begin
+  If (ConInMode And 2) <> 0 Then ConReadIn := ConReadLine(Buf, N)
+  Else ConReadIn := ConReadRaw(Buf, N);
+End;
+
+Function AllocConsole : LongInt;
+Begin
+  ConEnsure;
+  AllocConsole := 1;
+End;
+
+Function FreeConsole : LongInt;
+Begin
+  FreeConsole := 1;
+End;
+
+Function GetConsoleMode(H, P : LongInt) : LongInt;
+Begin
+  GetConsoleMode := 0;
+  If Not IsConsoleH(H) Then Exit;
+  If H = HStdIn Then MemL[0:P] := ConInMode Else MemL[0:P] := 3;
+  GetConsoleMode := 1;
+End;
+
+Function SetConsoleMode(H, M : LongInt) : LongInt;
+Begin
+  SetConsoleMode := 0;
+  If Not IsConsoleH(H) Then Exit;
+  If H = HStdIn Then ConInMode := M;
+  SetConsoleMode := 1;
+End;
+
+Function WriteConsoleA(H, Buf, N, PW, R : LongInt) : LongInt;
+Begin
+  ConWrite(Buf, N);
+  If PW <> 0 Then MemL[0:PW] := N;
+  WriteConsoleA := 1;
+End;
+
+Function ReadConsoleA(H, Buf, N, PR, R : LongInt) : LongInt;
+Var Got : LongInt;
+Begin
+  Got := ConReadIn(Buf, N);
+  If PR <> 0 Then MemL[0:PR] := Got;
+  ReadConsoleA := 1;
+End;
+
+{ INPUT_RECORD (20 octets) d'une touche }
+Procedure ConPutRec(A, VK, Ch, Ctl : LongInt);
+Begin
+  FillMem(A, 20, 0);
+  MemW[0:A] := 1;                        { KEY_EVENT }
+  MemL[0:A + 4] := 1;                    { bKeyDown }
+  MemW[0:A + 8] := 1;                    { wRepeatCount }
+  MemW[0:A + 10] := VK;
+  MemW[0:A + 12] := (Ctl Shr 16) And 255; { wVirtualScanCode }
+  Mem[0:A + 14] := Ch;                   { uChar.AsciiChar }
+  MemL[0:A + 16] := Ctl And $FFFF;       { dwControlKeyState }
+End;
+
+Function PeekConsoleInputA(H, Buf, N, PR : LongInt) : LongInt;
+Var I, K : LongInt;
+Begin
+  ConEnsure;
+  K := Min(N, ConQLen);
+  For I := 0 To K - 1 Do
+    ConPutRec(Buf + I * 20, ConQVk[(ConQHead + I) Mod ConQMax],
+              ConQCh[(ConQHead + I) Mod ConQMax],
+              ConQCtl[(ConQHead + I) Mod ConQMax]);
+  If PR <> 0 Then MemL[0:PR] := K;
+  PeekConsoleInputA := 1;
+End;
+
+Function ReadConsoleInputA(H, Buf, N, PR : LongInt) : LongInt;
+Var I, VK, Ch, Ctl : LongInt;
+Begin
+  ReadConsoleInputA := 0;
+  If Not IsConsoleH(H) Then Exit;
+  ConWaitKey;
+  I := 0;
+  While (ConQLen > 0) And (I < N) Do
+  Begin
+    ConQPop(VK, Ch, Ctl);
+    ConPutRec(Buf + I * 20, VK, Ch, Ctl);
+    Inc(I);
+  End;
+  If PR <> 0 Then MemL[0:PR] := I;
+  ReadConsoleInputA := 1;
+End;
+
+Function GetNumberOfConsoleInputEvents(H, P : LongInt) : LongInt;
+Begin
+  ConEnsure;
+  If P <> 0 Then MemL[0:P] := ConQLen;
+  GetNumberOfConsoleInputEvents := 1;
+End;
+
+Function FlushConsoleInputBuffer(H : LongInt) : LongInt;
+Begin
+  ConQLen := 0; ConPend := '';
+  FlushConsoleInputBuffer := 1;
+End;
+
+{ CONSOLE_SCREEN_BUFFER_INFO }
+Function GetConsoleScreenBufferInfo(H, P : LongInt) : LongInt;
+Begin
+  ConEnsure;
+  FillMem(P, 22, 0);
+  MemW[0:P] := ConCols; MemW[0:P + 2] := ConRows;
+  MemW[0:P + 4] := ConX; MemW[0:P + 6] := ConY;
+  MemW[0:P + 8] := ConAttr;
+  MemW[0:P + 10] := 0; MemW[0:P + 12] := 0;
+  MemW[0:P + 14] := ConCols - 1; MemW[0:P + 16] := ConRows - 1;
+  MemW[0:P + 18] := ConCols; MemW[0:P + 20] := ConRows;
+  GetConsoleScreenBufferInfo := 1;
+End;
+
+Function SetConsoleCursorPosition(H, C : LongInt) : LongInt;
+Begin
+  ConEnsure;
+  ConDirty(ConY);
+  ConX := Max(0, Min(ConCols - 1, C And $FFFF));
+  ConY := Max(0, Min(ConRows - 1, (C Shr 16) And $FFFF));
+  ConDirty(ConY);
+  SetConsoleCursorPosition := 1;
+End;
+
+Function SetConsoleTextAttribute(H, A : LongInt) : LongInt;
+Begin
+  ConAttr := A And 255;
+  SetConsoleTextAttribute := 1;
+End;
+
+Function GetConsoleCursorInfo(H, P : LongInt) : LongInt;
+Begin
+  MemL[0:P] := 25; MemL[0:P + 4] := Ord(ConCurVis);
+  GetConsoleCursorInfo := 1;
+End;
+
+Function SetConsoleCursorInfo(H, P : LongInt) : LongInt;
+Begin
+  ConCurVis := MemL[0:P + 4] <> 0;
+  ConDirty(ConY);
+  SetConsoleCursorInfo := 1;
+End;
+
+{ Remplir N cellules a partir de C (caracteres ou attributs) }
+Procedure ConFill(C, N, V : LongInt; Attr : Boolean);
+Var I, P : LongInt;
+Begin
+  ConEnsure;
+  P := ((C Shr 16) And $FFFF) * ConCols + (C And $FFFF);
+  For I := 0 To N - 1 Do
+    If (P + I >= 0) And (P + I < ConCols * ConRows) Then
+      If Attr Then ConAt[P + I] := V And 255 Else ConCh[P + I] := V And 255;
+  ConFull := True;
+  ConRowsDue := True;
+End;
+
+Function FillConsoleOutputCharacterA(H, Ch, N, C, PW : LongInt) : LongInt;
+Begin
+  ConFill(C, N, Ch, False);
+  If PW <> 0 Then MemL[0:PW] := N;
+  FillConsoleOutputCharacterA := 1;
+End;
+
+Function FillConsoleOutputAttribute(H, A, N, C, PW : LongInt) : LongInt;
+Begin
+  ConFill(C, N, A, True);
+  If PW <> 0 Then MemL[0:PW] := N;
+  FillConsoleOutputAttribute := 1;
+End;
+
+Function WriteConsoleOutputCharacterA(H, Buf, N, C, PW : LongInt) : LongInt;
+Var I, P : LongInt;
+Begin
+  ConEnsure;
+  P := ((C Shr 16) And $FFFF) * ConCols + (C And $FFFF);
+  For I := 0 To N - 1 Do
+    If (P + I >= 0) And (P + I < ConCols * ConRows) Then
+      ConCh[P + I] := Mem[0:Buf + I];
+  ConFull := True;
+  ConRowsDue := True;
+  If PW <> 0 Then MemL[0:PW] := N;
+  WriteConsoleOutputCharacterA := 1;
+End;
+
+{ Deplacer le rectangle PScr vers Dest, remplir ce qui est libere }
+Function ScrollConsoleScreenBufferA(H, PScr, PClip, Dest, PFill : LongInt)
+  : LongInt;
+Var L, T, R, B, DX, DY, X, Y, FC, FA, W, HH, I : LongInt;
+    TC, TA : Array[0..ConCols * ConRows - 1] Of Byte;
+Begin
+  ConEnsure;
+  L := ConS16(MemW[0:PScr]); T := ConS16(MemW[0:PScr + 2]);
+  R := ConS16(MemW[0:PScr + 4]); B := ConS16(MemW[0:PScr + 6]);
+  L := Max(L, 0); T := Max(T, 0);
+  R := Min(R, ConCols - 1); B := Min(B, ConRows - 1);
+  DX := ConS16(Dest); DY := ConS16(Dest Shr 16);
+  FC := 32; FA := ConAttr;
+  If PFill <> 0 Then
+  Begin
+    FC := Mem[0:PFill]; FA := Mem[0:PFill + 2];
+  End;
+  ScrollConsoleScreenBufferA := 1;
+  If (L > R) Or (T > B) Then Exit;
+  W := R - L + 1; HH := B - T + 1;
+  For Y := 0 To HH - 1 Do
+    For X := 0 To W - 1 Do
+    Begin
+      I := (T + Y) * ConCols + L + X;
+      TC[Y * ConCols + X] := ConCh[I]; TA[Y * ConCols + X] := ConAt[I];
+      ConCh[I] := FC; ConAt[I] := FA;
+    End;
+  For Y := 0 To HH - 1 Do
+    For X := 0 To W - 1 Do
+      If (DX + X >= 0) And (DX + X < ConCols) And (DY + Y >= 0) And
+         (DY + Y < ConRows) Then
+      Begin
+        I := (DY + Y) * ConCols + DX + X;
+        ConCh[I] := TC[Y * ConCols + X]; ConAt[I] := TA[Y * ConCols + X];
+      End;
+  ConFull := True;
+  ConRowsDue := True;
+End;
+
+Function SetConsoleScreenBufferSize(H, C : LongInt) : LongInt;
+Begin
+  SetConsoleScreenBufferSize := 1;
+End;
+
+Function SetConsoleTitleA(P : LongInt) : LongInt;
+Begin
+  ConTitle := PStr(P);
+  If ConW >= 0 Then
+  Begin
+    Wnds[ConW].Text := ConTitle;
+    KRepaint(ConW);
+    TaskbarChanged;
+  End;
+  SetConsoleTitleA := 1;
+End;
+
+Function GetConsoleTitleA(P, N : LongInt) : LongInt;
+Begin
+  PutPStr(P, ConTitle, N);
+  GetConsoleTitleA := Length(ConTitle);
+End;
+
+Function SetConsoleCtrlHandler(F, Add : LongInt) : LongInt;
+Begin
+  SetConsoleCtrlHandler := 1;
+End;
+
+Function GetConsoleCP : LongInt;
+Begin
+  GetConsoleCP := 850;
+End;
+
+Function GetConsoleOutputCP : LongInt;
+Begin
+  GetConsoleOutputCP := 850;
+End;
+
+Function SetConsoleCP(CP : LongInt) : LongInt;
+Begin
+  SetConsoleCP := 1;
+End;
+
+Function SetConsoleOutputCP(CP : LongInt) : LongInt;
+Begin
+  SetConsoleOutputCP := 1;
+End;
+
+Function GetLargestConsoleWindowSize(H : LongInt) : LongInt;
+Begin
+  GetLargestConsoleWindowSize := ConCols Or (ConRows Shl 16);
+End;
+
+Function Beep(F, D : LongInt) : LongInt;
+Begin
+  Beep := 1;
 End;
 
 { Ouvrir un fichier ; Disp : 1 CREATE_NEW 2 CREATE_ALWAYS 3 OPEN_EXISTING
@@ -9121,6 +9871,14 @@ Function KReadFile(H, Buf, N : LongInt; Var Got : LongInt) : Boolean;
 Var I, R : LongInt;
 Begin
   KReadFile := False; Got := 0;
+  If IsConsoleH(H) Then
+  Begin
+    { entree standard : la console (mode ligne par defaut) }
+    If (H = HStdIn) And ((ConW >= 0) Or AppConsole) Then
+      Got := ConReadIn(Buf, N);
+    KReadFile := True;
+    Exit;
+  End;
   I := KObjOf(H, koFile);
   If I < 0 Then
   Begin
@@ -9167,10 +9925,14 @@ Begin
   KWriteFile := -1;
   If IsConsoleH(H) Then
   Begin
-    S := '';
-    For I := 0 To Min(N, 200) - 1 Do
-      If Mem[0:Buf + I] >= 32 Then S := S + Chr(Mem[0:Buf + I]);
-    KLog('CON: ' + S);
+    If (ConW >= 0) Or AppConsole Then ConWrite(Buf, N)
+    Else
+    Begin
+      S := '';
+      For I := 0 To Min(N, 200) - 1 Do
+        If Mem[0:Buf + I] >= 32 Then S := S + Chr(Mem[0:Buf + I]);
+      KLog('CON: ' + S);
+    End;
     KWriteFile := N;
     Exit;
   End;
@@ -10626,8 +11388,13 @@ Begin
   ReleaseMutex := Ord(I >= 0);
 End;
 
+Procedure ChainStart; Forward;
+
 Function WaitForSingleObject(H, Ms : LongInt) : LongInt;
 Begin
+  { programme lance par CreateProcessA : lui passer la main }
+  If (ChainExec <> '') And (ChainObj >= 0) And
+     (KObjOf(H, koProcess) = ChainObj) And (CurT <> 0) Then ChainStart;
   WaitForSingleObject := KWait(H, Ms);
 End;
 
@@ -17936,6 +18703,15 @@ Begin
   DefaultPalette;
   MarkAll;
   KillingApp := False;
+  AppConsole := False;
+  { fin du programme : fermer sa console, sauf si l'Invite MS-DOS va
+    reprendre la main (programme lance depuis l'Invite) }
+  If (ConW >= 0) And Not ConKeep And (ChainExec = '') And (ChainRet = '') Then
+  Begin
+    I := ConW;
+    ConW := -1;
+    DestroyW(I);
+  End;
   KLog('Programme termine');
 End;
 
@@ -18013,7 +18789,14 @@ Begin
   CurDirS := ParentDir(AppPath);
   If Length(CurDirS) = 3 Then CurDirS := Copy(CurDirS, 1, 2);
   AppProcObj := KObjNew(koProcess);
-  KLog('Lancement de ' + AppPath + ' (sous-systeme ' + IntStr(Sub) + ')');
+  KLog('Lancement de ' + S + ' (sous-systeme ' + IntStr(Sub) + ')');
+  { programme console : la console (fenetre Invite MS-DOS) }
+  AppConsole := Sub = 3;
+  If AppConsole Then
+  Begin
+    If ConW < 0 Then ConTitle := '';
+    ConEnsure;
+  End;
   T := ThreadNew(AppEntry, 0, $100000, True);
   If T < 0 Then
   Begin
@@ -18023,6 +18806,137 @@ Begin
   AppMainT := T;
   HeapOwner := 0;
   CursorSetShape(0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Lancer un programme depuis un autre (Invite MS-DOS)                  }
+{ ------------------------------------------------------------------ }
+{ Un seul programme Win32 a la fois : CreateProcessA note le programme
+  demande ; quand l'appelant l'attend (WaitForSingleObject), il se
+  termine, le programme demande demarre, puis l'appelant est relance
+  (l'Invite MS-DOS avec /R : sans banniere, meme console, meme
+  repertoire). }
+
+Function CreateProcessA(PApp, PCmd, PA, TA, Inh, Flags, Env, PDir, SI,
+                        PI : LongInt) : LongInt;
+Var S, Prog, Args, F : String; P, I : LongInt; Q : Boolean;
+Begin
+  CreateProcessA := 0;
+  S := '';
+  If PCmd <> 0 Then S := Trim(PStr(PCmd));
+  If PApp <> 0 Then
+  Begin
+    Prog := PStr(PApp);
+    Args := S;
+    { la ligne de commande commence par le nom du programme }
+    If (Args <> '') And (Args[1] = '"') Then
+    Begin
+      P := Pos('"', Copy(Args, 2, 255));
+      If P > 0 Then Args := Copy(Args, P + 2, 255) Else Args := '';
+    End
+    Else
+    Begin
+      P := Pos(' ', Args);
+      If P > 0 Then Args := Copy(Args, P + 1, 255) Else Args := '';
+    End;
+  End
+  Else
+  Begin
+    Q := (S <> '') And (S[1] = '"');
+    If Q Then
+    Begin
+      P := Pos('"', Copy(S, 2, 255));
+      If P = 0 Then P := Length(S);
+      Prog := Copy(S, 2, P - 1);
+      Args := Copy(S, P + 2, 255);
+    End
+    Else
+    Begin
+      P := Pos(' ', S);
+      If P = 0 Then P := Length(S) + 1;
+      Prog := Copy(S, 1, P - 1);
+      Args := Copy(S, P + 1, 255);
+    End;
+  End;
+  Args := Trim(Args);
+  F := FindModuleFile(Prog);
+  If F = '' Then F := FindModuleFile(Prog + '.EXE');
+  If F = '' Then
+  Begin
+    SetErr(ErrFileNotFound);
+    Exit;
+  End;
+  I := KObjNew(koProcess);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
+  ChainExec := F; ChainArgs := Args; ChainObj := I;
+  If PI <> 0 Then
+  Begin
+    MemL[0:PI] := KHandle(I); MemL[0:PI + 4] := KHandle(I);
+    MemL[0:PI + 8] := $200 + I; MemL[0:PI + 12] := $300 + I;
+  End;
+  CreateProcessA := 1;
+End;
+
+Function GetExitCodeProcess(H, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := KObjOf(H, koProcess);
+  If P <> 0 Then
+    If (I >= 0) And (KObjs[I].F2 = 0) Then MemL[0:P] := 259
+    Else MemL[0:P] := 0;
+  GetExitCodeProcess := 1;
+End;
+
+{ L'appelant attend le programme demande : passer la main }
+Procedure ChainStart;
+Begin
+  ChainRet := AppPath;
+  If UpStr(BaseName(AppPath)) = 'COMMAND.EXE' Then ChainRetArgs := '/R'
+  Else ChainRetArgs := '';
+  ChainDir := CurDirS;
+  ConKeep := True;
+  ExitProcessK(0);
+End;
+
+{ Tache 0 : lancer le programme demande, puis revenir a l'appelant }
+Procedure ChainPoll;
+Var P, A : String;
+Begin
+  If ConKillReq Then
+  Begin
+    ConKillReq := False;
+    If AppRunning Then KillApp;
+  End;
+  If AppRunning Then Exit;
+  If ChainExec <> '' Then
+  Begin
+    P := ChainExec; A := ChainArgs;
+    ChainExec := '';
+    If (ChainObj >= 0) And KObjs[ChainObj].Used Then KObjs[ChainObj].F2 := 1;
+    ChainObj := -1;
+    If Not RunExe(P, A) Then
+    Begin
+      If ConW >= 0 Then
+        ConWriteS(L('Impossible de lancer ', 'Cannot run ', 'Kann nicht ',
+                    'Impossibile eseguire ', 'No se puede ejecutar ') +
+                  P + #13#10);
+    End
+    Else
+    Begin
+      If ChainDir <> '' Then CurDirS := ChainDir;
+      Exit;
+    End;
+  End;
+  If ChainRet <> '' Then
+  Begin
+    P := ChainRet; A := ChainRetArgs;
+    ChainRet := '';
+    ConKeep := False;
+    If Not RunExe(P, A) Then Exit;
+    If ChainDir <> '' Then CurDirS := ChainDir;
+    ChainDir := '';
+  End;
 End;
 
 { ==================================================================== }
@@ -22696,7 +23610,13 @@ Var AH, AL, H, N, R, P, D, T : LongInt; S : String;
 Begin
   AH := (RegW(40) Shr 8) And $FF;
   AL := RegW(40) And $FF;
-  If W16Tmp = 0 Then W16Tmp := KAlloc(512);
+  If W16Tmp = 0 Then
+  Begin
+    { tampon du noyau : survit a la fin du programme (KFreeOwner) }
+    T := HeapOwner; HeapOwner := 0;
+    W16Tmp := KAlloc(512);
+    HeapOwner := T;
+  End;
   DosCF(0);
   If W16Trace Then
   Begin
@@ -27644,7 +28564,17 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   GetEnvironmentVariableA, SetEnvironmentVariableA,
   GetEnvironmentStrings, GetEnvironmentStringsA, FreeEnvironmentStringsA,
   GetVersion, GetVersionExA, GetSystemInfo, GetCommandLineA, GetStartupInfoA,
-  GetStdHandle, SetStdHandle, GetLastError, SetLastError, SetErrorMode,
+  GetStdHandle, SetStdHandle, AllocConsole, FreeConsole, GetConsoleMode,
+  SetConsoleMode, WriteConsoleA, ReadConsoleA, PeekConsoleInputA,
+  ReadConsoleInputA, GetNumberOfConsoleInputEvents, FlushConsoleInputBuffer,
+  GetConsoleScreenBufferInfo, SetConsoleCursorPosition,
+  SetConsoleTextAttribute, GetConsoleCursorInfo, SetConsoleCursorInfo,
+  FillConsoleOutputCharacterA, FillConsoleOutputAttribute,
+  WriteConsoleOutputCharacterA, ScrollConsoleScreenBufferA,
+  SetConsoleScreenBufferSize, SetConsoleTitleA, GetConsoleTitleA,
+  SetConsoleCtrlHandler, GetConsoleCP, GetConsoleOutputCP, SetConsoleCP,
+  SetConsoleOutputCP, GetLargestConsoleWindowSize, Beep, CreateProcessA,
+  GetExitCodeProcess, GetLastError, SetLastError, SetErrorMode,
   OutputDebugStringA, SetUnhandledExceptionFilter, UnhandledExceptionFilter,
   GetCurrentProcess, GetCurrentProcessId, GetCurrentThread,
   GetCurrentThreadId, ExitProcess, TerminateProcess, RaiseException,
@@ -27781,6 +28711,7 @@ Begin
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
+  KClass[ikConsole] := ClassAdd('#Console', 0, ikConsole, 0);
   KClass[ikButton] := ClassAdd('BUTTON', 0, ikButton, CS_DBLCLKS);
   KClass[ikStatic] := ClassAdd('STATIC', 0, ikStatic, 0);
   KClass[ikEdit] := ClassAdd('EDIT', 0, ikEdit, CS_DBLCLKS);
@@ -27798,6 +28729,7 @@ Var I : LongInt; Busy : Boolean;
 Begin
   Repeat
     ProcessInput;
+    ChainPoll;
     NetPoll;
     RunMMTimers;
     RunWave;
@@ -27884,6 +28816,12 @@ BEGIN
   W16Init2;
   NetInit;
   AppProcObj := -1;
+  ConW := -1; ConTitle := ''; ConRowsDue := False; ConLastCY := -1;
+  ConPalVer := -1;
+  ConKeep := False; ConKillReq := False;
+  AppConsole := False; ChainObj := -1;
+  ChainExec := ''; ChainArgs := ''; ChainRet := ''; ChainRetArgs := '';
+  ChainDir := '';
   DeskBuild;
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,
                       WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
