@@ -25407,51 +25407,6 @@ Begin
   If B = 0 Then SysStringLen := 0 Else SysStringLen := MemL[0:B - 4] Div 2;
 End;
 
-{ WININET : Pasdows n'a pas de client HTTP integre ; les programmes
-  recoivent une erreur (ERROR_INTERNET_NAME_NOT_RESOLVED) }
-Function InternetOpenA(Agent, Access, Proxy, Bypass, Flags : LongInt)
-  : LongInt;
-Begin
-  SetErr(12007);
-  InternetOpenA := 0;
-End;
-
-Function InternetOpenUrlA(H, Url, Hdr, HdrLen, Flags, Ctx : LongInt)
-  : LongInt;
-Begin
-  SetErr(12007);
-  InternetOpenUrlA := 0;
-End;
-
-Function InternetReadFile(H, Buf, N, PRead : LongInt) : LongInt;
-Begin
-  If PRead <> 0 Then MemL[0:PRead] := 0;
-  SetErr(6);
-  InternetReadFile := 0;
-End;
-
-Function InternetSetOptionA(H, Opt, Buf, N : LongInt) : LongInt;
-Begin
-  InternetSetOptionA := 1;
-End;
-
-Function InternetCloseHandle(H : LongInt) : LongInt;
-Begin
-  InternetCloseHandle := 1;
-End;
-
-Function HttpQueryInfoA(H, Info, Buf, PLen, PIdx : LongInt) : LongInt;
-Begin
-  SetErr(6);
-  HttpQueryInfoA := 0;
-End;
-
-Function InternetGetConnectedState(PFlags, R : LongInt) : LongInt;
-Begin
-  If PFlags <> 0 Then MemL[0:PFlags] := 0;
-  InternetGetConnectedState := 0;
-End;
-
 Function OleInitialize(P : LongInt) : LongInt;
 Begin
   OleInitialize := 0;
@@ -34621,9 +34576,13 @@ End;
 { TCP                                                                  }
 { ------------------------------------------------------------------ }
 
+{ fenetre annoncee : au plus 7 segments, ce que l'anneau de reception
+  de la NE2000 (58 pages de 256 octets) garde entre deux lectures ;
+  au-dela, une rafale du correspondant deborde de la carte et les
+  segments perdus attendent une retransmission (500 ms) }
 Function SkWnd(S : LongInt) : LongInt;
 Begin
-  SkWnd := Min(SkRxSize - SkRxLen[S], 65535);
+  SkWnd := Min(SkRxSize - SkRxLen[S], 7 * NetMss);
 End;
 
 { Segment TCP : Len octets de donnees depuis Data (adresse lineaire) }
@@ -35239,6 +35198,50 @@ Begin
 End;
 
 { Nom -> adresse IP ; False si introuvable }
+{ fichier HOSTS du dossier systeme (comme C:\WINDOWS\HOSTS de
+  Windows 95) : lignes "adresse nom [nom...]", # pour un commentaire }
+Function HostsLookup(Const U : String; Var IP : LongInt) : Boolean;
+Var B : Array[0..4095] Of Byte; H, N, I, K : LongInt; Ln, Tk, Ad : String;
+    Cm : Boolean;
+Begin
+  HostsLookup := False;
+  H := KOpenFile(SysDir + 'HOSTS', False, 3);
+  If H = INVALID_HANDLE Then Exit;
+  N := 0;
+  If Not KReadFile(H, LongInt(@B[0]), 4095, N) Then N := 0;
+  CloseHandle(H);
+  B[N] := 10;
+  Ln := '';
+  For I := 0 To N Do
+    If (B[I] = 10) Or (B[I] = 13) Then
+    Begin
+      { decouper la ligne en mots ; le premier est l'adresse }
+      Ad := ''; Tk := ''; Cm := False;
+      Ln := Ln + ' ';
+      For K := 1 To Length(Ln) Do
+      Begin
+        If Ln[K] = '#' Then Cm := True;
+        If Cm Then Continue;
+        If (Ln[K] = ' ') Or (Ln[K] = #9) Then
+        Begin
+          If Tk <> '' Then
+          Begin
+            If Ad = '' Then Ad := Tk
+            Else If (UpStr(Tk) = U) And ParseIp(Ad, IP) Then
+            Begin
+              HostsLookup := True;
+              Exit;
+            End;
+          End;
+          Tk := '';
+        End
+        Else If Length(Tk) < 255 Then Tk := Tk + Ln[K];
+      End;
+      Ln := '';
+    End
+    Else If Length(Ln) < 250 Then Ln := Ln + Chr(B[I]);
+End;
+
 Function NetLookup(Name : String; Var IP : LongInt) : Boolean;
 Var D, O, I, K, N, T, Try0 : LongInt; Lb : String; U : String;
 Begin
@@ -35250,6 +35253,7 @@ Begin
     IP := $0100007F;
     Exit;
   End;
+  If HostsLookup(U, IP) Then Exit;
   If (U = 'PASDOWS') And (NetIP <> 0) Then
   Begin
     IP := NetIP;
@@ -36474,6 +36478,1615 @@ Begin
   WS_WSARecvEx := WS_recv(H, Buf, Len, 0);
 End;
 
+{ ==================================================================== }
+{ HTTPS : TLS 1.2 et client HTTP de WININET.DLL                         }
+{ ==================================================================== }
+{ Les memes sources (TlXXX, HtXXX) sont essayees hors de Pasdows avec   }
+{ OpenSSL ; ici, les octets sont lus par Mem et les sockets sont celles }
+{ de la pile TCP/IP du noyau (WS_xxx).                                  }
+
+Type
+  TlPtr = LongInt;
+
+Function TlGet(A : TlPtr) : LongInt;
+Begin
+  TlGet := Mem[0:A];
+End;
+
+Procedure TlPut(A : TlPtr; V : LongInt);
+Begin
+  Mem[0:A] := V And 255;
+End;
+
+{ memoire du noyau (proprietaire 0 : non liberee a la fin d'un
+  programme) }
+Function TlNew(N : LongInt) : TlPtr;
+Var O : LongInt;
+Begin
+  O := HeapOwner; HeapOwner := 0;
+  TlNew := KAlloc(N);
+  HeapOwner := O;
+End;
+
+Procedure TlEntropy; Forward;
+
+Function TlSockOpen(Const Host : String; Port : LongInt) : LongInt;
+Forward;
+
+Function TlSockSend(S, A, N : LongInt) : LongInt;
+Begin
+  TlSockSend := WS_send(S, A, N, 0);
+End;
+
+Function TlSockRecv(S, A, N : LongInt) : LongInt;
+Begin
+  TlSockRecv := WS_recv(S, A, N, 0);
+End;
+
+Procedure TlSockClose(S : LongInt);
+Begin
+  WS_closesocket(S);
+End;
+{ ==================================================================== }
+{ Cryptographie de TLS 1.2 : SHA-256, HMAC, PRF, AES-128-GCM, X25519  }
+{ (mots de 32 bits en LongInt ; Shr est un decalage logique)          }
+{ ==================================================================== }
+
+Type
+  TlSha = Record
+    H : Array[0..7] Of LongInt;
+    B : Array[0..63] Of Byte;
+    N : LongInt;                     { octets en attente dans B }
+    Len : LongInt;                   { longueur totale (octets) }
+  End;
+  TlFe = Array[0..31] Of LongInt;    { element de GF(2^255-19), 8 bits }
+  TlAes = Record
+    RK : Array[0..43] Of LongInt;    { cles de tour (AES-128) }
+    M : Array[0..63] Of LongInt;     { GHASH : 16 multiples de H }
+  End;
+
+Const
+  TlShaKC : Array[0..63] Of LongWord = (
+    $428A2F98, $71374491, $B5C0FBCF, $E9B5DBA5, $3956C25B, $59F111F1,
+    $923F82A4, $AB1C5ED5, $D807AA98, $12835B01, $243185BE, $550C7DC3,
+    $72BE5D74, $80DEB1FE, $9BDC06A7, $C19BF174, $E49B69C1, $EFBE4786,
+    $0FC19DC6, $240CA1CC, $2DE92C6F, $4A7484AA, $5CB0A9DC, $76F988DA,
+    $983E5152, $A831C66D, $B00327C8, $BF597FC7, $C6E00BF3, $D5A79147,
+    $06CA6351, $14292967, $27B70A85, $2E1B2138, $4D2C6DFC, $53380D13,
+    $650A7354, $766A0ABB, $81C2C92E, $92722C85, $A2BFE8A1, $A81A664B,
+    $C24B8B70, $C76C51A3, $D192E819, $D6990624, $F40E3585, $106AA070,
+    $19A4C116, $1E376C08, $2748774C, $34B0BCB5, $391C0CB3, $4ED8AA4A,
+    $5B9CCA4F, $682E6FF3, $748F82EE, $78A5636F, $84C87814, $8CC70208,
+    $90BEFFFA, $A4506CEB, $BEF9A3F7, $C67178F2);
+  TlSBox : Array[0..255] Of Byte = (
+    $63, $7C, $77, $7B, $F2, $6B, $6F, $C5, $30, $01, $67, $2B,
+    $FE, $D7, $AB, $76, $CA, $82, $C9, $7D, $FA, $59, $47, $F0,
+    $AD, $D4, $A2, $AF, $9C, $A4, $72, $C0, $B7, $FD, $93, $26,
+    $36, $3F, $F7, $CC, $34, $A5, $E5, $F1, $71, $D8, $31, $15,
+    $04, $C7, $23, $C3, $18, $96, $05, $9A, $07, $12, $80, $E2,
+    $EB, $27, $B2, $75, $09, $83, $2C, $1A, $1B, $6E, $5A, $A0,
+    $52, $3B, $D6, $B3, $29, $E3, $2F, $84, $53, $D1, $00, $ED,
+    $20, $FC, $B1, $5B, $6A, $CB, $BE, $39, $4A, $4C, $58, $CF,
+    $D0, $EF, $AA, $FB, $43, $4D, $33, $85, $45, $F9, $02, $7F,
+    $50, $3C, $9F, $A8, $51, $A3, $40, $8F, $92, $9D, $38, $F5,
+    $BC, $B6, $DA, $21, $10, $FF, $F3, $D2, $CD, $0C, $13, $EC,
+    $5F, $97, $44, $17, $C4, $A7, $7E, $3D, $64, $5D, $19, $73,
+    $60, $81, $4F, $DC, $22, $2A, $90, $88, $46, $EE, $B8, $14,
+    $DE, $5E, $0B, $DB, $E0, $32, $3A, $0A, $49, $06, $24, $5C,
+    $C2, $D3, $AC, $62, $91, $95, $E4, $79, $E7, $C8, $37, $6D,
+    $8D, $D5, $4E, $A9, $6C, $56, $F4, $EA, $65, $7A, $AE, $08,
+    $BA, $78, $25, $2E, $1C, $A6, $B4, $C6, $E8, $DD, $74, $1F,
+    $4B, $BD, $8B, $8A, $70, $3E, $B5, $66, $48, $03, $F6, $0E,
+    $61, $35, $57, $B9, $86, $C1, $1D, $9E, $E1, $F8, $98, $11,
+    $69, $D9, $8E, $94, $9B, $1E, $87, $E9, $CE, $55, $28, $DF,
+    $8C, $A1, $89, $0D, $BF, $E6, $42, $68, $41, $99, $2D, $0F,
+    $B0, $54, $BB, $16);
+  TlLast4 : Array[0..15] Of LongInt = ($0000, $1C20, $3840, $2460,
+    $7080, $6CA0, $48C0, $54E0, $E100, $FD20, $D940, $C560, $9180,
+    $8DA0, $A9C0, $B5E0);
+
+Var
+  TlK : Array[0..63] Of LongInt;
+  TlTe : Array[0..255] Of LongInt;   { table T0 de l'AES }
+  TlReady : Boolean;
+
+Function TlRor(X, N : LongInt) : LongInt;
+Begin
+  TlRor := (X Shr N) Or (X Shl (32 - N));
+End;
+
+Function TlXt(B : LongInt) : LongInt;
+Begin
+  B := B Shl 1;
+  If (B And $100) <> 0 Then B := B Xor $11B;
+  TlXt := B And 255;
+End;
+
+Procedure TlInit;
+Var I, S, S2, S3 : LongInt; W : LongInt;
+Begin
+  If TlReady Then Exit;
+  For I := 0 To 63 Do Begin W := TlShaKC[I]; TlK[I] := W; End;
+  For I := 0 To 255 Do
+  Begin
+    S := TlSBox[I]; S2 := TlXt(S); S3 := S2 Xor S;
+    TlTe[I] := (S2 Shl 24) Or (S Shl 16) Or (S Shl 8) Or S3;
+  End;
+  TlReady := True;
+End;
+
+{ ---- SHA-256 ---- }
+
+Procedure TlShaBlock(Var C : TlSha);
+Var W : Array[0..63] Of LongInt; I, A, B, D, E, F, G, H, T1, T2,
+    Cc, S0, S1 : LongInt;
+Begin
+  For I := 0 To 15 Do
+    W[I] := (C.B[I * 4] Shl 24) Or (C.B[I * 4 + 1] Shl 16) Or
+            (C.B[I * 4 + 2] Shl 8) Or C.B[I * 4 + 3];
+  For I := 16 To 63 Do
+  Begin
+    S0 := TlRor(W[I - 15], 7) Xor TlRor(W[I - 15], 18) Xor
+          (W[I - 15] Shr 3);
+    S1 := TlRor(W[I - 2], 17) Xor TlRor(W[I - 2], 19) Xor
+          (W[I - 2] Shr 10);
+    W[I] := W[I - 16] + S0 + W[I - 7] + S1;
+  End;
+  A := C.H[0]; B := C.H[1]; Cc := C.H[2]; D := C.H[3];
+  E := C.H[4]; F := C.H[5]; G := C.H[6]; H := C.H[7];
+  For I := 0 To 63 Do
+  Begin
+    S1 := TlRor(E, 6) Xor TlRor(E, 11) Xor TlRor(E, 25);
+    T1 := H + S1 + ((E And F) Xor ((Not E) And G)) + TlK[I] + W[I];
+    S0 := TlRor(A, 2) Xor TlRor(A, 13) Xor TlRor(A, 22);
+    T2 := S0 + ((A And B) Xor (A And Cc) Xor (B And Cc));
+    H := G; G := F; F := E; E := D + T1;
+    D := Cc; Cc := B; B := A; A := T1 + T2;
+  End;
+  C.H[0] := C.H[0] + A; C.H[1] := C.H[1] + B; C.H[2] := C.H[2] + Cc;
+  C.H[3] := C.H[3] + D; C.H[4] := C.H[4] + E; C.H[5] := C.H[5] + F;
+  C.H[6] := C.H[6] + G; C.H[7] := C.H[7] + H;
+End;
+
+Procedure TlShaInit(Var C : TlSha);
+Begin
+  TlInit;
+  C.H[0] := $6A09E667; C.H[1] := LongInt($BB67AE85);
+  C.H[2] := $3C6EF372; C.H[3] := LongInt($A54FF53A);
+  C.H[4] := $510E527F; C.H[5] := LongInt($9B05688C);
+  C.H[6] := $1F83D9AB; C.H[7] := $5BE0CD19;
+  C.N := 0; C.Len := 0;
+End;
+
+{ ajoute N octets a partir de l'adresse A }
+Procedure TlShaAdd(Var C : TlSha; A : TlPtr; N : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To N - 1 Do
+  Begin
+    C.B[C.N] := TlGet(A + I);
+    Inc(C.N);
+    If C.N = 64 Then Begin TlShaBlock(C); C.N := 0; End;
+  End;
+  C.Len := C.Len + N;
+End;
+
+Procedure TlShaByte(Var C : TlSha; V : LongInt);
+Var B : Array[0..0] Of Byte;
+Begin
+  B[0] := V And 255;
+  TlShaAdd(C, TlPtr(@B[0]), 1);
+End;
+
+{ empreinte de 32 octets a l'adresse Out (C est detruit) }
+Procedure TlShaDone(Var C : TlSha; Out0 : TlPtr);
+Var I, L : LongInt;
+Begin
+  L := C.Len;
+  TlShaByte(C, $80);
+  While C.N <> 56 Do TlShaByte(C, 0);
+  TlShaByte(C, 0); TlShaByte(C, 0); TlShaByte(C, 0);
+  TlShaByte(C, (L Shr 29) And 7);
+  TlShaByte(C, (L Shr 21) And 255); TlShaByte(C, (L Shr 13) And 255);
+  TlShaByte(C, (L Shr 5) And 255); TlShaByte(C, (L Shl 3) And 255);
+  For I := 0 To 7 Do
+  Begin
+    TlPut(Out0 + I * 4, C.H[I] Shr 24);
+    TlPut(Out0 + I * 4 + 1, C.H[I] Shr 16);
+    TlPut(Out0 + I * 4 + 2, C.H[I] Shr 8);
+    TlPut(Out0 + I * 4 + 3, C.H[I]);
+  End;
+End;
+
+{ ---- HMAC-SHA256 (cle de 64 octets au plus) et PRF de TLS 1.2 ---- }
+
+Procedure TlHmac(Key : TlPtr; KLen : LongInt; Msg : TlPtr;
+  MLen : LongInt; Msg2 : TlPtr; M2Len : LongInt; Out0 : TlPtr);
+Var C : TlSha; Pad : Array[0..63] Of Byte; In0 : Array[0..31] Of Byte;
+    I : LongInt;
+Begin
+  For I := 0 To 63 Do
+    If I < KLen Then Pad[I] := TlGet(Key + I) Xor $36
+    Else Pad[I] := $36;
+  TlShaInit(C);
+  TlShaAdd(C, TlPtr(@Pad[0]), 64);
+  TlShaAdd(C, Msg, MLen);
+  If M2Len > 0 Then TlShaAdd(C, Msg2, M2Len);
+  TlShaDone(C, TlPtr(@In0[0]));
+  For I := 0 To 63 Do Pad[I] := Pad[I] Xor ($36 Xor $5C);
+  TlShaInit(C);
+  TlShaAdd(C, TlPtr(@Pad[0]), 64);
+  TlShaAdd(C, TlPtr(@In0[0]), 32);
+  TlShaDone(C, Out0);
+End;
+
+{ PRF(secret, label + seed) sur N octets }
+Procedure TlPrf(Sec : TlPtr; SLen : LongInt; Const Lbl : String;
+  Seed : TlPtr; SdLen : LongInt; Out0 : TlPtr; N : LongInt);
+Var LS : Array[0..127] Of Byte; A, T : Array[0..31] Of Byte;
+    I, L, Done : LongInt;
+Begin
+  L := Length(Lbl);
+  For I := 1 To L Do LS[I - 1] := Ord(Lbl[I]);
+  For I := 0 To SdLen - 1 Do LS[L + I] := TlGet(Seed + I);
+  L := L + SdLen;
+  TlHmac(Sec, SLen, TlPtr(@LS[0]), L, TlPtr(@LS[0]), 0, TlPtr(@A[0]));
+  Done := 0;
+  While Done < N Do
+  Begin
+    TlHmac(Sec, SLen, TlPtr(@A[0]), 32, TlPtr(@LS[0]), L,
+           TlPtr(@T[0]));
+    I := 0;
+    While (I < 32) And (Done < N) Do
+    Begin
+      TlPut(Out0 + Done, T[I]); Inc(I); Inc(Done);
+    End;
+    TlHmac(Sec, SLen, TlPtr(@A[0]), 32, TlPtr(@A[0]), 0, TlPtr(@A[0]));
+  End;
+End;
+
+{ ---- AES-128 (chiffrement seulement : GCM n'utilise que lui) ---- }
+
+Type
+  TlBlk = Array[0..15] Of Byte;
+  TlKey32 = Array[0..31] Of Byte;
+
+Var
+  TlTe1, TlTe2, TlTe3 : Array[0..255] Of LongInt;
+
+Procedure TlAesTables;
+Var I : LongInt;
+Begin
+  TlInit;
+  For I := 0 To 255 Do
+  Begin
+    TlTe1[I] := TlRor(TlTe[I], 8);
+    TlTe2[I] := TlRor(TlTe[I], 16);
+    TlTe3[I] := TlRor(TlTe[I], 24);
+  End;
+End;
+
+Function TlSubW(W : LongInt) : LongInt;
+Begin
+  TlSubW := (TlSBox[(W Shr 24) And 255] Shl 24) Or
+            (TlSBox[(W Shr 16) And 255] Shl 16) Or
+            (TlSBox[(W Shr 8) And 255] Shl 8) Or TlSBox[W And 255];
+End;
+
+Function TlGetW(Var B : TlBlk; I : LongInt) : LongInt;
+Begin
+  TlGetW := (B[I] Shl 24) Or (B[I + 1] Shl 16) Or (B[I + 2] Shl 8) Or
+            B[I + 3];
+End;
+
+Procedure TlPutW(Var B : TlBlk; I, W : LongInt);
+Begin
+  B[I] := (W Shr 24) And 255; B[I + 1] := (W Shr 16) And 255;
+  B[I + 2] := (W Shr 8) And 255; B[I + 3] := W And 255;
+End;
+
+Procedure TlAesEnc(Var A : TlAes; Var Inp, Outp : TlBlk);
+Var S0, S1, S2, S3, T0, T1, T2, T3, R, K : LongInt;
+Begin
+  S0 := TlGetW(Inp, 0) Xor A.RK[0]; S1 := TlGetW(Inp, 4) Xor A.RK[1];
+  S2 := TlGetW(Inp, 8) Xor A.RK[2]; S3 := TlGetW(Inp, 12) Xor A.RK[3];
+  K := 4;
+  For R := 1 To 9 Do
+  Begin
+    T0 := TlTe[S0 Shr 24] Xor TlTe1[(S1 Shr 16) And 255] Xor
+          TlTe2[(S2 Shr 8) And 255] Xor TlTe3[S3 And 255] Xor A.RK[K];
+    T1 := TlTe[S1 Shr 24] Xor TlTe1[(S2 Shr 16) And 255] Xor
+          TlTe2[(S3 Shr 8) And 255] Xor TlTe3[S0 And 255] Xor
+          A.RK[K + 1];
+    T2 := TlTe[S2 Shr 24] Xor TlTe1[(S3 Shr 16) And 255] Xor
+          TlTe2[(S0 Shr 8) And 255] Xor TlTe3[S1 And 255] Xor
+          A.RK[K + 2];
+    T3 := TlTe[S3 Shr 24] Xor TlTe1[(S0 Shr 16) And 255] Xor
+          TlTe2[(S1 Shr 8) And 255] Xor TlTe3[S2 And 255] Xor
+          A.RK[K + 3];
+    S0 := T0; S1 := T1; S2 := T2; S3 := T3;
+    K := K + 4;
+  End;
+  T0 := (TlSBox[S0 Shr 24] Shl 24) Or (TlSBox[(S1 Shr 16) And 255] Shl 16)
+        Or (TlSBox[(S2 Shr 8) And 255] Shl 8) Or TlSBox[S3 And 255];
+  T1 := (TlSBox[S1 Shr 24] Shl 24) Or (TlSBox[(S2 Shr 16) And 255] Shl 16)
+        Or (TlSBox[(S3 Shr 8) And 255] Shl 8) Or TlSBox[S0 And 255];
+  T2 := (TlSBox[S2 Shr 24] Shl 24) Or (TlSBox[(S3 Shr 16) And 255] Shl 16)
+        Or (TlSBox[(S0 Shr 8) And 255] Shl 8) Or TlSBox[S1 And 255];
+  T3 := (TlSBox[S3 Shr 24] Shl 24) Or (TlSBox[(S0 Shr 16) And 255] Shl 16)
+        Or (TlSBox[(S1 Shr 8) And 255] Shl 8) Or TlSBox[S2 And 255];
+  TlPutW(Outp, 0, T0 Xor A.RK[40]); TlPutW(Outp, 4, T1 Xor A.RK[41]);
+  TlPutW(Outp, 8, T2 Xor A.RK[42]); TlPutW(Outp, 12, T3 Xor A.RK[43]);
+End;
+
+{ cle de 16 octets ; prepare aussi les tables de GHASH (H = E(0)) }
+Procedure TlAesKey(Var A : TlAes; Var Key : TlBlk);
+Const Rc : Array[0..9] Of LongInt = ($01, $02, $04, $08, $10, $20,
+  $40, $80, $1B, $36);
+Var I, T, V0, V1, V2, V3, J, B : LongInt; Z : TlBlk;
+Begin
+  TlAesTables;
+  For I := 0 To 3 Do A.RK[I] := TlGetW(Key, I * 4);
+  For I := 4 To 43 Do
+  Begin
+    T := A.RK[I - 1];
+    If (I And 3) = 0 Then
+      T := TlSubW(TlRor(T, 24)) Xor (Rc[I Div 4 - 1] Shl 24);
+    A.RK[I] := A.RK[I - 4] Xor T;
+  End;
+  For I := 0 To 15 Do Z[I] := 0;
+  TlAesEnc(A, Z, Z);
+  V0 := TlGetW(Z, 0); V1 := TlGetW(Z, 4);
+  V2 := TlGetW(Z, 8); V3 := TlGetW(Z, 12);
+  For I := 0 To 3 Do A.M[I] := 0;
+  A.M[32] := V0; A.M[33] := V1; A.M[34] := V2; A.M[35] := V3;
+  I := 4;
+  While I > 0 Do
+  Begin
+    B := V3 And 1;
+    V3 := (V3 Shr 1) Or (V2 Shl 31);
+    V2 := (V2 Shr 1) Or (V1 Shl 31);
+    V1 := (V1 Shr 1) Or (V0 Shl 31);
+    V0 := V0 Shr 1;
+    If B <> 0 Then V0 := V0 Xor LongInt($E1000000);
+    A.M[I * 4] := V0; A.M[I * 4 + 1] := V1;
+    A.M[I * 4 + 2] := V2; A.M[I * 4 + 3] := V3;
+    I := I Div 2;
+  End;
+  I := 2;
+  While I <= 8 Do
+  Begin
+    For J := 1 To I - 1 Do
+      For B := 0 To 3 Do
+        A.M[(I + J) * 4 + B] := A.M[I * 4 + B] Xor A.M[J * 4 + B];
+    I := I * 2;
+  End;
+End;
+
+{ Y := Y * H dans GF(2^128) (tables de 4 bits, comme mbed TLS) }
+Procedure TlGMul(Var A : TlAes; Var Y : TlBlk);
+Var Z0, Z1, Z2, Z3, I, Lo, Hi, R : LongInt;
+Begin
+  Lo := Y[15] And 15;
+  Z0 := A.M[Lo * 4]; Z1 := A.M[Lo * 4 + 1];
+  Z2 := A.M[Lo * 4 + 2]; Z3 := A.M[Lo * 4 + 3];
+  For I := 15 DownTo 0 Do
+  Begin
+    Lo := Y[I] And 15; Hi := (Y[I] Shr 4) And 15;
+    If I <> 15 Then
+    Begin
+      R := Z3 And 15;
+      Z3 := (Z3 Shr 4) Or (Z2 Shl 28); Z2 := (Z2 Shr 4) Or (Z1 Shl 28);
+      Z1 := (Z1 Shr 4) Or (Z0 Shl 28);
+      Z0 := (Z0 Shr 4) Xor (TlLast4[R] Shl 16);
+      Z0 := Z0 Xor A.M[Lo * 4]; Z1 := Z1 Xor A.M[Lo * 4 + 1];
+      Z2 := Z2 Xor A.M[Lo * 4 + 2]; Z3 := Z3 Xor A.M[Lo * 4 + 3];
+    End;
+    R := Z3 And 15;
+    Z3 := (Z3 Shr 4) Or (Z2 Shl 28); Z2 := (Z2 Shr 4) Or (Z1 Shl 28);
+    Z1 := (Z1 Shr 4) Or (Z0 Shl 28);
+    Z0 := (Z0 Shr 4) Xor (TlLast4[R] Shl 16);
+    Z0 := Z0 Xor A.M[Hi * 4]; Z1 := Z1 Xor A.M[Hi * 4 + 1];
+    Z2 := Z2 Xor A.M[Hi * 4 + 2]; Z3 := Z3 Xor A.M[Hi * 4 + 3];
+  End;
+  TlPutW(Y, 0, Z0); TlPutW(Y, 4, Z1); TlPutW(Y, 8, Z2); TlPutW(Y, 12, Z3);
+End;
+
+{ AES-128-GCM sur N octets a l'adresse D (chiffre ou dechiffre sur
+  place) ; Iv : 12 octets, Aad : NA octets ; Tag : 16 octets calcules
+  (sur le texte chiffre) }
+Procedure TlGcm(Var A : TlAes; Var Iv : TlBlk; Var Aad : TlBlk;
+  NA : LongInt; D : TlPtr; N : LongInt; Enc : Boolean; Var Tag : TlBlk);
+Var J0, Cb, Ks, Y : TlBlk; I, K, L, C : LongInt;
+Begin
+  For I := 0 To 11 Do J0[I] := Iv[I];
+  J0[12] := 0; J0[13] := 0; J0[14] := 0; J0[15] := 1;
+  Cb := J0;
+  For I := 0 To 15 Do Y[I] := 0;
+  For I := 0 To NA - 1 Do Y[I] := Aad[I];
+  If NA > 0 Then TlGMul(A, Y);
+  K := 0;
+  While K < N Do
+  Begin
+    { compteur sur 32 bits }
+    I := 15;
+    Repeat
+      C := (Cb[I] + 1) And 255; Cb[I] := C; Dec(I);
+    Until (C <> 0) Or (I < 12);
+    TlAesEnc(A, Cb, Ks);
+    L := N - K; If L > 16 Then L := 16;
+    For I := 0 To L - 1 Do
+    Begin
+      C := TlGet(D + K + I);
+      If Enc Then
+      Begin
+        C := C Xor Ks[I]; TlPut(D + K + I, C);
+      End
+      Else TlPut(D + K + I, C Xor Ks[I]);
+      Y[I] := Y[I] Xor C;
+    End;
+    TlGMul(A, Y);
+    K := K + L;
+  End;
+  { longueurs en bits (64 bits chacune) }
+  For I := 0 To 15 Do Ks[I] := 0;
+  TlPutW(Ks, 4, NA * 8);
+  TlPutW(Ks, 8, N Shr 29); TlPutW(Ks, 12, N Shl 3);
+  For I := 0 To 15 Do Y[I] := Y[I] Xor Ks[I];
+  TlGMul(A, Y);
+  TlAesEnc(A, J0, Ks);
+  For I := 0 To 15 Do Tag[I] := Y[I] Xor Ks[I];
+End;
+
+{ ---- X25519 (RFC 7748) : 32 chiffres de 8 bits signes ---- }
+
+Procedure TlFeCarry(Var A : TlFe);
+Var I, C, V, P : LongInt;
+Begin
+  For P := 1 To 2 Do
+    For I := 0 To 31 Do
+    Begin
+      V := A[I];
+      If V >= 0 Then C := V Shr 8 Else C := -((255 - V) Shr 8);
+      A[I] := V - C * 256;
+      If I < 31 Then A[I + 1] := A[I + 1] + C
+      Else A[0] := A[0] + 38 * C;
+    End;
+End;
+
+Procedure TlFeAdd(Var R : TlFe; Var A, B : TlFe);
+Var I : LongInt;
+Begin
+  For I := 0 To 31 Do R[I] := A[I] + B[I];
+  TlFeCarry(R);
+End;
+
+Procedure TlFeSub(Var R : TlFe; Var A, B : TlFe);
+Var I : LongInt;
+Begin
+  For I := 0 To 31 Do R[I] := A[I] - B[I];
+  TlFeCarry(R);
+End;
+
+Procedure TlFeMul(Var R : TlFe; Var A, B : TlFe);
+Var T : Array[0..63] Of LongInt; I, J, X : LongInt;
+Begin
+  For I := 0 To 63 Do T[I] := 0;
+  For I := 0 To 31 Do
+  Begin
+    X := A[I];
+    If X <> 0 Then
+      For J := 0 To 31 Do T[I + J] := T[I + J] + X * B[J];
+  End;
+  For I := 0 To 31 Do R[I] := T[I] + 38 * T[I + 32];
+  TlFeCarry(R);
+End;
+
+Procedure TlFeMulK(Var R : TlFe; Var A : TlFe; K : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 31 Do R[I] := A[I] * K;
+  TlFeCarry(R);
+End;
+
+Procedure TlFeSwap(Var A, B : TlFe; S : LongInt);
+Var I, T, M : LongInt;
+Begin
+  M := -S;
+  For I := 0 To 31 Do
+  Begin
+    T := M And (A[I] Xor B[I]);
+    A[I] := A[I] Xor T; B[I] := B[I] Xor T;
+  End;
+End;
+
+Procedure TlFeInv(Var R : TlFe; Var A : TlFe);
+Var C, T : TlFe; I : LongInt;
+Begin
+  C := A;
+  For I := 253 DownTo 0 Do
+  Begin
+    TlFeMul(T, C, C); C := T;
+    If (I <> 2) And (I <> 4) Then Begin TlFeMul(T, C, A); C := T; End;
+  End;
+  R := C;
+End;
+
+{ valeur canonique (0..p-1) en 32 octets }
+Procedure TlFePack(Var A : TlFe; Var O : TlKey32);
+Var T : TlFe; I, K, B, V : LongInt;
+Begin
+  TlFeCarry(A); TlFeCarry(A);
+  For K := 1 To 2 Do
+  Begin
+    B := 0;
+    For I := 0 To 31 Do
+    Begin
+      If I = 0 Then V := A[0] - $ED
+      Else If I = 31 Then V := A[31] - $7F
+      Else V := A[I] - $FF;
+      V := V - B;
+      If V < 0 Then Begin V := V + 256; B := 1; End Else B := 0;
+      T[I] := V;
+    End;
+    If B = 0 Then A := T;
+  End;
+  For I := 0 To 31 Do O[I] := A[I] And 255;
+End;
+
+{ Out := X25519(K, U) ; tableaux de 32 octets }
+Procedure TlX25519(Var Out0, K, U : TlKey32);
+Var X1, X2, Z2, X3, Z3, A, AA, B, BB, E, C, D, DA, CB, T : TlFe;
+    E0 : Array[0..31] Of Byte; I, Bit, Sw : LongInt;
+Begin
+  For I := 0 To 31 Do E0[I] := K[I];
+  E0[0] := E0[0] And 248; E0[31] := (E0[31] And 127) Or 64;
+  For I := 0 To 31 Do
+  Begin
+    X1[I] := U[I]; X2[I] := 0; Z2[I] := 0; Z3[I] := 0;
+  End;
+  X1[31] := X1[31] And 127;
+  X2[0] := 1; Z3[0] := 1; X3 := X1;
+  Sw := 0;
+  For I := 254 DownTo 0 Do
+  Begin
+    Bit := (E0[I Shr 3] Shr (I And 7)) And 1;
+    Sw := Sw Xor Bit;
+    TlFeSwap(X2, X3, Sw); TlFeSwap(Z2, Z3, Sw);
+    Sw := Bit;
+    TlFeAdd(A, X2, Z2); TlFeMul(AA, A, A);
+    TlFeSub(B, X2, Z2); TlFeMul(BB, B, B);
+    TlFeSub(E, AA, BB);
+    TlFeAdd(C, X3, Z3); TlFeSub(D, X3, Z3);
+    TlFeMul(DA, D, A); TlFeMul(CB, C, B);
+    TlFeAdd(T, DA, CB); TlFeMul(X3, T, T);
+    TlFeSub(T, DA, CB); TlFeMul(D, T, T); TlFeMul(Z3, X1, D);
+    TlFeMul(X2, AA, BB);
+    TlFeMulK(T, E, 121665); TlFeAdd(T, AA, T); TlFeMul(Z2, E, T);
+  End;
+  TlFeSwap(X2, X3, Sw); TlFeSwap(Z2, Z3, Sw);
+  TlFeInv(T, Z2); TlFeMul(A, X2, T);
+  TlFePack(A, Out0);
+End;
+
+{ ---- TLS 1.2 client : ECDHE (x25519) + AES-128-GCM + SHA-256 ---- }
+{ Suites TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (C02F) et              }
+{ TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (C02B). Le certificat du    }
+{ serveur n'est pas verifie (Pasdows n'a pas de magasin de            }
+{ certificats racines) : la connexion est chiffree, pas authentifiee. }
+
+Const
+  TlMaxConn = 4;
+  TlRecMax = 18500;                  { enregistrement chiffre + marge }
+  TlHsMax = 65536;                   { messages de la poignee de main }
+
+Type
+  TlConn = Record
+    Used, Tls, Enc, Dec, Eof : Boolean;
+    Sock : LongInt;
+    CAes, SAes : TlAes;
+    CIv, SIv : TlBlk;
+    CSeq, SSeq : LongInt;
+    RB : Array[0..TlRecMax - 1] Of Byte;   { enregistrement recu }
+    RPos, REnd : LongInt;                  { texte clair disponible }
+    OB : Array[0..TlRecMax - 1] Of Byte;   { enregistrement a envoyer }
+  End;
+
+  PTlConn = ^TlConn;
+  TlHsBuf = Array[0..TlHsMax - 1] Of Byte;
+  PTlHsBuf = ^TlHsBuf;
+
+Var
+  TlC : Array[0..TlMaxConn - 1] Of PTlConn;  { alloues au premier usage }
+  TlHs : PTlHsBuf;
+  TlHsLen : LongInt;
+  TlErr : String;
+  TlPool : TlSha;
+  TlPoolN : LongInt;
+
+{ ---- aleas : SHA-256 d'un compteur et des evenements du systeme ---- }
+
+Procedure TlSeed(V : LongInt);
+Begin
+  If TlPoolN = 0 Then TlShaInit(TlPool);
+  Inc(TlPoolN);
+  TlShaByte(TlPool, V); TlShaByte(TlPool, V Shr 8);
+  TlShaByte(TlPool, V Shr 16); TlShaByte(TlPool, V Shr 24);
+End;
+
+Procedure TlRandom(A : TlPtr; N : LongInt);
+Var C : TlSha; H : TlKey32; I, K : LongInt;
+Begin
+  TlEntropy;
+  K := 0;
+  While K < N Do
+  Begin
+    TlSeed(K);
+    C := TlPool;
+    TlShaDone(C, TlPtr(@H[0]));
+    I := 0;
+    While (I < 32) And (K < N) Do
+    Begin
+      TlPut(A + K, H[I]); Inc(I); Inc(K);
+    End;
+  End;
+End;
+
+{ ---- envoi et reception d'enregistrements ---- }
+
+Function TlSendAll(Var C : TlConn; A : TlPtr; N : LongInt) : Boolean;
+Var R : LongInt;
+Begin
+  TlSendAll := False;
+  While N > 0 Do
+  Begin
+    R := TlSockSend(C.Sock, A, N);
+    If R <= 0 Then Begin TlErr := 'envoi TCP impossible'; Exit; End;
+    A := A + R; N := N - R;
+  End;
+  TlSendAll := True;
+End;
+
+Function TlRecvAll(Var C : TlConn; A : TlPtr; N : LongInt) : Boolean;
+Var R : LongInt;
+Begin
+  TlRecvAll := False;
+  While N > 0 Do
+  Begin
+    R := TlSockRecv(C.Sock, A, N);
+    If R <= 0 Then Begin TlErr := 'connexion fermee'; Exit; End;
+    A := A + R; N := N - R;
+  End;
+  TlRecvAll := True;
+End;
+
+Procedure TlSeqBytes(Seq : LongInt; Var B : TlBlk; Ofs : LongInt);
+Begin
+  B[Ofs] := 0; B[Ofs + 1] := 0; B[Ofs + 2] := 0; B[Ofs + 3] := 0;
+  B[Ofs + 4] := (Seq Shr 24) And 255; B[Ofs + 5] := (Seq Shr 16) And 255;
+  B[Ofs + 6] := (Seq Shr 8) And 255; B[Ofs + 7] := Seq And 255;
+End;
+
+{ envoie un enregistrement de type Typ (N octets a l'adresse A) }
+Function TlSendRec(Var C : TlConn; Typ : LongInt; A : TlPtr;
+  N : LongInt) : Boolean;
+Var Iv, Aad, Tag : TlBlk; I, L : LongInt; P : TlPtr;
+Begin
+  P := TlPtr(@C.OB[0]);
+  C.OB[0] := Typ; C.OB[1] := 3; C.OB[2] := 3;
+  If C.Enc Then
+  Begin
+    For I := 0 To N - 1 Do C.OB[13 + I] := TlGet(A + I);
+    For I := 0 To 3 Do Iv[I] := C.CIv[I];
+    TlSeqBytes(C.CSeq, Iv, 4);
+    For I := 0 To 7 Do C.OB[5 + I] := Iv[4 + I];
+    TlSeqBytes(C.CSeq, Aad, 0);
+    Aad[8] := Typ; Aad[9] := 3; Aad[10] := 3;
+    Aad[11] := (N Shr 8) And 255; Aad[12] := N And 255;
+    TlGcm(C.CAes, Iv, Aad, 13, P + 13, N, True, Tag);
+    For I := 0 To 15 Do C.OB[13 + N + I] := Tag[I];
+    Inc(C.CSeq);
+    L := N + 24;
+  End
+  Else
+  Begin
+    For I := 0 To N - 1 Do C.OB[5 + I] := TlGet(A + I);
+    L := N;
+  End;
+  C.OB[3] := (L Shr 8) And 255; C.OB[4] := L And 255;
+  TlSendRec := TlSendAll(C, P, L + 5);
+End;
+
+{ lit un enregistrement : type rendu, texte clair dans RB[RPos..REnd) ;
+  -1 en cas d'erreur }
+Function TlRecvRec(Var C : TlConn) : LongInt;
+Var Typ, L, I : LongInt; Iv, Aad, Tag : TlBlk; P : TlPtr;
+Begin
+  TlRecvRec := -1;
+  P := TlPtr(@C.RB[0]);
+  If Not TlRecvAll(C, P, 5) Then Exit;
+  Typ := C.RB[0];
+  L := (C.RB[3] Shl 8) Or C.RB[4];
+  If (L > TlRecMax - 5) Or (C.RB[1] <> 3) Then
+  Begin
+    TlErr := 'enregistrement TLS invalide'; Exit;
+  End;
+  If Not TlRecvAll(C, P + 5, L) Then Exit;
+  C.RPos := 5; C.REnd := 5 + L;
+  If C.Dec Then
+  Begin
+    If L < 24 Then Begin TlErr := 'enregistrement trop court'; Exit; End;
+    For I := 0 To 3 Do Iv[I] := C.SIv[I];
+    For I := 0 To 7 Do Iv[4 + I] := C.RB[5 + I];
+    L := L - 24;
+    TlSeqBytes(C.SSeq, Aad, 0);
+    Aad[8] := Typ; Aad[9] := 3; Aad[10] := 3;
+    Aad[11] := (L Shr 8) And 255; Aad[12] := L And 255;
+    TlGcm(C.SAes, Iv, Aad, 13, P + 13, L, False, Tag);
+    For I := 0 To 15 Do
+      If Tag[I] <> C.RB[13 + L + I] Then
+      Begin
+        TlErr := 'enregistrement TLS altere (GCM)'; Exit;
+      End;
+    Inc(C.SSeq);
+    C.RPos := 13; C.REnd := 13 + L;
+  End;
+  If Typ = 21 Then
+  Begin
+    If (C.REnd - C.RPos >= 2) And (C.RB[C.RPos + 1] = 0) Then
+    Begin
+      C.Eof := True; C.RPos := C.REnd; TlRecvRec := 23; Exit;
+    End;
+    Str(C.RB[C.RPos + 1], TlErr);
+    TlErr := 'alerte TLS ' + TlErr;
+    Exit;
+  End;
+  TlRecvRec := Typ;
+End;
+
+{ ---- poignee de main ---- }
+
+{ message de la poignee de main suivant : type, corps dans TlHs^[4..] }
+Function TlNextHs(Var C : TlConn; Var Tr : TlSha; Var Body : LongInt)
+  : LongInt;
+Var Typ, L, I : LongInt;
+Begin
+  TlNextHs := -1;
+  { completer TlHs avec les enregistrements de type 22 }
+  While True Do
+  Begin
+    If TlHsLen >= 4 Then
+    Begin
+      L := (TlHs^[1] Shl 16) Or (TlHs^[2] Shl 8) Or TlHs^[3];
+      If L + 4 > TlHsMax Then Begin TlErr := 'message trop long'; Exit; End;
+      If TlHsLen >= L + 4 Then Break;
+    End;
+    If C.RPos >= C.REnd Then
+    Begin
+      Typ := TlRecvRec(C);
+      If Typ < 0 Then Exit;
+      If Typ <> 22 Then Begin TlErr := 'message inattendu'; Exit; End;
+    End;
+    While (C.RPos < C.REnd) And (TlHsLen < TlHsMax) Do
+    Begin
+      TlHs^[TlHsLen] := C.RB[C.RPos]; Inc(TlHsLen); Inc(C.RPos);
+    End;
+  End;
+  Typ := TlHs^[0];
+  Body := L;
+  TlShaAdd(Tr, TlPtr(@TlHs^[0]), L + 4);
+  TlNextHs := Typ;
+End;
+
+{ retire le message traite de TlHs }
+Procedure TlDropHs;
+Var L, I : LongInt;
+Begin
+  L := ((TlHs^[1] Shl 16) Or (TlHs^[2] Shl 8) Or TlHs^[3]) + 4;
+  For I := L To TlHsLen - 1 Do TlHs^[I - L] := TlHs^[I];
+  TlHsLen := TlHsLen - L;
+End;
+
+Function TlHandshake(Var C : TlConn; Const Host : String) : Boolean;
+Var M : Array[0..511] Of Byte; N, I, L, Typ, Body, Suite, P : LongInt;
+    Tr, T2 : TlSha; CR, SR, Priv, Pub, SPub, Pms : TlKey32;
+    Ms : Array[0..47] Of Byte; Kb : Array[0..39] Of Byte;
+    Seed : Array[0..63] Of Byte; Hh : TlKey32; Key : TlBlk;
+    GotKey : Boolean;
+
+  Procedure B(V : LongInt);
+  Begin
+    M[N] := V And 255; Inc(N);
+  End;
+
+  Procedure W(V : LongInt);
+  Begin
+    B(V Shr 8); B(V);
+  End;
+
+Begin
+  TlHandshake := False;
+  C.Enc := False; C.Dec := False; C.CSeq := 0; C.SSeq := 0;
+  C.RPos := 0; C.REnd := 0; C.Eof := False;
+  TlHsLen := 0;
+  TlRandom(TlPtr(@CR[0]), 32);
+  TlRandom(TlPtr(@Priv[0]), 32);
+  { ClientHello }
+  N := 0;
+  B(1); B(0); B(0); B(0);
+  B(3); B(3);
+  For I := 0 To 31 Do B(CR[I]);
+  B(0);
+  W(6); W($C02F); W($C02B); W($00FF);
+  B(1); B(0);
+  L := N; W(0);                      { longueur des extensions }
+  W(0); W(Length(Host) + 5); W(Length(Host) + 3); B(0);
+  W(Length(Host));
+  For I := 1 To Length(Host) Do B(Ord(Host[I]));
+  W($000A); W(6); W(4); W($001D); W($0017);
+  W($000B); W(2); B(1); B(0);
+  W($000D); W(22); W(20);
+  W($0401); W($0501); W($0601); W($0403); W($0503); W($0603);
+  W($0804); W($0805); W($0806); W($0201);
+  M[L] := ((N - L - 2) Shr 8) And 255; M[L + 1] := (N - L - 2) And 255;
+  M[1] := 0; M[2] := ((N - 4) Shr 8) And 255; M[3] := (N - 4) And 255;
+  TlShaInit(Tr);
+  TlShaAdd(Tr, TlPtr(@M[0]), N);
+  If Not TlSendRec(C, 22, TlPtr(@M[0]), N) Then Exit;
+  { ServerHello ... ServerHelloDone }
+  GotKey := False; Suite := 0;
+  Repeat
+    Typ := TlNextHs(C, Tr, Body);
+    If Typ < 0 Then Exit;
+    If Typ = 2 Then
+    Begin
+      If (TlHs^[4] <> 3) Or (TlHs^[5] <> 3) Then
+      Begin
+        TlErr := 'le serveur refuse TLS 1.2'; Exit;
+      End;
+      For I := 0 To 31 Do SR[I] := TlHs^[6 + I];
+      P := 38 + TlHs^[38] + 1;
+      Suite := (TlHs^[P] Shl 8) Or TlHs^[P + 1];
+      If (Suite <> $C02F) And (Suite <> $C02B) Then
+      Begin
+        TlErr := 'suite de chiffrement non prise en charge'; Exit;
+      End;
+    End
+    Else If Typ = 12 Then
+    Begin
+      If (TlHs^[4] <> 3) Or (TlHs^[5] <> 0) Or (TlHs^[6] <> $1D) Or
+         (TlHs^[7] <> 32) Then
+      Begin
+        TlErr := 'courbe x25519 refusee par le serveur'; Exit;
+      End;
+      For I := 0 To 31 Do SPub[I] := TlHs^[8 + I];
+      GotKey := True;
+    End
+    Else If Typ = 13 Then
+    Begin
+      TlErr := 'certificat client demande'; Exit;
+    End;
+    TlDropHs;
+  Until Typ = 14;
+  If (Suite = 0) Or Not GotKey Then
+  Begin
+    TlErr := 'poignee de main incomplete'; Exit;
+  End;
+  { ClientKeyExchange, cles }
+  For I := 0 To 31 Do Pub[I] := 0;
+  Pub[0] := 9;
+  TlX25519(Pub, Priv, Pub);
+  TlX25519(Pms, Priv, SPub);
+  N := 0;
+  B(16); B(0); B(0); B(33); B(32);
+  For I := 0 To 31 Do B(Pub[I]);
+  TlShaAdd(Tr, TlPtr(@M[0]), N);
+  If Not TlSendRec(C, 22, TlPtr(@M[0]), N) Then Exit;
+  For I := 0 To 31 Do
+  Begin
+    Seed[I] := CR[I]; Seed[32 + I] := SR[I];
+  End;
+  TlPrf(TlPtr(@Pms[0]), 32, 'master secret', TlPtr(@Seed[0]), 64,
+        TlPtr(@Ms[0]), 48);
+  For I := 0 To 31 Do
+  Begin
+    Seed[I] := SR[I]; Seed[32 + I] := CR[I];
+  End;
+  TlPrf(TlPtr(@Ms[0]), 48, 'key expansion', TlPtr(@Seed[0]), 64,
+        TlPtr(@Kb[0]), 40);
+  For I := 0 To 15 Do Key[I] := Kb[I];
+  TlAesKey(C.CAes, Key);
+  For I := 0 To 15 Do Key[I] := Kb[16 + I];
+  TlAesKey(C.SAes, Key);
+  For I := 0 To 3 Do
+  Begin
+    C.CIv[I] := Kb[32 + I]; C.SIv[I] := Kb[36 + I];
+  End;
+  { ChangeCipherSpec et Finished }
+  M[0] := 1;
+  If Not TlSendRec(C, 20, TlPtr(@M[0]), 1) Then Exit;
+  C.Enc := True;
+  T2 := Tr; TlShaDone(T2, TlPtr(@Hh[0]));
+  M[0] := 20; M[1] := 0; M[2] := 0; M[3] := 12;
+  TlPrf(TlPtr(@Ms[0]), 48, 'client finished', TlPtr(@Hh[0]), 32,
+        TlPtr(@M[4]), 12);
+  TlShaAdd(Tr, TlPtr(@M[0]), 16);
+  If Not TlSendRec(C, 22, TlPtr(@M[0]), 16) Then Exit;
+  { ChangeCipherSpec et Finished du serveur }
+  Repeat
+    Typ := TlRecvRec(C);
+    If Typ < 0 Then Exit;
+    If Typ = 22 Then
+    Begin
+      { NewSessionTicket eventuel avant le ChangeCipherSpec }
+      C.RPos := C.REnd;
+    End
+    Else If Typ <> 20 Then Begin TlErr := 'ChangeCipherSpec attendu'; Exit;
+    End;
+  Until Typ = 20;
+  C.Dec := True;
+  C.RPos := C.REnd;
+  T2 := Tr; TlShaDone(T2, TlPtr(@Hh[0]));
+  TlPrf(TlPtr(@Ms[0]), 48, 'server finished', TlPtr(@Hh[0]), 32,
+        TlPtr(@M[100]), 12);
+  TlHsLen := 0;
+  Typ := TlNextHs(C, T2, Body);
+  If (Typ <> 20) Or (Body <> 12) Then
+  Begin
+    If Typ >= 0 Then TlErr := 'Finished du serveur attendu';
+    Exit;
+  End;
+  For I := 0 To 11 Do
+    If TlHs^[4 + I] <> M[100 + I] Then
+    Begin
+      TlErr := 'Finished du serveur invalide'; Exit;
+    End;
+  TlHandshake := True;
+End;
+
+{ ---- donnees de l'application ---- }
+
+{ lit au plus N octets ; 0 a la fin, -1 en cas d'erreur }
+Function TlRead(Var C : TlConn; A : TlPtr; N : LongInt) : LongInt;
+Var Typ, K : LongInt;
+Begin
+  TlRead := -1;
+  If Not C.Tls Then
+  Begin
+    TlRead := TlSockRecv(C.Sock, A, N);
+    Exit;
+  End;
+  While C.RPos >= C.REnd Do
+  Begin
+    If C.Eof Then Begin TlRead := 0; Exit; End;
+    Typ := TlRecvRec(C);
+    If Typ < 0 Then
+    Begin
+      { fermeture TCP sans close_notify : fin des donnees }
+      If TlErr = 'connexion fermee' Then TlRead := 0;
+      Exit;
+    End;
+    If Typ <> 23 Then C.RPos := C.REnd;
+  End;
+  K := C.REnd - C.RPos;
+  If K > N Then K := N;
+  For Typ := 0 To K - 1 Do TlPut(A + Typ, C.RB[C.RPos + Typ]);
+  C.RPos := C.RPos + K;
+  TlRead := K;
+End;
+
+Function TlWrite(Var C : TlConn; A : TlPtr; N : LongInt) : Boolean;
+Var K : LongInt;
+Begin
+  TlWrite := False;
+  If Not C.Tls Then
+  Begin
+    TlWrite := TlSendAll(C, A, N); Exit;
+  End;
+  While N > 0 Do
+  Begin
+    K := N; If K > 16384 Then K := 16384;
+    If Not TlSendRec(C, 23, A, K) Then Exit;
+    A := A + K; N := N - K;
+  End;
+  TlWrite := True;
+End;
+
+{ tampons des connexions : alloues une fois, au premier usage }
+Procedure TlAlloc;
+Var I, J : LongInt;
+Begin
+  If TlHs <> Nil Then Exit;
+  For I := 0 To TlMaxConn - 1 Do
+  Begin
+    TlC[I] := PTlConn(TlNew(SizeOf(TlConn)));
+    TlC[I]^.Used := False;
+  End;
+  TlHs := PTlHsBuf(TlNew(SizeOf(TlHsBuf)));
+End;
+
+{ ouvre une connexion (TLS si Secure) ; rend son numero ou -1 }
+Function TlOpen(Const Host : String; Port : LongInt; Secure : Boolean)
+  : LongInt;
+Var I, S : LongInt;
+Begin
+  TlOpen := -1;
+  TlAlloc;
+  I := 0;
+  While (I < TlMaxConn) And TlC[I]^.Used Do Inc(I);
+  If I >= TlMaxConn Then Begin TlErr := 'trop de connexions'; Exit; End;
+  S := TlSockOpen(Host, Port);
+  If S < 0 Then Exit;
+  TlC[I]^.Used := True; TlC[I]^.Sock := S; TlC[I]^.Tls := Secure;
+  TlC[I]^.RPos := 0; TlC[I]^.REnd := 0; TlC[I]^.Eof := False;
+  TlC[I]^.Enc := False; TlC[I]^.Dec := False;
+  If Secure Then
+    If Not TlHandshake(TlC[I]^, Host) Then
+    Begin
+      TlSockClose(S); TlC[I]^.Used := False; Exit;
+    End;
+  TlOpen := I;
+End;
+
+Procedure TlClose(I : LongInt);
+Var M : Array[0..1] Of Byte;
+Begin
+  If (I < 0) Or (I >= TlMaxConn) Or Not TlC[I]^.Used Then Exit;
+  If TlC[I]^.Tls And TlC[I]^.Enc Then
+  Begin
+    M[0] := 1; M[1] := 0;
+    If TlSendRec(TlC[I]^, 21, TlPtr(@M[0]), 2) Then;
+  End;
+  TlSockClose(TlC[I]^.Sock);
+  TlC[I]^.Used := False;
+End;
+
+{ ---- client HTTP/1.1 (http:// et https://) ---- }
+
+Const
+  HtMaxUrl = 4096;
+  HtMaxHdr = 8192;
+  HtIBSize = 16384;
+
+Type
+  HtReq = Record
+    Used : Boolean;
+    Conn : LongInt;                    { connexion TlC, -1 si aucune }
+    Status, CLen, Left, ChunkLeft : LongInt;
+    Chunked, Done : Boolean;
+    Url : Array[0..HtMaxUrl - 1] Of Byte;
+    UrlLen : LongInt;
+    Hdr : Array[0..HtMaxHdr - 1] Of Byte;
+    HdrLen : LongInt;
+    IB : Array[0..HtIBSize - 1] Of Byte;
+    IPos, IEnd : LongInt;
+  End;
+
+  PHtReq = ^HtReq;
+
+Var
+  HtR : Array[0..TlMaxConn - 1] Of PHtReq;   { alloues au premier usage }
+
+Procedure HtAlloc;
+Var I : LongInt;
+Begin
+  If HtR[0] <> Nil Then Exit;
+  For I := 0 To TlMaxConn - 1 Do
+  Begin
+    HtR[I] := PHtReq(TlNew(SizeOf(HtReq)));
+    HtR[I]^.Used := False; HtR[I]^.Conn := -1;
+  End;
+  TlAlloc;
+End;
+
+Function HtLow(C : LongInt) : LongInt;
+Begin
+  If (C >= 65) And (C <= 90) Then C := C + 32;
+  HtLow := C;
+End;
+
+Function HtByte(Var R : HtReq) : LongInt;
+Var K : LongInt;
+Begin
+  If R.IPos >= R.IEnd Then
+  Begin
+    R.IPos := 0; R.IEnd := 0;
+    K := TlRead(TlC[R.Conn]^, TlPtr(@R.IB[0]), HtIBSize);
+    If K <= 0 Then Begin HtByte := -1; Exit; End;
+    R.IEnd := K;
+  End;
+  HtByte := R.IB[R.IPos];
+  Inc(R.IPos);
+End;
+
+{ valeur de l'en-tete Name (sans casse) ; Ofs/Len dans R.Hdr }
+Function HtHeader(Var R : HtReq; Const Name : String; Var Ofs, Len
+  : LongInt) : Boolean;
+Var I, J, L : LongInt; Ok : Boolean;
+Begin
+  HtHeader := False;
+  L := Length(Name);
+  I := 0;
+  { sauter la ligne d'etat }
+  While (I < R.HdrLen) And (R.Hdr[I] <> 10) Do Inc(I);
+  Inc(I);
+  While I < R.HdrLen Do
+  Begin
+    Ok := I + L < R.HdrLen;
+    J := 0;
+    While Ok And (J < L) Do
+    Begin
+      If HtLow(R.Hdr[I + J]) <> HtLow(Ord(Name[J + 1])) Then Ok := False;
+      Inc(J);
+    End;
+    If Ok And (R.Hdr[I + L] = Ord(':')) Then
+    Begin
+      Ofs := I + L + 1;
+      While (Ofs < R.HdrLen) And (R.Hdr[Ofs] = 32) Do Inc(Ofs);
+      Len := 0;
+      While (Ofs + Len < R.HdrLen) And (R.Hdr[Ofs + Len] <> 13) And
+            (R.Hdr[Ofs + Len] <> 10) Do Inc(Len);
+      HtHeader := True;
+      Exit;
+    End;
+    While (I < R.HdrLen) And (R.Hdr[I] <> 10) Do Inc(I);
+    Inc(I);
+  End;
+End;
+
+Function HtHeaderNum(Var R : HtReq; Const Name : String) : LongInt;
+Var O, L, V, I : LongInt;
+Begin
+  HtHeaderNum := -1;
+  If Not HtHeader(R, Name, O, L) Then Exit;
+  V := 0;
+  For I := O To O + L - 1 Do
+    If (R.Hdr[I] >= 48) And (R.Hdr[I] <= 57) Then
+      V := V * 10 + R.Hdr[I] - 48;
+  HtHeaderNum := V;
+End;
+
+{ decompose R.Url ; Path = position du chemin dans R.Url }
+Function HtSplit(Var R : HtReq; Var Https : Boolean; Var Host : String;
+  Var Port, Path : LongInt) : Boolean;
+Var I, S : LongInt;
+Begin
+  HtSplit := False;
+  I := 0;
+  Https := False;
+  If (R.UrlLen > 8) And (HtLow(R.Url[4]) = Ord('s')) And
+     (R.Url[5] = Ord(':')) Then Begin Https := True; I := 8; End
+  Else If (R.UrlLen > 7) And (R.Url[4] = Ord(':')) Then I := 7
+  Else Begin TlErr := 'URL invalide'; Exit; End;
+  If Https Then Port := 443 Else Port := 80;
+  Host := '';
+  While (I < R.UrlLen) And (R.Url[I] <> Ord('/')) And
+        (R.Url[I] <> Ord(':')) And (R.Url[I] <> Ord('?')) Do
+  Begin
+    If Length(Host) < 255 Then Host := Host + Chr(R.Url[I]);
+    Inc(I);
+  End;
+  If (I < R.UrlLen) And (R.Url[I] = Ord(':')) Then
+  Begin
+    Inc(I); S := 0;
+    While (I < R.UrlLen) And (R.Url[I] >= 48) And (R.Url[I] <= 57) Do
+    Begin
+      S := S * 10 + R.Url[I] - 48; Inc(I);
+    End;
+    Port := S;
+  End;
+  Path := I;
+  HtSplit := Host <> '';
+End;
+
+Procedure HtCloseConn(Var R : HtReq);
+Begin
+  If R.Conn >= 0 Then TlClose(R.Conn);
+  R.Conn := -1;
+End;
+
+{ envoie la requete GET et lit les en-tetes ; suit les redirections }
+Function HtGet(Var R : HtReq; Const Agent : String; Extra : TlPtr;
+  ExtraLen : LongInt) : Boolean;
+Var Https : Boolean; Host : String; Port, Path, Hops, I, C, O, L,
+    K : LongInt; Q : Array[0..HtMaxUrl + 1023] Of Byte; N : LongInt;
+    Base : Array[0..HtMaxUrl - 1] Of Byte; BLen : LongInt;
+
+  Procedure S(Const T : String);
+  Var J : LongInt;
+  Begin
+    For J := 1 To Length(T) Do
+      If N < HtMaxUrl + 1024 Then Begin Q[N] := Ord(T[J]); Inc(N); End;
+  End;
+
+Begin
+  HtGet := False;
+  Hops := 0;
+  While True Do
+  Begin
+    If Not HtSplit(R, Https, Host, Port, Path) Then Exit;
+    R.Conn := TlOpen(Host, Port, Https);
+    If R.Conn < 0 Then Exit;
+    N := 0;
+    S('GET ');
+    If Path >= R.UrlLen Then S('/');
+    For I := Path To R.UrlLen - 1 Do
+      If N < HtMaxUrl Then Begin Q[N] := R.Url[I]; Inc(N); End;
+    S(' HTTP/1.1'#13#10'Host: ' + Host);
+    If ((Port <> 443) And Https) Or ((Port <> 80) And Not Https) Then
+    Begin
+      Str(Port, Host); S(':' + Host);
+    End;
+    S(#13#10'User-Agent: ' + Agent + #13#10'Accept: */*'#13#10 +
+      'Accept-Encoding: identity'#13#10'Connection: close'#13#10);
+    For I := 0 To ExtraLen - 1 Do
+      If N < HtMaxUrl + 1000 Then Begin Q[N] := TlGet(Extra + I); Inc(N);
+      End;
+    If (ExtraLen >= 2) And (Q[N - 1] <> 10) Then S(#13#10);
+    S(#13#10);
+    If Not TlWrite(TlC[R.Conn]^, TlPtr(@Q[0]), N) Then
+    Begin
+      HtCloseConn(R); Exit;
+    End;
+    { en-tetes de la reponse }
+    R.IPos := 0; R.IEnd := 0; R.HdrLen := 0;
+    K := 0;
+    Repeat
+      C := HtByte(R);
+      If C < 0 Then
+      Begin
+        If TlErr = '' Then TlErr := 'reponse HTTP incomplete';
+        HtCloseConn(R); Exit;
+      End;
+      If R.HdrLen < HtMaxHdr Then
+      Begin
+        R.Hdr[R.HdrLen] := C; Inc(R.HdrLen);
+      End;
+      If C = 10 Then Inc(K) Else If C <> 13 Then K := 0;
+    Until K = 2;
+    R.Status := 0;
+    I := 0;
+    While (I < R.HdrLen) And (R.Hdr[I] <> 32) Do Inc(I);
+    Inc(I);
+    While (I < R.HdrLen) And (R.Hdr[I] >= 48) And (R.Hdr[I] <= 57) Do
+    Begin
+      R.Status := R.Status * 10 + R.Hdr[I] - 48; Inc(I);
+    End;
+    { redirection }
+    If ((R.Status = 301) Or (R.Status = 302) Or (R.Status = 303) Or
+        (R.Status = 307) Or (R.Status = 308)) And (Hops < 10) And
+       HtHeader(R, 'Location', O, L) Then
+    Begin
+      HtCloseConn(R);
+      Inc(Hops);
+      If (L > 0) And (R.Hdr[O] = Ord('/')) Then
+      Begin
+        { chemin absolu : meme schema et meme serveur }
+        BLen := Path;
+        For I := 0 To BLen - 1 Do Base[I] := R.Url[I];
+        If L > HtMaxUrl - BLen Then L := HtMaxUrl - BLen;
+        For I := 0 To BLen - 1 Do R.Url[I] := Base[I];
+        For I := 0 To L - 1 Do R.Url[BLen + I] := R.Hdr[O + I];
+        R.UrlLen := BLen + L;
+      End
+      Else
+      Begin
+        If L > HtMaxUrl Then L := HtMaxUrl;
+        For I := 0 To L - 1 Do R.Url[I] := R.Hdr[O + I];
+        R.UrlLen := L;
+      End;
+      Continue;
+    End;
+    Break;
+  End;
+  R.CLen := HtHeaderNum(R, 'Content-Length');
+  R.Left := R.CLen;
+  R.Chunked := False;
+  If HtHeader(R, 'Transfer-Encoding', O, L) Then
+    For I := O To O + L - 7 Do
+      If (HtLow(R.Hdr[I]) = Ord('c')) And (HtLow(R.Hdr[I + 1]) = Ord('h'))
+         And (HtLow(R.Hdr[I + 6]) = Ord('d')) Then R.Chunked := True;
+  If R.Chunked Then R.CLen := -1;
+  R.ChunkLeft := 0;
+  R.Done := False;
+  HtGet := True;
+End;
+
+{ lit au plus N octets du corps ; 0 a la fin }
+Function HtRead(Var R : HtReq; A : TlPtr; N : LongInt) : LongInt;
+Var K, C, V, M, J : LongInt;
+Begin
+  HtRead := 0;
+  If R.Done Or (R.Conn < 0) Then Exit;
+  K := 0;
+  While K < N Do
+  Begin
+    If R.Chunked And (R.ChunkLeft = 0) Then
+    Begin
+      { taille du morceau suivant (hexadecimal) }
+      V := 0;
+      Repeat C := HtByte(R); Until (C < 0) Or ((C <> 13) And (C <> 10));
+      While (C >= 0) And (C <> 13) And (C <> 10) And (C <> Ord(';')) Do
+      Begin
+        C := HtLow(C);
+        If (C >= 48) And (C <= 57) Then V := V * 16 + C - 48
+        Else If (C >= 97) And (C <= 102) Then V := V * 16 + C - 87;
+        C := HtByte(R);
+      End;
+      While (C >= 0) And (C <> 10) Do C := HtByte(R);
+      If (C < 0) Or (V = 0) Then Begin R.Done := True; Break; End;
+      R.ChunkLeft := V;
+    End;
+    If (Not R.Chunked) And (R.CLen >= 0) And (R.Left = 0) Then
+    Begin
+      R.Done := True; Break;
+    End;
+    If R.IPos >= R.IEnd Then
+    Begin
+      R.IPos := 0; R.IEnd := 0;
+      M := TlRead(TlC[R.Conn]^, TlPtr(@R.IB[0]), HtIBSize);
+      If M <= 0 Then Begin R.Done := True; Break; End;
+      R.IEnd := M;
+    End;
+    M := R.IEnd - R.IPos;
+    If M > N - K Then M := N - K;
+    If R.Chunked And (M > R.ChunkLeft) Then M := R.ChunkLeft;
+    If (Not R.Chunked) And (R.CLen >= 0) And (M > R.Left) Then M := R.Left;
+    For J := 0 To M - 1 Do TlPut(A + K + J, R.IB[R.IPos + J]);
+    R.IPos := R.IPos + M; K := K + M;
+    If R.Chunked Then R.ChunkLeft := R.ChunkLeft - M
+    Else If R.CLen >= 0 Then R.Left := R.Left - M;
+  End;
+  HtRead := K;
+End;
+
+Procedure TlEntropy;
+Var A, B : LongInt;
+Begin
+  { compteur du PIT (1,19 MHz), horloge, souris }
+  Port[$43] := 0;
+  A := Port[$40]; B := Port[$40];
+  TlSeed(A Or (B Shl 8) Or (Ticks Shl 16));
+  TlSeed(Ticks); TlSeed(CurX * 65536 + CurY); TlSeed(NetIP);
+End;
+
+Function TlSockOpen(Const Host : String; Port : LongInt) : LongInt;
+Var A : Array[0..15] Of Byte; S, IP, I : LongInt;
+Begin
+  TlSockOpen := -1;
+  If Not NetLookup(Host, IP) Then
+  Begin
+    TlErr := 'serveur introuvable : ' + Host; Exit;
+  End;
+  S := WS_socket(2, 1, 6);
+  If S < 0 Then Begin TlErr := 'socket impossible'; Exit; End;
+  For I := 0 To 15 Do A[I] := 0;
+  A[0] := 2; A[2] := (Port Shr 8) And 255; A[3] := Port And 255;
+  MemL[0:LongInt(@A[4])] := IP;
+  If WS_connect(S, LongInt(@A[0]), 16) <> 0 Then
+  Begin
+    TlErr := 'connexion impossible a ' + Host;
+    WS_closesocket(S);
+    Exit;
+  End;
+  TlSockOpen := S;
+End;
+
+{ ---- WININET : InternetOpenUrl, InternetReadFile, HttpQueryInfo ---- }
+
+Const
+  InetSession = $00CC0001;
+  InetReqBase = $00CC0100;
+
+Var
+  InetAgent : String;
+
+Function InetSlot(H : LongInt) : LongInt;
+Begin
+  InetSlot := -1;
+  If HtR[0] = Nil Then Exit;
+  If (H >= InetReqBase) And (H < InetReqBase + TlMaxConn) Then
+    If HtR[H - InetReqBase]^.Used Then InetSlot := H - InetReqBase;
+End;
+
+Function InternetOpenA(Agent, Access, Proxy, Bypass, Flags : LongInt)
+  : LongInt;
+Begin
+  InetAgent := 'Pasdows/4.0';
+  If Agent <> 0 Then InetAgent := PStr(Agent);
+  InternetOpenA := InetSession;
+End;
+
+Function InternetOpenUrlA(H, Url, Hdr, HdrLen, Flags, Ctx : LongInt)
+  : LongInt;
+Var I, K : LongInt; S : String;
+Begin
+  InternetOpenUrlA := 0;
+  HtAlloc;
+  I := 0;
+  While (I < TlMaxConn) And HtR[I]^.Used Do Inc(I);
+  If (I >= TlMaxConn) Or (Url = 0) Then
+  Begin
+    SetErr(12004); Exit;                  { ERROR_INTERNET_INTERNAL }
+  End;
+  K := 0;
+  While (K < HtMaxUrl) And (Mem[0:Url + K] <> 0) Do
+  Begin
+    HtR[I]^.Url[K] := Mem[0:Url + K]; Inc(K);
+  End;
+  HtR[I]^.UrlLen := K;
+  HtR[I]^.Conn := -1;
+  If Hdr = 0 Then HdrLen := 0
+  Else If HdrLen < 0 Then
+  Begin
+    HdrLen := 0;
+    While Mem[0:Hdr + HdrLen] <> 0 Do Inc(HdrLen);
+  End;
+  S := PStr(Url);
+  KLog('WININET : GET ' + Copy(S, 1, 120));
+  TlErr := '';
+  If Not HtGet(HtR[I]^, InetAgent, Hdr, HdrLen) Then
+  Begin
+    KLog('WININET : ' + TlErr);
+    SetErr(12029);                        { ERROR_INTERNET_CANNOT_CONNECT }
+    Exit;
+  End;
+  HtR[I]^.Used := True;
+  KLog('WININET : HTTP ' + IntStr(HtR[I]^.Status) + ', ' +
+       IntStr(HtR[I]^.CLen) + ' octets');
+  InternetOpenUrlA := InetReqBase + I;
+End;
+
+Function InternetReadFile(H, Buf, N, PRead : LongInt) : LongInt;
+Var I, K : LongInt;
+Begin
+  InternetReadFile := 0;
+  If PRead <> 0 Then MemL[0:PRead] := 0;
+  I := InetSlot(H);
+  If I < 0 Then Begin SetErr(6); Exit; End;
+  K := 0;
+  If N > 0 Then K := HtRead(HtR[I]^, Buf, N);
+  If K < 0 Then K := 0;
+  If PRead <> 0 Then MemL[0:PRead] := K;
+  InternetReadFile := 1;
+End;
+
+Function InternetQueryDataAvailable(H, PAvail, Flags, Ctx : LongInt)
+  : LongInt;
+Var I, K : LongInt;
+Begin
+  InternetQueryDataAvailable := 0;
+  I := InetSlot(H);
+  If I < 0 Then Begin SetErr(6); Exit; End;
+  K := HtR[I]^.IEnd - HtR[I]^.IPos;
+  If (K <= 0) And Not HtR[I]^.Done Then K := HtIBSize;
+  If HtR[I]^.Done Then K := 0;
+  If PAvail <> 0 Then MemL[0:PAvail] := K;
+  InternetQueryDataAvailable := 1;
+End;
+
+Function InternetSetOptionA(H, Opt, Buf, N : LongInt) : LongInt;
+Begin
+  InternetSetOptionA := 1;
+End;
+
+Function InternetCloseHandle(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := InetSlot(H);
+  If I >= 0 Then
+  Begin
+    HtCloseConn(HtR[I]^);
+    HtR[I]^.Used := False;
+  End;
+  InternetCloseHandle := 1;
+End;
+
+{ HttpQueryInfoA : code d'etat, en-tetes par nom ou bruts }
+Function HttpQueryInfoA(H, Info, Buf, PLen, PIdx : LongInt) : LongInt;
+Var I, Q, O, L, V, K : LongInt; Nm : String; Num, Found : Boolean;
+    T : String;
+Begin
+  HttpQueryInfoA := 0;
+  I := InetSlot(H);
+  If (I < 0) Or (PLen = 0) Then Begin SetErr(6); Exit; End;
+  Q := Info And $FFFF;
+  Num := (Info And $20000000) <> 0;
+  Found := False; O := 0; L := 0; T := '';
+  Case Q Of
+    19 :
+    Begin
+      T := IntStr(HtR[I]^.Status); Found := True;
+    End;
+    20, 18 :
+    Begin
+      { texte de la ligne d'etat ou version }
+      K := 0;
+      While (K < HtR[I]^.HdrLen) And (HtR[I]^.Hdr[K] <> 13) Do Inc(K);
+      O := 0; L := 0;
+      While (O < K) And (HtR[I]^.Hdr[O] <> 32) Do Inc(O);
+      If Q = 18 Then Begin L := O; O := 0; End
+      Else
+      Begin
+        Inc(O);
+        While (O < K) And (HtR[I]^.Hdr[O] <> 32) Do Inc(O);
+        Inc(O); L := K - O;
+      End;
+      Found := L >= 0;
+    End;
+    21, 22 :
+    Begin
+      O := 0; L := HtR[I]^.HdrLen; Found := True;
+    End;
+  Else
+    Begin
+      Nm := '';
+      Case Q Of
+        1 : Nm := 'Content-Type';
+        5 : Nm := 'Content-Length';
+        9 : Nm := 'Date';
+        11 : Nm := 'Last-Modified';
+        29 : Nm := 'Content-Encoding';
+        33 : Nm := 'Location';
+        45 : Nm := 'Accept-Ranges';
+        46 : Nm := 'ETag';
+        53 : Nm := 'Server';
+        65 : Nm := 'Transfer-Encoding';
+      End;
+      If Nm <> '' Then Found := HtHeader(HtR[I]^, Nm, O, L);
+    End;
+  End;
+  If Not Found Then
+  Begin
+    SetErr(12150);                     { ERROR_HTTP_HEADER_NOT_FOUND }
+    Exit;
+  End;
+  If T = '' Then
+    For K := 0 To L - 1 Do
+      If Length(T) < 255 Then T := T + Chr(HtR[I]^.Hdr[O + K]);
+  If Num Then
+  Begin
+    V := 0;
+    For K := 1 To Length(T) Do
+      If (T[K] >= '0') And (T[K] <= '9') Then
+        V := V * 10 + Ord(T[K]) - 48;
+    If MemL[0:PLen] < 4 Then
+    Begin
+      MemL[0:PLen] := 4; SetErr(122); Exit;
+    End;
+    MemL[0:Buf] := V; MemL[0:PLen] := 4;
+    HttpQueryInfoA := 1;
+    Exit;
+  End;
+  If (Q = 21) Or (Q = 22) Then K := L Else K := Length(T);
+  If MemL[0:PLen] < K + 1 Then
+  Begin
+    MemL[0:PLen] := K + 1; SetErr(122); Exit;
+  End;
+  If (Q = 21) Or (Q = 22) Then
+  Begin
+    For V := 0 To L - 1 Do Mem[0:Buf + V] := HtR[I]^.Hdr[V];
+    { RAW_HEADERS : lignes separees par des zeros }
+    If Q = 21 Then
+      For V := 0 To L - 1 Do
+        If Mem[0:Buf + V] = 10 Then Mem[0:Buf + V] := 0
+        Else If Mem[0:Buf + V] = 13 Then Mem[0:Buf + V] := 0;
+  End
+  Else
+    For V := 1 To K Do Mem[0:Buf + V - 1] := Ord(T[V]);
+  Mem[0:Buf + K] := 0;
+  MemL[0:PLen] := K;
+  HttpQueryInfoA := 1;
+End;
+
+
+Function InternetGetConnectedState(PFlags, R : LongInt) : LongInt;
+Begin
+  If PFlags <> 0 Then
+    If NetIP <> 0 Then MemL[0:PFlags] := 2 Else MemL[0:PFlags] := 0;
+  InternetGetConnectedState := Ord(NetIP <> 0);
+End;
+
 { ------------------------------------------------------------------ }
 { ICMP.DLL : IcmpSendEcho (utilise par PING.EXE)                       }
 { ------------------------------------------------------------------ }
@@ -36812,6 +38425,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   SysAllocStringLen, SysAllocString, SysFreeString, SysStringLen,
   InternetOpenA, InternetOpenUrlA, InternetReadFile, InternetSetOptionA,
   InternetCloseHandle, HttpQueryInfoA, InternetGetConnectedState,
+  InternetQueryDataAvailable,
   OleInitialize, OleUninitialize, ICClose,
   ICGetDisplayFormat, ICOpen, ICLocate, RegOpenKeyExA, RegOpenKeyA,
   RegCreateKeyA, RegCloseKey, RegQueryValueExA, RegSetValueExA,

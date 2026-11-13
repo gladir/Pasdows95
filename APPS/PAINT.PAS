@@ -44516,6 +44516,11 @@ Begin
  If D='' Then Begin
   {$IFDEF WINDOWS}
   D:=GetEnv('LOCALAPPDATA');
+  {$IFDEF WPC}
+  { Pasdows 95 : pas de LOCALAPPDATA ; le dossier courant est souvent le
+    CD-ROM (lecture seule) : cache sur le disque dur C: }
+  If D='' Then D:='C:';
+  {$ENDIF}
   If D='' Then D:='.';
   D:=D+'\vton';
   {$ELSE}
