@@ -36451,6 +36451,176 @@ Begin
   KLog('Systeme : C:\WINDOWS (disque dur)');
 End;
 
+{ ------------------------------------------------------------------ }
+{ Boite de progression du demarrage : entre le logo d'IO.SYS et le    }
+{ bureau, l'initialisation du noyau (disques, systemes de fichiers,   }
+{ bibliotheques, Win16, reseau...) laissait l'ecran noir plusieurs     }
+{ secondes sur une machine lente. Chaque etape est listee avec une    }
+{ case cochee en vert une fois terminee. Dessinee directement dans le }
+{ tampon Back (le gestionnaire de fenetres n'existe pas encore).      }
+{ ------------------------------------------------------------------ }
+
+Const
+  BootN = 8;
+  BootW = 420;
+
+Var
+  BootCur : LongInt;                 { etape en cours (BootN : fini) }
+  BootX, BootY, BootH, BootMsgN : LongInt;
+
+Function BootTitle : String;
+Begin
+  BootTitle := L('D'#130'marrage de Pasdows 95', 'Starting Pasdows 95',
+                 'Pasdows 95 wird gestartet', 'Avvio di Pasdows 95',
+                 'Iniciando Pasdows 95');
+End;
+
+Function BootMsg : String;
+Begin
+  BootMsg := L('Veuillez patienter pendant la pr'#130'paration de ' +
+               'Pasdows 95.',
+               'Please wait while Pasdows 95 is being prepared.',
+               'Bitte warten Sie, w'#132'hrend Pasdows 95 vorbereitet ' +
+               'wird.',
+               'Attendere la preparazione di Pasdows 95.',
+               'Espere mientras se prepara Pasdows 95.');
+End;
+
+Function BootLabel(I : LongInt) : String;
+Begin
+  Case I Of
+    0 : BootLabel := L('Carte graphique, horloge et son',
+                       'Graphics card, clock and sound',
+                       'Grafikkarte, Uhr und Sound',
+                       'Scheda grafica, orologio e audio',
+                       'Tarjeta gr'#160'fica, reloj y sonido');
+    1 : BootLabel := L('Disques durs et lecteur de CD-ROM',
+                       'Hard disks and CD-ROM drive',
+                       'Festplatten und CD-ROM-Laufwerk',
+                       'Dischi rigidi e unit'#133' CD-ROM',
+                       'Discos duros y unidad de CD-ROM');
+    2 : BootLabel := L('Syst'#138'mes de fichiers (FAT, NTFS)',
+                       'File systems (FAT, NTFS)',
+                       'Dateisysteme (FAT, NTFS)',
+                       'File system (FAT, NTFS)',
+                       'Sistemas de archivos (FAT, NTFS)');
+    3 : BootLabel := L('Clavier, souris et interface graphique',
+                       'Keyboard, mouse and graphical interface',
+                       'Tastatur, Maus und Grafikoberfl'#132'che',
+                       'Tastiera, mouse e interfaccia grafica',
+                       'Teclado, rat'#162'n e interfaz gr'#160'fica');
+    4 : BootLabel := L('Biblioth'#138'ques Win32 et Registre',
+                       'Win32 libraries and Registry',
+                       'Win32-Bibliotheken und Registrierung',
+                       'Librerie Win32 e Registro',
+                       'Bibliotecas Win32 y Registro');
+    5 : BootLabel := L('Sous-syst'#138'me Windows 16 bits',
+                       '16-bit Windows subsystem',
+                       '16-Bit-Windows-Subsystem',
+                       'Sottosistema Windows a 16 bit',
+                       'Subsistema de Windows de 16 bits');
+    6 : BootLabel := L('R'#130'seau (TCP/IP)', 'Network (TCP/IP)',
+                       'Netzwerk (TCP/IP)', 'Rete (TCP/IP)',
+                       'Red (TCP/IP)');
+  Else
+    BootLabel := L('Bureau et barre des t'#131'ches', 'Desktop and taskbar',
+                   'Desktop und Taskleiste',
+                   'Desktop e barra delle applicazioni',
+                   'Escritorio y barra de tareas');
+  End;
+End;
+
+{ Coche verte dans la case de 13 x 13 points en (X, Y) }
+Procedure BootCheck(X, Y : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To 2 Do
+  Begin
+    DLine(X + 3, Y + 5 + K, X + 5, Y + 7 + K, cGreen);
+    DLine(X + 5, Y + 7 + K, X + 9, Y + 3 + K, cGreen);
+  End;
+End;
+
+{ Dessiner la boite (Full : avec le fond d'ecran) et la recopier a
+  l'ecran }
+Procedure BootPaint(Full : Boolean);
+Var X1, Y1, X2, Y2, I, Y, C : LongInt; R : TRect;
+Begin
+  SetTarget(Back, 0, 0);
+  X1 := BootX; Y1 := BootY; X2 := BootX + BootW - 1; Y2 := BootY + BootH - 1;
+  If Full Then
+  Begin
+    FBar(0, 0, ScrW - 1, ScrH - 1, cTeal);
+    { cadre et barre de titre d'une boite de dialogue }
+    FBar(X1, Y1, X2, Y2, cSilver);
+    Edge(X1, Y1, X2, Y2, cSilver, cBlack);
+    Edge(X1 + 1, Y1 + 1, X2 - 1, Y2 - 1, cWhite, cGray);
+    FBar(X1 + 3, Y1 + 3, X2 - 3, Y1 + 20, cNavy);
+    PaintIcon(icLogo, X1 + 5, Y1 + 4, 16);
+    OutBold(X1 + 24, Y1 + 4, Fit(BootTitle, BootW - 32), cWhite);
+    PaintIcon(icLogo, X1 + 16, Y1 + 32, 32);
+    WrapText(X1 + 60, Y1 + 34, BootW - 76, BootMsg, cBlack, True);
+  End;
+  Y := Y1 + 50 + BootMsgN * 16;
+  For I := 0 To BootN - 1 Do
+  Begin
+    FBar(X1 + 8, Y - 2, X2 - 8, Y + 15, cSilver);
+    Sunken(X1 + 28, Y + 1, X1 + 40, Y + 13, cWhite);
+    If I < BootCur Then BootCheck(X1 + 28, Y + 1);
+    If I = BootCur Then
+    Begin
+      Arrow(X1 + 14, Y + 3, 0, cBlack);
+      OutBold(X1 + 50, Y, Fit(BootLabel(I), BootW - 60), cBlack);
+    End
+    Else
+    Begin
+      If I < BootCur Then C := cBlack Else C := cGray;
+      OutTxt(X1 + 50, Y, Fit(BootLabel(I), BootW - 60), C);
+    End;
+    Y := Y + 20;
+  End;
+  { barre de progression }
+  Y := Y + 6;
+  Sunken(X1 + 16, Y, X2 - 16, Y + 17, cWhite);
+  C := (X2 - 16 - X1 - 16 - 4) * BootCur Div BootN;
+  For I := 0 To C Div 10 - 1 Do
+    FBar(X1 + 19 + I * 10, Y + 3, X1 + 19 + I * 10 + 7, Y + 14, cNavy);
+  SetR(R, X1, Y1, X2 + 1, Y2 + 1);
+  LfbCopy(R);
+  { le fond ensuite : la boite apparait sans attendre la recopie de
+    tout l'ecran (lente sur une vieille carte graphique) }
+  If Full Then
+  Begin
+    SetR(R, 0, 0, ScrW, Y1);
+    LfbCopy(R);
+    SetR(R, 0, Y1, X1, Y2 + 1);
+    LfbCopy(R);
+    SetR(R, X2 + 1, Y1, ScrW, Y2 + 1);
+    LfbCopy(R);
+    SetR(R, 0, Y2 + 1, ScrW, ScrH);
+    LfbCopy(R);
+  End;
+End;
+
+{ Afficher la boite, etape 0 en cours }
+Procedure BootShow;
+Begin
+  BootCur := 0;
+  BootMsgN := WrapText(0, 0, BootW - 76, BootMsg, 0, False);
+  If BootMsgN < 2 Then BootMsgN := 2;
+  BootH := 50 + BootMsgN * 16 + BootN * 20 + 6 + 18 + 14;
+  BootX := (ScrW - BootW) Div 2;
+  BootY := (ScrH - BootH) Div 2;
+  BootPaint(True);
+End;
+
+{ Etapes precedentes terminees (cochees), etape K en cours }
+Procedure BootStep(K : LongInt);
+Begin
+  BootCur := K;
+  BootPaint(False);
+End;
+
 Procedure SystemLoop;
 Var I : LongInt; Busy : Boolean;
 Begin
@@ -36507,6 +36677,15 @@ BEGIN
   End;
   OptFlags := MemL[0:BootInfo + $30];
   VideoFromBoot;
+  { la boite de progression remplace l'ecran noir des que le mode
+    graphique est pret (palette, tampon de l'ecran, police d'IO.SYS) }
+  asm
+    finit
+  end;
+  InitKeyTables;
+  DefaultPalette;
+  SurfNew(Back, ScrW, ScrH);
+  BootShow;
   DispiDetect;
   DispW := -1; RebootAskW := -1; DtW := -1;
   TzLoad;
@@ -36519,20 +36698,17 @@ BEGIN
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
   If KImgHi > $00400000 Then
     KLog('ATTENTION : image du noyau au-dela de 00400000h (programmes Win32)');
-  asm
-    finit
-  end;
-  InitKeyTables;
-  DefaultPalette;
-  SurfNew(Back, ScrW, ScrH);
   CursorSetShape(0);
   CurX := ScrW Div 2; CurY := ScrH Div 2;
+  BootStep(1);
   AtaInit;
   CdInit;
+  BootStep(2);
   FmtAskW := -1; ExpCW := -1;
   FatInit;
   CurDirS := 'D:';
   SysDirInit;
+  BootStep(3);
   { ApiTrace := True journalise chaque appel d'API d'un programme Win32
     (nom, appelant, arguments, resultat) sur le port serie COM1 }
   ApiTrace := False;
@@ -36544,13 +36720,17 @@ BEGIN
   DeskColor := cTeal;
   InitClasses;
   InitGdi;
+  BootStep(4);
   InitExports;
   If ApiTrace Then TraceInit;
   RegInit;
+  BootStep(5);
   InitW16;
   InitW16Apis;
   W16Init2;
+  BootStep(6);
   NetInit;
+  BootStep(7);
   AppProcObj := -1;
   ConW := -1; ConTitle := ''; ConRowsDue := False; ConLastCY := -1;
   ConPalVer := -1;
@@ -36559,6 +36739,7 @@ BEGIN
   ChainExec := ''; ChainArgs := ''; ChainRet := ''; ChainRetArgs := '';
   ChainDir := '';
   DeskBuild;
+  BootStep(BootN);
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,
                       WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
   ShowW(TaskbarW, True, False);
