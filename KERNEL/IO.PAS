@@ -50,6 +50,7 @@ Program IO;
     70000h-7FFFFh  texte du Bloc-notes
     80000h-807FFh  tampon d'un secteur du CD-ROM
     80800h-80BFFh  secteur de FAT et secteur de repertoire (disque dur)
+    89000h-8CFFFh  NTFS : enregistrement, bloc d'index, runs, file
     81000h-887FFh  lecture des fichiers (30 Ko)                     }
 
 {$S-,R-,I-}
@@ -64,6 +65,12 @@ Const
   TmpSeg    = $8100;
   FatSeg    = $8080;
   DirSeg    = $80A0;
+  NRecSeg   = $8900;                 { enregistrement de la MFT (4 Ko) }
+  NIdxSeg   = $8A00;                 { bloc d'index (4 Ko) }
+  NMftRun   = $8B00;                 { runs de $MFT }
+  NIdxRun   = $8B60;                 { runs de l'index parcouru }
+  NFileRun  = $8BA0;                 { runs du fichier lu }
+  NQueue    = $8C80;                 { blocs d'index a parcourir }
   NoteMax   = 60000;
   TmpMax    = 30720;
   Version   = '4.00.950';
@@ -246,7 +253,14 @@ Var
     de la FAT et des donnees, grappe de la racine, secteurs par grappe,
     secteur de FAT en cache et position dans la chaine du fichier lu }
   HdBoot      : Boolean;
+  Fat16       : Boolean;                 { FAT16 (sinon FAT32) }
   FatLba, DataLba, RootClus, FatCached : LongInt;
+  Root16Lba, Root16Secs : LongInt;       { racine fixe de la FAT16 }
+  { NTFS : partition, cluster, enregistrement, bloc d'index, runs }
+  NtfsBoot    : Boolean;
+  NtPart, NtCb, NtRecSz, NtIdxSz, NtVcnSz : LongInt;
+  NtSpc, NtMftN, NtQTail, NtFileIdx, NtFileN : Integer;
+  NtFileRes   : Boolean;
   SecPerClus  : Integer;
   ChIdx       : Integer;
   ChClus, ChNum : LongInt;
@@ -835,29 +849,43 @@ Function FatNext(C : LongInt) : LongInt;
 Var Sec : LongInt; Ofs : Word;
 Begin
   FatNext := $0FFFFFFF;
-  Sec := FatLba + (C Shr 7);
-  Ofs := (C And 127) * 4;
+  If Fat16 Then
+  Begin
+    Sec := FatLba + (C Shr 8);
+    Ofs := (C And 255) * 2;
+  End
+  Else
+  Begin
+    Sec := FatLba + (C Shr 7);
+    Ofs := (C And 127) * 4;
+  End;
   If Sec <> FatCached Then
   Begin
     If Not HdRead(Sec, FatSeg, 1) Then Exit;
     FatCached := Sec;
   End;
-  FatNext := GetD(FatSeg, Ofs) And $0FFFFFFF;
+  If Fat16 Then
+  Begin
+    If MemW[FatSeg:Ofs] < $FFF8 Then FatNext := MemW[FatSeg:Ofs];
+  End
+  Else FatNext := GetD(FatSeg, Ofs) And $0FFFFFFF;
 End;
 
 { Ajouter les entrees du repertoire commencant a la grappe C ; retourne
   la grappe du sous-repertoire Sub (0 si absent) }
 Function FatDir(C : LongInt; Const Sub : String) : LongInt;
-Var I, K, Ofs : Integer; Sec : LongInt; Nm, Ext : String; A : Byte;
+Var I, K, Ofs, NS : Integer; Sec : LongInt; Nm, Ext : String; A : Byte;
     Hops : Integer;
 Begin
   FatDir := 0;
   Hops := 0;
-  While (C >= 2) And (C < $0FFFFFF8) And (Hops < 4096) Do
+  While ((C >= 2) And (C < $0FFFFFF8) Or (C = 0)) And (Hops < 4096) Do
   Begin
-    For I := 0 To SecPerClus - 1 Do
+    NS := SecPerClus;
+    If C = 0 Then NS := Root16Secs;
+    For I := 0 To NS - 1 Do
     Begin
-      Sec := ClusLba(C) + I;
+      If C = 0 Then Sec := Root16Lba + I Else Sec := ClusLba(C) + I;
       If Not HdRead(Sec, DirSeg, 1) Then Exit;
       For K := 0 To 15 Do
       Begin
@@ -901,6 +929,7 @@ Begin
         End;
       End;
     End;
+    If C = 0 Then Exit;
     C := FatNext(C);
     Inc(Hops);
   End;
@@ -920,27 +949,316 @@ Begin
   Begin
     Ofs := 446 + I * 16;
     T := Mem[CdSeg:Ofs + 4];
-    If ((T = $0B) Or (T = $0C)) And
+    If ((T = $0B) Or (T = $0C) Or (T = $04) Or (T = $06) Or (T = $0E)) And
        ((Start < 0) Or (Mem[CdSeg:Ofs] = $80)) Then
       Start := GetD(CdSeg, Ofs + 8);
   End;
   If Start < 0 Then Exit;
   If Not HdRead(Start, CdSeg, 1) Then Exit;
-  If (MemW[CdSeg:11] <> 512) Or (Mem[CdSeg:13] = 0) Or
-     (MemW[CdSeg:22] <> 0) Then Exit;
+  If (MemW[CdSeg:11] <> 512) Or (Mem[CdSeg:13] = 0) Then Exit;
   SecPerClus := Mem[CdSeg:13];
   FatLba := Start + MemW[CdSeg:14];
-  DataLba := FatLba + LongInt(Mem[CdSeg:16]) * GetD(CdSeg, 36);
-  RootClus := GetD(CdSeg, 44);
+  Fat16 := MemW[CdSeg:22] <> 0;
+  If Fat16 Then
+  Begin
+    Root16Lba := FatLba + LongInt(Mem[CdSeg:16]) * MemW[CdSeg:22];
+    Root16Secs := (LongInt(MemW[CdSeg:17]) * 32 + 511) Div 512;
+    DataLba := Root16Lba + Root16Secs;
+    RootClus := 0;
+  End
+  Else
+  Begin
+    DataLba := FatLba + LongInt(Mem[CdSeg:16]) * GetD(CdSeg, 36);
+    RootClus := GetD(CdSeg, 44);
+  End;
   FatCached := -1; ChIdx := -1;
   CdCount := 0; VolLabel := '';
   W := FatDir(RootClus, 'WINDOWS');
   If W >= 2 Then FatDir(W, '');
   If VolLabel = '' Then
-    For I := 0 To 10 Do VolLabel := VolLabel + Chr(Mem[CdSeg:71 + I]);
+    For I := 0 To 10 Do
+      If Fat16 Then VolLabel := VolLabel + Chr(Mem[CdSeg:43 + I])
+      Else VolLabel := VolLabel + Chr(Mem[CdSeg:71 + I]);
   VolLabel := Trim(VolLabel);
   HdBoot := True;
   RootLba := 0; RootSize := 0;
+End;
+
+
+{ ================================================================== }
+{ Disque dur NTFS (Pasdows installe par INSTALL sur une partition 07h) }
+{ ================================================================== }
+
+{ Enregistrements de la MFT et blocs d'index lus en NRecSeg et NIdxSeg
+  (correctifs de secteurs appliques) ; runs (VCN, LCN, longueur) de
+  $MFT, de l'index parcouru et du fichier lu en NMftRun, NIdxRun et
+  NFileRun ; file des blocs d'index a parcourir en NQueue. }
+
+Function NtHd(Lba : LongInt; BSeg : Word) : Boolean;
+Begin
+  NtHd := HdRead(NtPart + Lba, BSeg, 1);
+End;
+
+Function NtVcnLcn(RSeg : Word; RN : Integer; Vcn : LongInt;
+                  Var Lcn : LongInt) : Boolean;
+Var I : Integer; V0 : LongInt;
+Begin
+  NtVcnLcn := False;
+  For I := 0 To RN - 1 Do
+  Begin
+    V0 := GetD(RSeg, I * 12);
+    If (Vcn >= V0) And (Vcn < V0 + GetD(RSeg, I * 12 + 8)) Then
+    Begin
+      Lcn := GetD(RSeg, I * 12 + 4) + Vcn - V0;
+      NtVcnLcn := True;
+      Exit;
+    End;
+  End;
+End;
+
+{ Lire Len octets (multiple de 512) a l'octet Off d'un flux en BSeg:0 }
+Function NtStream(RSeg : Word; RN : Integer; Off, Len : LongInt;
+                  BSeg : Word) : Boolean;
+Var Lcn, Vcn : LongInt;
+Begin
+  NtStream := False;
+  While Len > 0 Do
+  Begin
+    Vcn := Off Div NtCb;
+    If Not NtVcnLcn(RSeg, RN, Vcn, Lcn) Then Exit;
+    If Not NtHd(Lcn * NtSpc + (Off Mod NtCb) Div 512, BSeg) Then Exit;
+    Off := Off + 512; Len := Len - 512; BSeg := BSeg + 32;
+  End;
+  NtStream := True;
+End;
+
+Procedure NtUnfix(BSeg : Word);
+Var UO, I, N : Word;
+Begin
+  UO := MemW[BSeg:4]; N := MemW[BSeg:6];
+  For I := 1 To N - 1 Do
+    MemW[BSeg:I * 512 - 2] := MemW[BSeg:UO + I * 2];
+End;
+
+Function NtReadRec(N : LongInt) : Boolean;
+Begin
+  NtReadRec := False;
+  If Not NtStream(NMftRun, NtMftN, N * NtRecSz, NtRecSz, NRecSeg) Then
+    Exit;
+  If GetD(NRecSeg, 0) <> $454C4946 Then Exit;
+  NtUnfix(NRecSeg);
+  NtReadRec := True;
+End;
+
+{ Attribut de type T (NL : longueur du nom, 0 ou 4 pour $I30) }
+Function NtAttr(T : LongInt; NL : Integer) : Word;
+Var P : Word;
+Begin
+  NtAttr := 0;
+  P := MemW[NRecSeg:$14];
+  While (P < NtRecSz) And (GetD(NRecSeg, P) <> -1) Do
+  Begin
+    If (GetD(NRecSeg, P) = T) And (Mem[NRecSeg:P + 9] = NL) Then
+    Begin
+      NtAttr := P;
+      Exit;
+    End;
+    If MemW[NRecSeg:P + 4] = 0 Then Exit;
+    P := P + MemW[NRecSeg:P + 4];
+  End;
+End;
+
+{ Decoder les runs de l'attribut P (en NRecSeg) en RSeg ; nombre }
+Function NtRuns(P : Word; RSeg : Word; Max : Integer) : Integer;
+Var Q : Word; H, NL, NO, K : Integer; Vcn, Lcn, Len, D : LongInt;
+    N : Integer;
+Begin
+  N := 0;
+  Q := P + MemW[NRecSeg:P + $20];
+  Vcn := GetD(NRecSeg, P + $10); Lcn := 0;
+  While (Mem[NRecSeg:Q] <> 0) And (N < Max) Do
+  Begin
+    H := Mem[NRecSeg:Q]; NL := H And 15; NO := H Shr 4;
+    Len := 0;
+    For K := NL - 1 DownTo 0 Do Len := Len * 256 + Mem[NRecSeg:Q + 1 + K];
+    D := 0;
+    For K := NO - 1 DownTo 0 Do D := D * 256 + Mem[NRecSeg:Q + 1 + NL + K];
+    If (NO > 0) And (NO < 4) Then
+      If (Mem[NRecSeg:Q + NL + NO] And $80) <> 0 Then
+        D := D - (LongInt(1) Shl (8 * NO));
+    Lcn := Lcn + D;
+    MemW[RSeg:N * 12] := Vcn And $FFFF;
+    MemW[RSeg:N * 12 + 2] := Vcn Shr 16;
+    MemW[RSeg:N * 12 + 4] := Lcn And $FFFF;
+    MemW[RSeg:N * 12 + 6] := Lcn Shr 16;
+    MemW[RSeg:N * 12 + 8] := Len And $FFFF;
+    MemW[RSeg:N * 12 + 10] := Len Shr 16;
+    Inc(N);
+    Vcn := Vcn + Len;
+    Q := Q + 1 + NL + NO;
+  End;
+  NtRuns := N;
+End;
+
+{ Entrees d'un noeud (en-tete d'index en BSeg:H) : fichiers ajoutes a
+  CdFiles, sous-noeuds a la file }
+Procedure NtNode(BSeg, H : Word; Var WinRec : LongInt);
+Var E, K : Word; Fl, Ref : LongInt; NLen, Ns : Integer; Nm : String;
+    W : Word;
+Begin
+  E := H + MemW[BSeg:H];
+  Repeat
+    Fl := GetD(BSeg, E + 12);
+    If ((Fl And 1) <> 0) And (NtQTail < 255) Then
+    Begin
+      MemW[NQueue:NtQTail * 4] := MemW[BSeg:E + MemW[BSeg:E + 8] - 8];
+      MemW[NQueue:NtQTail * 4 + 2] := MemW[BSeg:E + MemW[BSeg:E + 8] - 6];
+      Inc(NtQTail);
+    End;
+    If (Fl And 2) <> 0 Then Exit;
+    Ref := GetD(BSeg, E);
+    NLen := Mem[BSeg:E + 16 + $40]; Ns := Mem[BSeg:E + 16 + $41];
+    If (Ref >= 16) And (Ns <> 2) And (CdCount < CdMax) Then
+    Begin
+      Nm := '';
+      For K := 0 To NLen - 1 Do
+      Begin
+        W := MemW[BSeg:E + 16 + $42 + K * 2];
+        If W < 256 Then Nm := Nm + UpCase(Chr(W)) Else Nm := Nm + '_';
+      End;
+      CdFiles[CdCount].Name := Copy(Nm, 1, 12);
+      CdFiles[CdCount].Lba := Ref;
+      CdFiles[CdCount].Size := GetD(BSeg, E + 16 + $30);
+      CdFiles[CdCount].Dir := (GetD(BSeg, E + 16 + $38) And $10000000) <> 0;
+      CdFiles[CdCount].Yr := 126; CdFiles[CdCount].Mo := 1;
+      CdFiles[CdCount].Dy := 1; CdFiles[CdCount].Hr := 0;
+      CdFiles[CdCount].Mi := 0;
+      If CdFiles[CdCount].Dir And (Nm = 'WINDOWS') Then WinRec := Ref;
+      Inc(CdCount);
+    End;
+    E := E + MemW[BSeg:E + 8];
+  Until MemW[BSeg:E + 8] = 0;
+End;
+
+{ Lister le repertoire Rec (racine, puis blocs INDX en largeur) }
+Function NtList(Rec : LongInt; Var WinRec : LongInt) : Boolean;
+Var P : Word; RN : Integer; Q : Integer; Vcn : LongInt;
+Begin
+  NtList := False;
+  If Not NtReadRec(Rec) Then Exit;
+  RN := 0;
+  P := NtAttr($A0, 4);
+  If P <> 0 Then RN := NtRuns(P, NIdxRun, 64);
+  P := NtAttr($90, 4);
+  If P = 0 Then Exit;
+  NtQTail := 0;
+  NtNode(NRecSeg, P + MemW[NRecSeg:P + $14] + $10, WinRec);
+  Q := 0;
+  While Q < NtQTail Do
+  Begin
+    Vcn := GetD(NQueue, Q * 4);
+    Inc(Q);
+    If NtStream(NIdxRun, RN, Vcn * NtVcnSz, NtIdxSz, NIdxSeg) Then
+      If GetD(NIdxSeg, 0) = $58444E49 Then
+      Begin
+        NtUnfix(NIdxSeg);
+        NtNode(NIdxSeg, $18, WinRec);
+      End;
+  End;
+  NtList := True;
+End;
+
+Function NtSize(C : Byte) : LongInt;
+Begin
+  If C < 128 Then NtSize := LongInt(C) * NtCb
+  Else NtSize := LongInt(1) Shl (256 - C);
+End;
+
+{ Volume NTFS du disque d'amorcage : racine puis C:\WINDOWS }
+Procedure NtScan;
+Var I, Ofs : Integer; Start, W : LongInt; T : Byte; P : Word;
+Begin
+  If BootDrive < $80 Then Exit;
+  If Not HdRead(0, CdSeg, 1) Then Exit;
+  If MemW[CdSeg:510] <> $AA55 Then Exit;
+  Start := -1;
+  For I := 0 To 3 Do
+  Begin
+    Ofs := 446 + I * 16;
+    T := Mem[CdSeg:Ofs + 4];
+    If (T = $07) And ((Start < 0) Or (Mem[CdSeg:Ofs] = $80)) Then
+      Start := GetD(CdSeg, Ofs + 8);
+  End;
+  If Start < 0 Then Exit;
+  If Not HdRead(Start, CdSeg, 1) Then Exit;
+  If (GetD(CdSeg, 3) <> $5346544E) Or (MemW[CdSeg:11] <> 512) Then Exit;
+  NtPart := Start;
+  NtSpc := Mem[CdSeg:13];
+  NtCb := LongInt(NtSpc) * 512;
+  NtRecSz := NtSize(Mem[CdSeg:$40]);
+  NtIdxSz := NtSize(Mem[CdSeg:$44]);
+  If (NtRecSz > 4096) Or (NtIdxSz > 4096) Then Exit;
+  If NtIdxSz >= NtCb Then NtVcnSz := NtCb Else NtVcnSz := 512;
+  { $MFT : enregistrement 0 lu directement, puis ses runs }
+  MemW[NMftRun:0] := 0; MemW[NMftRun:2] := 0;
+  MemW[NMftRun:4] := MemW[CdSeg:$30]; MemW[NMftRun:6] := MemW[CdSeg:$32];
+  MemW[NMftRun:8] := $FFFF; MemW[NMftRun:10] := 0;
+  NtMftN := 1;
+  VolLabel := '';
+  If Not NtReadRec(0) Then Exit;
+  P := NtAttr($80, 0);
+  If P = 0 Then Exit;
+  NtMftN := NtRuns(P, NMftRun, 120);
+  { etiquette ($Volume) }
+  If NtReadRec(3) Then
+  Begin
+    P := NtAttr($60, 0);
+    If P <> 0 Then
+      For I := 0 To Integer(MemW[NRecSeg:P + $10] Div 2) - 1 Do
+        If I < 32 Then
+          VolLabel := VolLabel + Chr(Mem[NRecSeg:P + MemW[NRecSeg:P + $14] +
+                                         I * 2]);
+  End;
+  CdCount := 0; W := -1;
+  If Not NtList(5, W) Then Exit;
+  If W >= 0 Then NtList(W, W);
+  NtFileIdx := -1;
+  HdBoot := True; NtfsBoot := True;
+  RootLba := 0; RootSize := 0;
+End;
+
+{ Bloc K (2 Ko) du fichier NTFS Idx en Seg:0000 }
+Function NtFileRead(Idx : Integer; K : LongInt; BSeg : Word) : Boolean;
+Var P, VO, L : Word; I : Integer; Off : LongInt;
+Begin
+  NtFileRead := False;
+  If NtFileIdx <> Idx Then
+  Begin
+    If Not NtReadRec(CdFiles[Idx].Lba) Then Exit;
+    P := NtAttr($80, 0);
+    If P = 0 Then Exit;
+    NtFileRes := Mem[NRecSeg:P + 8] = 0;
+    If Not NtFileRes Then NtFileN := NtRuns(P, NFileRun, 250);
+    NtFileIdx := Idx;
+  End;
+  If NtFileRes Then
+  Begin
+    { donnees residentes (petit fichier ecrit par VMM32) }
+    If Not NtReadRec(CdFiles[Idx].Lba) Then Exit;
+    P := NtAttr($80, 0);
+    If P = 0 Then Exit;
+    VO := P + MemW[NRecSeg:P + $14];
+    L := MemW[NRecSeg:P + $10];
+    For I := 0 To 2047 Do
+    Begin
+      Off := K * 2048 + I;
+      If Off < L Then Mem[BSeg:I] := Mem[NRecSeg:VO + Word(Off)]
+      Else Mem[BSeg:I] := 0;
+    End;
+    NtFileRead := True;
+    Exit;
+  End;
+  NtFileRead := NtStream(NFileRun, NtFileN, K * 2048, 2048, BSeg);
 End;
 
 { Lire le bloc K (2 Ko) du fichier Idx en Seg:0000 }
@@ -950,6 +1268,11 @@ Begin
   If Not HdBoot Then
   Begin
     FileRead := CdRead(CdFiles[Idx].Lba + K, BSeg);
+    Exit;
+  End;
+  If NtfsBoot Then
+  Begin
+    FileRead := NtFileRead(Idx, K, BSeg);
     Exit;
   End;
   FileRead := False;
@@ -6838,7 +7161,7 @@ End;
   de configuration, Affichage) dans le CMOS : 7Ah bits par point (4 : VGA
   16 couleurs), 7Bh signature 5Ah, 7Ch largeur / 8, 7Dh hauteur / 8.
   GDT temporaire en 0000:0A00, GDTR en 0000:0A20, transition 32 bits en
-  0000:0A40, zone de transit du fichier en 00400000h. }
+  0000:0A40, zone de transit du fichier en 00800000h. }
 
 Const
   VInfo     = $0500;
@@ -6847,7 +7170,7 @@ Const
   VTramp    = $0A40;
   VFont     = $2000;
   VEnv      = $3000;
-  VStaging  = $00400000;
+  VStaging  = $00800000;
   CmosDosFlag = $7E;
   VModes    = $0600;
   MaxVModes = 48;
@@ -7447,6 +7770,7 @@ BEGIN
   SetEnv('WINDIR', 'D:\');
   CdScan;
   If Not CdOk Then FatScan;
+  If Not CdOk And Not HdBoot Then NtScan;
   If HdBoot Then
   Begin
     SetEnv('PATH', 'C:\WINDOWS;C:\');
