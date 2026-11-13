@@ -5546,6 +5546,28 @@ Begin
   End;
 End;
 
+{ Logo de demarrage sans animation ni attente : affiche pendant le
+  chargement et l'initialisation du noyau 32 bits (voir StartVmm32) }
+Procedure SplashStatic;
+Var K, X : Integer; C : Byte;
+Begin
+  DrawSky;
+  DrawLogo(140);
+  OutBold(ScrW - 8 - TextW('Gladir.com'), 440, 'Gladir.com', cWhite);
+  For K := 0 To 7 Do
+  Begin
+    X := K * 80;
+    Case K Mod 4 Of
+      0 : C := cRed;
+      1 : C := cYellow;
+      2 : C := cLime;
+    Else
+      C := cBlue;
+    End;
+    Bar(X, ScrH - 10, X + 79, ScrH - 1, C);
+  End;
+End;
+
 Procedure PowerOff;
 Begin
   asm
@@ -6777,10 +6799,12 @@ Begin
     mov R,al
   end;
   If R <> $1A Then Exit;
-  asm
-    mov ax,0012h
-    int 10h
-  end;
+  { deja en mode 12h (logo de demarrage) : le garder a l'ecran }
+  If Mem[$40:$49] <> $12 Then
+    asm
+      mov ax,0012h
+      int 10h
+    end;
   If Mem[$40:$49] <> $12 Then Exit;
   PutInfoD($0C, $A0000);
   MemW[0:VInfo + $10] := 80;
@@ -6939,13 +6963,23 @@ Begin
   Vmm32Why := 3;
   If ExtMemKb < 15 * 1024 Then Exit;
   Vmm32Why := 4;
-  TextMode;
-  TClear;
-  TWrite(0, 0, L('Chargement de Pasdows 95 (VMM32.VXD)...',
-         'Loading Pasdows 95 (VMM32.VXD)...',
-         'Pasdows 95 wird geladen (VMM32.VXD)...',
-         'Caricamento di Pasdows 95 (VMM32.VXD)...',
-         'Cargando Pasdows 95 (VMM32.VXD)...'), $07);
+  { logo de demarrage pendant le chargement (Logo=1 dans MSDOS.SYS), comme
+    Windows 95 ; en VGA il reste affiche jusqu'au bureau du noyau 32 bits }
+  If OptLogo Then
+  Begin
+    GraphMode;
+    SplashStatic;
+  End
+  Else
+  Begin
+    TextMode;
+    TClear;
+    TWrite(0, 0, L('Chargement de Pasdows 95 (VMM32.VXD)...',
+           'Loading Pasdows 95 (VMM32.VXD)...',
+           'Pasdows 95 wird geladen (VMM32.VXD)...',
+           'Caricamento di Pasdows 95 (VMM32.VXD)...',
+           'Cargando Pasdows 95 (VMM32.VXD)...'), $07);
+  End;
   EnableA20;
   If Not LoadVmm32 Then Exit;
   CopyFont;
