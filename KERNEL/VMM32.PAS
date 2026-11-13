@@ -157,6 +157,9 @@ Var
   HeapStart, HeapEnd, HeapRover : LongInt;
   HeapOwner  : LongInt;          { 1 : bloc d'un programme Win32 }
   OptFlags   : LongInt;
+  { dossier systeme : racine du CD-ROM (D:\) ou C:\WINDOWS\ quand
+    Pasdows a ete installe sur le disque dur (IO.SYS, drapeau 4) }
+  SysDir, CmdPath : String[40];
 
 { ------------------------------------------------------------------ }
 { Memoire et chaines                                                 }
@@ -6850,8 +6853,29 @@ Begin
                   'S'#161'mbolo de MS-DOS');
 End;
 
+{ Entree I du dossier systeme (racine du CD-ROM ou C:\WINDOWS) }
+Function SysEntry(I : LongInt; Var Nm : String; Var IsDir : Boolean)
+  : Boolean;
+Var Lba, Size, Fl, Tm, Idx, K : LongInt;
+Begin
+  If SysDir = 'D:\' Then
+  Begin
+    SysEntry := IsoDirEntry(RootLba, RootSize, I, Nm, Lba, Size, Fl, Tm);
+    IsDir := (Fl And 2) <> 0;
+    Exit;
+  End;
+  SysEntry := False;
+  Idx := 0;
+  For K := 0 To I Do
+    If Not FatDirEntry(Copy(SysDir, 1, Length(SysDir) - 1), 0, Idx) Then
+      Exit;
+  Nm := UpStr(FfShort);
+  IsDir := (FfAttr And $10) <> 0;
+  SysEntry := True;
+End;
+
 Procedure DeskBuild;
-Var I, Lba, Size, Fl, Tm : LongInt; Nm : String;
+Var I, Lba, Size, Fl, Tm : LongInt; Nm : String; Dir : Boolean;
 Begin
   DeskCnt := 0; ExeCnt := 0;
   DeskAdd(L('Poste de travail', 'My Computer', 'Arbeitsplatz',
@@ -6860,17 +6884,17 @@ Begin
             'Papelera de reciclaje'), icRecycle, cmRecycle, '');
   DeskAdd(L('Lisez-moi', 'Read Me', 'Liesmich', 'Leggimi', 'L'#130'ame'),
           icText, cmReadme, '');
-  If IsoLookup('\COMMAND.EXE', Lba, Size, Fl, Tm) Then
-    DeskAdd(PromptName, icDos, cmPrompt, 'D:\COMMAND.EXE');
+  If PathInfo(CmdPath, Fl, Size, Tm, Lba, I) Then
+    DeskAdd(PromptName, icDos, cmPrompt, CmdPath);
   I := 0;
-  While IsoDirEntry(RootLba, RootSize, I, Nm, Lba, Size, Fl, Tm) Do
+  While SysEntry(I, Nm, Dir) Do
   Begin
-    If ((Fl And 2) = 0) And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
+    If Not Dir And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
        (Nm <> 'COMMAND.EXE') And (ExeCnt < 16) Then
     Begin
-      ExePaths[ExeCnt] := 'D:\' + Nm;
+      ExePaths[ExeCnt] := SysDir + Nm;
       DeskAdd(Copy(Nm, 1, Length(Nm) - 4), icApp, cmExeBase + ExeCnt,
-              'D:\' + Nm);
+              SysDir + Nm);
       Inc(ExeCnt);
     End;
     Inc(I);
@@ -7136,14 +7160,14 @@ End;
 
 { Fichier texte N de la racine du CD (menu Documents) }
 Function DocFile(N : LongInt; Var Nm : String) : Boolean;
-Var I, C, Lba, Size, Fl, Tm : LongInt; E : String;
+Var I, C : LongInt; E : String; Dir : Boolean;
 Begin
   DocFile := False;
   I := 0; C := 0;
-  While IsoDirEntry(RootLba, RootSize, I, Nm, Lba, Size, Fl, Tm) Do
+  While SysEntry(I, Nm, Dir) Do
   Begin
     E := Copy(Nm, Pos('.', Nm) + 1, 3);
-    If ((Fl And 2) = 0) And ((E = 'TXT') Or (E = 'BAT') Or (E = 'INI'))
+    If Not Dir And ((E = 'TXT') Or (E = 'BAT') Or (E = 'INI'))
     Then
     Begin
       If C = N Then
@@ -12043,9 +12067,9 @@ Begin
       ShowW(W, True, True);
     End;
     cmNotepad : NoteOpen('');
-    cmPrompt : RunExe('D:\COMMAND.EXE', '');
+    cmPrompt : RunExe(CmdPath, '');
     cmNetwork : NetConfigBox;
-    cmReadme : NoteOpen('D:\LISEZMOI.TXT');
+    cmReadme : NoteOpen(SysDir + 'LISEZMOI.TXT');
     cmRecycle :
       MsgBoxOpen(L('Corbeille', 'Recycle Bin', 'Papierkorb', 'Cestino',
                    'Papelera'), L('La Corbeille est vide.',
@@ -12101,7 +12125,7 @@ Begin
     If Cmd >= cmExeBase Then RunExe(ExePaths[Cmd - cmExeBase], '')
     Else If Cmd >= cmDocBase Then
     Begin
-      If DocFile(Cmd - cmDocBase, Nm) Then NoteOpen('D:\' + Nm);
+      If DocFile(Cmd - cmDocBase, Nm) Then NoteOpen(SysDir + Nm);
     End
   End;
 End;
@@ -15284,7 +15308,7 @@ Begin
   If (Pos('\', F) = 0) And (Pos(':', F) = 0) Then
   Begin
     If RamFind('C:\WINDOWS\' + UpStr(F)) >= 0 Then F := 'C:\WINDOWS\' + F
-    Else F := 'D:\' + F;
+    Else F := SysDir + F;
   End;
   IniPath := F;
 End;
@@ -22265,12 +22289,13 @@ Begin
   PlaySoundA := Ord(Ok);
 End;
 
-{ Son de demarrage (D:\PASDOWS.WAV), comme Demarrage de Windows }
+{ Son de demarrage (PASDOWS.WAV du dossier systeme), comme le son
+  Demarrage de Windows }
 Procedure StartupSound;
 Var A, N : LongInt;
 Begin
   If Not SbOk Then Exit;
-  A := LoadWholeFile('D:\PASDOWS.WAV', N);
+  A := LoadWholeFile(SysDir + 'PASDOWS.WAV', N);
   If A = 0 Then Exit;
   PlayWavImage(A, N, False);
   KFree(A);
@@ -23260,6 +23285,12 @@ Begin
       FindModuleFile := S;
       Exit;
     End;
+  End;
+  S := SysDir + UpStr(BaseName(Name));
+  If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
+  Begin
+    FindModuleFile := S;
+    Exit;
   End;
   S := 'D:\' + UpStr(BaseName(Name));
   If PathInfo(S, Attr, Size, Time, Lba, Ram) Then FindModuleFile := S;
@@ -33867,6 +33898,18 @@ Begin
   End;
 End;
 
+{ Dossier systeme : C:\WINDOWS si IO.SYS a demarre du disque dur }
+Procedure SysDirInit;
+Var A, S, T, L0, R0 : LongInt;
+Begin
+  SysDir := 'D:\'; CmdPath := 'D:\COMMAND.EXE';
+  If (OptFlags And 4) = 0 Then Exit;
+  If Not PathInfo('C:\WINDOWS\VMM32.VXD', A, S, T, L0, R0) Then Exit;
+  SysDir := 'C:\WINDOWS\'; CmdPath := 'C:\COMMAND.EXE';
+  CurDirS := 'C:';
+  KLog('Systeme : C:\WINDOWS (disque dur)');
+End;
+
 Procedure SystemLoop;
 Var I : LongInt; Busy : Boolean;
 Begin
@@ -33944,6 +33987,7 @@ BEGIN
   FmtAskW := -1; ExpCW := -1;
   FatInit;
   CurDirS := 'D:';
+  SysDirInit;
   { ApiTrace := True journalise chaque appel d'API d'un programme Win32
     (nom, appelant, arguments, resultat) sur le port serie COM1 }
   ApiTrace := False;

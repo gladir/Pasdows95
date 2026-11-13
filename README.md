@@ -11,17 +11,20 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 
 <table>
 	<tr><th>Nom</th><th>Description</th></tr>
-	<tr><td><b>KERNEL/IO.PAS</b></td><td>IO.SYS de Pasdows 95 (16 bits) : démarrage, menu de démarrage (F8), lecture du CD-ROM, MSDOS.SYS et AUTOEXEC.BAT, mode MS-DOS, interface 16 couleurs du mode sans échec, puis chargement de VMM32.VXD (VESA, mode protégé).</td></tr>
+	<tr><td><b>KERNEL/IO.PAS</b></td><td>IO.SYS de Pasdows 95 (16 bits) : démarrage, menu de démarrage (F8), lecture du CD-ROM (ou du disque dur FAT32 après l'installation), MSDOS.SYS et AUTOEXEC.BAT, mode MS-DOS, interface 16 couleurs du mode sans échec, puis chargement de VMM32.VXD (VESA, mode protégé).</td></tr>
 	<tr><td><b>KERNEL/VMM32.PAS</b></td><td>Noyau 32 bits VMM32.VXD : mode protégé, mémoire, tâches préemptives, interface 256 couleurs, chargeur PE et API Win32 (plus de 550 fonctions de KERNEL32, USER32, GDI32, WINMM, ADVAPI32, SHELL32, COMDLG32, COMCTL32, OLE32, VERSION, MSVFW32).</td></tr>
+	<tr><td><b>SETUP/INSTALL.PAS</b></td><td>Programme d'installation graphique de Pasdows 95 sur un disque dur (INSTALL.SYS, image d'amorce du CD-ROM d'installation), compilé par <b>WPC -CW95IO</b> : langue, partition, formatage FAT32, fuseau horaire, affichage, composants, copie des fichiers.</td></tr>
+	<tr><td><b>SETUP/MBR.ASM</b>, <b>SETUP/BOOT32.ASM</b></td><td>Sources NASM du code d'amorce écrit par INSTALL : secteur de partition (MBR) et secteur d'amorce FAT32 qui charge C:\IO.SYS (les octets assemblés sont repris dans INSTALL.PAS).</td></tr>
 	<tr><td><b>SYSTEM/COMMAND.PAS</b></td><td>Interpréteur de commandes de l'Invite MS-DOS (COMMAND.EXE), adapté de CMD.PAS du projet Corail et compilé par <b>WPC -CW32</b> ; il tourne dans la console Win32 de VMM32.</td></tr>
 	<tr><td><b>EXAMPLES/HELLO.PAS</b></td><td>Exemple de programme Windows 95 (Win32, unité Graph) compilé par <b>WPC -CW32</b> en HELLO.EXE.</td></tr>
-	<tr><td><b>KERNEL/BUILD.sh</b></td><td>Construit les outils, IO.SYS et le CD-ROM amorçable <i>IMAGE/PASDOWS.ISO</i> (Linux).</td></tr>
+	<tr><td><b>KERNEL/BUILD.sh</b></td><td>Construit les outils, IO.SYS, le CD-ROM amorçable <i>IMAGE/PASDOWS.ISO</i> et le CD-ROM d'installation <i>IMAGE/INSTALL.ISO</i> (Linux).</td></tr>
 	<tr><td><b>KERNEL/BUILD.BAT</b></td><td>Même chose sous DOS ou Windows (Free Pascal dans le PATH).</td></tr>
 	<tr><td><b>TOOLS/WPC.PAS</b></td><td>Compilateur « Windows 95 Pascal Compiler » : copie du compilateur <i>OS2PC.PAS</i> (« OS/2 Pascal Compiler ») du dépôt <a href="https://github.com/gladir/OS2-0">OS2-0</a>, renommé et augmenté des destinations <b>-CW95IO</b> et <b>-CVMM32</b>.</td></tr>
 	<tr><td><b>TOOLS/MAKEISO.PAS</b></td><td>Fabrique une image CD-ROM ISO 9660 amorçable (El Torito) avec table d'information d'amorce (dérivé de MAKEISO.PAS d'OS2-0).</td></tr>
 	<tr><td><b>WIN64/WPC.EXE</b></td><td>Compilateur WPC compilé pour Windows 64 bits.</td></tr>
 	<tr><td><b>WIN64/MAKEISO.EXE</b></td><td>MAKEISO compilé pour Windows 64 bits.</td></tr>
-	<tr><td><b>IMAGE/PASDOWS.ISO</b></td><td>Image du CD-ROM amorçable de Pasdows 95.</td></tr>
+	<tr><td><b>IMAGE/PASDOWS.ISO</b></td><td>Image du CD-ROM amorçable de Pasdows 95 (démarre Pasdows directement depuis le CD-ROM).</td></tr>
+	<tr><td><b>IMAGE/INSTALL.ISO</b></td><td>Image du CD-ROM d'installation : mêmes fichiers, mais il démarre le programme d'installation INSTALL.SYS (il n'est que sur ce CD-ROM).</td></tr>
 	<tr><td><b>IMAGE/CDROM</b></td><td>Contenu du CD-ROM : IO.SYS, VMM32.VXD, HELLO.EXE, MSDOS.SYS, CONFIG.SYS, AUTOEXEC.BAT et LISEZMOI.TXT. Tout programme Windows 95 déposé ici est mis sur le CD-ROM par BUILD.</td></tr>
 	<tr><td><b>IMAGE/SCREENSHOTS</b></td><td>Captures d'écran de Pasdows 95 (QEMU, 640x480 en 256 couleurs) reprises dans ce document.</td></tr>
 </table>
@@ -47,6 +50,32 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<li>Arrêter Pasdows : arrêt de l'ordinateur (APM), redémarrage ou redémarrage en mode MS-DOS (texte 80x25, <b>EXIT</b> ou <b>WIN</b> pour revenir).</li>
 	<li>Raccourcis : Ctrl+Échap (menu Démarrer), Alt+F4, Alt+Tab, F1, double-clic.</li>
 </ul>
+
+<h2>Installation sur le disque dur</h2>
+
+Le CD-ROM d'installation <b>IMAGE/INSTALL.ISO</b> démarre <b>INSTALL.SYS</b> (<b>SETUP/INSTALL.PAS</b>), un programme d'installation en mode graphique (VGA 640x480, souris et clavier) écrit en Pascal, comme le CD-ROM de Windows 95. Il n'a besoin ni de DOS ni de Pasdows : il utilise le BIOS (INT 13h étendue pour le CD-ROM et le disque dur) et le matériel. L'assistant demande :
+
+<ul>
+	<li>la <b>langue</b> parmi les 5 langues de Pasdows : français (par défaut), anglais, allemand, italien, espagnol ; l'assistant change de langue aussitôt et <i>AUTOEXEC.BAT</i> reçoit <b>SET LANGUAGE=</b> ;</li>
+	<li>le <b>disque dur</b> (taille, table des partitions actuelle) et la <b>partition</b> : créer une nouvelle partition principale FAT32 active (taille en Mo, le disque est effacé) ou formater une partition existante ;</li>
+	<li>le <b>fuseau horaire</b> (même liste que <i>Date/Heure</i>) et l'heure d'été ;</li>
+	<li>l'<b>affichage</b> (640x480, 800x600 ou 1024x768, en 16, 256 ou 65 536 couleurs) ;</li>
+	<li>les <b>composants</b> (programmes d'exemple, son de démarrage, Lisez-moi), avec l'espace nécessaire.</li>
+</ul>
+
+Après un résumé et une confirmation, il écrit le <b>MBR</b> (code de <b>SETUP/MBR.ASM</b> et table des partitions), <b>formate</b> la partition en <b>FAT32</b> (secteur d'amorce <b>SETUP/BOOT32.ASM</b> et sa copie, FSInfo, deux FAT, grappes de 512 octets à 32 Ko selon la taille) et copie les fichiers du CD-ROM avec une barre de progression : <i>C:\IO.SYS</i> et <i>C:\MSDOS.SYS</i> (cachés, système), <i>C:\CONFIG.SYS</i>, <i>C:\AUTOEXEC.BAT</i>, <i>C:\COMMAND.EXE</i> et le dossier <i>C:\WINDOWS</i> (VMM32.VXD, PASDOWS.WAV, LISEZMOI.TXT, programmes). Le fuseau horaire et le mode d'affichage sont gardés dans le CMOS.
+
+Au redémarrage, le secteur d'amorce charge <i>C:\IO.SYS</i>, qui lit alors ses fichiers sur le disque dur (FAT32) et démarre VMM32 avec <i>C:\WINDOWS</i> comme dossier système (bureau, Lisez-moi, son de démarrage, Invite MS-DOS sur C:). Si le CD-ROM d'installation reste dans le lecteur et que le disque dur a déjà une partition active, il suffit de ne toucher aucune touche pendant 5 secondes : le disque dur démarre ; une touche relance l'installation.
+
+<pre>qemu-img create -f raw disque.img 512M
+qemu-system-i386 -m 64 -cdrom IMAGE/INSTALL.ISO -hda disque.img -boot d
+qemu-system-i386 -m 64 -hda disque.img</pre>
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/INSTALL_LANGUE.png" width="320" alt="Choix de la langue"><br><i>Choix de la langue</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/INSTALL_DISQUE.png" width="320" alt="Disque dur et partition"><br><i>Disque dur et partition</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/INSTALL_FUSEAU.png" width="320" alt="Fuseau horaire"><br><i>Fuseau horaire</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/INSTALL_RESUME.png" width="320" alt="Résumé avant l'installation"><br><i>Résumé avant l'installation</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/INSTALL_COPIE.png" width="320" alt="Formatage et copie des fichiers"><br><i>Formatage et copie des fichiers</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/INSTALL_TERMINE.png" width="320" alt="Installation terminée"><br><i>Installation terminée</i></td></tr>
+</table>
 
 <h2>Captures d'écran</h2>
 
