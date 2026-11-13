@@ -5,6 +5,7 @@ REM   WPC -CW95IO IO.PAS IO.SYS        IO.SYS amorcable (El Torito)
 REM   WPC -CVMM32 VMM32.PAS VMM32.VXD  noyau 32 bits et API Win32
 REM   WPC -CW32 ..\SYSTEM\*.PAS        programmes systeme (COMMAND.EXE)
 REM   WPC -CW32 ..\EXAMPLES\*.PAS      exemples de programmes Windows 95
+REM   WPC -CW32 ..\APPS\*.PAS          applications (PAINT.EXE)
 REM   WPC -CW95IO ..\SETUP\INSTALL.PAS  programme d'installation (INSTALL.ISO)
 REM Tous les fichiers de IMAGE\CDROM sont copies sur le CD-ROM.
 IF NOT EXIST ..\BUILD\NUL MD ..\BUILD
@@ -28,6 +29,9 @@ FOR %%F IN (..\SYSTEM\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
 FOR %%F IN (..\SYSTEM\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
 FOR %%F IN (..\EXAMPLES\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
 FOR %%F IN (..\EXAMPLES\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
+ECHO == Applications (WPC -CW32)
+FOR %%F IN (..\APPS\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
+FOR %%F IN (..\APPS\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
 ECHO == CD-ROM amorcable
 ..\BUILD\MAKEISO ..\IMAGE\PASDOWS.ISO /BOOT:..\BUILD\CD\IO.SYS /LABEL:PASDOWS95 ..\BUILD\CD\*.*
 IF ERRORLEVEL 1 GOTO ERREUR

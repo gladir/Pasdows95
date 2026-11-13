@@ -9171,7 +9171,7 @@ Const
   cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
   cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
-  cmSysProps = 22;
+  cmSysProps = 22; cmPaint = 23;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -9416,11 +9416,15 @@ Begin
           icText, cmReadme, '');
   If PathInfo(CmdPath, Fl, Size, Tm, Lba, I) Then
     DeskAdd(PromptName, icDos, cmPrompt, CmdPath);
+  { Paint (APPS\PAINT.PAS) : icone dediee }
+  If PathInfo(SysDir + 'PAINT.EXE', Fl, Size, Tm, Lba, I) Then
+    DeskAdd('Paint', icPaint, cmPaint, SysDir + 'PAINT.EXE');
   I := 0;
   While SysEntry(I, Nm, Dir) Do
   Begin
     If Not Dir And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
-       (Nm <> 'COMMAND.EXE') And (ExeCnt < 16) Then
+       (Nm <> 'COMMAND.EXE') And (Nm <> 'PAINT.EXE') And
+       (ExeCnt < 16) Then
     Begin
       ExePaths[ExeCnt] := SysDir + Nm;
       DeskAdd(Copy(Nm, 1, Length(Nm) - 4), icApp, cmExeBase + ExeCnt,
@@ -9892,7 +9896,7 @@ Var N : LongInt; S : String;
 Begin
   Case M Of
     mnStart : MenuCount := 8;
-    mnPrograms : MenuCount := 4 + ExeCnt;
+    mnPrograms : MenuCount := 5 + ExeCnt;
     mnSettings : MenuCount := 7;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -9977,17 +9981,22 @@ Begin
       End
       Else If I = 2 Then
       Begin
+        T := 'Paint';
+        Cmd := cmPaint; Icon := icPaint;
+      End
+      Else If I = 3 Then
+      Begin
         T := PromptName;
         Cmd := cmPrompt; Icon := icDos;
       End
-      Else If I = 3 Then
+      Else If I = 4 Then
       Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 4]);
-        Cmd := cmExeBase + I - 4; Icon := icApp;
+        T := BaseName(ExePaths[I - 5]);
+        Cmd := cmExeBase + I - 5; Icon := icApp;
       End;
     mnSettings :
       If I = 0 Then
@@ -14598,6 +14607,13 @@ Begin
     End;
     cmNotepad : NoteOpen('');
     cmPrompt : RunExe(CmdPath, '');
+    cmPaint :
+      If Not RunExe(SysDir + 'PAINT.EXE', '') Then
+        MsgBoxOpen('Paint', L('PAINT.EXE est introuvable.',
+                   'PAINT.EXE cannot be found.',
+                   'PAINT.EXE wurde nicht gefunden.',
+                   'Impossibile trovare PAINT.EXE.',
+                   'No se encuentra PAINT.EXE.'), $10);
     cmNetwork : NetConfigBox;
     cmReadme : NoteOpen(SysDir + 'LISEZMOI.TXT');
     cmRecycle :
@@ -22748,6 +22764,368 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
+{ MSVCRT : sprintf et strtod (reels du runtime de WPC : Str, Write,  }
+{ Val), sans utiliser Str sur un reel (qui rappellerait sprintf)     }
+{ ------------------------------------------------------------------ }
+
+{ V en virgule fixe (Prec decimales) ou scientifique (d.dddE+xxx) }
+Function KFmtFloat(V : Double; Prec : LongInt; Sci : Boolean) : String;
+Var Neg : Boolean; E, N, I, D : LongInt; M : Double; Dg, R : String;
+
+  Function DigitAt(P : LongInt) : Char;
+  Begin
+    If (E - P >= 0) And (E - P < Length(Dg)) Then DigitAt := Dg[E - P + 1]
+    Else DigitAt := '0';
+  End;
+
+Begin
+  If Prec < 0 Then Prec := 6;
+  If Prec > 60 Then Prec := 60;
+  Neg := V < 0;
+  If Neg Then V := -V;
+  R := '';
+  If V <> V Then R := 'nan'
+  Else If V > 1.7976931348623157E308 Then R := 'inf'
+  Else
+  Begin
+    E := 0; M := V;
+    If M <> 0 Then
+    Begin
+      While M >= 10 Do Begin M := M / 10; Inc(E); End;
+      While M < 1 Do Begin M := M * 10; Dec(E); End;
+    End;
+    If Sci Then N := Prec + 1 Else N := E + 1 + Prec;
+    Dg := '';
+    If N >= 0 Then
+    Begin
+      { N chiffres et un chiffre de garde pour l'arrondi }
+      For I := 0 To N Do
+      Begin
+        D := 0;
+        If I < 17 Then
+        Begin
+          D := Trunc(M);
+          If D < 0 Then D := 0;
+          If D > 9 Then D := 9;
+          M := (M - D) * 10;
+        End;
+        Dg := Dg + Chr(48 + D);
+      End;
+      I := N;
+      If Dg[N + 1] >= '5' Then
+      Begin
+        Repeat
+          If I = 0 Then Break;
+          If Dg[I] = '9' Then Begin Dg[I] := '0'; Dec(I); End
+          Else Begin Dg[I] := Chr(Ord(Dg[I]) + 1); I := -1; End;
+        Until I < 0;
+        If I = 0 Then Begin Dg := '1' + Dg; Inc(E); Inc(N); End;
+      End;
+      Dg := Copy(Dg, 1, N);
+      If Sci Then Dg := Copy(Dg, 1, Prec + 1);
+    End;
+    If V = 0 Then E := 0;
+    If Sci Then
+    Begin
+      If Dg = '' Then Dg := '0';
+      While Length(Dg) < Prec + 1 Do Dg := Dg + '0';
+      R := Dg[1];
+      If Prec > 0 Then R := R + '.' + Copy(Dg, 2, Prec);
+      R := R + 'E';
+      If E < 0 Then R := R + '-' Else R := R + '+';
+      Dg := IntStr(Abs(E));
+      While Length(Dg) < 3 Do Dg := '0' + Dg;
+      R := R + Dg;
+    End
+    Else
+    Begin
+      If E < 0 Then R := '0'
+      Else For I := E DownTo 0 Do R := R + DigitAt(I);
+      If Prec > 0 Then
+      Begin
+        R := R + '.';
+        For I := 1 To Prec Do R := R + DigitAt(-I);
+      End;
+    End;
+  End;
+  If Neg Then R := '-' + R;
+  KFmtFloat := R;
+End;
+
+{ sprintf (cdecl) : %f %e %E %g en plus des formats de wsprintfA }
+Function sprintf(Buf, Fmt, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11,
+  A12 : LongInt) : LongInt;
+Var Args : Array[0..11] Of LongInt; F, O, K, Wd, Pr, V : LongInt;
+    C : Char; S : String; Left, Zero, Spc, Plus : Boolean; D : Double;
+    T : Array[0..1] Of LongInt; K0 : LongInt;
+
+  Function NextArg : LongInt;
+  Begin
+    If K <= 11 Then NextArg := Args[K] Else NextArg := 0;
+    Inc(K);
+  End;
+
+  Procedure Emit(Const P0 : String);
+  Var J : LongInt; P : String;
+  Begin
+    P := P0;
+    While Length(P) < Wd Do
+      If Left Then P := P + ' '
+      Else If Zero And (P <> '') And (P[1] In ['-', '+', ' ']) Then
+        Insert('0', P, 2)
+      Else If Zero Then P := '0' + P
+      Else P := ' ' + P;
+    For J := 1 To Length(P) Do
+    Begin
+      Mem[0:Buf + O] := Ord(P[J]);
+      Inc(O);
+    End;
+  End;
+
+Begin
+  Args[0] := A1; Args[1] := A2; Args[2] := A3; Args[3] := A4;
+  Args[4] := A5; Args[5] := A6; Args[6] := A7; Args[7] := A8;
+  Args[8] := A9; Args[9] := A10; Args[10] := A11; Args[11] := A12;
+  F := Fmt; O := 0; K := 0;
+  While (Mem[0:F] <> 0) And (O < 1000) Do
+  Begin
+    C := Chr(Mem[0:F]);
+    Inc(F);
+    If C <> '%' Then
+    Begin
+      Mem[0:Buf + O] := Ord(C);
+      Inc(O);
+      Continue;
+    End;
+    Left := False; Zero := False; Spc := False; Plus := False;
+    Wd := 0; Pr := -1;
+    While Chr(Mem[0:F]) In ['-', '0', ' ', '+', '#'] Do
+    Begin
+      Case Chr(Mem[0:F]) Of
+        '-' : Left := True;
+        '0' : Zero := True;
+        ' ' : Spc := True;
+        '+' : Plus := True;
+      End;
+      Inc(F);
+    End;
+    If Chr(Mem[0:F]) = '*' Then
+    Begin
+      Wd := NextArg; Inc(F);
+      If Wd < 0 Then Begin Left := True; Wd := -Wd; End;
+    End
+    Else
+      While (Mem[0:F] >= 48) And (Mem[0:F] <= 57) Do
+      Begin
+        Wd := Wd * 10 + Mem[0:F] - 48;
+        Inc(F);
+      End;
+    If Wd > 200 Then Wd := 200;
+    If Chr(Mem[0:F]) = '.' Then
+    Begin
+      Inc(F); Pr := 0;
+      If Chr(Mem[0:F]) = '*' Then Begin Pr := NextArg; Inc(F); End
+      Else
+        While (Mem[0:F] >= 48) And (Mem[0:F] <= 57) Do
+        Begin
+          Pr := Pr * 10 + Mem[0:F] - 48;
+          Inc(F);
+        End;
+    End;
+    While Chr(Mem[0:F]) In ['l', 'h', 'L'] Do Inc(F);
+    C := Chr(Mem[0:F]);
+    Inc(F);
+    Case C Of
+      '%' : Emit('%');
+      'c' : Emit(Chr(NextArg And 255));
+      's' :
+      Begin
+        S := PStr(NextArg);
+        If (Pr >= 0) And (Pr < Length(S)) Then S := Copy(S, 1, Pr);
+        Emit(S);
+      End;
+      'd', 'i', 'u', 'x', 'X' :
+      Begin
+        V := NextArg;
+        If C In ['d', 'i'] Then
+        Begin
+          S := IntStr(V);
+          If V >= 0 Then
+            If Plus Then S := '+' + S Else If Spc Then S := ' ' + S;
+        End
+        Else If C = 'u' Then
+        Begin
+          If V >= 0 Then S := IntStr(V)
+          Else S := IntStr((V Shr 1) Div 5) +
+                    Chr(48 + (V - ((V Shr 1) Div 5) * 10));
+        End
+        Else
+        Begin
+          S := HexStr(V, 8);
+          While (Length(S) > 1) And (S[1] = '0') Do Delete(S, 1, 1);
+          If C = 'x' Then
+            For V := 1 To Length(S) Do
+              If S[V] In ['A'..'F'] Then S[V] := Chr(Ord(S[V]) + 32);
+        End;
+        Emit(S);
+      End;
+      'f', 'F', 'e', 'E', 'g', 'G' :
+      Begin
+        T[0] := NextArg; T[1] := NextArg;
+        Move(T, D, 8);
+        If C In ['g', 'G'] Then
+        Begin
+          If Pr < 0 Then Pr := 6;
+          If Pr = 0 Then Pr := 1;
+          S := KFmtFloat(D, Pr - 1, True);
+          V := Pos('E', S) + 2;
+          K0 := 0;
+          While V <= Length(S) Do
+          Begin
+            K0 := K0 * 10 + Ord(S[V]) - 48; Inc(V);
+          End;
+          If S[Pos('E', S) + 1] = '-' Then V := -K0 Else V := K0;
+          If (V < -4) Or (V >= Pr) Then S := KFmtFloat(D, Pr - 1, True)
+          Else S := KFmtFloat(D, Pr - 1 - V, False);
+          { %g : sans les zeros de queue }
+          If Pos('.', S) > 0 Then
+          Begin
+            V := Pos('E', S);
+            If V = 0 Then V := Length(S) + 1;
+            While (V > 1) And (S[V - 1] = '0') Do
+            Begin
+              Delete(S, V - 1, 1); Dec(V);
+            End;
+            If S[V - 1] = '.' Then Delete(S, V - 1, 1);
+          End;
+          If C = 'g' Then
+            For V := 1 To Length(S) Do
+              If S[V] = 'E' Then S[V] := 'e';
+        End
+        Else
+        Begin
+          S := KFmtFloat(D, Pr, C In ['e', 'E']);
+          If C = 'e' Then
+            For V := 1 To Length(S) Do
+              If S[V] = 'E' Then S[V] := 'e';
+        End;
+        If (S <> '') And (S[1] <> '-') Then
+          If Plus Then S := '+' + S Else If Spc Then S := ' ' + S;
+        Emit(S);
+      End;
+    Else
+      Emit(C);
+    End;
+  End;
+  Mem[0:Buf + O] := 0;
+  sprintf := O;
+End;
+
+{ strtod (cdecl) : chaine -> reel ; EndP recoit la fin de la conversion }
+Function strtod(Str0, EndP : LongInt) : Double;
+Var P, Ex, ES, Nd : LongInt; Neg, NegE, Any : Boolean; V, Sc : Double;
+Begin
+  P := Str0;
+  While (Mem[0:P] = 32) Or ((Mem[0:P] >= 9) And (Mem[0:P] <= 13)) Do
+    Inc(P);
+  Neg := False;
+  If Mem[0:P] = 45 Then Begin Neg := True; Inc(P); End
+  Else If Mem[0:P] = 43 Then Inc(P);
+  V := 0; Ex := 0; Nd := 0; Any := False;
+  While (Mem[0:P] >= 48) And (Mem[0:P] <= 57) Do
+  Begin
+    If Nd < 19 Then Begin V := V * 10 + (Mem[0:P] - 48); Inc(Nd); End
+    Else Inc(Ex);
+    Any := True;
+    Inc(P);
+  End;
+  If Mem[0:P] = 46 Then
+  Begin
+    Inc(P);
+    While (Mem[0:P] >= 48) And (Mem[0:P] <= 57) Do
+    Begin
+      If Nd < 19 Then
+      Begin
+        V := V * 10 + (Mem[0:P] - 48); Dec(Ex);
+        If V <> 0 Then Inc(Nd);
+      End;
+      Any := True;
+      Inc(P);
+    End;
+  End;
+  If Not Any Then
+  Begin
+    If EndP <> 0 Then MemL[0:EndP] := Str0;
+    strtod := 0;
+    Exit;
+  End;
+  If (Mem[0:P] = 69) Or (Mem[0:P] = 101) Then
+  Begin
+    ES := P + 1; NegE := False;
+    If Mem[0:ES] = 45 Then Begin NegE := True; Inc(ES); End
+    Else If Mem[0:ES] = 43 Then Inc(ES);
+    If (Mem[0:ES] >= 48) And (Mem[0:ES] <= 57) Then
+    Begin
+      Nd := 0;
+      While (Mem[0:ES] >= 48) And (Mem[0:ES] <= 57) Do
+      Begin
+        If Nd < 10000 Then Nd := Nd * 10 + (Mem[0:ES] - 48);
+        Inc(ES);
+      End;
+      If NegE Then Ex := Ex - Nd Else Ex := Ex + Nd;
+      P := ES;
+    End;
+  End;
+  If EndP <> 0 Then MemL[0:EndP] := P;
+  If Ex > 330 Then Ex := 330;
+  If Ex < -360 Then Ex := -360;
+  If (Ex >= -22) And (Ex <= 22) Then
+  Begin
+    { 10^n est exact jusqu'a 10^22 : une seule operation }
+    Sc := 1;
+    For Nd := 1 To Abs(Ex) Do Sc := Sc * 10;
+    If Ex < 0 Then V := V / Sc Else V := V * Sc;
+  End
+  Else If Ex < 0 Then
+  Begin
+    { grandes puissances negatives : diviser en plusieurs fois }
+    Nd := -Ex;
+    While Nd > 0 Do
+    Begin
+      If Nd >= 100 Then Begin V := V / 1E100; Nd := Nd - 100; End
+      Else Begin V := V / 10; Dec(Nd); End;
+    End;
+  End
+  Else
+  Begin
+    Nd := Ex;
+    While Nd > 0 Do
+    Begin
+      If Nd >= 100 Then Begin V := V * 1E100; Nd := Nd - 100; End
+      Else Begin V := V * 10; Dec(Nd); End;
+    End;
+  End;
+  If Neg Then V := -V;
+  strtod := V;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Compteur de performance (resolution : la milliseconde)             }
+{ ------------------------------------------------------------------ }
+
+Function QueryPerformanceFrequency(P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then Begin MemL[0:P] := 1000; MemL[0:P + 4] := 0; End;
+  QueryPerformanceFrequency := 1;
+End;
+
+Function QueryPerformanceCounter(P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then Begin MemL[0:P] := Ticks; MemL[0:P + 4] := 0; End;
+  QueryPerformanceCounter := 1;
+End;
+
+{ ------------------------------------------------------------------ }
 { Ressources : chaines, curseurs, icones, bitmaps, accelerateurs     }
 { ------------------------------------------------------------------ }
 
@@ -24979,6 +25357,101 @@ Begin
   CoCreateInstance := LongInt($80040154);
 End;
 
+Function CoTaskMemAlloc(Size : LongInt) : LongInt;
+Begin
+  CoTaskMemAlloc := KAlloc(Size);
+End;
+
+Procedure CoTaskMemFree(P : LongInt);
+Begin
+  If P <> 0 Then KFree(P);
+End;
+
+{ PROPVARIANT : seul le type est remis a VT_EMPTY }
+Function PropVariantClear(P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then FillMem(P, 16, 0);
+  PropVariantClear := 0;
+End;
+
+{ OLEAUT32 : BSTR (longueur sur 4 octets puis caracteres UTF-16) }
+Function SysAllocStringLen(P, N : LongInt) : LongInt;
+Var A : LongInt;
+Begin
+  SysAllocStringLen := 0;
+  If N < 0 Then Exit;
+  A := KAlloc(N * 2 + 6);
+  If A = 0 Then Exit;
+  MemL[0:A] := N * 2;
+  If P <> 0 Then MoveMem(P, A + 4, N * 2);
+  SysAllocStringLen := A + 4;
+End;
+
+Function SysAllocString(P : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  SysAllocString := 0;
+  If P = 0 Then Exit;
+  N := 0;
+  While MemW[0:P + N * 2] <> 0 Do Inc(N);
+  SysAllocString := SysAllocStringLen(P, N);
+End;
+
+Procedure SysFreeString(B : LongInt);
+Begin
+  If B <> 0 Then KFree(B - 4);
+End;
+
+Function SysStringLen(B : LongInt) : LongInt;
+Begin
+  If B = 0 Then SysStringLen := 0 Else SysStringLen := MemL[0:B - 4] Div 2;
+End;
+
+{ WININET : Pasdows n'a pas de client HTTP integre ; les programmes
+  recoivent une erreur (ERROR_INTERNET_NAME_NOT_RESOLVED) }
+Function InternetOpenA(Agent, Access, Proxy, Bypass, Flags : LongInt)
+  : LongInt;
+Begin
+  SetErr(12007);
+  InternetOpenA := 0;
+End;
+
+Function InternetOpenUrlA(H, Url, Hdr, HdrLen, Flags, Ctx : LongInt)
+  : LongInt;
+Begin
+  SetErr(12007);
+  InternetOpenUrlA := 0;
+End;
+
+Function InternetReadFile(H, Buf, N, PRead : LongInt) : LongInt;
+Begin
+  If PRead <> 0 Then MemL[0:PRead] := 0;
+  SetErr(6);
+  InternetReadFile := 0;
+End;
+
+Function InternetSetOptionA(H, Opt, Buf, N : LongInt) : LongInt;
+Begin
+  InternetSetOptionA := 1;
+End;
+
+Function InternetCloseHandle(H : LongInt) : LongInt;
+Begin
+  InternetCloseHandle := 1;
+End;
+
+Function HttpQueryInfoA(H, Info, Buf, PLen, PIdx : LongInt) : LongInt;
+Begin
+  SetErr(6);
+  HttpQueryInfoA := 0;
+End;
+
+Function InternetGetConnectedState(PFlags, R : LongInt) : LongInt;
+Begin
+  If PFlags <> 0 Then MemL[0:PFlags] := 0;
+  InternetGetConnectedState := 0;
+End;
+
 Function OleInitialize(P : LongInt) : LongInt;
 Begin
   OleInitialize := 0;
@@ -25448,13 +25921,13 @@ End;
 
 Const
   MaxMod = 16;
-  SysDllN = 20;
+  SysDllN = 21;
   SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
     'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
     'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
     'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
     'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL', 'WS2_32.DLL',
-    'ICMP.DLL');
+    'ICMP.DLL', 'WININET.DLL');
 
 Type
   TModule = Record
@@ -36308,6 +36781,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   SetClipboardViewer, ChangeClipboardChain, RegisterWindowMessageA,
   CharUpperA, CharLowerA, CharUpperBuffA, CharNextA, CharPrevA,
   CharToOemBuffA, CharToOemA, OemToCharA, IsCharAlphaA, wsprintfA, wvsprintfA,
+  sprintf, strtod, QueryPerformanceCounter, QueryPerformanceFrequency,
   LoadStringA, CreateCursor, DestroyCursor, LoadCursorA, SetCursor, GetCursor,
   ShowCursor, ClipCursor, LoadIconA, DestroyIcon, LoadBitmapA,
   LoadAcceleratorsA, CreateAcceleratorTableA, CopyAcceleratorTableA,
@@ -36334,7 +36808,11 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   mciSendCommandA, mciSendStringA, mciGetErrorStringA, GetOpenFileNameA,
   GetSaveFileNameA, PrintDlgA, ChooseColorA, CommDlgExtendedError,
   FindExecutableA, ShellExecuteA, CoInitialize, CoUninitialize,
-  CoCreateInstance, OleInitialize, OleUninitialize, ICClose,
+  CoCreateInstance, CoTaskMemAlloc, CoTaskMemFree, PropVariantClear,
+  SysAllocStringLen, SysAllocString, SysFreeString, SysStringLen,
+  InternetOpenA, InternetOpenUrlA, InternetReadFile, InternetSetOptionA,
+  InternetCloseHandle, HttpQueryInfoA, InternetGetConnectedState,
+  OleInitialize, OleUninitialize, ICClose,
   ICGetDisplayFormat, ICOpen, ICLocate, RegOpenKeyExA, RegOpenKeyA,
   RegCreateKeyA, RegCloseKey, RegQueryValueExA, RegSetValueExA,
   GetModuleHandleA, GetModuleFileNameA, LoadLibraryA, LoadLibraryExA,

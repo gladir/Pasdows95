@@ -1,7 +1,9 @@
 # Pasdows95
 Clone de Windows 95 ecrit en Pascal
 
-![Pasdows 95](IMAGE/PASDOWS95.png)
+![Paint dans Pasdows 95](IMAGE/SCREENSHOTS/PAINT.png)
+
+<i>Paint (APPS/PAINT.PAS, le Paint de CloneDRAW devenu une application Windows 95) dans le bureau de Pasdows 95 en 800x600.</i>
 
 Pasdows 95 est un clone de Windows 95 écrit en Turbo Pascal / Free Pascal et compilé par <b>WPC</b> (« Windows 95 Pascal Compiler »). Comme Windows 95, il se compose d'un <b>IO.SYS</b> 16 bits (<b>KERNEL/IO.PAS</b>), amorçable directement depuis un CD-ROM (El Torito, sans émulation) et copiable sur n'importe quelle image ISO 9660, qui charge un noyau 32 bits <b>VMM32.VXD</b> (<b>KERNEL/VMM32.PAS</b>). VMM32 exécute de <b>vrais programmes Windows 95</b> (exécutables PE Win32) en leur fournissant KERNEL32, USER32, GDI32, WINMM et les autres DLL système.
 
@@ -16,6 +18,7 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>SETUP/INSTALL.PAS</b></td><td>Programme d'installation graphique de Pasdows 95 sur un disque dur (INSTALL.SYS, image d'amorce du CD-ROM d'installation), compilé par <b>WPC -CW95IO</b> : langue, partition, formatage FAT32, fuseau horaire, affichage, composants, copie des fichiers.</td></tr>
 	<tr><td><b>SETUP/MBR.ASM</b>, <b>SETUP/BOOT16.ASM</b>, <b>SETUP/BOOT32.ASM</b>, <b>SETUP/NTFSBOOT.ASM</b></td><td>Sources NASM du code d'amorce écrit par INSTALL : secteur de partition (MBR), secteurs d'amorce FAT16 et FAT32 et chargeur NTFS de 16 secteurs ($Boot) qui cherche IO.SYS dans l'index de la racine ; tous chargent C:\IO.SYS (les octets assemblés sont repris dans INSTALL.PAS).</td></tr>
 	<tr><td><b>SYSTEM/COMMAND.PAS</b></td><td>Interpréteur de commandes de l'Invite MS-DOS (COMMAND.EXE), adapté de CMD.PAS du projet Corail et compilé par <b>WPC -CW32</b> ; il tourne dans la console Win32 de VMM32.</td></tr>
+	<tr><td><b>APPS/PAINT.PAS</b></td><td><b>Paint</b> : le programme de dessin PAINT.PAS du dépôt <a href="https://github.com/gladir/clonedraw">CloneDRAW</a> (plus de 45 000 lignes, toutes ses fonctions conservées) devenu une application Windows 95 compilée par <b>WPC -CW32</b> en PAINT.EXE ; une couche Win32 remplace les unités Graph, Crt et PtcMouse (voir la section <a href="#paint">Paint</a>).</td></tr>
 	<tr><td><b>EXAMPLES/HELLO.PAS</b></td><td>Exemple de programme Windows 95 (Win32, unité Graph) compilé par <b>WPC -CW32</b> en HELLO.EXE.</td></tr>
 	<tr><td><b>KERNEL/BUILD.sh</b></td><td>Construit les outils, IO.SYS, le CD-ROM amorçable <i>IMAGE/PASDOWS.ISO</i> et le CD-ROM d'installation <i>IMAGE/INSTALL.ISO</i> (Linux).</td></tr>
 	<tr><td><b>KERNEL/BUILD.BAT</b></td><td>Même chose sous DOS ou Windows (Free Pascal dans le PATH).</td></tr>
@@ -25,7 +28,7 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>WIN64/MAKEISO.EXE</b></td><td>MAKEISO compilé pour Windows 64 bits.</td></tr>
 	<tr><td><b>IMAGE/PASDOWS.ISO</b></td><td>Image du CD-ROM amorçable de Pasdows 95 (démarre Pasdows directement depuis le CD-ROM).</td></tr>
 	<tr><td><b>IMAGE/INSTALL.ISO</b></td><td>Image du CD-ROM d'installation : mêmes fichiers, mais il démarre le programme d'installation INSTALL.SYS (il n'est que sur ce CD-ROM).</td></tr>
-	<tr><td><b>IMAGE/CDROM</b></td><td>Contenu du CD-ROM : IO.SYS, VMM32.VXD, HELLO.EXE, MSDOS.SYS, CONFIG.SYS, AUTOEXEC.BAT et LISEZMOI.TXT. Tout programme Windows 95 déposé ici est mis sur le CD-ROM par BUILD.</td></tr>
+	<tr><td><b>IMAGE/CDROM</b></td><td>Contenu du CD-ROM : IO.SYS, VMM32.VXD, PAINT.EXE, HELLO.EXE, MSDOS.SYS, CONFIG.SYS, AUTOEXEC.BAT et LISEZMOI.TXT. Tout programme Windows 95 déposé ici est mis sur le CD-ROM par BUILD.</td></tr>
 	<tr><td><b>IMAGE/SCREENSHOTS</b></td><td>Captures d'écran de Pasdows 95 (QEMU, 640x480 en 256 couleurs) reprises dans ce document.</td></tr>
 </table>
 
@@ -47,7 +50,8 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<li><b>NTFS</b> (partitions de type 07h, NTFS 3.x de Windows 2000/XP) en lecture et en écriture : enregistrements de la MFT avec correctifs de secteurs, attributs résidents et non résidents, fichiers fragmentés et creux, listes d'attributs, répertoires en arbre B+ ($I30) avec la table $UpCase, étiquette de $Volume. En écriture : création, écriture, troncature, suppression et renommage de fichiers et de répertoires, bitmap des clusters et de la MFT, extension de la MFT, passage des petits fichiers résidents aux fichiers non résidents, index reconstruits (petit index ou arbre B+ à plusieurs niveaux), $MFTMirr ; le journal $LogFile n'est pas tenu (il est vidé, comme le fait ntfs-3g). Les volumes modifiés par Pasdows restent valides pour ntfs-3g et ntfsresize. GetVolumeInformation rend « NTFS ». Les fichiers compressés ou chiffrés ne sont pas lus.</li>
 	<li><b>Réseau TCP/IP</b> : pilote de carte <b>NE2000</b> (PCI RTL8029 ou ISA en 300h, comme la « NE2000 compatible » de Windows 95), pile TCP/IP écrite en Pascal (ARP, IP, ICMP, UDP, TCP avec retransmission et fenêtres, boucle locale 127.0.0.1), client <b>DHCP</b> et résolveur <b>DNS</b>. Les programmes utilisent <b>WSOCK32.DLL</b> / <b>WS2_32.DLL</b> (Winsock 1.1 par nom ou par ordinal : socket, connect, bind, listen, accept, send, recv, sendto, recvfrom, select, ioctlsocket, gethostbyname, WSAAsyncSelect...) et <b>ICMP.DLL</b> (IcmpSendEcho). Dans Pasdows : <i>Démarrer, Paramètres, Réseau (TCP/IP)</i> ou <i>Exécuter</i> <b>winipcfg</b> affiche la configuration IP, <b>ping</b> <i>hôte</i> envoie des échos ICMP. Exemple : <b>EXAMPLES/NETTEST.C</b> (NETTEST.EXE sur le CD-ROM : TCP et UDP locaux, ping, DNS, HTTP).</li>
 	<li>Interface graphique (palette de Windows 95) : écran d'accueil, bureau et icônes (dont les .EXE du CD-ROM), barre des tâches avec horloge, menu Démarrer et sous-menus, fenêtres en relief déplaçables, boutons Réduire / Agrandir / Fermer, souris PS/2 et clavier.</li>
-	<li>Applications : Poste de travail et Explorateur (navigation sur le CD-ROM), Bloc-notes, Calculatrice, Paint, Invite MS-DOS (<b>COMMAND.EXE</b>, programme console Win32 : CD, CLS, COPY, DATE, DEL, DIR, ECHO, EXIT, MD, PATH, PROMPT, RD, REN, SET, TIME, TYPE, VER, VOL..., changement d'unité avec C: ou D:, historique avec les flèches, lancement des programmes du CD-ROM puis retour à l'invite), Panneau de configuration (Affichage, Date/Heure, Paramètres régionaux, Système), Corbeille, Aide, Exécuter, À propos, Bienvenue.</li>
+	<li><b>Paint</b> (icône sur le bureau et <i>Démarrer, Programmes, Paint</i>) : le Paint complet de CloneDRAW, voir la section <a href="#paint">Paint</a>.</li>
+	<li>Applications : Poste de travail et Explorateur (navigation sur le CD-ROM), Bloc-notes, Paint, Invite MS-DOS (<b>COMMAND.EXE</b>, programme console Win32 : CD, CLS, COPY, DATE, DEL, DIR, ECHO, EXIT, MD, PATH, PROMPT, RD, REN, SET, TIME, TYPE, VER, VOL..., changement d'unité avec C: ou D:, historique avec les flèches, lancement des programmes du CD-ROM puis retour à l'invite), Panneau de configuration (Affichage, Date/Heure, Paramètres régionaux, Système), Corbeille, Aide, Exécuter, À propos, Bienvenue.</li>
 	<li>Arrêter Pasdows : arrêt de l'ordinateur (APM), redémarrage ou redémarrage en mode MS-DOS (texte 80x25, <b>EXIT</b> ou <b>WIN</b> pour revenir).</li>
 	<li>Raccourcis : Ctrl+Échap (menu Démarrer), Alt+F4, Alt+Tab, F1, double-clic.</li>
 </ul>
@@ -89,6 +93,37 @@ qemu-system-i386 -m 64 -hda disque.img</pre>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/AFFICHAGE.png" width="320" alt="Propriétés d'affichage (modes VESA)"><br><i>Propriétés d'affichage (modes VESA)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/INVITE_MSDOS.png" width="320" alt="Invite MS-DOS (COMMAND.EXE)"><br><i>Invite MS-DOS (COMMAND.EXE)</i></td></tr>
 </table>
 
+<h2 id="paint">Paint</h2>
+
+<b>APPS/PAINT.PAS</b> est le programme <b>PAINT.PAS</b> du dépôt <a href="https://github.com/gladir/clonedraw">CloneDRAW</a>, écrit pour DOS (Free Pascal, unités Graph, Crt et PtcMouse), adapté pour fonctionner comme une vraie application Windows 95 dans Pasdows. <b>Aucune fonction n'a été retirée</b> : outils de dessin (sélection, gomme, remplissage, pipette, loupe, crayon, pinceau, aérographe, texte, ligne, courbe, rectangle, polygone, ellipse, rectangle arrondi), annuler et rétablir, presse-papiers, zoom et plein écran, <i>Retourner/Pivoter</i>, <i>Étirer/Incliner</i>, <i>Inverser couleurs</i>, <i>Redimensionner</i>, <i>Rogner</i>, <i>Attributs</i>, <i>Modifier les couleurs</i> (teinte, saturation, luminosité, couleurs personnalisées, import et export de palettes), l'explorateur de fichiers de PAINT pour <i>Ouvrir</i> et <i>Enregistrer sous</i> (lecteurs, dossiers, nouveau dossier, filtres) avec tous ses formats (BMP, DIB, GIF, PNG, APNG, JPEG, PCX, TGA, TIFF, ICO, CUR, PPM, XBM, LBM, MSP, MacPaint, GEM, WPG, PSP, DDS, HDR, EXR, DICOM, fax, RAW ARW/CR2/DNG, BGX, export en source Pascal, assembleur, BASIC, C, C#, Python et Ruby), <i>Propriétés</i> du fichier, et les outils avancés : <i>Supprimer l'arrière-plan</i>, <i>Flou de l'arrière-plan</i>, <i>Reconnaissance de texte (OCR)</i> et <i>Fusionner des vêtements</i> (moteur VTON écrit en Pascal).
+
+Le programme se lance par son icône sur le bureau, par <i>Démarrer, Programmes, Paint</i> (ou en tapant <b>PAINT</b> dans l'Invite MS-DOS). Il s'ouvre dans une fenêtre de 640x480 (zone de dessin de PAINT) centrée sur le bureau, dont le titre suit le fichier ouvert (« MAISON.BMP - Paint ») ; si l'écran est trop petit pour la fenêtre et son cadre (bureau en 640x480), Paint occupe tout l'écran, au-dessus de la barre des tâches, comme en plein écran. Alt+F4 ou <i>Fichier, Quitter</i> le ferment (en proposant d'enregistrer une image modifiée).
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_MENU_DEMARRER.png" width="400" alt="Paint dans le menu Démarrer"><br><i>Démarrer, Programmes, Paint</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_IMAGE.png" width="400" alt="Menu Image de Paint"><br><i>Menu Image</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_PIVOTER.png" width="400" alt="Retourner / Pivoter"><br><i>Retourner / Pivoter (aperçu avant et après)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_COULEURS.png" width="400" alt="Modifier les couleurs"><br><i>Modifier les couleurs</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_ENREGISTRER.png" width="400" alt="Explorateur Enregistrer sous de PAINT"><br><i>Enregistrer sous (disque dur C:)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_OUTILS.png" width="400" alt="Menu Outils de Paint"><br><i>Menu Outils (arrière-plan, OCR, vêtements)</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PAINT_VETEMENTS.png" width="400" alt="Fusionner des vêtements"><br><i>Fusionner des vêtements (moteur VTON)</i></td><td></td></tr>
+</table>
+
+<h3>Comment PAINT.PAS est devenu une application Windows 95</h3>
+
+<ul>
+	<li>Le source reste celui de CloneDRAW : compilé par Free Pascal ou Turbo Pascal, il utilise toujours ses unités d'origine. Compilé par WPC (symbole <b>WPC</b> défini), la section « Couche Pasdows 95 » placée en tête remplace les unités <b>Graph</b>, <b>Crt</b> et <b>PtcMouse</b> par des appels Win32 et <b>{$APPTYPE GUI}</b> en fait un programme fenêtré (sous-système 2, sans console).</li>
+	<li><b>Graph</b> : PAINT dessine dans une image de 256 couleurs en mémoire (DIB descendante) avec les primitives du BGI réécrites en Pascal (PutPixel, GetPixel, Line avec styles et épaisseurs, Rectangle, Bar, Circle, Arc, Ellipse, FillEllipse, OutTextXY avec la police 8x8 de la page de code 437, GetImage/PutImage, SetViewPort, SetWriteMode XOR, SetRGBPalette sur 8 bits...). Seule la zone modifiée est copiée dans la fenêtre par <b>SetDIBitsToDevice</b> ; WM_PAINT recopie toute l'image.</li>
+	<li><b>Crt</b> et <b>PtcMouse</b> : la procédure de fenêtre de PAINT reçoit les messages WM_KEYDOWN, WM_SYSKEYDOWN et WM_CHAR (traduits en codes de ReadKey, avec #0 et le code de balayage pour les touches étendues, Alt+lettre et Alt+F4) et les messages de la souris (coordonnées de la zone client, capture pendant un glissement, clics brefs mémorisés jusqu'à leur lecture). KeyPressed, ReadKey, Delay, GetMouseState lisent ces messages par PeekMessage, si bien que PAINT garde sa propre boucle de messages comme sous DOS.</li>
+	<li>Les dialogues propres à PAINT (explorateur de fichiers, propriétés, couleurs, OCR, VTON...) sont dessinés par PAINT lui-même dans sa fenêtre, comme sous DOS.</li>
+	<li>Quelques corrections ont été faites dans le code de PAINT pour qu'il fonctionne et ne plante pas : le menu <b>?</b> (Aide, À propos) ne s'ouvrait pas (borne 5 au lieu de MENU_HELP), les racines des lecteurs (C:\, D:\) sont reconnues comme des dossiers par l'explorateur, et le moteur VTON attend le relâchement du clic de <i>Générer l'aperçu</i> avant de commencer (sinon ce clic était pris pour <i>Annuler</i>).</li>
+</ul>
+
+<h3>Limites dans Pasdows</h3>
+
+<ul>
+	<li><b>Fusionner des vêtements</b> utilise le modèle de segmentation <i>segformer_b2_clothes</i> (110 Mo). Sous Windows, PAINT le télécharge de Hugging Face par WinINet en HTTPS ; Pasdows n'a pas de client HTTPS, donc WININET.DLL y répond « InternetOpen a échoué » et PAINT l'affiche sans planter. Il suffit de copier <i>model.safetensors</i> (et <i>config.json</i>) dans <i>C:\VTON\segformer_b2_clothes</i> et d'ajouter <b>SET VTON_CACHE=C:\VTON</b> dans <i>AUTOEXEC.BAT</i>. Direct3D 11 n'existe pas dans Pasdows : le calcul se fait sur le processeur.</li>
+	<li><b>Importer depuis un scanner</b> (WIA) et <b>Imprimer</b> affichent qu'ils ne sont pas disponibles, comme sur un Windows sans scanner ni imprimante.</li>
+	<li>Les images s'enregistrent sur le disque dur <b>C:</b> (le CD-ROM D: est en lecture seule).</li>
+</ul>
+
 <h2>Langue</h2>
 
 La langue par défaut est le français. On utilise l'anglais si la variable d'environnement est <b>LANGUAGE=EN</b>, l'allemand si elle est <b>LANGUAGE=GR</b>, l'espagnol avec <b>LANGUAGE=SP</b> et l'italien avec <b>LANGUAGE=IT</b>. La variable se fixe dans <i>AUTOEXEC.BAT</i> sur le CD-ROM, avec la commande <b>SET</b> dans l'Invite MS-DOS ou dans <i>Paramètres régionaux</i> ; l'interface change de langue immédiatement.
@@ -103,6 +138,17 @@ La langue par défaut est le français. On utilise l'anglais si la variable d'en
 	<tr><td><b>-CVMM32</b></td><td>VMM32.VXD de Pasdows 95 : image PE 32 bits chargée à 1 Mo (comme la destination noyau d'OS2-0). La clause <b>exports</b> du programme publie ses fonctions Pascal comme API Win32 : WPC génère pour chacune un thunk stdcall et la table d'exportation dans laquelle le chargeur PE de VMM32 résout les importations des programmes.</td></tr>
 	<tr><td><b>-CW32</b></td><td>Exécutable Windows 95 (PE Win32), destination d'origine du compilateur ; l'unité Graph y est émulée par une fenêtre GDI.</td></tr>
 </table>
+
+Pour compiler Paint, WPC (destination <b>-CW32</b>) a été étendu au dialecte Free Pascal utilisé par CloneDRAW, et plusieurs erreurs du compilateur ont été corrigées :
+
+<ul>
+	<li>Types <b>Int64</b> / <b>QWord</b> (EDX:EAX, multiplication, division, décalages et comparaisons 64 bits), <b>AnsiString</b> en <b>{$H+}</b> (compteur de références, concaténation, Copy, Delete, SetLength, Length, chaînes constantes), <b>tableaux dynamiques</b> (SetLength, High, Length, libération automatique), <b>exceptions</b> (<b>Try...Except</b>, <b>Try...Finally</b>, <b>Raise</b>, classes d'exception sans champs), <b>{$PUSH}</b>/<b>{$POP}</b>, <b>{$APPTYPE GUI}</b>.</li>
+	<li>Conventions <b>stdcall</b> et <b>cdecl</b>, types procéduraux (avec appel par transtypage), procédures imbriquées avec lien statique, tableaux ouverts, paramètres Var/Const sans type, valeurs par défaut, transtypages vers les types du programme (y compris à gauche d'une affectation), arithmétique de pointeurs (POINTERMATH), <b>With</b> réentrant, résultat de fonction <b>Result</b>.</li>
+	<li>Corrections : constante nommée dans les bornes d'un tableau d'une section TYPE (le tableau n'avait qu'un élément), paramètres <b>Var</b> d'un type procédural pris pour des variables globales (une variable <i>Inc</i> masquait la procédure Inc), plus de 8 DLL importées (WININET et OLEAUT32 disparaissaient de la table d'importation), plus de 256 commutateurs {$I±}, {$R±}, <b>PType(expr)^ :=</b>, fonctions qui rendent un enregistrement (adresse dans une pile libérée), Ord, Abs et transtypages sur 32 bits, valeur d'un PChar littéral, adresse indiquée par les erreurs d'E/S.</li>
+	<li>Limites relevées : 1,5 million de jetons, 4096 procédures, 16 Mo de code, 32 Mo de données.</li>
+</ul>
+
+VMM32 exporte aussi les fonctions nécessaires à PAINT : <b>sprintf</b> et <b>strtod</b> (formatage et lecture des réels du runtime de WPC), QueryPerformanceCounter/Frequency, CoTaskMemAlloc/Free, PropVariantClear, SysAllocString/SysFreeString (OLEAUT32) et un WININET minimal.
 
 <h2>Construire et essayer</h2>
 
@@ -141,6 +187,7 @@ MAKEISO MONCD.ISO /BOOT:IO.SYS IO.SYS VMM32.VXD AUTOEXEC.BAT MSDOS.SYS LISEZMOI.
 	<li>Turbo Pascal / Free Pascal, sans programmation objet : des enregistrements (<i>Record</i>) passés par référence à des procédures et fonctions.</li>
 	<li>Aucune unité ajoutée (IO.PAS et VMM32.PAS n'en utilisent aucune, ils ne s'appuient que sur le BIOS et le matériel) et aucun fichier d'inclusion ($I).</li>
 	<li>Lignes de 80 caractères au plus dans IO.PAS et VMM32.PAS (chargeables dans l'EDI de Free Pascal) ; les caractères accentués sont écrits avec des codes <i>#nnn</i> de la page de code 437 (police du BIOS VGA).</li>
+	<li><b>APPS/PAINT.PAS</b> garde le style de CloneDRAW (fichier UTF-8, lignes longues, mode FPC) pour rester compilable par Free Pascal et facile à resynchroniser ; seule sa couche Pasdows 95 suit les règles ci-dessus.</li>
 </ul>
 
 <h2>Licence</h2>
