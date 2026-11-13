@@ -738,7 +738,11 @@ Begin
   Port[$21] := $50; Port[$A1] := $58;
   Port[$21] := $04; Port[$A1] := $02;
   Port[$21] := $01; Port[$A1] := $01;
-  Port[$21] := $F8; Port[$A1] := $FF;
+  { IRQ 0 et 2 seulement : l'IRQ 1 est demasquee a la fin d'InitInput -
+    demasquee ici, la reponse du 8042 a sa commande 20h declenchait le
+    gestionnaire du clavier, qui la lisait a la place de KbcRead (attente
+    de 200000 lectures, plus d'une seconde au demarrage). }
+  Port[$21] := $FA; Port[$A1] := $FF;
 End;
 
 Procedure InitIdt;
@@ -3289,11 +3293,13 @@ End;
 { ------------------------------------------------------------------ }
 
 Const
-  { couleurs du pilote VGA de Windows (ordre IRGB du VGA) }
+  { couleurs du pilote VGA de Windows, dans l'ordre de l'interface 16
+    couleurs d'IO.SYS (1 bordeaux, 4 marine...) : le logo de demarrage
+    qu'IO.SYS laisse a l'ecran garde ses couleurs }
   VgaRGB : Array[0..15] Of LongInt = (
-    $000000, $000080, $008000, $008080, $800000, $800080, $808000,
-    $C0C0C0, $808080, $0000FF, $00FF00, $00FFFF, $FF0000, $FF00FF,
-    $FFFF00, $FFFFFF);
+    $000000, $800000, $008000, $808000, $000080, $800080, $008080,
+    $C0C0C0, $808080, $FF0000, $00FF00, $FFFF00, $0000FF, $FF00FF,
+    $00FFFF, $FFFFFF);
 
 Procedure VgaInit;
 Var I, B : LongInt;
@@ -4366,6 +4372,9 @@ Begin
   Begin
     VgaMapChanged := False;
     If DDShow Then DDDirty := True
+    Else If (Dirty.L <= 0) And (Dirty.T <= 0) And (Dirty.R >= ScrW) And
+            (Dirty.B >= ScrH) Then
+      { tout l'ecran va etre recompose et converti juste apres }
     Else
     Begin
       SetR(R, 0, 0, ScrW, ScrH);
