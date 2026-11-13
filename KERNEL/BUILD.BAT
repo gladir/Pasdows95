@@ -3,8 +3,8 @@ REM BUILD.BAT - Construit Pasdows 95 et le CD-ROM amorcable IMAGE\PASDOWS.ISO
 REM (a lancer depuis le dossier KERNEL, Free Pascal dans le PATH)
 REM   WPC -CW95IO IO.PAS IO.SYS        IO.SYS amorcable (El Torito)
 REM   WPC -CVMM32 VMM32.PAS VMM32.VXD  noyau 32 bits et API Win32
-REM   WPC -CW32 ..\SYSTEME\*.PAS     programmes systeme (COMMAND.EXE)
-REM   WPC -CW32 ..\EXEMPLES\*.PAS      exemples de programmes Windows 95
+REM   WPC -CW32 ..\SYSTEM\*.PAS        programmes systeme (COMMAND.EXE)
+REM   WPC -CW32 ..\EXAMPLES\*.PAS      exemples de programmes Windows 95
 REM Tous les fichiers de IMAGE\CDROM sont copies sur le CD-ROM.
 IF NOT EXIST ..\BUILD\NUL MD ..\BUILD
 IF NOT EXIST ..\BUILD\CD\NUL MD ..\BUILD\CD
@@ -23,10 +23,10 @@ ECHO == VMM32.VXD (WPC -CVMM32)
 ..\BUILD\WPC -CVMM32 VMM32.PAS ..\BUILD\CD\VMM32.VXD
 IF ERRORLEVEL 1 GOTO ERREUR
 ECHO == Programmes systeme et exemples Win32 (WPC -CW32)
-FOR %%F IN (..\SYSTEME\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
-FOR %%F IN (..\SYSTEME\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
-FOR %%F IN (..\EXEMPLES\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
-FOR %%F IN (..\EXEMPLES\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
+FOR %%F IN (..\SYSTEM\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
+FOR %%F IN (..\SYSTEM\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
+FOR %%F IN (..\EXAMPLES\*.PAS) DO ..\BUILD\WPC -CW32 %%F ..\BUILD\CD\%%~nF.EXE
+FOR %%F IN (..\EXAMPLES\*.PAS) DO COPY ..\BUILD\CD\%%~nF.EXE ..\IMAGE\CDROM > NUL
 ECHO == CD-ROM amorcable
 ..\BUILD\MAKEISO ..\IMAGE\PASDOWS.ISO /BOOT:..\BUILD\CD\IO.SYS /LABEL:PASDOWS95 ..\BUILD\CD\*.*
 IF ERRORLEVEL 1 GOTO ERREUR

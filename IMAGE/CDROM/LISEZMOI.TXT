@@ -21,7 +21,7 @@ PROGRAMMES WINDOWS 95
   reconstruisez le CD-ROM avec KERNEL\BUILD.BAT ou KERNEL/BUILD.sh.
   L'icone du programme apparait sur le bureau ; double-cliquez-la
   (ou Demarrer, Executer). Exemple fourni : HELLO.EXE, compile par
-  WPC -CW32 a partir de EXEMPLES\HELLO.PAS. Un projecteur Macromedia
+  WPC -CW32 a partir de EXAMPLES\HELLO.PAS. Un projecteur Macromedia
   Director 5 avec son film (.DIR) a ete essaye avec succes.
 
   DirectX : DDRAW.DLL (plein ecran 320x200, 320x240 ou 640x480 en
