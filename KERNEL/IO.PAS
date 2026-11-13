@@ -6621,6 +6621,15 @@ End;
     +1C base du noyau      +20 taille de l'image  +24 point d'entree
     +28 police 8x16 (0000:2000)  +2C environnement (0000:3000)
     +30 options : bit 0 ecran d'accueil, bit 1 son
+    +34 nombre de modes VESA   +36 adresse de leur table (0000:0600)
+    +38 mode VESA courant      +3A tailles et positions des composantes
+        rouge, verte et bleue (couleurs directes, 6 octets)
+  Table des modes VESA (0000:0600, 20 octets par mode, au plus 48) :
+    +0 numero  +2 largeur  +4 hauteur  +6 bits par point  +8 octets par
+    ligne  +10 tailles/positions R, V, B  +16 memoire lineaire
+  Le mode est choisi d'apres la preference enregistree par VMM32 (Panneau
+  de configuration, Affichage) dans le CMOS : 7Ah bits par point (4 : VGA
+  16 couleurs), 7Bh signature 5Ah, 7Ch largeur / 8, 7Dh hauteur / 8.
   GDT temporaire en 0000:0A00, GDTR en 0000:0A20, transition 32 bits en
   0000:0A40, zone de transit du fichier en 00400000h. }
 
@@ -6633,10 +6642,19 @@ Const
   VEnv      = $3000;
   VStaging  = $00400000;
   CmosDosFlag = $7E;
+  VModes    = $0600;
+  MaxVModes = 48;
+  CmosBpp   = $7A;
+  CmosVSig  = $7B;
+  CmosVW    = $7C;
+  CmosVH    = $7D;
 
 Var
   MoveGdt   : Array[0..47] Of Byte;
   VbeBuf    : Array[0..255] Of Byte;
+  VbeInfo   : Array[0..511] Of Byte;
+  VbeList   : Array[0..127] Of Word;
+  VmCnt     : Integer;
   VEntry    : LongInt;
 
 Function CmosRead(R : Byte) : Byte;
@@ -6747,11 +6765,10 @@ Begin
   MemW[0:VInfo + Ofs + 2] := Word(V Shr 16);
 End;
 
-{ Mode VESA 101h (640x480, 256 couleurs) avec memoire lineaire }
-Function VbeSetup : Boolean;
-Var R : Word; Lfb : LongInt; I : Integer;
+{ Informations du mode M (4F01h) dans VbeBuf ; False si absent }
+Function VbeModeInfo(M : Word) : Boolean;
+Var R : Word; I : Integer;
 Begin
-  VbeSetup := False;
   For I := 0 To 255 Do VbeBuf[I] := 0;
   asm
     push es
@@ -6760,29 +6777,173 @@ Begin
     pop es
     lea di,VbeBuf
     mov ax,4F01h
-    mov cx,0101h
+    mov cx,M
+    int 10h
+    mov R,ax
+    pop di
+    pop es
+  end;
+  VbeModeInfo := R = $004F;
+End;
+
+Function VbeW(Ofs : Integer) : Word;
+Begin
+  VbeW := VbeBuf[Ofs] + Word(VbeBuf[Ofs + 1]) Shl 8;
+End;
+
+{ Liste des modes VESA graphiques a memoire lineaire, 640x480 et plus,
+  en 256 couleurs (pixels groupes) ou en couleurs directes (15, 16, 24 et
+  32 bits) : table de VMM32 en 0000:0600 (Panneau de configuration,
+  Affichage : nombre de couleurs et zone d'ecran) }
+Procedure VbeEnum;
+Var R, Sg, Mo, M, W, H, Attr : Word; N, I, J : Integer; Bpp : Byte;
+    A : Word; Dup : Boolean;
+Begin
+  VmCnt := 0;
+  For I := 0 To 511 Do VbeInfo[I] := 0;
+  VbeInfo[0] := Ord('V'); VbeInfo[1] := Ord('B');
+  VbeInfo[2] := Ord('E'); VbeInfo[3] := Ord('2');
+  asm
+    push es
+    push di
+    push ds
+    pop es
+    lea di,VbeInfo
+    mov ax,4F00h
     int 10h
     mov R,ax
     pop di
     pop es
   end;
   If R <> $004F Then Exit;
-  If (VbeBuf[0] And $81) <> $81 Then Exit;
-  Lfb := LongInt(VbeBuf[$28]) + LongInt(VbeBuf[$29]) Shl 8 +
-         LongInt(VbeBuf[$2A]) Shl 16 + LongInt(VbeBuf[$2B]) Shl 24;
+  If (VbeInfo[0] <> Ord('V')) Or (VbeInfo[1] <> Ord('E')) Then Exit;
+  Mo := VbeInfo[14] + Word(VbeInfo[15]) Shl 8;
+  Sg := VbeInfo[16] + Word(VbeInfo[17]) Shl 8;
+  N := 0;
+  While (N < 128) And (MemW[Sg:Mo + N * 2] <> $FFFF) Do
+  Begin
+    VbeList[N] := MemW[Sg:Mo + N * 2];
+    Inc(N);
+  End;
+  For I := 0 To N - 1 Do
+  Begin
+    M := VbeList[I];
+    If (VmCnt < MaxVModes) And VbeModeInfo(M) Then
+    Begin
+      Attr := VbeW(0);
+      W := VbeW(18); H := VbeW(20);
+      Bpp := VbeBuf[25];
+      { 15 bits annonces comme 16 : composante verte de 5 bits }
+      If (Bpp = 16) And (VbeBuf[33] = 5) Then Bpp := 15;
+      If ((Attr And $91) = $91) And (W >= 640) And (H >= 480) And
+         (W <= 1600) And (H <= 1200) And
+         (((VbeBuf[27] = 4) And (Bpp = 8)) Or
+          ((VbeBuf[27] = 6) And ((Bpp = 15) Or (Bpp = 16) Or (Bpp = 24) Or
+                                 (Bpp = 32)))) Then
+      Begin
+        Dup := False;
+        For J := 0 To VmCnt - 1 Do
+        Begin
+          A := VModes + J * 20;
+          If (MemW[0:A + 2] = W) And (MemW[0:A + 4] = H) And
+             (Mem[0:A + 6] = Bpp) Then Dup := True;
+        End;
+        If Not Dup Then
+        Begin
+          A := VModes + VmCnt * 20;
+          MemW[0:A] := M; MemW[0:A + 2] := W; MemW[0:A + 4] := H;
+          Mem[0:A + 6] := Bpp; Mem[0:A + 7] := 0;
+          MemW[0:A + 8] := VbeW(16);
+          If Bpp = 8 Then
+            For J := 0 To 5 Do Mem[0:A + 10 + J] := 0
+          Else
+            For J := 0 To 5 Do Mem[0:A + 10 + J] := VbeBuf[31 + J];
+          MemW[0:A + 16] := VbeW(40);
+          MemW[0:A + 18] := VbeW(42);
+          Inc(VmCnt);
+        End;
+      End;
+    End;
+  End;
+End;
+
+{ Mode de la table : largeur W, hauteur H, Bpp bits par point (-1) }
+Function VbeFind(W, H : Word; Bpp : Byte) : Integer;
+Var J : Integer; A : Word;
+Begin
+  VbeFind := -1;
+  For J := 0 To VmCnt - 1 Do
+  Begin
+    A := VModes + J * 20;
+    If (MemW[0:A + 2] = W) And (MemW[0:A + 4] = H) And
+       (Mem[0:A + 6] = Bpp) Then
+    Begin
+      VbeFind := J;
+      Exit;
+    End;
+  End;
+End;
+
+{ Mode VESA d'apres la preference du CMOS (defaut : 640x480, 256
+  couleurs), avec memoire lineaire ; Vga := True si la preference est le
+  VGA 16 couleurs }
+Function VbeSetup(Var Vga : Boolean) : Boolean;
+Var R, M : Word; Lfb : LongInt; I, J : Integer; A : Word; Bpp : Byte;
+Begin
+  VbeSetup := False;
+  Vga := False;
+  MemW[0:VInfo + $38] := 0;
+  For J := 0 To 5 Do Mem[0:VInfo + $3A + J] := 0;
+  VbeEnum;
+  MemW[0:VInfo + $34] := VmCnt;
+  MemW[0:VInfo + $36] := VModes;
+  I := -1;
+  If CmosRead(CmosVSig) = $5A Then
+  Begin
+    Bpp := CmosRead(CmosBpp);
+    If Bpp = 4 Then
+    Begin
+      Vga := True;
+      Exit;
+    End;
+    I := VbeFind(Word(CmosRead(CmosVW)) * 8, Word(CmosRead(CmosVH)) * 8,
+                 Bpp);
+  End;
+  If I < 0 Then I := VbeFind(640, 480, 8);
+  If I < 0 Then
+    For J := VmCnt - 1 DownTo 0 Do
+      If (MemW[0:VModes + J * 20 + 2] = 640) And
+         (MemW[0:VModes + J * 20 + 4] = 480) Then I := J;
+  If I < 0 Then
+  Begin
+    { BIOS sans liste exploitable : 101h (640x480, 256 couleurs) }
+    If Not VbeModeInfo($101) Or ((VbeBuf[0] And $81) <> $81) Then Exit;
+    A := VModes;
+    MemW[0:A] := $101; MemW[0:A + 2] := 640; MemW[0:A + 4] := 480;
+    Mem[0:A + 6] := 8; Mem[0:A + 7] := 0; MemW[0:A + 8] := VbeW(16);
+    For J := 0 To 5 Do Mem[0:A + 10 + J] := 0;
+    MemW[0:A + 16] := VbeW(40); MemW[0:A + 18] := VbeW(42);
+    VmCnt := 1; I := 0;
+    MemW[0:VInfo + $34] := 1;
+  End;
+  A := VModes + I * 20;
+  M := MemW[0:A] Or $4000;
+  Lfb := LongInt(MemW[0:A + 16]) + LongInt(MemW[0:A + 18]) Shl 16;
   If Lfb = 0 Then Exit;
   asm
     mov ax,4F02h
-    mov bx,4101h
+    mov bx,M
     int 10h
     mov R,ax
   end;
   If R <> $004F Then Exit;
   PutInfoD($0C, Lfb);
-  MemW[0:VInfo + $10] := VbeBuf[$10] + Word(VbeBuf[$11]) Shl 8;
-  MemW[0:VInfo + $12] := 640;
-  MemW[0:VInfo + $14] := 480;
-  MemW[0:VInfo + $16] := 8;
+  MemW[0:VInfo + $10] := MemW[0:A + 8];
+  MemW[0:VInfo + $12] := MemW[0:A + 2];
+  MemW[0:VInfo + $14] := MemW[0:A + 4];
+  MemW[0:VInfo + $16] := Mem[0:A + 6];
+  MemW[0:VInfo + $38] := MemW[0:A];
+  For J := 0 To 5 Do Mem[0:VInfo + $3A + J] := Mem[0:A + 10 + J];
   VbeSetup := True;
 End;
 
@@ -6952,7 +7113,7 @@ End;
 
 { Demarrer Pasdows en mode protege ; ne revient qu'en cas d'echec }
 Procedure StartVmm32;
-Var Flags : Byte;
+Var Flags : Byte; Vga : Boolean;
 Begin
   { 32 bits : 80386 au moins (sur un 286, LoadVmm32 et la bascule
     executeraient des instructions 32 bits) }
@@ -6996,7 +7157,7 @@ Begin
   If OptLogo Then Flags := Flags Or 1;
   PutInfoD($30, Flags);
   Vmm32Why := 5;
-  If Not VbeSetup Then
+  If Not VbeSetup(Vga) Then
     If Not VgaSetup Then
     Begin
       TextMode;

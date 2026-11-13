@@ -72,10 +72,8 @@ Const
   SelData     = $10;
   SelFs       = $18;
 
-  ScrW        = 640;
-  ScrH        = 480;
   TaskH       = 28;
-  TaskY       = ScrH - TaskH;
+  MaxVm       = 48;             { modes VESA retenus par IO.SYS }
 
   { Couleurs statiques de la palette systeme (20 couleurs de Windows) }
   cBlack   = 0;   cMaroon  = 1;   cGreen   = 2;   cOlive   = 3;
@@ -152,6 +150,10 @@ Var
   SliceStart : LongInt;          { debut de la tranche de temps }
   KImgLo, KImgHi : LongInt;      { image du noyau (jamais preemptee) }
   Ticks      : LongInt;          { millisecondes depuis le demarrage }
+  { ecran : mode VESA choisi par IO.SYS ou par le Panneau de
+    configuration (Affichage) ; ScrBpp : 4 (VGA 16 couleurs, plans),
+    8 (256 couleurs) ou 15, 16, 24, 32 (couleurs directes) }
+  ScrW, ScrH, TaskY, ScrBpp, ScrBytes, ScrMode : LongInt;
   HeapStart, HeapEnd, HeapRover : LongInt;
   HeapOwner  : LongInt;          { 1 : bloc d'un programme Win32 }
   OptFlags   : LongInt;
@@ -577,6 +579,8 @@ Var
   { DirectDraw : surface primaire affichee en plein ecran (exclusif) }
   DDShow, DDDirty : Boolean;
   DDBuf, DDW, DDH : LongInt;
+  DDBufSz : LongInt;          { taille allouee de DDBuf }
+  DDCleared : Boolean;        { bords noirs deja traces (ecran plus grand) }
 
 Procedure SetGate(N, Addr : LongInt);
 Begin
@@ -3254,6 +3258,16 @@ Type
 
 Var
   Lfb, LfbPitch : LongInt;
+  { couleurs directes : l'ecran compose reste en 256 couleurs (Back,
+    palette systeme) ; OutPal donne le pixel de la memoire video de
+    chaque indice, refaite quand la palette change }
+  OutPal    : Array[0..255] Of LongInt;
+  OutPalChanged : Boolean;
+  RMs, RPs, GMs, GPs, BMs, BPs : LongInt;  { tailles/positions R, V, B }
+  { modes VESA (table d'IO.SYS en 0000:0600) }
+  VmN       : LongInt;
+  VmNum, VmW, VmH, VmBpp, VmPitch, VmLfb : Array[0..MaxVm - 1] Of LongInt;
+  VmMask    : Array[0..MaxVm * 6 - 1] Of Byte;
   { VGA 16 couleurs (mode 12h, 4 plans) quand IO.SYS n'a pas trouve de
     mode VESA : l'ecran 256 couleurs (Back) est converti a la copie }
   VgaPlanar : Boolean;
@@ -3465,11 +3479,30 @@ Begin
   Port[$3C5] := $0F;
 End;
 
+{ Pixel de la memoire video (couleurs directes) de l'indice I }
+Procedure OutPalSet(I : LongInt);
+Var R, G, B, V : LongInt;
+Begin
+  R := SysPal[I * 3]; G := SysPal[I * 3 + 1]; B := SysPal[I * 3 + 2];
+  V := ((R Shr (8 - RMs)) Shl RPs) Or ((G Shr (8 - GMs)) Shl GPs) Or
+       ((B Shr (8 - BMs)) Shl BPs);
+  If OutPal[I] <> V Then
+  Begin
+    OutPal[I] := V;
+    OutPalChanged := True;
+  End;
+End;
+
 Procedure DacSet(I : LongInt);
 Begin
   If VgaPlanar Then
   Begin
     VgaMapSet(I);
+    Exit;
+  End;
+  If ScrBpp > 8 Then
+  Begin
+    OutPalSet(I);
     Exit;
   End;
   Port[$3C8] := I;
@@ -4234,6 +4267,132 @@ Begin
   SetR(Dirty, 0, 0, ScrW, ScrH);
 End;
 
+{ N pixels de 256 couleurs (Src) vers la memoire video en couleurs
+  directes (Dst), par OutPal, en assembleur }
+Procedure ConvRow16(Src, Dst, N : LongInt);
+Var T : LongInt;
+Begin
+  If N <= 0 Then Exit;
+  T := LongInt(@OutPal);
+  asm
+    push esi
+    push edi
+    push ebx
+    mov esi,Src
+    mov edi,Dst
+    mov ecx,N
+    mov ebx,T
+  @c16:
+    movzx eax,byte ptr [esi]
+    inc esi
+    shl eax,2
+    add eax,ebx
+    mov eax,[eax]
+    mov [edi],ax
+    add edi,2
+    dec ecx
+    jnz @c16
+    pop ebx
+    pop edi
+    pop esi
+  end;
+End;
+
+Procedure ConvRow24(Src, Dst, N : LongInt);
+Var T : LongInt;
+Begin
+  If N <= 0 Then Exit;
+  T := LongInt(@OutPal);
+  asm
+    push esi
+    push edi
+    push ebx
+    mov esi,Src
+    mov edi,Dst
+    mov ecx,N
+    mov ebx,T
+  @c24:
+    movzx eax,byte ptr [esi]
+    inc esi
+    shl eax,2
+    add eax,ebx
+    mov eax,[eax]
+    mov [edi],ax
+    shr eax,16
+    mov [edi+2],al
+    add edi,3
+    dec ecx
+    jnz @c24
+    pop ebx
+    pop edi
+    pop esi
+  end;
+End;
+
+Procedure ConvRow32(Src, Dst, N : LongInt);
+Var T : LongInt;
+Begin
+  If N <= 0 Then Exit;
+  T := LongInt(@OutPal);
+  asm
+    push esi
+    push edi
+    push ebx
+    mov esi,Src
+    mov edi,Dst
+    mov ecx,N
+    mov ebx,T
+  @c32:
+    movzx eax,byte ptr [esi]
+    inc esi
+    shl eax,2
+    add eax,ebx
+    mov eax,[eax]
+    mov [edi],eax
+    add edi,4
+    dec ecx
+    jnz @c32
+    pop ebx
+    pop edi
+    pop esi
+  end;
+End;
+
+{ Ligne de N pixels (indices) vers l'adresse D de la memoire video }
+Procedure OutRow(S, D, N : LongInt);
+Begin
+  Case ScrBpp Of
+    15, 16 : ConvRow16(S, D, N);
+    24 : ConvRow24(S, D, N);
+    32 : ConvRow32(S, D, N);
+  Else
+    MoveMem(S, D, N);
+  End;
+End;
+
+{ Un pixel d'indice C en (X, Y) de la memoire video }
+Procedure OutPix(X, Y, C : LongInt);
+Var A, V : LongInt;
+Begin
+  A := Lfb + Y * LfbPitch + X * ScrBytes;
+  If ScrBpp <= 8 Then
+  Begin
+    Mem[0:A] := C;
+    Exit;
+  End;
+  V := OutPal[C And 255];
+  Case ScrBytes Of
+    2 : MemW[0:A] := V;
+    3 :
+    Begin
+      MemW[0:A] := V;
+      Mem[0:A + 2] := V Shr 16;
+    End;
+  Else
+    MemL[0:A] := V;
+  End;
+End;
+
 { Recopier une zone du tampon dans la memoire video }
 Procedure LfbCopy(R : TRect);
 Var Y, S, D, N : LongInt;
@@ -4252,10 +4411,10 @@ Begin
   End;
   N := R.R - R.L;
   S := Back.Bits + R.T * Back.Pitch + R.L;
-  D := Lfb + R.T * LfbPitch + R.L;
+  D := Lfb + R.T * LfbPitch + R.L * ScrBytes;
   For Y := R.T To R.B - 1 Do
   Begin
-    MoveMem(S, D, N);
+    OutRow(S, D, N);
     S := S + Back.Pitch;
     D := D + LfbPitch;
   End;
@@ -4345,10 +4504,10 @@ Begin
         V := CurMap[Y * 32 + X];
         If (V <> 0) And (PX >= 0) And (PX < ScrW) Then
         Begin
-          A := Lfb + PY * LfbPitch + PX;
-          If V = 1 Then Mem[0:A] := cBlack
-          Else If V = 2 Then Mem[0:A] := cWhite
-          Else Mem[0:A] := Mem[0:Back.Bits + PY * Back.Pitch + PX] Xor 255;
+          If V = 1 Then OutPix(PX, PY, cBlack)
+          Else If V = 2 Then OutPix(PX, PY, cWhite)
+          Else OutPix(PX, PY,
+                      Mem[0:Back.Bits + PY * Back.Pitch + PX] Xor 255);
         End;
       End;
   End;
@@ -4374,12 +4533,14 @@ End;
 
 { Composer la zone modifiee et l'afficher }
 Procedure FlushScreen;
-Var R, C, I : TRect; Y : LongInt;
+Var R, C, I : TRect; Y, X0, Y0, Z : LongInt;
 Begin
-  { VGA 16 couleurs : palette changee, tout l'ecran a reconvertir }
-  If VgaPlanar And VgaMapChanged Then
+  { VGA 16 couleurs ou couleurs directes : palette changee, tout l'ecran
+    a reconvertir }
+  If (VgaPlanar And VgaMapChanged) Or ((ScrBpp > 8) And OutPalChanged) Then
   Begin
     VgaMapChanged := False;
+    OutPalChanged := False;
     If DDShow Then DDDirty := True
     Else If (Dirty.L <= 0) And (Dirty.T <= 0) And (Dirty.R >= ScrW) And
             (Dirty.B >= ScrH) Then
@@ -4391,15 +4552,35 @@ Begin
       If CurShownB Then CursorDraw;
     End;
   End;
-  { DirectDraw en mode exclusif : la surface primaire occupe l'ecran }
+  { DirectDraw en mode exclusif : la surface primaire occupe l'ecran,
+    centree sur fond noir quand l'ecran est plus grand que son mode }
   If DDShow Then
   Begin
+    X0 := ((ScrW - Min(DDW, ScrW)) Div 2) And Not 7;
+    Y0 := (ScrH - Min(DDH, ScrH)) Div 2;
+    If Not DDCleared Then
+    Begin
+      DDCleared := True;
+      If (X0 > 0) Or (Y0 > 0) Then
+      Begin
+        Z := KAlloc(ScrW + 16);
+        If Z <> 0 Then
+        Begin
+          For Y := 0 To ScrH - 1 Do
+            If VgaPlanar Then VgaWriteRow(Y, 0, (ScrW - 1) Shr 3, Z)
+            Else OutRow(Z, Lfb + Y * LfbPitch, ScrW);
+          KFree(Z);
+        End;
+      End;
+    End;
     If DDDirty Then
       For Y := 0 To Min(DDH, ScrH) - 1 Do
         If VgaPlanar Then
-          VgaWriteRow(Y, 0, (Min(DDW, ScrW) - 1) Shr 3, DDBuf + Y * DDW)
+          VgaWriteRow(Y0 + Y, X0 Shr 3, (X0 + Min(DDW, ScrW) - 1) Shr 3,
+                      DDBuf + Y * DDW)
         Else
-          MoveMem(DDBuf + Y * DDW, Lfb + Y * LfbPitch, Min(DDW, ScrW));
+          OutRow(DDBuf + Y * DDW, Lfb + (Y0 + Y) * LfbPitch + X0 * ScrBytes,
+                 Min(DDW, ScrW));
     DDDirty := False;
     SetR(Dirty, 0, 0, 0, 0);
     Exit;
@@ -4936,7 +5117,8 @@ Const
   { sortes internes de fenetres }
   ikNone = 0; ikTaskbar = 1; ikMenu = 2; ikExplorer = 3; ikMsgBox = 4;
   ikAbout = 5; ikRun = 6; ikShutdown = 7; ikHelp = 8; ikWelcome = 9;
-  ikNotepad = 10; ikConsole = 11; ikButton = 20; ikStatic = 21; ikEdit = 22;
+  ikNotepad = 10; ikConsole = 11; ikDisplay = 12;
+  ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
   ikMdiClient = 27;
 
@@ -6329,10 +6511,26 @@ Const
   cmNone = 0; cmExplorer = 1; cmComputer = 2; cmNotepad = 3; cmHelp = 4;
   cmRun = 5; cmAbout = 6; cmShutdown = 7; cmReadme = 8; cmRecycle = 9;
   cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
+  cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
+  cmIconOpen = 18;
+  cmGray = 99;                       { element de menu grise }
   cmDocBase = 100; cmExeBase = 200;
+  cmColorBase = 400;                 { + bits par point (Affichage) }
+  { menus contextuels : bureau, Reorganiser les icones, palette de
+    couleurs (Affichage), icone du bureau }
+  mnDesk = 5; mnArrange = 6; mnColors = 7; mnIcon = 8;
   MaxDesk = 12;
 
 Var
+  { Propriete de Affichage : boite ouverte, profondeurs proposees,
+    resolutions de la profondeur choisie, question de redemarrage }
+  DispW     : LongInt;
+  DepN      : LongInt;
+  DepBpp    : Array[0..7] Of LongInt;
+  ResN      : LongInt;
+  ResW, ResH : Array[0..MaxVm - 1] Of LongInt;
+  RebootAskW : LongInt;
+  DispiOk   : Boolean;                     { interface Bochs/QEMU (1CEh) }
   KClass    : Array[0..31] Of LongInt;     { classe interne par sorte }
   TaskbarW  : LongInt;
   MenuW     : Array[0..3] Of LongInt;      { menus ouverts (niveaux) }
@@ -6477,9 +6675,13 @@ Begin
 End;
 
 Procedure DeskPos(I : LongInt; Var X, Y : LongInt);
+Var R : LongInt;
 Begin
-  X := 6 + (I Div 6) * 84;
-  Y := 8 + (I Mod 6) * 72;
+  { colonnes de icones aussi hautes que le bureau le permet }
+  R := (TaskY - 8) Div 72;
+  If R < 1 Then R := 1;
+  X := 6 + (I Div R) * 84;
+  Y := 8 + (I Mod R) * 72;
 End;
 
 Procedure SplitLabel(Const S : String; N : LongInt; Var A, B : String);
@@ -6710,13 +6912,89 @@ Begin
   End;
 End;
 
+{ Nom d'une profondeur de couleurs (Affichage, Palette de couleurs) }
+Function DepthName(B : LongInt) : String;
+Begin
+  Case B Of
+    4 : DepthName := L('16 couleurs', '16 Color', '16 Farben', '16 colori',
+                       '16 colores');
+    8 : DepthName := L('256 couleurs', '256 Color', '256 Farben',
+                       '256 colori', '256 colores');
+    15 : DepthName := 'High Color (15 bits)';
+    16 : DepthName := 'High Color (16 bits)';
+    24 : DepthName := 'True Color (24 bits)';
+  Else
+    DepthName := 'True Color (32 bits)';
+  End;
+End;
+
+{ Profondeurs disponibles : VGA 16 couleurs, puis celles des modes VESA }
+Procedure DispDepths;
+Var K, I, B : LongInt; Found : Boolean;
+Begin
+  DepN := 1; DepBpp[0] := 4;
+  For K := 0 To 4 Do
+  Begin
+    Case K Of
+      0 : B := 8; 1 : B := 15; 2 : B := 16; 3 : B := 24;
+    Else
+      B := 32;
+    End;
+    Found := False;
+    For I := 0 To VmN - 1 Do If VmBpp[I] = B Then Found := True;
+    If Found Then
+    Begin
+      DepBpp[DepN] := B;
+      Inc(DepN);
+    End;
+  End;
+End;
+
+{ Resolutions de la profondeur B, de la plus petite a la plus grande }
+Procedure DispRes(B : LongInt);
+Var I, J : LongInt; Dup : Boolean;
+Begin
+  ResN := 0;
+  If B = 4 Then
+  Begin
+    ResW[0] := 640; ResH[0] := 480; ResN := 1;
+    Exit;
+  End;
+  For I := 0 To VmN - 1 Do
+    If VmBpp[I] = B Then
+    Begin
+      Dup := False;
+      For J := 0 To ResN - 1 Do
+        If (ResW[J] = VmW[I]) And (ResH[J] = VmH[I]) Then Dup := True;
+      If Not Dup Then
+      Begin
+        J := ResN;
+        While (J > 0) And (ResW[J - 1] * ResH[J - 1] > VmW[I] * VmH[I]) Do
+        Begin
+          ResW[J] := ResW[J - 1]; ResH[J] := ResH[J - 1];
+          Dec(J);
+        End;
+        ResW[J] := VmW[I]; ResH[J] := VmH[I];
+        Inc(ResN);
+      End;
+    End;
+  If ResN = 0 Then
+  Begin
+    ResW[0] := 640; ResH[0] := 480; ResN := 1;
+  End;
+End;
+
 Function MenuCount(M : LongInt) : LongInt;
 Var N : LongInt; S : String;
 Begin
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 4 + ExeCnt;
-    mnSettings : MenuCount := 3;
+    mnSettings : MenuCount := 5;
+    mnDesk : MenuCount := 9;
+    mnArrange : MenuCount := 2;
+    mnColors : MenuCount := DepN;
+    mnIcon : MenuCount := 3;
     mnDocs :
     Begin
       N := 0;
@@ -6802,23 +7080,92 @@ Begin
     mnSettings :
       If I = 0 Then
       Begin
-        T := L('Mode sans '#130'chec (16 couleurs)', 'Safe mode (16 colors)',
-               'Abgesicherter Modus', 'Modalit'#133' provvisoria',
-               'Modo a prueba de fallos');
-        Cmd := cmSafeMode; Icon := icDisplay;
+        T := L('Affichage...', 'Display...', 'Anzeige...', 'Schermo...',
+               'Pantalla...');
+        Cmd := cmDisplay; Icon := icDisplay;
       End
-      Else If I = 2 Then
+      Else If I = 1 Then
       Begin
         T := L('R'#130'seau (TCP/IP)...', 'Network (TCP/IP)...',
                'Netzwerk (TCP/IP)...', 'Rete (TCP/IP)...',
                'Red (TCP/IP)...');
         Cmd := cmNetwork; Icon := icComputer;
       End
-      Else
+      Else If I = 3 Then
+      Begin
+        T := L('Mode sans '#130'chec (16 couleurs)', 'Safe mode (16 colors)',
+               'Abgesicherter Modus', 'Modalit'#133' provvisoria',
+               'Modo a prueba de fallos');
+        Cmd := cmSafeMode; Icon := icDisplay;
+      End
+      Else If I = 4 Then
       Begin
         T := L('Mode MS-DOS', 'MS-DOS mode', 'MS-DOS-Modus',
                'Modalit'#133' MS-DOS', 'Modo MS-DOS');
         Cmd := cmDosMode; Icon := icDos;
+      End;
+    mnDesk :
+      Case I Of
+        0 : Begin
+              T := L('R'#130'organiser les ic'#147'nes', 'Arrange Icons',
+                     'Symbole anordnen', 'Disponi icone',
+                     'Organizar iconos');
+              Sub := mnArrange;
+            End;
+        1 : Begin
+              T := L('Aligner les ic'#147'nes', 'Line up Icons',
+                     'Am Raster ausrichten', 'Allinea icone',
+                     'Alinear iconos');
+              Cmd := cmAlign;
+            End;
+        3 : Begin
+              T := L('Coller', 'Paste', 'Einf'#129'gen', 'Incolla', 'Pegar');
+              Cmd := cmGray;
+            End;
+        4 : Begin
+              T := L('Coller le raccourci', 'Paste Shortcut',
+                     'Verkn'#129'pfung einf'#129'gen', 'Incolla collegamento',
+                     'Pegar acceso directo');
+              Cmd := cmGray;
+            End;
+        6 : Begin
+              T := L('Nouveau', 'New', 'Neu', 'Nuovo', 'Nuevo');
+              Cmd := cmGray;
+            End;
+        8 : Begin
+              T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+                     'Propriet'#133, 'Propiedades');
+              Cmd := cmDisplay;
+            End;
+      End;
+    mnArrange :
+      If I = 0 Then
+      Begin
+        T := L('par nom', 'by Name', 'nach Name', 'per nome',
+               'por nombre');
+        Cmd := cmArrName;
+      End
+      Else
+      Begin
+        T := L('par type', 'by Type', 'nach Typ', 'per tipo', 'por tipo');
+        Cmd := cmArrType;
+      End;
+    mnColors :
+      Begin
+        T := DepthName(DepBpp[I]);
+        Cmd := cmColorBase + DepBpp[I];
+      End;
+    mnIcon :
+      If I = 0 Then
+      Begin
+        T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
+        Cmd := cmIconOpen;
+      End
+      Else If I = 2 Then
+      Begin
+        T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+               'Propriet'#133, 'Propiedades');
+        Cmd := cmGray;
       End;
     mnDocs :
       If DocFile(I, T) Then
@@ -6826,7 +7173,10 @@ Begin
         Cmd := cmDocBase + I; Icon := icText;
       End
       Else
+      Begin
         T := L('(vide)', '(empty)', '(leer)', '(vuoto)', '(vac'#161'o)');
+        Cmd := cmGray;
+      End;
   End;
 End;
 
@@ -6947,6 +7297,12 @@ Begin
         Else PaintIcon(Ic, TX, YY + 2, 16);
       End;
       If M = mnStart Then OutTxt(TX + 32, YY + 8, T, Fg)
+      Else If Cmd = cmGray Then
+      Begin
+        { element indisponible : grave, comme Windows 95 }
+        If I <> Wnds[W].K2 Then OutTxt(TX + 23, YY + 3, T, cWhite);
+        OutTxt(TX + 22, YY + 2, T, cGray);
+      End
       Else OutTxt(TX + 22, YY + 2, T, Fg);
       If Sub <> 0 Then Arrow(X + WW - 14, YY + IH Div 2 - 3, 0, Fg);
       YY := YY + IH;
@@ -6996,7 +7352,7 @@ Begin
   End;
   If Msg = WM_LBUTTONUP Then
   Begin
-    If Sub <> 0 Then Exit;
+    If (Sub <> 0) Or (Cmd = cmGray) Then Exit;
     CloseMenus(0);
     If Cmd <> cmNone Then KCommand(Cmd);
   End;
@@ -7137,8 +7493,21 @@ Begin
     If Wnds[I].Used And (Wnds[I].IKind = ikExplorer) Then KRepaint(I);
 End;
 
+Procedure DoShutdown(Mode : LongInt); Forward;
+
 Procedure MsgBoxEnd(W, Res : LongInt);
 Begin
+  If (W = RebootAskW) And (RebootAskW >= 0) Then
+  Begin
+    RebootAskW := -1;
+    If Res = IDYES Then
+    Begin
+      Wnds[W].K1 := Res;
+      Wnds[W].DlgEnded := True;
+      ShowW(W, False, False);
+      DoShutdown(1);
+    End;
+  End;
   If (W = FmtAskW) And (FmtAskW >= 0) Then
   Begin
     FmtAskW := -1;
@@ -7746,8 +8115,6 @@ Begin
   End;
 End;
 
-Procedure DoShutdown(Mode : LongInt); Forward;
-
 Procedure DialogAction(W, B : LongInt);
 Var S : String; K : LongInt;
 Begin
@@ -7908,10 +8275,461 @@ End;
 { Commandes et procedure des fenetres internes                       }
 { ------------------------------------------------------------------ }
 
+{ ------------------------------------------------------------------ }
+{ Affichage : nombre de couleurs et zone d'ecran (modes VESA)         }
+{ ------------------------------------------------------------------ }
+{ IO.SYS choisit le mode au demarrage d'apres la preference du CMOS
+  (7Ah bits par point, 7Bh signature 5Ah, 7Ch largeur / 8, 7Dh hauteur
+  / 8). Avec l'interface VBE de Bochs/QEMU/VirtualBox (ports 1CEh/1CFh,
+  dite DISPI), le mode change tout de suite, sans redemarrer ; sinon,
+  comme Windows 95 pour le nombre de couleurs, le nouveau mode prend
+  effet au redemarrage. L'ecran reste compose en 256 couleurs (palette
+  systeme) et converti vers la profondeur de la memoire video. }
+
+Procedure DispiW(Idx, V : LongInt);
+Begin
+  PortW[$1CE] := Idx;
+  PortW[$1CF] := V;
+End;
+
+Function DispiR(Idx : LongInt) : LongInt;
+Begin
+  PortW[$1CE] := Idx;
+  DispiR := PortW[$1CF];
+End;
+
+Procedure DispiDetect;
+Var V : LongInt;
+Begin
+  V := DispiR(0);
+  DispiOk := (V >= $B0C0) And (V <= $B0CF);
+  If DispiOk Then KLog('Ecran : interface VBE DISPI ' + HexStr(V, 4));
+End;
+
+{ Mode W x H en B bits par point, memoire lineaire (DISPI) }
+Function DispiSet(W, H, B : LongInt) : Boolean;
+Begin
+  DispiW(4, 0);
+  DispiW(1, W); DispiW(2, H); DispiW(3, B);
+  DispiW(5, 0);
+  DispiW(6, W); DispiW(7, H);
+  DispiW(8, 0); DispiW(9, 0);
+  DispiW(4, $41);
+  DispiSet := (DispiR(1) = W) And (DispiR(2) = H) And (DispiR(3) = B);
+End;
+
+{ Indice du mode VESA W x H x B dans la table d'IO.SYS (-1) }
+Function VmFind(W, H, B : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  VmFind := -1;
+  For I := 0 To VmN - 1 Do
+    If (VmW[I] = W) And (VmH[I] = H) And (VmBpp[I] = B) Then
+    Begin
+      VmFind := I;
+      Exit;
+    End;
+End;
+
+{ Passer au mode I de la table, sans redemarrer : nouvel ecran, barre
+  des taches et fenetres agrandies a la nouvelle taille, fenetres
+  ramenees dans l'ecran, WM_DISPLAYCHANGE aux programmes }
+Function KSetMode(I : LongInt) : Boolean;
+Var W, X, Y : LongInt;
+Begin
+  KSetMode := False;
+  If (I < 0) Or (I >= VmN) Or Not DispiOk Then Exit;
+  If Not DispiSet(VmW[I], VmH[I], VmBpp[I]) Then Exit;
+  CurShownB := False;
+  ScrW := VmW[I]; ScrH := VmH[I]; ScrBpp := VmBpp[I];
+  ScrBytes := (ScrBpp + 7) Div 8;
+  TaskY := ScrH - TaskH;
+  ScrMode := VmNum[I];
+  VideoMasks(LongInt(@VmMask) + I * 6);
+  VgaPlanar := False;
+  LfbPitch := ScrW * ScrBytes;
+  If VmLfb[I] <> 0 Then Lfb := VmLfb[I];
+  SurfFree(Back);
+  SurfNew(Back, ScrW, ScrH);
+  FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
+  DacAll;
+  OutPalChanged := False;
+  DDCleared := False;
+  If TaskbarW >= 0 Then MoveW(TaskbarW, 0, TaskY, ScrW, TaskH, True);
+  For W := 0 To MaxWnd - 1 Do
+    If Wnds[W].Used And Not IsChildW(W) And (W <> TaskbarW) Then
+    Begin
+      If Wnds[W].Max Then
+        MoveW(W, -Wnds[W].CL, -Wnds[W].CL, ScrW + 2 * Wnds[W].CL,
+              TaskY + 2 * Wnds[W].CL, True)
+      Else
+      Begin
+        X := Wnds[W].X; Y := Wnds[W].Y;
+        If X + 60 > ScrW Then X := Max(0, ScrW - Wnds[W].W);
+        If Y + 30 > TaskY Then Y := Max(0, TaskY - Wnds[W].H);
+        If (X <> Wnds[W].X) Or (Y <> Wnds[W].Y) Then
+          MoveW(W, X, Y, Wnds[W].W, Wnds[W].H, True);
+      End;
+      If Wnds[W].IKind = ikNone Then
+        PostMsgW(W, $7E, 8, (ScrH Shl 16) Or ScrW);  { WM_DISPLAYCHANGE }
+    End;
+  If CurX >= ScrW Then CurX := ScrW - 1;
+  If CurY >= ScrH Then CurY := ScrH - 1;
+  TaskbarChanged;
+  MarkAll;
+  KLog('Ecran : ' + IntStr(ScrW) + 'x' + IntStr(ScrH) + 'x' +
+       IntStr(ScrBpp) + ' (mode ' + HexStr(ScrMode, 3) + ')');
+  KSetMode := True;
+End;
+
+Function DispCurBpp : LongInt;
+Begin
+  If VgaPlanar Then DispCurBpp := 4 Else DispCurBpp := ScrBpp;
+End;
+
+{ Rectangles de la boite (coordonnees ecran) }
+Procedure DispRects(W : LongInt; Var CX, GY, GX1, GX2, SX1, SX2 : LongInt);
+Var X1, Y1, X2, Y2 : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  CX := (X1 + X2) Div 2;
+  GY := Y1 + 196;
+  GX1 := X1 + 16; GX2 := CX + 30;
+  SX1 := CX + 66; SX2 := X2 - 32;
+End;
+
+{ Couleur de l'arc-en-ciel a la position T (0..255) }
+Function SpectrumIdx(T : LongInt; Q : Boolean) : LongInt;
+Var R, G, B, S, F : LongInt;
+Begin
+  S := (T * 6) Div 256; F := ((T * 6) Mod 256);
+  Case S Of
+    0 : Begin R := 255; G := F; B := 0 End;
+    1 : Begin R := 255 - F; G := 255; B := 0 End;
+    2 : Begin R := 0; G := 255; B := F End;
+    3 : Begin R := 0; G := 255 - F; B := 255 End;
+    4 : Begin R := F; G := 0; B := 255 End;
+  Else
+    Begin R := 255; G := 0; B := 255 - F End;
+  End;
+  If Q Then
+  Begin
+    { 16 couleurs : composantes 0, 128 ou 255 }
+    If R > 170 Then R := 255 Else If R > 64 Then R := 128 Else R := 0;
+    If G > 170 Then G := 255 Else If G > 64 Then G := 128 Else G := 0;
+    If B > 170 Then B := 255 Else If B > 64 Then B := 128 Else B := 0;
+  End;
+  SpectrumIdx := NearestIdx(R, G, B);
+End;
+
+Procedure PaintDisplay(W : LongInt);
+Var X1, Y1, X2, Y2, CX, MY, GY, GX1, GX2, SX1, SX2, I, PX, BX1, BY1,
+    BX2, BY2 : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  DispRects(W, CX, GY, GX1, GX2, SX1, SX2);
+  { onglet Parametres et son panneau }
+  Edge(X1 + 6, Y2 - 40, X2 - 6, Y2 - 40, cSilver, cBlack);
+  Edge(X1 + 6, Y1 + 26, X2 - 6, Y2 - 40, cWhite, cBlack);
+  Edge(X1 + 7, Y1 + 27, X2 - 7, Y2 - 41, cSilver, cGray);
+  FBar(X1 + 8, Y1 + 6, X1 + 108, Y1 + 27, cSilver);
+  HLine(X1 + 8, X1 + 106, Y1 + 5, cWhite);
+  VLine(X1 + 6, Y1 + 7, Y1 + 26, cWhite);
+  VLine(X1 + 107, Y1 + 7, Y1 + 26, cBlack);
+  VLine(X1 + 106, Y1 + 7, Y1 + 26, cGray);
+  OutTxt(X1 + 18, Y1 + 9, L('Param'#138'tres', 'Settings', 'Einstellungen',
+         'Impostazioni', 'Configuraci'#162'n'), cBlack);
+  { moniteur }
+  MY := Y1 + 40;
+  Edge(CX - 86, MY, CX + 86, MY + 124, cWhite, cBlack);
+  FBar(CX - 85, MY + 1, CX + 85, MY + 123, cSilver);
+  Sunken(CX - 74, MY + 10, CX + 74, MY + 112, DeskColor);
+  FBar(CX - 72, MY + 102, CX + 72, MY + 110, cSilver);
+  FBar(CX - 70, MY + 104, CX - 56, MY + 108, cGray);
+  FBar(CX - 34, MY + 30, CX + 40, MY + 84, cSilver);
+  Edge(CX - 34, MY + 30, CX + 40, MY + 84, cWhite, cBlack);
+  FBar(CX - 32, MY + 32, CX + 38, MY + 39, cNavy);
+  FBar(CX - 30, MY + 42, CX + 36, MY + 82, cWhite);
+  Edge(CX - 30, MY + 125, CX + 30, MY + 133, cWhite, cBlack);
+  Edge(CX - 54, MY + 134, CX + 54, MY + 140, cWhite, cBlack);
+  { palette de couleurs }
+  GroupBox(GX1, GY, GX2, GY + 104, L('Palette de couleurs', 'Color palette',
+           'Farbpalette', 'Tavolozza dei colori', 'Paleta de colores'));
+  Sunken(GX1 + 10, GY + 20, GX2 - 10, GY + 43, cWhite);
+  OutTxt(GX1 + 15, GY + 24, DepthName(Wnds[W].K1), cBlack);
+  Raised(GX2 - 28, GY + 22, GX2 - 12, GY + 41, False);
+  Arrow(GX2 - 23, GY + 30, 1, cBlack);
+  Sunken(GX1 + 10, GY + 56, GX2 - 10, GY + 76, cWhite);
+  For I := GX1 + 12 To GX2 - 12 Do
+    VLine(I, GY + 58, GY + 74,
+          SpectrumIdx(((I - GX1 - 12) * 255) Div Max(1, GX2 - GX1 - 24),
+                      Wnds[W].K1 = 4));
+  { zone d'ecran }
+  GroupBox(CX + 42, GY, X2 - 16, GY + 104, L('Zone d'''#130'cran',
+           'Desktop area', 'Desktop-Bereich', 'Area dello schermo',
+           #160'rea de la pantalla'));
+  OutTxt(CX + 54, GY + 20, L('Moins', 'Less', 'Weniger', 'Meno', 'Menos'),
+         cBlack);
+  T := L('Plus', 'More', 'Mehr', 'Pi'#151, 'M'#160's');
+  OutTxt(X2 - 28 - TextW(T), GY + 20, T, cBlack);
+  Sunken(SX1, GY + 46, SX2, GY + 50, cSilver);
+  If ResN > 1 Then
+    PX := SX1 + (Wnds[W].K2 * (SX2 - SX1)) Div (ResN - 1)
+  Else PX := SX1;
+  Raised(PX - 5, GY + 38, PX + 5, GY + 60, False);
+  T := IntStr(ResW[Wnds[W].K2]) + L(' par ', ' by ', ' x ', ' x ', ' por ') +
+       IntStr(ResH[Wnds[W].K2]) + L(' pixels', ' pixels', ' Pixel',
+       ' pixel', ' p'#161'xeles');
+  OutCenter(CX + 42, X2 - 16, GY + 72, T, cBlack);
+  { boutons }
+  For I := 0 To 2 Do
+  Begin
+    DlgBtnRect(W, I, 3, BX1, BY1, BX2, BY2);
+    Case I Of
+      0 : T := TxtOk;
+      1 : T := TxtCancel;
+    Else
+      T := L('Appliquer', 'Apply', #154'bernehmen', 'Applica', 'Aplicar');
+    End;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+Procedure DispOpen;
+Var I, X, Y : LongInt;
+Begin
+  If (DispW >= 0) And Wnds[DispW].Used And
+     (Wnds[DispW].IKind = ikDisplay) Then
+  Begin
+    ActivateW(DispW);
+    Exit;
+  End;
+  DispDepths;
+  X := Max(0, (ScrW - 460) Div 2); Y := Max(0, (TaskY - 384) Div 2);
+  DispW := KCreate(ikDisplay, L('Propri'#130't'#130's de Affichage',
+                   'Display Properties', 'Eigenschaften von Anzeige',
+                   'Propriet'#133' - Schermo', 'Propiedades de Pantalla'),
+                   icDisplay, X, Y, 460, 384,
+                   WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+  If DispW < 0 Then Exit;
+  Wnds[DispW].K1 := DispCurBpp;
+  DispRes(Wnds[DispW].K1);
+  Wnds[DispW].K2 := 0;
+  For I := 0 To ResN - 1 Do
+    If (ResW[I] = ScrW) And (ResH[I] = ScrH) Then Wnds[DispW].K2 := I;
+  Wnds[DispW].K3 := 0;
+  ShowW(DispW, True, True);
+End;
+
+{ Nouvelle profondeur choisie : garder la zone d'ecran si possible }
+Procedure DispSetDepth(B : LongInt);
+Var I, OW, OH, K : LongInt;
+Begin
+  If (DispW < 0) Or Not Wnds[DispW].Used Then Exit;
+  DispRes(Wnds[DispW].K1);
+  OW := ResW[Wnds[DispW].K2]; OH := ResH[Wnds[DispW].K2];
+  Wnds[DispW].K1 := B;
+  DispRes(B);
+  K := 0;
+  For I := 0 To ResN - 1 Do
+    If ResW[I] * ResH[I] <= OW * OH Then K := I;
+  Wnds[DispW].K2 := K;
+  KRepaint(DispW);
+End;
+
+{ Appliquer : changement immediat (DISPI) ou au redemarrage }
+Procedure DispApply(W : LongInt);
+Var B, RW, RH, I : LongInt;
+Begin
+  B := Wnds[W].K1;
+  DispRes(B);
+  RW := ResW[Wnds[W].K2]; RH := ResH[Wnds[W].K2];
+  If (B = DispCurBpp) And (RW = ScrW) And (RH = ScrH) Then Exit;
+  CmosWrite($7A, B);
+  CmosWrite($7C, RW Div 8);
+  CmosWrite($7D, RH Div 8);
+  CmosWrite($7B, $5A);
+  I := VmFind(RW, RH, B);
+  If (B <> 4) And KSetMode(I) Then
+  Begin
+    { la boite reste centree dans le nouvel ecran }
+    MoveW(W, Max(0, (ScrW - Wnds[W].W) Div 2),
+          Max(0, (TaskY - Wnds[W].H) Div 2), Wnds[W].W, Wnds[W].H, True);
+    Exit;
+  End;
+  RebootAskW := MsgBoxOpen(L('Modification des param'#138'tres syst'#138'me',
+    'System Settings Change', 'Ge'#132'nderte Systemeinstellungen',
+    'Modifica impostazioni di sistema',
+    'Cambio de configuraci'#162'n del sistema'),
+    L('Vous devez red'#130'marrer l''ordinateur pour que les nouveaux ' +
+      'param'#138'tres prennent effet.|Voulez-vous red'#130'marrer ' +
+      'maintenant ?',
+      'You must restart your computer before the new settings will ' +
+      'take effect.|Do you want to restart your computer now?',
+      'Die neuen Einstellungen werden erst nach einem Neustart ' +
+      'wirksam.|Jetzt neu starten?',
+      'Le nuove impostazioni avranno effetto al riavvio.|' +
+      'Riavviare il computer adesso?',
+      'Debe reiniciar el equipo para que la nueva configuraci'#162'n ' +
+      'tenga efecto.|'#168'Desea reiniciar ahora?'), $24);
+End;
+
+Procedure DispAction(W, B : LongInt);
+Begin
+  Case B Of
+    0 :
+    Begin
+      DestroyW(W);
+      DispW := -1;
+      DispApply(W);
+    End;
+    1 :
+    Begin
+      DestroyW(W);
+      DispW := -1;
+    End;
+  Else
+    DispApply(W);
+    KRepaint(W);
+  End;
+End;
+
+Procedure DispSlide(W, X : LongInt);
+Var CX, GY, GX1, GX2, SX1, SX2, K : LongInt;
+Begin
+  DispRects(W, CX, GY, GX1, GX2, SX1, SX2);
+  If ResN <= 1 Then K := 0
+  Else K := ((X - SX1) * (ResN - 1) + (SX2 - SX1) Div 2) Div (SX2 - SX1);
+  If K < 0 Then K := 0;
+  If K > ResN - 1 Then K := ResN - 1;
+  If K <> Wnds[W].K2 Then
+  Begin
+    Wnds[W].K2 := K;
+    KRepaint(W);
+  End;
+End;
+
+Procedure DisplayMouse(W, Msg, X, Y : LongInt);
+Var I, CX, GY, GX1, GX2, SX1, SX2, BX1, BY1, BX2, BY2 : LongInt;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  DispRects(W, CX, GY, GX1, GX2, SX1, SX2);
+  DispRes(Wnds[W].K1);
+  If Wnds[W].K3 = 1 Then
+  Begin
+    { curseur de la zone d'ecran tire a la souris }
+    DispSlide(W, X);
+    If Msg = WM_LBUTTONUP Then
+    Begin
+      Wnds[W].K3 := 0;
+      CaptureWin := -1;
+    End;
+    Exit;
+  End;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    If InRect(X, Y, GX1 + 10, GY + 20, GX2 - 10, GY + 43) Then
+    Begin
+      DispDepths;
+      OpenMenu(0, mnColors, GX1 + 10, GY + 44, False);
+      Exit;
+    End;
+    If InRect(X, Y, SX1 - 8, GY + 34, SX2 + 8, GY + 64) Then
+    Begin
+      Wnds[W].K3 := 1;
+      CaptureWin := W;
+      DispSlide(W, X);
+      Exit;
+    End;
+  End;
+  For I := 0 To 2 Do
+  Begin
+    DlgBtnRect(W, I, 3, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        DispAction(W, I);
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure DisplayKey(W, VK : LongInt);
+Begin
+  DispRes(Wnds[W].K1);
+  If VK = $0D Then DispAction(W, 0)
+  Else If VK = $1B Then DispAction(W, 1)
+  Else If (VK = $25) And (Wnds[W].K2 > 0) Then
+  Begin
+    Dec(Wnds[W].K2);
+    KRepaint(W);
+  End
+  Else If (VK = $27) And (Wnds[W].K2 < ResN - 1) Then
+  Begin
+    Inc(Wnds[W].K2);
+    KRepaint(W);
+  End;
+End;
+
+{ Reorganiser les icones du bureau (Poste de travail et Corbeille
+  restent en tete, comme sous Windows 95) : par nom ou par type }
+Procedure DeskArrange(ByType : Boolean);
+Var I, J, K : LongInt; N, P : String; Swap : Boolean;
+Begin
+  For I := 2 To DeskCnt - 2 Do
+    For J := 2 To DeskCnt - 2 - (I - 2) Do
+    Begin
+      If ByType And (DeskIco[J] <> DeskIco[J + 1]) Then
+        Swap := DeskIco[J] > DeskIco[J + 1]
+      Else Swap := UpStr(DeskName[J]) > UpStr(DeskName[J + 1]);
+      If Swap Then
+      Begin
+        N := DeskName[J]; DeskName[J] := DeskName[J + 1];
+        DeskName[J + 1] := N;
+        P := DeskPath[J]; DeskPath[J] := DeskPath[J + 1];
+        DeskPath[J + 1] := P;
+        K := DeskIco[J]; DeskIco[J] := DeskIco[J + 1]; DeskIco[J + 1] := K;
+        K := DeskCmd[J]; DeskCmd[J] := DeskCmd[J + 1]; DeskCmd[J + 1] := K;
+      End;
+    End;
+  DeskSel := -1;
+  MarkAll;
+End;
+
 Procedure KCommand(Cmd : LongInt);
 Var W : LongInt; Nm : String;
 Begin
+  If (Cmd >= cmColorBase) And (Cmd < cmColorBase + 64) Then
+  Begin
+    DispSetDepth(Cmd - cmColorBase);
+    Exit;
+  End;
   Case Cmd Of
+    cmDisplay : DispOpen;
+    cmAlign : MarkAll;
+    cmArrName : DeskArrange(False);
+    cmArrType : DeskArrange(True);
+    cmIconOpen : If DeskSel >= 0 Then KCommand(DeskCmd[DeskSel]);
     cmComputer, cmExplorer :
     Begin
       W := KCreate(ikExplorer, '', icComputer, 60 + Ticks Mod 40,
@@ -8005,6 +8823,21 @@ Begin
     If (Msg <> WM_LBUTTONDOWN) And (Msg <> WM_RBUTTONDOWN) Then Exit;
     If MenuDepth > 0 Then CloseMenus(0);
     I := DeskHit(X, Y);
+    If Msg = WM_RBUTTONDOWN Then
+    Begin
+      { menu contextuel du bureau ou de l'icone }
+      If I <> DeskSel Then
+      Begin
+        DeskRedraw(DeskSel);
+        DeskSel := I;
+        DeskRedraw(I);
+      End;
+      ActivateW(-1);
+      LastClickW := -1;
+      If I >= 0 Then OpenMenu(0, mnIcon, X, Y, False)
+      Else OpenMenu(0, mnDesk, X, Y, False);
+      Exit;
+    End;
     If (I >= 0) And (I = LastClickW - 10000) And (Ticks - LastClickT < 700)
     Then
     Begin
@@ -8030,6 +8863,7 @@ Begin
     ikMsgBox : MsgBoxMouse(W, Msg, X, Y);
     ikExplorer : ExpMouse(W, Msg, X, Y);
     ikAbout, ikRun, ikShutdown : DialogMouse(W, Msg, X, Y);
+    ikDisplay : DisplayMouse(W, Msg, X, Y);
   End;
 End;
 
@@ -8442,6 +9276,7 @@ Begin
         KRepaint(W);
       End;
     ikAbout : If (VK = $0D) Or (VK = $1B) Then DestroyW(W);
+    ikDisplay : DisplayKey(W, VK);
     ikNotepad : NoteKey(W, VK, Ch);
     ikConsole : ConKeyIn(VK, Ch);
     ikExplorer :
@@ -8482,6 +9317,7 @@ Begin
     ikMsgBox : PaintMsgBox(W);
     ikExplorer : PaintExplorer(W);
     ikAbout, ikRun, ikShutdown : PaintDialog(W);
+    ikDisplay : PaintDisplay(W);
     ikHelp : PaintHelp(W);
     ikNotepad : PaintNotepad(W);
     ikConsole : PaintConsole(W);
@@ -24929,14 +25765,20 @@ Begin
   If (Caps And $200) <> 0 Then
   Begin
     { surface primaire : l'ecran }
-    If DDBuf = 0 Then DDBuf := KAlloc(ScrW * ScrH + 16);
-    FillMem(DDBuf, ScrW * ScrH, 0);
+    If DDBufSz < DDW * DDH Then
+    Begin
+      If DDBuf <> 0 Then KFree(DDBuf);
+      DDBufSz := DDW * DDH;
+      DDBuf := KAlloc(DDBufSz + 16);
+    End;
+    FillMem(DDBuf, DDW * DDH, 0);
     S := SurfMake(DDW, DDH, Caps Or $20 Or $4000, DDBuf);
     DDPrimary := S;
     If (DDCoopFl And $11) = $11 Then
     Begin
       DDShow := True;
       DDDirty := True;
+      DDCleared := False;
     End;
     N := 0;
     If (Fl And $20) <> 0 Then N := MemL[0:PDesc + 20];
@@ -28708,6 +29550,7 @@ Begin
   KClass[ikMsgBox] := ClassAdd('#MsgBox', 0, ikMsgBox, 0);
   KClass[ikAbout] := ClassAdd('#About', 0, ikAbout, 0);
   KClass[ikRun] := ClassAdd('#Run', 0, ikRun, 0);
+  KClass[ikDisplay] := ClassAdd('#Display', 0, ikDisplay, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
@@ -28724,6 +29567,65 @@ End;
 
 
 { Boucle de la tache 0 : peripheriques, fenetres internes, ecran }
+{ Composantes R, V, B du mode courant (couleurs directes) }
+Procedure VideoMasks(A : LongInt);
+Begin
+  RMs := Mem[0:A]; RPs := Mem[0:A + 1];
+  GMs := Mem[0:A + 2]; GPs := Mem[0:A + 3];
+  BMs := Mem[0:A + 4]; BPs := Mem[0:A + 5];
+  If (ScrBpp > 8) And (RMs = 0) Then
+  Begin
+    { BIOS VBE 1.x sans composantes : valeurs usuelles }
+    Case ScrBpp Of
+      15 : Begin RMs := 5; RPs := 10; GMs := 5; GPs := 5; BMs := 5; End;
+      16 : Begin RMs := 5; RPs := 11; GMs := 6; GPs := 5; BMs := 5; End;
+    Else
+      Begin RMs := 8; RPs := 16; GMs := 8; GPs := 8; BMs := 8; End;
+    End;
+    BPs := 0;
+  End;
+End;
+
+{ Mode d'ecran prepare par IO.SYS (bloc 0000:0500) et table des modes
+  VESA disponibles (0000:0600) }
+Procedure VideoFromBoot;
+Var I, A : LongInt;
+Begin
+  Lfb := MemL[0:BootInfo + $0C];
+  LfbPitch := MemW[0:BootInfo + $10];
+  ScrW := MemW[0:BootInfo + $12];
+  ScrH := MemW[0:BootInfo + $14];
+  ScrBpp := MemW[0:BootInfo + $16];
+  If (ScrW < 640) Or (ScrH < 480) Then
+  Begin
+    ScrW := 640; ScrH := 480;
+  End;
+  If ScrBpp = 0 Then ScrBpp := 8;
+  ScrBytes := (ScrBpp + 7) Div 8;
+  If ScrBytes < 1 Then ScrBytes := 1;
+  TaskY := ScrH - TaskH;
+  ScrMode := MemW[0:BootInfo + $38];
+  VideoMasks(BootInfo + $3A);
+  VgaPlanar := ScrBpp = 4;
+  If VgaPlanar Then VgaInit;
+  If VgaPlanar Then
+    KLog('Ecran : 640x480, VGA 16 couleurs')
+  Else
+    KLog('Ecran : ' + IntStr(ScrW) + 'x' + IntStr(ScrH) + 'x' +
+         IntStr(ScrBpp) + ' (mode VESA ' + HexStr(ScrMode, 3) + ')');
+  VmN := MemW[0:BootInfo + $34];
+  If VmN > MaxVm Then VmN := MaxVm;
+  For I := 0 To VmN - 1 Do
+  Begin
+    A := MemW[0:BootInfo + $36] + I * 20;
+    VmNum[I] := MemW[0:A]; VmW[I] := MemW[0:A + 2];
+    VmH[I] := MemW[0:A + 4]; VmBpp[I] := Mem[0:A + 6];
+    VmPitch[I] := MemW[0:A + 8];
+    MoveMem(A + 10, LongInt(@VmMask) + I * 6, 6);
+    VmLfb[I] := MemL[0:A + 16];
+  End;
+End;
+
 Procedure SystemLoop;
 Var I : LongInt; Busy : Boolean;
 Begin
@@ -28777,10 +29679,9 @@ BEGIN
     Language := _French;
   End;
   OptFlags := MemL[0:BootInfo + $30];
-  Lfb := MemL[0:BootInfo + $0C];
-  LfbPitch := MemW[0:BootInfo + $10];
-  VgaPlanar := MemW[0:BootInfo + $16] = 4;
-  If VgaPlanar Then VgaInit;
+  VideoFromBoot;
+  DispiDetect;
+  DispW := -1; RebootAskW := -1;
   ThreadInit0;
   KImgLo := $100000;
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
