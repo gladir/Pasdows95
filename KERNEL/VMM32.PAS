@@ -3689,7 +3689,20 @@ End;
 
 { Ouvrir en lecture (l'ecriture s'ajoute dans NtOpenW) }
 Function NtOpenR(V, F : LongInt) : Boolean;
+Var Own : LongInt;
 Begin
+  { table des runs : a la premiere ouverture NTFS de cette entree }
+  If FoRA[F] = 0 Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    FoRA[F] := KAlloc(NtMaxRuns * 12);
+    HeapOwner := Own;
+    If FoRA[F] = 0 Then
+    Begin
+      NtOpenR := False;
+      Exit;
+    End;
+  End;
   FoVol[F] := V; FoClus[F] := FfClus; FoDir[F] := FfDirClus;
   FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoCIdx[F] := -1;
   FoDirty[F] := False;
@@ -5195,7 +5208,7 @@ Begin
   NgCap := 65536; NgBuf := KAlloc(NgCap);
   NgOffCap := 4096; NgOff := KAlloc(NgOffCap);
   NdBuf := 0; NdCap := 0; NdVol := -1; NdPathVol := -1;
-  For I := 0 To MaxFo - 1 Do FoRA[I] := KAlloc(NtMaxRuns * 12);
+  For I := 0 To MaxFo - 1 Do FoRA[I] := 0;
   HeapOwner := HO;
   DcVol := -1;
   DiskN := 0; VolN := 0;
