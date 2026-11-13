@@ -66,6 +66,7 @@ Const
   Com1        = $3F8;
   KStackTop   = $00090000;
   HeapBase    = $01000000;      { tas : de 16 Mo a la fin de la memoire }
+                                { (debut reel : ExeTop, voir plus bas) }
 
   SelCode     = $08;
   SelData     = $10;
@@ -143,6 +144,7 @@ Var
   Language   : TLanguage;
   BootDrive  : LongInt;
   MemTop     : LongInt;
+  ExeTop     : LongInt;   { fin de la zone des images de programmes }
   SerialOk   : Boolean;
   LogOn      : Boolean;
   ApiTrace   : Boolean;          { journal des appels d API (serie) }
@@ -3244,7 +3246,7 @@ Var
   VgaPlanar : Boolean;
   VgaMapChanged : Boolean;
   VgaMap    : Array[0..255] Of Byte;     { indice -> couleur VGA 0..15 }
-  VgaP0, VgaP1, VgaP2, VgaP3 : Array[0..79] Of Byte;
+  VgaP      : Array[0..319] Of Byte;     { 4 plans de 80 octets }
   VgaTmp    : Array[0..47] Of Byte;
   { VgaTab[K * 256 + I] : bits des 4 plans (un octet par plan) du pixel
     d'indice I en position K (0 = bit 7) d'un octet ; refaite quand
@@ -3368,33 +3370,83 @@ End;
 { Ecrire la ligne Y, octets B0..B1 (pixels B0*8..B1*8+7), depuis Src :
   pixels 8 bits a partir de B0*8 }
 Procedure VgaWriteRow(Y, B0, B1, Src : LongInt);
-Var B, V, S, A : LongInt;
+Var N, TabA, PA, A : LongInt;
 Begin
   If B0 < 0 Then B0 := 0;
   If B1 > 79 Then B1 := 79;
   If (B0 > B1) Or (Y < 0) Or (Y >= ScrH) Then Exit;
   If Not VgaTabOk Then VgaTabBuild;
-  S := Src;
-  For B := B0 To B1 Do
-  Begin
-    V := VgaTab[Mem[0:S]] Or VgaTab[256 + Mem[0:S + 1]] Or
-         VgaTab[512 + Mem[0:S + 2]] Or VgaTab[768 + Mem[0:S + 3]] Or
-         VgaTab[1024 + Mem[0:S + 4]] Or VgaTab[1280 + Mem[0:S + 5]] Or
-         VgaTab[1536 + Mem[0:S + 6]] Or VgaTab[1792 + Mem[0:S + 7]];
-    VgaP0[B] := V And 255; VgaP1[B] := (V Shr 8) And 255;
-    VgaP2[B] := (V Shr 16) And 255; VgaP3[B] := (V Shr 24) And 255;
-    S := S + 8;
-  End;
-  A := Lfb + Y * LfbPitch;
+  N := B1 - B0 + 1;
+  TabA := LongInt(@VgaTab);
+  PA := LongInt(@VgaP);
+  { 8 pixels -> 4 octets de plans : 8 consultations de VgaTab (une table
+    de 1024 octets par position), en assembleur - la version Pascal
+    coutait environ 250 instructions par octet, ce qui laissait l'ecran
+    noir de longues secondes au demarrage }
+  asm
+    push esi
+    push edi
+    push ebx
+    mov esi,Src
+    mov edi,PA
+    mov ecx,N
+    mov ebx,TabA
+  @lp:
+    movzx eax,byte ptr [esi]
+    shl eax,2
+    add eax,ebx
+    mov edx,[eax]
+    movzx eax,byte ptr [esi+1]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+1024]
+    movzx eax,byte ptr [esi+2]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+2048]
+    movzx eax,byte ptr [esi+3]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+3072]
+    movzx eax,byte ptr [esi+4]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+4096]
+    movzx eax,byte ptr [esi+5]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+5120]
+    movzx eax,byte ptr [esi+6]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+6144]
+    movzx eax,byte ptr [esi+7]
+    shl eax,2
+    add eax,ebx
+    or edx,[eax+7168]
+    mov [edi],dl
+    mov [edi+80],dh
+    shr edx,16
+    mov [edi+160],dl
+    mov [edi+240],dh
+    add esi,8
+    inc edi
+    dec ecx
+    jnz @lp
+    pop ebx
+    pop edi
+    pop esi
+  end;
+  A := Lfb + Y * LfbPitch + B0;
   Port[$3C4] := 2;
   Port[$3C5] := 1;
-  For B := B0 To B1 Do Mem[0:A + B] := VgaP0[B];
+  MoveMem(PA, A, N);
   Port[$3C5] := 2;
-  For B := B0 To B1 Do Mem[0:A + B] := VgaP1[B];
+  MoveMem(PA + 80, A, N);
   Port[$3C5] := 4;
-  For B := B0 To B1 Do Mem[0:A + B] := VgaP2[B];
+  MoveMem(PA + 160, A, N);
   Port[$3C5] := 8;
-  For B := B0 To B1 Do Mem[0:A + B] := VgaP3[B];
+  MoveMem(PA + 240, A, N);
   Port[$3C5] := $0F;
 End;
 
@@ -17407,7 +17459,7 @@ Begin
   ImgSize := MemL[0:Pe + 24 + 56];
   HdrSize := MemL[0:Pe + 24 + 60];
   { adresse de chargement }
-  If Not IsDll And (Base >= $00400000) And (Base + ImgSize <= HeapBase) Then
+  If Not IsDll And (Base >= $00400000) And (Base + ImgSize <= ExeTop) Then
     Load := Base
   Else
   Begin
@@ -27768,7 +27820,13 @@ BEGIN
   end;
   MemTop := $100000 + MemL[0:BootInfo + $18] * 1024;
   If MemTop > $40000000 Then MemTop := $40000000;
-  HeapInit(HeapBase, MemTop);
+  { Image du programme a son adresse preferee : de 4 Mo a ExeTop. Avec
+    moins de 32 Mo, 4 Mo lui suffisent et le tas commence a 8 Mo : il
+    commencait toujours a 16 Mo, et avec 16 Mo de memoire il ne restait
+    que 544 Ko libres - aucun programme ne pouvait demarrer. Une image
+    plus grande est chargee dans le tas (relocalisee), comme une DLL. }
+  If MemTop >= $02000000 Then ExeTop := HeapBase Else ExeTop := $00800000;
+  HeapInit(ExeTop, MemTop);
   Case Mem[0:BootInfo + 3] Mod 5 Of
     1 : Language := _English;
     2 : Language := _Germany;
