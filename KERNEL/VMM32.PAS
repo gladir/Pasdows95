@@ -1035,8 +1035,22 @@ Begin
   AtaDelay;
 End;
 
+Var
+  CdModel : String[40];                  { modele du lecteur de CD-ROM }
+
+{ Modele (mots 27 a 46 d'IDENTIFY, octets inverses), sans espaces de fin }
+Function AtaModelStr(A : LongInt) : String;
+Var S : String; I : LongInt;
+Begin
+  S := '';
+  For I := 27 To 46 Do
+    S := S + Chr(Mem[0:A + I * 2 + 1]) + Chr(Mem[0:A + I * 2]);
+  While (Length(S) > 0) And (S[Length(S)] = ' ') Do Delete(S, Length(S), 1);
+  AtaModelStr := S;
+End;
+
 Function AtaProbe(Base, Ctrl : LongInt; Slave : Boolean) : Boolean;
-Var St, I, X : LongInt;
+Var St, I, X : LongInt; Id : Array[0..255] Of Word;
 Begin
   AtaProbe := False;
   AtaBase := Base; AtaCtrl := Ctrl; AtaSlave := Slave;
@@ -1048,7 +1062,8 @@ Begin
   AtaDelay;
   St := AtaWaitBusy;
   If (St < 0) Or ((St And 1) <> 0) Or ((St And 8) = 0) Then Exit;
-  For I := 0 To 255 Do X := PortW[Base];
+  For I := 0 To 255 Do Id[I] := PortW[Base];
+  CdModel := AtaModelStr(LongInt(@Id));
   AtaProbe := True;
 End;
 
@@ -1601,6 +1616,7 @@ Var
   DiskN     : LongInt;
   DiskBase, DiskCtrl, DiskSecs : Array[0..MaxDisk - 1] Of LongInt;
   DiskSlave : Array[0..MaxDisk - 1] Of Boolean;
+  DiskModel : Array[0..MaxDisk - 1] Of String[40];
   VolN      : LongInt;
   VolDisk, VolStart, VolSecs, VolType, VolSpc, VolRsvd, VolNFats,
   VolFatSz, VolRootClus, VolRootSec, VolRootCnt, VolData, VolClus,
@@ -1772,6 +1788,7 @@ Begin
   DiskSlave[DiskN] := Slave;
   DiskSecs[DiskN] := MemL[0:A + 120];    { mots 60-61 : secteurs LBA28 }
   If DiskSecs[DiskN] <= 0 Then Exit;
+  DiskModel[DiskN] := AtaModelStr(A);
   Inc(DiskN);
   HdIdentify := True;
 End;
@@ -3261,7 +3278,9 @@ Const
   icShutdown = 17; icPaint    = 18; icInfo     = 19; icWarn     = 20;
   icError    = 21; icPrograms = 22; icDocs     = 23; icSettings = 24;
   icApp      = 25; icHardDisk = 26; icLogo     = 27; icExplorer = 28;
-  icQuestion = 29;
+  icQuestion = 29; icSpeaker  = 30; icMute     = 31; icSound    = 32;
+  icKeyboard = 33; icMouse    = 34; icNet      = 35; icPort     = 36;
+  icChip     = 37; icDiskCtl  = 38;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -4162,6 +4181,78 @@ Begin
       QR(17, 17, 24, 23, cGreen);
       QR(12, 19, 15, 25, cGreen);
       QC(16, 16, 13, cNavy);
+    End;
+    icSpeaker, icMute :
+    Begin
+      { haut-parleur et ondes ; sourdine : cercle barre rouge }
+      QR(5, 11, 11, 20, cGray);
+      QB(5, 11, 11, 20, cBlack);
+      For I := 0 To 7 Do QL(12 + I, 10 - I, 12 + I, 21 + I, cBlack);
+      For I := 0 To 6 Do QL(13 + I, 11 - I, 13 + I, 20 + I, cSilver);
+      If Id = icSpeaker Then
+      Begin
+        QL(23, 12, 25, 16, cBlack); QL(25, 16, 23, 20, cBlack);
+        QL(26, 8, 29, 16, cBlack); QL(29, 16, 26, 24, cBlack);
+      End
+      Else
+      Begin
+        QC(16, 16, 13, cRed); QC(16, 16, 12, cRed);
+        QL(7, 7, 25, 25, cRed); QL(8, 7, 26, 25, cRed);
+      End;
+    End;
+    icSound :
+    Begin
+      IFrame(2, 8, 29, 24, cGreen);
+      For I := 0 To 5 Do QR(5 + I * 4, 24, 6 + I * 4, 27, cYellow);
+      QR(5, 11, 13, 19, cBlack);
+      QD(22, 15, 4, cSilver); QC(22, 15, 4, cBlack);
+    End;
+    icKeyboard :
+    Begin
+      IFrame(1, 10, 30, 23, cSilver);
+      For I := 0 To 6 Do
+      Begin
+        QR(3 + I * 4, 12, 5 + I * 4, 13, cWhite);
+        QR(4 + I * 4, 15, 6 + I * 4, 16, cWhite);
+      End;
+      QR(7, 19, 24, 20, cWhite);
+    End;
+    icMouse :
+    Begin
+      QD(16, 18, 9, cSilver); QC(16, 18, 9, cBlack);
+      QL(16, 9, 16, 17, cBlack); QL(7, 17, 25, 17, cBlack);
+      QL(16, 9, 16, 2, cBlack); QL(16, 2, 22, 1, cBlack);
+    End;
+    icNet :
+    Begin
+      IFrame(3, 6, 28, 22, cGreen);
+      For I := 0 To 5 Do QR(6 + I * 4, 22, 7 + I * 4, 26, cYellow);
+      QR(6, 9, 13, 15, cBlack);
+      IFrame(18, 9, 25, 15, cSilver);
+    End;
+    icPort :
+    Begin
+      IFrame(4, 10, 27, 21, cSilver);
+      For I := 0 To 4 Do QD(8 + I * 4, 14, 1, cBlack);
+      For I := 0 To 3 Do QD(10 + I * 4, 18, 1, cBlack);
+    End;
+    icChip :
+    Begin
+      IFrame(7, 7, 24, 24, cBlack);
+      For I := 0 To 4 Do
+      Begin
+        QR(9 + I * 3, 4, 10 + I * 3, 6, cGray);
+        QR(9 + I * 3, 25, 10 + I * 3, 27, cGray);
+        QR(4, 9 + I * 3, 6, 10 + I * 3, cGray);
+        QR(25, 9 + I * 3, 27, 10 + I * 3, cGray);
+      End;
+    End;
+    icDiskCtl :
+    Begin
+      IFrame(2, 9, 29, 22, cSilver);
+      QR(5, 12, 26, 13, cGray);
+      QR(5, 17, 26, 18, cGray);
+      QR(23, 19, 25, 20, cGreen);
     End;
     icClock :
     Begin
@@ -5150,6 +5241,8 @@ Const
   ikNone = 0; ikTaskbar = 1; ikMenu = 2; ikExplorer = 3; ikMsgBox = 4;
   ikAbout = 5; ikRun = 6; ikShutdown = 7; ikHelp = 8; ikWelcome = 9;
   ikNotepad = 10; ikConsole = 11; ikDisplay = 12; ikDateTime = 13;
+  ikVolPop = 14; ikMixer = 15; ikAudio = 16; ikSysProps = 17;
+  ikDevProps = 18; ikFileDlg = 19; ikFind = 28;
   ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
   ikMdiClient = 27;
@@ -6189,7 +6282,7 @@ Var X, Y : LongInt;
 Begin
   ClientScreenOrg(W, X, Y);
   X := CurX - X; Y := CurY - Y;
-  If Wnds[W].IKind >= ikButton Then
+  If (Wnds[W].IKind >= ikButton) And (Wnds[W].IKind <= ikMdiClient) Then
   Begin
     If Wnds[W].IKind <> ikDialog Then
       KWndProc(W, Msg, MouseKeys, ((Y And $FFFF) Shl 16) Or (X And $FFFF));
@@ -6544,7 +6637,15 @@ Const
   cmRun = 5; cmAbout = 6; cmShutdown = 7; cmReadme = 8; cmRecycle = 9;
   cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
   cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
-  cmIconOpen = 18; cmDateTime = 19;
+  cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
+  cmSysProps = 22;
+  { Bloc-notes }
+  cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
+  cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
+  cmNSelAll = 40; cmNTime = 41; cmNFind = 42; cmNFindNext = 43;
+  cmNAbout = 44;
+  cmFdDrive = 600;                   { + lettre (0 = A) : boite Fichier }
+  cmFdType = 640;                    { + type de fichier }
   cmGray = 99;                       { element de menu grise }
   cmDocBase = 100; cmExeBase = 200;
   cmColorBase = 400;                 { + bits par point (Affichage) }
@@ -6553,7 +6654,9 @@ Const
   { menus contextuels : bureau, Reorganiser les icones, palette de
     couleurs (Affichage), icone du bureau }
   mnDesk = 5; mnArrange = 6; mnColors = 7; mnIcon = 8;
-  mnMonths = 9; mnTz = 10;
+  mnMonths = 9; mnTz = 10; mnVolCtx = 11;
+  mnNFile = 12; mnNEdit = 13; mnNSearch = 14; mnNHelp = 15;
+  mnFdDrives = 16; mnFdTypes = 17;
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -6606,6 +6709,29 @@ Var
   DtTz, DtSec : LongInt;
   DtDst : Boolean;
   TzCur : LongInt;                         { fuseau horaire du systeme }
+  TrayVol : Boolean;                       { icone de volume affichee }
+  { Bloc-notes : fichier, modifie, ancre de selection (-1), premiere
+    colonne affichee, annulation (copie du texte), recherche, question
+    d'enregistrement en cours et action qui suit }
+  NotePath : String;
+  NoteDirty, NoteGroup, NoteUndoOk, NoteCase : Boolean;
+  NoteSel, NoteLeft, NoteUndoBuf, NoteUndoLen, NoteUndoPos : LongInt;
+  NoteFind : String[63];
+  NoteAskW, NoteAskAct, NotePend, NoteMenuSel : LongInt;
+  { presse-papiers (texte, CR LF) }
+  ClipBuf, ClipLen : LongInt;
+  { boite Ouvrir / Enregistrer sous }
+  FdW, FdMode, FdOwner, FdN, FdSel, FdTop, FdFiltN, FdFiltI : LongInt;
+  FdDir, FdName, FdMask, FdResult, FdDefExt, FdTitle : String;
+  FdNm : Array[0..199] Of String[63];
+  FdIsDir : Array[0..199] Of Boolean;
+  FdFiltDesc : Array[0..7] Of String[63];
+  FdFiltPat : Array[0..7] Of String[31];
+  FdDone, FdOk : Boolean;
+  FdClickR, FdClickT : LongInt;
+  FindW : LongInt;
+  MixW0, AudW : LongInt;                   { Controle du volume, Audio }
+  TrayClickT : LongInt;                    { double-clic sur l'icone }
   TzDst : Boolean;
   DispiOk   : Boolean;                     { interface Bochs/QEMU (1CEh) }
   KClass    : Array[0..31] Of LongInt;     { classe interne par sorte }
@@ -6848,9 +6974,13 @@ Begin
   StartW := TextW(StartText) + 30;
 End;
 
+Function TrayVolOn : Boolean; Forward;
+
+{ Zone de notification : icone de volume (carte son) puis l'heure }
 Function TrayX : LongInt;
 Begin
-  TrayX := ScrW - 4 - (TextW(TimeStr) + 34);
+  If TrayVolOn Then TrayX := ScrW - 4 - (TextW(TimeStr) + 34)
+  Else TrayX := ScrW - 4 - (TextW(TimeStr) + 14);
 End;
 
 Function TaskCount : LongInt;
@@ -6920,8 +7050,13 @@ Begin
   End;
   X1 := TrayX;
   Edge(X1, TaskY + 4, ScrW - 4, TaskY + 25, cGray, cWhite);
-  PaintIcon(icDisplay, X1 + 4, TaskY + 7, 16);
-  OutTxt(X1 + 26, TaskY + 7, TimeStr, cBlack);
+  If TrayVolOn Then
+  Begin
+    If MixMute[0] Then PaintIcon(icMute, X1 + 4, TaskY + 7, 16)
+    Else PaintIcon(icSpeaker, X1 + 4, TaskY + 7, 16);
+    OutTxt(X1 + 26, TaskY + 7, TimeStr, cBlack);
+  End
+  Else OutTxt(X1 + 7, TaskY + 7, TimeStr, cBlack);
 End;
 
 Procedure TaskbarChanged;
@@ -6933,11 +7068,38 @@ End;
 Procedure OpenStartMenu; Forward;
 Procedure CloseMenus(Lv : LongInt); Forward;
 
+Procedure VolPopOpen; Forward;
+
 Procedure TaskbarMouse(Msg, X, Y : LongInt);
 Var I, N, X1, X2, K : LongInt;
 Begin
-  If Msg <> WM_LBUTTONDOWN Then Exit;
   X := X + Wnds[TaskbarW].X; Y := Y + Wnds[TaskbarW].Y;
+  { icone de volume : clic, double-clic, clic droit }
+  If TrayVolOn And InRect(X, Y, TrayX + 2, TaskY + 4, TrayX + 22,
+                          TaskY + 25) Then
+  Begin
+    If Msg = WM_RBUTTONDOWN Then
+    Begin
+      CloseMenus(0);
+      OpenMenu(0, mnVolCtx, X, TaskY, True);
+    End
+    Else If Msg = WM_LBUTTONDOWN Then
+    Begin
+      CloseMenus(0);
+      If Ticks - TrayClickT < 700 Then
+      Begin
+        TrayClickT := 0;
+        KCommand(cmMixer);
+      End
+      Else
+      Begin
+        TrayClickT := Ticks;
+        VolPopOpen;
+      End;
+    End;
+    Exit;
+  End;
+  If Msg <> WM_LBUTTONDOWN Then Exit;
   If InRect(X, Y, 2, TaskY + 4, StartW + 1, TaskY + 25) Then
   Begin
     If (MenuDepth > 0) And (Wnds[MenuW[0]].K1 = mnStart) Then CloseMenus(0)
@@ -7009,6 +7171,34 @@ Begin
   Else
     DepthName := 'True Color (32 bits)';
   End;
+End;
+
+Function GetLogicalDrives : LongInt; Forward;
+
+{ Lecteurs de la boite Ouvrir/Enregistrer : C:, D: et les volumes FAT }
+Function FdDriveCount : LongInt;
+Var M, I, N : LongInt;
+Begin
+  M := GetLogicalDrives; N := 0;
+  For I := 0 To 25 Do If (M And (1 Shl I)) <> 0 Then Inc(N);
+  FdDriveCount := N;
+End;
+
+Function FdDriveName(K : LongInt) : String;
+Var M, I : LongInt;
+Begin
+  M := GetLogicalDrives;
+  FdDriveName := 'C:';
+  For I := 0 To 25 Do
+    If (M And (1 Shl I)) <> 0 Then
+    Begin
+      If K = 0 Then
+      Begin
+        FdDriveName := Chr(65 + I) + ':';
+        Exit;
+      End;
+      Dec(K);
+    End;
 End;
 
 { Nom du mois M (1..12) }
@@ -7149,8 +7339,15 @@ Begin
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 4 + ExeCnt;
-    mnSettings : MenuCount := 6;
+    mnSettings : MenuCount := 7;
     mnMonths : MenuCount := 12;
+    mnVolCtx : MenuCount := 2;
+    mnNFile : MenuCount := 9;
+    mnNEdit : MenuCount := 10;
+    mnNSearch : MenuCount := 2;
+    mnNHelp : MenuCount := 3;
+    mnFdDrives : MenuCount := FdDriveCount;
+    mnFdTypes : MenuCount := FdFiltN;
     mnTz : MenuCount := TzCount;
     mnDesk : MenuCount := 9;
     mnArrange : MenuCount := 2;
@@ -7258,14 +7455,20 @@ Begin
                'Red (TCP/IP)...');
         Cmd := cmNetwork; Icon := icComputer;
       End
-      Else If I = 4 Then
+      Else If I = 3 Then
+      Begin
+        T := L('Syst'#138'me...', 'System...', 'System...', 'Sistema...',
+               'Sistema...');
+        Cmd := cmSysProps; Icon := icSystem;
+      End
+      Else If I = 5 Then
       Begin
         T := L('Mode sans '#130'chec (16 couleurs)', 'Safe mode (16 colors)',
                'Abgesicherter Modus', 'Modalit'#133' provvisoria',
                'Modo a prueba de fallos');
         Cmd := cmSafeMode; Icon := icDisplay;
       End
-      Else If I = 5 Then
+      Else If I = 6 Then
       Begin
         T := L('Mode MS-DOS', 'MS-DOS mode', 'MS-DOS-Modus',
                'Modalit'#133' MS-DOS', 'Modo MS-DOS');
@@ -7322,6 +7525,121 @@ Begin
         T := DepthName(DepBpp[I]);
         Cmd := cmColorBase + DepBpp[I];
       End;
+    mnNFile :
+      Case I Of
+        0 : Begin T := L('Nouveau', 'New', 'Neu', 'Nuovo', 'Nuevo');
+              Cmd := cmNNew; End;
+        1 : Begin T := L('Ouvrir...', 'Open...', #148'ffnen...', 'Apri...',
+                         'Abrir...');
+              Cmd := cmNOpen; End;
+        2 : Begin T := L('Enregistrer', 'Save', 'Speichern', 'Salva',
+                         'Guardar');
+              Cmd := cmNSave; End;
+        3 : Begin T := L('Enregistrer sous...', 'Save As...',
+                         'Speichern unter...', 'Salva con nome...',
+                         'Guardar como...');
+              Cmd := cmNSaveAs; End;
+        5 : Begin T := L('Mise en page...', 'Page Setup...',
+                         'Seite einrichten...', 'Imposta pagina...',
+                         'Configurar p'#160'gina...');
+              Cmd := cmGray; End;
+        6 : Begin T := L('Imprimer', 'Print', 'Drucken', 'Stampa',
+                         'Imprimir');
+              Cmd := cmGray; End;
+        8 : Begin T := L('Quitter', 'Exit', 'Beenden', 'Esci', 'Salir');
+              Cmd := cmNExit; End;
+      End;
+    mnNEdit :
+      Case I Of
+        0 : Begin
+              T := L('Annuler', 'Undo', 'R'#129'ckg'#132'ngig', 'Annulla',
+                     'Deshacer') + #9'Ctrl+Z';
+              If NoteUndoOk Then Cmd := cmNUndo Else Cmd := cmGray;
+            End;
+        2 : Begin
+              T := L('Couper', 'Cut', 'Ausschneiden', 'Taglia', 'Cortar') +
+                   #9'Ctrl+X';
+              If NoteSel >= 0 Then Cmd := cmNCut Else Cmd := cmGray;
+            End;
+        3 : Begin
+              T := L('Copier', 'Copy', 'Kopieren', 'Copia', 'Copiar') +
+                   #9'Ctrl+C';
+              If NoteSel >= 0 Then Cmd := cmNCopy Else Cmd := cmGray;
+            End;
+        4 : Begin
+              T := L('Coller', 'Paste', 'Einf'#129'gen', 'Incolla', 'Pegar') +
+                   #9'Ctrl+V';
+              If ClipLen > 0 Then Cmd := cmNPaste Else Cmd := cmGray;
+            End;
+        5 : Begin
+              T := L('Supprimer', 'Delete', 'L'#148'schen', 'Elimina',
+                     'Eliminar') + #9'Suppr';
+              If NoteSel >= 0 Then Cmd := cmNDel Else Cmd := cmGray;
+            End;
+        7 : Begin
+              T := L('S'#130'lectionner tout', 'Select All', 'Alles markieren',
+                     'Seleziona tutto', 'Seleccionar todo');
+              Cmd := cmNSelAll;
+            End;
+        8 : Begin
+              T := L('Heure/Date', 'Time/Date', 'Uhrzeit/Datum', 'Ora/data',
+                     'Hora/fecha') + #9'F5';
+              Cmd := cmNTime;
+            End;
+      End;
+    mnNSearch :
+      If I = 0 Then
+      Begin
+        T := L('Rechercher...', 'Find...', 'Suchen...', 'Trova...',
+               'Buscar...');
+        Cmd := cmNFind;
+      End
+      Else
+      Begin
+        T := L('Suivant', 'Find Next', 'Weitersuchen', 'Trova successivo',
+               'Buscar siguiente') + #9'F3';
+        If NoteFind <> '' Then Cmd := cmNFindNext Else Cmd := cmGray;
+      End;
+    mnNHelp :
+      If I = 0 Then
+      Begin
+        T := L('Rubriques d''aide', 'Help Topics', 'Hilfethemen',
+               'Argomenti della Guida', 'Temas de Ayuda');
+        Cmd := cmHelp;
+      End
+      Else If I = 2 Then
+      Begin
+        T := L(#183' propos du Bloc-notes', 'About Notepad', #142'ber Editor',
+               'Informazioni su Blocco note', 'Acerca del Bloc de notas');
+        Cmd := cmNAbout;
+      End;
+    mnFdDrives :
+      Begin
+        T := FdDriveName(I);
+        Cmd := cmFdDrive + Ord(T[1]) - 65;
+        Icon := icHardDisk;
+        If T[1] = 'D' Then Icon := icCdrom;
+      End;
+    mnFdTypes :
+      Begin
+        T := FdFiltDesc[I];
+        Cmd := cmFdType + I;
+      End;
+    mnVolCtx :
+      If I = 0 Then
+      Begin
+        T := L('Ouvrir les contr'#147'les du volume', 'Open Volume Controls',
+               'Lautst'#132'rkeregelung '#148'ffnen', 'Apri controllo volume',
+               'Abrir controles de volumen');
+        Cmd := cmMixer;
+      End
+      Else
+      Begin
+        T := L('Ajuster les propri'#130't'#130's audio',
+               'Adjust Audio Properties', 'Audioeigenschaften anpassen',
+               'Regola propriet'#133' audio', 'Ajustar propiedades de audio');
+        Cmd := cmAudioProps;
+      End;
     mnMonths :
       Begin
         T := MonthName(I + 1);
@@ -7342,7 +7660,9 @@ Begin
       Begin
         T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
                'Propriet'#133, 'Propiedades');
-        Cmd := cmGray;
+        If (DeskSel >= 0) And (DeskCmd[DeskSel] = cmComputer) Then
+          Cmd := cmSysProps
+        Else Cmd := cmGray;
       End;
     mnDocs :
       If DocFile(I, T) Then
@@ -7364,7 +7684,7 @@ End;
 
 { Ouvrir le menu M au niveau Lv (coin X, Y ; Up : au-dessus de Y) }
 Procedure OpenMenu(Lv, M, X, Y : LongInt; Up : Boolean);
-Var I, WW, HH, Cmd, Sub, Ic : LongInt; T : String;
+Var I, WW, HH, Cmd, Sub, Ic, K : LongInt; T : String;
 Begin
   CloseMenus(Lv);
   WW := 0; HH := 6;
@@ -7375,7 +7695,9 @@ Begin
     Else
     Begin
       HH := HH + MenuItemH(M);
-      If TextW(T) > WW Then WW := TextW(T);
+      { raccourci apres une tabulation : colonne de droite }
+      If Pos(#9, T) > 0 Then K := TextW(T) + 40 Else K := TextW(T);
+      If K > WW Then WW := K;
     End;
   End;
   WW := WW + 62;
@@ -7433,8 +7755,8 @@ Begin
 End;
 
 Procedure PaintMenu(W : LongInt);
-Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH : LongInt;
-    T : String;
+Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH, K : LongInt;
+    T, A : String;
 Begin
   X := Wnds[W].X; Y := Wnds[W].Y; WW := Wnds[W].W; HH := Wnds[W].H;
   M := Wnds[W].K1;
@@ -7472,6 +7794,19 @@ Begin
       Begin
         If M = mnStart Then PaintIcon(Ic, TX, YY + 4, 24)
         Else PaintIcon(Ic, TX, YY + 2, 16);
+      End;
+      K := Pos(#9, T);
+      If K > 0 Then
+      Begin
+        A := Copy(T, K + 1, 255);
+        T := Copy(T, 1, K - 1);
+        If Cmd = cmGray Then
+        Begin
+          If I <> Wnds[W].K2 Then
+            OutTxt(X + WW - 15 - TextW(A), YY + 3, A, cWhite);
+          OutTxt(X + WW - 16 - TextW(A), YY + 2, A, cGray);
+        End
+        Else OutTxt(X + WW - 16 - TextW(A), YY + 2, A, Fg);
       End;
       If M = mnStart Then OutTxt(TX + 32, YY + 8, T, Fg)
       Else If Cmd = cmGray Then
@@ -7672,8 +8007,19 @@ End;
 
 Procedure DoShutdown(Mode : LongInt); Forward;
 
+Procedure NoteAskEnd(Res : LongInt); Forward;
+
 Procedure MsgBoxEnd(W, Res : LongInt);
 Begin
+  If (W = NoteAskW) And (NoteAskW >= 0) Then
+  Begin
+    NoteAskW := -1;
+    Wnds[W].K1 := Res;
+    Wnds[W].DlgEnded := True;
+    ShowW(W, False, False);
+    NoteAskEnd(Res);
+    Exit;
+  End;
   If (W = RebootAskW) And (RebootAskW >= 0) Then
   Begin
     RebootAskW := -1;
@@ -8014,21 +8360,41 @@ Begin
   NLineEnd := P;
 End;
 
-Procedure NoteOpen(Path : String);
-Var W, A, Size, R, Wr, B : LongInt; CR : Boolean;
+Function KOpenFile(Name : String; Wr : Boolean; Disp : LongInt) : LongInt;
+  Forward;
+Function KWriteFile(H, Buf, N : LongInt) : LongInt; Forward;
+Function CloseHandle(H : LongInt) : LongInt; Forward;
+Procedure FdOpen(Mode, Owner : LongInt; Const Dir, Name : String); Forward;
+
+{ Texte du Bloc-notes : CR seul en memoire, CR LF dans les fichiers.
+  K1 longueur, K2 position du curseur, K3 debut de la premiere ligne
+  affichee ; barre de menus de 20 points en haut de la zone client. }
+
+Function NoteTitle : String;
 Begin
-  W := KFindKind(ikNotepad);
-  If W < 0 Then
-  Begin
-    W := KCreate(ikNotepad, '', icNotepad, 110, 46, 480, 340,
-                 WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or WS_THICKFRAME
-                 Or WS_MINIMIZEBOX Or WS_MAXIMIZEBOX, WS_EX_CLIENTEDGE);
-    If W < 0 Then Exit;
-    Wnds[W].Extra := KAlloc(NoteMax + 16);
-  End;
+  If NotePath = '' Then
+    NoteTitle := L('Sans titre', 'Untitled', 'Unbenannt', 'Senza nome',
+                   'Sin t'#161'tulo')
+  Else NoteTitle := BaseName(NotePath);
+End;
+
+Procedure NoteSetTitle(W : LongInt);
+Begin
+  Wnds[W].Text := NoteTitle + ' - ' + L('Bloc-notes', 'Notepad', 'Editor',
+                  'Blocco note', 'Bloc de notas');
+  Wnds[W].NeedNc := True;
+  TaskbarChanged;
+End;
+
+{ Charger le fichier Path (vide : nouveau document) }
+Procedure NoteLoad(W : LongInt; Path : String);
+Var A, Size, R, Wr, B : LongInt; CR : Boolean;
+Begin
   B := Wnds[W].Extra;
   Wnds[W].K1 := 0; Wnds[W].K2 := 0; Wnds[W].K3 := 0;
-  Wnds[W].KS := '';
+  NoteSel := -1; NoteLeft := 0; NoteDirty := False;
+  NoteUndoOk := False; NoteGroup := False;
+  NotePath := '';
   If Path <> '' Then
   Begin
     A := LoadWholeFile(Path, Size);
@@ -8058,110 +8424,181 @@ Begin
       End;
       KFree(A);
       Wnds[W].K1 := Wr;
-      Wnds[W].KS := BaseName(Path);
-    End;
+      NotePath := FullPath(Path);
+    End
+    Else
+      MsgBoxOpen(L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
+                   'Bloc de notas'), L('Impossible d''ouvrir ', 'Cannot open ',
+                   'Kann nicht '#148'ffnen: ', 'Impossibile aprire ',
+                   'No se puede abrir ') + Path, $30);
   End;
-  If Wnds[W].KS = '' Then
-    Wnds[W].Text := L('Sans titre', 'Untitled', 'Unbenannt', 'Senza nome',
-                      'Sin t'#161'tulo')
-  Else Wnds[W].Text := Wnds[W].KS;
-  Wnds[W].Text := Wnds[W].Text + ' - ' + L('Bloc-notes', 'Notepad',
-                  'Editor', 'Blocco note', 'Bloc de notas');
-  Wnds[W].NeedNc := True;
+  NoteSetTitle(W);
   KRepaint(W);
+End;
+
+Procedure NoteOpen(Path : String);
+Var W, Own : LongInt;
+Begin
+  W := KFindKind(ikNotepad);
+  If W < 0 Then
+  Begin
+    W := KCreate(ikNotepad, '', icNotepad, 110, 46, 480, 340,
+                 WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or WS_THICKFRAME
+                 Or WS_MINIMIZEBOX Or WS_MAXIMIZEBOX, WS_EX_CLIENTEDGE);
+    If W < 0 Then Exit;
+    Own := HeapOwner; HeapOwner := 0;
+    Wnds[W].Extra := KAlloc(NoteMax + 16);
+    If NoteUndoBuf = 0 Then NoteUndoBuf := KAlloc(NoteMax + 16);
+    HeapOwner := Own;
+  End;
+  NoteLoad(W, Path);
   ShowW(W, True, True);
   ActivateW(W);
-  TaskbarChanged;
 End;
 
-Procedure PaintNotepad(W : LongInt);
-Var X1, Y1, X2, Y2, Rows, Cols, R, CC, B, N, P, E, Q : LongInt;
-    S : String; Ch : LongInt;
+{ Ecrire le texte dans Path (CR LF) ; False si impossible }
+Function NoteWrite(W : LongInt; Path : String) : Boolean;
+Var B, N, T, I, K, H, Own : LongInt; Ok : Boolean;
 Begin
-  KClient(W, X1, Y1, X2, Y2);
-  FBar(X1, Y1, X2, Y2, cWhite);
+  NoteWrite := False; Ok := False;
   B := Wnds[W].Extra; N := Wnds[W].K1;
-  Rows := (Y2 - Y1 - 4) Div 16;
-  Cols := (X2 - X1 - 6) Div 8;
-  P := Wnds[W].K3;
-  For R := 0 To Rows - 1 Do
+  Own := HeapOwner; HeapOwner := 0;
+  T := KAlloc(N * 2 + 16);
+  HeapOwner := Own;
+  If T = 0 Then Exit;
+  K := 0;
+  For I := 0 To N - 1 Do
   Begin
-    If P > N Then Exit;
-    E := NLineEnd(B, P, N);
-    S := '';
-    Q := P; CC := 0;
-    While (Q < E) And (CC < Cols) Do
+    Mem[0:T + K] := Mem[0:B + I]; Inc(K);
+    If Mem[0:B + I] = 13 Then
     Begin
-      Ch := Mem[0:B + Q];
-      If Ch < 32 Then Ch := 32;
-      S := S + Chr(Ch);
-      Inc(Q); Inc(CC);
+      Mem[0:T + K] := 10; Inc(K);
     End;
-    OutTxt(X1 + 3, Y1 + 2 + R * 16, S, cBlack);
-    If (Wnds[W].K2 >= P) And (Wnds[W].K2 <= E) And (W = ActiveWin) Then
-    Begin
-      CC := Wnds[W].K2 - P;
-      If CC <= Cols Then
-        VLine(X1 + 3 + CC * 8, Y1 + 2 + R * 16, Y1 + 16 + R * 16, cBlack);
-    End;
-    P := E + 1;
   End;
+  H := KOpenFile(Path, True, 2);
+  If H <> INVALID_HANDLE Then
+  Begin
+    Ok := KWriteFile(H, T, K) = K;
+    CloseHandle(H);
+  End;
+  KFree(T);
+  NoteWrite := Ok;
+  If Ok Then
+  Begin
+    NotePath := FullPath(Path);
+    NoteDirty := False;
+    NoteSetTitle(W);
+  End
+  Else
+    MsgBoxOpen(L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
+               'Bloc de notas'), L('Impossible d''enregistrer ', 'Cannot ' +
+               'save ', 'Kann nicht speichern: ', 'Impossibile salvare ',
+               'No se puede guardar ') + Path + L(' (le CD-ROM D: est en ' +
+               'lecture seule).', ' (CD-ROM D: is read-only).',
+               ' (D: ist schreibgesch'#129'tzt).',
+               ' (D: '#138' di sola lettura).',
+               ' (D: es de s'#162'lo lectura).'), $30);
 End;
 
-Procedure NoteKey(W, VK, Ch : LongInt);
-Var B, N, C, LS, LE, Col, X1, Y1, X2, Y2, Rows, Ln, P : LongInt;
+Procedure NoteSelRange(W : LongInt; Var A, B : LongInt);
+Begin
+  A := Min(NoteSel, Wnds[W].K2); B := Max(NoteSel, Wnds[W].K2);
+End;
+
+{ Copie pour Annuler (debut d'un groupe de modifications) }
+Procedure NoteSnap(W : LongInt);
+Begin
+  If NoteGroup Or (NoteUndoBuf = 0) Then Exit;
+  MoveMem(Wnds[W].Extra, NoteUndoBuf, Wnds[W].K1);
+  NoteUndoLen := Wnds[W].K1; NoteUndoPos := Wnds[W].K2;
+  NoteUndoOk := True;
+End;
+
+Procedure NoteUndo(W : LongInt);
+Var I, T, B : LongInt;
+Begin
+  If Not NoteUndoOk Then Exit;
+  B := Wnds[W].Extra;
+  { echange : un second Annuler retablit }
+  For I := 0 To Max(NoteUndoLen, Wnds[W].K1) - 1 Do
+  Begin
+    T := Mem[0:B + I];
+    Mem[0:B + I] := Mem[0:NoteUndoBuf + I];
+    Mem[0:NoteUndoBuf + I] := T;
+  End;
+  T := Wnds[W].K1; Wnds[W].K1 := NoteUndoLen; NoteUndoLen := T;
+  T := Wnds[W].K2; Wnds[W].K2 := Min(NoteUndoPos, Wnds[W].K1);
+  NoteUndoPos := T;
+  NoteSel := -1; NoteDirty := True; NoteGroup := False;
+End;
+
+{ Supprimer la selection ; True s'il y en avait une }
+Function NoteDelSel(W : LongInt) : Boolean;
+Var A, B, Bf, N : LongInt;
+Begin
+  NoteDelSel := False;
+  If NoteSel < 0 Then Exit;
+  NoteSelRange(W, A, B);
+  NoteSel := -1;
+  If A = B Then Exit;
+  Bf := Wnds[W].Extra; N := Wnds[W].K1;
+  MoveMem(Bf + B, Bf + A, N - B);
+  Wnds[W].K1 := N - (B - A); Wnds[W].K2 := A;
+  NoteDirty := True;
+  NoteDelSel := True;
+End;
+
+{ Inserer N caracteres de Src (texte CR LF : les LF sont retires) }
+Procedure NoteInsert(W, Src, N : LongInt);
+Var I, C, Bf, Len, P : LongInt;
+Begin
+  Bf := Wnds[W].Extra;
+  For I := 0 To N - 1 Do
+  Begin
+    C := Mem[0:Src + I];
+    If (C = 10) Or (C = 0) Then Continue;
+    Len := Wnds[W].K1; P := Wnds[W].K2;
+    If Len >= NoteMax Then Exit;
+    MoveMem(Bf + P, Bf + P + 1, Len - P);
+    Mem[0:Bf + P] := C;
+    Wnds[W].K1 := Len + 1; Wnds[W].K2 := P + 1;
+  End;
+  NoteDirty := True;
+End;
+
+{ Selection vers le presse-papiers (CR -> CR LF) }
+Procedure NoteCopy(W : LongInt);
+Var A, B, I, K, Own : LongInt;
+Begin
+  If NoteSel < 0 Then Exit;
+  NoteSelRange(W, A, B);
+  If ClipBuf <> 0 Then KFree(ClipBuf);
+  Own := HeapOwner; HeapOwner := 0;
+  ClipBuf := KAlloc((B - A) * 2 + 16);
+  HeapOwner := Own;
+  ClipLen := 0;
+  If ClipBuf = 0 Then Exit;
+  K := 0;
+  For I := A To B - 1 Do
+  Begin
+    Mem[0:ClipBuf + K] := Mem[0:Wnds[W].Extra + I]; Inc(K);
+    If Mem[0:Wnds[W].Extra + I] = 13 Then
+    Begin
+      Mem[0:ClipBuf + K] := 10; Inc(K);
+    End;
+  End;
+  Mem[0:ClipBuf + K] := 0;
+  ClipLen := K;
+End;
+
+{ Le curseur reste visible (lignes et colonnes) }
+Procedure NoteScroll(W : LongInt);
+Var B, N, C, X1, Y1, X2, Y2, Rows, Cols, Ln, P, Col : LongInt;
 Begin
   B := Wnds[W].Extra; N := Wnds[W].K1; C := Wnds[W].K2;
-  Case VK Of
-    $25 : If C > 0 Then Dec(C);
-    $27 : If C < N Then Inc(C);
-    $24 : C := NLineStart(B, C);
-    $23 : C := NLineEnd(B, C, N);
-    $26 :
-    Begin
-      LS := NLineStart(B, C); Col := C - LS;
-      If LS > 0 Then
-      Begin
-        LS := NLineStart(B, LS - 1); LE := NLineEnd(B, LS, N);
-        C := Min(LS + Col, LE);
-      End;
-    End;
-    $28 :
-    Begin
-      LS := NLineStart(B, C); Col := C - LS;
-      LE := NLineEnd(B, C, N);
-      If LE < N Then
-      Begin
-        LS := LE + 1; LE := NLineEnd(B, LS, N);
-        C := Min(LS + Col, LE);
-      End;
-    End;
-    $2E :
-      If C < N Then
-      Begin
-        MoveMem(B + C + 1, B + C, N - C - 1);
-        Dec(N);
-      End;
-    8 :
-      If C > 0 Then
-      Begin
-        MoveMem(B + C, B + C - 1, N - C);
-        Dec(N); Dec(C);
-      End;
-  Else
-    If (Ch = 13) Or (Ch >= 32) Then
-    Begin
-      If N >= NoteMax Then Exit;
-      MoveMem(B + C, B + C + 1, N - C);
-      Mem[0:B + C] := Ch;
-      Inc(N); Inc(C);
-    End
-    Else Exit;
-  End;
-  Wnds[W].K1 := N; Wnds[W].K2 := C;
-  { premiere ligne affichee }
   KClient(W, X1, Y1, X2, Y2);
-  Rows := Max(1, (Y2 - Y1 - 4) Div 16);
+  Rows := Max(1, (Y2 - Y1 - 24) Div 16);
+  Cols := Max(1, (X2 - X1 - 6) Div 8);
   If C < Wnds[W].K3 Then Wnds[W].K3 := NLineStart(B, C)
   Else
   Begin
@@ -8177,6 +8614,523 @@ Begin
       Dec(Ln);
     End;
   End;
+  Col := C - NLineStart(B, C);
+  If Col < NoteLeft Then NoteLeft := Max(0, Col - 8);
+  If Col >= NoteLeft + Cols Then NoteLeft := Col - Cols + 8;
+End;
+
+{ Titres de la barre de menus : position X (ecran) du titre I }
+Function NoteMenuTitle(I : LongInt) : String;
+Begin
+  Case I Of
+    0 : NoteMenuTitle := L('Fichier', 'File', 'Datei', 'File', 'Archivo');
+    1 : NoteMenuTitle := L('Edition', 'Edit', 'Bearbeiten', 'Modifica',
+                           'Edici'#162'n');
+    2 : NoteMenuTitle := L('Recherche', 'Search', 'Suchen', 'Cerca',
+                           'Buscar');
+  Else
+    NoteMenuTitle := '?';
+  End;
+End;
+
+Function NoteMenuX(W, I : LongInt) : LongInt;
+Var X1, Y1, X2, Y2, K, X : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  X := X1 + 4;
+  For K := 0 To I - 1 Do X := X + TextW(NoteMenuTitle(K)) + 16;
+  NoteMenuX := X;
+End;
+
+Procedure PaintNotepad(W : LongInt);
+Var X1, Y1, X2, Y2, Rows, Cols, R, CC, B, N, P, E, Q, I, SA, SB, TX, Fg,
+    Bg, Ch, MX, M : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  { barre de menus }
+  FBar(X1, Y1, X2, Y1 + 19, cSilver);
+  HLine(X1, X2, Y1 + 19, cGray);
+  M := -1;
+  If (MenuDepth > 0) And (MenuW[0] >= 0) And Wnds[MenuW[0]].Used Then
+    If (Wnds[MenuW[0]].K1 >= mnNFile) And (Wnds[MenuW[0]].K1 <= mnNHelp) Then
+      M := Wnds[MenuW[0]].K1 - mnNFile;
+  For I := 0 To 3 Do
+  Begin
+    MX := NoteMenuX(W, I);
+    If I = M Then
+      Edge(MX - 4, Y1 + 1, MX + TextW(NoteMenuTitle(I)) + 4, Y1 + 18, cGray,
+           cWhite);
+    OutTxt(MX, Y1 + 2, NoteMenuTitle(I), cBlack);
+  End;
+  FBar(X1, Y1 + 20, X2, Y2, cWhite);
+  B := Wnds[W].Extra; N := Wnds[W].K1;
+  Rows := (Y2 - Y1 - 24) Div 16;
+  Cols := (X2 - X1 - 6) Div 8;
+  SA := -1; SB := -1;
+  If NoteSel >= 0 Then NoteSelRange(W, SA, SB);
+  P := Wnds[W].K3;
+  For R := 0 To Rows - 1 Do
+  Begin
+    If P > N Then Exit;
+    E := NLineEnd(B, P, N);
+    Q := P + NoteLeft; CC := 0;
+    While (Q < E) And (CC < Cols) Do
+    Begin
+      Ch := Mem[0:B + Q];
+      If Ch < 32 Then Ch := 32;
+      TX := X1 + 3 + CC * 8;
+      If (Q >= SA) And (Q < SB) Then
+      Begin
+        FBar(TX, Y1 + 22 + R * 16, TX + 7, Y1 + 37 + R * 16, cNavy);
+        Fg := cWhite;
+      End
+      Else Fg := cBlack;
+      DrawChar(TX, Y1 + 22 + R * 16, Chr(Ch), Fg);
+      Inc(Q); Inc(CC);
+    End;
+    { fin de ligne selectionnee }
+    If (E >= SA) And (E < SB) And (E - P - NoteLeft >= 0) And
+       (E - P - NoteLeft < Cols) Then
+      FBar(X1 + 3 + (E - P - NoteLeft) * 8, Y1 + 22 + R * 16,
+           X1 + 6 + (E - P - NoteLeft) * 8, Y1 + 37 + R * 16, cNavy);
+    If (Wnds[W].K2 >= P) And (Wnds[W].K2 <= E) And (W = ActiveWin) Then
+    Begin
+      CC := Wnds[W].K2 - P - NoteLeft;
+      If (CC >= 0) And (CC <= Cols) Then
+        VLine(X1 + 3 + CC * 8, Y1 + 22 + R * 16, Y1 + 36 + R * 16, cBlack);
+    End;
+    P := E + 1;
+  End;
+End;
+
+{ Position du texte sous le point (X, Y) de l'ecran }
+Function NoteHit(W, X, Y : LongInt) : LongInt;
+Var X1, Y1, X2, Y2, B, N, P, R, Col : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  B := Wnds[W].Extra; N := Wnds[W].K1;
+  R := (Y - Y1 - 22) Div 16;
+  If Y < Y1 + 22 Then R := 0;
+  P := Wnds[W].K3;
+  While (R > 0) And (NLineEnd(B, P, N) < N) Do
+  Begin
+    P := NLineEnd(B, P, N) + 1;
+    Dec(R);
+  End;
+  Col := (X - X1 - 3 + 4) Div 8 + NoteLeft;
+  If Col < 0 Then Col := 0;
+  NoteHit := Min(P + Col, NLineEnd(B, P, N));
+End;
+
+Procedure NoteMouse(W, Msg, X, Y : LongInt);
+Var X1, Y1, X2, Y2, I, MX : LongInt;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  If (Msg = WM_LBUTTONDOWN) And (Y < Y1 + 20) Then
+  Begin
+    For I := 0 To 3 Do
+    Begin
+      MX := NoteMenuX(W, I);
+      If InRect(X, Y, MX - 4, Y1, MX + TextW(NoteMenuTitle(I)) + 4,
+                Y1 + 19) Then
+      Begin
+        CloseMenus(0);
+        OpenMenu(0, mnNFile + I, MX - 4, Y1 + 19, False);
+        KRepaint(W);
+        Exit;
+      End;
+    End;
+    Exit;
+  End;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    Wnds[W].K2 := NoteHit(W, X, Y);
+    NoteSel := Wnds[W].K2;
+    NoteGroup := False;
+    CaptureWin := W;
+    KRepaint(W);
+  End
+  Else If (Msg = WM_MOUSEMOVE) And (CaptureWin = W) Then
+  Begin
+    Wnds[W].K2 := NoteHit(W, X, Y);
+    NoteScroll(W);
+    KRepaint(W);
+  End
+  Else If Msg = WM_LBUTTONUP Then
+  Begin
+    CaptureWin := -1;
+    If NoteSel = Wnds[W].K2 Then NoteSel := -1;
+    KRepaint(W);
+  End;
+End;
+
+{ Question "enregistrer les modifications ?" puis action Act (0 fermer,
+  1 nouveau, 2 ouvrir) ; True si l'action peut avoir lieu tout de suite }
+Function NoteAsk(W, Act : LongInt) : Boolean;
+Begin
+  NoteAsk := True;
+  If Not NoteDirty Then Exit;
+  NoteAsk := False;
+  NoteAskAct := Act;
+  NoteAskW := MsgBoxOpen(L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
+    'Bloc de notas'), L('Le texte du fichier ', 'The text in the ',
+    'Der Text in der Datei ', 'Il testo del file ', 'El texto del archivo ') +
+    NoteTitle + L(' a '#130't'#130' modifi'#130'.|Voulez-vous enregistrer ' +
+    'les modifications'#255'?', ' file has changed.|Do you want to save the ' +
+    'changes?', ' wurde ge'#132'ndert.|'#142'nderungen speichern?',
+    #138' stato modificato.|Salvare le modifiche?',
+    ' ha cambiado.|'#168'Desea guardar los cambios?'), $23);
+End;
+
+Procedure NoteDoAct(W, Act : LongInt);
+Begin
+  Case Act Of
+    0 : DestroyW(W);
+    1 : NoteLoad(W, '');
+  Else
+    FdOpen(0, 0, ParentDir(NotePath), '');
+  End;
+End;
+
+{ Enregistrer (sous un nouveau nom si Ask ou sans nom) puis Act (-1) }
+Procedure NoteSave(W : LongInt; Ask : Boolean; Act : LongInt);
+Begin
+  If Ask Or (NotePath = '') Then
+  Begin
+    NotePend := Act;
+    If NotePath = '' Then FdOpen(1, 0, 'C:', '*.TXT')
+    Else FdOpen(1, 0, ParentDir(NotePath), BaseName(NotePath));
+    Exit;
+  End;
+  If NoteWrite(W, NotePath) And (Act >= 0) Then NoteDoAct(W, Act);
+End;
+
+{ Reponse a la question d'enregistrement }
+Procedure NoteAskEnd(Res : LongInt);
+Var W : LongInt;
+Begin
+  W := KFindKind(ikNotepad);
+  If W < 0 Then Exit;
+  If Res = IDYES Then NoteSave(W, False, NoteAskAct)
+  Else If Res = IDNO Then NoteDoAct(W, NoteAskAct);
+End;
+
+Procedure NoteFindNext(W : LongInt; Quiet : Boolean);
+Var B, N, P, I, K : LongInt; Ok : Boolean; C1, C2 : Char;
+Begin
+  If NoteFind = '' Then Exit;
+  B := Wnds[W].Extra; N := Wnds[W].K1;
+  P := Wnds[W].K2;
+  For I := P To N - Length(NoteFind) Do
+  Begin
+    Ok := True;
+    For K := 1 To Length(NoteFind) Do
+    Begin
+      C1 := Chr(Mem[0:B + I + K - 1]); C2 := NoteFind[K];
+      If Not NoteCase Then
+      Begin
+        C1 := UpCase(C1); C2 := UpCase(C2);
+      End;
+      If C1 <> C2 Then
+      Begin
+        Ok := False;
+        Break;
+      End;
+    End;
+    If Ok Then
+    Begin
+      NoteSel := I; Wnds[W].K2 := I + Length(NoteFind);
+      NoteGroup := False;
+      NoteScroll(W);
+      KRepaint(W);
+      Exit;
+    End;
+  End;
+  If Not Quiet Then
+    MsgBoxOpen(L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
+               'Bloc de notas'), L('Impossible de trouver '#174' ',
+               'Cannot find "', '"', 'Impossibile trovare "',
+               'No se encuentra "') + NoteFind + L(' '#175'.', '".',
+               '" nicht gefunden.', '".', '".'), $40);
+End;
+
+Procedure NoteKey(W, VK, Ch : LongInt);
+Var B, N, C, LS, LE, Col, Old : LongInt; Sh, Ctl : Boolean; T : String;
+Begin
+  B := Wnds[W].Extra; N := Wnds[W].K1; C := Wnds[W].K2;
+  Sh := (KeyState[$10] And $80) <> 0;
+  Ctl := (KeyState[$11] And $80) <> 0;
+  { raccourcis }
+  If Ctl Then
+  Begin
+    Case VK Of
+      $41 : KCommand(cmNSelAll);
+      $43 : KCommand(cmNCopy);
+      $58 : KCommand(cmNCut);
+      $56 : KCommand(cmNPaste);
+      $5A : KCommand(cmNUndo);
+      $4E : KCommand(cmNNew);
+      $4F : KCommand(cmNOpen);
+      $53 : KCommand(cmNSave);
+      $46 : KCommand(cmNFind);
+    End;
+    Exit;
+  End;
+  If VK = $72 Then
+  Begin
+    NoteFindNext(W, False);
+    Exit;
+  End;
+  If VK = $74 Then
+  Begin
+    KCommand(cmNTime);
+    Exit;
+  End;
+  Old := C;
+  Case VK Of
+    $25, $27, $24, $23, $26, $28, $21, $22 :
+    Begin
+      Case VK Of
+        $25 : If C > 0 Then Dec(C);
+        $27 : If C < N Then Inc(C);
+        $24 : C := NLineStart(B, C);
+        $23 : C := NLineEnd(B, C, N);
+        $26, $21 :
+        Begin
+          LS := NLineStart(B, C); Col := C - LS;
+          If LS > 0 Then
+          Begin
+            LS := NLineStart(B, LS - 1); LE := NLineEnd(B, LS, N);
+            C := Min(LS + Col, LE);
+          End;
+        End;
+      Else
+        Begin
+          LS := NLineStart(B, C); Col := C - LS;
+          LE := NLineEnd(B, C, N);
+          If LE < N Then
+          Begin
+            LS := LE + 1; LE := NLineEnd(B, LS, N);
+            C := Min(LS + Col, LE);
+          End;
+        End;
+      End;
+      If Sh Then
+      Begin
+        If NoteSel < 0 Then NoteSel := Old;
+      End
+      Else NoteSel := -1;
+      Wnds[W].K2 := C;
+      NoteGroup := False;
+    End;
+    $2E :
+    Begin
+      NoteSnap(W); NoteGroup := False;
+      If Not NoteDelSel(W) And (C < N) Then
+      Begin
+        MoveMem(B + C + 1, B + C, N - C - 1);
+        Wnds[W].K1 := N - 1;
+        NoteDirty := True;
+      End;
+    End;
+    8 :
+    Begin
+      NoteSnap(W); NoteGroup := True;
+      If Not NoteDelSel(W) And (C > 0) Then
+      Begin
+        MoveMem(B + C, B + C - 1, N - C);
+        Wnds[W].K1 := N - 1; Wnds[W].K2 := C - 1;
+        NoteDirty := True;
+      End;
+    End;
+  Else
+    If (Ch = 13) Or ((Ch >= 32) And (Ch < 256)) Then
+    Begin
+      NoteSnap(W);
+      NoteDelSel(W);
+      NoteGroup := True;
+      T := Chr(Ch);
+      NoteInsert(W, LongInt(@T[1]), 1);
+    End
+    Else Exit;
+  End;
+  NoteScroll(W);
+  KRepaint(W);
+End;
+
+Procedure NoteCmd(Cmd : LongInt);
+Var W, A, B, P : LongInt; T : String;
+Begin
+  W := KFindKind(ikNotepad);
+  If W < 0 Then Exit;
+  Case Cmd Of
+    cmNNew : If NoteAsk(W, 1) Then NoteDoAct(W, 1);
+    cmNOpen : If NoteAsk(W, 2) Then NoteDoAct(W, 2);
+    cmNSave : NoteSave(W, False, -1);
+    cmNSaveAs : NoteSave(W, True, -1);
+    cmNExit : If NoteAsk(W, 0) Then NoteDoAct(W, 0);
+    cmNUndo : NoteUndo(W);
+    cmNCut :
+      If NoteSel >= 0 Then
+      Begin
+        NoteCopy(W); NoteGroup := False; NoteSnap(W); NoteDelSel(W);
+      End;
+    cmNCopy : NoteCopy(W);
+    cmNPaste :
+      If ClipLen > 0 Then
+      Begin
+        NoteGroup := False; NoteSnap(W); NoteDelSel(W);
+        NoteInsert(W, ClipBuf, ClipLen);
+      End;
+    cmNDel :
+    Begin
+      NoteGroup := False; NoteSnap(W); NoteDelSel(W);
+    End;
+    cmNSelAll :
+    Begin
+      NoteSel := 0; Wnds[W].K2 := Wnds[W].K1;
+    End;
+    cmNTime :
+    Begin
+      ReadRtc;
+      T := Pad2(RtcHour) + ':' + Pad2(RtcMin) + ' ' + Pad2(RtcDay) + '/' +
+           Pad2(RtcMonth) + '/' + IntStr(RtcYear);
+      NoteGroup := False; NoteSnap(W); NoteDelSel(W);
+      NoteInsert(W, LongInt(@T[1]), Length(T));
+    End;
+    cmNFind :
+    Begin
+      If (FindW >= 0) And Wnds[FindW].Used And
+         (Wnds[FindW].IKind = ikFind) Then
+        ActivateW(FindW)
+      Else
+      Begin
+        FindW := KCreate(ikFind, L('Rechercher', 'Find', 'Suchen', 'Trova',
+                         'Buscar'), icNotepad, Wnds[W].X + 40, Wnds[W].Y + 80,
+                         380, 130, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                         WS_EX_DLGMODALFRAME Or WS_EX_TOOLWINDOW);
+        If FindW >= 0 Then
+        Begin
+          Wnds[FindW].KS := NoteFind;
+          ShowW(FindW, True, True);
+        End;
+      End;
+      Exit;
+    End;
+    cmNFindNext : NoteFindNext(W, False);
+    cmNAbout :
+    Begin
+      MsgBoxOpen(L(#183' propos du Bloc-notes', 'About Notepad',
+        #142'ber Editor', 'Informazioni su Blocco note',
+        'Acerca del Bloc de notas'), 'Pasdows 95 - ' + L('Bloc-notes',
+        'Notepad', 'Editor', 'Blocco note', 'Bloc de notas') + '|Version ' +
+        KVersion + '|Copyright (C) 2026 Gladir.com', $40);
+      Exit;
+    End;
+  End;
+  If (W >= 0) And Wnds[W].Used Then
+  Begin
+    NoteScroll(W);
+    KRepaint(W);
+  End;
+End;
+
+{ Boite Rechercher : texte (KS), Respecter la casse, Suivant, Annuler }
+Procedure PaintFind(W : LongInt);
+Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  OutTxt(X1 + 10, Y1 + 14, L('Rechercher :', 'Find what:', 'Suchen nach:',
+         'Trova:', 'Buscar:'), cBlack);
+  Sunken(X1 + 110, Y1 + 10, X2 - 110, Y1 + 32, cWhite);
+  OutTxt(X1 + 114, Y1 + 13, Fit(Wnds[W].KS, X2 - X1 - 230), cBlack);
+  VLine(X1 + 114 + TextW(Fit(Wnds[W].KS, X2 - X1 - 230)), Y1 + 12, Y1 + 29,
+        cBlack);
+  CheckBox(X1 + 10, Y1 + 50, L('Respecter la casse', 'Match case',
+           'Gro'#225'-/Kleinschreibung', 'Maiuscole/minuscole',
+           'Coincidir may'#163'sculas'), NoteCase);
+  For I := 0 To 1 Do
+  Begin
+    BX1 := X2 - 100; BX2 := X2 - 10;
+    BY1 := Y1 + 10 + I * 30; BY2 := BY1 + 22;
+    If I = 0 Then T := L('Suivant', 'Find Next', 'Weitersuchen', 'Successivo',
+                         'Siguiente')
+    Else T := TxtCancel;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+Procedure FindAction(W, B : LongInt);
+Var N : LongInt;
+Begin
+  If B = 0 Then
+  Begin
+    NoteFind := Wnds[W].KS;
+    N := KFindKind(ikNotepad);
+    If N >= 0 Then NoteFindNext(N, False);
+  End
+  Else
+  Begin
+    DestroyW(W);
+    FindW := -1;
+  End;
+End;
+
+Procedure FindMouse(W, Msg, X, Y : LongInt);
+Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt;
+Begin
+  If Msg = WM_LBUTTONDBLCLK Then Msg := WM_LBUTTONDOWN;
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  If (Msg = WM_LBUTTONDOWN) And InRect(X, Y, X1 + 10, Y1 + 48, X1 + 200,
+                                        Y1 + 66) Then
+  Begin
+    NoteCase := Not NoteCase;
+    KRepaint(W);
+    Exit;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    BX1 := X2 - 100; BX2 := X2 - 10;
+    BY1 := Y1 + 10 + I * 30; BY2 := BY1 + 22;
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        KRepaint(W);
+        FindAction(W, I);
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure FindKey(W, VK, Ch : LongInt);
+Begin
+  If VK = $0D Then FindAction(W, 0)
+  Else If VK = $1B Then FindAction(W, 1)
+  Else If VK = 8 Then Delete(Wnds[W].KS, Length(Wnds[W].KS), 1)
+  Else If (Ch >= 32) And (Length(Wnds[W].KS) < 60) Then
+    Wnds[W].KS := Wnds[W].KS + Chr(Ch);
   KRepaint(W);
 End;
 
@@ -9373,6 +10327,1625 @@ Begin
   KRepaint(DtW);
 End;
 
+{ ------------------------------------------------------------------ }
+{ Volume : icone de la barre des taches, reglage rapide, Controle du  }
+{ volume (mixeur) et Proprietes de Multimedia (Audio)                 }
+{ ------------------------------------------------------------------ }
+
+Function TrayVolOn : Boolean;
+Begin
+  TrayVolOn := TrayVol And (SbOk Or OplOk);
+End;
+
+Function MixName(I : LongInt) : String;
+Begin
+  Case I Of
+    0 : MixName := L('Contr'#147'le du volume', 'Volume Control',
+                     'Lautst'#132'rke', 'Controllo volume',
+                     'Control de volumen');
+    1 : MixName := 'Wave';
+    2 : MixName := 'MIDI';
+    3 : MixName := L('CD audio', 'CD Audio', 'Audio-CD', 'CD audio',
+                     'CD de audio');
+  Else
+    MixName := L('Ligne', 'Line In', 'Line-In', 'Linea', 'L'#161'nea');
+  End;
+End;
+
+Function MixVol(I : LongInt) : LongInt;
+Begin
+  MixVol := Max(MixVolL[I], MixVolR[I]);
+End;
+
+{ Balance -100 (gauche) .. 100 (droite) }
+Function MixBal(I : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  V := MixVol(I);
+  If V = 0 Then MixBal := 0
+  Else MixBal := ((MixVolR[I] - MixVolL[I]) * 100) Div V;
+End;
+
+Procedure MixSet(I, V, B : LongInt);
+Begin
+  V := Max(0, Min(255, V)); B := Max(-100, Min(100, B));
+  If B >= 0 Then
+  Begin
+    MixVolR[I] := V; MixVolL[I] := (V * (100 - B)) Div 100;
+  End
+  Else
+  Begin
+    MixVolL[I] := V; MixVolR[I] := (V * (100 + B)) Div 100;
+  End;
+  SndApplyVol;
+End;
+
+{ Curseur vertical (X : axe, Y1..Y2 : course, V : 0..255) }
+Procedure VSlider(X, Y1, Y2, V : LongInt);
+Var I, TY : LongInt;
+Begin
+  For I := 0 To 8 Do
+    HLine(X + 12, X + 15, Y1 + (I * (Y2 - Y1)) Div 8, cBlack);
+  Sunken(X - 2, Y1 - 2, X + 2, Y2 + 2, cBlack);
+  TY := Y2 - (V * (Y2 - Y1)) Div 255;
+  Raised(X - 10, TY - 4, X + 10, TY + 4, False);
+  HLine(X - 7, X + 7, TY, cGray);
+End;
+
+{ Curseur horizontal (balance -100..100) }
+Procedure HSlider(X1, X2, Y, V : LongInt);
+Var TX : LongInt;
+Begin
+  Sunken(X1 - 2, Y - 2, X2 + 2, Y + 2, cBlack);
+  TX := X1 + ((V + 100) * (X2 - X1)) Div 200;
+  Raised(TX - 4, Y - 8, TX + 4, Y + 8, False);
+End;
+
+{ Reglage rapide (clic sur l'icone) : volume general et Muet, ferme
+  comme un menu (clic ailleurs) }
+Procedure VolPopOpen;
+Var W : LongInt;
+Begin
+  CloseMenus(0);
+  W := KCreate(ikVolPop, '', 0, ScrW - 84, TaskY - 152, 80, 150, WS_POPUP,
+               WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
+  If W < 0 Then Exit;
+  Wnds[W].K1 := 0; Wnds[W].K2 := -1;
+  MenuW[0] := W; MenuDepth := 1;
+  ShowW(W, True, False);
+  ZTop(W);
+End;
+
+Procedure PaintVolPop(W : LongInt);
+Var X, Y, WW, HH : LongInt;
+Begin
+  X := Wnds[W].X; Y := Wnds[W].Y; WW := Wnds[W].W; HH := Wnds[W].H;
+  Edge(X, Y, X + WW - 1, Y + HH - 1, cSilver, cBlack);
+  Edge(X + 1, Y + 1, X + WW - 2, Y + HH - 2, cWhite, cGray);
+  FBar(X + 2, Y + 2, X + WW - 3, Y + HH - 3, cSilver);
+  OutCenter(X, X + WW - 1, Y + 6, 'Volume', cBlack);
+  VSlider(X + 34, Y + 30, Y + 112, MixVol(0));
+  CheckBox(X + 12, Y + 126, L('Muet', 'Mute', 'Stumm', 'Muto', 'Silencio'),
+           MixMute[0]);
+End;
+
+Procedure VolSlideTo(W, Y, Y1, Y2, Line : LongInt);
+Begin
+  MixSet(Line, ((Y2 - Y) * 255) Div Max(1, Y2 - Y1), MixBal(Line));
+  KRepaint(W);
+  If (MixW0 >= 0) And Wnds[MixW0].Used Then KRepaint(MixW0);
+End;
+
+Procedure VolPopMouse(W, Msg, X, Y : LongInt);
+Begin
+  X := X + Wnds[W].X; Y := Y + Wnds[W].Y;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    If InRect(X, Y, Wnds[W].X + 20, Wnds[W].Y + 22, Wnds[W].X + 48,
+              Wnds[W].Y + 120) Then
+    Begin
+      Wnds[W].K2 := 0; CaptureWin := W;
+      VolSlideTo(W, Y, Wnds[W].Y + 30, Wnds[W].Y + 112, 0);
+    End
+    Else If Y >= Wnds[W].Y + 122 Then
+    Begin
+      MixMute[0] := Not MixMute[0];
+      SndApplyVol;
+      KRepaint(W); TaskbarChanged;
+      If (MixW0 >= 0) And Wnds[MixW0].Used Then KRepaint(MixW0);
+    End;
+  End
+  Else If (Msg = WM_MOUSEMOVE) And (Wnds[W].K2 = 0) Then
+    VolSlideTo(W, Y, Wnds[W].Y + 30, Wnds[W].Y + 112, 0)
+  Else If Msg = WM_LBUTTONUP Then
+  Begin
+    Wnds[W].K2 := -1; CaptureWin := -1;
+  End;
+End;
+
+{ Controle du volume : une colonne par source (general, Wave, MIDI,
+  CD audio, ligne) : balance, volume, Muet }
+Procedure MixerOpen;
+Begin
+  If (MixW0 >= 0) And Wnds[MixW0].Used And (Wnds[MixW0].IKind = ikMixer) Then
+  Begin
+    ActivateW(MixW0);
+    Exit;
+  End;
+  MixW0 := KCreate(ikMixer, MixName(0), icSpeaker, Max(0, (ScrW - 520) Div 2),
+                   Max(0, (TaskY - 300) Div 2), 520, 300,
+                   WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or
+                   WS_MINIMIZEBOX, 0);
+  If MixW0 < 0 Then Exit;
+  Wnds[MixW0].K2 := -1;
+  ShowW(MixW0, True, True);
+End;
+
+Procedure MixCol(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 4 + I * ((CX2 - CX1 - 8) Div MixLines);
+  X2 := X1 + (CX2 - CX1 - 8) Div MixLines - 4;
+  Y1 := CY1 + 4; Y2 := CY2 - 22;
+End;
+
+Procedure PaintMixer(W : LongInt);
+Var X1, Y1, X2, Y2, I, CX : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  For I := 0 To MixLines - 1 Do
+  Begin
+    MixCol(W, I, X1, Y1, X2, Y2);
+    If I > 0 Then
+    Begin
+      VLine(X1 - 3, Y1, Y2, cGray); VLine(X1 - 2, Y1, Y2, cWhite);
+    End;
+    If I = 0 Then
+      T := L('G'#130'n'#130'ral', 'Master', 'Gesamt', 'Generale', 'General')
+    Else T := MixName(I);
+    OutCenter(X1, X2, Y1 + 4, Fit(T, X2 - X1), cBlack);
+    CX := (X1 + X2) Div 2;
+    OutTxt(X1 + 6, Y1 + 30, 'Balance :', cBlack);
+    OutTxt(X1 + 4, Y1 + 50, 'G', cBlack);
+    OutTxt(X2 - 10, Y1 + 50, 'D', cBlack);
+    HSlider(X1 + 18, X2 - 18, Y1 + 58, MixBal(I));
+    OutTxt(X1 + 6, Y1 + 78, 'Volume :', cBlack);
+    VSlider(CX - 4, Y1 + 104, Y2 - 40, MixVol(I));
+    If I = 0 Then
+      T := L('Tout muet', 'Mute all', 'Alles stumm', 'Disattiva tutto',
+             'Silenciar todo')
+    Else T := L('Muet', 'Mute', 'Stumm', 'Muto', 'Silencio');
+    CheckBox(X1 + 6, Y2 - 22, T, MixMute[I]);
+  End;
+  KClient(W, X1, Y1, X2, Y2);
+  HLine(X1, X2, Y2 - 20, cGray); HLine(X1, X2, Y2 - 19, cWhite);
+  If SbOk Then T := SbName Else T := L('Synth'#130'tiseur FM (OPL2)',
+                                       'FM Synthesizer (OPL2)', 'OPL2', 'OPL2',
+                                       'OPL2');
+  OutTxt(X1 + 6, Y2 - 16, T, cBlack);
+End;
+
+Procedure MixerMouse(W, Msg, X, Y : LongInt);
+Var I, X1, Y1, X2, Y2, CX, K : LongInt;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  K := Wnds[W].K2;
+  If (Msg = WM_MOUSEMOVE) And (K >= 0) Then
+  Begin
+    MixCol(W, K Mod 10, X1, Y1, X2, Y2);
+    If K >= 10 Then
+      MixSet(K Mod 10, MixVol(K Mod 10),
+             ((X - X1 - 18) * 200) Div Max(1, X2 - X1 - 36) - 100)
+    Else
+      MixSet(K, ((Y2 - 40 - Y) * 255) Div Max(1, Y2 - 40 - Y1 - 104),
+             MixBal(K));
+    KRepaint(W);
+    TaskbarChanged;
+    Exit;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    Wnds[W].K2 := -1; CaptureWin := -1;
+    Exit;
+  End;
+  If Msg <> WM_LBUTTONDOWN Then Exit;
+  For I := 0 To MixLines - 1 Do
+  Begin
+    MixCol(W, I, X1, Y1, X2, Y2);
+    CX := (X1 + X2) Div 2;
+    If InRect(X, Y, X1 + 6, Y2 - 24, X2, Y2 - 6) Then
+    Begin
+      MixMute[I] := Not MixMute[I];
+      SndApplyVol;
+      KRepaint(W); TaskbarChanged;
+      Exit;
+    End;
+    If InRect(X, Y, X1 + 10, Y1 + 48, X2 - 10, Y1 + 68) Then
+    Begin
+      Wnds[W].K2 := 10 + I; CaptureWin := W;
+      MixerMouse(W, WM_MOUSEMOVE, X - Wnds[W].X - Wnds[W].CL,
+                 Y - Wnds[W].Y - Wnds[W].CT);
+      Exit;
+    End;
+    If InRect(X, Y, CX - 16, Y1 + 96, CX + 12, Y2 - 32) Then
+    Begin
+      Wnds[W].K2 := I; CaptureWin := W;
+      MixerMouse(W, WM_MOUSEMOVE, X - Wnds[W].X - Wnds[W].CL,
+                 Y - Wnds[W].Y - Wnds[W].CT);
+      Exit;
+    End;
+  End;
+End;
+
+{ Proprietes de Multimedia, onglet Audio : peripheriques de lecture
+  (Wave et MIDI), volume et icone de la barre des taches }
+Procedure AudioOpen;
+Begin
+  If (AudW >= 0) And Wnds[AudW].Used And (Wnds[AudW].IKind = ikAudio) Then
+  Begin
+    ActivateW(AudW);
+    Exit;
+  End;
+  AudW := KCreate(ikAudio, L('Propri'#130't'#130's de Multim'#130'dia',
+                  'Multimedia Properties', 'Eigenschaften von Multimedia',
+                  'Propriet'#133' - Multimedia', 'Propiedades de Multimedia'),
+                  icSpeaker, Max(0, (ScrW - 400) Div 2),
+                  Max(0, (TaskY - 300) Div 2), 400, 300,
+                  WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+  If AudW < 0 Then Exit;
+  Wnds[AudW].K2 := -1;
+  ShowW(AudW, True, True);
+End;
+
+Procedure PaintAudio(W : LongInt);
+Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  Edge(X1 + 6, Y1 + 26, X2 - 6, Y2 - 40, cWhite, cBlack);
+  FBar(X1 + 8, Y1 + 6, X1 + 70, Y1 + 27, cSilver);
+  HLine(X1 + 8, X1 + 68, Y1 + 5, cWhite);
+  VLine(X1 + 6, Y1 + 7, Y1 + 26, cWhite);
+  VLine(X1 + 69, Y1 + 7, Y1 + 26, cBlack);
+  OutTxt(X1 + 20, Y1 + 9, 'Audio', cBlack);
+  GroupBox(X1 + 16, Y1 + 44, X2 - 16, Y1 + 150, L('Lecture', 'Playback',
+           'Wiedergabe', 'Riproduzione', 'Reproducci'#162'n'));
+  PaintIcon(icSpeaker, X1 + 26, Y1 + 60, 32);
+  OutTxt(X1 + 70, Y1 + 58, L('Volume :', 'Volume:', 'Lautst'#132'rke:',
+         'Volume:', 'Volumen:'), cBlack);
+  OutTxt(X1 + 160, Y1 + 58, L('Faible', 'Low', 'Leise', 'Basso', 'Bajo'),
+         cBlack);
+  OutTxt(X2 - 70, Y1 + 58, L('Fort', 'High', 'Laut', 'Alto', 'Alto'), cBlack);
+  Sunken(X1 + 160, Y1 + 84, X2 - 30, Y1 + 88, cBlack);
+  I := X1 + 160 + (MixVol(0) * (X2 - 30 - X1 - 160)) Div 255;
+  Raised(I - 4, Y1 + 76, I + 4, Y1 + 96, False);
+  OutTxt(X1 + 26, Y1 + 106, L('P'#130'riph'#130'rique pr'#130'f'#130'r'#130' :',
+         'Preferred device:', 'Bevorzugtes Ger'#132't:',
+         'Periferica preferita:', 'Dispositivo preferido:'), cBlack);
+  If SbOk Then T := SbName + ' Wave Out' Else T := L('(aucun)', '(none)',
+                  '(keines)', '(nessuno)', '(ninguno)');
+  Sunken(X1 + 26, Y1 + 122, X2 - 26, Y1 + 142, cWhite);
+  OutTxt(X1 + 30, Y1 + 124, T, cBlack);
+  GroupBox(X1 + 16, Y1 + 162, X2 - 16, Y1 + 210, 'MIDI');
+  If OplOk Then T := L('Synth'#130'tiseur FM (OPL2)', 'FM Synthesizer (OPL2)',
+                       'FM-Synthesizer (OPL2)', 'Sintetizzatore FM (OPL2)',
+                       'Sintetizador FM (OPL2)')
+  Else T := L('(aucun)', '(none)', '(keines)', '(nessuno)', '(ninguno)');
+  OutTxt(X1 + 26, Y1 + 182, T, cBlack);
+  CheckBox(X1 + 16, Y1 + 218, L('Afficher le contr'#147'le du volume dans la ' +
+           'barre des t'#131'ches', 'Show volume control on the taskbar',
+           'Lautst'#132'rke in der Taskleiste anzeigen',
+           'Mostra il volume sulla barra', 'Mostrar volumen en la barra'),
+           TrayVol);
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If I = 0 Then T := TxtOk Else T := TxtCancel;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+Procedure AudioMouse(W, Msg, X, Y : LongInt);
+Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  If (Wnds[W].K2 = 0) And ((Msg = WM_MOUSEMOVE) Or (Msg = WM_LBUTTONDOWN))
+  Then
+  Begin
+    MixSet(0, ((X - X1 - 160) * 255) Div Max(1, X2 - 30 - X1 - 160),
+           MixBal(0));
+    KRepaint(W); TaskbarChanged;
+    If (MixW0 >= 0) And Wnds[MixW0].Used Then KRepaint(MixW0);
+    Exit;
+  End;
+  If (Msg = WM_LBUTTONUP) And (Wnds[W].K2 = 0) Then
+  Begin
+    Wnds[W].K2 := -1; CaptureWin := -1;
+    Exit;
+  End;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    If InRect(X, Y, X1 + 152, Y1 + 72, X2 - 22, Y1 + 100) Then
+    Begin
+      Wnds[W].K2 := 0; CaptureWin := W;
+      AudioMouse(W, WM_MOUSEMOVE, X - Wnds[W].X - Wnds[W].CL,
+                 Y - Wnds[W].Y - Wnds[W].CT);
+      Exit;
+    End;
+    If InRect(X, Y, X1 + 16, Y1 + 216, X2 - 16, Y1 + 232) Then
+    Begin
+      TrayVol := Not TrayVol;
+      KRepaint(W); TaskbarChanged;
+      Exit;
+    End;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        DestroyW(W);
+        AudW := -1;
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Proprietes Systeme : Gestionnaire de peripheriques                  }
+{ ------------------------------------------------------------------ }
+{ Comme Windows 95 : arbre du materiel par type (Ordinateur, puis les
+  categories, puis les peripheriques), Proprietes (etat, ressources :
+  plages d'E/S, IRQ, DMA, memoire) et Actualiser. Le materiel est celui
+  que le noyau a reconnu (son, reseau, ATA/ATAPI, VESA, souris) plus le
+  bus PCI (noms des circuits connus, sinon selon la classe), les ports
+  COM/LPT et les peripheriques systeme d'un PC. }
+
+Const
+  MaxDev = 64;
+  DevCats = 13;
+  MaxRow = 96;
+
+Var
+  DevN : LongInt;
+  DevCat, DevIco : Array[0..MaxDev - 1] Of LongInt;
+  DevName : Array[0..MaxDev - 1] Of String[63];
+  DevMfg : Array[0..MaxDev - 1] Of String[31];
+  DevRes : Array[0..MaxDev - 1] Of String[160];
+  CatOpen : Array[0..DevCats - 1] Of Boolean;
+  RowN : LongInt;
+  RowKind, RowIdx : Array[0..MaxRow - 1] Of LongInt;
+  SysW, DevPW : LongInt;
+  PciDispName, PciIdeName, PciNetName : String[63];
+  PciNetIrq : LongInt;
+  DmClickR, DmClickT : LongInt;          { double-clic dans l'arbre }
+
+Function CatName(C : LongInt) : String;
+Begin
+  Case C Of
+    0 : CatName := L('Cartes graphiques', 'Display adapters', 'Grafikkarten',
+                     'Schede video', 'Adaptadores de pantalla');
+    1 : CatName := L('Cartes r'#130'seau', 'Network adapters',
+                     'Netzwerkkarten', 'Schede di rete', 'Adaptadores de red');
+    2 : CatName := L('Clavier', 'Keyboard', 'Tastatur', 'Tastiera', 'Teclado');
+    3 : CatName := L('Contr'#147'leurs de disque dur', 'Hard disk controllers',
+                     'Festplattencontroller', 'Controller disco fisso',
+                     'Controladores de disco duro');
+    4 : CatName := L('Contr'#147'leurs de disquettes', 'Floppy disk ' +
+                     'controllers', 'Diskettencontroller',
+                     'Controller floppy', 'Controladores de disquete');
+    5 : CatName := L('Contr'#147'leurs son, vid'#130'o et jeu',
+                     'Sound, video and game controllers',
+                     'Audio-, Video- und Gamecontroller',
+                     'Controller audio, video e giochi',
+                     'Dispositivos de sonido, v'#161'deo y juegos');
+    6 : CatName := L('Lecteur de CD-ROM', 'CDROM', 'CD-ROM', 'CD-ROM',
+                     'CD-ROM');
+    7 : CatName := L('Lecteurs de disque', 'Disk drives', 'Laufwerke',
+                     'Unit'#133' disco', 'Unidades de disco');
+    8 : CatName := L('Moniteurs', 'Monitors', 'Monitore', 'Monitor',
+                     'Monitores');
+    9 : CatName := L('P'#130'riph'#130'riques syst'#138'me', 'System devices',
+                     'Systemkomponenten', 'Periferiche di sistema',
+                     'Dispositivos de sistema');
+    10 : CatName := L('Ports (COM et LPT)', 'Ports (COM & LPT)',
+                      'Anschl'#129'sse (COM und LPT)', 'Porte (COM e LPT)',
+                      'Puertos (COM y LPT)');
+    11 : CatName := L('Souris', 'Mouse', 'Maus', 'Mouse', 'Mouse');
+  Else
+    CatName := L('Autres p'#130'riph'#130'riques', 'Other devices',
+                 'Andere Komponenten', 'Altre periferiche',
+                 'Otros dispositivos');
+  End;
+End;
+
+Function CatIcon(C : LongInt) : LongInt;
+Begin
+  Case C Of
+    0, 8 : CatIcon := icDisplay;
+    1 : CatIcon := icNet;
+    2 : CatIcon := icKeyboard;
+    3, 4 : CatIcon := icDiskCtl;
+    5 : CatIcon := icSound;
+    6 : CatIcon := icCdrom;
+    7 : CatIcon := icHardDisk;
+    9 : CatIcon := icChip;
+    10 : CatIcon := icPort;
+    11 : CatIcon := icMouse;
+  Else
+    CatIcon := icQuestion;
+  End;
+End;
+
+Procedure DevAdd(C : LongInt; Const N, M, R : String);
+Begin
+  If DevN >= MaxDev Then Exit;
+  DevCat[DevN] := C; DevName[DevN] := N; DevMfg[DevN] := M;
+  DevRes[DevN] := R; DevIco[DevN] := CatIcon(C);
+  Inc(DevN);
+End;
+
+{ Ressources : I = plage d'E/S, Q = IRQ, D = DMA, M = memoire }
+Function RIo(A, B : LongInt) : String;
+Begin
+  RIo := 'I' + HexStr(A, 4) + '-' + HexStr(B, 4) + '|';
+End;
+
+Function RIrq(N : LongInt) : String;
+Begin
+  RIrq := 'Q' + Pad2(N) + '|';
+End;
+
+Function RDma(N : LongInt) : String;
+Begin
+  RDma := 'D' + Pad2(N) + '|';
+End;
+
+{ Nom d'un circuit PCI connu ('' sinon) }
+Function PciName(Id : LongInt) : String;
+Begin
+  Case Id Of
+    $12378086 : PciName := L('Pont h'#147'te PCI Intel 82441FX (440FX)',
+                             'Intel 82441FX (440FX) PCI host bridge',
+                             'Intel 82441FX PCI-Host-Bridge',
+                             'Bridge host PCI Intel 82441FX',
+                             'Puente host PCI Intel 82441FX');
+    $70008086 : PciName := L('Pont PCI vers ISA Intel 82371SB (PIIX3)',
+                             'Intel 82371SB (PIIX3) PCI to ISA bridge',
+                             'Intel 82371SB PCI-ISA-Bridge',
+                             'Bridge PCI-ISA Intel 82371SB',
+                             'Puente PCI a ISA Intel 82371SB');
+    $70108086 : PciName := 'Intel 82371SB (PIIX3) PCI Bus Master IDE';
+    $70208086 : PciName := 'Intel 82371SB (PIIX3) USB';
+    $71108086 : PciName := L('Pont PCI vers ISA Intel 82371AB (PIIX4)',
+                             'Intel 82371AB (PIIX4) PCI to ISA bridge',
+                             'Intel 82371AB PCI-ISA-Bridge',
+                             'Bridge PCI-ISA Intel 82371AB',
+                             'Puente PCI a ISA Intel 82371AB');
+    $71118086 : PciName := 'Intel 82371AB (PIIX4) PCI Bus Master IDE';
+    $71138086 : PciName := 'Intel 82371AB (PIIX4) ACPI';
+    $71908086, $71928086 : PciName := 'Intel 82443BX (440BX) Pentium(R) II';
+    $29C08086 : PciName := 'Intel 82G33 (Q35) PCI';
+    $29188086 : PciName := 'Intel ICH9 LPC';
+    $29228086 : PciName := 'Intel ICH9 SATA AHCI';
+    $11111234 : PciName := L('Carte VGA standard (VBE Bochs/QEMU)',
+                             'Standard VGA (Bochs/QEMU VBE)',
+                             'Standard-VGA (Bochs/QEMU VBE)',
+                             'VGA standard (VBE Bochs/QEMU)',
+                             'VGA est'#160'ndar (VBE Bochs/QEMU)');
+    $802910EC : PciName := 'Realtek RTL8029 (NE2000 PCI)';
+    $813910EC : PciName := 'Realtek RTL8139 Fast Ethernet';
+    $100E8086 : PciName := 'Intel PRO/1000 MT';
+    $50001274 : PciName := 'Ensoniq AudioPCI (ES1370)';
+    $24158086 : PciName := 'Intel 82801AA AC''97 Audio';
+    $88115333 : PciName := 'S3 Trio32/64';
+    $00B81013 : PciName := 'Cirrus Logic GD5446';
+    $BEEF80EE : PciName := 'VirtualBox Graphics Adapter';
+    $CAFE80EE : PciName := 'VirtualBox Guest Service';
+    $040515AD : PciName := 'VMware SVGA II';
+  Else
+    PciName := '';
+  End;
+End;
+
+Function PciCat(Cls : LongInt) : LongInt;
+Begin
+  Case Cls Shr 8 Of
+    $01 : PciCat := 3;
+    $02 : PciCat := 1;
+    $03 : PciCat := 0;
+    $04 : PciCat := 5;
+    $06 : PciCat := 9;
+  Else
+    PciCat := 12;
+  End;
+End;
+
+{ Bus PCI 0 : circuits presents (les cartes graphique, reseau et IDE
+  donnent leur nom aux entrees du noyau) }
+Procedure DevScanPci;
+Var D, F, Id, Cl, Nf, C, Irq : LongInt; N, R : String;
+Begin
+  PciDispName := ''; PciIdeName := ''; PciNetName := ''; PciNetIrq := -1;
+  If PciRead(0, 0, 0, 0) = -1 Then Exit;
+  DevAdd(9, L('Bus PCI', 'PCI bus', 'PCI-Bus', 'Bus PCI', 'Bus PCI'),
+         '(' + L('Standard', 'Standard', 'Standard', 'Standard',
+                 'Est'#160'ndar') +
+         ')', RIo($CF8, $CFF));
+  For D := 0 To 31 Do
+  Begin
+    Id := PciRead(0, D, 0, 0);
+    If (Id And $FFFF) = $FFFF Then Continue;
+    If ((PciRead(0, D, 0, $0C) Shr 16) And $80) <> 0 Then Nf := 7
+    Else Nf := 0;
+    For F := 0 To Nf Do
+    Begin
+      Id := PciRead(0, D, F, 0);
+      If (Id And $FFFF) = $FFFF Then Continue;
+      Cl := (PciRead(0, D, F, 8) Shr 16) And $FFFF;
+      N := PciName(Id);
+      C := PciCat(Cl);
+      If N = '' Then
+        N := L('P'#130'riph'#130'rique PCI ', 'PCI device ', 'PCI-Ger'#132't ',
+               'Periferica PCI ', 'Dispositivo PCI ') +
+             HexStr(Id And $FFFF, 4) +
+             ':' + HexStr((Id Shr 16) And $FFFF, 4);
+      Irq := PciRead(0, D, F, $3C) And 255;
+      R := '';
+      If (Irq > 0) And (Irq < 16) Then R := RIrq(Irq);
+      Case Cl Of
+        $0300, $0380 : If PciDispName = '' Then PciDispName := N;
+        $0200 : If PciNetName = '' Then
+                Begin
+                  PciNetName := N;
+                  If (Irq > 0) And (Irq < 16) Then PciNetIrq := Irq;
+                End;
+        $0101 : If PciIdeName = '' Then PciIdeName := N;
+      Else
+        DevAdd(C, N, '(PCI ' + HexStr(Id And $FFFF, 4) + ')', R);
+      End;
+    End;
+  End;
+End;
+
+Function ComPresent(B : LongInt) : Boolean;
+Begin
+  Port[B + 7] := $5A;
+  ComPresent := Port[B + 7] = $5A;
+End;
+
+Function LptPresent(B : LongInt) : Boolean;
+Begin
+  Port[B] := $AA;
+  LptPresent := Port[B] = $AA;
+End;
+
+Procedure DevScan;
+Var I, V : LongInt; N, Std : String;
+Begin
+  DevN := 0;
+  Std := '(' + L('P'#130'riph'#130'riques standard', 'Standard devices',
+         'Standardger'#132'te', 'Periferiche standard',
+         'Dispositivos est'#160'ndar') + ')';
+  DevScanPci;
+  { carte graphique et moniteur }
+  N := PciDispName;
+  If N = '' Then N := PStr(BootInfo + $80);
+  If N = '' Then
+    N := L('Carte VGA standard', 'Standard VGA display adapter',
+           'Standard-VGA-Grafikkarte', 'Scheda VGA standard',
+           'Adaptador VGA est'#160'ndar');
+  If VmN > 0 Then
+    DevAdd(0, N, 'VESA ' + IntStr(MemW[0:BootInfo + $40] Shr 8) + '.' +
+           IntStr(MemW[0:BootInfo + $40] And 255), RIo($3B0, $3BB) +
+           RIo($3C0, $3DF) + 'M000A0000-000BFFFF|M' + HexStr(Lfb, 8) +
+           '-' + HexStr(Lfb + MemW[0:BootInfo + $42] * 65536 - 1, 8) + '|')
+  Else
+    DevAdd(0, N, Std, RIo($3B0, $3BB) + RIo($3C0, $3DF) +
+           'M000A0000-000BFFFF|');
+  DevAdd(8, L('Moniteur standard', 'Standard monitor', 'Standardmonitor',
+         'Monitor standard', 'Monitor est'#160'ndar'), Std, '');
+  { clavier, souris }
+  DevAdd(2, L('Clavier standard 101/102 touches', 'Standard 101/102-Key ' +
+         'Keyboard', 'Standardtastatur (101/102 Tasten)',
+         'Tastiera standard a 101/102 tasti', 'Teclado est'#160'ndar 101/102'),
+         Std, RIo($60, $60) + RIo($64, $64) + RIrq(1));
+  If MouOk Then
+    DevAdd(11, L('Souris PS/2 standard', 'Standard PS/2 Port Mouse',
+           'PS/2-Standardmaus', 'Mouse PS/2 standard',
+           'Mouse PS/2 est'#160'ndar'), Std, RIrq(12));
+  { disques : controleur IDE, disques ATA, CD-ROM ATAPI }
+  If PciIdeName <> '' Then N := PciIdeName
+  Else N := L('Contr'#147'leur IDE standard (double FIFO)',
+              'Standard Dual PCI IDE Controller', 'Standard-IDE-Controller',
+              'Controller IDE standard', 'Controlador IDE est'#160'ndar');
+  DevAdd(3, N, Std, '');
+  DevAdd(3, L('Contr'#147'leur IDE principal', 'Primary IDE controller',
+         'Prim'#132'rer IDE-Kanal', 'Controller IDE primario',
+         'Controlador IDE principal'), Std, RIo($1F0, $1F7) +
+         RIo($3F6, $3F6) + RIrq(14));
+  DevAdd(3, L('Contr'#147'leur IDE secondaire', 'Secondary IDE controller',
+         'Sekund'#132'rer IDE-Kanal', 'Controller IDE secondario',
+         'Controlador IDE secundario'), Std, RIo($170, $177) +
+         RIo($376, $376) + RIrq(15));
+  For I := 0 To DiskN - 1 Do
+  Begin
+    N := DiskModel[I];
+    If N = '' Then N := 'GENERIC IDE  DISK TYPE47';
+    DevAdd(7, N, Std, '');
+  End;
+  If CmosRead($10) <> 0 Then
+  Begin
+    DevAdd(4, L('Contr'#147'leur de disquettes standard', 'Standard Floppy ' +
+           'Disk Controller', 'Standard-Diskettencontroller',
+           'Controller floppy standard',
+           'Controlador de disquete est'#160'ndar'),
+           Std, RIo($3F0, $3F5) + RIo($3F7, $3F7) + RIrq(6) + RDma(2));
+    DevAdd(7, L('Lecteur de disquettes standard', 'Standard floppy disk ' +
+           'drive', 'Standard-Diskettenlaufwerk', 'Unit'#133' floppy standard',
+           'Unidad de disquete est'#160'ndar'), Std, '');
+  End;
+  If AtaFound Then
+  Begin
+    N := CdModel;
+    If N = '' Then N := 'CD-ROM ATAPI';
+    DevAdd(6, N, Std, '');
+  End;
+  { reseau, son }
+  If NicBase <> 0 Then
+  Begin
+    If PciNetName <> '' Then N := PciNetName
+    Else N := L('Compatible NE2000', 'NE2000 Compatible', 'NE2000-kompatibel',
+                'Compatibile NE2000', 'Compatible NE2000');
+    If PciNetIrq > 0 Then
+      DevAdd(1, N, 'Novell/Anthem', RIo(NicBase, NicBase + $1F) +
+             RIrq(PciNetIrq))
+    Else DevAdd(1, N, 'Novell/Anthem', RIo(NicBase, NicBase + $1F));
+  End;
+  If SbOk Then
+  Begin
+    If Sb16 Then
+      DevAdd(5, 'Creative ' + SbName, 'Creative Labs',
+             RIo(SbBase, SbBase + $F) +
+             RIo($330, $331) + RIrq(SbIrq) + RDma(SbDma8) + RDma(SbDma16))
+    Else
+      DevAdd(5, 'Creative ' + SbName, 'Creative Labs',
+             RIo(SbBase, SbBase + $F) +
+             RIrq(SbIrq) + RDma(SbDma8));
+  End;
+  If OplOk Then
+    DevAdd(5, L('Synth'#130'tiseur FM OPL2 (AdLib)', 'OPL2 FM Synthesizer ' +
+           '(AdLib)', 'OPL2-FM-Synthesizer (AdLib)', 'Sintetizzatore FM OPL2',
+           'Sintetizador FM OPL2'), 'Yamaha', RIo($388, $389));
+  { ports }
+  If ComPresent($3F8) Then
+    DevAdd(10, L('Port de communication (COM1)', 'Communications Port (COM1)',
+           'Kommunikationsanschluss (COM1)', 'Porta di comunicazione (COM1)',
+           'Puerto de comunicaciones (COM1)'), Std, RIo($3F8, $3FF) + RIrq(4));
+  If ComPresent($2F8) Then
+    DevAdd(10, L('Port de communication (COM2)', 'Communications Port (COM2)',
+           'Kommunikationsanschluss (COM2)', 'Porta di comunicazione (COM2)',
+           'Puerto de comunicaciones (COM2)'), Std, RIo($2F8, $2FF) + RIrq(3));
+  If LptPresent($378) Then
+    DevAdd(10, L('Port imprimante (LPT1)', 'Printer Port (LPT1)',
+           'Druckeranschluss (LPT1)', 'Porta stampante (LPT1)',
+           'Puerto de impresora (LPT1)'), Std, RIo($378, $37A) + RIrq(7));
+  { peripheriques systeme d'un PC }
+  DevAdd(9, L('Contr'#147'leur d''interruption programmable',
+         'Programmable interrupt controller', 'Interruptcontroller',
+         'Controller di interrupt', 'Controlador de interrupciones'), Std,
+         RIo($20, $21) + RIo($A0, $A1) + RIrq(2));
+  DevAdd(9, L('Horloge syst'#138'me', 'System timer', 'Systemzeitgeber',
+         'Timer di sistema', 'Reloj del sistema'), Std, RIo($40, $43) +
+         RIrq(0));
+  DevAdd(9, L('Contr'#147'leur d''acc'#138's direct '#133' la m'#130'moire',
+         'Direct memory access controller', 'DMA-Controller',
+         'Controller DMA', 'Controlador de acceso directo a memoria'), Std,
+         RIo($0, $F) + RIo($81, $8F) + RIo($C0, $DF) + RDma(4));
+  DevAdd(9, L('Horloge syst'#138'me CMOS/temps r'#130'el', 'System CMOS/real ' +
+         'time clock', 'Echtzeituhr', 'Orologio CMOS', 'Reloj CMOS'), Std,
+         RIo($70, $71) + RIrq(8));
+  DevAdd(9, L('Haut-parleur du syst'#138'me', 'System speaker',
+         'Systemlautsprecher', 'Altoparlante di sistema',
+         'Altavoz del sistema'), Std, RIo($61, $61));
+  DevAdd(9, L('Processeur de donn'#130'es num'#130'riques', 'Numeric data ' +
+         'processor', 'Numerischer Coprozessor', 'Coprocessore matematico',
+         'Coprocesador num'#130'rico'), Std, RIo($F0, $FF) + RIrq(13));
+  DevAdd(9, L('Ressources de la carte m'#138're', 'Motherboard resources',
+         'Hauptplatinenressourcen', 'Risorse della scheda madre',
+         'Recursos de la placa base'), Std, '');
+  V := 0;
+  For I := 0 To DevCats - 1 Do CatOpen[I] := False;
+End;
+
+{ Processeur (CPUID quand il existe) }
+Function CpuName : String;
+Var Has, A, B, C, D : LongInt; S : String;
+Begin
+  asm
+    pushfd
+    pop eax
+    mov ecx,eax
+    xor eax,200000h
+    push eax
+    popfd
+    pushfd
+    pop eax
+    xor eax,ecx
+    mov Has,eax
+    push ecx
+    popfd
+  end;
+  If (Has And $200000) = 0 Then
+  Begin
+    CpuName := '80386';
+    Exit;
+  End;
+  asm
+    push ebx
+    xor eax,eax
+    db 0Fh,0A2h
+    mov B,ebx
+    mov C,ecx
+    mov D,edx
+    mov eax,1
+    db 0Fh,0A2h
+    mov A,eax
+    pop ebx
+  end;
+  S := '';
+  For Has := 0 To 3 Do S := S + Chr((B Shr (Has * 8)) And 255);
+  For Has := 0 To 3 Do S := S + Chr((D Shr (Has * 8)) And 255);
+  For Has := 0 To 3 Do S := S + Chr((C Shr (Has * 8)) And 255);
+  Case (A Shr 8) And 15 Of
+    4 : S := S + ' 80486';
+    5 : S := S + ' Pentium(r)';
+    6 : S := S + ' Pentium(r) Pro/II';
+  Else
+    S := S + ' (' + L('famille ', 'family ', 'Familie ', 'famiglia ',
+              'familia ') + IntStr((A Shr 8) And 15) + ')';
+  End;
+  CpuName := S;
+End;
+
+Procedure DmBuildRows;
+Var C, D : LongInt; Any : Boolean;
+Begin
+  RowN := 1; RowKind[0] := 0; RowIdx[0] := 0;
+  For C := 0 To DevCats - 1 Do
+  Begin
+    Any := False;
+    For D := 0 To DevN - 1 Do If DevCat[D] = C Then Any := True;
+    If Any And (RowN < MaxRow) Then
+    Begin
+      RowKind[RowN] := 1; RowIdx[RowN] := C; Inc(RowN);
+      If CatOpen[C] Then
+        For D := 0 To DevN - 1 Do
+          If (DevCat[D] = C) And (RowN < MaxRow) Then
+          Begin
+            RowKind[RowN] := 2; RowIdx[RowN] := D; Inc(RowN);
+          End;
+    End;
+  End;
+End;
+
+Procedure SysOpen;
+Begin
+  If (SysW >= 0) And Wnds[SysW].Used And (Wnds[SysW].IKind = ikSysProps) Then
+  Begin
+    ActivateW(SysW);
+    Exit;
+  End;
+  DevScan;
+  SysW := KCreate(ikSysProps, L('Propri'#130't'#130's Syst'#138'me',
+                  'System Properties', 'Eigenschaften von System',
+                  'Propriet'#133' - Sistema', 'Propiedades del Sistema'),
+                  icSystem, Max(0, (ScrW - 440) Div 2),
+                  Max(0, (TaskY - 430) Div 2), 440, 430,
+                  WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+  If SysW < 0 Then Exit;
+  Wnds[SysW].K1 := 1; Wnds[SysW].K2 := 0; Wnds[SysW].K3 := 0;
+  ShowW(SysW, True, True);
+End;
+
+{ Zone de la liste (coordonnees ecran) et nombre de lignes visibles }
+Procedure DmList(W : LongInt; Var X1, Y1, X2, Y2, Vis : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 18; Y1 := CY1 + 66; X2 := CX2 - 18; Y2 := CY2 - 86;
+  Vis := (Y2 - Y1 - 4) Div 18;
+End;
+
+{ Boutons Proprietes, Actualiser, Supprimer, Imprimer }
+Procedure DmBtn(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 18 + I * 100; X2 := X1 + 94;
+  Y1 := CY2 - 78; Y2 := Y1 + 22;
+End;
+
+Procedure TabStrip(W, N, Sel : LongInt; Const T0, T1 : String);
+Var X1, Y1, X2, Y2, I, A, B, Y : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  Edge(X1 + 6, Y1 + 26, X2 - 6, Y2 - 40, cWhite, cBlack);
+  Edge(X1 + 7, Y1 + 27, X2 - 7, Y2 - 41, cSilver, cGray);
+  A := X1 + 6;
+  For I := 0 To N - 1 Do
+  Begin
+    If I = 0 Then T := T0 Else T := T1;
+    B := A + TextW(T) + 20;
+    Y := Y1 + 6;
+    If I = Sel Then
+    Begin
+      Y := Y - 2;
+      FBar(A, Y, B, Y1 + 27, cSilver);
+    End;
+    HLine(A + 2, B - 2, Y, cWhite);
+    VLine(A, Y + 2, Y1 + 26, cWhite);
+    VLine(B, Y + 2, Y1 + 26, cBlack);
+    VLine(B - 1, Y + 1, Y1 + 26, cGray);
+    OutTxt(A + 10, Y + 4, T, cBlack);
+    A := B + 2;
+  End;
+End;
+
+Function TabHit(W, N, X, Y : LongInt; Const T0, T1 : String) : LongInt;
+Var X1, Y1, X2, Y2, I, A, B : LongInt; T : String;
+Begin
+  TabHit := -1;
+  KClient(W, X1, Y1, X2, Y2);
+  A := X1 + 6;
+  For I := 0 To N - 1 Do
+  Begin
+    If I = 0 Then T := T0 Else T := T1;
+    B := A + TextW(T) + 20;
+    If InRect(X, Y, A, Y1 + 4, B, Y1 + 26) Then TabHit := I;
+    A := B + 2;
+  End;
+End;
+
+Function SysTab0 : String;
+Begin
+  SysTab0 := L('G'#130'n'#130'ral', 'General', 'Allgemein', 'Generale',
+               'General');
+End;
+
+Function SysTab1 : String;
+Begin
+  SysTab1 := L('Gestionnaire de p'#130'riph'#130'riques', 'Device Manager',
+               'Ger'#132'te-Manager', 'Gestione periferiche',
+               'Administrador de dispositivos');
+End;
+
+Procedure PaintSysProps(W : LongInt);
+Var X1, Y1, X2, Y2, I, R, Y, X, Vis, LX1, LY1, LX2, LY2, Ic, Fg, BX1, BY1,
+    BX2, BY2, TY : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  TabStrip(W, 2, Wnds[W].K1, SysTab0, SysTab1);
+  If Wnds[W].K1 = 0 Then
+  Begin
+    PaintIcon(icComputer, X1 + 40, Y1 + 70, 64);
+    X := X1 + 200; Y := Y1 + 50;
+    OutTxt(X, Y, L('Syst'#138'me :', 'System:', 'System:', 'Sistema:',
+           'Sistema:'), cBlack);
+    OutTxt(X + 20, Y + 18, 'Pasdows 95', cBlack);
+    OutTxt(X + 20, Y + 36, KVersion, cBlack);
+    OutTxt(X, Y + 70, L('Enregistr'#130' '#133' :', 'Registered to:',
+           'Registriert f'#129'r:', 'Registrato a:', 'Registrado a:'), cBlack);
+    OutTxt(X + 20, Y + 88, 'Gladir.com', cBlack);
+    OutTxt(X, Y + 122, L('Ordinateur :', 'Computer:', 'Computer:',
+           'Computer:', 'Equipo:'), cBlack);
+    T := CpuName;
+    R := Pos(' ', T);
+    If R = 0 Then R := Length(T) + 1;
+    OutTxt(X + 20, Y + 140, Copy(T, 1, R - 1), cBlack);
+    OutTxt(X + 20, Y + 158, Fit(Copy(T, R + 1, 255), X2 - X - 30), cBlack);
+    { memoire comptee comme Windows 95 (avec la zone de 640 Ko a 1 Mo) }
+    I := MemKb + 384;
+    OutTxt(X + 20, Y + 176, IntStr(I Div 1024) + ',' +
+           IntStr(((I Mod 1024) * 10) Div 1024) +
+           L(' Mo de RAM', ' MB RAM', ' MB RAM', ' MB di RAM', ' MB de RAM'),
+           cBlack);
+  End
+  Else
+  Begin
+    RadioButton(X1 + 18, Y1 + 38, L('Par type', 'View devices by type',
+                'Nach Typ', 'Per tipo', 'Por tipo'), True);
+    RadioButton(X1 + 200, Y1 + 38, L('Par connexion', 'View by connection',
+                'Nach Anschluss', 'Per connessione', 'Por conexi'#162'n'),
+                False);
+    DmList(W, LX1, LY1, LX2, LY2, Vis);
+    Sunken(LX1, LY1, LX2, LY2, cWhite);
+    DmBuildRows;
+    If Wnds[W].K2 >= RowN Then Wnds[W].K2 := RowN - 1;
+    If Wnds[W].K3 > Max(0, RowN - Vis) Then Wnds[W].K3 := Max(0, RowN - Vis);
+    For R := Wnds[W].K3 To Min(RowN - 1, Wnds[W].K3 + Vis - 1) Do
+    Begin
+      Y := LY1 + 3 + (R - Wnds[W].K3) * 18;
+      Case RowKind[R] Of
+        0 : Begin
+              X := LX1 + 6; Ic := icComputer;
+              T := L('Ordinateur', 'Computer', 'Computer', 'Computer',
+                     'Equipo');
+            End;
+        1 : Begin
+              X := LX1 + 26; Ic := CatIcon(RowIdx[R]);
+              T := CatName(RowIdx[R]);
+              { case + / - }
+              Box(X - 14, Y + 4, X - 6, Y + 12, cGray);
+              HLine(X - 12, X - 8, Y + 8, cBlack);
+              If Not CatOpen[RowIdx[R]] Then
+                VLine(X - 10, Y + 6, Y + 10, cBlack);
+            End;
+      Else
+        Begin
+          X := LX1 + 46; Ic := DevIco[RowIdx[R]];
+          T := DevName[RowIdx[R]];
+        End;
+      End;
+      PaintIcon(Ic, X, Y, 16);
+      Fg := cBlack;
+      If R = Wnds[W].K2 Then
+      Begin
+        FBar(X + 19, Y, X + 22 + TextW(T), Y + 16, cNavy);
+        Fg := cWhite;
+      End;
+      OutTxt(X + 21, Y, Fit(T, LX2 - X - 40), Fg);
+    End;
+    { barre de defilement }
+    If RowN > Vis Then
+    Begin
+      FBar(LX2 - 17, LY1 + 2, LX2 - 2, LY2 - 2, cSilver);
+      Raised(LX2 - 17, LY1 + 2, LX2 - 2, LY1 + 17, False);
+      Arrow(LX2 - 12, LY1 + 8, 2, cBlack);
+      Raised(LX2 - 17, LY2 - 17, LX2 - 2, LY2 - 2, False);
+      Arrow(LX2 - 12, LY2 - 11, 1, cBlack);
+      TY := LY1 + 18 + (Wnds[W].K3 * (LY2 - LY1 - 52)) Div
+            Max(1, RowN - Vis);
+      Raised(LX2 - 17, TY, LX2 - 2, TY + 16, False);
+    End;
+    For I := 0 To 3 Do
+    Begin
+      DmBtn(W, I, BX1, BY1, BX2, BY2);
+      Case I Of
+        0 : T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+                   'Propriet'#133, 'Propiedades');
+        1 : T := L('Actualiser', 'Refresh', 'Aktualisieren', 'Aggiorna',
+                   'Actualizar');
+        2 : T := L('Supprimer', 'Remove', 'Entfernen', 'Rimuovi', 'Quitar');
+      Else
+        T := L('Imprimer...', 'Print...', 'Drucken...', 'Stampa...',
+               'Imprimir...');
+      End;
+      Raised(BX1, BY1, BX2, BY2, (PressWin = W) And (PressBtn = 10 + I));
+      If I >= 2 Then
+      Begin
+        OutCenter(BX1 + 1, BX2 + 1, BY1 + 4, T, cWhite);
+        OutCenter(BX1, BX2, BY1 + 3, T, cGray);
+      End
+      Else OutCenter(BX1, BX2, BY1 + 3, T, cBlack);
+    End;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If I = 0 Then T := TxtOk Else T := TxtCancel;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+Procedure DevPropsOpen(D : LongInt);
+Begin
+  If (DevPW >= 0) And Wnds[DevPW].Used Then DestroyW(DevPW);
+  DevPW := KCreate(ikDevProps, L('Propri'#130't'#130's de ', 'Properties of ',
+                   'Eigenschaften von ', 'Propriet'#133' di ',
+                   'Propiedades de ') + Fit(DevName[D], 220), DevIco[D],
+                   Max(0, (ScrW - 440) Div 2), Max(0, (TaskY - 360) Div 2),
+                   440, 360, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                   WS_EX_DLGMODALFRAME);
+  If DevPW < 0 Then Exit;
+  Wnds[DevPW].K1 := D;
+  ShowW(DevPW, True, True);
+End;
+
+Procedure PaintDevProps(W : LongInt);
+Var X1, Y1, X2, Y2, D, Y, P, BX1, BY1, BX2, BY2 : LongInt; R, T, V : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  D := Wnds[W].K1;
+  PaintIcon(DevIco[D], X1 + 14, Y1 + 12, 32);
+  OutTxt(X1 + 60, Y1 + 20, Fit(DevName[D], X2 - X1 - 70), cBlack);
+  HLine(X1 + 12, X2 - 12, Y1 + 52, cGray);
+  HLine(X1 + 12, X2 - 12, Y1 + 53, cWhite);
+  OutTxt(X1 + 14, Y1 + 62, L('Type de p'#130'riph'#130'rique :', 'Device type:',
+         'Ger'#132'tetyp:', 'Tipo:', 'Tipo:'), cBlack);
+  OutTxt(X1 + 200, Y1 + 62, Fit(CatName(DevCat[D]), X2 - X1 - 210), cBlack);
+  OutTxt(X1 + 14, Y1 + 80, L('Fabricant :', 'Manufacturer:', 'Hersteller:',
+         'Produttore:', 'Fabricante:'), cBlack);
+  OutTxt(X1 + 200, Y1 + 80, Fit(DevMfg[D], X2 - X1 - 210), cBlack);
+  GroupBox(X1 + 12, Y1 + 110, X2 - 12, Y1 + 150, L(''#144'tat du ' +
+           'p'#130'riph'#130'rique', 'Device status', 'Ger'#132'testatus',
+           'Stato', 'Estado'));
+  OutTxt(X1 + 22, Y1 + 126, Fit(L('Ce p'#130'riph'#130'rique fonctionne ' +
+         'correctement.', 'This device is working properly.',
+         'Das Ger'#132't ist betriebsbereit.', 'La periferica funziona.',
+         'Este dispositivo funciona correctamente.'), X2 - X1 - 40), cBlack);
+  GroupBox(X1 + 12, Y1 + 166, X2 - 12, Y2 - 40, L('Ressources',
+           'Resources', 'Ressourcen', 'Risorse', 'Recursos'));
+  Sunken(X1 + 22, Y1 + 182, X2 - 22, Y2 - 50, cWhite);
+  R := DevRes[D]; Y := Y1 + 186;
+  If R = '' Then
+    OutTxt(X1 + 28, Y, L('Aucune ressource requise.', 'No resources ' +
+           'required.', 'Keine Ressourcen.', 'Nessuna risorsa.',
+           'Sin recursos.'), cGray);
+  While (R <> '') And (Y < Y2 - 66) Do
+  Begin
+    P := Pos('|', R);
+    If P = 0 Then P := Length(R) + 1;
+    V := Copy(R, 2, P - 2);
+    Case R[1] Of
+      'I' : T := L('Plage d''entr'#130'e/sortie', 'Input/Output Range',
+                   'E/A-Bereich', 'Intervallo I/O', 'Intervalo de E/S');
+      'Q' : T := L('Requ'#136'te d''interruption', 'Interrupt Request',
+                   'Interrupt', 'Interrupt', 'Interrupci'#162'n');
+      'D' : T := L('Acc'#138's direct '#133' la m'#130'moire',
+                   'Direct Memory Access', 'DMA', 'DMA', 'DMA');
+    Else
+      T := L('Plage de m'#130'moire', 'Memory Range', 'Speicherbereich',
+             'Intervallo memoria', 'Intervalo de memoria');
+    End;
+    OutTxt(X1 + 28, Y, Fit(T, 220), cBlack);
+    OutTxt(X1 + 262, Y, V, cBlack);
+    Delete(R, 1, P);
+    Y := Y + 18;
+  End;
+  DlgBtnRect(W, 0, 1, BX1, BY1, BX2, BY2);
+  PushButton(BX1, BY1, BX2, BY2, TxtOk, (PressWin = W) And (PressBtn = 0),
+             True);
+End;
+
+Procedure DevPropsMouse(W, Msg, X, Y : LongInt);
+Var BX1, BY1, BX2, BY2 : LongInt;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  DlgBtnRect(W, 0, 1, BX1, BY1, BX2, BY2);
+  If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+  Begin
+    If Msg = WM_LBUTTONDOWN Then
+    Begin
+      PressWin := W; PressBtn := 0; CaptureWin := W;
+      KRepaint(W);
+    End
+    Else If (Msg = WM_LBUTTONUP) And (PressWin = W) Then
+    Begin
+      PressWin := -1; CaptureWin := -1;
+      DestroyW(W);
+      DevPW := -1;
+    End;
+  End
+  Else If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+{ Ligne R : deplier/replier une categorie, ouvrir un peripherique }
+Procedure DmActivate(W, R : LongInt);
+Begin
+  If (R < 0) Or (R >= RowN) Then Exit;
+  Case RowKind[R] Of
+    1 : CatOpen[RowIdx[R]] := Not CatOpen[RowIdx[R]];
+    2 : DevPropsOpen(RowIdx[R]);
+  End;
+  KRepaint(W);
+End;
+
+Procedure SysPropsMouse(W, Msg, X, Y : LongInt);
+Var I, LX1, LY1, LX2, LY2, Vis, R, BX1, BY1, BX2, BY2, X0 : LongInt;
+    Dbl : Boolean;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  Dbl := Msg = WM_LBUTTONDBLCLK;
+  If Dbl Then Msg := WM_LBUTTONDOWN;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    I := TabHit(W, 2, X, Y, SysTab0, SysTab1);
+    If I >= 0 Then
+    Begin
+      Wnds[W].K1 := I;
+      KRepaint(W);
+      Exit;
+    End;
+  End;
+  If (Wnds[W].K1 = 1) And (Msg = WM_LBUTTONDOWN) Then
+  Begin
+    DmList(W, LX1, LY1, LX2, LY2, Vis);
+    DmBuildRows;
+    If InRect(X, Y, LX1, LY1, LX2, LY2) Then
+    Begin
+      If (RowN > Vis) And (X >= LX2 - 17) Then
+      Begin
+        If Y < LY1 + 18 Then Wnds[W].K3 := Max(0, Wnds[W].K3 - 1)
+        Else If Y > LY2 - 18 Then
+          Wnds[W].K3 := Min(RowN - Vis, Wnds[W].K3 + 1)
+        Else If Y < (LY1 + LY2) Div 2 Then
+          Wnds[W].K3 := Max(0, Wnds[W].K3 - Vis)
+        Else Wnds[W].K3 := Min(RowN - Vis, Wnds[W].K3 + Vis);
+        KRepaint(W);
+        Exit;
+      End;
+      R := Wnds[W].K3 + (Y - LY1 - 3) Div 18;
+      If (R >= 0) And (R < RowN) Then
+      Begin
+        X0 := LX1 + 26;
+        If (RowKind[R] = 1) And (X >= X0 - 16) And (X <= X0 - 4) Then
+          DmActivate(W, R)
+        Else If (R = Wnds[W].K2) And (Dbl Or ((DmClickR = R) And
+                (Ticks - DmClickT < 700))) Then
+        Begin
+          DmClickR := -1;
+          DmActivate(W, R);
+        End
+        Else
+        Begin
+          Wnds[W].K2 := R;
+          DmClickR := R; DmClickT := Ticks;
+          KRepaint(W);
+        End;
+      End;
+      Exit;
+    End;
+    For I := 0 To 1 Do
+    Begin
+      DmBtn(W, I, BX1, BY1, BX2, BY2);
+      If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+      Begin
+        If I = 0 Then
+        Begin
+          If (Wnds[W].K2 >= 0) And (Wnds[W].K2 < RowN) Then
+          Begin
+            If RowKind[Wnds[W].K2] = 2 Then DevPropsOpen(RowIdx[Wnds[W].K2])
+            Else DmActivate(W, Wnds[W].K2);
+          End;
+        End
+        Else
+        Begin
+          DevScan;
+          Wnds[W].K2 := 0; Wnds[W].K3 := 0;
+          KRepaint(W);
+        End;
+        Exit;
+      End;
+    End;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        DestroyW(W);
+        SysW := -1;
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure SysPropsKey(W, VK : LongInt);
+Var LX1, LY1, LX2, LY2, Vis, R : LongInt;
+Begin
+  If VK = $1B Then
+  Begin
+    DestroyW(W);
+    SysW := -1;
+    Exit;
+  End;
+  If Wnds[W].K1 <> 1 Then Exit;
+  DmBuildRows;
+  DmList(W, LX1, LY1, LX2, LY2, Vis);
+  R := Wnds[W].K2;
+  Case VK Of
+    $26 : If R > 0 Then Dec(R);
+    $28 : If R < RowN - 1 Then Inc(R);
+    $25 : If RowKind[R] = 1 Then CatOpen[RowIdx[R]] := False;
+    $27 : If RowKind[R] = 1 Then CatOpen[RowIdx[R]] := True;
+    $0D : DmActivate(W, R);
+  End;
+  Wnds[W].K2 := R;
+  If R < Wnds[W].K3 Then Wnds[W].K3 := R;
+  If R >= Wnds[W].K3 + Vis Then Wnds[W].K3 := R - Vis + 1;
+  KRepaint(W);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Boites Ouvrir et Enregistrer sous (Bloc-notes, COMDLG32)             }
+{ ------------------------------------------------------------------ }
+
+Function FindFirstFileA(PName, P : LongInt) : LongInt; Forward;
+Function FindNextFileA(H, P : LongInt) : LongInt; Forward;
+Function FindClose(H : LongInt) : LongInt; Forward;
+
+{ Contenu du dossier FdDir : dossiers puis fichiers du type choisi }
+Procedure FdRefresh;
+Var H, J : LongInt; Fd : Array[0..319] Of Byte; Pat, Nm : String;
+    Dir : Boolean;
+Begin
+  FdN := 0; FdSel := -1; FdTop := 0;
+  Pat := FdDir;
+  If (Length(Pat) > 0) And (Pat[Length(Pat)] <> '\') Then Pat := Pat + '\';
+  Pat := Pat + '*.*' + #0;
+  H := FindFirstFileA(LongInt(@Pat[1]), LongInt(@Fd));
+  If H = INVALID_HANDLE Then Exit;
+  Repeat
+    Nm := PStr(LongInt(@Fd) + 44);
+    Dir := (MemL[0:LongInt(@Fd)] And $10) <> 0;
+    If (Nm <> '.') And (Nm <> '..') And (Nm <> '') And
+       (Dir Or MatchMask(UpStr(Nm), UpStr(FdMask))) And (FdN < 200) Then
+    Begin
+      { insertion triee : dossiers d'abord, puis par nom }
+      J := FdN;
+      While (J > 0) And ((Dir And Not FdIsDir[J - 1]) Or
+            ((Dir = FdIsDir[J - 1]) And (UpStr(Nm) < UpStr(FdNm[J - 1])))) Do
+      Begin
+        FdNm[J] := FdNm[J - 1]; FdIsDir[J] := FdIsDir[J - 1];
+        Dec(J);
+      End;
+      FdNm[J] := Nm; FdIsDir[J] := Dir;
+      Inc(FdN);
+    End;
+  Until FindNextFileA(H, LongInt(@Fd)) = 0;
+  FindClose(H);
+End;
+
+{ Mode 0 : Ouvrir, 1 : Enregistrer sous ; Owner 0 : Bloc-notes, 1 :
+  programme (GetOpenFileName, attend FdDone) }
+Procedure FdOpen(Mode, Owner : LongInt; Const Dir, Name : String);
+Var T : String;
+Begin
+  If (FdW >= 0) And Wnds[FdW].Used And (Wnds[FdW].IKind = ikFileDlg) Then
+    DestroyW(FdW);
+  FdMode := Mode; FdOwner := Owner;
+  FdDir := Dir;
+  If FdDir = '' Then FdDir := 'C:';
+  If (Length(FdDir) = 3) And (FdDir[3] = '\') Then FdDir := Copy(FdDir, 1, 2);
+  FdDone := False; FdOk := False; FdResult := '';
+  If Owner = 0 Then
+  Begin
+    FdFiltN := 2;
+    FdFiltDesc[0] := L('Documents texte (*.txt)', 'Text Documents (*.txt)',
+                       'Textdateien (*.txt)', 'Documenti di testo (*.txt)',
+                       'Documentos de texto (*.txt)');
+    FdFiltPat[0] := '*.TXT';
+    FdFiltDesc[1] := L('Tous les fichiers (*.*)', 'All Files (*.*)',
+                       'Alle Dateien (*.*)', 'Tutti i file (*.*)',
+                       'Todos los archivos (*.*)');
+    FdFiltPat[1] := '*.*';
+    FdFiltI := 0;
+    FdDefExt := 'TXT';
+    FdTitle := '';
+  End;
+  If FdFiltN > 0 Then FdMask := FdFiltPat[FdFiltI] Else FdMask := '*.*';
+  If (Pos('*', Name) > 0) Or (Pos('?', Name) > 0) Then FdName := ''
+  Else FdName := Name;
+  FdRefresh;
+  If FdTitle <> '' Then T := FdTitle
+  Else If Mode = 0 Then T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir')
+  Else T := L('Enregistrer sous', 'Save As', 'Speichern unter',
+              'Salva con nome', 'Guardar como');
+  FdW := KCreate(ikFileDlg, T, icFolder, Max(0, (ScrW - 480) Div 2),
+                 Max(0, (TaskY - 310) Div 2), 480, 310,
+                 WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                 WS_EX_DLGMODALFRAME Or WS_EX_TOOLWINDOW);
+  If FdW < 0 Then
+  Begin
+    FdDone := True;
+    Exit;
+  End;
+  ShowW(FdW, True, True);
+End;
+
+Procedure FdList(W : LongInt; Var X1, Y1, X2, Y2, Vis : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 10; Y1 := CY1 + 40; X2 := CX2 - 10; Y2 := CY1 + 196;
+  Vis := (Y2 - Y1 - 4) Div 18;
+End;
+
+Procedure PaintFileDlg(W : LongInt);
+Var X1, Y1, X2, Y2, LX1, LY1, LX2, LY2, Vis, I, Y, Fg, TY : LongInt;
+    T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  If FdMode = 0 Then T := L('Regarder dans :', 'Look in:', 'Suchen in:',
+                            'Cerca in:', 'Buscar en:')
+  Else T := L('Enregistrer dans :', 'Save in:', 'Speichern in:', 'Salva in:',
+              'Guardar en:');
+  OutTxt(X1 + 10, Y1 + 12, T, cBlack);
+  Sunken(X1 + 166, Y1 + 8, X2 - 44, Y1 + 30, cWhite);
+  PaintIcon(icFolder, X1 + 170, Y1 + 11, 16);
+  OutTxt(X1 + 190, Y1 + 11, Fit(FdDir + '\', X2 - X1 - 256), cBlack);
+  Raised(X2 - 62, Y1 + 10, X2 - 46, Y1 + 28, False);
+  Arrow(X2 - 57, Y1 + 17, 1, cBlack);
+  { dossier parent }
+  Raised(X2 - 38, Y1 + 8, X2 - 10, Y1 + 30, False);
+  PaintIcon(icFolder, X2 - 32, Y1 + 11, 16);
+  Arrow(X2 - 28, Y1 + 14, 2, cBlack);
+  FdList(W, LX1, LY1, LX2, LY2, Vis);
+  Sunken(LX1, LY1, LX2, LY2, cWhite);
+  For I := FdTop To Min(FdN - 1, FdTop + Vis - 1) Do
+  Begin
+    Y := LY1 + 3 + (I - FdTop) * 18;
+    If FdIsDir[I] Then PaintIcon(icFolder, LX1 + 4, Y, 16)
+    Else PaintIcon(icText, LX1 + 4, Y, 16);
+    Fg := cBlack;
+    If I = FdSel Then
+    Begin
+      FBar(LX1 + 23, Y, LX1 + 26 + TextW(FdNm[I]), Y + 16, cNavy);
+      Fg := cWhite;
+    End;
+    OutTxt(LX1 + 25, Y, Fit(FdNm[I], LX2 - LX1 - 50), Fg);
+  End;
+  If FdN > Vis Then
+  Begin
+    FBar(LX2 - 17, LY1 + 2, LX2 - 2, LY2 - 2, cSilver);
+    Raised(LX2 - 17, LY1 + 2, LX2 - 2, LY1 + 17, False);
+    Arrow(LX2 - 12, LY1 + 8, 2, cBlack);
+    Raised(LX2 - 17, LY2 - 17, LX2 - 2, LY2 - 2, False);
+    Arrow(LX2 - 12, LY2 - 11, 1, cBlack);
+    TY := LY1 + 18 + (FdTop * (LY2 - LY1 - 52)) Div Max(1, FdN - Vis);
+    Raised(LX2 - 17, TY, LX2 - 2, TY + 16, False);
+  End;
+  OutTxt(X1 + 10, Y1 + 210, L('Nom de fichier :', 'File name:',
+         'Dateiname:', 'Nome file:', 'Nombre:'), cBlack);
+  Sunken(X1 + 150, Y1 + 206, X2 - 110, Y1 + 228, cWhite);
+  OutTxt(X1 + 154, Y1 + 209, Fit(FdName, X2 - X1 - 270), cBlack);
+  VLine(X1 + 154 + TextW(Fit(FdName, X2 - X1 - 270)), Y1 + 208, Y1 + 225,
+        cBlack);
+  OutTxt(X1 + 10, Y1 + 240, L('Type :', 'Files of type:', 'Dateityp:',
+         'Tipo:', 'Tipo:'), cBlack);
+  Sunken(X1 + 150, Y1 + 236, X2 - 110, Y1 + 258, cWhite);
+  If FdFiltN > 0 Then
+    OutTxt(X1 + 154, Y1 + 239, Fit(FdFiltDesc[FdFiltI], X2 - X1 - 282),
+           cBlack);
+  Raised(X2 - 128, Y1 + 238, X2 - 112, Y1 + 256, False);
+  Arrow(X2 - 123, Y1 + 245, 1, cBlack);
+  For I := 0 To 1 Do
+  Begin
+    If I = 0 Then
+    Begin
+      If FdMode = 0 Then T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir')
+      Else T := L('Enregistrer', 'Save', 'Speichern', 'Salva', 'Guardar');
+    End
+    Else T := TxtCancel;
+    PushButton(X2 - 100, Y1 + 206 + I * 30, X2 - 10, Y1 + 228 + I * 30, T,
+               (PressWin = W) And (PressBtn = I), I = 0);
+  End;
+End;
+
+Procedure FdClose(Ok : Boolean);
+Var W : LongInt;
+Begin
+  FdOk := Ok; FdDone := True;
+  If (FdW >= 0) And Wnds[FdW].Used Then DestroyW(FdW);
+  FdW := -1;
+  If FdOwner <> 0 Then Exit;
+  W := KFindKind(ikNotepad);
+  If W < 0 Then Exit;
+  If Not Ok Then Exit;
+  If FdMode = 0 Then NoteLoad(W, FdResult)
+  Else If NoteWrite(W, FdResult) And (NotePend >= 0) Then
+    NoteDoAct(W, NotePend);
+  NotePend := -1;
+End;
+
+{ Ouvrir / Enregistrer : dossier, motif ou fichier }
+Procedure FdAccept;
+Var N, F : String; Attr, Size, Time, Lba, Ram : LongInt;
+Begin
+  N := Trim(FdName);
+  If (N = '') And (FdSel >= 0) Then N := FdNm[FdSel];
+  If N = '' Then Exit;
+  If (Pos('*', N) > 0) Or (Pos('?', N) > 0) Then
+  Begin
+    FdMask := N; FdName := '';
+    FdRefresh;
+    Exit;
+  End;
+  If (Pos(':', N) > 0) Or ((Length(N) > 0) And (N[1] = '\')) Then
+    F := FullPath(N)
+  Else F := FullPath(FdDir + '\' + N);
+  If PathInfo(F, Attr, Size, Time, Lba, Ram) And ((Attr And $10) <> 0) Then
+  Begin
+    FdDir := F;
+    If Length(FdDir) = 3 Then FdDir := Copy(FdDir, 1, 2);
+    FdName := '';
+    FdRefresh;
+    Exit;
+  End;
+  If FdMode = 0 Then
+  Begin
+    If Not PathInfo(F, Attr, Size, Time, Lba, Ram) Then
+    Begin
+      MsgBoxOpen(L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir'), F + '|' +
+        L('Fichier introuvable. V'#130'rifiez le nom du fichier.',
+        'File not found. Please verify the correct file name was given.',
+        'Datei nicht gefunden.', 'File non trovato.',
+        'No se encuentra el archivo.'), $30);
+      Exit;
+    End;
+  End
+  Else If (Pos('.', BaseName(F)) = 0) And (FdDefExt <> '') Then
+    F := F + '.' + FdDefExt;
+  FdResult := F;
+  FdClose(True);
+End;
+
+Procedure FileDlgMouse(W, Msg, X, Y : LongInt);
+Var X1, Y1, X2, Y2, LX1, LY1, LX2, LY2, Vis, R, I : LongInt; Dbl : Boolean;
+Begin
+  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  Dbl := Msg = WM_LBUTTONDBLCLK;
+  If Dbl Then Msg := WM_LBUTTONDOWN;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    If InRect(X, Y, X1 + 166, Y1 + 8, X2 - 44, Y1 + 30) Then
+    Begin
+      OpenMenu(0, mnFdDrives, X1 + 166, Y1 + 31, False);
+      Exit;
+    End;
+    If InRect(X, Y, X2 - 38, Y1 + 8, X2 - 10, Y1 + 30) Then
+    Begin
+      If Length(FdDir) > 2 Then
+      Begin
+        FdDir := ParentDir(FdDir);
+        If Length(FdDir) = 3 Then FdDir := Copy(FdDir, 1, 2);
+        FdRefresh;
+        KRepaint(W);
+      End;
+      Exit;
+    End;
+    If InRect(X, Y, X1 + 150, Y1 + 236, X2 - 110, Y1 + 258) Then
+    Begin
+      OpenMenu(0, mnFdTypes, X1 + 150, Y1 + 259, False);
+      Exit;
+    End;
+    FdList(W, LX1, LY1, LX2, LY2, Vis);
+    If InRect(X, Y, LX1, LY1, LX2, LY2) Then
+    Begin
+      If (FdN > Vis) And (X >= LX2 - 17) Then
+      Begin
+        If Y < (LY1 + LY2) Div 2 Then FdTop := Max(0, FdTop - Vis + 1)
+        Else FdTop := Min(FdN - Vis, FdTop + Vis - 1);
+        KRepaint(W);
+        Exit;
+      End;
+      R := FdTop + (Y - LY1 - 3) Div 18;
+      If (R >= 0) And (R < FdN) Then
+      Begin
+        If (R = FdSel) And (Dbl Or ((FdClickR = R) And
+           (Ticks - FdClickT < 700))) Then
+        Begin
+          FdClickR := -1;
+          FdName := FdNm[R];
+          FdAccept;
+          If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+          Exit;
+        End;
+        FdSel := R; FdClickR := R; FdClickT := Ticks;
+        If Not FdIsDir[R] Then FdName := FdNm[R];
+        KRepaint(W);
+      End;
+      Exit;
+    End;
+  End;
+  For I := 0 To 1 Do
+    If InRect(X, Y, X2 - 100, Y1 + 206 + I * 30, X2 - 10, Y1 + 228 + I * 30)
+    Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        If I = 0 Then FdAccept Else FdClose(False);
+        If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+      End;
+      Exit;
+    End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure FileDlgKey(W, VK, Ch : LongInt);
+Var LX1, LY1, LX2, LY2, Vis : LongInt;
+Begin
+  FdList(W, LX1, LY1, LX2, LY2, Vis);
+  Case VK Of
+    $0D : FdAccept;
+    $1B : FdClose(False);
+    8 : Delete(FdName, Length(FdName), 1);
+    $26, $28 :
+    Begin
+      If VK = $26 Then FdSel := Max(0, FdSel - 1)
+      Else FdSel := Min(FdN - 1, FdSel + 1);
+      If (FdSel >= 0) And Not FdIsDir[FdSel] Then FdName := FdNm[FdSel];
+      If FdSel < FdTop Then FdTop := FdSel;
+      If FdSel >= FdTop + Vis Then FdTop := FdSel - Vis + 1;
+    End;
+  Else
+    If (Ch >= 32) And (Ch < 256) And (Length(FdName) < 60) Then
+      FdName := FdName + Chr(Ch);
+  End;
+  If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+End;
+
 { Reorganiser les icones du bureau (Poste de travail et Corbeille
   restent en tete, comme sous Windows 95) : par nom ou par type }
 Procedure DeskArrange(ByType : Boolean);
@@ -9413,6 +11986,26 @@ Begin
     If DtW >= 0 Then KRepaint(DtW);
     Exit;
   End;
+  If (Cmd >= cmNNew) And (Cmd <= cmNAbout) Then
+  Begin
+    NoteCmd(Cmd);
+    Exit;
+  End;
+  If (Cmd >= cmFdDrive) And (Cmd < cmFdDrive + 26) Then
+  Begin
+    FdDir := Chr(65 + Cmd - cmFdDrive) + ':';
+    FdRefresh;
+    If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+    Exit;
+  End;
+  If (Cmd >= cmFdType) And (Cmd < cmFdType + 8) Then
+  Begin
+    FdFiltI := Cmd - cmFdType;
+    FdMask := FdFiltPat[FdFiltI];
+    FdRefresh;
+    If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+    Exit;
+  End;
   If (Cmd >= cmTzBase) And (Cmd < cmTzBase + TzCount) Then
   Begin
     DtTz := Cmd - cmTzBase;
@@ -9422,6 +12015,9 @@ Begin
   Case Cmd Of
     cmDisplay : DispOpen;
     cmDateTime : DtOpen;
+    cmMixer : MixerOpen;
+    cmSysProps : SysOpen;
+    cmAudioProps : AudioOpen;
     cmAlign : MarkAll;
     cmArrName : DeskArrange(False);
     cmArrType : DeskArrange(True);
@@ -9552,7 +12148,13 @@ Begin
     Exit;
   End;
   If (MenuDepth > 0) And (Wnds[W].IKind <> ikMenu) And
-     (Msg = WM_LBUTTONDOWN) Then CloseMenus(0);
+     (Wnds[W].IKind <> ikVolPop) And (Msg = WM_LBUTTONDOWN) Then
+    CloseMenus(0);
+  { boites internes : un second clic rapide reste un clic (compteurs,
+    curseurs) ; l'arbre du Gestionnaire de peripheriques s'en sert }
+  If (Msg = WM_LBUTTONDBLCLK) And (Wnds[W].IKind >= ikDisplay) And
+     (Wnds[W].IKind <= ikDevProps) And (Wnds[W].IKind <> ikSysProps) Then
+    Msg := WM_LBUTTONDOWN;
   Case Wnds[W].IKind Of
     ikTaskbar : TaskbarMouse(Msg, X, Y);
     ikMenu : MenuMouse(W, Msg, X, Y);
@@ -9561,6 +12163,14 @@ Begin
     ikAbout, ikRun, ikShutdown : DialogMouse(W, Msg, X, Y);
     ikDisplay : DisplayMouse(W, Msg, X, Y);
     ikDateTime : DateTimeMouse(W, Msg, X, Y);
+    ikVolPop : VolPopMouse(W, Msg, X, Y);
+    ikMixer : MixerMouse(W, Msg, X, Y);
+    ikAudio : AudioMouse(W, Msg, X, Y);
+    ikSysProps : SysPropsMouse(W, Msg, X, Y);
+    ikNotepad : NoteMouse(W, Msg, X, Y);
+    ikFileDlg : FileDlgMouse(W, Msg, X, Y);
+    ikFind : FindMouse(W, Msg, X, Y);
+    ikDevProps : DevPropsMouse(W, Msg, X, Y);
   End;
 End;
 
@@ -9910,6 +12520,8 @@ Begin
       Begin
         If Wnds[I].IKind = ikMsgBox Then MsgBoxEnd(I, IDCANCEL)
         Else If Wnds[I].IKind = ikShutdown Then DialogAction(I, 1)
+        Else If Wnds[I].IKind = ikNotepad Then KCommand(cmNExit)
+        Else If Wnds[I].IKind = ikFileDlg Then FdClose(False)
         Else DestroyW(I);
       End
       Else PostMsgW(I, WM_CLOSE, 0, 0);
@@ -9934,7 +12546,7 @@ Begin
     Exit;
   End;
   If Msg <> WM_KEYDOWN Then Exit;
-  If Wnds[W].IKind >= ikButton Then
+  If (Wnds[W].IKind >= ikButton) And (Wnds[W].IKind <= ikMdiClient) Then
   Begin
     I := TopOf(W);
     If (VK = $0D) And (Wnds[I].IKind = ikDialog) Then
@@ -9975,6 +12587,14 @@ Begin
     ikAbout : If (VK = $0D) Or (VK = $1B) Then DestroyW(W);
     ikDisplay : DisplayKey(W, VK);
     ikDateTime : DateTimeKey(W, VK);
+    ikSysProps : SysPropsKey(W, VK);
+    ikFileDlg : FileDlgKey(W, VK, Ch);
+    ikFind : FindKey(W, VK, Ch);
+    ikDevProps : If (VK = $0D) Or (VK = $1B) Then
+                 Begin
+                   DestroyW(W);
+                   DevPW := -1;
+                 End;
     ikNotepad : NoteKey(W, VK, Ch);
     ikConsole : ConKeyIn(VK, Ch);
     ikExplorer :
@@ -10017,6 +12637,13 @@ Begin
     ikAbout, ikRun, ikShutdown : PaintDialog(W);
     ikDisplay : PaintDisplay(W);
     ikDateTime : PaintDateTime(W);
+    ikVolPop : PaintVolPop(W);
+    ikMixer : PaintMixer(W);
+    ikAudio : PaintAudio(W);
+    ikSysProps : PaintSysProps(W);
+    ikFileDlg : PaintFileDlg(W);
+    ikFind : PaintFind(W);
+    ikDevProps : PaintDevProps(W);
     ikHelp : PaintHelp(W);
     ikNotepad : PaintNotepad(W);
     ikConsole : PaintConsole(W);
@@ -10239,6 +12866,8 @@ Begin
       Begin
         If Wnds[W].IKind = ikMsgBox Then MsgBoxEnd(W, IDCANCEL)
         Else If Wnds[W].IKind = ikShutdown Then DialogAction(W, 1)
+        Else If Wnds[W].IKind = ikNotepad Then KCommand(cmNExit)
+        Else If Wnds[W].IKind = ikFileDlg Then FdClose(False)
         Else DestroyW(W);
       End;
     WM_SETTEXT :
@@ -17297,7 +19926,8 @@ Begin
   ShowScrollBar := 1;
 End;
 
-{ Presse-papiers (vide) }
+{ Presse-papiers : texte (CF_TEXT 1, CF_OEMTEXT 7), partage avec le
+  Bloc-notes ; les handles de memoire globale sont des adresses }
 Function OpenClipboard(H : LongInt) : LongInt;
 Begin
   OpenClipboard := 1;
@@ -17310,27 +19940,49 @@ End;
 
 Function EmptyClipboard : LongInt;
 Begin
+  ClipLen := 0;
   EmptyClipboard := 1;
 End;
 
 Function GetClipboardData(F : LongInt) : LongInt;
+Var A : LongInt;
 Begin
   GetClipboardData := 0;
+  If ((F <> 1) And (F <> 7)) Or (ClipLen = 0) Then Exit;
+  A := KAlloc(ClipLen + 1);
+  If A = 0 Then Exit;
+  MoveMem(ClipBuf, A, ClipLen);
+  Mem[0:A + ClipLen] := 0;
+  GetClipboardData := A;
 End;
 
 Function SetClipboardData(F, H : LongInt) : LongInt;
+Var N, Own : LongInt;
 Begin
   SetClipboardData := H;
+  If ((F <> 1) And (F <> 7)) Or (H = 0) Then Exit;
+  N := 0;
+  While (Mem[0:H + N] <> 0) And (N < 1000000) Do Inc(N);
+  If ClipBuf <> 0 Then KFree(ClipBuf);
+  Own := HeapOwner; HeapOwner := 0;
+  ClipBuf := KAlloc(N + 1);
+  HeapOwner := Own;
+  ClipLen := 0;
+  If ClipBuf = 0 Then Exit;
+  MoveMem(H, ClipBuf, N);
+  Mem[0:ClipBuf + N] := 0;
+  ClipLen := N;
 End;
 
 Function EnumClipboardFormats(F : LongInt) : LongInt;
 Begin
-  EnumClipboardFormats := 0;
+  If (F = 0) And (ClipLen > 0) Then EnumClipboardFormats := 1
+  Else EnumClipboardFormats := 0;
 End;
 
 Function IsClipboardFormatAvailable(F : LongInt) : LongInt;
 Begin
-  IsClipboardFormatAvailable := 0;
+  IsClipboardFormatAvailable := Ord(((F = 1) Or (F = 7)) And (ClipLen > 0));
 End;
 
 Function RegisterClipboardFormatA(S : LongInt) : LongInt;
@@ -18571,6 +21223,569 @@ Var
   WaveQHdr, WaveQEnd : Array[0..MaxWave * MaxWaveQ - 1] Of LongInt;
   InWave : Boolean;
 
+{ ------------------------------------------------------------------ }
+{ Cartes son : Sound Blaster (1.x, 2.0, Pro, 16) et AdLib (OPL2)      }
+{ ------------------------------------------------------------------ }
+{ Comme les pilotes de Windows 95 : la carte est trouvee par la
+  variable BLASTER (A220 I5 D1 H5) ou en sondant 220h-280h (remise a
+  zero du DSP, AAh), sa version par la commande E1h ; une Sound Blaster
+  16 donne son IRQ et ses canaux DMA par son mixeur (80h, 81h). Le son
+  waveOut passe par un tampon DMA de 32 Ko en 90000h (sous la pile du
+  noyau, dans une meme page de 64 Ko) lu en boucle (auto-init) : la
+  carte interrompt a chaque moitie jouee, que le gestionnaire remplit
+  aussitot avec la suite des tampons du programme (ou du silence). Un
+  tampon WAVEHDR est rendu quand ses octets ont ete joues. La Sound
+  Blaster 16 joue directement le format du programme (8/16 bits, mono
+  ou stereo) ; les cartes 8 bits recoivent du 8 bits mono converti.
+  L'AdLib (et l'OPL2 des Sound Blaster) sert de synthetiseur MIDI FM. }
+
+Const
+  SbDmaBuf = $90000;
+  SbDmaLen = $8000;
+  SbHalf = $4000;
+  MixLines = 5;              { general, wave, MIDI, CD, ligne }
+
+Var
+  SbOk, Sb16, OplOk : Boolean;
+  SbBase, SbIrq, SbDma8, SbDma16, SbVer : LongInt;
+  SbPlaying, SbPaused : Boolean;
+  SbDev : LongInt;                       { peripherique waveOut sur la carte }
+  SbBits, SbChans, SbRate : LongInt;     { format du programme }
+  SbOBits, SbOChans : LongInt;           { format envoye a la carte }
+  SbNext : LongInt;                      { moitie a remplir (0/1) }
+  SbQueued, SbPlayed : LongInt;          { octets (format carte) }
+  SbCopyK, SbCopyOff : LongInt;          { tampon et position en copie }
+  SbSilent : LongInt;                    { moities de silence de suite }
+  SbIrqs : LongInt;
+  MixVolL, MixVolR : Array[0..MixLines - 1] Of LongInt;   { 0..255 }
+  MixMute : Array[0..MixLines - 1] Of Boolean;
+  OplVoiceNote, OplVoiceChan, OplVoiceAge : Array[0..8] Of LongInt;
+  OplAge : LongInt;
+  MidiOpen : Boolean;
+
+Function IntOff : LongInt;
+Var F : LongInt;
+Begin
+  asm
+    pushfd
+    pop eax
+    mov F,eax
+    cli
+  end;
+  IntOff := F;
+End;
+
+Procedure IntRestore(F : LongInt);
+Begin
+  If (F And $200) <> 0 Then
+    asm
+      sti
+    end;
+End;
+
+Procedure SbDelay(N : LongInt);
+Var I, X : LongInt;
+Begin
+  For I := 1 To N Do X := Port[$80];
+End;
+
+Function SbWriteDsp(V : LongInt) : Boolean;
+Var N : LongInt;
+Begin
+  N := 0;
+  While ((Port[SbBase + $C] And $80) <> 0) And (N < 100000) Do Inc(N);
+  Port[SbBase + $C] := V;
+  SbWriteDsp := N < 100000;
+End;
+
+Function SbReadDsp : LongInt;
+Var N : LongInt;
+Begin
+  N := 0;
+  While ((Port[SbBase + $E] And $80) = 0) And (N < 100000) Do Inc(N);
+  If N >= 100000 Then SbReadDsp := -1 Else SbReadDsp := Port[SbBase + $A];
+End;
+
+Function SbReset(B : LongInt) : Boolean;
+Var N : LongInt;
+Begin
+  SbBase := B;
+  Port[B + 6] := 1;
+  SbDelay(8);
+  Port[B + 6] := 0;
+  N := 0;
+  While ((Port[B + $E] And $80) = 0) And (N < 20000) Do Inc(N);
+  SbReset := (N < 20000) And (Port[B + $A] = $AA);
+End;
+
+Procedure MixW(R, V : LongInt);
+Begin
+  Port[SbBase + 4] := R;
+  Port[SbBase + 5] := V;
+End;
+
+Function MixR(R : LongInt) : LongInt;
+Begin
+  Port[SbBase + 4] := R;
+  MixR := Port[SbBase + 5];
+End;
+
+{ Valeur numerique apres la lettre C de la variable BLASTER (-1) }
+Function BlasterVal(Const B : String; C : Char; Hex : Boolean) : LongInt;
+Var I, V, D : LongInt; Ok : Boolean;
+Begin
+  BlasterVal := -1;
+  I := 1;
+  While I <= Length(B) Do
+  Begin
+    If (UpCase(B[I]) = C) And ((I = 1) Or (B[I - 1] = ' ')) Then
+    Begin
+      V := 0; Ok := False; Inc(I);
+      While (I <= Length(B)) And (B[I] <> ' ') Do
+      Begin
+        D := -1;
+        If (B[I] >= '0') And (B[I] <= '9') Then D := Ord(B[I]) - 48
+        Else If Hex And (UpCase(B[I]) >= 'A') And (UpCase(B[I]) <= 'F') Then
+          D := Ord(UpCase(B[I])) - 55;
+        If D < 0 Then Break;
+        If Hex Then V := V * 16 + D Else V := V * 10 + D;
+        Ok := True; Inc(I);
+      End;
+      If Ok Then BlasterVal := V;
+      Exit;
+    End;
+    Inc(I);
+  End;
+End;
+
+{ OPL2 (AdLib) : registre R = V, avec les delais de la puce }
+Procedure OplW(R, V : LongInt);
+Var I, X : LongInt;
+Begin
+  Port[$388] := R;
+  For I := 1 To 6 Do X := Port[$388];
+  Port[$389] := V;
+  For I := 1 To 35 Do X := Port[$388];
+End;
+
+Function OplDetect : Boolean;
+Var S1, S2, I, X : LongInt;
+Begin
+  OplW(4, $60); OplW(4, $80);
+  S1 := Port[$388];
+  OplW(2, $FF); OplW(4, $21);
+  For I := 1 To 400 Do X := Port[$80];
+  S2 := Port[$388];
+  OplW(4, $60); OplW(4, $80);
+  OplDetect := ((S1 And $E0) = 0) And ((S2 And $E0) = $C0);
+End;
+
+Function SbName : String;
+Begin
+  If Not SbOk Then SbName := ''
+  Else If Sb16 Then SbName := 'Sound Blaster 16'
+  Else If SbVer >= $300 Then SbName := 'Sound Blaster Pro'
+  Else If SbVer >= $200 Then SbName := 'Sound Blaster 2.0'
+  Else SbName := 'Sound Blaster';
+End;
+
+{ Mixeur : appliquer les volumes (0..255) et les sourdines }
+Procedure SndApplyVol;
+Var I, L, R : LongInt;
+  Reg16, RegPro : Array[0..MixLines - 1] Of LongInt;
+Begin
+  If Not SbOk Then Exit;
+  Reg16[0] := $30; Reg16[1] := $32; Reg16[2] := $34; Reg16[3] := $36;
+  Reg16[4] := $38;
+  RegPro[0] := $22; RegPro[1] := $04; RegPro[2] := $26; RegPro[3] := $28;
+  RegPro[4] := $2E;
+  For I := 0 To MixLines - 1 Do
+  Begin
+    L := MixVolL[I]; R := MixVolR[I];
+    If MixMute[I] Or (MixMute[0] And (I = 0)) Then
+    Begin
+      L := 0; R := 0;
+    End;
+    If Sb16 Then
+    Begin
+      MixW(Reg16[I], (L Shr 3) Shl 3);
+      MixW(Reg16[I] + 1, (R Shr 3) Shl 3);
+    End
+    Else If SbVer >= $300 Then
+      MixW(RegPro[I], ((L Shr 5) Shl 5) Or ((R Shr 5) Shl 1) Or $11);
+  End;
+End;
+
+{ Canal DMA C (0-3 : 8 bits, 5-7 : 16 bits) : lecture memoire -> carte,
+  en boucle, sur SbDmaLen octets en SbDmaBuf }
+Procedure DmaStart(C : LongInt);
+Const Pg8 : Array[0..3] Of LongInt = ($87, $83, $81, $82);
+      Pg16 : Array[5..7] Of LongInt = ($8B, $89, $8A);
+Var A, N, K : LongInt;
+Begin
+  A := SbDmaBuf;
+  If C < 4 Then
+  Begin
+    N := SbDmaLen - 1;
+    Port[$0A] := 4 Or C;
+    Port[$0C] := 0;
+    Port[$0B] := $58 Or C;
+    Port[C * 2] := A And 255;
+    Port[C * 2] := (A Shr 8) And 255;
+    Port[Pg8[C]] := (A Shr 16) And 255;
+    Port[C * 2 + 1] := N And 255;
+    Port[C * 2 + 1] := (N Shr 8) And 255;
+    Port[$0A] := C;
+  End
+  Else
+  Begin
+    K := C - 4;
+    N := SbDmaLen Div 2 - 1;
+    Port[$D4] := 4 Or K;
+    Port[$D8] := 0;
+    Port[$D6] := $58 Or K;
+    Port[$C0 + K * 4] := (A Shr 1) And 255;
+    Port[$C0 + K * 4] := (A Shr 9) And 255;
+    Port[Pg16[C]] := (A Shr 16) And $FE;
+    Port[$C2 + K * 4] := N And 255;
+    Port[$C2 + K * 4] := (N Shr 8) And 255;
+    Port[$D4] := K;
+  End;
+End;
+
+Procedure DmaStop(C : LongInt);
+Begin
+  If C < 4 Then Port[$0A] := 4 Or C Else Port[$D4] := 4 Or (C - 4);
+End;
+
+{ Remplir la moitie H du tampon DMA avec la suite des tampons du
+  peripherique SbDev (format carte), sinon du silence }
+Procedure SbFill(H : LongInt);
+Var D, P, Hdr, Len, B, V, Got, SBy, Fr, K, L, R : LongInt;
+Begin
+  D := SbDmaBuf + H * SbHalf;
+  P := 0; Got := 0;
+  SBy := (SbBits Div 8) * SbChans;               { octets par trame }
+  While (P < SbHalf) And (SbDev >= 0) And
+        (SbCopyK < WaveDevs[SbDev].QN) Do
+  Begin
+    Hdr := WaveQHdr[SbDev * MaxWaveQ + SbCopyK];
+    Len := MemL[0:Hdr + 4];
+    B := MemL[0:Hdr];
+    If (SbOBits = SbBits) And (SbOChans = SbChans) Then
+    Begin
+      K := Min(Len - SbCopyOff, SbHalf - P);
+      If K > 0 Then MoveMem(B + SbCopyOff, D + P, K);
+      SbCopyOff := SbCopyOff + Max(K, 0); P := P + Max(K, 0);
+    End
+    Else
+    Begin
+      { conversion vers 8 bits mono (cartes 8 bits) }
+      While (SbCopyOff + SBy <= Len) And (P < SbHalf) Do
+      Begin
+        Fr := B + SbCopyOff;
+        If SbBits = 16 Then
+        Begin
+          L := MemW[0:Fr]; If L >= 32768 Then L := L - 65536;
+          If SbChans = 2 Then
+          Begin
+            R := MemW[0:Fr + 2]; If R >= 32768 Then R := R - 65536;
+            L := (L + R) Div 2;
+          End;
+          V := (L Div 256) + 128;
+        End
+        Else
+        Begin
+          V := Mem[0:Fr];
+          If SbChans = 2 Then V := (V + Mem[0:Fr + 1]) Div 2;
+        End;
+        Mem[0:D + P] := V;
+        Inc(P);
+        SbCopyOff := SbCopyOff + SBy;
+      End;
+      If SbCopyOff + SBy > Len Then SbCopyOff := Len;
+    End;
+    If SbCopyOff >= Len Then
+    Begin
+      { tampon entierement copie : rendu quand cet octet sera joue }
+      WaveQEnd[SbDev * MaxWaveQ + SbCopyK] := SbQueued + P;
+      Inc(SbCopyK);
+      SbCopyOff := 0;
+    End;
+    Got := 1;
+  End;
+  If P < SbHalf Then
+  Begin
+    If SbOBits = 16 Then FillMem(D + P, SbHalf - P, 0)
+    Else FillMem(D + P, SbHalf - P, $80);
+  End;
+  If Got = 0 Then Inc(SbSilent) Else SbSilent := 0;
+  SbQueued := SbQueued + SbHalf;
+End;
+
+{ Interruption de la carte : une moitie vient d'etre jouee }
+Procedure SbIsr;
+Var X : LongInt;
+Begin
+  If SbOBits = 16 Then X := Port[SbBase + $F] Else X := Port[SbBase + $E];
+  Inc(SbIrqs);
+  If Not SbPlaying Then Exit;
+  SbPlayed := SbPlayed + SbHalf;
+  SbFill(SbNext);
+  SbNext := 1 - SbNext;
+End;
+
+Procedure IrqSound; Interrupt;
+Begin
+  SbIsr;
+  If SbIrq >= 8 Then Port[$A0] := $20;
+  Port[$20] := $20;
+End;
+
+Procedure SndInit;
+Var V, B, I, Hi, Lo : LongInt; Bl : String;
+Begin
+  SbOk := False; Sb16 := False; SbDev := -1; SbPlaying := False;
+  For I := 0 To MixLines - 1 Do
+  Begin
+    MixVolL[I] := 192; MixVolR[I] := 192; MixMute[I] := False;
+  End;
+  Bl := '';
+  If EnvFind('BLASTER', V) Then Bl := PStr(V);
+  B := BlasterVal(Bl, 'A', True);
+  If (B > 0) And SbReset(B) Then SbOk := True
+  Else
+  Begin
+    B := $220;
+    While (B <= $280) And Not SbOk Do
+    Begin
+      If SbReset(B) Then SbOk := True Else B := B + $20;
+    End;
+  End;
+  If SbOk And SbWriteDsp($E1) Then
+  Begin
+    Hi := SbReadDsp; Lo := SbReadDsp;
+    If Hi < 0 Then SbOk := False
+    Else SbVer := Hi * 256 + Lo;
+  End;
+  If SbOk Then
+  Begin
+    Sb16 := SbVer >= $400;
+    SbIrq := BlasterVal(Bl, 'I', False);
+    SbDma8 := BlasterVal(Bl, 'D', False);
+    SbDma16 := BlasterVal(Bl, 'H', False);
+    If Sb16 Then
+    Begin
+      MixW(0, 0);
+      V := MixR($80);
+      If (V And 1) <> 0 Then SbIrq := 2
+      Else If (V And 2) <> 0 Then SbIrq := 5
+      Else If (V And 4) <> 0 Then SbIrq := 7
+      Else If (V And 8) <> 0 Then SbIrq := 10;
+      V := MixR($81);
+      For I := 0 To 3 Do
+        If (V And (1 Shl I)) <> 0 Then SbDma8 := I;
+      For I := 5 To 7 Do
+        If (V And (1 Shl I)) <> 0 Then SbDma16 := I;
+    End;
+    If (SbIrq < 2) Or (SbIrq > 15) Then
+      If Sb16 Then SbIrq := 5 Else SbIrq := 7;
+    If (SbDma8 < 0) Or (SbDma8 > 3) Then SbDma8 := 1;
+    If (SbDma16 < 5) Or (SbDma16 > 7) Then SbDma16 := 5;
+    If SbIrq = 2 Then SbIrq := 9;
+    SetGate($50 + SbIrq, LongInt(@IrqSound));
+    If SbIrq < 8 Then Port[$21] := Port[$21] And Not (1 Shl SbIrq)
+    Else
+    Begin
+      Port[$A1] := Port[$A1] And Not (1 Shl (SbIrq - 8));
+      Port[$21] := Port[$21] And Not 4;
+    End;
+    SndApplyVol;
+    KLog('Son : ' + SbName + ' (DSP ' + IntStr(SbVer Shr 8) + '.' +
+         Pad2(SbVer And 255) + ') en ' + HexStr(SbBase, 3) + 'h, IRQ ' +
+         IntStr(SbIrq) + ', DMA ' + IntStr(SbDma8) + '/' + IntStr(SbDma16));
+  End;
+  OplOk := OplDetect;
+  If OplOk Then
+  Begin
+    KLog('Son : synthetiseur FM OPL2 (AdLib) en 388h');
+    OplW(1, $20);
+    For I := 0 To 8 Do
+    Begin
+      OplVoiceNote[I] := -1; OplVoiceAge[I] := 0;
+    End;
+  End;
+  If Not SbOk And Not OplOk Then KLog('Son : aucune carte son');
+End;
+
+
+{ Demarrer la lecture du peripherique SbDev }
+Procedure SbStart;
+Var TC, N, Md : LongInt;
+Begin
+  If Not SbOk Or SbPlaying Or (SbDev < 0) Then Exit;
+  If Sb16 Then
+  Begin
+    SbOBits := SbBits; SbOChans := SbChans;
+  End
+  Else
+  Begin
+    SbOBits := 8; SbOChans := 1;
+  End;
+  SbQueued := 0; SbPlayed := 0; SbCopyK := 0; SbCopyOff := 0;
+  SbSilent := 0; SbNext := 0; SbPaused := False;
+  SbFill(0); SbFill(1);
+  SbPlaying := True;
+  SbWriteDsp($D1);
+  If SbOBits = 16 Then DmaStart(SbDma16) Else DmaStart(SbDma8);
+  If Sb16 Then
+  Begin
+    SbWriteDsp($41);
+    SbWriteDsp((SbRate Shr 8) And 255);
+    SbWriteDsp(SbRate And 255);
+    If SbOChans = 2 Then Md := $20 Else Md := 0;
+    If SbOBits = 16 Then
+    Begin
+      SbWriteDsp($B6); SbWriteDsp(Md Or $10);
+      N := SbHalf Div 2 - 1;
+    End
+    Else
+    Begin
+      SbWriteDsp($C6); SbWriteDsp(Md);
+      N := SbHalf - 1;
+    End;
+    SbWriteDsp(N And 255); SbWriteDsp((N Shr 8) And 255);
+  End
+  Else
+  Begin
+    TC := 256 - 1000000 Div Max(4000, Min(SbRate, 44100));
+    SbWriteDsp($40); SbWriteDsp(TC And 255);
+    N := SbHalf - 1;
+    SbWriteDsp($48); SbWriteDsp(N And 255); SbWriteDsp((N Shr 8) And 255);
+    If (SbRate > 22050) And (SbVer >= $201) Then SbWriteDsp($90)
+    Else SbWriteDsp($1C);
+  End;
+End;
+
+Procedure SbStop;
+Begin
+  If Not SbPlaying Then Exit;
+  SbPlaying := False;
+  If Sb16 Then
+  Begin
+    If SbOBits = 16 Then
+    Begin
+      SbWriteDsp($D9); SbWriteDsp($D5);
+    End
+    Else
+    Begin
+      SbWriteDsp($DA); SbWriteDsp($D0);
+    End;
+  End
+  Else SbWriteDsp($D0);
+  If SbOBits = 16 Then DmaStop(SbDma16) Else DmaStop(SbDma8);
+  SbWriteDsp($D3);
+  KLog('Son : fin de lecture (' + IntStr(SbPlayed) + ' octets, ' +
+       IntStr(SbIrqs) + ' interruptions)');
+End;
+
+{ ------------------------------- MIDI FM (OPL2) ------------------- }
+
+Const
+  OplOp : Array[0..8] Of LongInt = (0, 1, 2, 8, 9, 10, 16, 17, 18);
+  OplFn : Array[0..11] Of LongInt = ($157, $16B, $181, $198, $1B0, $1CA,
+    $1E5, $202, $220, $241, $263, $287);
+
+{ Instrument du programme MIDI P : piano, orgue, cordes ou cuivres }
+Procedure OplPatch(V, P : LongInt);
+Var O : LongInt;
+Begin
+  O := OplOp[V];
+  Case P Div 16 Of
+    1 : Begin { orgue }
+          OplW($20 + O, $A1); OplW($40 + O, $1F); OplW($60 + O, $F0);
+          OplW($80 + O, $0F); OplW($23 + O, $A1); OplW($63 + O, $F0);
+          OplW($83 + O, $0F); OplW($C0 + V, $0F);
+        End;
+    2 : Begin { cordes et basses }
+          OplW($20 + O, $61); OplW($40 + O, $18); OplW($60 + O, $72);
+          OplW($80 + O, $16); OplW($23 + O, $21); OplW($63 + O, $71);
+          OplW($83 + O, $26); OplW($C0 + V, $0C);
+        End;
+    3, 4, 5, 6, 7 : Begin { cuivres, anches, flutes }
+          OplW($20 + O, $21); OplW($40 + O, $1C); OplW($60 + O, $75);
+          OplW($80 + O, $15); OplW($23 + O, $21); OplW($63 + O, $74);
+          OplW($83 + O, $17); OplW($C0 + V, $0A);
+        End;
+  Else
+    Begin { piano }
+      OplW($20 + O, $01); OplW($40 + O, $1A); OplW($60 + O, $F3);
+      OplW($80 + O, $52); OplW($23 + O, $01); OplW($63 + O, $F2);
+      OplW($83 + O, $54); OplW($C0 + V, $06);
+    End;
+  End;
+  OplW($E0 + O, 0); OplW($E3 + O, 0);
+End;
+
+Var
+  MidiProg : Array[0..15] Of LongInt;
+
+Procedure OplNoteOff(Ch, N : LongInt);
+Var V : LongInt;
+Begin
+  For V := 0 To 8 Do
+    If (OplVoiceNote[V] = N) And (OplVoiceChan[V] = Ch) Then
+    Begin
+      OplW($B0 + V, 0);
+      OplVoiceNote[V] := -1;
+    End;
+End;
+
+Procedure OplNoteOn(Ch, N, Vel : LongInt);
+Var V, K, Blk, F, TL, Vol : LongInt;
+Begin
+  If Ch = 9 Then Exit;                     { percussions : non gerees }
+  If Vel = 0 Then
+  Begin
+    OplNoteOff(Ch, N);
+    Exit;
+  End;
+  V := -1;
+  For K := 0 To 8 Do
+    If (V < 0) And (OplVoiceNote[K] < 0) Then V := K;
+  If V < 0 Then
+  Begin
+    V := 0;
+    For K := 1 To 8 Do
+      If OplVoiceAge[K] < OplVoiceAge[V] Then V := K;
+    OplW($B0 + V, 0);
+  End;
+  Inc(OplAge);
+  OplVoiceNote[V] := N; OplVoiceChan[V] := Ch; OplVoiceAge[V] := OplAge;
+  OplPatch(V, MidiProg[Ch]);
+  Vol := Vel;
+  If MixMute[2] Or MixMute[0] Then Vol := 0
+  Else Vol := (Vol * MixVolL[2]) Div 255;
+  TL := 63 - (Vol * 63) Div 127;
+  OplW($43 + OplOp[V], TL);
+  Blk := N Div 12 - 1;
+  If Blk < 0 Then Blk := 0;
+  If Blk > 7 Then Blk := 7;
+  F := OplFn[N Mod 12];
+  OplW($A0 + V, F And 255);
+  OplW($B0 + V, $20 Or (Blk Shl 2) Or ((F Shr 8) And 3));
+End;
+
+Procedure OplAllOff;
+Var V : LongInt;
+Begin
+  For V := 0 To 8 Do
+  Begin
+    OplW($B0 + V, 0);
+    OplVoiceNote[V] := -1;
+  End;
+End;
+
 Function WaveOf(H : LongInt) : LongInt;
 Begin
   WaveOf := -1;
@@ -18608,8 +21823,9 @@ End;
 
 { Tampon K de la file du peripherique I termine }
 Procedure WaveDone(I, K : LongInt);
-Var Hdr, J : LongInt;
+Var Hdr, J, F : LongInt;
 Begin
+  F := IntOff;
   Hdr := WaveQHdr[I * MaxWaveQ + K];
   For J := K To WaveDevs[I].QN - 2 Do
   Begin
@@ -18617,11 +21833,15 @@ Begin
     WaveQEnd[I * MaxWaveQ + J] := WaveQEnd[I * MaxWaveQ + J + 1];
   End;
   Dec(WaveDevs[I].QN);
+  If (I = SbDev) And (K < SbCopyK) Then Dec(SbCopyK);
+  IntRestore(F);
   MemL[0:Hdr + 16] := (MemL[0:Hdr + 16] And Not 16) Or 1;
   WaveNotify(I, WOM_DONE, Hdr);
 End;
 
 { Appelee par la tache 0 : rendre les tampons dont la duree est passee }
+Procedure PlaySoundPoll; Forward;
+
 Procedure RunWave;
 Var I : LongInt;
 Begin
@@ -18629,8 +21849,21 @@ Begin
   InWave := True;
   For I := 0 To MaxWave - 1 Do
     If WaveDevs[I].Used And Not WaveDevs[I].Paused Then
-      While (WaveDevs[I].QN > 0) And (Ticks >= WaveQEnd[I * MaxWaveQ]) Do
-        WaveDone(I, 0);
+    Begin
+      If I = SbDev Then
+      Begin
+        { carte son : tampons rendus quand leurs octets sont joues }
+        While (WaveDevs[I].QN > 0) And (SbCopyK > 0) And
+              (SbPlayed >= WaveQEnd[I * MaxWaveQ]) Do
+          WaveDone(I, 0);
+        If SbPlaying And (WaveDevs[I].QN = 0) And (SbSilent >= 2) Then
+          SbStop;
+      End
+      Else
+        While (WaveDevs[I].QN > 0) And (Ticks >= WaveQEnd[I * MaxWaveQ]) Do
+          WaveDone(I, 0);
+    End;
+  PlaySoundPoll;
   InWave := False;
 End;
 
@@ -18648,7 +21881,8 @@ Begin
   FillMem(P, 52, 0);
   MemW[0:P] := 1; MemW[0:P + 2] := 1;
   MemL[0:P + 4] := $0400;
-  PutPStr(P + 8, 'Pasdows Son', 32);
+  If SbOk Then PutPStr(P + 8, SbName + ' Wave Out', 32)
+  Else PutPStr(P + 8, 'Pasdows Son', 32);
   MemL[0:P + 40] := $FFF;
   MemW[0:P + 44] := 2;
   MemL[0:P + 48] := $C;
@@ -18674,6 +21908,15 @@ Begin
   WaveDevs[I].Rate := 11025;
   If Fmt <> 0 Then
     If MemL[0:Fmt + 8] > 0 Then WaveDevs[I].Rate := MemL[0:Fmt + 8];
+  { la carte son prend le premier peripherique ouvert (PCM) }
+  If SbOk And (SbDev < 0) And (Fmt <> 0) And (MemW[0:Fmt] = 1) Then
+  Begin
+    SbDev := I;
+    SbChans := Max(1, Min(2, MemW[0:Fmt + 2]));
+    SbRate := MemL[0:Fmt + 4];
+    SbBits := MemW[0:Fmt + 14];
+    If SbBits <> 16 Then SbBits := 8;
+  End;
   WaveDevs[I].Cb := Cb;
   WaveDevs[I].Inst := Inst;
   WaveDevs[I].CbType := Flags And $70000;
@@ -18695,6 +21938,11 @@ Begin
     Exit;
   End;
   WaveNotify(I, WOM_CLOSE, 0);
+  If I = SbDev Then
+  Begin
+    SbStop;
+    SbDev := -1;
+  End;
   WaveDevs[I].Used := False;
   waveOutClose := 0;
 End;
@@ -18722,7 +21970,7 @@ Begin
 End;
 
 Function waveOutWrite(H, Hdr, N : LongInt) : LongInt;
-Var I, Len, R, St, Q : LongInt;
+Var I, Len, R, St, Q, F : LongInt;
 Begin
   waveOutWrite := 5;
   I := WaveOf(H);
@@ -18742,9 +21990,13 @@ Begin
   Len := MemL[0:Hdr + 4]; R := WaveDevs[I].Rate;
   St := Max(Ticks, WaveDevs[I].LastEnd);
   WaveDevs[I].LastEnd := St + (Len Div R) * 1000 + ((Len Mod R) * 1000) Div R;
+  F := IntOff;
   WaveQHdr[I * MaxWaveQ + Q] := Hdr;
-  WaveQEnd[I * MaxWaveQ + Q] := WaveDevs[I].LastEnd;
+  If I = SbDev Then WaveQEnd[I * MaxWaveQ + Q] := MaxLongInt
+  Else WaveQEnd[I * MaxWaveQ + Q] := WaveDevs[I].LastEnd;
   WaveDevs[I].QN := Q + 1;
+  IntRestore(F);
+  If (I = SbDev) And Not SbPlaying And Not WaveDevs[I].Paused Then SbStart;
   waveOutWrite := 0;
 End;
 
@@ -18754,6 +22006,7 @@ Begin
   waveOutReset := 5;
   I := WaveOf(H);
   If I < 0 Then Exit;
+  If I = SbDev Then SbStop;
   While WaveDevs[I].QN > 0 Do WaveDone(I, 0);
   WaveDevs[I].LastEnd := Ticks;
   WaveDevs[I].Paused := False;
@@ -18770,6 +22023,11 @@ Begin
   Begin
     WaveDevs[I].Paused := True;
     WaveDevs[I].PauseAt := Ticks;
+    If (I = SbDev) And SbPlaying Then
+    Begin
+      If SbOBits = 16 Then SbWriteDsp($D5) Else SbWriteDsp($D0);
+      SbPaused := True;
+    End;
   End;
   waveOutPause := 0;
 End;
@@ -18787,24 +22045,136 @@ Begin
       WaveQEnd[I * MaxWaveQ + K] := WaveQEnd[I * MaxWaveQ + K] + D;
     WaveDevs[I].LastEnd := WaveDevs[I].LastEnd + D;
     WaveDevs[I].Paused := False;
+    If (I = SbDev) And SbPlaying And SbPaused Then
+    Begin
+      If SbOBits = 16 Then SbWriteDsp($D6) Else SbWriteDsp($D4);
+      SbPaused := False;
+    End
+    Else If (I = SbDev) And Not SbPlaying And (WaveDevs[I].QN > 0) Then
+      SbStart;
   End;
   waveOutRestart := 0;
 End;
 
 Function waveOutGetVolume(H, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := -1;
+  If P <> 0 Then
+    MemL[0:P] := (MixVolL[1] * 257) Or ((MixVolR[1] * 257) Shl 16);
   waveOutGetVolume := 0;
 End;
 
 Function waveOutSetVolume(H, V : LongInt) : LongInt;
 Begin
+  MixVolL[1] := (V And $FFFF) Shr 8;
+  MixVolR[1] := (V Shr 24) And 255;
+  SndApplyVol;
   waveOutSetVolume := 0;
 End;
 
+{ --------------------------- midiOut (FM) ------------------------- }
+
+Const HMidi = $9800;
+
 Function midiOutGetNumDevs : LongInt;
 Begin
-  midiOutGetNumDevs := 0;
+  midiOutGetNumDevs := Ord(OplOk);
+End;
+
+{ MIDIOUTCAPSA : +0 fabricant, +2 produit, +4 version, +8 nom (32),
+  +40 technologie (MOD_FMSYNTH = 4), +42 voix, +44 notes, +46 canaux,
+  +48 possibilites (volume) }
+Function midiOutGetDevCapsA(Id, P, N : LongInt) : LongInt;
+Begin
+  midiOutGetDevCapsA := 2;
+  If Not OplOk Or (P = 0) Or (N < 52) Then Exit;
+  FillMem(P, 52, 0);
+  MemW[0:P] := 1; MemW[0:P + 2] := 2;
+  MemL[0:P + 4] := $0400;
+  PutPStr(P + 8, L('Synth'#130'tiseur FM (OPL2)', 'FM Synthesizer (OPL2)',
+          'FM-Synthesizer (OPL2)', 'Sintetizzatore FM (OPL2)',
+          'Sintetizador FM (OPL2)'), 32);
+  MemW[0:P + 40] := 4; MemW[0:P + 42] := 9; MemW[0:P + 44] := 9;
+  MemW[0:P + 46] := $FFFF; MemL[0:P + 48] := 1;
+  midiOutGetDevCapsA := 0;
+End;
+
+Function midiOutOpen(PH, Id, Cb, Inst, Flags : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  midiOutOpen := 2;
+  If Not OplOk Then Exit;
+  If MidiOpen Then
+  Begin
+    midiOutOpen := 4;
+    Exit;
+  End;
+  MidiOpen := True;
+  For I := 0 To 15 Do MidiProg[I] := 0;
+  OplAllOff;
+  If PH <> 0 Then MemL[0:PH] := HMidi;
+  midiOutOpen := 0;
+End;
+
+Function midiOutClose(H : LongInt) : LongInt;
+Begin
+  If MidiOpen Then OplAllOff;
+  MidiOpen := False;
+  midiOutClose := 0;
+End;
+
+Function midiOutShortMsg(H, M : LongInt) : LongInt;
+Var St, Ch, D1, D2 : LongInt;
+Begin
+  midiOutShortMsg := 5;
+  If Not MidiOpen Then Exit;
+  St := M And $F0; Ch := M And 15;
+  D1 := (M Shr 8) And $7F; D2 := (M Shr 16) And $7F;
+  Case St Of
+    $80 : OplNoteOff(Ch, D1);
+    $90 : OplNoteOn(Ch, D1, D2);
+    $C0 : MidiProg[Ch] := D1;
+    $B0 : If (D1 = 123) Or (D1 = 120) Then OplAllOff;
+  End;
+  midiOutShortMsg := 0;
+End;
+
+Function midiOutReset(H : LongInt) : LongInt;
+Begin
+  If MidiOpen Then OplAllOff;
+  midiOutReset := 0;
+End;
+
+Function midiOutLongMsg(H, Hdr, N : LongInt) : LongInt;
+Begin
+  If Hdr <> 0 Then MemL[0:Hdr + 16] := MemL[0:Hdr + 16] Or 1;
+  midiOutLongMsg := 0;
+End;
+
+Function midiOutPrepareHeader(H, Hdr, N : LongInt) : LongInt;
+Begin
+  If Hdr <> 0 Then MemL[0:Hdr + 16] := MemL[0:Hdr + 16] Or 2;
+  midiOutPrepareHeader := 0;
+End;
+
+Function midiOutUnprepareHeader(H, Hdr, N : LongInt) : LongInt;
+Begin
+  If Hdr <> 0 Then MemL[0:Hdr + 16] := MemL[0:Hdr + 16] And Not 2;
+  midiOutUnprepareHeader := 0;
+End;
+
+Function midiOutSetVolume(H, V : LongInt) : LongInt;
+Begin
+  MixVolL[2] := (V And $FFFF) Shr 8;
+  MixVolR[2] := (V Shr 24) And 255;
+  SndApplyVol;
+  midiOutSetVolume := 0;
+End;
+
+Function midiOutGetVolume(H, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+    MemL[0:P] := (MixVolL[2] * 257) Or ((MixVolR[2] * 257) Shl 16);
+  midiOutGetVolume := 0;
 End;
 
 Function auxGetNumDevs : LongInt;
@@ -18812,14 +22182,103 @@ Begin
   auxGetNumDevs := 0;
 End;
 
-Function sndPlaySoundA(S, F : LongInt) : LongInt;
+{ PlaySound / sndPlaySound : fichier WAV (PCM) joue par waveOut sur un
+  peripherique du noyau ; SND_ASYNC (1) rend la main tout de suite, sinon
+  la tache attend la fin. SND_MEMORY (4) : image WAV en memoire. Les
+  alias du registre (SystemStart...) ne sont pas geres. }
+Var
+  PsDev, PsBuf, PsHdr : LongInt;
+
+Procedure PlaySoundStop;
 Begin
-  sndPlaySoundA := 1;
+  If PsDev >= 0 Then
+  Begin
+    waveOutReset(HWaveBase + PsDev);
+    waveOutClose(HWaveBase + PsDev);
+    PsDev := -1;
+  End;
+  If PsBuf <> 0 Then KFree(PsBuf);
+  If PsHdr <> 0 Then KFree(PsHdr);
+  PsBuf := 0; PsHdr := 0;
+End;
+
+Procedure PlaySoundPoll;
+Begin
+  If (PsDev >= 0) And (WaveDevs[PsDev].QN = 0) Then PlaySoundStop;
+End;
+
+{ Jouer l'image WAV A (N octets) ; False si ce n'est pas du PCM }
+Function PlayWavImage(A, N : LongInt; Wait : Boolean) : Boolean;
+Var P, Ck, Sz, Fmt, Dat, DLen, H, Own : LongInt;
+Begin
+  PlayWavImage := False;
+  If (N < 44) Or (MemL[0:A] <> $46464952) Or (MemL[0:A + 8] <> $45564157)
+  Then Exit;
+  P := 12; Fmt := 0; Dat := 0; DLen := 0;
+  While P + 8 <= N Do
+  Begin
+    Ck := MemL[0:A + P]; Sz := MemL[0:A + P + 4];
+    If Ck = $20746D66 Then Fmt := A + P + 8
+    Else If Ck = $61746164 Then
+    Begin
+      Dat := A + P + 8; DLen := Min(Sz, N - P - 8);
+    End;
+    P := P + 8 + ((Sz + 1) And Not 1);
+  End;
+  If (Fmt = 0) Or (Dat = 0) Or (MemW[0:Fmt] <> 1) Then Exit;
+  PlaySoundStop;
+  Own := HeapOwner; HeapOwner := 0;
+  PsBuf := KAlloc(DLen + 16);
+  PsHdr := KAlloc(32);
+  HeapOwner := Own;
+  If (PsBuf = 0) Or (PsHdr = 0) Then Exit;
+  MoveMem(Dat, PsBuf, DLen);
+  If waveOutOpen(LongInt(@H), 0, Fmt, 0, 0, 0) <> 0 Then Exit;
+  PsDev := H - HWaveBase;
+  MemL[0:PsHdr] := PsBuf; MemL[0:PsHdr + 4] := DLen;
+  waveOutPrepareHeader(H, PsHdr, 32);
+  waveOutWrite(H, PsHdr, 32);
+  PlayWavImage := True;
+  If Wait And (CurT <> 0) Then
+    While (PsDev >= 0) And (WaveDevs[PsDev].QN > 0) Do KSleep(20);
 End;
 
 Function PlaySoundA(S, M, F : LongInt) : LongInt;
+Var A, N : LongInt; Ok : Boolean;
 Begin
-  PlaySoundA := 1;
+  PlaySoundA := 0;
+  If S = 0 Then
+  Begin
+    PlaySoundStop;
+    PlaySoundA := 1;
+    Exit;
+  End;
+  If (F And 4) <> 0 Then
+  Begin
+    PlaySoundA := Ord(PlayWavImage(S, MemL[0:S + 4] + 8, (F And 1) = 0));
+    Exit;
+  End;
+  A := LoadWholeFile(PStr(S), N);
+  If A = 0 Then Exit;
+  Ok := PlayWavImage(A, N, (F And 1) = 0);
+  KFree(A);
+  PlaySoundA := Ord(Ok);
+End;
+
+{ Son de demarrage (D:\PASDOWS.WAV), comme Demarrage de Windows }
+Procedure StartupSound;
+Var A, N : LongInt;
+Begin
+  If Not SbOk Then Exit;
+  A := LoadWholeFile('D:\PASDOWS.WAV', N);
+  If A = 0 Then Exit;
+  PlayWavImage(A, N, False);
+  KFree(A);
+End;
+
+Function sndPlaySoundA(S, F : LongInt) : LongInt;
+Begin
+  sndPlaySoundA := PlaySoundA(S, 0, F And $1F);
 End;
 
 Function DefDriverProc(Id, Drv, Msg, P1, P2 : LongInt) : LongInt;
@@ -18847,15 +22306,68 @@ Begin
   mciGetErrorStringA := 1;
 End;
 
-{ COMDLG32 }
+{ COMDLG32 : boites Ouvrir / Enregistrer sous du noyau, modales pour la
+  tache du programme. OPENFILENAME : +12 filtres, +24 filtre choisi, +28
+  nom (+32 taille), +36 titre du fichier (+40), +44 dossier initial,
+  +48 titre, +56/58 decalages du nom et de l'extension, +60 extension
+  par defaut. }
+Function FileDlgApp(P, Mode : LongInt) : LongInt;
+Var F, S, D, N : String; A, K, I : LongInt;
+Begin
+  FileDlgApp := 0;
+  If (CurT = 0) Or (P = 0) Then Exit;
+  FdFiltN := 0;
+  A := MemL[0:P + 12];
+  While (A <> 0) And (Mem[0:A] <> 0) And (FdFiltN < 8) Do
+  Begin
+    FdFiltDesc[FdFiltN] := PStr(A);
+    A := A + Length(PStr(A)) + 1;
+    S := PStr(A);
+    A := A + Length(S) + 1;
+    K := Pos(';', S);
+    If K > 0 Then S := Copy(S, 1, K - 1);
+    FdFiltPat[FdFiltN] := S;
+    Inc(FdFiltN);
+  End;
+  FdFiltI := Max(0, Min(FdFiltN - 1, MemL[0:P + 24] - 1));
+  If MemL[0:P + 60] <> 0 Then FdDefExt := UpStr(PStr(MemL[0:P + 60]))
+  Else FdDefExt := '';
+  If MemL[0:P + 48] <> 0 Then FdTitle := PStr(MemL[0:P + 48])
+  Else FdTitle := '';
+  D := CurDirS;
+  If MemL[0:P + 44] <> 0 Then
+    If PStr(MemL[0:P + 44]) <> '' Then D := FullPath(PStr(MemL[0:P + 44]));
+  N := '';
+  If MemL[0:P + 28] <> 0 Then N := PStr(MemL[0:P + 28]);
+  If Pos('', N) > 0 Then
+  Begin
+    D := ParentDir(FullPath(N));
+    N := BaseName(N);
+  End;
+  FdOpen(Mode, 1, D, N);
+  While Not FdDone Do KSleep(20);
+  If Not FdOk Then Exit;
+  F := FdResult;
+  If MemL[0:P + 28] <> 0 Then PutPStr(MemL[0:P + 28], F, MemL[0:P + 32]);
+  If MemL[0:P + 36] <> 0 Then
+    PutPStr(MemL[0:P + 36], BaseName(F), MemL[0:P + 40]);
+  I := Length(F);
+  While (I > 0) And (F[I] <> '') Do Dec(I);
+  MemW[0:P + 56] := I;
+  K := Length(F);
+  While (K > I) And (F[K] <> '.') Do Dec(K);
+  If K > I Then MemW[0:P + 58] := K Else MemW[0:P + 58] := Length(F);
+  FileDlgApp := 1;
+End;
+
 Function GetOpenFileNameA(P : LongInt) : LongInt;
 Begin
-  GetOpenFileNameA := 0;
+  GetOpenFileNameA := FileDlgApp(P, 0);
 End;
 
 Function GetSaveFileNameA(P : LongInt) : LongInt;
 Begin
-  GetSaveFileNameA := 0;
+  GetSaveFileNameA := FileDlgApp(P, 1);
 End;
 
 Function PrintDlgA(P : LongInt) : LongInt;
@@ -30243,7 +33755,10 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   waveOutGetNumDevs, waveOutGetDevCapsA, waveOutOpen, waveOutClose,
   waveOutPrepareHeader, waveOutUnprepareHeader, waveOutWrite, waveOutReset,
   waveOutPause, waveOutRestart, waveOutGetVolume, waveOutSetVolume,
-  midiOutGetNumDevs, auxGetNumDevs, sndPlaySoundA, PlaySoundA, DefDriverProc,
+  midiOutGetNumDevs, midiOutGetDevCapsA, midiOutOpen, midiOutClose,
+  midiOutShortMsg, midiOutReset, midiOutLongMsg, midiOutPrepareHeader,
+  midiOutUnprepareHeader, midiOutSetVolume, midiOutGetVolume,
+  auxGetNumDevs, sndPlaySoundA, PlaySoundA, DefDriverProc,
   mciSendCommandA, mciSendStringA, mciGetErrorStringA, GetOpenFileNameA,
   GetSaveFileNameA, PrintDlgA, ChooseColorA, CommDlgExtendedError,
   FindExecutableA, ShellExecuteA, CoInitialize, CoUninitialize,
@@ -30270,6 +33785,13 @@ Begin
   KClass[ikRun] := ClassAdd('#Run', 0, ikRun, 0);
   KClass[ikDisplay] := ClassAdd('#Display', 0, ikDisplay, 0);
   KClass[ikDateTime] := ClassAdd('#DateTime', 0, ikDateTime, 0);
+  KClass[ikVolPop] := ClassAdd('#VolPop', 0, ikVolPop, 0);
+  KClass[ikMixer] := ClassAdd('#Mixer', 0, ikMixer, 0);
+  KClass[ikAudio] := ClassAdd('#Audio', 0, ikAudio, 0);
+  KClass[ikSysProps] := ClassAdd('#SysProps', 0, ikSysProps, 0);
+  KClass[ikFileDlg] := ClassAdd('#FileDlg', 0, ikFileDlg, 0);
+  KClass[ikFind] := ClassAdd('#Find', 0, ikFind, 0);
+  KClass[ikDevProps] := ClassAdd('#DevProps', 0, ikDevProps, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
@@ -30402,6 +33924,10 @@ BEGIN
   DispiDetect;
   DispW := -1; RebootAskW := -1; DtW := -1;
   TzLoad;
+  PsDev := -1;
+  SndInit;
+  TrayVol := True; MixW0 := -1; AudW := -1; SysW := -1; DevPW := -1;
+  FdW := -1; FindW := -1; NoteAskW := -1; NotePend := -1; NoteSel := -1;
   ThreadInit0;
   KImgLo := $100000;
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
@@ -30453,5 +33979,6 @@ BEGIN
   FlushScreen;
   CursorDraw;
   KLog('Memoire libre : ' + IntStr(HeapFreeBytes Div 1024) + ' Ko');
+  StartupSound;
   SystemLoop;
 END.
