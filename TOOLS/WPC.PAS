@@ -5319,6 +5319,7 @@ Begin
   EmitRaw('CRT_CSBI  DB 22 DUP(0)');   { CONSOLE_SCREEN_BUFFER_INFO (22 bytes)  }
   EmitRaw('CRT_INREC DB 20 DUP(0)');   { INPUT_RECORD buffer (20 bytes)         }
   EmitRaw('CRT_NEVT  DD 0');           { nombre d evenements console            }
+  EmitRaw('CRT_PEND  DD 0');           { code etendu en attente (ReadKey #0) }
   EmitRaw('CRT_NWRT  DD 0');           { nombre de cellules ecrites            }
   EmitRaw('CRT_SCROLL DB 16 DUP(0)');  { SMALL_RECT pour ScrollConsoleScreenBuffer }
   EmitRaw('CRT_FILL   DD 0,0');        { CHAR_INFO (char + attr) pour scroll fill  }
@@ -32028,7 +32029,13 @@ Begin
   { Si mode graphique actif, utiliser la fenetre }
   EmitInstr('CMP DWORD PTR [GR_ACTIVE],0');
   EmitInstr('JNE ' + TP_RT_PFX + 'KP_GR');
-  { --- Chemin console (inchange) --- }
+  { --- Chemin console --- }
+  { code etendu en attente (2e octet d une touche speciale) }
+  EmitInstr('CMP DWORD PTR [CRT_PEND],0');
+  EmitInstr('JE ' + TP_RT_PFX + 'KP_NP');
+  EmitInstr('MOV EAX,1');
+  EmitInstr('JMP ' + TP_RT_PFX + 'KP_DN');
+  EmitLabel(TP_RT_PFX + 'KP_NP');
   { GetNumberOfConsoleInputEvents(hStdin, &count) }
   EmitInstr('PUSH OFFSET CRT_NEVT');
   EmitInstr('PUSH DWORD PTR [HSTDIN]');
@@ -32050,6 +32057,13 @@ Begin
   EmitInstr('MOV EAX,DWORD PTR [CRT_INREC+4]');
   EmitInstr('TEST EAX,EAX');
   EmitInstr('JZ ' + TP_RT_PFX + 'KP_FL');
+  { Maj, Ctrl, Alt, verrouillages et touches Windows seules : pas une   }
+  { touche pour ReadKey (comme Free Pascal), retirer l evenement        }
+  EmitInstr('CMP BYTE PTR [CRT_INREC+14],0');
+  EmitInstr('JNE ' + TP_RT_PFX + 'KP_OK');
+  EmitInstr('CALL ' + TP_RT_PFX + 'CRT_MODK');
+  EmitInstr('JE ' + TP_RT_PFX + 'KP_FL');
+  EmitLabel(TP_RT_PFX + 'KP_OK');
   EmitInstr('MOV EAX,1');
   EmitInstr('JMP ' + TP_RT_PFX + 'KP_DN');
   EmitLabel(TP_RT_PFX + 'KP_FL');
@@ -32105,6 +32119,14 @@ Begin
   EmitInstr('CMP DWORD PTR [GR_ACTIVE],0');
   EmitInstr('JNE ' + TP_RT_PFX + 'RK_GR');
   { --- Chemin console (inchange) --- }
+  { 2e appel apres une touche speciale : son code (comme Turbo Pascal) }
+  EmitInstr('MOV EAX,DWORD PTR [CRT_PEND]');
+  EmitInstr('TEST EAX,EAX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'RK_LP');
+  EmitInstr('MOV DWORD PTR [CRT_PEND],0');
+  EmitInstr('POP EDX');
+  EmitInstr('POP ECX');
+  EmitInstr('RET');
   EmitLabel(TP_RT_PFX + 'RK_LP');
   { ReadConsoleInputA(hStdin, &rec, 1, &count) }
   EmitInstr('PUSH OFFSET CRT_NEVT');
@@ -32141,8 +32163,44 @@ Begin
   EmitInstr('JZ ' + TP_RT_PFX + 'RK_LP');
   { Retourner AsciiChar (offset 14 dans INPUT_RECORD) }
   EmitInstr('MOVZX EAX,BYTE PTR [CRT_INREC+14]');
+  EmitInstr('TEST EAX,EAX');
+  EmitInstr('JNZ ' + TP_RT_PFX + 'RK_CH');
+  { AsciiChar = 0 : touche de modification seule -> ignoree ; touche  }
+  { speciale (fleches, F1-F12...) -> #0 puis, au prochain appel, son  }
+  { code de balayage (wVirtualScanCode, offset 12), comme Turbo Pascal }
+  EmitInstr('CALL ' + TP_RT_PFX + 'CRT_MODK');
+  EmitInstr('JE ' + TP_RT_PFX + 'RK_LP');
+  EmitInstr('MOVZX EAX,BYTE PTR [CRT_INREC+12]');
+  EmitInstr('TEST EAX,EAX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'RK_LP');
+  EmitInstr('MOV DWORD PTR [CRT_PEND],EAX');
+  EmitInstr('XOR EAX,EAX');
+  EmitLabel(TP_RT_PFX + 'RK_CH');
   EmitInstr('POP EDX');
   EmitInstr('POP ECX');
+  EmitInstr('RET');
+  { ------ _TPRT_CRT_MODK : ZF=1 si CRT_INREC est une touche de      }
+  { modification seule (wVirtualKeyCode, offset 10) - EAX modifie   }
+  EmitLabel(TP_RT_PFX + 'CRT_MODK');
+  EmitInstr('MOVZX EAX,WORD PTR [CRT_INREC+10]');
+  EmitInstr('CMP EAX,10h');                  { Maj }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,11h');                  { Ctrl }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,12h');                  { Alt }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,14h');                  { Verr. Maj }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,90h');                  { Verr. Num }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,91h');                  { Arret defil }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,5Bh');                  { Windows gauche }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,5Ch');                  { Windows droite }
+  EmitInstr('JE ' + TP_RT_PFX + 'CMK_DN');
+  EmitInstr('CMP EAX,5Dh');                  { Applications }
+  EmitLabel(TP_RT_PFX + 'CMK_DN');
   EmitInstr('RET');
   { --- Chemin fenetre graphique --- }
   EmitLabel(TP_RT_PFX + 'RK_GR');
@@ -41904,6 +41962,7 @@ Begin
   BcDefineDataLabel('CRT_CSBI');   BcDataZeros(22);
   BcDefineDataLabel('CRT_INREC');  BcDataZeros(20);
   BcDefineDataLabel('CRT_NEVT');   BcDataD(0);
+  BcDefineDataLabel('CRT_PEND');   BcDataD(0);
   BcDefineDataLabel('CRT_NWRT');   BcDataD(0);
   BcDefineDataLabel('CRT_SCROLL'); BcDataZeros(16);
   BcDefineDataLabel('CRT_FILL');   BcDataD(0); BcDataD(0);

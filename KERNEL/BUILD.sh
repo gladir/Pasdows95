@@ -6,7 +6,9 @@
 #  2. compile le systeme avec WPC :
 #        WPC -CW95IO IO.PAS IO.SYS         (IO.SYS amorcable, El Torito)
 #        WPC -CVMM32 VMM32.PAS VMM32.VXD   (noyau 32 bits et Win32)
-#  3. compile les exemples Win32 (EXEMPLES/*.PAS, WPC -CW32) ;
+#  3. compile les programmes systeme (SYSTEME/*.PAS, dont COMMAND.EXE,
+#     l'interpreteur de commandes) et les exemples Win32 (EXEMPLES/*.PAS),
+#     avec WPC -CW32 ;
 #  4. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec tous
 #     les fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
 #     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) ;
@@ -36,8 +38,8 @@ echo "== IO.SYS (WPC -CW95IO)"
 echo "== VMM32.VXD (WPC -CVMM32)"
 "$W/wpc" -CVMM32 "$HERE/VMM32.PAS" "$W/cd/VMM32.VXD"
 
-echo "== Exemples Win32 (WPC -CW32)"
-for P in "$ROOT"/EXEMPLES/*.PAS; do
+echo "== Programmes systeme et exemples Win32 (WPC -CW32)"
+for P in "$ROOT"/SYSTEME/*.PAS "$ROOT"/EXEMPLES/*.PAS; do
   N=$(basename "$P" .PAS)
   "$W/wpc" -CW32 "$P" "$W/cd/$N.EXE"
   cp "$W/cd/$N.EXE" "$ROOT/IMAGE/CDROM/$N.EXE"
