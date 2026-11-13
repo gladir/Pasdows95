@@ -6624,6 +6624,8 @@ End;
     +34 nombre de modes VESA   +36 adresse de leur table (0000:0600)
     +38 mode VESA courant      +3A tailles et positions des composantes
         rouge, verte et bleue (couleurs directes, 6 octets)
+    +40 version VBE            +42 memoire video (blocs de 64 Ko)
+    +80 nom du fabricant de la carte VESA (ASCIIZ, 63 caracteres)
   Table des modes VESA (0000:0600, 20 octets par mode, au plus 48) :
     +0 numero  +2 largeur  +4 hauteur  +6 bits par point  +8 octets par
     ligne  +10 tailles/positions R, V, B  +16 memoire lineaire
@@ -6817,6 +6819,18 @@ Begin
   end;
   If R <> $004F Then Exit;
   If (VbeInfo[0] <> Ord('V')) Or (VbeInfo[1] <> Ord('E')) Then Exit;
+  { version, memoire et fabricant (Gestionnaire de peripheriques) }
+  MemW[0:VInfo + $40] := VbeInfo[4] + Word(VbeInfo[5]) Shl 8;
+  MemW[0:VInfo + $42] := VbeInfo[18] + Word(VbeInfo[19]) Shl 8;
+  Mo := VbeInfo[6] + Word(VbeInfo[7]) Shl 8;
+  Sg := VbeInfo[8] + Word(VbeInfo[9]) Shl 8;
+  I := 0;
+  While (I < 63) And (Mem[Sg:Mo + I] <> 0) Do
+  Begin
+    Mem[0:VInfo + $80 + I] := Mem[Sg:Mo + I];
+    Inc(I);
+  End;
+  Mem[0:VInfo + $80 + I] := 0;
   Mo := VbeInfo[14] + Word(VbeInfo[15]) Shl 8;
   Sg := VbeInfo[16] + Word(VbeInfo[17]) Shl 8;
   N := 0;
@@ -6894,6 +6908,8 @@ Begin
   Vga := False;
   MemW[0:VInfo + $38] := 0;
   For J := 0 To 5 Do Mem[0:VInfo + $3A + J] := 0;
+  MemW[0:VInfo + $40] := 0; MemW[0:VInfo + $42] := 0;
+  Mem[0:VInfo + $80] := 0;
   VbeEnum;
   MemW[0:VInfo + $34] := VmCnt;
   MemW[0:VInfo + $36] := VModes;
