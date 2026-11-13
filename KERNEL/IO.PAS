@@ -6838,7 +6838,7 @@ End;
   de configuration, Affichage) dans le CMOS : 7Ah bits par point (4 : VGA
   16 couleurs), 7Bh signature 5Ah, 7Ch largeur / 8, 7Dh hauteur / 8.
   GDT temporaire en 0000:0A00, GDTR en 0000:0A20, transition 32 bits en
-  0000:0A40, zone de transit du fichier en 00400000h. }
+  0000:0A40, zone de transit du fichier en 00800000h. }
 
 Const
   VInfo     = $0500;
@@ -6847,7 +6847,7 @@ Const
   VTramp    = $0A40;
   VFont     = $2000;
   VEnv      = $3000;
-  VStaging  = $00400000;
+  VStaging  = $00800000;
   CmosDosFlag = $7E;
   VModes    = $0600;
   MaxVModes = 48;

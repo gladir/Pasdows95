@@ -1639,6 +1639,9 @@ Var
   FoVol, FoClus, FoSize, FoDir, FoIdx, FoCIdx, FoCClus, FoTime
     : Array[0..MaxFo - 1] Of LongInt;
   FoDirty   : Array[0..MaxFo - 1] Of Boolean;
+  { NTFS : runs de $DATA du fichier ouvert, donnees residentes }
+  FoRA, FoRN : Array[0..MaxFo - 1] Of LongInt;
+  FoRes     : Array[0..MaxFo - 1] Of Boolean;
   { parcours de repertoire (cache du dernier cluster) }
   DcVol, DcDir, DcK, DcClus : LongInt;
   LfnBuf    : Array[0..259] Of LongInt;
@@ -2622,6 +2625,2433 @@ Begin
   VolMount := True;
 End;
 
+{ ==================================================================== }
+{ Partie 3c - NTFS (lecture et ecriture)                                }
+{ ==================================================================== }
+
+{ Volumes NTFS 3.x (Windows 2000, XP...) des partitions de type 07h :
+  enregistrements de la MFT (correctifs de secteurs), attributs
+  residents et non residents (listes de runs, fichiers creux, listes
+  d'attributs), repertoires (index $I30 en arbre B+, comparaison des
+  noms par la table $UpCase). En ecriture : bitmap des clusters et de
+  la MFT, fichiers residents puis non residents, extension de la MFT,
+  index reconstruits a chaque modification (petit index dans
+  $INDEX_ROOT ou arbre de blocs INDX), $MFTMirr. Le journal $LogFile
+  n'est pas tenu : comme ntfs-3g, VMM32 le vide (rempli de FFh) pour que
+  Windows ne rejoue pas d'anciennes transactions. Les fichiers
+  compresses ou chiffres ne sont pas lus. Les noms sont convertis en
+  Latin-1 (caracteres au-dela de 255 : '_'). }
+
+Const
+  NtfsT = 7;                       { VolType d'un volume NTFS }
+  NtMaxRuns = 8192;                { runs par attribut }
+  NdEntSz = 288;                   { entree du cache de repertoire }
+
+Var
+  NvCb, NvRec, NvIdx, NvVcnSz, NvMftLcn, NvMirrLcn, NvMftRA, NvMftRN,
+  NvRecN, NvBmp, NvBmpRA, NvBmpRN, NvBmpLen, NvUpc, NvMBmp, NvMBmpLen,
+  NvSecId, NvVer, NvHint, NvIrB, NvIrC, NvRO
+    : Array[0..MaxVol - 1] Of LongInt;
+  { cache du repertoire liste (NtDirList) }
+  NdVol, NdDir, NdN, NdBuf, NdCap : LongInt;
+  { entrees brutes d'un index (NtGather) : decalages dans NgBuf }
+  NgN, NgBuf, NgCap, NgUsed, NgOff, NgOffCap : LongInt;
+  NtTmpR : LongInt;                { runs temporaires }
+  NdPath : String;                 { dernier repertoire resolu (chemin) }
+  NdPathVol, NdPathRec : LongInt;
+  NtClusBuf : LongInt;             { un cluster (64 Ko au plus) }
+
+Procedure NtInval;
+Begin
+  NdVol := -1; NdPathVol := -1;
+End;
+
+{ E/S de secteurs relatifs au volume }
+Function NtIo(V, Lba, Cnt, Buf : LongInt; Wr : Boolean) : Boolean;
+Var D, K, N : LongInt;
+Begin
+  NtIo := False;
+  D := VolDisk[V];
+  K := 0;
+  While K < Cnt Do
+  Begin
+    N := Min(Cnt - K, 128);
+    If Wr Then
+    Begin
+      SecInval(D, VolStart[V] + Lba + K, N);
+      If Not HdWrite(D, VolStart[V] + Lba + K, N, Buf + K * 512) Then
+      Begin
+        FatIoErr := True;
+        Exit;
+      End;
+    End
+    Else If Not HdRead(D, VolStart[V] + Lba + K, N, Buf + K * 512) Then
+    Begin
+      FatIoErr := True;
+      Exit;
+    End;
+    K := K + N;
+  End;
+  NtIo := True;
+End;
+
+Function NtClusIo(V, Lcn, N, Buf : LongInt; Wr : Boolean) : Boolean;
+Begin
+  NtClusIo := NtIo(V, Lcn * VolSpc[V], N * VolSpc[V], Buf, Wr);
+End;
+
+{ Correctifs de secteurs (multi-sector protection) }
+Function NtUnfix(B, Size : LongInt) : Boolean;
+Var UO, UC, Usn, I, P : LongInt;
+Begin
+  NtUnfix := False;
+  UO := MemW[0:B + 4]; UC := MemW[0:B + 6];
+  If (UO < 8) Or (UO + UC * 2 > 1024) Then Exit;
+  Usn := MemW[0:B + UO];
+  For I := 1 To UC - 1 Do
+  Begin
+    If I * 512 > Size Then Break;
+    P := B + I * 512 - 2;
+    If MemW[0:P] <> Usn Then Exit;
+    MemW[0:P] := MemW[0:B + UO + I * 2];
+  End;
+  NtUnfix := True;
+End;
+
+Procedure NtFix(B, Size : LongInt);
+Var UO, UC, Usn, I, P : LongInt;
+Begin
+  UO := MemW[0:B + 4]; UC := MemW[0:B + 6];
+  Usn := MemW[0:B + UO] + 1;
+  If (Usn = 0) Or (Usn >= $FFFF) Then Usn := 1;
+  MemW[0:B + UO] := Usn;
+  For I := 1 To UC - 1 Do
+  Begin
+    If I * 512 > Size Then Break;
+    P := B + I * 512 - 2;
+    MemW[0:B + UO + I * 2] := MemW[0:P];
+    MemW[0:P] := Usn;
+  End;
+End;
+
+Procedure NtUnfixW(B, Size : LongInt);
+Var UO, UC, I, P : LongInt;
+Begin
+  UO := MemW[0:B + 4]; UC := MemW[0:B + 6];
+  For I := 1 To UC - 1 Do
+  Begin
+    If I * 512 > Size Then Break;
+    P := B + I * 512 - 2;
+    MemW[0:P] := MemW[0:B + UO + I * 2];
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Runs (tableau de triplets VCN, LCN (-1 : creux), longueur)           }
+{ ------------------------------------------------------------------ }
+
+Function NtSigned(P, N : LongInt) : LongInt;
+Var V, K : LongInt;
+Begin
+  V := 0;
+  If N > 4 Then N := 4;
+  For K := N - 1 DownTo 0 Do V := (V Shl 8) Or Mem[0:P + K];
+  If (N < 4) And (N > 0) And ((Mem[0:P + N - 1] And $80) <> 0) Then
+    V := V - (1 Shl (8 * N));
+  NtSigned := V;
+End;
+
+{ Ajouter les runs de l'attribut non resident At a (RA, RN) }
+Function NtRunsDecode(At, RA : LongInt; Var RN : LongInt) : Boolean;
+Var P, H, NL, NO, Len, Vcn, Lcn, E : LongInt;
+Begin
+  NtRunsDecode := False;
+  P := At + MemW[0:At + $20];
+  E := At + MemL[0:At + 4];
+  Vcn := MemL[0:At + $10]; Lcn := 0;
+  While (P < E) And (Mem[0:P] <> 0) Do
+  Begin
+    H := Mem[0:P]; NL := H And 15; NO := H Shr 4;
+    If (NL = 0) Or (NL > 4) Or (RN >= NtMaxRuns) Then Exit;
+    Len := NtSigned(P + 1, NL);
+    If NL = 4 Then Len := MemL[0:P + 1];
+    MemL[0:RA + RN * 12] := Vcn;
+    MemL[0:RA + RN * 12 + 8] := Len;
+    If NO = 0 Then MemL[0:RA + RN * 12 + 4] := -1
+    Else
+    Begin
+      Lcn := Lcn + NtSigned(P + 1 + NL, NO);
+      MemL[0:RA + RN * 12 + 4] := Lcn;
+    End;
+    Inc(RN);
+    Vcn := Vcn + Len;
+    P := P + 1 + NL + NO;
+  End;
+  NtRunsDecode := True;
+End;
+
+{ LCN du VCN et nombre de clusters contigus ; False hors des runs }
+Function NtVcnLcn(RA, RN, Vcn : LongInt; Var Lcn, Cnt : LongInt) : Boolean;
+Var I, V0, L : LongInt;
+Begin
+  NtVcnLcn := False;
+  For I := 0 To RN - 1 Do
+  Begin
+    V0 := MemL[0:RA + I * 12];
+    L := MemL[0:RA + I * 12 + 8];
+    If (Vcn >= V0) And (Vcn < V0 + L) Then
+    Begin
+      Lcn := MemL[0:RA + I * 12 + 4];
+      If Lcn >= 0 Then Lcn := Lcn + Vcn - V0;
+      Cnt := V0 + L - Vcn;
+      NtVcnLcn := True;
+      Exit;
+    End;
+  End;
+End;
+
+Function NtSigBytes(V : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  N := 1;
+  While (N < 4) And Not ((V >= -(1 Shl (8 * N - 1))) And
+        (V < (1 Shl (8 * N - 1)))) Do Inc(N);
+  NtSigBytes := N;
+End;
+
+{ Encoder les runs en Dst ; retourne la longueur (avec le 0 final) }
+Function NtRunsEncode(RA, RN, Dst : LongInt) : LongInt;
+Var I, P, Len, Lcn, Prev, D, NL, NO, K : LongInt;
+Begin
+  P := Dst; Prev := 0;
+  For I := 0 To RN - 1 Do
+  Begin
+    Len := MemL[0:RA + I * 12 + 8];
+    Lcn := MemL[0:RA + I * 12 + 4];
+    NL := NtSigBytes(Len);
+    If Lcn < 0 Then NO := 0
+    Else
+    Begin
+      D := Lcn - Prev;
+      NO := NtSigBytes(D);
+      Prev := Lcn;
+    End;
+    If Dst <> 0 Then
+    Begin
+      Mem[0:P] := NL Or (NO Shl 4);
+      For K := 0 To NL - 1 Do Mem[0:P + 1 + K] := (Len Shr (8 * K)) And $FF;
+      For K := 0 To NO - 1 Do
+        Mem[0:P + 1 + NL + K] := (D Shr (8 * K)) And $FF;
+    End;
+    P := P + 1 + NL + NO;
+  End;
+  If Dst <> 0 Then Mem[0:P] := 0;
+  NtRunsEncode := P - Dst + 1;
+End;
+
+{ Lire ou ecrire N octets a la position Off d'un flux non resident }
+Function NtStreamIo(V, RA, RN, Off, N, Buf : LongInt; Wr : Boolean)
+  : Boolean;
+Var Cb, Vcn, Co, L, Lcn, Cnt, K : LongInt;
+Begin
+  NtStreamIo := False;
+  Cb := NvCb[V];
+  While N > 0 Do
+  Begin
+    Vcn := Off Div Cb; Co := Off Mod Cb;
+    If Not NtVcnLcn(RA, RN, Vcn, Lcn, Cnt) Then Exit;
+    If (Co = 0) And (N >= Cb) Then
+    Begin
+      { clusters entiers contigus }
+      K := Min(Cnt, Min(N Div Cb, 16));
+      If Lcn < 0 Then
+      Begin
+        If Wr Then Exit;
+        FillMem(Buf, K * Cb, 0);
+      End
+      Else If Not NtClusIo(V, Lcn, K, Buf, Wr) Then Exit;
+      L := K * Cb;
+    End
+    Else
+    Begin
+      L := Min(N, Cb - Co);
+      If Lcn < 0 Then
+      Begin
+        If Wr Then Exit;
+        FillMem(Buf, L, 0);
+      End
+      Else
+      Begin
+        If Not NtClusIo(V, Lcn, 1, NtClusBuf, False) Then Exit;
+        If Wr Then
+        Begin
+          MoveMem(Buf, NtClusBuf + Co, L);
+          If Not NtClusIo(V, Lcn, 1, NtClusBuf, True) Then Exit;
+        End
+        Else MoveMem(NtClusBuf + Co, Buf, L);
+      End;
+    End;
+    Off := Off + L; Buf := Buf + L; N := N - L;
+  End;
+  NtStreamIo := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Enregistrements de la MFT                                            }
+{ ------------------------------------------------------------------ }
+
+Function NtReadRec(V, N, Buf : LongInt) : Boolean;
+Begin
+  NtReadRec := False;
+  If (N < 0) Or (N >= NvRecN[V]) Then Exit;
+  If Not NtStreamIo(V, NvMftRA[V], NvMftRN[V], N * NvRec[V], NvRec[V],
+                    Buf, False) Then Exit;
+  If MemL[0:Buf] <> $454C4946 Then Exit;          { FILE }
+  NtReadRec := NtUnfix(Buf, NvRec[V]);
+End;
+
+Function NtWriteRec(V, N, Buf : LongInt) : Boolean;
+Var Ok : Boolean;
+Begin
+  NtFix(Buf, NvRec[V]);
+  Ok := NtStreamIo(V, NvMftRA[V], NvMftRN[V], N * NvRec[V], NvRec[V],
+                   Buf, True);
+  { $MFTMirr : copie des 4 premiers enregistrements }
+  If Ok And (N < 4) And (NvMirrLcn[V] > 0) Then
+  Begin
+    If NtClusIo(V, NvMirrLcn[V] + (N * NvRec[V]) Div NvCb[V], 1, NtClusBuf,
+                False) Then
+    Begin
+      MoveMem(Buf, NtClusBuf + (N * NvRec[V]) Mod NvCb[V], NvRec[V]);
+      NtClusIo(V, NvMirrLcn[V] + (N * NvRec[V]) Div NvCb[V], 1, NtClusBuf,
+               True);
+    End;
+  End;
+  NtUnfixW(Buf, NvRec[V]);
+  NtWriteRec := Ok;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Attributs                                                            }
+{ ------------------------------------------------------------------ }
+
+Function NtAttrNameIs(P : LongInt; Const Nm : String) : Boolean;
+Var K, A : LongInt;
+Begin
+  NtAttrNameIs := False;
+  If Mem[0:P + 9] <> Length(Nm) Then Exit;
+  A := P + MemW[0:P + 10];
+  For K := 1 To Length(Nm) Do
+    If MemW[0:A + (K - 1) * 2] <> Ord(Nm[K]) Then Exit;
+  NtAttrNameIs := True;
+End;
+
+{ Attribut suivant (apres P, ou le premier si P = 0) de type Typ et de nom
+  Nm ('' : sans nom) ; 0 si absent }
+Function NtAttrAfter(V, R, P, Typ : LongInt; Const Nm : String) : LongInt;
+Var E : LongInt;
+Begin
+  NtAttrAfter := 0;
+  E := R + NvRec[V];
+  If P = 0 Then P := R + MemW[0:R + $14]
+  Else P := P + MemL[0:P + 4];
+  While (P + 8 <= E) And (MemL[0:P] <> -1) And (MemL[0:P] <> 0) Do
+  Begin
+    If MemL[0:P + 4] <= 0 Then Exit;
+    If (MemL[0:P] = Typ) And NtAttrNameIs(P, Nm) Then
+    Begin
+      NtAttrAfter := P;
+      Exit;
+    End;
+    P := P + MemL[0:P + 4];
+  End;
+End;
+
+Function NtAttr(V, R, Typ : LongInt; Const Nm : String) : LongInt;
+Begin
+  NtAttr := NtAttrAfter(V, R, 0, Typ, Nm);
+End;
+
+Function NtResVal(P : LongInt) : LongInt;
+Begin
+  NtResVal := P + MemW[0:P + $14];
+End;
+
+{ Taille des donnees d'un attribut (resident ou non) }
+Function NtAttrSize(P : LongInt) : LongInt;
+Begin
+  If Mem[0:P + 8] = 0 Then NtAttrSize := MemL[0:P + $10]
+  Else NtAttrSize := MemL[0:P + $30];
+End;
+
+{ Runs d'un attribut non resident de l'enregistrement de base R (numero
+  N), en suivant la liste d'attributs ($20) ; RA recoit les runs,
+  Size la taille (de l'extent VCN 0), Res l'adresse de l'attribut s'il
+  est resident dans R (0 sinon). False si absent. }
+Function NtGetAttr(V, N, R, Typ : LongInt; Const Nm : String;
+                   RA : LongInt; Var RN, Size, Res : LongInt) : Boolean;
+Var P, L, LA, LS, Q, E, T, Ref, X, LRN, Ext : LongInt; Found : Boolean;
+    S : String; K : LongInt;
+Begin
+  NtGetAttr := False;
+  RN := 0; Size := 0; Res := 0;
+  L := NtAttr(V, R, $20, '');
+  If L = 0 Then
+  Begin
+    P := NtAttr(V, R, Typ, Nm);
+    If P = 0 Then Exit;
+    If Mem[0:P + 8] = 0 Then
+    Begin
+      Res := P;
+      Size := MemL[0:P + $10];
+    End
+    Else
+    Begin
+      Size := MemL[0:P + $30];
+      If Not NtRunsDecode(P, RA, RN) Then Exit;
+    End;
+    NtGetAttr := True;
+    Exit;
+  End;
+  { liste d'attributs }
+  LS := NtAttrSize(L);
+  LA := KAlloc(LS + 16);
+  If LA = 0 Then Exit;
+  If Mem[0:L + 8] = 0 Then MoveMem(NtResVal(L), LA, LS)
+  Else
+  Begin
+    LRN := 0;
+    If (Not NtRunsDecode(L, NtTmpR, LRN)) Or
+       Not NtStreamIo(V, NtTmpR, LRN, 0, LS, LA, False) Then
+    Begin
+      KFree(LA);
+      Exit;
+    End;
+  End;
+  Ext := KAlloc(NvRec[V]);
+  Found := False;
+  Q := LA; E := LA + LS;
+  While (Q + 26 <= E) And (MemW[0:Q + 4] > 0) Do
+  Begin
+    T := MemL[0:Q];
+    S := '';
+    For K := 0 To Mem[0:Q + 6] - 1 Do
+      S := S + Chr(MemW[0:Q + Mem[0:Q + 7] + K * 2] And $FF);
+    If (T = Typ) And (S = Nm) Then
+    Begin
+      Ref := MemL[0:Q + 16];
+      If Ref = N Then X := R
+      Else
+      Begin
+        X := 0;
+        If (Ext <> 0) And NtReadRec(V, Ref, Ext) Then X := Ext;
+      End;
+      If X <> 0 Then
+      Begin
+        P := NtAttr(V, X, Typ, Nm);
+        While (P <> 0) And (MemW[0:P + 14] <> MemW[0:Q + 24]) Do
+          P := NtAttrAfter(V, X, P, Typ, Nm);
+        If P <> 0 Then
+        Begin
+          Found := True;
+          If Mem[0:P + 8] = 0 Then
+          Begin
+            If X = R Then Res := P;
+            Size := MemL[0:P + $10];
+          End
+          Else
+          Begin
+            If MemL[0:P + $10] = 0 Then Size := MemL[0:P + $30];
+            NtRunsDecode(P, RA, RN);
+          End;
+        End;
+      End;
+    End;
+    Q := Q + MemW[0:Q + 4];
+  End;
+  If Ext <> 0 Then KFree(Ext);
+  KFree(LA);
+  NtGetAttr := Found;
+End;
+
+{ Lire tout le flux d'un attribut (resident ou non) dans un bloc du tas }
+Function NtLoadAttr(V, N, R, Typ : LongInt; Const Nm : String;
+                    Var Size : LongInt) : LongInt;
+Var RA, RN, Res, A : LongInt;
+Begin
+  NtLoadAttr := 0;
+  RA := KAlloc(NtMaxRuns * 12);
+  If RA = 0 Then Exit;
+  If NtGetAttr(V, N, R, Typ, Nm, RA, RN, Size, Res) Then
+  Begin
+    A := KAlloc(Size + 16);
+    If A <> 0 Then
+    Begin
+      If Res <> 0 Then MoveMem(NtResVal(Res), A, Size)
+      Else If Not NtStreamIo(V, RA, RN, 0, Size, A, False) Then
+      Begin
+        KFree(A);
+        A := 0;
+      End;
+    End;
+    NtLoadAttr := A;
+  End;
+  KFree(RA);
+End;
+{ ------------------------------------------------------------------ }
+{ Noms (UTF-16) et comparaison par la table $UpCase                    }
+{ ------------------------------------------------------------------ }
+
+Function NtUp(V, W : LongInt) : LongInt;
+Begin
+  If NvUpc[V] <> 0 Then NtUp := MemW[0:NvUpc[V] + W * 2]
+  Else If (W >= 97) And (W <= 122) Then NtUp := W - 32
+  Else NtUp := W;
+End;
+
+{ Nom UTF-16 (A, N caracteres) -> chaine Latin-1 }
+Function NtName(A, N : LongInt) : String;
+Var S : String; K, W : LongInt;
+Begin
+  S := '';
+  For K := 0 To N - 1 Do
+  Begin
+    W := MemW[0:A + K * 2];
+    If W < 256 Then S := S + Chr(W) Else S := S + '_';
+  End;
+  NtName := S;
+End;
+
+{ Le nom UTF-16 (A, N) est-il S, sans tenir compte de la casse ? }
+Function NtNameEq(V, A, N : LongInt; Const S : String) : Boolean;
+Var K : LongInt;
+Begin
+  NtNameEq := False;
+  If N <> Length(S) Then Exit;
+  For K := 0 To N - 1 Do
+    If NtUp(V, MemW[0:A + K * 2]) <> NtUp(V, Ord(S[K + 1])) Then Exit;
+  NtNameEq := True;
+End;
+
+{ Ordre des noms dans un index $I30 : majuscules puis casse exacte }
+Function NtCollate(V, A1, N1, A2, N2 : LongInt) : LongInt;
+Var K, C1, C2 : LongInt;
+Begin
+  For K := 0 To Min(N1, N2) - 1 Do
+  Begin
+    C1 := NtUp(V, MemW[0:A1 + K * 2]); C2 := NtUp(V, MemW[0:A2 + K * 2]);
+    If C1 <> C2 Then
+    Begin
+      If C1 < C2 Then NtCollate := -1 Else NtCollate := 1;
+      Exit;
+    End;
+  End;
+  If N1 <> N2 Then
+  Begin
+    If N1 < N2 Then NtCollate := -1 Else NtCollate := 1;
+    Exit;
+  End;
+  For K := 0 To N1 - 1 Do
+  Begin
+    C1 := MemW[0:A1 + K * 2]; C2 := MemW[0:A2 + K * 2];
+    If C1 <> C2 Then
+    Begin
+      If C1 < C2 Then NtCollate := -1 Else NtCollate := 1;
+      Exit;
+    End;
+  End;
+  NtCollate := 0;
+End;
+
+{ Nom court affiche (8.3) : le nom s'il est valide, sinon NOM~1.EXT }
+Function NtShort(Const S : String) : String;
+Var P, K : LongInt; B, E, R : String; Ok : Boolean;
+Begin
+  P := 0;
+  For K := Length(S) DownTo 1 Do If (P = 0) And (S[K] = '.') Then P := K;
+  If P > 0 Then
+  Begin
+    B := Copy(S, 1, P - 1); E := Copy(S, P + 1, 255);
+  End
+  Else
+  Begin
+    B := S; E := '';
+  End;
+  Ok := (Length(B) >= 1) And (Length(B) <= 8) And (Length(E) <= 3);
+  For K := 1 To Length(B) Do If Not Valid83Ch(UpCase(B[K])) Then Ok := False;
+  For K := 1 To Length(E) Do If Not Valid83Ch(UpCase(E[K])) Then Ok := False;
+  If Ok Then
+  Begin
+    NtShort := UpStr(S);
+    Exit;
+  End;
+  R := '';
+  For K := 1 To Length(B) Do
+    If (Length(R) < 6) And Valid83Ch(UpCase(B[K])) Then R := R + UpCase(B[K]);
+  If R = '' Then R := 'NTFS';
+  R := R + '~1';
+  E := UpStr(Copy(E, 1, 3));
+  If E <> '' Then R := R + '.' + E;
+  NtShort := R;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Index des repertoires ($I30)                                         }
+{ ------------------------------------------------------------------ }
+
+Procedure NgReset;
+Begin
+  NgN := 0; NgUsed := 0;
+End;
+
+{ Ajouter une entree brute (reference 8 octets, cle) a la liste }
+Function NgAdd(RefLo, RefHi, Key, KLen, At : LongInt) : Boolean;
+Var Need, NB, NO, I, Own : LongInt;
+Begin
+  NgAdd := False;
+  Need := 12 + KLen;
+  If NgUsed + Need > NgCap Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    NB := KAlloc(NgCap * 2 + Need);
+    HeapOwner := Own;
+    If NB = 0 Then Exit;
+    MoveMem(NgBuf, NB, NgUsed);
+    KFree(NgBuf);
+    NgBuf := NB; NgCap := NgCap * 2 + Need;
+  End;
+  If (NgN + 1) * 4 > NgOffCap Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    NO := KAlloc(NgN * 8 + 64);
+    HeapOwner := Own;
+    If NO = 0 Then Exit;
+    MoveMem(NgOff, NO, NgN * 4);
+    KFree(NgOff);
+    NgOff := NO; NgOffCap := NgN * 8 + 64;
+  End;
+  MemL[0:NgBuf + NgUsed] := RefLo;
+  MemL[0:NgBuf + NgUsed + 4] := RefHi;
+  MemL[0:NgBuf + NgUsed + 8] := KLen;
+  MoveMem(Key, NgBuf + NgUsed + 12, KLen);
+  If At < 0 Then At := NgN;
+  For I := NgN DownTo At + 1 Do
+    MemL[0:NgOff + I * 4] := MemL[0:NgOff + (I - 1) * 4];
+  MemL[0:NgOff + At * 4] := NgUsed;
+  NgUsed := NgUsed + Need;
+  Inc(NgN);
+  NgAdd := True;
+End;
+
+Function NgEnt(I : LongInt) : LongInt;
+Begin
+  NgEnt := NgBuf + MemL[0:NgOff + I * 4];
+End;
+
+Procedure NgDel(I : LongInt);
+Var K : LongInt;
+Begin
+  For K := I To NgN - 2 Do
+    MemL[0:NgOff + K * 4] := MemL[0:NgOff + (K + 1) * 4];
+  Dec(NgN);
+End;
+
+{ Parcourir les entrees d'un noeud (entrees a partir de E) dans l'ordre }
+Function NtWalk(V, E, Lim, IaRA, IaRN : LongInt; Depth : LongInt) : Boolean;
+Var Fl, Len, KL, Sub, B, EO : LongInt;
+Begin
+  NtWalk := False;
+  If Depth > 8 Then Exit;
+  While E + 16 <= Lim Do
+  Begin
+    Len := MemW[0:E + 8]; KL := MemW[0:E + 10]; Fl := MemL[0:E + 12];
+    If Len < 16 Then Exit;
+    If (Fl And 1) <> 0 Then
+    Begin
+      Sub := MemL[0:E + Len - 8];
+      B := KAlloc(NvIdx[V]);
+      If B = 0 Then Exit;
+      If Not NtStreamIo(V, IaRA, IaRN, Sub * NvVcnSz[V], NvIdx[V], B, False)
+         Or (MemL[0:B] <> $58444E49) Or Not NtUnfix(B, NvIdx[V]) Then
+      Begin
+        KFree(B);
+        Exit;
+      End;
+      EO := B + $18 + MemL[0:B + $18];
+      If Not NtWalk(V, EO, B + $18 + MemL[0:B + $1C], IaRA, IaRN,
+                    Depth + 1) Then
+      Begin
+        KFree(B);
+        Exit;
+      End;
+      KFree(B);
+    End;
+    If (Fl And 2) <> 0 Then Break;
+    If Not NgAdd(MemL[0:E], MemL[0:E + 4], E + 16, KL, -1) Then Exit;
+    E := E + Len;
+  End;
+  NtWalk := True;
+End;
+
+{ Toutes les entrees du repertoire Dir (enregistrement deja lu en R) }
+Function NtGather(V, Dir, R : LongInt) : Boolean;
+Var Ir, IaRA, IaRN, Sz, Res, H : LongInt;
+Begin
+  NtGather := False;
+  NgReset;
+  Ir := NtAttr(V, R, $90, '$I30');
+  If (Ir = 0) Or (Mem[0:Ir + 8] <> 0) Then Exit;
+  Ir := NtResVal(Ir);
+  IaRA := KAlloc(NtMaxRuns * 12);
+  If IaRA = 0 Then Exit;
+  IaRN := 0;
+  NtGetAttr(V, Dir, R, $A0, '$I30', IaRA, IaRN, Sz, Res);
+  H := Ir + $10;
+  NtGather := NtWalk(V, H + MemL[0:H], H + MemL[0:H + 4], IaRA, IaRN, 0);
+  KFree(IaRA);
+End;
+
+{ Cache de liste du repertoire Dir : nom, reference, attributs, taille,
+  date (pour FindFirstFile, l'Explorateur et la resolution des chemins) }
+Function NtDirList(V, Dir : LongInt) : Boolean;
+Var R, I, E, K, Ns, Need, A, Own : LongInt; S : String;
+Begin
+  NtDirList := False;
+  If (NdVol = V) And (NdDir = Dir) Then
+  Begin
+    NtDirList := True;
+    Exit;
+  End;
+  NdVol := -1;
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  If Not NtReadRec(V, Dir, R) Or ((MemW[0:R + $16] And 2) = 0) Or
+     Not NtGather(V, Dir, R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  KFree(R);
+  Need := (NgN + 1) * NdEntSz;
+  If Need > NdCap Then
+  Begin
+    If NdBuf <> 0 Then KFree(NdBuf);
+    Own := HeapOwner; HeapOwner := 0;
+    NdBuf := KAlloc(Need);
+    HeapOwner := Own;
+    If NdBuf = 0 Then
+    Begin
+      NdCap := 0;
+      Exit;
+    End;
+    NdCap := Need;
+  End;
+  NdN := 0;
+  For I := 0 To NgN - 1 Do
+  Begin
+    E := NgEnt(I);
+    K := E + 12;
+    Ns := Mem[0:K + $41];
+    If (Ns <> 2) And (MemL[0:E] >= 16) And (MemL[0:E + 8] >= $42) Then
+    Begin
+      A := NdBuf + NdN * NdEntSz;
+      MemL[0:A] := MemL[0:E];                      { enregistrement }
+      MemL[0:A + 4] := MemL[0:E + 4];              { sequence }
+      MemL[0:A + 8] := MemL[0:K + $38];            { attributs }
+      MemL[0:A + 12] := MemL[0:K + $30];           { taille }
+      MemL[0:A + 16] := MemL[0:K + $10];           { modification }
+      MemL[0:A + 20] := MemL[0:K + $14];
+      S := NtName(K + $42, Mem[0:K + $40]);
+      Mem[0:A + 24] := Length(S);
+      For Ns := 1 To Length(S) Do Mem[0:A + 24 + Ns] := Ord(S[Ns]);
+      Inc(NdN);
+    End;
+  End;
+  NdVol := V; NdDir := Dir;
+  NtDirList := True;
+End;
+
+Function NdName(I : LongInt) : String;
+Var S : String; A, K : LongInt;
+Begin
+  A := NdBuf + I * NdEntSz + 24;
+  S := '';
+  For K := 1 To Mem[0:A] Do S := S + Chr(Mem[0:A + K]);
+  NdName := S;
+End;
+
+Function NtDosTime(Lo, Hi : LongInt) : LongInt;
+Var Ft : Array[0..1] Of LongInt; D, T : Word;
+Begin
+  Ft[0] := Lo; Ft[1] := Hi;
+  D := 0; T := 0;
+  If (Hi = 0) And (Lo = 0) Then
+  Begin
+    NtDosTime := DosNow;
+    Exit;
+  End;
+  FileTimeToDosDateTime(LongInt(@Ft), LongInt(@D), LongInt(@T));
+  NtDosTime := (LongInt(D) Shl 16) Or T;
+End;
+
+{ Remplir Ff* avec l'entree I du cache }
+Procedure NtSetFf(I : LongInt);
+Var A, Fl : LongInt;
+Begin
+  A := NdBuf + I * NdEntSz;
+  FfName := NdName(I);
+  FfShort := NtShort(FfName);
+  Fl := MemL[0:A + 8];
+  FfAttr := Fl And $27;
+  If (Fl And $10000000) <> 0 Then FfAttr := FfAttr Or $10;
+  FfSize := MemL[0:A + 12];
+  If (FfAttr And $10) <> 0 Then FfSize := 0;
+  FfTime := NtDosTime(MemL[0:A + 16], MemL[0:A + 20]);
+  FfClus := MemL[0:A];
+  FfDirClus := NdDir;
+  FfIdx := I;
+  FfNEnt := 1;
+End;
+
+{ Chemin complet (X:\A\B) -> Ff* ; la taille vient de l'enregistrement }
+Function NtResolve(V : LongInt; Path : String) : Boolean;
+Var P, I, Dir, R, Sz, Res : LongInt; Part : String; Found : Boolean;
+Begin
+  NtResolve := False;
+  Delete(Path, 1, 2);
+  While (Length(Path) > 0) And (Path[1] = '\') Do Delete(Path, 1, 1);
+  While (Length(Path) > 0) And (Path[Length(Path)] = '\') Do
+    Delete(Path, Length(Path), 1);
+  Dir := 5;
+  If Path = '' Then
+  Begin
+    FfName := ''; FfShort := ''; FfAttr := $10; FfSize := 0;
+    FfTime := DosNow; FfClus := 5; FfDirClus := 5; FfIdx := -1;
+    NtResolve := True;
+    Exit;
+  End;
+  While Path <> '' Do
+  Begin
+    P := Pos('\', Path);
+    If P > 0 Then
+    Begin
+      Part := Copy(Path, 1, P - 1);
+      Delete(Path, 1, P);
+    End
+    Else
+    Begin
+      Part := Path;
+      Path := '';
+    End;
+    If Not NtDirList(V, Dir) Then Exit;
+    Found := False;
+    For I := 0 To NdN - 1 Do
+      If UpStr(NdName(I)) = UpStr(Part) Then
+      Begin
+        NtSetFf(I);
+        Found := True;
+        Break;
+      End;
+    If Not Found Then
+    Begin
+      For I := 0 To NdN - 1 Do
+        If NtShort(NdName(I)) = UpStr(Part) Then
+        Begin
+          NtSetFf(I);
+          Found := True;
+          Break;
+        End;
+    End;
+    If Not Found Then Exit;
+    If (Path <> '') And ((FfAttr And $10) = 0) Then Exit;
+    Dir := FfClus;
+  End;
+  { taille exacte (l'index peut etre en retard) }
+  If (FfAttr And $10) = 0 Then
+  Begin
+    R := KAlloc(NvRec[V] + NtMaxRuns * 12);
+    If R <> 0 Then
+    Begin
+      If NtReadRec(V, FfClus, R) Then
+        If NtGetAttr(V, FfClus, R, $80, '', R + NvRec[V], I, Sz, Res) Then
+          FfSize := Sz;
+      KFree(R);
+    End;
+  End;
+  NtResolve := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Montage                                                              }
+{ ------------------------------------------------------------------ }
+
+Function NtBmpGet(V, C : LongInt) : Boolean;
+Begin
+  NtBmpGet := (Mem[0:NvBmp[V] + C Shr 3] And (1 Shl (C And 7))) <> 0;
+End;
+
+Function NtMount(D, Start, Secs : LongInt) : Boolean;
+Var V, A, R, C, Sz, Res, RN, N : LongInt; S : String;
+Begin
+  NtMount := False;
+  If VolN >= MaxVol Then Exit;
+  V := VolN;
+  A := SecGet(D, Start);
+  If FatIoErr Then
+  Begin
+    FatIoErr := False;
+    Exit;
+  End;
+  If (MemL[0:A + 3] <> $5346544E) Or (MemW[0:A + 11] <> 512) Then Exit;
+  VolDisk[V] := D; VolStart[V] := Start; VolType[V] := NtfsT;
+  VolSpc[V] := Mem[0:A + 13];
+  If VolSpc[V] = 0 Then Exit;
+  NvCb[V] := VolSpc[V] * 512;
+  If NvCb[V] > 65536 Then Exit;
+  VolSecs[V] := MemL[0:A + $28];
+  VolClus[V] := VolSecs[V] Div VolSpc[V];
+  NvMftLcn[V] := MemL[0:A + $30];
+  NvMirrLcn[V] := MemL[0:A + $38];
+  C := Mem[0:A + $40];
+  If C < 128 Then NvRec[V] := C * NvCb[V] Else NvRec[V] := 1 Shl (256 - C);
+  C := Mem[0:A + $44];
+  If C < 128 Then NvIdx[V] := C * NvCb[V] Else NvIdx[V] := 1 Shl (256 - C);
+  If NvIdx[V] >= NvCb[V] Then NvVcnSz[V] := NvCb[V] Else NvVcnSz[V] := 512;
+  VolSerial[V] := MemL[0:A + $48];
+  If (NvRec[V] < 512) Or (NvRec[V] > 4096) Or (NvIdx[V] > 65536) Then Exit;
+  { $MFT : enregistrement 0 lu directement, puis ses runs }
+  NvMftRA[V] := KAlloc(NtMaxRuns * 12);
+  R := KAlloc(4096);
+  If (NvMftRA[V] = 0) Or (R = 0) Then Exit;
+  MemL[0:NvMftRA[V]] := 0; MemL[0:NvMftRA[V] + 4] := NvMftLcn[V];
+  MemL[0:NvMftRA[V] + 8] := (NvRec[V] + NvCb[V] - 1) Div NvCb[V];
+  NvMftRN[V] := 1; NvRecN[V] := 1;
+  If Not NtReadRec(V, 0, R) Then Exit;
+  RN := 0;
+  If Not NtGetAttr(V, 0, R, $80, '', NvMftRA[V], RN, Sz, Res) Or
+     (RN = 0) Then Exit;
+  NvMftRN[V] := RN;
+  NvRecN[V] := Sz Div NvRec[V];
+  { bitmap de la MFT ($B0 de l'enregistrement 0) }
+  NvMBmp[V] := NtLoadAttr(V, 0, R, $B0, '', NvMBmpLen[V]);
+  { $Volume : etiquette et version }
+  S := '';
+  NvVer[V] := 3;
+  If NtReadRec(V, 3, R) Then
+  Begin
+    A := NtAttr(V, R, $60, '');
+    If (A <> 0) And (Mem[0:A + 8] = 0) Then
+      S := NtName(NtResVal(A), MemL[0:A + $10] Div 2);
+    A := NtAttr(V, R, $70, '');
+    If (A <> 0) And (Mem[0:A + 8] = 0) Then
+      NvVer[V] := Mem[0:NtResVal(A) + 8];
+  End;
+  VolLab[V] := Copy(S, 1, 11);
+  { $UpCase }
+  NvUpc[V] := 0;
+  If NtReadRec(V, 10, R) Then
+  Begin
+    NvUpc[V] := NtLoadAttr(V, 10, R, $80, '', Sz);
+    If (NvUpc[V] <> 0) And (Sz < 131072) Then
+    Begin
+      KFree(NvUpc[V]);
+      NvUpc[V] := 0;
+    End;
+  End;
+  { $Bitmap : en memoire }
+  NvBmpRA[V] := KAlloc(NtMaxRuns * 12);
+  NvBmp[V] := 0; NvBmpRN[V] := 0;
+  If NtReadRec(V, 6, R) Then
+  Begin
+    RN := 0;
+    If NtGetAttr(V, 6, R, $80, '', NvBmpRA[V], RN, Sz, Res) And
+       (Res = 0) Then
+    Begin
+      NvBmpRN[V] := RN; NvBmpLen[V] := Sz;
+      NvBmp[V] := KAlloc(Sz + 16);
+      If NvBmp[V] <> 0 Then
+        If Not NtStreamIo(V, NvBmpRA[V], RN, 0, Sz, NvBmp[V], False) Then
+        Begin
+          KFree(NvBmp[V]);
+          NvBmp[V] := 0;
+        End;
+    End;
+  End;
+  If NvBmp[V] <> 0 Then
+  Begin
+    N := 0;
+    For C := 0 To VolClus[V] - 1 Do
+      If Not NtBmpGet(V, C) Then Inc(N);
+    VolFree[V] := N;
+  End
+  Else VolFree[V] := 0;
+  { racine : parametres d'index et identifiant de securite }
+  NvSecId[V] := 0; NvIrB[V] := NvIdx[V]; NvIrC[V] := 1;
+  If NtReadRec(V, 5, R) Then
+  Begin
+    A := NtAttr(V, R, $10, '');
+    If (A <> 0) And (MemL[0:A + $10] >= $38) Then
+      NvSecId[V] := MemL[0:NtResVal(A) + $34];
+    A := NtAttr(V, R, $90, '$I30');
+    If A <> 0 Then
+    Begin
+      NvIrB[V] := MemL[0:NtResVal(A) + 8];
+      NvIrC[V] := Mem[0:NtResVal(A) + 12];
+    End;
+  End;
+  NvRO[V] := Ord((NvVer[V] < 3) Or (NvBmp[V] = 0) Or (NvMBmp[V] = 0));
+  NvHint[V] := 0;
+  KFree(R);
+  If VolN = 0 Then VolLetter[V] := Ord('C')
+  Else VolLetter[V] := Ord('D') + VolN;
+  VolFsDirty[V] := False;
+  Inc(VolN);
+  NtInval;
+  KLog('NTFS ' + IntStr(NvVer[V]) + ' : ' + Chr(VolLetter[V]) +
+       ': disque ' + IntStr(D) + ' secteur ' + IntStr(Start) + ', ' +
+       IntStr(VolClus[V]) + ' clusters de ' + IntStr(NvCb[V]) +
+       ' octets, MFT ' + IntStr(NvRecN[V]) + ' enregistrements, ' +
+       IntStr(VolFree[V]) + ' clusters libres, etiquette ' + VolLab[V]);
+  NtMount := True;
+End;
+{ ------------------------------------------------------------------ }
+{ Fichiers ouverts (Fo* communs avec FAT : FoClus = enregistrement)    }
+{ ------------------------------------------------------------------ }
+
+{ Recharger les runs de $DATA du fichier ouvert F }
+Function NtFoLoad(F : LongInt) : Boolean;
+Var V, R, Sz, Res, RN : LongInt;
+Begin
+  NtFoLoad := False;
+  V := FoVol[F];
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  RN := 0;
+  If NtReadRec(V, FoClus[F], R) Then
+    If NtGetAttr(V, FoClus[F], R, $80, '', FoRA[F], RN, Sz, Res) Then
+    Begin
+      FoRN[F] := RN;
+      FoRes[F] := Res <> 0;
+      FoSize[F] := Sz;
+      NtFoLoad := True;
+    End;
+  KFree(R);
+End;
+
+Function NtRead(F, Pos0, N, Dst : LongInt) : LongInt;
+Var V, R, P : LongInt;
+Begin
+  NtRead := 0;
+  V := FoVol[F];
+  If Pos0 + N > FoSize[F] Then N := FoSize[F] - Pos0;
+  If N <= 0 Then Exit;
+  If FoRes[F] Then
+  Begin
+    R := KAlloc(NvRec[V]);
+    If R = 0 Then Exit;
+    If NtReadRec(V, FoClus[F], R) Then
+    Begin
+      P := NtAttr(V, R, $80, '');
+      If (P <> 0) And (Mem[0:P + 8] = 0) Then
+      Begin
+        MoveMem(NtResVal(P) + Pos0, Dst, N);
+        NtRead := N;
+      End;
+    End;
+    KFree(R);
+    Exit;
+  End;
+  FatIoErr := False;
+  If NtStreamIo(V, FoRA[F], FoRN[F], Pos0, N, Dst, False) Then NtRead := N
+  Else FatIoErr := True;
+End;
+
+{ Entree Idx du repertoire Dir (chemin) ; Idx avance }
+Function NtDirEntry(Const Dir : String; Var Idx : LongInt) : Boolean;
+Var V, D : LongInt;
+Begin
+  NtDirEntry := False;
+  V := FatVolOf(Dir);
+  If V < 0 Then Exit;
+  If (NdPathVol = V) And (NdPath = UpStr(Dir)) Then D := NdPathRec
+  Else
+  Begin
+    If Not NtResolve(V, Dir) Or ((FfAttr And $10) = 0) Then Exit;
+    D := FfClus;
+    NdPathVol := V; NdPath := UpStr(Dir); NdPathRec := D;
+  End;
+  If Not NtDirList(V, D) Then Exit;
+  If (Idx < 0) Or (Idx >= NdN) Then Exit;
+  NtSetFf(Idx);
+  Inc(Idx);
+  NtDirEntry := True;
+End;
+
+{ Ouvrir en lecture (l'ecriture s'ajoute dans NtOpenW) }
+Function NtOpenR(V, F : LongInt) : Boolean;
+Begin
+  FoVol[F] := V; FoClus[F] := FfClus; FoDir[F] := FfDirClus;
+  FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoCIdx[F] := -1;
+  FoDirty[F] := False;
+  NtOpenR := NtFoLoad(F);
+End;
+{ ------------------------------------------------------------------ }
+{ Ecriture : bitmap des clusters                                       }
+{ ------------------------------------------------------------------ }
+
+{ Ecrire les octets B0..B1 du bitmap en memoire (secteurs entiers) }
+Procedure NtBmpSave(V, B0, B1 : LongInt);
+Var S0, S1 : LongInt;
+Begin
+  S0 := (B0 Div 512) * 512;
+  S1 := (B1 Div 512 + 1) * 512;
+  If S1 > NvBmpLen[V] Then S1 := NvBmpLen[V];
+  If S1 > S0 Then
+    NtStreamIo(V, NvBmpRA[V], NvBmpRN[V], S0, S1 - S0, NvBmp[V] + S0, True);
+End;
+
+Procedure NtBmpMark(V, C, N : LongInt; On : Boolean);
+Var I, A, M : LongInt;
+Begin
+  If N <= 0 Then Exit;
+  For I := C To C + N - 1 Do
+  Begin
+    A := NvBmp[V] + I Shr 3; M := 1 Shl (I And 7);
+    If On Then
+    Begin
+      If (Mem[0:A] And M) = 0 Then Dec(VolFree[V]);
+      Mem[0:A] := Mem[0:A] Or M;
+    End
+    Else
+    Begin
+      If (Mem[0:A] And M) <> 0 Then Inc(VolFree[V]);
+      Mem[0:A] := Mem[0:A] And Not M;
+    End;
+  End;
+  NtBmpSave(V, C Shr 3, (C + N - 1) Shr 3);
+End;
+
+{ Trouver et reserver au plus Want clusters contigus (a partir de Hint) }
+Function NtAllocRun(V, Want, Hint : LongInt; Var Lcn, Len : LongInt)
+  : Boolean;
+Var C, N, Tot : LongInt;
+Begin
+  NtAllocRun := False;
+  Tot := VolClus[V];
+  If (Hint < 0) Or (Hint >= Tot) Then Hint := 0;
+  C := Hint; N := 0;
+  While N < Tot Do
+  Begin
+    If (Mem[0:NvBmp[V] + C Shr 3] = $FF) And ((C And 7) = 0) And
+       (C + 8 <= Tot) Then
+    Begin
+      C := C + 8; N := N + 8;
+    End
+    Else If NtBmpGet(V, C) Then
+    Begin
+      Inc(C); Inc(N);
+    End
+    Else Break;
+    If C >= Tot Then C := 0;
+  End;
+  If N >= Tot Then Exit;
+  Lcn := C; Len := 0;
+  While (Len < Want) And (C + Len < Tot) And Not NtBmpGet(V, C + Len) Do
+    Inc(Len);
+  NtBmpMark(V, Lcn, Len, True);
+  NvHint[V] := Lcn + Len;
+  NtAllocRun := True;
+End;
+
+{ Clusters couverts par les runs }
+Function NtRunsLen(RA, RN : LongInt) : LongInt;
+Begin
+  If RN = 0 Then NtRunsLen := 0
+  Else NtRunsLen := MemL[0:RA + (RN - 1) * 12] +
+                    MemL[0:RA + (RN - 1) * 12 + 8];
+End;
+
+{ Ajouter des clusters jusqu'a Need au total }
+Function NtExtend(V, RA : LongInt; Var RN : LongInt; Need : LongInt)
+  : Boolean;
+Var Have, Hint, L, N, Last : LongInt;
+Begin
+  NtExtend := False;
+  Have := NtRunsLen(RA, RN);
+  Hint := NvHint[V];
+  If RN > 0 Then
+  Begin
+    Last := RA + (RN - 1) * 12;
+    If MemL[0:Last + 4] >= 0 Then Hint := MemL[0:Last + 4] + MemL[0:Last + 8];
+  End;
+  While Have < Need Do
+  Begin
+    If RN >= NtMaxRuns - 1 Then Exit;
+    If Not NtAllocRun(V, Need - Have, Hint, L, N) Or (N = 0) Then Exit;
+    Last := RA + (RN - 1) * 12;
+    If (RN > 0) And (MemL[0:Last + 4] >= 0) And
+       (MemL[0:Last + 4] + MemL[0:Last + 8] = L) Then
+      MemL[0:Last + 8] := MemL[0:Last + 8] + N
+    Else
+    Begin
+      MemL[0:RA + RN * 12] := Have;
+      MemL[0:RA + RN * 12 + 4] := L;
+      MemL[0:RA + RN * 12 + 8] := N;
+      Inc(RN);
+    End;
+    Have := Have + N;
+    Hint := L + N;
+  End;
+  NtExtend := True;
+End;
+
+{ Liberer les clusters a partir du VCN Keep }
+Procedure NtTruncRuns(V, RA : LongInt; Var RN : LongInt; Keep : LongInt);
+Var I, V0, L, Lc, Cut : LongInt;
+Begin
+  I := RN - 1;
+  While I >= 0 Do
+  Begin
+    V0 := MemL[0:RA + I * 12]; Lc := MemL[0:RA + I * 12 + 4];
+    L := MemL[0:RA + I * 12 + 8];
+    If V0 + L <= Keep Then Break;
+    If V0 >= Keep Then
+    Begin
+      If Lc >= 0 Then NtBmpMark(V, Lc, L, False);
+      RN := I;
+    End
+    Else
+    Begin
+      Cut := V0 + L - Keep;
+      If Lc >= 0 Then NtBmpMark(V, Lc + L - Cut, Cut, False);
+      MemL[0:RA + I * 12 + 8] := L - Cut;
+    End;
+    Dec(I);
+  End;
+End;
+
+Procedure NtFreeAllRuns(V, RA, RN : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To RN - 1 Do
+    If MemL[0:RA + I * 12 + 4] >= 0 Then
+      NtBmpMark(V, MemL[0:RA + I * 12 + 4], MemL[0:RA + I * 12 + 8], False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ecriture : attributs dans un enregistrement                          }
+{ ------------------------------------------------------------------ }
+
+Function Al8(N : LongInt) : LongInt;
+Begin
+  Al8 := (N + 7) And Not 7;
+End;
+
+Function NtAttrResize(V, R, P, NewLen : LongInt) : Boolean;
+Var U, Old : LongInt;
+Begin
+  NtAttrResize := False;
+  U := MemL[0:R + $18]; Old := MemL[0:P + 4];
+  If U - Old + NewLen > NvRec[V] Then Exit;
+  MoveMem(P + Old, P + NewLen, R + U - (P + Old));
+  If NewLen > Old Then FillMem(P + Old, NewLen - Old, 0);
+  MemL[0:P + 4] := NewLen;
+  MemL[0:R + $18] := U - Old + NewLen;
+  NtAttrResize := True;
+End;
+
+Procedure NtAttrDel(V, R, P : LongInt);
+Var U, L : LongInt;
+Begin
+  U := MemL[0:R + $18]; L := MemL[0:P + 4];
+  MoveMem(P + L, P, R + U - (P + L));
+  MemL[0:R + $18] := U - L;
+End;
+
+{ Inserer un attribut (ordre : type puis nom) de longueur totale Len ;
+  HdrLen : taille de l'en-tete sans le nom (18h resident, 40h non) }
+Function NtAttrIns(V, R, Typ : LongInt; Const Nm : String;
+                   HdrLen, Len : LongInt) : LongInt;
+Var P, E, U, K : LongInt;
+Begin
+  NtAttrIns := 0;
+  U := MemL[0:R + $18];
+  If U + Len > NvRec[V] Then Exit;
+  P := R + MemW[0:R + $14];
+  E := R + NvRec[V];
+  While (P + 8 <= E) And (MemL[0:P] <> -1) And (MemL[0:P] <> 0) Do
+  Begin
+    If (MemL[0:P] > Typ) Or ((MemL[0:P] = Typ) And (Mem[0:P + 9] >
+       Length(Nm))) Then Break;
+    P := P + MemL[0:P + 4];
+  End;
+  MoveMem(P, P + Len, R + U - P);
+  FillMem(P, Len, 0);
+  MemL[0:P] := Typ; MemL[0:P + 4] := Len;
+  Mem[0:P + 9] := Length(Nm);
+  MemW[0:P + 10] := HdrLen;
+  For K := 1 To Length(Nm) Do MemW[0:P + HdrLen + (K - 1) * 2] := Ord(Nm[K]);
+  MemW[0:P + 14] := MemW[0:R + $28];
+  MemW[0:R + $28] := MemW[0:R + $28] + 1;
+  MemL[0:R + $18] := U + Len;
+  NtAttrIns := P;
+End;
+
+Function NtAddRes(V, R, Typ : LongInt; Const Nm : String; VLen : LongInt)
+  : LongInt;
+Var P, VO : LongInt;
+Begin
+  VO := Al8($18 + Length(Nm) * 2);
+  P := NtAttrIns(V, R, Typ, Nm, $18, Al8(VO + VLen));
+  If P <> 0 Then
+  Begin
+    MemL[0:P + $10] := VLen;
+    MemW[0:P + $14] := VO;
+  End;
+  NtAddRes := P;
+End;
+
+Function NtAddNonRes(V, R, Typ : LongInt; Const Nm : String) : LongInt;
+Var P, RO : LongInt;
+Begin
+  RO := Al8($40 + Length(Nm) * 2);
+  P := NtAttrIns(V, R, Typ, Nm, $40, RO + 8);
+  If P <> 0 Then
+  Begin
+    Mem[0:P + 8] := 1;
+    MemW[0:P + $20] := RO;
+    MemL[0:P + $18] := -1; MemL[0:P + $1C] := -1;
+  End;
+  NtAddNonRes := P;
+End;
+
+{ Valeur residente : nouvelle longueur }
+Function NtResSetLen(V, R, P, NewLen : LongInt) : Boolean;
+Begin
+  NtResSetLen := False;
+  If Not NtAttrResize(V, R, P, Al8(MemW[0:P + $14] + NewLen)) Then Exit;
+  MemL[0:P + $10] := NewLen;
+  NtResSetLen := True;
+End;
+
+{ Attribut non resident : runs et tailles }
+Function NtSetRuns(V, R, P, RA, RN, DataSz, InitSz : LongInt) : Boolean;
+Var L, Clus : LongInt;
+Begin
+  NtSetRuns := False;
+  L := NtRunsEncode(RA, RN, 0);
+  If Not NtAttrResize(V, R, P, Al8(MemW[0:P + $20] + L)) Then Exit;
+  NtRunsEncode(RA, RN, P + MemW[0:P + $20]);
+  Clus := NtRunsLen(RA, RN);
+  MemL[0:P + $10] := 0; MemL[0:P + $14] := 0;
+  MemL[0:P + $18] := Clus - 1;
+  If Clus = 0 Then MemL[0:P + $1C] := -1 Else MemL[0:P + $1C] := 0;
+  MemL[0:P + $28] := Clus * NvCb[V]; MemL[0:P + $2C] := 0;
+  MemL[0:P + $30] := DataSz; MemL[0:P + $34] := 0;
+  MemL[0:P + $38] := InitSz; MemL[0:P + $3C] := 0;
+  NtSetRuns := True;
+End;
+
+Procedure NtNow(P : LongInt);
+Begin
+  DosToFileTime(DosNow, P);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ecriture : bitmap et extension de la MFT                             }
+{ ------------------------------------------------------------------ }
+
+{ Ecrire le bitmap de la MFT ($B0 de l'enregistrement 0) }
+Function NtMBmpSave(V : LongInt) : Boolean;
+Var R, P, RA, RN, Sz, Res : LongInt;
+Begin
+  NtMBmpSave := False;
+  R := KAlloc(NvRec[V] + NtMaxRuns * 12);
+  If R = 0 Then Exit;
+  RA := R + NvRec[V];
+  If NtReadRec(V, 0, R) Then
+  Begin
+    P := NtAttr(V, R, $B0, '');
+    If (P <> 0) And (Mem[0:P + 8] = 0) Then
+    Begin
+      MoveMem(NvMBmp[V], NtResVal(P), Min(MemL[0:P + $10], NvMBmpLen[V]));
+      NtMBmpSave := NtWriteRec(V, 0, R);
+    End
+    Else If P <> 0 Then
+    Begin
+      RN := 0;
+      If NtGetAttr(V, 0, R, $B0, '', RA, RN, Sz, Res) Then
+        NtMBmpSave := NtStreamIo(V, RA, RN, 0, Min(Sz, NvMBmpLen[V]),
+                                 NvMBmp[V], True);
+    End;
+  End;
+  KFree(R);
+End;
+
+{ Ajouter 64 enregistrements a la MFT }
+Function NtMftGrow(V : LongInt) : Boolean;
+Var R, P, B, RA, RN, Clus, OldN, NewN, N, NB, Own, BmRA, BmRN,
+    Need : LongInt;
+Begin
+  NtMftGrow := False;
+  R := KAlloc(NvRec[V] * 2 + NtMaxRuns * 24);
+  If R = 0 Then Exit;
+  B := R + NvRec[V]; RA := B + NvRec[V]; BmRA := RA + NtMaxRuns * 12;
+  If Not NtReadRec(V, 0, R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  P := NtAttr(V, R, $80, '');
+  If (P = 0) Or (Mem[0:P + 8] = 0) Or (NtAttr(V, R, $20, '') <> 0) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  OldN := NvRecN[V];
+  NewN := OldN + 64;
+  MoveMem(NvMftRA[V], RA, NvMftRN[V] * 12);
+  RN := NvMftRN[V];
+  Clus := (NewN * NvRec[V] + NvCb[V] - 1) Div NvCb[V];
+  If Not NtExtend(V, RA, RN, Clus) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  { nouveaux enregistrements, libres }
+  For N := OldN To NewN - 1 Do
+  Begin
+    FillMem(B, NvRec[V], 0);
+    MemL[0:B] := $454C4946;
+    MemW[0:B + 4] := $30; MemW[0:B + 6] := NvRec[V] Div 512 + 1;
+    MemW[0:B + $10] := 1;
+    MemW[0:B + $14] := Al8($30 + 2 * MemW[0:B + 6]);
+    MemL[0:B + $18] := MemW[0:B + $14] + 8;
+    MemL[0:B + $1C] := NvRec[V];
+    MemL[0:B + $2C] := N;
+    MemL[0:B + MemW[0:B + $14]] := -1;
+    NtFix(B, NvRec[V]);
+    NtStreamIo(V, RA, RN, N * NvRec[V], NvRec[V], B, True);
+  End;
+  If Not NtSetRuns(V, R, P, RA, RN, NewN * NvRec[V], NewN * NvRec[V]) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  { bitmap de la MFT : 8 octets de plus si besoin }
+  Need := Al8((NewN + 7) Div 8);
+  If Need > NvMBmpLen[V] Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    NB := KAlloc(Need + 16);
+    HeapOwner := Own;
+    If NB = 0 Then
+    Begin
+      KFree(R);
+      Exit;
+    End;
+    FillMem(NB, Need, 0);
+    MoveMem(NvMBmp[V], NB, NvMBmpLen[V]);
+    P := NtAttr(V, R, $B0, '');
+    If P = 0 Then
+    Begin
+      KFree(R);
+      Exit;
+    End;
+    If Mem[0:P + 8] = 0 Then
+    Begin
+      If Not NtResSetLen(V, R, P, Need) Then
+      Begin
+        KFree(R);
+        Exit;
+      End;
+      MoveMem(NB, NtResVal(P), Need);
+    End
+    Else
+    Begin
+      BmRN := 0;
+      NtRunsDecode(P, BmRA, BmRN);
+      If Not NtExtend(V, BmRA, BmRN, (Need + NvCb[V] - 1) Div NvCb[V]) Then
+      Begin
+        KFree(R);
+        Exit;
+      End;
+      If Not NtSetRuns(V, R, P, BmRA, BmRN, Need, Need) Then
+      Begin
+        KFree(R);
+        Exit;
+      End;
+      NtStreamIo(V, BmRA, BmRN, 0, Need, NB, True);
+    End;
+    KFree(NvMBmp[V]);
+    NvMBmp[V] := NB; NvMBmpLen[V] := Need;
+  End;
+  { les runs servent a ecrire l'enregistrement 0 lui-meme }
+  MoveMem(RA, NvMftRA[V], RN * 12);
+  NvMftRN[V] := RN;
+  NvRecN[V] := NewN;
+  NtMftGrow := NtWriteRec(V, 0, R);
+  KFree(R);
+End;
+
+{ Reserver un enregistrement libre de la MFT (a partir de 24) }
+Function NtAllocRec(V : LongInt) : LongInt;
+Var N, Tries : LongInt;
+Begin
+  NtAllocRec := -1;
+  For Tries := 0 To 1 Do
+  Begin
+    For N := 24 To NvRecN[V] - 1 Do
+      If (N Shr 3) < NvMBmpLen[V] Then
+        If (Mem[0:NvMBmp[V] + N Shr 3] And (1 Shl (N And 7))) = 0 Then
+        Begin
+          Mem[0:NvMBmp[V] + N Shr 3] := Mem[0:NvMBmp[V] + N Shr 3] Or
+                                        (1 Shl (N And 7));
+          If NtMBmpSave(V) Then NtAllocRec := N;
+          Exit;
+        End;
+    If Not NtMftGrow(V) Then Exit;
+  End;
+End;
+
+Procedure NtFreeRecBit(V, N : LongInt);
+Begin
+  If (N Shr 3) >= NvMBmpLen[V] Then Exit;
+  Mem[0:NvMBmp[V] + N Shr 3] := Mem[0:NvMBmp[V] + N Shr 3] And
+                                Not (1 Shl (N And 7));
+  NtMBmpSave(V);
+End;
+{ ------------------------------------------------------------------ }
+{ Ecriture : index des repertoires                                     }
+{ ------------------------------------------------------------------ }
+
+{ Les entrees de Ng (triees) sont reecrites a chaque modification :
+  petit index dans $INDEX_ROOT si elles y tiennent, sinon arbre B+
+  construit niveau par niveau (blocs INDX remplis, chaque bloc plein
+  promouvant l'entree suivante au niveau superieur) jusqu'a ce que le
+  dernier niveau tienne dans $INDEX_ROOT. }
+
+Function NtEntSz(KL : LongInt; Sub : Boolean) : LongInt;
+Begin
+  If Sub Then NtEntSz := Al8(16 + KL) + 8 Else NtEntSz := Al8(16 + KL);
+End;
+
+Function NtKLen(KA, I : LongInt) : LongInt;
+Begin
+  NtKLen := MemL[0:NgEnt(MemL[0:KA + I * 4]) + 8];
+End;
+
+{ Taille des entrees I = A..B-1 (sous-noeud C[I]) et de l'entree de fin
+  (sous-noeud C[B]) }
+Function NtRangeSz(KA, CA, A, B : LongInt) : LongInt;
+Var I, T : LongInt;
+Begin
+  T := 16;
+  If MemL[0:CA + B * 4] >= 0 Then T := 24;
+  For I := A To B - 1 Do
+    T := T + NtEntSz(NtKLen(KA, I), MemL[0:CA + I * 4] >= 0);
+  NtRangeSz := T;
+End;
+
+Function NtPutEntries(KA, CA, A, B, Dst : LongInt) : LongInt;
+Var I, E, KL, L, P : LongInt; Sub : Boolean;
+Begin
+  P := Dst;
+  For I := A To B - 1 Do
+  Begin
+    E := NgEnt(MemL[0:KA + I * 4]); KL := MemL[0:E + 8];
+    Sub := MemL[0:CA + I * 4] >= 0;
+    L := NtEntSz(KL, Sub);
+    FillMem(P, L, 0);
+    MemL[0:P] := MemL[0:E]; MemL[0:P + 4] := MemL[0:E + 4];
+    MemW[0:P + 8] := L; MemW[0:P + 10] := KL;
+    MemL[0:P + 12] := Ord(Sub);
+    MoveMem(E + 12, P + 16, KL);
+    If Sub Then MemL[0:P + L - 8] := MemL[0:CA + I * 4];
+    P := P + L;
+  End;
+  Sub := MemL[0:CA + B * 4] >= 0;
+  L := 16; If Sub Then L := 24;
+  FillMem(P, L, 0);
+  MemW[0:P + 8] := L;
+  MemL[0:P + 12] := 2 Or Ord(Sub);
+  If Sub Then MemL[0:P + 16] := MemL[0:CA + B * 4];
+  NtPutEntries := P + L - Dst;
+End;
+
+Function NtWriteNode(V, IaRA, IaRN, Vcn, KA, CA, A, B : LongInt) : Boolean;
+Var Bf, EO, L : LongInt;
+Begin
+  NtWriteNode := False;
+  Bf := KAlloc(NvIdx[V]);
+  If Bf = 0 Then Exit;
+  FillMem(Bf, NvIdx[V], 0);
+  MemL[0:Bf] := $58444E49;                         { INDX }
+  MemW[0:Bf + 4] := $28; MemW[0:Bf + 6] := NvIdx[V] Div 512 + 1;
+  MemL[0:Bf + $10] := Vcn;
+  EO := Al8($28 + 2 * MemW[0:Bf + 6]);
+  MemL[0:Bf + $18] := EO - $18;
+  L := NtPutEntries(KA, CA, A, B, Bf + EO);
+  MemL[0:Bf + $1C] := EO - $18 + L;
+  MemL[0:Bf + $20] := NvIdx[V] - $18;
+  Mem[0:Bf + $24] := Ord(MemL[0:CA + A * 4] >= 0);
+  NtFix(Bf, NvIdx[V]);
+  NtWriteNode := NtStreamIo(V, IaRA, IaRN, Vcn * NvVcnSz[V], NvIdx[V], Bf,
+                            True);
+  KFree(Bf);
+End;
+
+{ Construire les niveaux ; au retour KA/CA/N : sequence de la racine,
+  Blocks : nombre de blocs INDX. Wr : ecrire les blocs. }
+Function NtPack(V, IaRA, IaRN, RootAvail : LongInt; Wr : Boolean;
+                KA, CA, Tmp : LongInt; Var N, Blocks : LongInt) : Boolean;
+Var I, St, Tot, Cap, NG, G, Vcn, ES, GA, GB, SP, NK, NC : LongInt;
+    Child : Boolean;
+Begin
+  NtPack := False;
+  N := NgN;
+  For I := 0 To N - 1 Do MemL[0:KA + I * 4] := I;
+  For I := 0 To N Do MemL[0:CA + I * 4] := -1;
+  Blocks := 0;
+  GA := Tmp; GB := GA + (NgN + 2) * 4; SP := GB + (NgN + 2) * 4;
+  NK := SP + (NgN + 2) * 4; NC := NK + (NgN + 2) * 4;
+  Cap := NvIdx[V] - $40;
+  Repeat
+    If $20 + NtRangeSz(KA, CA, 0, N) <= RootAvail Then
+    Begin
+      NtPack := True;
+      Exit;
+    End;
+    Child := MemL[0:CA] >= 0;
+    I := 0; NG := 0;
+    While I < N Do
+    Begin
+      St := I;
+      Tot := 16; If Child Then Tot := 24;
+      While I < N Do
+      Begin
+        ES := NtEntSz(NtKLen(KA, I), Child);
+        If Tot + ES > Cap Then Break;
+        Tot := Tot + ES;
+        Inc(I);
+      End;
+      If I = St Then Inc(I);
+      MemL[0:GA + NG * 4] := St; MemL[0:GB + NG * 4] := I;
+      If I < N Then
+      Begin
+        MemL[0:SP + NG * 4] := I;
+        Inc(I);
+      End
+      Else MemL[0:SP + NG * 4] := -1;
+      Inc(NG);
+    End;
+    { le dernier element etait un separateur : pas de groupe a droite }
+    G := NG - 1;
+    If MemL[0:SP + G * 4] >= 0 Then
+    Begin
+      St := MemL[0:GA + G * 4]; I := MemL[0:GB + G * 4];
+      If I - St >= 2 Then
+      Begin
+        MemL[0:SP + G * 4] := I - 1; MemL[0:GB + G * 4] := I - 1;
+        MemL[0:GA + NG * 4] := I; MemL[0:GB + NG * 4] := I + 1;
+        MemL[0:SP + NG * 4] := -1;
+        Inc(NG);
+      End
+      Else
+      Begin
+        MemL[0:GB + G * 4] := N;
+        MemL[0:SP + G * 4] := -1;
+      End;
+    End;
+    For G := 0 To NG - 1 Do
+    Begin
+      Vcn := Blocks * (NvIdx[V] Div NvVcnSz[V]);
+      Inc(Blocks);
+      If Wr Then
+        If Not NtWriteNode(V, IaRA, IaRN, Vcn, KA, CA, MemL[0:GA + G * 4],
+                           MemL[0:GB + G * 4]) Then Exit;
+      MemL[0:NC + G * 4] := Vcn;
+      If G < NG - 1 Then
+        MemL[0:NK + G * 4] := MemL[0:KA + MemL[0:SP + G * 4] * 4];
+    End;
+    N := NG - 1;
+    For I := 0 To N - 1 Do MemL[0:KA + I * 4] := MemL[0:NK + I * 4];
+    For I := 0 To N Do MemL[0:CA + I * 4] := MemL[0:NC + I * 4];
+  Until Blocks > 100000;
+End;
+
+Function NtWriteRoot(V, R, KA, CA, N, Large : LongInt) : Boolean;
+Var IR, Vl, L : LongInt;
+Begin
+  NtWriteRoot := False;
+  IR := NtAttr(V, R, $90, '$I30');
+  If IR = 0 Then Exit;
+  If Not NtResSetLen(V, R, IR, $20 + NtRangeSz(KA, CA, 0, N)) Then Exit;
+  Vl := NtResVal(IR);
+  L := NtPutEntries(KA, CA, 0, N, Vl + $20);
+  MemL[0:Vl + $10] := $10;
+  MemL[0:Vl + $14] := $10 + L;
+  MemL[0:Vl + $18] := $10 + L;
+  MemL[0:Vl + $1C] := Large;
+  NtWriteRoot := True;
+End;
+
+{ Reecrire l'index du repertoire Dir (enregistrement en R) avec Ng }
+Function NtStoreIndex(V, Dir, R : LongInt) : Boolean;
+Var IR, IA, BM, Base, RA, RN, KA, CA, Tmp, N, Blocks, Need, DSz, BmL,
+    I, Bv : LongInt;
+Begin
+  NtStoreIndex := False;
+  IR := NtAttr(V, R, $90, '$I30');
+  If (IR = 0) Or (NtAttr(V, R, $20, '') <> 0) Then Exit;
+  IA := NtAttr(V, R, $A0, '$I30'); BM := NtAttr(V, R, $B0, '$I30');
+  Base := NvRec[V] - MemL[0:R + $18] + MemL[0:IR + 4] - MemW[0:IR + $14];
+  If IA <> 0 Then Base := Base + MemL[0:IA + 4];
+  If BM <> 0 Then Base := Base + MemL[0:BM + 4];
+  RA := KAlloc(NtMaxRuns * 12 + (NgN + 2) * 4 * 7);
+  If RA = 0 Then Exit;
+  KA := RA + NtMaxRuns * 12; CA := KA + (NgN + 2) * 4;
+  Tmp := CA + (NgN + 2) * 4;
+  RN := 0;
+  If IA <> 0 Then NtRunsDecode(IA, RA, RN);
+  For I := 0 To NgN - 1 Do MemL[0:KA + I * 4] := I;
+  For I := 0 To NgN Do MemL[0:CA + I * 4] := -1;
+  If $20 + NtRangeSz(KA, CA, 0, NgN) <= Base - 8 Then
+  Begin
+    { petit index : liberer l'allocation }
+    If IA <> 0 Then
+    Begin
+      NtFreeAllRuns(V, RA, RN);
+      NtAttrDel(V, R, NtAttr(V, R, $A0, '$I30'));
+    End;
+    BM := NtAttr(V, R, $B0, '$I30');
+    If BM <> 0 Then NtAttrDel(V, R, BM);
+    If NtWriteRoot(V, R, KA, CA, NgN, 0) Then
+      NtStoreIndex := NtWriteRec(V, Dir, R);
+    KFree(RA);
+    Exit;
+  End;
+  { grand index }
+  If Not NtPack(V, RA, RN, Base - 256, False, KA, CA, Tmp, N, Blocks) Then
+  Begin
+    KFree(RA);
+    Exit;
+  End;
+  { racine reduite d'abord (place pour $INDEX_ALLOCATION et $BITMAP) ;
+    elle est reecrite par NtWriteRoot }
+  If Not NtResSetLen(V, R, IR, $38) Then
+  Begin
+    KFree(RA);
+    Exit;
+  End;
+  If IA = 0 Then
+  Begin
+    IA := NtAddNonRes(V, R, $A0, '$I30');
+    If IA = 0 Then
+    Begin
+      KFree(RA);
+      Exit;
+    End;
+    DSz := 0;
+  End
+  Else DSz := MemL[0:IA + $30];
+  If NtAttr(V, R, $B0, '$I30') = 0 Then
+    If NtAddRes(V, R, $B0, '$I30', 8) = 0 Then
+    Begin
+      KFree(RA);
+      Exit;
+    End;
+  Need := (Blocks * NvIdx[V] + NvCb[V] - 1) Div NvCb[V];
+  If Not NtExtend(V, RA, RN, Need) Then
+  Begin
+    KFree(RA);
+    Exit;
+  End;
+  If Blocks * NvIdx[V] > DSz Then DSz := Blocks * NvIdx[V];
+  IA := NtAttr(V, R, $A0, '$I30');
+  If Not NtSetRuns(V, R, IA, RA, RN, DSz, DSz) Then
+  Begin
+    KFree(RA);
+    Exit;
+  End;
+  BM := NtAttr(V, R, $B0, '$I30');
+  BmL := Al8((DSz Div NvIdx[V] + 7) Div 8);
+  If Not NtResSetLen(V, R, BM, BmL) Then
+  Begin
+    KFree(RA);
+    Exit;
+  End;
+  Bv := NtResVal(BM);
+  FillMem(Bv, BmL, 0);
+  For I := 0 To Blocks - 1 Do
+    Mem[0:Bv + I Shr 3] := Mem[0:Bv + I Shr 3] Or (1 Shl (I And 7));
+  If NtPack(V, RA, RN, Base - 256, True, KA, CA, Tmp, N, Blocks) Then
+    If NtWriteRoot(V, R, KA, CA, N, 1) Then
+      NtStoreIndex := NtWriteRec(V, Dir, R);
+  KFree(RA);
+End;
+
+{ Position d'insertion du nom (Key + 42h, longueur Key + 40h) dans Ng }
+Function NtInsPos(V, Key : LongInt) : LongInt;
+Var I, E : LongInt;
+Begin
+  For I := 0 To NgN - 1 Do
+  Begin
+    E := NgEnt(I) + 12;
+    If NtCollate(V, Key + $42, Mem[0:Key + $40], E + $42, Mem[0:E + $40])
+       < 0 Then
+    Begin
+      NtInsPos := I;
+      Exit;
+    End;
+  End;
+  NtInsPos := NgN;
+End;
+
+{ Retirer du repertoire Dir les entrees de l'enregistrement N et, si Key
+  <> 0, ajouter l'entree (N, Seq, Key) }
+Function NtDirEdit(V, Dir, N, Seq, Key, KLen : LongInt) : Boolean;
+Var R, I : LongInt;
+Begin
+  NtDirEdit := False;
+  NtInval;
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  If NtReadRec(V, Dir, R) And NtGather(V, Dir, R) Then
+  Begin
+    For I := NgN - 1 DownTo 0 Do
+      If MemL[0:NgEnt(I)] = N Then NgDel(I);
+    If Key <> 0 Then NgAdd(N, Seq Shl 16, Key, KLen, NtInsPos(V, Key));
+    NtDirEdit := NtStoreIndex(V, Dir, R);
+  End;
+  KFree(R);
+  NtInval;
+End;
+{ ------------------------------------------------------------------ }
+{ Ecriture : fichiers et repertoires                                   }
+{ ------------------------------------------------------------------ }
+
+Function NtDisp(Const Path, Orig : String) : String;
+Var B : String;
+Begin
+  B := BaseName(Path);
+  If (Orig <> '') And (UpStr(Orig) = B) Then NtDisp := Orig
+  Else NtDisp := B;
+End;
+
+{ Cle $FILE_NAME (aussi valeur de l'attribut 30h) en K ; longueur }
+Function NtKey(K, Parent, PSeq : LongInt; Const Name : String;
+               Fl, Alloc, Size, TP : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  FillMem(K, $42 + Length(Name) * 2, 0);
+  MemL[0:K] := Parent; MemW[0:K + 6] := PSeq;
+  For I := 0 To 3 Do
+  Begin
+    MemL[0:K + 8 + I * 8] := MemL[0:TP + I * 8];
+    MemL[0:K + 12 + I * 8] := MemL[0:TP + 4 + I * 8];
+  End;
+  MemL[0:K + $28] := Alloc; MemL[0:K + $30] := Size;
+  MemL[0:K + $38] := Fl;
+  Mem[0:K + $40] := Length(Name);
+  If NtShort(Name) = Name Then Mem[0:K + $41] := 3 Else Mem[0:K + $41] := 1;
+  For I := 1 To Length(Name) Do MemW[0:K + $42 + (I - 1) * 2] := Ord(Name[I]);
+  NtKey := $42 + Length(Name) * 2;
+End;
+
+{ Creer le fichier ou repertoire Name dans Dir ; code d'erreur Win32 }
+Function NtCreate(V, Dir : LongInt; Const Name : String; IsDir : Boolean;
+                  Var NewN : LongInt) : LongInt;
+Var R, N, Seq, PSeq, P, K, KL, Fl, I : LongInt;
+    T : Array[0..7] Of LongInt;
+Begin
+  NtCreate := 112;
+  NewN := -1;
+  If NvRO[V] <> 0 Then
+  Begin
+    NtCreate := 19;                                { protege en ecriture }
+    Exit;
+  End;
+  If (Length(Name) = 0) Or (Length(Name) > 255) Then
+  Begin
+    NtCreate := 123;
+    Exit;
+  End;
+  R := KAlloc(NvRec[V] + 1024);
+  If R = 0 Then Exit;
+  K := R + NvRec[V];
+  If Not NtReadRec(V, Dir, R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  PSeq := MemW[0:R + $10];
+  N := NtAllocRec(V);
+  If N < 0 Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  Seq := 1;
+  If NtStreamIo(V, NvMftRA[V], NvMftRN[V], N * NvRec[V], NvRec[V], R,
+                False) Then
+    If (MemL[0:R] = $454C4946) And (MemW[0:R + $10] > 0) Then
+      Seq := MemW[0:R + $10];
+  NtNow(LongInt(@T));
+  For I := 1 To 3 Do
+  Begin
+    T[I * 2] := T[0]; T[I * 2 + 1] := T[1];
+  End;
+  { en-tete }
+  FillMem(R, NvRec[V], 0);
+  MemL[0:R] := $454C4946;
+  MemW[0:R + 4] := $30; MemW[0:R + 6] := NvRec[V] Div 512 + 1;
+  MemW[0:R + $10] := Seq; MemW[0:R + $12] := 1;
+  MemW[0:R + $14] := Al8($30 + 2 * MemW[0:R + 6]);
+  If IsDir Then MemW[0:R + $16] := 3 Else MemW[0:R + $16] := 1;
+  MemL[0:R + $18] := MemW[0:R + $14] + 8;
+  MemL[0:R + $1C] := NvRec[V];
+  MemL[0:R + $2C] := N;
+  MemL[0:R + MemW[0:R + $14]] := -1;
+  { $STANDARD_INFORMATION }
+  P := NtAddRes(V, R, $10, '', $48);
+  MoveMem(LongInt(@T), NtResVal(P), 32);
+  If IsDir Then Fl := 0 Else Fl := $20;
+  MemL[0:NtResVal(P) + $20] := Fl;
+  MemL[0:NtResVal(P) + $34] := NvSecId[V];
+  { $FILE_NAME }
+  If IsDir Then Fl := $10000000 Else Fl := $20;
+  KL := NtKey(K, Dir, PSeq, Name, Fl, 0, 0, LongInt(@T));
+  P := NtAddRes(V, R, $30, '', KL);
+  Mem[0:P + $16] := 1;
+  MoveMem(K, NtResVal(P), KL);
+  If IsDir Then
+  Begin
+    P := NtAddRes(V, R, $90, '$I30', $30);
+    MemL[0:NtResVal(P)] := $30; MemL[0:NtResVal(P) + 4] := 1;
+    MemL[0:NtResVal(P) + 8] := NvIrB[V];
+    Mem[0:NtResVal(P) + 12] := NvIrC[V];
+    MemL[0:NtResVal(P) + $10] := $10; MemL[0:NtResVal(P) + $14] := $20;
+    MemL[0:NtResVal(P) + $18] := $20;
+    MemW[0:NtResVal(P) + $28] := $10; MemL[0:NtResVal(P) + $2C] := 2;
+  End
+  Else NtAddRes(V, R, $80, '', 0);
+  If Not NtWriteRec(V, N, R) Then
+  Begin
+    NtFreeRecBit(V, N);
+    KFree(R);
+    Exit;
+  End;
+  If Not NtDirEdit(V, Dir, N, Seq, K, KL) Then
+  Begin
+    MemW[0:R + $16] := 0;
+    NtWriteRec(V, N, R);
+    NtFreeRecBit(V, N);
+    KFree(R);
+    Exit;
+  End;
+  KFree(R);
+  NewN := N;
+  NtCreate := 0;
+End;
+
+{ Liberer un enregistrement et ses clusters (extensions comprises) }
+Procedure NtFreeRec(V, N, R : LongInt);
+Var P, RA, RN, L, LS, LA, Q, Ref, X, Seq : LongInt;
+Begin
+  RA := KAlloc(NtMaxRuns * 12 + NvRec[V]);
+  If RA = 0 Then Exit;
+  X := RA + NtMaxRuns * 12;
+  L := NtAttr(V, R, $20, '');
+  If L <> 0 Then
+  Begin
+    LS := NtAttrSize(L);
+    LA := NtLoadAttr(V, N, R, $20, '', LS);
+    If LA <> 0 Then
+    Begin
+      Q := LA;
+      While (Q + 26 <= LA + LS) And (MemW[0:Q + 4] > 0) Do
+      Begin
+        Ref := MemL[0:Q + 16];
+        If (Ref <> N) And NtReadRec(V, Ref, X) And
+           ((MemW[0:X + $16] And 1) <> 0) Then
+        Begin
+          P := X + MemW[0:X + $14];
+          While (MemL[0:P] <> -1) And (MemL[0:P] > 0) Do
+          Begin
+            If Mem[0:P + 8] <> 0 Then
+            Begin
+              RN := 0;
+              If NtRunsDecode(P, RA, RN) Then NtFreeAllRuns(V, RA, RN);
+            End;
+            P := P + MemL[0:P + 4];
+          End;
+          MemW[0:X + $16] := 0;
+          NtWriteRec(V, Ref, X);
+          NtFreeRecBit(V, Ref);
+        End;
+        Q := Q + MemW[0:Q + 4];
+      End;
+      KFree(LA);
+    End;
+  End;
+  P := R + MemW[0:R + $14];
+  While (MemL[0:P] <> -1) And (MemL[0:P] > 0) Do
+  Begin
+    If Mem[0:P + 8] <> 0 Then
+    Begin
+      RN := 0;
+      If NtRunsDecode(P, RA, RN) Then NtFreeAllRuns(V, RA, RN);
+    End;
+    P := P + MemL[0:P + 4];
+  End;
+  MemW[0:R + $16] := 0;
+  Seq := MemW[0:R + $10] + 1;
+  If Seq > $FFFF Then Seq := 1;
+  MemW[0:R + $10] := Seq;
+  NtWriteRec(V, N, R);
+  NtFreeRecBit(V, N);
+  KFree(RA);
+End;
+
+{ Supprimer un fichier (IsDir False) ou un repertoire vide }
+Function NtRemove(V : LongInt; Const Path : String; IsDir : Boolean)
+  : LongInt;
+Var N, D, R, I : LongInt;
+Begin
+  NtRemove := 2;
+  If IsDir Then NtRemove := 3;
+  If Not NtResolve(V, Path) Or (FfIdx < 0) Then Exit;
+  If ((FfAttr And $10) <> 0) <> IsDir Then
+  Begin
+    NtRemove := 5;
+    Exit;
+  End;
+  If NvRO[V] <> 0 Then
+  Begin
+    NtRemove := 19;
+    Exit;
+  End;
+  N := FfClus; D := FfDirClus;
+  For I := 0 To MaxFo - 1 Do
+    If FoUsed[I] And (FoVol[I] = V) And (FoClus[I] = N) Then
+    Begin
+      NtRemove := 32;
+      Exit;
+    End;
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  If Not NtReadRec(V, N, R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  If IsDir Then
+    If Not NtGather(V, N, R) Or (NgN > 0) Then
+    Begin
+      NtRemove := 145;
+      KFree(R);
+      Exit;
+    End;
+  If Not NtDirEdit(V, D, N, 0, 0, 0) Then
+  Begin
+    NtRemove := 5;
+    KFree(R);
+    Exit;
+  End;
+  NtFreeRec(V, N, R);
+  KFree(R);
+  NtInval;
+  NtRemove := 0;
+End;
+
+{ Renommer / deplacer sur le meme volume }
+Function NtRename(V : LongInt; Const Src, Dst, Orig : String) : LongInt;
+Var N, D1, D2, R, K, KL, P, Fl, Alloc, Size, PSeq, Seq, Si : LongInt;
+    Dir : Boolean; Nm : String;
+Begin
+  NtRename := 2;
+  If Not NtResolve(V, Src) Or (FfIdx < 0) Then Exit;
+  N := FfClus; D1 := FfDirClus; Dir := (FfAttr And $10) <> 0;
+  If NtResolve(V, Dst) Then
+  Begin
+    NtRename := 183;
+    Exit;
+  End;
+  NtRename := 3;
+  If Not NtResolve(V, ParentDir(Dst)) Or ((FfAttr And $10) = 0) Then Exit;
+  D2 := FfClus;
+  NtRename := 5;
+  If NvRO[V] <> 0 Then Exit;
+  R := KAlloc(NvRec[V] * 2 + 1024);
+  If R = 0 Then Exit;
+  K := R + NvRec[V] * 2;
+  If Not NtReadRec(V, D2, R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  PSeq := MemW[0:R + $10];
+  If Not NtReadRec(V, N, R) Or (NtAttr(V, R, $20, '') <> 0) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  Seq := MemW[0:R + $10];
+  Si := NtAttr(V, R, $10, '');
+  If Si = 0 Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  Fl := MemL[0:NtResVal(Si) + $20] And $FFFF;
+  If Dir Then Fl := Fl Or $10000000;
+  Alloc := 0; Size := 0;
+  P := NtAttr(V, R, $80, '');
+  If P <> 0 Then
+    If Mem[0:P + 8] = 0 Then Size := MemL[0:P + $10]
+    Else
+    Begin
+      Alloc := MemL[0:P + $28]; Size := MemL[0:P + $30];
+    End;
+  Nm := NtDisp(Dst, Orig);
+  KL := NtKey(K, D2, PSeq, Nm, Fl, Alloc, Size, NtResVal(Si));
+  P := NtAttr(V, R, $30, '');
+  While P <> 0 Do
+  Begin
+    NtAttrDel(V, R, P);
+    P := NtAttr(V, R, $30, '');
+  End;
+  P := NtAddRes(V, R, $30, '', KL);
+  If P = 0 Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  Mem[0:P + $16] := 1;
+  MoveMem(K, NtResVal(P), KL);
+  MemW[0:R + $12] := 1;
+  If Not NtWriteRec(V, N, R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  If D1 <> D2 Then NtDirEdit(V, D1, N, 0, 0, 0);
+  If NtDirEdit(V, D2, N, Seq, K, KL) Then NtRename := 0;
+  KFree(R);
+  NtInval;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ecriture : donnees des fichiers ouverts                              }
+{ ------------------------------------------------------------------ }
+
+Function NtWrite(F, Pos0, N, Src : LongInt) : LongInt;
+Var V, R, P, NewEnd, Z, Old, B, Need, RN : LongInt;
+Begin
+  NtWrite := -1;
+  V := FoVol[F];
+  If NvRO[V] <> 0 Then Exit;
+  While FoSize[F] < Pos0 Do
+  Begin
+    Z := Min(Pos0 - FoSize[F], 32768);
+    If NtWrite(F, FoSize[F], Z, FatZero) < Z Then Exit;
+  End;
+  If N <= 0 Then
+  Begin
+    NtWrite := 0;
+    Exit;
+  End;
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  If Not NtReadRec(V, FoClus[F], R) Or (NtAttr(V, R, $20, '') <> 0) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  P := NtAttr(V, R, $80, '');
+  If P = 0 Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  NewEnd := Max(FoSize[F], Pos0 + N);
+  If Mem[0:P + 8] = 0 Then
+  Begin
+    { resident : agrandir si l'enregistrement le permet }
+    Old := MemL[0:P + $10];
+    If (NewEnd <= 700) And
+       (MemL[0:R + $18] + Al8(NewEnd) - Al8(Old) <= NvRec[V]) Then
+    Begin
+      If Not NtResSetLen(V, R, P, NewEnd) Then
+      Begin
+        KFree(R);
+        Exit;
+      End;
+      MoveMem(Src, NtResVal(P) + Pos0, N);
+      If NtWriteRec(V, FoClus[F], R) Then
+      Begin
+        FoSize[F] := NewEnd; FoRes[F] := True; FoDirty[F] := True;
+        NtWrite := N;
+      End;
+      KFree(R);
+      Exit;
+    End;
+    { passage en non resident }
+    B := KAlloc(Old + 16);
+    If B = 0 Then
+    Begin
+      KFree(R);
+      Exit;
+    End;
+    MoveMem(NtResVal(P), B, Old);
+    RN := 0;
+    Need := (NewEnd + NvCb[V] - 1) Div NvCb[V];
+    If Not NtExtend(V, FoRA[F], RN, Need) Then
+    Begin
+      NtFreeAllRuns(V, FoRA[F], RN);
+      KFree(B); KFree(R);
+      Exit;
+    End;
+    If Old > 0 Then NtStreamIo(V, FoRA[F], RN, 0, Old, B, True);
+    KFree(B);
+    NtAttrDel(V, R, P);
+    P := NtAddNonRes(V, R, $80, '');
+    If P = 0 Then
+    Begin
+      NtFreeAllRuns(V, FoRA[F], RN);
+      KFree(R);
+      Exit;
+    End;
+    FoRN[F] := RN; FoRes[F] := False;
+  End
+  Else
+  Begin
+    RN := FoRN[F];
+    Need := (NewEnd + NvCb[V] - 1) Div NvCb[V];
+    If NtRunsLen(FoRA[F], RN) < Need Then
+      If Not NtExtend(V, FoRA[F], RN, Need) Then
+      Begin
+        FoRN[F] := RN;
+        KFree(R);
+        Exit;
+      End;
+    FoRN[F] := RN;
+  End;
+  If Not NtStreamIo(V, FoRA[F], FoRN[F], Pos0, N, Src, True) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  If Not NtSetRuns(V, R, P, FoRA[F], FoRN[F], NewEnd, NewEnd) Or
+     Not NtWriteRec(V, FoClus[F], R) Then
+  Begin
+    KFree(R);
+    Exit;
+  End;
+  FoSize[F] := NewEnd; FoDirty[F] := True;
+  KFree(R);
+  NtWrite := N;
+End;
+
+Function NtSetSize(F, NewSize : LongInt) : Boolean;
+Var V, R, P, RN : LongInt;
+Begin
+  NtSetSize := False;
+  If NewSize = FoSize[F] Then
+  Begin
+    NtSetSize := True;
+    Exit;
+  End;
+  If NewSize > FoSize[F] Then
+  Begin
+    NtSetSize := NtWrite(F, NewSize, 0, FatZero) >= 0;
+    Exit;
+  End;
+  V := FoVol[F];
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  If NtReadRec(V, FoClus[F], R) Then
+  Begin
+    P := NtAttr(V, R, $80, '');
+    If P <> 0 Then
+      If Mem[0:P + 8] = 0 Then
+      Begin
+        If NtResSetLen(V, R, P, NewSize) Then
+          NtSetSize := NtWriteRec(V, FoClus[F], R);
+      End
+      Else
+      Begin
+        RN := FoRN[F];
+        NtTruncRuns(V, FoRA[F], RN, (NewSize + NvCb[V] - 1) Div NvCb[V]);
+        FoRN[F] := RN;
+        If NtSetRuns(V, R, P, FoRA[F], RN, NewSize, NewSize) Then
+          NtSetSize := NtWriteRec(V, FoClus[F], R);
+      End;
+  End;
+  KFree(R);
+  FoSize[F] := NewSize; FoDirty[F] := True;
+End;
+
+{ Fermeture d'un fichier modifie : dates et tailles dans $STANDARD_
+  INFORMATION et dans l'entree du repertoire }
+Procedure NtClose(F : LongInt);
+Var V, R, P, Si, I, E, Alloc : LongInt;
+    T : Array[0..1] Of LongInt;
+Begin
+  V := FoVol[F];
+  NtNow(LongInt(@T));
+  R := KAlloc(NvRec[V]);
+  If R = 0 Then Exit;
+  Alloc := 0;
+  If NtReadRec(V, FoClus[F], R) Then
+  Begin
+    Si := NtAttr(V, R, $10, '');
+    If Si <> 0 Then
+      For I := 1 To 3 Do
+      Begin
+        MemL[0:NtResVal(Si) + I * 8] := T[0];
+        MemL[0:NtResVal(Si) + I * 8 + 4] := T[1];
+      End;
+    P := NtAttr(V, R, $80, '');
+    If (P <> 0) And (Mem[0:P + 8] <> 0) Then Alloc := MemL[0:P + $28];
+    If (P <> 0) And (Mem[0:P + 8] = 0) Then Alloc := Al8(MemL[0:P + $10]);
+    NtWriteRec(V, FoClus[F], R);
+  End;
+  { entree du repertoire parent }
+  If NtReadRec(V, FoDir[F], R) And NtGather(V, FoDir[F], R) Then
+  Begin
+    For I := 0 To NgN - 1 Do
+    Begin
+      E := NgEnt(I);
+      If MemL[0:E] = FoClus[F] Then
+      Begin
+        MemL[0:E + 12 + $10] := T[0]; MemL[0:E + 12 + $14] := T[1];
+        MemL[0:E + 12 + $18] := T[0]; MemL[0:E + 12 + $1C] := T[1];
+        MemL[0:E + 12 + $20] := T[0]; MemL[0:E + 12 + $24] := T[1];
+        MemL[0:E + 12 + $28] := Alloc; MemL[0:E + 12 + $2C] := 0;
+        MemL[0:E + 12 + $30] := FoSize[F]; MemL[0:E + 12 + $34] := 0;
+      End;
+    End;
+    NtStoreIndex(V, FoDir[F], R);
+  End;
+  KFree(R);
+  NtInval;
+End;
+
+{ Ouvrir (et creer) un fichier ; meme logique que FatOpen }
+Function NtOpen(V : LongInt; Const Path, Orig : String; Wr : Boolean;
+                Disp : LongInt; Var Err : LongInt) : LongInt;
+Var F, I, N, D : LongInt; Ex : Boolean;
+Begin
+  NtOpen := -1;
+  Err := 3;
+  Ex := NtResolve(V, Path);
+  If Ex And ((FfAttr And $10) <> 0) Then
+  Begin
+    Err := 5;
+    Exit;
+  End;
+  If Ex And (Disp = 1) Then
+  Begin
+    Err := 80;
+    Exit;
+  End;
+  If Not Ex And ((Disp = 3) Or (Disp = 5)) Then
+  Begin
+    Err := 2;
+    If Not NtResolve(V, ParentDir(Path)) Then Err := 3;
+    Exit;
+  End;
+  If (Wr Or Not Ex) And (NvRO[V] <> 0) Then
+  Begin
+    Err := 19;
+    Exit;
+  End;
+  If Ex And Wr And ((FfAttr And 1) <> 0) Then
+  Begin
+    Err := 5;
+    Exit;
+  End;
+  F := -1;
+  For I := MaxFo - 1 DownTo 0 Do If Not FoUsed[I] Then F := I;
+  If F < 0 Then
+  Begin
+    Err := 4;
+    Exit;
+  End;
+  If Not Ex Then
+  Begin
+    If Not NtResolve(V, ParentDir(Path)) Or ((FfAttr And $10) = 0) Then
+      Exit;
+    D := FfClus;
+    Err := NtCreate(V, D, NtDisp(Path, Orig), False, N);
+    If Err <> 0 Then Exit;
+    If Not NtResolve(V, Path) Then
+    Begin
+      Err := 3;
+      Exit;
+    End;
+  End;
+  FoUsed[F] := True;
+  If Not NtOpenR(V, F) Then
+  Begin
+    FoUsed[F] := False;
+    Err := 5;
+    Exit;
+  End;
+  FoDirty[F] := Not Ex;
+  If Ex And ((Disp = 2) Or (Disp = 5)) And (FoSize[F] > 0) Then
+    NtSetSize(F, 0);
+  Err := 0;
+  NtOpen := F;
+End;
+
+Function NtMkDir(V : LongInt; Const Path, Orig : String) : LongInt;
+Var N : LongInt;
+Begin
+  NtMkDir := 3;
+  If Length(Path) <= 3 Then Exit;
+  If NtResolve(V, Path) Then
+  Begin
+    NtMkDir := 183;
+    Exit;
+  End;
+  If Not NtResolve(V, ParentDir(Path)) Or ((FfAttr And $10) = 0) Then Exit;
+  NtMkDir := NtCreate(V, FfClus, NtDisp(Path, Orig), True, N);
+End;
+
+{ Vider $LogFile (FFh) s'il contient un journal (comme ntfs-3g) }
+Procedure NtLogReset(V : LongInt);
+Var R, RA, RN, Sz, Res, B, Off, L, K : LongInt; Dirty : Boolean;
+Begin
+  R := KAlloc(NvRec[V] + NtMaxRuns * 12 + 65536);
+  If R = 0 Then Exit;
+  RA := R + NvRec[V]; B := RA + NtMaxRuns * 12;
+  RN := 0;
+  If NtReadRec(V, 2, R) Then
+    If NtGetAttr(V, 2, R, $80, '', RA, RN, Sz, Res) And (Res = 0) And
+       (Sz > 4096) Then
+      If NtStreamIo(V, RA, RN, 0, 4096, B, False) Then
+      Begin
+        Dirty := False;
+        For K := 0 To 1023 Do If MemL[0:B + K * 4] <> -1 Then Dirty := True;
+        If Dirty Then
+        Begin
+          KLog('NTFS : $LogFile vide (' + IntStr(Sz Div 1024) + ' Ko)');
+          FillMem(B, 65536, $FF);
+          Off := 0;
+          While Off < Sz Do
+          Begin
+            L := Min(65536, Sz - Off);
+            If Not NtStreamIo(V, RA, RN, Off, L, B, True) Then Break;
+            Off := Off + L;
+          End;
+        End;
+      End;
+  KFree(R);
+End;
+
 Function IsFatPart(T : LongInt) : Boolean;
 Begin
   IsFatPart := (T = $01) Or (T = $04) Or (T = $06) Or (T = $0B) Or
@@ -2655,12 +5085,19 @@ Begin
     VolMount(D, 0, DiskSecs[D]);
     Exit;
   End;
+  If (MemL[0:A + 3] = $5346544E) And ((PT[0] < 0) Or (PS[0] = 0)) Then
+  Begin
+    NtMount(D, 0, DiskSecs[D]);
+    Exit;
+  End;
   Ext := 0;
   For I := 0 To 3 Do
   Begin
     T := PT[I];
     If IsFatPart(T) And (PS[I] > 0) Then
       If VolMount(D, PS[I], PZ[I]) Then Found := True;
+    If (T = $07) And (PS[I] > 0) Then
+      If NtMount(D, PS[I], PZ[I]) Then Found := True;
     If (T = $05) Or (T = $0F) Or (T = $85) Then Ext := PS[I];
   End;
   { partitions logiques de la partition etendue }
@@ -2675,6 +5112,7 @@ Begin
     I := MemL[0:A + 446 + 16 + 8];
     If (Mem[0:A + 446 + 16 + 4] = 0) Or (I = 0) Then I := -1;
     If IsFatPart(T) And (St > 0) Then VolMount(D, Ebr + St, Sz);
+    If (T = $07) And (St > 0) Then NtMount(D, Ebr + St, Sz);
     If I < 0 Then Ebr := 0 Else Ebr := Ext + I;
     Inc(N);
   End;
@@ -2711,6 +5149,14 @@ Procedure FatWinDirs;
 Var R, W : LongInt;
 Begin
   If (VolN = 0) Or (VolLetter[0] <> Ord('C')) Then Exit;
+  If VolType[0] = NtfsT Then
+  Begin
+    NtMkDir(0, 'C:\WINDOWS', 'WINDOWS');
+    NtMkDir(0, 'C:\WINDOWS\SYSTEM', 'SYSTEM');
+    NtMkDir(0, 'C:\WINDOWS\TEMP', 'TEMP');
+    NtMkDir(0, 'C:\TEMP', 'TEMP');
+    Exit;
+  End;
   R := RootOf(0);
   If Not DirFind(0, R, 'WINDOWS') Then
   Begin
@@ -2742,6 +5188,15 @@ Begin
   HeapOwner := HO;
   FillMem(FatZero, 64 * 512, 0);
   For I := 0 To MaxFo - 1 Do FoUsed[I] := False;
+  { NTFS }
+  HeapOwner := 0;
+  NtTmpR := KAlloc(NtMaxRuns * 12);
+  NtClusBuf := KAlloc(65536);
+  NgCap := 65536; NgBuf := KAlloc(NgCap);
+  NgOffCap := 4096; NgOff := KAlloc(NgOffCap);
+  NdBuf := 0; NdCap := 0; NdVol := -1; NdPathVol := -1;
+  For I := 0 To MaxFo - 1 Do FoRA[I] := KAlloc(NtMaxRuns * 12);
+  HeapOwner := HO;
   DcVol := -1;
   DiskN := 0; VolN := 0;
   HdIdentify($1F0, $3F6, False);
@@ -2755,6 +5210,8 @@ Begin
          IntStr(DiskSecs[I] Div 2048) + ' Mo');
     DiskScan(I);
   End;
+  For I := 0 To VolN - 1 Do
+    If (VolType[I] = NtfsT) And (NvRO[I] = 0) Then NtLogReset(I);
   FatWinDirs;
 End;
 
@@ -2769,7 +5226,12 @@ Var V : LongInt;
 Begin
   FatPathInfo := False;
   V := FatVolOf(Path);
-  If (V < 0) Or Not FatResolve(V, Path) Then Exit;
+  If V < 0 Then Exit;
+  If VolType[V] = NtfsT Then
+  Begin
+    If Not NtResolve(V, Path) Then Exit;
+  End
+  Else If Not FatResolve(V, Path) Then Exit;
   Attr := FfAttr And $37;
   If Attr = 0 Then Attr := $80;
   Size := FfSize; Time := FfTime;
@@ -2824,6 +5286,11 @@ Begin
   FatMkDir := 3;                                   { chemin introuvable }
   V := FatVolOf(Path);
   If (V < 0) Or (Length(Path) <= 3) Then Exit;
+  If VolType[V] = NtfsT Then
+  Begin
+    FatMkDir := NtMkDir(V, Path, Orig);
+    Exit;
+  End;
   If FatResolve(V, Path) Then
   Begin
     FatMkDir := 183;                               { existe deja }
@@ -2841,6 +5308,11 @@ Var V, C : LongInt;
 Begin
   FatRmDir := 3;
   V := FatVolOf(Path);
+  If (V >= 0) And (VolType[V] = NtfsT) Then
+  Begin
+    FatRmDir := NtRemove(V, Path, True);
+    Exit;
+  End;
   If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
   If (FfAttr And $10) = 0 Then Exit;
   C := FfClus;
@@ -2862,6 +5334,11 @@ Var V, I : LongInt;
 Begin
   FatDelete := 2;                                  { introuvable }
   V := FatVolOf(Path);
+  If (V >= 0) And (VolType[V] = NtfsT) Then
+  Begin
+    FatDelete := NtRemove(V, Path, False);
+    Exit;
+  End;
   If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
   If (FfAttr And $10) <> 0 Then
   Begin
@@ -2890,6 +5367,11 @@ Begin
   If (V < 0) Or (FatVolOf(Dst) <> V) Then
   Begin
     If V >= 0 Then FatRename := 17;                { autre volume }
+    Exit;
+  End;
+  If VolType[V] = NtfsT Then
+  Begin
+    FatRename := NtRename(V, Src, Dst, Orig);
     Exit;
   End;
   If Not FatResolve(V, Src) Or (FfIdx < 0) Then Exit;
@@ -2942,6 +5424,11 @@ Begin
   V := FatVolOf(Path);
   Err := 3;
   If V < 0 Then Exit;
+  If VolType[V] = NtfsT Then
+  Begin
+    FatOpen := NtOpen(V, Path, Orig, Wr, Disp, Err);
+    Exit;
+  End;
   Ex := FatResolve(V, Path);
   If Ex And ((FfAttr And $10) <> 0) Then
   Begin
@@ -3038,6 +5525,11 @@ End;
 Function FatRead(F, Pos0, N, Dst : LongInt) : LongInt;
 Var CB, Done, K, Off, L, C : LongInt;
 Begin
+  If VolType[FoVol[F]] = NtfsT Then
+  Begin
+    FatRead := NtRead(F, Pos0, N, Dst);
+    Exit;
+  End;
   If Pos0 + N > FoSize[F] Then N := FoSize[F] - Pos0;
   If N < 0 Then N := 0;
   CB := ClusBytes(FoVol[F]);
@@ -3059,6 +5551,11 @@ Function FatWrite(F, Pos0, N, Src : LongInt) : LongInt;
 Var CB, Done, K, Off, L, C, Z : LongInt;
 Begin
   FatWrite := -1;
+  If VolType[FoVol[F]] = NtfsT Then
+  Begin
+    FatWrite := NtWrite(F, Pos0, N, Src);
+    Exit;
+  End;
   { ecriture au-dela de la fin : remplir l'intervalle de zeros }
   While FoSize[F] < Pos0 Do
   Begin
@@ -3088,6 +5585,11 @@ Function FatSetSize(F, NewSize : LongInt) : Boolean;
 Var V, CB, K, C, N : LongInt;
 Begin
   FatSetSize := True;
+  If VolType[FoVol[F]] = NtfsT Then
+  Begin
+    FatSetSize := NtSetSize(F, NewSize);
+    Exit;
+  End;
   If NewSize = FoSize[F] Then Exit;
   If NewSize > FoSize[F] Then
   Begin
@@ -3122,6 +5624,11 @@ Procedure FatClose(F : LongInt);
 Begin
   If (F < 0) Or (F >= MaxFo) Or Not FoUsed[F] Then Exit;
   FoUsed[F] := False;
+  If VolType[FoVol[F]] = NtfsT Then
+  Begin
+    If FoDirty[F] Then NtClose(F);
+    Exit;
+  End;
   If FoDirty[F] Then FatFlush;
 End;
 
@@ -3153,6 +5660,11 @@ Begin
   FatDirEntry := False;
   V := FatVolOf(Dir);
   If V < 0 Then Exit;
+  If VolType[V] = NtfsT Then
+  Begin
+    FatDirEntry := NtDirEntry(Dir, Idx);
+    Exit;
+  End;
   C := FatDirClus(V, Dir);
   If C < 0 Then Exit;
   K := 0;
@@ -3167,6 +5679,11 @@ End;
 { Espace libre et total d'un volume (en clusters) }
 Procedure FatSpace(V : LongInt; Var Free0, Total, Spc : LongInt);
 Begin
+  If VolType[V] = NtfsT Then
+  Begin
+    Free0 := VolFree[V]; Total := VolClus[V]; Spc := VolSpc[V];
+    Exit;
+  End;
   If VolFree[V] < 0 Then FatCountFree(V);
   Free0 := VolFree[V]; Total := VolClus[V]; Spc := VolSpc[V];
 End;
@@ -14612,7 +17129,9 @@ Begin
     If PFlags <> 0 Then MemL[0:PFlags] := 6;
     If PFs <> 0 Then
       If VolType[V] = 32 Then PutPStr(PFs, 'FAT32', FsSize)
+      Else If VolType[V] = NtfsT Then PutPStr(PFs, 'NTFS', FsSize)
       Else PutPStr(PFs, 'FAT', FsSize);
+    If (PFlags <> 0) And (VolType[V] = NtfsT) Then MemL[0:PFlags] := $1F;
   End
   Else If (D <> '') And (D[1] = 'C') Then
   Begin
@@ -18218,6 +20737,8 @@ Type
     Seq   : LongInt;
     Text  : String[63];
   End;
+  TMItemArr = Array[0..MaxMenuItem - 1] Of TMenuItemR;
+  PMItemArr = ^TMItemArr;
 
   TCursorR = Record
     Used : Boolean;
@@ -18227,7 +20748,9 @@ Type
 
 Var
   MenuUsed  : Array[0..MaxMenu - 1] Of Boolean;
-  MItems    : Array[0..MaxMenuItem - 1] Of TMenuItemR;
+  { elements de menu : dans le tas (l'image du noyau doit finir sous
+    00400000h, adresse de chargement des programmes Win32) }
+  MItemsP   : PMItemArr;
   MSeq      : LongInt;
   Cursors   : Array[0..31] Of TCursorR;
   AppCursor : LongInt;
@@ -20115,7 +22638,7 @@ End;
 Function wsprintfA(Buf, Fmt, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11,
   A12 : LongInt) : LongInt;
 Var Args : Array[0..11] Of LongInt; F, O, K, Wd, V : LongInt; C : Char;
-    S : String; Left, Zero : Boolean; R : Real;
+    S : String; Left, Zero : Boolean; R0 : LongInt;
 
   Procedure Emit(Const T : String);
   Var J : LongInt; P : String;
@@ -20171,11 +22694,12 @@ Begin
       'd', 'i' : Begin Emit(IntStr(V)); Inc(K) End;
       'u' :
       Begin
+        { non signe : sans reel (Str(R:0:0) debordait le tampon) }
         If V >= 0 Then S := IntStr(V)
         Else
         Begin
-          R := V + 4294967296.0;
-          Str(R:0:0, S);
+          R0 := (V Shr 1) Div 5;
+          S := IntStr(R0) + Chr(48 + (V - R0 * 10));
         End;
         Emit(S); Inc(K);
       End;
@@ -20464,10 +22988,11 @@ Begin
   Begin
     Best := -1; BS := $7FFFFFFF;
     For I := 0 To MaxMenuItem - 1 Do
-      If MItems[I].Used And (MItems[I].Menu = M) And (MItems[I].Seq > Last)
-         And (MItems[I].Seq < BS) Then
+      If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+         (MItemsP^[I].Seq > Last)
+         And (MItemsP^[I].Seq < BS) Then
       Begin
-        Best := I; BS := MItems[I].Seq;
+        Best := I; BS := MItemsP^[I].Seq;
       End;
     If Best < 0 Then Exit;
     Last := BS;
@@ -20485,7 +23010,8 @@ Begin
   End;
   MItemFind := -1;
   For I := 0 To MaxMenuItem - 1 Do
-    If MItems[I].Used And (MItems[I].Menu = M) And (MItems[I].Id = Id) Then
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+       (MItemsP^[I].Id = Id) Then
     Begin
       MItemFind := I;
       Exit;
@@ -20499,14 +23025,14 @@ Begin
   M := MenuIdx(H);
   If M < 0 Then Exit;
   For I := 0 To MaxMenuItem - 1 Do
-    If Not MItems[I].Used Then
+    If Not MItemsP^[I].Used Then
     Begin
-      MItems[I].Used := True; MItems[I].Menu := M;
-      MItems[I].Flags := Flags; MItems[I].Id := Id;
-      Inc(MSeq); MItems[I].Seq := MSeq;
+      MItemsP^[I].Used := True; MItemsP^[I].Menu := M;
+      MItemsP^[I].Flags := Flags; MItemsP^[I].Id := Id;
+      Inc(MSeq); MItemsP^[I].Seq := MSeq;
       If ((Flags And (MF_SEPARATOR Or 4 Or $100)) = 0) And (Item <> 0) Then
-        MItems[I].Text := Copy(PStr(Item), 1, 63)
-      Else MItems[I].Text := '';
+        MItemsP^[I].Text := Copy(PStr(Item), 1, 63)
+      Else MItemsP^[I].Text := '';
       AppendMenuA := 1;
       Exit;
     End;
@@ -20525,9 +23051,9 @@ Begin
   If M < 0 Then Exit;
   I := MItemFind(M, Pos0, Flags);
   If I < 0 Then Exit;
-  MItems[I].Flags := Flags And Not MF_BYPOSITION; MItems[I].Id := Id;
+  MItemsP^[I].Flags := Flags And Not MF_BYPOSITION; MItemsP^[I].Id := Id;
   If ((Flags And (MF_SEPARATOR Or 4 Or $100)) = 0) And (Item <> 0) Then
-    MItems[I].Text := Copy(PStr(Item), 1, 63);
+    MItemsP^[I].Text := Copy(PStr(Item), 1, 63);
   ModifyMenuA := 1;
 End;
 
@@ -20539,7 +23065,7 @@ Begin
   If M < 0 Then Exit;
   I := MItemFind(M, Pos0, Flags);
   If I < 0 Then Exit;
-  MItems[I].Used := False;
+  MItemsP^[I].Used := False;
   DeleteMenu := 1;
 End;
 
@@ -20555,7 +23081,8 @@ Begin
   M := MenuIdx(H);
   If M < 0 Then Exit;
   For I := 0 To MaxMenuItem - 1 Do
-    If MItems[I].Used And (MItems[I].Menu = M) Then MItems[I].Used := False;
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) Then
+      MItemsP^[I].Used := False;
   MenuUsed[M] := False;
   DestroyMenu := 1;
 End;
@@ -20567,7 +23094,7 @@ Begin
   N := 0;
   If M >= 0 Then
     For I := 0 To MaxMenuItem - 1 Do
-      If MItems[I].Used And (MItems[I].Menu = M) Then Inc(N);
+      If MItemsP^[I].Used And (MItemsP^[I].Menu = M) Then Inc(N);
   If M < 0 Then N := -1;
   GetMenuItemCount := N;
 End;
@@ -20579,8 +23106,8 @@ Begin
   M := MenuIdx(H);
   If M < 0 Then Exit;
   I := MItemAt(M, Pos0);
-  If (I >= 0) And ((MItems[I].Flags And MF_POPUP) = 0) Then
-    GetMenuItemID := MItems[I].Id;
+  If (I >= 0) And ((MItemsP^[I].Flags And MF_POPUP) = 0) Then
+    GetMenuItemID := MItemsP^[I].Id;
 End;
 
 Function GetSubMenu(H, Pos0 : LongInt) : LongInt;
@@ -20590,8 +23117,8 @@ Begin
   M := MenuIdx(H);
   If M < 0 Then Exit;
   I := MItemAt(M, Pos0);
-  If (I >= 0) And ((MItems[I].Flags And MF_POPUP) <> 0) Then
-    GetSubMenu := MItems[I].Id;
+  If (I >= 0) And ((MItemsP^[I].Flags And MF_POPUP) <> 0) Then
+    GetSubMenu := MItemsP^[I].Id;
 End;
 
 Function GetMenuState(H, Id, Flags : LongInt) : LongInt;
@@ -20601,7 +23128,7 @@ Begin
   M := MenuIdx(H);
   If M < 0 Then Exit;
   I := MItemFind(M, Id, Flags);
-  If I >= 0 Then GetMenuState := MItems[I].Flags And $FF;
+  If I >= 0 Then GetMenuState := MItemsP^[I].Flags And $FF;
 End;
 
 Function GetMenuStringA(H, Id, Buf, N, Flags : LongInt) : LongInt;
@@ -20612,8 +23139,8 @@ Begin
   If M < 0 Then Exit;
   I := MItemFind(M, Id, Flags);
   If I < 0 Then Exit;
-  If Buf <> 0 Then PutPStr(Buf, MItems[I].Text, N);
-  GetMenuStringA := Length(MItems[I].Text);
+  If Buf <> 0 Then PutPStr(Buf, MItemsP^[I].Text, N);
+  GetMenuStringA := Length(MItemsP^[I].Text);
 End;
 
 Function CheckMenuItem(H, Id, Flags : LongInt) : LongInt;
@@ -20624,8 +23151,8 @@ Begin
   If M < 0 Then Exit;
   I := MItemFind(M, Id, Flags);
   If I < 0 Then Exit;
-  CheckMenuItem := MItems[I].Flags And MF_CHECKED;
-  MItems[I].Flags := (MItems[I].Flags And Not MF_CHECKED) Or
+  CheckMenuItem := MItemsP^[I].Flags And MF_CHECKED;
+  MItemsP^[I].Flags := (MItemsP^[I].Flags And Not MF_CHECKED) Or
                      (Flags And MF_CHECKED);
 End;
 
@@ -20637,8 +23164,8 @@ Begin
   If M < 0 Then Exit;
   I := MItemFind(M, Id, Flags);
   If I < 0 Then Exit;
-  EnableMenuItem := MItems[I].Flags And 3;
-  MItems[I].Flags := (MItems[I].Flags And Not 3) Or (Flags And 3);
+  EnableMenuItem := MItemsP^[I].Flags And 3;
+  MItemsP^[I].Flags := (MItemsP^[I].Flags And Not 3) Or (Flags And 3);
 End;
 
 Function HiliteMenuItem(H, M, Id, Flags : LongInt) : LongInt;
@@ -23010,6 +25537,7 @@ End;
 Procedure ApiMissing(Name : LongInt);
 Begin
   KLog('API non disponible : ' + PStr(Name));
+
   MsgBoxOpen('Pasdows', L('La fonction ', 'The function ', 'Die Funktion ',
              'La funzione ', 'La funci'#162'n ') + PStr(Name) +
              L(' n''est pas disponible.', ' is not available.',
@@ -33954,6 +36482,8 @@ BEGIN
     plus grande est chargee dans le tas (relocalisee), comme une DLL. }
   If MemTop >= $02000000 Then ExeTop := HeapBase Else ExeTop := $00800000;
   HeapInit(ExeTop, MemTop);
+  I := KAlloc(SizeOf(TMItemArr));
+  Move(I, MItemsP, 4);
   Case Mem[0:BootInfo + 3] Mod 5 Of
     1 : Language := _English;
     2 : Language := _Germany;
@@ -33974,6 +36504,8 @@ BEGIN
   ThreadInit0;
   KImgLo := $100000;
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
+  If KImgHi > $00400000 Then
+    KLog('ATTENTION : image du noyau au-dela de 00400000h (programmes Win32)');
   asm
     finit
   end;
