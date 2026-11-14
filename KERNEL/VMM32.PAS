@@ -584,6 +584,7 @@ Var
   DDShow, DDDirty : Boolean;
   DDBuf, DDW, DDH : LongInt;
   DDBufSz : LongInt;          { taille allouee de DDBuf }
+  DXOn : Boolean;             { DirectDraw affiche sa primaire }
   DDCleared : Boolean;        { bords noirs deja traces (ecran plus grand) }
 
 Procedure SetGate(N, Addr : LongInt);
@@ -999,6 +1000,10 @@ Type
     Time : LongInt;
   End;
 
+Type
+  TKObjArr = Array[0..MaxKObj - 1] Of TKObj;
+  PKObjArr = ^TKObjArr;
+
 Var
   AtaBase, AtaCtrl : LongInt;
   AtaSlave, AtaFound : Boolean;
@@ -1007,7 +1012,7 @@ Var
   CacheNext : LongInt;
   RootLba, RootSize : LongInt;
   VolLabel  : String[32];
-  KObjs     : Array[0..MaxKObj - 1] Of TKObj;
+  KObjs     : PKObjArr;       { alloue dans le tas (place sous 4 Mo) }
   KObjOwner : Array[0..MaxKObj - 1] Of LongInt;
   RamFiles  : Array[0..MaxRam - 1] Of TRamFile;
   CurDirS   : String[127];
@@ -1318,13 +1323,13 @@ Var I : LongInt;
 Begin
   KObjNew := -1;
   For I := 0 To MaxKObj - 1 Do
-    If Not KObjs[I].Used Then
+    If Not KObjs^[I].Used Then
     Begin
-      KObjs[I].Used := True;
-      KObjs[I].Kind := Kind;
-      KObjs[I].F1 := 0; KObjs[I].F2 := 0; KObjs[I].F3 := 0;
-      KObjs[I].F4 := 0; KObjs[I].F5 := 0; KObjs[I].F6 := 0;
-      KObjs[I].Name := ''; KObjs[I].Mask := '';
+      KObjs^[I].Used := True;
+      KObjs^[I].Kind := Kind;
+      KObjs^[I].F1 := 0; KObjs^[I].F2 := 0; KObjs^[I].F3 := 0;
+      KObjs^[I].F4 := 0; KObjs^[I].F5 := 0; KObjs^[I].F6 := 0;
+      KObjs^[I].Name := ''; KObjs^[I].Mask := '';
       KObjOwner[I] := HeapOwner;
       KObjNew := I;
       Exit;
@@ -1343,8 +1348,8 @@ Begin
   KObjOf := -1;
   If (H < HKObjBase) Or (H >= HKObjBase + MaxKObj * 4) Then Exit;
   I := (H - HKObjBase) Div 4;
-  If Not KObjs[I].Used Then Exit;
-  If (Kind <> 0) And (KObjs[I].Kind <> Kind) Then Exit;
+  If Not KObjs^[I].Used Then Exit;
+  If (Kind <> 0) And (KObjs^[I].Kind <> Kind) Then Exit;
   KObjOf := I;
 End;
 
@@ -9348,10 +9353,18 @@ Begin
   End;
 End;
 
+Procedure DXPresent; Forward;
+Procedure DXScrRows(Y0, Y1 : LongInt); Forward;
+
 { Recopier une zone du tampon dans la memoire video }
 Procedure LfbCopy(R : TRect);
 Var Y, S, D, N : LongInt;
 Begin
+  If DDShow And DXOn Then
+  Begin
+    DXScrRows(R.T, R.B);
+    Exit;
+  End;
   If R.L < 0 Then R.L := 0;
   If R.T < 0 Then R.T := 0;
   If R.R > ScrW Then R.R := ScrW;
@@ -9547,6 +9560,12 @@ Begin
   End;
   { DirectDraw en mode exclusif : la surface primaire occupe l'ecran,
     centree sur fond noir quand l'ecran est plus grand que son mode }
+  If DDShow And DXOn Then
+  Begin
+    DXPresent;
+    SetR(Dirty, 0, 0, 0, 0);
+    Exit;
+  End;
   If DDShow Then
   Begin
     X0 := ((ScrW - Min(DDW, ScrW)) Div 2) And Not 7;
@@ -9638,6 +9657,7 @@ Type
     KObj     : LongInt;
     IsApp    : Boolean;
     PaintReq : Boolean;
+    Susp     : LongInt;                 { compteur de SuspendThread }
   End;
 
   TMsgRec = Record
@@ -9649,9 +9669,13 @@ Type
     Delay, Next, Proc, User, Flags : LongInt;
   End;
 
+Type
+  TMsgQArr = Array[0..MaxThread * MaxQueue - 1] Of TMsgRec;
+  PMsgQArr = ^TMsgQArr;
+
 Var
   Threads  : Array[0..MaxThread - 1] Of TThread;
-  MsgQ     : Array[0..MaxThread * MaxQueue - 1] Of TMsgRec;
+  MsgQ     : PMsgQArr;        { alloue dans le tas }
   CurT     : LongInt;
   FpuArea  : Array[0..MaxThread * 112 - 1] Of Byte;
   { par tache : pile de l'anneau 0 pour le code 16 bits (TSS.ESP0),
@@ -9742,6 +9766,7 @@ Function ThreadRunnable(T : LongInt) : Boolean;
 Begin
   ThreadRunnable := False;
   If Not Threads[T].Used Then Exit;
+  If Threads[T].Susp > 0 Then Exit;
   Case Threads[T].State Of
     tsReady : ThreadRunnable := True;
     tsSleep : ThreadRunnable := Ticks >= Threads[T].WakeAt;
@@ -9929,6 +9954,7 @@ Begin
   Threads[T].Start := Start;
   Threads[T].Param := Param;
   Threads[T].ExitCode := 259;
+  Threads[T].Susp := 0;
   Threads[T].IsApp := IsApp;
   ThrOwner[T] := Ord(IsApp);
   ThrW16[T] := False;
@@ -9936,7 +9962,7 @@ Begin
   ThrCr3[T] := KPd;
   Threads[T].PaintReq := False;
   Threads[T].KObj := KObjNew(koThread);
-  If Threads[T].KObj >= 0 Then KObjs[Threads[T].KObj].F1 := T;
+  If Threads[T].KObj >= 0 Then KObjs^[Threads[T].KObj].F1 := T;
   { cadre initial : EFLAGS, PUSHAD, puis EBP -> [0, ThreadStartup] }
   FP := Top - 16;
   MemL[0:FP] := 0;
@@ -9967,7 +9993,7 @@ Begin
       KFree(Threads[I].Tib);
       Threads[I].Used := False;
       If Threads[I].KObj >= 0 Then
-        KObjs[Threads[I].KObj].F2 := 1;    { tache terminee : signalee }
+        KObjs^[Threads[I].KObj].F2 := 1;    { tache terminee : signalee }
     End;
 End;
 
@@ -9997,35 +10023,35 @@ Begin
     ObjSignaled := True;
     Exit;
   End;
-  Case KObjs[I].Kind Of
+  Case KObjs^[I].Kind Of
     koEvent :
-      If KObjs[I].F1 <> 0 Then
+      If KObjs^[I].F1 <> 0 Then
       Begin
         ObjSignaled := True;
-        If Consume And (KObjs[I].F2 = 0) Then KObjs[I].F1 := 0;
+        If Consume And (KObjs^[I].F2 = 0) Then KObjs^[I].F1 := 0;
       End;
     koSemaphore :
-      If KObjs[I].F1 > 0 Then
+      If KObjs^[I].F1 > 0 Then
       Begin
         ObjSignaled := True;
-        If Consume Then Dec(KObjs[I].F1);
+        If Consume Then Dec(KObjs^[I].F1);
       End;
     koMutex :
-      If (KObjs[I].F1 = 0) Or (KObjs[I].F1 = ThreadId(CurT)) Then
+      If (KObjs^[I].F1 = 0) Or (KObjs^[I].F1 = ThreadId(CurT)) Then
       Begin
         ObjSignaled := True;
         If Consume Then
         Begin
-          KObjs[I].F1 := ThreadId(CurT);
-          Inc(KObjs[I].F2);
+          KObjs^[I].F1 := ThreadId(CurT);
+          Inc(KObjs^[I].F2);
         End;
       End;
     koThread :
-      ObjSignaled := (KObjs[I].F2 <> 0) Or
-                     Not Threads[KObjs[I].F1].Used Or
-                     (Threads[KObjs[I].F1].State = tsDead);
+      ObjSignaled := (KObjs^[I].F2 <> 0) Or
+                     Not Threads[KObjs^[I].F1].Used Or
+                     (Threads[KObjs^[I].F1].State = tsDead);
     koProcess :
-      ObjSignaled := KObjs[I].F2 <> 0;
+      ObjSignaled := KObjs^[I].F2 <> 0;
   Else
     ObjSignaled := True;
   End;
@@ -10075,14 +10101,14 @@ Begin
   If (Msg = $200) And (Threads[T].QTail <> Threads[T].QHead) Then
   Begin
     I := (Threads[T].QTail + MaxQueue - 1) Mod MaxQueue;
-    If (MsgQ[T * MaxQueue + I].Msg = $200) And
-       (MsgQ[T * MaxQueue + I].Hwnd = Hwnd) Then
+    If (MsgQ^[T * MaxQueue + I].Msg = $200) And
+       (MsgQ^[T * MaxQueue + I].Hwnd = Hwnd) Then
     Begin
-      MsgQ[T * MaxQueue + I].WP := WP;
-      MsgQ[T * MaxQueue + I].LP := LP;
-      MsgQ[T * MaxQueue + I].X := CurX;
-      MsgQ[T * MaxQueue + I].Y := CurY;
-      MsgQ[T * MaxQueue + I].Time := Ticks;
+      MsgQ^[T * MaxQueue + I].WP := WP;
+      MsgQ^[T * MaxQueue + I].LP := LP;
+      MsgQ^[T * MaxQueue + I].X := CurX;
+      MsgQ^[T * MaxQueue + I].Y := CurY;
+      MsgQ^[T * MaxQueue + I].Time := Ticks;
       QPost := True;
       Exit;
     End;
@@ -10090,9 +10116,9 @@ Begin
   N := (Threads[T].QTail + 1) Mod MaxQueue;
   If N = Threads[T].QHead Then Exit;
   I := T * MaxQueue + Threads[T].QTail;
-  MsgQ[I].Hwnd := Hwnd; MsgQ[I].Msg := Msg;
-  MsgQ[I].WP := WP; MsgQ[I].LP := LP;
-  MsgQ[I].Time := Ticks; MsgQ[I].X := CurX; MsgQ[I].Y := CurY;
+  MsgQ^[I].Hwnd := Hwnd; MsgQ^[I].Msg := Msg;
+  MsgQ^[I].WP := WP; MsgQ^[I].LP := LP;
+  MsgQ^[I].Time := Ticks; MsgQ^[I].X := CurX; MsgQ^[I].Y := CurY;
   Threads[T].QTail := N;
   QPost := True;
 End;
@@ -10115,7 +10141,7 @@ Begin
       Begin
         { TIME_CALLBACK_EVENT_SET / PULSE : P est un evenement }
         Id := KObjOf(P, koEvent);
-        If Id >= 0 Then KObjs[Id].F1 := 1;
+        If Id >= 0 Then KObjs^[Id].F1 := 1;
       End
       Else If P <> 0 Then
         asm
@@ -10250,11 +10276,16 @@ Type
     Wnd, Id, Elapse, Next, Proc, Thread : LongInt;
   End;
 
+Type
+  TWndArr = Array[0..MaxWnd - 1] Of TWnd;
+  PWndArr = ^TWndArr;
+
 Var
   Classes  : Array[0..MaxClass - 1] Of TClass;
-  Wnds     : Array[0..MaxWnd - 1] Of TWnd;
+  Wnds     : PWndArr;         { alloue dans le tas }
   ZList    : Array[0..MaxWnd - 1] Of LongInt;
   ZCnt     : LongInt;
+  ZTaskW   : LongInt;                 { barre des taches (-1 : aucune) }
   Props    : Array[0..MaxProp - 1] Of TProp;
   WTimers  : Array[0..MaxTimer - 1] Of TTimerW;
   ActiveWin, FocusWin, CaptureWin : LongInt;
@@ -10297,19 +10328,19 @@ Begin
   WndOf := -1;
   If (H < HWndBase) Or (H >= HWndBase + MaxWnd * 4) Then Exit;
   I := (H - HWndBase) Div 4;
-  If Wnds[I].Used Then WndOf := I;
+  If Wnds^[I].Used Then WndOf := I;
 End;
 
 Function IsChildW(W : LongInt) : Boolean;
 Begin
-  IsChildW := (Wnds[W].Style And WS_CHILD) <> 0;
+  IsChildW := (Wnds^[W].Style And WS_CHILD) <> 0;
 End;
 
 { Fenetre de premier niveau ancetre }
 Function TopOf(W : LongInt) : LongInt;
 Begin
-  While (W >= 0) And IsChildW(W) And (Wnds[W].Parent >= 0) Do
-    W := Wnds[W].Parent;
+  While (W >= 0) And IsChildW(W) And (Wnds^[W].Parent >= 0) Do
+    W := Wnds^[W].Parent;
   TopOf := W;
 End;
 
@@ -10318,32 +10349,32 @@ Procedure CalcNc(W : LongInt);
 Var B, T : LongInt;
 Begin
   B := 0;
-  If (Wnds[W].Style And WS_THICKFRAME) <> 0 Then B := 4
-  Else If ((Wnds[W].Style And WS_DLGFRAME) <> 0) Or
-          ((Wnds[W].ExStyle And WS_EX_DLGMODALFRAME) <> 0) Then B := 3
-  Else If (Wnds[W].Style And WS_BORDER) <> 0 Then B := 1;
-  If (Wnds[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then B := B + 2;
+  If (Wnds^[W].Style And WS_THICKFRAME) <> 0 Then B := 4
+  Else If ((Wnds^[W].Style And WS_DLGFRAME) <> 0) Or
+          ((Wnds^[W].ExStyle And WS_EX_DLGMODALFRAME) <> 0) Then B := 3
+  Else If (Wnds^[W].Style And WS_BORDER) <> 0 Then B := 1;
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then B := B + 2;
   T := B;
-  If (Wnds[W].Style And WS_CAPTION) = WS_CAPTION Then T := T + 19;
-  Wnds[W].CL := B; Wnds[W].CT := T;
-  Wnds[W].CR := Max(B, Wnds[W].W - B);
-  Wnds[W].CB := Max(T, Wnds[W].H - B);
+  If (Wnds^[W].Style And WS_CAPTION) = WS_CAPTION Then T := T + 19;
+  Wnds^[W].CL := B; Wnds^[W].CT := T;
+  Wnds^[W].CR := Max(B, Wnds^[W].W - B);
+  Wnds^[W].CB := Max(T, Wnds^[W].H - B);
 End;
 
 { Position ecran du coin superieur gauche de la fenetre }
 Procedure WndScreenPos(W : LongInt; Var X, Y : LongInt);
 Var P : LongInt;
 Begin
-  X := Wnds[W].X; Y := Wnds[W].Y;
+  X := Wnds^[W].X; Y := Wnds^[W].Y;
   If IsChildW(W) Then
   Begin
-    P := Wnds[W].Parent;
+    P := Wnds^[W].Parent;
     While P >= 0 Do
     Begin
-      X := X + Wnds[P].X + Wnds[P].CL;
-      Y := Y + Wnds[P].Y + Wnds[P].CT;
+      X := X + Wnds^[P].X + Wnds^[P].CL;
+      Y := Y + Wnds^[P].Y + Wnds^[P].CT;
       If Not IsChildW(P) Then Break;
-      P := Wnds[P].Parent;
+      P := Wnds^[P].Parent;
     End;
   End;
 End;
@@ -10352,14 +10383,14 @@ Procedure WndScreenRect(W : LongInt; Var R : TRect);
 Var X, Y : LongInt;
 Begin
   WndScreenPos(W, X, Y);
-  SetR(R, X, Y, X + Wnds[W].W, Y + Wnds[W].H);
+  SetR(R, X, Y, X + Wnds^[W].W, Y + Wnds^[W].H);
 End;
 
 Procedure ClientScreenOrg(W : LongInt; Var X, Y : LongInt);
 Begin
   WndScreenPos(W, X, Y);
-  X := X + Wnds[W].CL;
-  Y := Y + Wnds[W].CT;
+  X := X + Wnds^[W].CL;
+  Y := Y + Wnds^[W].CT;
 End;
 
 Function WndVisible(W : LongInt) : Boolean;
@@ -10367,9 +10398,9 @@ Begin
   WndVisible := False;
   While W >= 0 Do
   Begin
-    If Not Wnds[W].Visible Or Wnds[W].Min Then Exit;
+    If Not Wnds^[W].Visible Or Wnds^[W].Min Then Exit;
     If Not IsChildW(W) Then Break;
-    W := Wnds[W].Parent;
+    W := Wnds^[W].Parent;
   End;
   WndVisible := W >= 0;
 End;
@@ -10383,27 +10414,27 @@ Begin
   WndTarget := False;
   If W < 0 Then Exit;
   T := TopOf(W);
-  If (T < 0) Or (Wnds[T].Surf.Bits = 0) Then Exit;
-  S := Wnds[T].Surf;
+  If (T < 0) Or (Wnds^[T].Surf.Bits = 0) Then Exit;
+  S := Wnds^[T].Surf;
   WndScreenPos(W, X, Y);
-  TX := Wnds[T].X; TY := Wnds[T].Y;
+  TX := Wnds^[T].X; TY := Wnds^[T].Y;
   If Client Then
   Begin
-    OX := X - TX + Wnds[W].CL; OY := Y - TY + Wnds[W].CT;
-    SetR(Clip, OX, OY, X - TX + Wnds[W].CR, Y - TY + Wnds[W].CB);
+    OX := X - TX + Wnds^[W].CL; OY := Y - TY + Wnds^[W].CT;
+    SetR(Clip, OX, OY, X - TX + Wnds^[W].CR, Y - TY + Wnds^[W].CB);
   End
   Else
   Begin
     OX := X - TX; OY := Y - TY;
-    SetR(Clip, OX, OY, OX + Wnds[W].W, OY + Wnds[W].H);
+    SetR(Clip, OX, OY, OX + Wnds^[W].W, OY + Wnds^[W].H);
   End;
   P := W;
-  While IsChildW(P) And (Wnds[P].Parent >= 0) Do
+  While IsChildW(P) And (Wnds^[P].Parent >= 0) Do
   Begin
-    P := Wnds[P].Parent;
+    P := Wnds^[P].Parent;
     WndScreenPos(P, PX, PY);
-    SetR(R, PX - TX + Wnds[P].CL, PY - TY + Wnds[P].CT,
-         PX - TX + Wnds[P].CR, PY - TY + Wnds[P].CB);
+    SetR(R, PX - TX + Wnds^[P].CL, PY - TY + Wnds^[P].CT,
+         PX - TX + Wnds^[P].CR, PY - TY + Wnds^[P].CB);
     If Not RInter(Clip, Clip, R) Then SetR(Clip, 0, 0, 0, 0);
   End;
   SetR(R, 0, 0, S.W, S.H);
@@ -10436,18 +10467,57 @@ Begin
   ZCnt := J;
 End;
 
+{ Fenetre de premier niveau qui couvre tout l'ecran (jeu, diaporama) }
+Function ZCovers(W : LongInt) : Boolean;
+Begin
+  ZCovers := Wnds^[W].Visible And Not IsChildW(W) And
+             (Wnds^[W].X <= 0) And (Wnds^[W].Y <= 0) And
+             (Wnds^[W].X + Wnds^[W].W >= ScrW) And
+             (Wnds^[W].Y + Wnds^[W].H >= ScrH);
+End;
+
+{ Comme le shell de Windows : la fenetre mise au premier plan qui
+  couvre tout l'ecran passe au-dessus de la barre des taches (toujours
+  visible) ; une autre fenetre mise au premier plan la fait revenir }
+Procedure ZFullScr(W : LongInt);
+Var I, T : LongInt; Low : Boolean;
+Begin
+  If (ZTaskW < 0) Or (W = ZTaskW) Then Exit;
+  If (Wnds^[W].ExStyle And WS_EX_TOPMOST) <> 0 Then Exit;
+  If ZCovers(W) Then
+  Begin
+    ZRemove(W);
+    ZList[ZCnt] := W;
+    Inc(ZCnt);
+    Exit;
+  End;
+  { la barre est-elle sous une fenetre ordinaire ? }
+  T := -1; Low := False;
+  For I := 0 To ZCnt - 1 Do
+    If ZList[I] = ZTaskW Then T := I
+    Else If (T >= 0) And
+            ((Wnds^[ZList[I]].ExStyle And WS_EX_TOPMOST) = 0) Then
+      Low := True;
+  If Not Low Then Exit;
+  ZRemove(ZTaskW);
+  ZList[ZCnt] := ZTaskW;
+  Inc(ZCnt);
+  DirtyWnd(ZTaskW);
+End;
+
 { Placer W au sommet (sous les fenetres toujours visibles) }
 Procedure ZTop(W : LongInt);
 Var I, P : LongInt;
 Begin
   ZRemove(W);
   P := ZCnt;
-  If (Wnds[W].ExStyle And WS_EX_TOPMOST) = 0 Then
-    While (P > 0) And ((Wnds[ZList[P - 1]].ExStyle And WS_EX_TOPMOST) <> 0) Do
+  If (Wnds^[W].ExStyle And WS_EX_TOPMOST) = 0 Then
+    While (P > 0) And ((Wnds^[ZList[P - 1]].ExStyle And WS_EX_TOPMOST) <> 0) Do
       Dec(P);
   For I := ZCnt DownTo P + 1 Do ZList[I] := ZList[I - 1];
   ZList[P] := W;
   Inc(ZCnt);
+  ZFullScr(W);
 End;
 
 Procedure ZBottom(W : LongInt);
@@ -10467,21 +10537,21 @@ Begin
   For I := 0 To ZCnt - 1 Do
   Begin
     W := ZList[I];
-    If Wnds[W].Used And Wnds[W].Visible And Not Wnds[W].Min And
-       (Wnds[W].Surf.Bits <> 0) Then
+    If Wnds^[W].Used And Wnds^[W].Visible And Not Wnds^[W].Min And
+       (Wnds^[W].Surf.Bits <> 0) Then
     Begin
-      SetR(WR, Wnds[W].X, Wnds[W].Y, Wnds[W].X + Wnds[W].W,
-           Wnds[W].Y + Wnds[W].H);
+      SetR(WR, Wnds^[W].X, Wnds^[W].Y, Wnds^[W].X + Wnds^[W].W,
+           Wnds^[W].Y + Wnds^[W].H);
       If RInter(X, R, WR) Then
       Begin
         N := X.R - X.L;
-        X0 := X.L - Wnds[W].X; Y0 := X.T - Wnds[W].Y;
-        S := Wnds[W].Surf.Bits + Y0 * Wnds[W].Surf.Pitch + X0;
+        X0 := X.L - Wnds^[W].X; Y0 := X.T - Wnds^[W].Y;
+        S := Wnds^[W].Surf.Bits + Y0 * Wnds^[W].Surf.Pitch + X0;
         D := Back.Bits + X.T * Back.Pitch + X.L;
         For Y := X.T To X.B - 1 Do
         Begin
           MoveMem(S, D, N);
-          S := S + Wnds[W].Surf.Pitch;
+          S := S + Wnds^[W].Surf.Pitch;
           D := D + Back.Pitch;
         End;
       End;
@@ -10495,8 +10565,8 @@ End;
 
 Function CapButtonCount(W : LongInt) : LongInt;
 Begin
-  If (Wnds[W].Style And WS_SYSMENU) = 0 Then CapButtonCount := 0
-  Else If (Wnds[W].Style And (WS_MINIMIZEBOX Or WS_MAXIMIZEBOX)) = 0 Then
+  If (Wnds^[W].Style And WS_SYSMENU) = 0 Then CapButtonCount := 0
+  Else If (Wnds^[W].Style And (WS_MINIMIZEBOX Or WS_MAXIMIZEBOX)) = 0 Then
     CapButtonCount := 1
   Else CapButtonCount := 3;
 End;
@@ -10505,9 +10575,9 @@ End;
 Procedure CapBtnRect(W, B : LongInt; Var X1, Y1, X2, Y2 : LongInt);
 Var Bd : LongInt;
 Begin
-  Bd := Wnds[W].CL;
-  If (Wnds[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then Bd := Bd - 2;
-  X2 := Wnds[W].W - Bd - 3;
+  Bd := Wnds^[W].CL;
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then Bd := Bd - 2;
+  X2 := Wnds^[W].W - Bd - 3;
   Y1 := Bd + 2;
   Y2 := Y1 + 13;
   If B >= 1 Then X2 := X2 - 18;
@@ -10519,17 +10589,17 @@ Procedure NcPaint(W : LongInt);
 Var Bd, X0, Y0, WW, HH, B, I, X1, Y1, X2, Y2, D : LongInt;
     Active : Boolean; Fg, C : LongInt; T : String;
 Begin
-  If Wnds[W].Surf.Bits = 0 Then Exit;
-  Wnds[W].NeedNc := False;
-  X0 := Wnds[W].X; Y0 := Wnds[W].Y; WW := Wnds[W].W; HH := Wnds[W].H;
-  SetTarget(Wnds[W].Surf, X0, Y0);
-  Bd := Wnds[W].CL;
-  If (Wnds[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then
+  If Wnds^[W].Surf.Bits = 0 Then Exit;
+  Wnds^[W].NeedNc := False;
+  X0 := Wnds^[W].X; Y0 := Wnds^[W].Y; WW := Wnds^[W].W; HH := Wnds^[W].H;
+  SetTarget(Wnds^[W].Surf, X0, Y0);
+  Bd := Wnds^[W].CL;
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then
   Begin
     Bd := Bd - 2;
-    Edge(X0 + Bd, Y0 + Wnds[W].CT - 2, X0 + WW - Bd - 1, Y0 + HH - Bd - 1,
+    Edge(X0 + Bd, Y0 + Wnds^[W].CT - 2, X0 + WW - Bd - 1, Y0 + HH - Bd - 1,
          cGray, cWhite);
-    Edge(X0 + Bd + 1, Y0 + Wnds[W].CT - 1, X0 + WW - Bd - 2,
+    Edge(X0 + Bd + 1, Y0 + Wnds^[W].CT - 1, X0 + WW - Bd - 2,
          Y0 + HH - Bd - 2, cBlack, cSilver);
   End;
   If Bd >= 2 Then
@@ -10540,7 +10610,7 @@ Begin
       Box(X0 + I, Y0 + I, X0 + WW - 1 - I, Y0 + HH - 1 - I, cSilver);
   End
   Else If Bd = 1 Then Box(X0, Y0, X0 + WW - 1, Y0 + HH - 1, cBlack);
-  If (Wnds[W].Style And WS_CAPTION) = WS_CAPTION Then
+  If (Wnds^[W].Style And WS_CAPTION) = WS_CAPTION Then
   Begin
     Active := (W = ActiveWin);
     If Active Then C := cNavy Else C := cGray;
@@ -10549,15 +10619,15 @@ Begin
     HLine(X0 + Bd, X0 + WW - Bd - 1, Y0 + Bd + 18, cSilver);
     B := CapButtonCount(W);
     I := 4;
-    If (Wnds[W].Style And WS_SYSMENU) <> 0 Then
+    If (Wnds^[W].Style And WS_SYSMENU) <> 0 Then
     Begin
-      If Wnds[W].IKind <> ikNone Then
-        PaintIcon(Wnds[W].K4, X0 + Bd + 2, Y0 + Bd + 1, 16)
+      If Wnds^[W].IKind <> ikNone Then
+        PaintIcon(Wnds^[W].K4, X0 + Bd + 2, Y0 + Bd + 1, 16)
       Else
         PaintIcon(icApp, X0 + Bd + 2, Y0 + Bd + 1, 16);
       I := 21;
     End;
-    T := Fit(Wnds[W].Text, WW - Bd * 2 - I - 4 - 18 * B);
+    T := Fit(Wnds^[W].Text, WW - Bd * 2 - I - 4 - 18 * B);
     OutBold(X0 + Bd + I, Y0 + Bd + 1, T, Fg);
     For I := 0 To B - 1 Do
     Begin
@@ -10577,9 +10647,9 @@ Begin
           End;
         1 :
         Begin
-          If (Wnds[W].Style And WS_MAXIMIZEBOX) <> 0 Then C := cBlack
+          If (Wnds^[W].Style And WS_MAXIMIZEBOX) <> 0 Then C := cBlack
           Else C := cGray;
-          If Wnds[W].Max Then
+          If Wnds^[W].Max Then
           Begin
             Box(X1 + 6, Y1 + 2, X1 + 11, Y1 + 6, C);
             HLine(X1 + 6, X1 + 11, Y1 + 3, C);
@@ -10594,7 +10664,7 @@ Begin
           End;
         End;
       Else
-        If (Wnds[W].Style And WS_MINIMIZEBOX) <> 0 Then C := cBlack
+        If (Wnds^[W].Style And WS_MINIMIZEBOX) <> 0 Then C := cBlack
         Else C := cGray;
         FBar(X1 + 4, Y1 + 9, X1 + 9, Y1 + 10, C);
       End;
@@ -10611,13 +10681,13 @@ Procedure InvalW(W : LongInt; R : TRect; Erase : Boolean);
 Var C : TRect;
 Begin
   If W < 0 Then Exit;
-  SetR(C, 0, 0, Wnds[W].CR - Wnds[W].CL, Wnds[W].CB - Wnds[W].CT);
+  SetR(C, 0, 0, Wnds^[W].CR - Wnds^[W].CL, Wnds^[W].CB - Wnds^[W].CT);
   If Not RInter(R, R, C) Then Exit;
-  RUnion(Wnds[W].Upd, R);
-  If Erase Then Wnds[W].UpdErase := True;
-  If Wnds[W].IKind <> ikNone Then Wnds[TopOf(W)].KNeedPaint := True
-  Else If (Wnds[W].Thread >= 0) And (Wnds[W].Thread < MaxThread) Then
-    Threads[Wnds[W].Thread].PaintReq := True;
+  RUnion(Wnds^[W].Upd, R);
+  If Erase Then Wnds^[W].UpdErase := True;
+  If Wnds^[W].IKind <> ikNone Then Wnds^[TopOf(W)].KNeedPaint := True
+  Else If (Wnds^[W].Thread >= 0) And (Wnds^[W].Thread < MaxThread) Then
+    Threads[Wnds^[W].Thread].PaintReq := True;
 End;
 
 Procedure InvalAll(W : LongInt; Erase : Boolean);
@@ -10626,14 +10696,14 @@ Begin
   SetR(R, 0, 0, 30000, 30000);
   InvalW(W, R, Erase);
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And IsChildW(I) And (Wnds[I].Parent = W) Then
+    If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = W) Then
       InvalAll(I, Erase);
 End;
 
 Function HasUpdate(W : LongInt) : Boolean;
 Begin
-  HasUpdate := (Wnds[W].Upd.L < Wnds[W].Upd.R) And
-               (Wnds[W].Upd.T < Wnds[W].Upd.B);
+  HasUpdate := (Wnds^[W].Upd.L < Wnds^[W].Upd.R) And
+               (Wnds^[W].Upd.T < Wnds^[W].Upd.B);
 End;
 
 { ------------------------------------------------------------------ }
@@ -10663,11 +10733,11 @@ End;
 Function SendMsgW(W, Msg, WP, LP : LongInt) : LongInt;
 Begin
   SendMsgW := 0;
-  If (W < 0) Or Not Wnds[W].Used Then Exit;
-  If Wnds[W].Proc <> 0 Then
+  If (W < 0) Or Not Wnds^[W].Used Then Exit;
+  If Wnds^[W].Proc <> 0 Then
   Begin
     If Not KillingApp Then
-      SendMsgW := CallProc(Wnds[W].Proc, HwndOf(W), Msg, WP, LP);
+      SendMsgW := CallProc(Wnds^[W].Proc, HwndOf(W), Msg, WP, LP);
   End
   Else
     SendMsgW := KWndProc(W, Msg, WP, LP);
@@ -10676,14 +10746,14 @@ End;
 Function PostMsgW(W, Msg, WP, LP : LongInt) : Boolean;
 Begin
   PostMsgW := False;
-  If (W < 0) Or Not Wnds[W].Used Then Exit;
-  If (Wnds[W].IKind <> ikNone) And (Wnds[W].IKind <> ikDialog) Then
+  If (W < 0) Or Not Wnds^[W].Used Then Exit;
+  If (Wnds^[W].IKind <> ikNone) And (Wnds^[W].IKind <> ikDialog) Then
   Begin
     KWndProc(W, Msg, WP, LP);
     PostMsgW := True;
   End
   Else
-    PostMsgW := QPost(Wnds[W].Thread, HwndOf(W), Msg, WP, LP);
+    PostMsgW := QPost(Wnds^[W].Thread, HwndOf(W), Msg, WP, LP);
 End;
 
 { Message en attente pour la tache T (y compris WM_PAINT et WM_TIMER) }
@@ -10742,15 +10812,15 @@ Var I : LongInt;
 Begin
   WndAlloc := -1;
   For I := 0 To MaxWnd - 1 Do
-    If Not Wnds[I].Used Then
+    If Not Wnds^[I].Used Then
     Begin
-      FillMem(LongInt(@Wnds[I]), SizeOf(TWnd), 0);
-      Wnds[I].Used := True;
-      Wnds[I].Parent := -1;
-      Wnds[I].Owner := -1;
-      Wnds[I].Enabled := True;
+      FillMem(LongInt(@Wnds^[I]), SizeOf(TWnd), 0);
+      Wnds^[I].Used := True;
+      Wnds^[I].Parent := -1;
+      Wnds^[I].Owner := -1;
+      Wnds^[I].Enabled := True;
       Inc(WndSeq);
-      Wnds[I].Seq := WndSeq;
+      Wnds^[I].Seq := WndSeq;
       WndAlloc := I;
       Exit;
     End;
@@ -10761,31 +10831,31 @@ Procedure WndSurf(W : LongInt);
 Var WW, HH, Own, T : LongInt;
 Begin
   If IsChildW(W) Then Exit;
-  WW := Max(1, Wnds[W].W); HH := Max(1, Wnds[W].H);
-  If (Wnds[W].Surf.Bits <> 0) And (Wnds[W].Surf.W = WW) And
-     (Wnds[W].Surf.H = HH) Then Exit;
-  SurfFree(Wnds[W].Surf);
+  WW := Max(1, Wnds^[W].W); HH := Max(1, Wnds^[W].H);
+  If (Wnds^[W].Surf.Bits <> 0) And (Wnds^[W].Surf.W = WW) And
+     (Wnds^[W].Surf.H = HH) Then Exit;
+  SurfFree(Wnds^[W].Surf);
   { la surface appartient au fil de la fenetre, pas au programme en
     cours : une fenetre du noyau (Invite MS-DOS...) creee ou agrandie
     pendant qu'un programme tourne perdait sa surface a la fin de
     celui-ci (KFreeOwner), puis la reutilisait par-dessus d'autres
     blocs (ligne de commande du programme suivant remplie de 07h) }
   Own := HeapOwner;
-  T := Wnds[W].Thread;
+  T := Wnds^[W].Thread;
   If (T >= 0) And (T < MaxThread) Then HeapOwner := ThrOwner[T]
   Else HeapOwner := 0;
-  If SurfNew(Wnds[W].Surf, WW, HH) Then
-    FillMem(Wnds[W].Surf.Bits, Wnds[W].Surf.Pitch * HH, cSilver);
+  If SurfNew(Wnds^[W].Surf, WW, HH) Then
+    FillMem(Wnds^[W].Surf.Bits, Wnds^[W].Surf.Pitch * HH, cSilver);
   HeapOwner := Own;
-  Wnds[W].NeedNc := True;
+  Wnds^[W].NeedNc := True;
 End;
 
 Function IsTaskWin(W : LongInt) : Boolean;
 Begin
-  IsTaskWin := Wnds[W].Used And Wnds[W].Visible And Not IsChildW(W) And
-    (Wnds[W].Owner < 0) And ((Wnds[W].ExStyle And WS_EX_TOOLWINDOW) = 0)
-    And (Wnds[W].IKind <> ikTaskbar) And (Wnds[W].IKind <> ikMenu) And
-    ((Wnds[W].Text <> '') Or ((Wnds[W].Style And WS_CAPTION) <> 0));
+  IsTaskWin := Wnds^[W].Used And Wnds^[W].Visible And Not IsChildW(W) And
+    (Wnds^[W].Owner < 0) And ((Wnds^[W].ExStyle And WS_EX_TOOLWINDOW) = 0)
+    And (Wnds^[W].IKind <> ikTaskbar) And (Wnds^[W].IKind <> ikMenu) And
+    ((Wnds^[W].Text <> '') Or ((Wnds^[W].Style And WS_CAPTION) <> 0));
 End;
 
 Procedure SetFocusW(W : LongInt);
@@ -10794,7 +10864,7 @@ Begin
   If W = FocusWin Then Exit;
   Old := FocusWin;
   FocusWin := W;
-  If (Old >= 0) And Wnds[Old].Used Then
+  If (Old >= 0) And Wnds^[Old].Used Then
     PostMsgW(Old, WM_KILLFOCUS, HwndOf(W), 0);
   If W >= 0 Then PostMsgW(W, WM_SETFOCUS, HwndOf(Old), 0);
 End;
@@ -10803,40 +10873,40 @@ Procedure ActivateW(W : LongInt);
 Var Old : LongInt;
 Begin
   If W >= 0 Then W := TopOf(W);
-  If (W >= 0) And ((Wnds[W].IKind = ikTaskbar) Or
-     (Wnds[W].IKind = ikMenu)) Then Exit;
+  If (W >= 0) And ((Wnds^[W].IKind = ikTaskbar) Or
+     (Wnds^[W].IKind = ikMenu)) Then Exit;
   Old := ActiveWin;
-  If (W >= 0) And Wnds[W].Visible Then ZTop(W);
+  If (W >= 0) And Wnds^[W].Visible Then ZTop(W);
   If W = Old Then
   Begin
     If W >= 0 Then DirtyWnd(W);
     Exit;
   End;
   ActiveWin := W;
-  If (Old >= 0) And Wnds[Old].Used Then
+  If (Old >= 0) And Wnds^[Old].Used Then
   Begin
     NcPaint(Old);
-    If Wnds[Old].IKind = ikNone Then
+    If Wnds^[Old].IKind = ikNone Then
     Begin
       PostMsgW(Old, WM_ACTIVATE, 0, HwndOf(W));
-      If (W < 0) Or (Wnds[W].Thread <> Wnds[Old].Thread) Then
+      If (W < 0) Or (Wnds^[W].Thread <> Wnds^[Old].Thread) Then
         PostMsgW(Old, WM_ACTIVATEAPP, 0, 0);
     End
     Else
-      Wnds[Old].KNeedPaint := True;
+      Wnds^[Old].KNeedPaint := True;
   End;
   If W >= 0 Then
   Begin
     NcPaint(W);
-    If Wnds[W].IKind = ikNone Then
+    If Wnds^[W].IKind = ikNone Then
     Begin
-      If (Old < 0) Or (Wnds[Old].Thread <> Wnds[W].Thread) Then
+      If (Old < 0) Or (Wnds^[Old].Thread <> Wnds^[W].Thread) Then
         PostMsgW(W, WM_ACTIVATEAPP, 1, 0);
       PostMsgW(W, WM_ACTIVATE, 1, HwndOf(Old));
       PostMsgW(W, WM_QUERYNEWPALETTE, 0, 0);
     End
     Else
-      Wnds[W].KNeedPaint := True;
+      Wnds^[W].KNeedPaint := True;
     SetFocusW(W);
     KActivated(W);
   End;
@@ -10850,8 +10920,8 @@ Begin
   For I := ZCnt - 1 DownTo 0 Do
   Begin
     W := ZList[I];
-    If Wnds[W].Used And Wnds[W].Visible And Not Wnds[W].Min And
-       (Wnds[W].IKind <> ikTaskbar) And (Wnds[W].IKind <> ikMenu) Then
+    If Wnds^[W].Used And Wnds^[W].Visible And Not Wnds^[W].Min And
+       (Wnds^[W].IKind <> ikTaskbar) And (Wnds^[W].IKind <> ikMenu) Then
     Begin
       ActivateW(W);
       Exit;
@@ -10862,18 +10932,18 @@ End;
 
 Procedure ShowW(W : LongInt; Show, Activate : Boolean);
 Begin
-  If Wnds[W].Visible = Show Then
+  If Wnds^[W].Visible = Show Then
   Begin
     If Show And Activate And Not IsChildW(W) Then ActivateW(W);
     Exit;
   End;
-  Wnds[W].Visible := Show;
+  Wnds^[W].Visible := Show;
   If Show Then
   Begin
     InvalAll(W, True);
     If Not IsChildW(W) Then
     Begin
-      Wnds[W].NeedNc := True;
+      Wnds^[W].NeedNc := True;
       If Activate Then ActivateW(W) Else ZTop(W);
     End;
   End
@@ -10888,27 +10958,27 @@ Var Sized, Moved : Boolean; R : TRect;
 Begin
   If WW < 0 Then WW := 0;
   If HH < 0 Then HH := 0;
-  Sized := (WW <> Wnds[W].W) Or (HH <> Wnds[W].H);
-  Moved := (X <> Wnds[W].X) Or (Y <> Wnds[W].Y);
+  Sized := (WW <> Wnds^[W].W) Or (HH <> Wnds^[W].H);
+  Moved := (X <> Wnds^[W].X) Or (Y <> Wnds^[W].Y);
   If Not Sized And Not Moved Then Exit;
   DirtyWnd(W);
   WndScreenRect(W, R);
-  Wnds[W].X := X; Wnds[W].Y := Y; Wnds[W].W := WW; Wnds[W].H := HH;
+  Wnds^[W].X := X; Wnds^[W].Y := Y; Wnds^[W].W := WW; Wnds^[W].H := HH;
   CalcNc(W);
   If Sized Then
   Begin
     WndSurf(W);
     If Not IsChildW(W) Then NcPaint(W);
     InvalAll(W, True);
-    SendMsgW(W, WM_SIZE, 0, ((Wnds[W].CB - Wnds[W].CT) Shl 16) Or
-             ((Wnds[W].CR - Wnds[W].CL) And $FFFF));
+    SendMsgW(W, WM_SIZE, 0, ((Wnds^[W].CB - Wnds^[W].CT) Shl 16) Or
+             ((Wnds^[W].CR - Wnds^[W].CL) And $FFFF));
   End;
   If Moved Then
-    SendMsgW(W, WM_MOVE, 0, (Wnds[W].Y Shl 16) Or (Wnds[W].X And $FFFF));
+    SendMsgW(W, WM_MOVE, 0, (Wnds^[W].Y Shl 16) Or (Wnds^[W].X And $FFFF));
   If IsChildW(W) Then
   Begin
     { l'ancienne zone de la fille doit etre repeinte par le parent }
-    If Wnds[W].Parent >= 0 Then InvalAll(Wnds[W].Parent, True);
+    If Wnds^[W].Parent >= 0 Then InvalAll(Wnds^[W].Parent, True);
   End;
   DirtyWnd(W);
 End;
@@ -10923,12 +10993,12 @@ Begin
     ChainExec := ''; ChainRet := ''; ConKeep := False;
     If AppRunning And AppConsole Then ConKillReq := True;
   End;
-  If (W < 0) Or Not Wnds[W].Used Or Wnds[W].Destroying Then Exit;
-  Wnds[W].Destroying := True;
-  If Wnds[W].Visible And Not IsChildW(W) Then DirtyWnd(W);
+  If (W < 0) Or Not Wnds^[W].Used Or Wnds^[W].Destroying Then Exit;
+  Wnds^[W].Destroying := True;
+  If Wnds^[W].Visible And Not IsChildW(W) Then DirtyWnd(W);
   SendMsgW(W, WM_DESTROY, 0, 0);
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And ((Wnds[I].Parent = W) Or (Wnds[I].Owner = W)) And
+    If Wnds^[I].Used And ((Wnds^[I].Parent = W) Or (Wnds^[I].Owner = W)) And
        (I <> W) Then DestroyW(I);
   SendMsgW(W, WM_NCDESTROY, 0, 0);
   For I := 0 To MaxTimer - 1 Do
@@ -10936,17 +11006,17 @@ Begin
       WTimers[I].Used := False;
   For I := 0 To MaxProp - 1 Do
     If Props[I].Used And (Props[I].Wnd = W) Then Props[I].Used := False;
-  If IsChildW(W) And (Wnds[W].Parent >= 0) Then
-    InvalAll(Wnds[W].Parent, True);
+  If IsChildW(W) And (Wnds^[W].Parent >= 0) Then
+    InvalAll(Wnds^[W].Parent, True);
   If Not IsChildW(W) Then
   Begin
     DirtyWnd(W);
     ZRemove(W);
-    SurfFree(Wnds[W].Surf);
+    SurfFree(Wnds^[W].Surf);
   End;
-  If Wnds[W].Extra <> 0 Then KFree(Wnds[W].Extra);
-  T := Wnds[W].Thread;
-  Wnds[W].Used := False;
+  If Wnds^[W].Extra <> 0 Then KFree(Wnds^[W].Extra);
+  T := Wnds^[W].Thread;
+  Wnds^[W].Used := False;
   If CaptureWin = W Then CaptureWin := -1;
   If DragWin = W Then DragWin := -1;
   If PressWin = W Then PressWin := -1;
@@ -10967,29 +11037,29 @@ Begin
   CreateW := -1;
   W := WndAlloc;
   If W < 0 Then Exit;
-  Wnds[W].Cls := Cls;
-  Wnds[W].Style := Style And Not WS_VISIBLE;
-  Wnds[W].ExStyle := ExStyle;
-  Wnds[W].Text := Name;
-  Wnds[W].Proc := Classes[Cls].Proc;
-  Wnds[W].IKind := Classes[Cls].IKind;
-  Wnds[W].Thread := CurT;
-  Wnds[W].Inst := Inst;
-  Wnds[W].Cursor := Classes[Cls].Cursor;
+  Wnds^[W].Cls := Cls;
+  Wnds^[W].Style := Style And Not WS_VISIBLE;
+  Wnds^[W].ExStyle := ExStyle;
+  Wnds^[W].Text := Name;
+  Wnds^[W].Proc := Classes[Cls].Proc;
+  Wnds^[W].IKind := Classes[Cls].IKind;
+  Wnds^[W].Thread := CurT;
+  Wnds^[W].Inst := Inst;
+  Wnds^[W].Cursor := Classes[Cls].Cursor;
   If (Style And WS_CHILD) <> 0 Then
   Begin
-    Wnds[W].Parent := Parent;
-    Wnds[W].Id := Menu;
+    Wnds^[W].Parent := Parent;
+    Wnds^[W].Id := Menu;
   End
   Else
   Begin
-    Wnds[W].Owner := Parent;
-    Wnds[W].Menu := Menu;
+    Wnds^[W].Owner := Parent;
+    Wnds^[W].Menu := Menu;
   End;
   If Classes[Cls].WndExtra > 0 Then
   Begin
-    Wnds[W].ExtraSz := Classes[Cls].WndExtra;
-    Wnds[W].Extra := KAlloc(Classes[Cls].WndExtra);
+    Wnds^[W].ExtraSz := Classes[Cls].WndExtra;
+    Wnds^[W].Extra := KAlloc(Classes[Cls].WndExtra);
   End;
   { CW_USEDEFAULT }
   If X = LongInt($80000000) Then
@@ -11000,8 +11070,8 @@ Begin
   Begin
     WW := 480; HH := 340;
   End;
-  Wnds[W].X := X; Wnds[W].Y := Y; Wnds[W].W := Max(0, WW);
-  Wnds[W].H := Max(0, HH);
+  Wnds^[W].X := X; Wnds^[W].Y := Y; Wnds^[W].W := Max(0, WW);
+  Wnds^[W].H := Max(0, HH);
   CalcNc(W);
   WndSurf(W);
   If Not IsChildW(W) Then ZTop(W);
@@ -11018,7 +11088,7 @@ Begin
   MemL[0:CS + 44] := ExStyle;
   CreateW := W;
   If SendMsgW(W, WM_NCCREATE, 0, CS) = 0 Then
-    If Wnds[W].Proc <> 0 Then
+    If Wnds^[W].Proc <> 0 Then
     Begin
       KFree(CS);
       DestroyW(W);
@@ -11033,19 +11103,19 @@ Begin
     CreateW := -1;
     Exit;
   End;
-  If Not Wnds[W].Used Then
+  If Not Wnds^[W].Used Then
   Begin
     CreateW := -1;
     Exit;
   End;
-  SendMsgW(W, WM_SIZE, 0, ((Wnds[W].CB - Wnds[W].CT) Shl 16) Or
-           ((Wnds[W].CR - Wnds[W].CL) And $FFFF));
-  SendMsgW(W, WM_MOVE, 0, (Wnds[W].Y Shl 16) Or (Wnds[W].X And $FFFF));
+  SendMsgW(W, WM_SIZE, 0, ((Wnds^[W].CB - Wnds^[W].CT) Shl 16) Or
+           ((Wnds^[W].CR - Wnds^[W].CL) And $FFFF));
+  SendMsgW(W, WM_MOVE, 0, (Wnds^[W].Y Shl 16) Or (Wnds^[W].X And $FFFF));
   If (Style And WS_MAXIMIZE) <> 0 Then
   Begin
-    Wnds[W].Max := True;
-    Wnds[W].NX := Wnds[W].X; Wnds[W].NY := Wnds[W].Y;
-    Wnds[W].NW := Wnds[W].W; Wnds[W].NH := Wnds[W].H;
+    Wnds^[W].Max := True;
+    Wnds^[W].NX := Wnds^[W].X; Wnds^[W].NY := Wnds^[W].Y;
+    Wnds^[W].NW := Wnds^[W].W; Wnds^[W].NH := Wnds^[W].H;
   End;
   If (Style And WS_VISIBLE) <> 0 Then
     ShowW(W, True, Not IsChildW(W));
@@ -11060,14 +11130,14 @@ Var I, Best, BestSeq, CX, CY : LongInt; R : TRect;
 Begin
   Best := -1; BestSeq := -1;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And Wnds[I].Visible And IsChildW(I) And
-       (Wnds[I].Parent = W) Then
+    If Wnds^[I].Used And Wnds^[I].Visible And IsChildW(I) And
+       (Wnds^[I].Parent = W) Then
     Begin
       WndScreenRect(I, R);
       If InRect(X, Y, R.L, R.T, R.R - 1, R.B - 1) Then
-        If Wnds[I].Seq > BestSeq Then
+        If Wnds^[I].Seq > BestSeq Then
         Begin
-          Best := I; BestSeq := Wnds[I].Seq;
+          Best := I; BestSeq := Wnds^[I].Seq;
         End;
     End;
   If Best >= 0 Then ChildAt := ChildAt(Best, X, Y) Else ChildAt := W;
@@ -11081,9 +11151,9 @@ Begin
   For I := ZCnt - 1 DownTo 0 Do
   Begin
     W := ZList[I];
-    If Wnds[W].Used And Wnds[W].Visible And Not Wnds[W].Min Then
-      If InRect(X, Y, Wnds[W].X, Wnds[W].Y, Wnds[W].X + Wnds[W].W - 1,
-                Wnds[W].Y + Wnds[W].H - 1) Then
+    If Wnds^[W].Used And Wnds^[W].Visible And Not Wnds^[W].Min Then
+      If InRect(X, Y, Wnds^[W].X, Wnds^[W].Y, Wnds^[W].X + Wnds^[W].W - 1,
+                Wnds^[W].Y + Wnds^[W].H - 1) Then
       Begin
         TopAt := W;
         Exit;
@@ -11158,9 +11228,9 @@ End;
 
 Procedure MinimizeW(W : LongInt);
 Begin
-  If Wnds[W].Min Then Exit;
+  If Wnds^[W].Min Then Exit;
   DirtyWnd(W);
-  Wnds[W].Min := True;
+  Wnds^[W].Min := True;
   If W = ActiveWin Then ActivateNext;
   PostMsgW(W, WM_SIZE, 1, 0);
   TaskbarChanged;
@@ -11168,33 +11238,41 @@ End;
 
 Procedure RestoreW(W : LongInt);
 Begin
-  If Wnds[W].Min Then
+  If Wnds^[W].Min Then
   Begin
-    Wnds[W].Min := False;
+    Wnds^[W].Min := False;
     DirtyWnd(W);
     ActivateW(W);
-    PostMsgW(W, WM_SIZE, 0, ((Wnds[W].CB - Wnds[W].CT) Shl 16) Or
-             ((Wnds[W].CR - Wnds[W].CL) And $FFFF));
+    PostMsgW(W, WM_SIZE, 0, ((Wnds^[W].CB - Wnds^[W].CT) Shl 16) Or
+             ((Wnds^[W].CR - Wnds^[W].CL) And $FFFF));
     InvalAll(W, True);
     Exit;
   End;
-  If Wnds[W].Max Then
+  If Wnds^[W].Max Then
   Begin
-    Wnds[W].Max := False;
-    MoveW(W, Wnds[W].NX, Wnds[W].NY, Wnds[W].NW, Wnds[W].NH, True);
+    Wnds^[W].Max := False;
+    MoveW(W, Wnds^[W].NX, Wnds^[W].NY, Wnds^[W].NW, Wnds^[W].NH, True);
     NcPaint(W);
+    ZFullScr(W);
   End;
 End;
 
+{ Agrandir : la zone de travail (au-dessus de la barre des taches) ;
+  une fenetre sans barre de titre (WS_POPUP d'un jeu) prend tout
+  l'ecran, comme sous Windows }
 Procedure MaximizeW(W : LongInt);
+Var B, HH : LongInt;
 Begin
-  If Wnds[W].Max Or ((Wnds[W].Style And WS_THICKFRAME) = 0) Then Exit;
-  Wnds[W].NX := Wnds[W].X; Wnds[W].NY := Wnds[W].Y;
-  Wnds[W].NW := Wnds[W].W; Wnds[W].NH := Wnds[W].H;
-  Wnds[W].Max := True;
-  MoveW(W, -Wnds[W].CL, -Wnds[W].CL, ScrW + 2 * Wnds[W].CL,
-        TaskY + 2 * Wnds[W].CL, True);
+  If Wnds^[W].Max Then Exit;
+  Wnds^[W].NX := Wnds^[W].X; Wnds^[W].NY := Wnds^[W].Y;
+  Wnds^[W].NW := Wnds^[W].W; Wnds^[W].NH := Wnds^[W].H;
+  Wnds^[W].Max := True;
+  B := Wnds^[W].CL;
+  If (Wnds^[W].Style And $C00000) = $C00000 Then HH := TaskY
+  Else HH := ScrH;
+  MoveW(W, -B, -B, ScrW + 2 * B, HH + 2 * B, True);
   NcPaint(W);
+  ZFullScr(W);
 End;
 
 { Commande systeme (bouton ou menu systeme) }
@@ -11229,12 +11307,12 @@ Var X, Y : LongInt;
 Begin
   ClientScreenOrg(W, X, Y);
   X := CurX - X; Y := CurY - Y;
-  If (Wnds[W].IKind >= ikButton) And (Wnds[W].IKind <= ikMdiClient) Then
+  If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) Then
   Begin
-    If Wnds[W].IKind <> ikDialog Then
+    If Wnds^[W].IKind <> ikDialog Then
       KWndProc(W, Msg, MouseKeys, ((Y And $FFFF) Shl 16) Or (X And $FFFF));
   End
-  Else If Wnds[W].IKind <> ikNone Then KMouse(W, Msg, X, Y)
+  Else If Wnds^[W].IKind <> ikNone Then KMouse(W, Msg, X, Y)
   Else
     PostMsgW(W, Msg, MouseKeys, ((Y And $FFFF) Shl 16) Or (X And $FFFF));
 End;
@@ -11256,7 +11334,7 @@ Begin
     Exit;
   End;
   { capture de la souris }
-  If (CaptureWin >= 0) And Wnds[CaptureWin].Used Then
+  If (CaptureWin >= 0) And Wnds^[CaptureWin].Used Then
   Begin
     If Btn = 1 Then
       If Down Then Msg := WM_LBUTTONDOWN Else Msg := WM_LBUTTONUP
@@ -11278,10 +11356,10 @@ Begin
       PressWin := -1;
       NcPaint(W);
       CapBtnRect(W, B, X1, Y1, X2, Y2);
-      If InRect(CurX - Wnds[W].X, CurY - Wnds[W].Y, X1, Y1, X2, Y2) Then
+      If InRect(CurX - Wnds^[W].X, CurY - Wnds^[W].Y, X1, Y1, X2, Y2) Then
         Case B Of
           0 : SysCommand(W, SC_CLOSE);
-          1 : If Wnds[W].Max Then SysCommand(W, SC_RESTORE)
+          1 : If Wnds^[W].Max Then SysCommand(W, SC_RESTORE)
               Else SysCommand(W, SC_MAXIMIZE);
           2 : SysCommand(W, SC_MINIMIZE);
         End;
@@ -11301,11 +11379,11 @@ Begin
     Exit;
   End;
   If Down And (T <> ActiveWin) Then ActivateW(T);
-  OX := CurX - Wnds[T].X; OY := CurY - Wnds[T].Y;
+  OX := CurX - Wnds^[T].X; OY := CurY - Wnds^[T].Y;
   { zone non client : barre de titre et boutons }
   If Down And (Btn = 1) And
-     Not InRect(OX, OY, Wnds[T].CL, Wnds[T].CT, Wnds[T].CR - 1,
-                Wnds[T].CB - 1) Then
+     Not InRect(OX, OY, Wnds^[T].CL, Wnds^[T].CT, Wnds^[T].CR - 1,
+                Wnds^[T].CB - 1) Then
   Begin
     For B := 0 To CapButtonCount(T) - 1 Do
     Begin
@@ -11317,30 +11395,30 @@ Begin
         Exit;
       End;
     End;
-    If ((Wnds[T].Style And WS_CAPTION) = WS_CAPTION) And
-       (OY < Wnds[T].CL + 19) Then
+    If ((Wnds^[T].Style And WS_CAPTION) = WS_CAPTION) And
+       (OY < Wnds^[T].CL + 19) Then
     Begin
       Dbl := (LastClickW = -2 - T) And (Ticks - LastClickT < 700);
       LastClickW := -2 - T; LastClickT := Ticks;
-      If Dbl And ((Wnds[T].Style And WS_MAXIMIZEBOX) <> 0) Then
+      If Dbl And ((Wnds^[T].Style And WS_MAXIMIZEBOX) <> 0) Then
       Begin
-        If Wnds[T].Max Then RestoreW(T) Else MaximizeW(T);
+        If Wnds^[T].Max Then RestoreW(T) Else MaximizeW(T);
         Exit;
       End;
-      If Not Wnds[T].Max Then
+      If Not Wnds^[T].Max Then
       Begin
         DragWin := T; DragDX := OX; DragDY := OY;
       End;
     End;
-    If Wnds[T].IKind <> ikNone Then KMouse(T, WM_LBUTTONDOWN, OX, OY);
+    If Wnds^[T].IKind <> ikNone Then KMouse(T, WM_LBUTTONDOWN, OX, OY);
     Exit;
   End;
-  If (Not Down) And (Btn = 1) And (Wnds[T].IKind <> ikNone) And
-     Not InRect(OX, OY, Wnds[T].CL, Wnds[T].CT, Wnds[T].CR - 1,
-                Wnds[T].CB - 1) Then Exit;
+  If (Not Down) And (Btn = 1) And (Wnds^[T].IKind <> ikNone) And
+     Not InRect(OX, OY, Wnds^[T].CL, Wnds^[T].CT, Wnds^[T].CR - 1,
+                Wnds^[T].CB - 1) Then Exit;
   { zone client : fenetre fille la plus profonde }
   W := ChildAt(T, CurX, CurY);
-  If Not Wnds[W].Enabled Then Exit;
+  If Not Wnds^[W].Enabled Then Exit;
   If Btn = 1 Then
   Begin
     If Down Then
@@ -11349,14 +11427,14 @@ Begin
              (Abs(CurX - LastClickX) < 4) And (Abs(CurY - LastClickY) < 4);
       LastClickW := W; LastClickT := Ticks;
       LastClickX := CurX; LastClickY := CurY;
-      If Dbl And (((Classes[Wnds[W].Cls].Style And CS_DBLCLKS) <> 0) Or
-         (Wnds[W].IKind <> ikNone)) Then
+      If Dbl And (((Classes[Wnds^[W].Cls].Style And CS_DBLCLKS) <> 0) Or
+         (Wnds^[W].IKind <> ikNone)) Then
       Begin
         Msg := WM_LBUTTONDBLCLK;
         LastClickW := -1;
       End
       Else Msg := WM_LBUTTONDOWN;
-      If (W <> FocusWin) And IsChildW(W) And (Wnds[W].Proc = 0) Then
+      If (W <> FocusWin) And IsChildW(W) And (Wnds^[W].Proc = 0) Then
         SetFocusW(W);
     End
     Else Msg := WM_LBUTTONUP;
@@ -11378,11 +11456,11 @@ Begin
     NX := CurX - DragDX; NY := CurY - DragDY;
     If NY < 0 Then NY := 0;
     If NY > TaskY - 20 Then NY := TaskY - 20;
-    MoveW(DragWin, NX, NY, Wnds[DragWin].W, Wnds[DragWin].H, False);
+    MoveW(DragWin, NX, NY, Wnds^[DragWin].W, Wnds^[DragWin].H, False);
     Exit;
   End;
   If PressWin >= 0 Then Exit;
-  If (CaptureWin >= 0) And Wnds[CaptureWin].Used Then
+  If (CaptureWin >= 0) And Wnds^[CaptureWin].Used Then
   Begin
     MouseTo(CaptureWin, WM_MOUSEMOVE);
     Exit;
@@ -11395,15 +11473,15 @@ Begin
     Exit;
   End;
   W := ChildAt(T, CurX, CurY);
-  If Wnds[W].IKind <> ikNone Then
+  If Wnds^[W].IKind <> ikNone Then
   Begin
     If CurKind <> 0 Then CursorSetShape(0);
     MouseTo(W, WM_MOUSEMOVE);
   End
   Else
   Begin
-    If InRect(CurX - Wnds[T].X, CurY - Wnds[T].Y, Wnds[T].CL, Wnds[T].CT,
-              Wnds[T].CR - 1, Wnds[T].CB - 1) Then
+    If InRect(CurX - Wnds^[T].X, CurY - Wnds^[T].Y, Wnds^[T].CL, Wnds^[T].CT,
+              Wnds^[T].CR - 1, Wnds^[T].CB - 1) Then
       MouseTo(W, WM_MOUSEMOVE)
     Else If CurKind = 2 Then CursorSetShape(0);
   End;
@@ -11439,13 +11517,13 @@ Begin
     If Vk = 0 Then Exit;
   End;
   W := FocusWin;
-  If (W < 0) Or Not Wnds[W].Used Then W := ActiveWin;
+  If (W < 0) Or Not Wnds^[W].Used Then W := ActiveWin;
   If W < 0 Then
   Begin
     If Not Up Then KKey(-2, WM_KEYDOWN, Vk, Ch);
     Exit;
   End;
-  If Wnds[W].IKind <> ikNone Then
+  If Wnds^[W].IKind <> ikNone Then
   Begin
     If Up Then KKey(W, WM_KEYUP, Vk, Ch) Else KKey(W, WM_KEYDOWN, Vk, Ch);
     Exit;
@@ -11480,6 +11558,8 @@ Begin
     MouseButton((Bt And 2) <> 0, 2);
   End;
 End;
+
+Procedure DIHook; Forward;
 
 Procedure ProcessInput;
 Var B, Dx, Dy, Bt, NX, NY, AX, AY, N : LongInt; Moved : Boolean;
@@ -11560,6 +11640,7 @@ Begin
     MouseSetBtn(Bt, Moved);
   End;
   If Moved Then MouseMoved;
+  DIHook;
   If SvOn Then
   Begin
     { apres un changement de mode, tout l'ecran une ou deux fois de plus
@@ -11597,9 +11678,9 @@ Begin
   I := Threads[T].QHead;
   While I <> Threads[T].QTail Do
   Begin
-    If MsgMatch(MsgQ[T * MaxQueue + I], Hwnd, MinM, MaxM) Then
+    If MsgMatch(MsgQ^[T * MaxQueue + I], Hwnd, MinM, MaxM) Then
     Begin
-      M := MsgQ[T * MaxQueue + I];
+      M := MsgQ^[T * MaxQueue + I];
       If Remove Then
       Begin
         { retirer l'element I de la file }
@@ -11607,7 +11688,7 @@ Begin
         While J <> Threads[T].QHead Do
         Begin
           K := (J + MaxQueue - 1) Mod MaxQueue;
-          MsgQ[T * MaxQueue + J] := MsgQ[T * MaxQueue + K];
+          MsgQ^[T * MaxQueue + J] := MsgQ^[T * MaxQueue + K];
           J := K;
         End;
         Threads[T].QHead := (Threads[T].QHead + 1) Mod MaxQueue;
@@ -11628,7 +11709,7 @@ Begin
   Begin
     Threads[T].PaintReq := False;
     For W := 0 To MaxWnd - 1 Do
-      If Wnds[W].Used And (Wnds[W].Thread = T) And (Wnds[W].IKind = ikNone)
+      If Wnds^[W].Used And (Wnds^[W].Thread = T) And (Wnds^[W].IKind = ikNone)
          And HasUpdate(W) And WndVisible(W) Then
       Begin
         Threads[T].PaintReq := True;
@@ -11823,8 +11904,8 @@ End;
 { Zone client d'une fenetre interne en coordonnees ecran (incluses) }
 Procedure KClient(W : LongInt; Var X1, Y1, X2, Y2 : LongInt);
 Begin
-  X1 := Wnds[W].X + Wnds[W].CL; Y1 := Wnds[W].Y + Wnds[W].CT;
-  X2 := Wnds[W].X + Wnds[W].CR - 1; Y2 := Wnds[W].Y + Wnds[W].CB - 1;
+  X1 := Wnds^[W].X + Wnds^[W].CL; Y1 := Wnds^[W].Y + Wnds^[W].CT;
+  X2 := Wnds^[W].X + Wnds^[W].CR - 1; Y2 := Wnds^[W].Y + Wnds^[W].CB - 1;
 End;
 
 { Creer une fenetre interne }
@@ -11839,9 +11920,9 @@ Begin
   HeapOwner := HO;
   If W >= 0 Then
   Begin
-    Wnds[W].Thread := 0;
-    Wnds[W].K4 := Icon;
-    Wnds[W].KNeedPaint := True;
+    Wnds^[W].Thread := 0;
+    Wnds^[W].K4 := Icon;
+    Wnds^[W].KNeedPaint := True;
     If (Style And WS_VISIBLE) <> 0 Then ShowW(W, True, True);
   End;
   KCreate := W;
@@ -11852,7 +11933,7 @@ Var I : LongInt;
 Begin
   KFindKind := -1;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And (Wnds[I].IKind = Kind) Then
+    If Wnds^[I].Used And (Wnds^[I].IKind = Kind) Then
     Begin
       KFindKind := I;
       Exit;
@@ -11861,7 +11942,7 @@ End;
 
 Procedure KRepaint(W : LongInt);
 Begin
-  If (W >= 0) And Wnds[W].Used Then Wnds[TopOf(W)].KNeedPaint := True;
+  If (W >= 0) And Wnds^[W].Used Then Wnds^[TopOf(W)].KNeedPaint := True;
 End;
 
 { ------------------------------------------------------------------ }
@@ -12062,10 +12143,10 @@ Begin
   Begin
     Best := -1; BS := $7FFFFFFF;
     For I := 0 To MaxWnd - 1 Do
-      If IsTaskWin(I) And (Wnds[I].Seq > LastSeq) And (Wnds[I].Seq < BS)
+      If IsTaskWin(I) And (Wnds^[I].Seq > LastSeq) And (Wnds^[I].Seq < BS)
       Then
       Begin
-        Best := I; BS := Wnds[I].Seq;
+        Best := I; BS := Wnds^[I].Seq;
       End;
     If Best < 0 Then Exit;
     LastSeq := BS;
@@ -12087,7 +12168,7 @@ Var I, N, X1, X2, K, D : LongInt; Pressed : Boolean; T : String;
 Begin
   FBar(0, TaskY, ScrW - 1, ScrH - 1, cSilver);
   HLine(0, ScrW - 1, TaskY + 1, cWhite);
-  Pressed := (MenuDepth > 0) And (Wnds[MenuW[0]].K1 = mnStart);
+  Pressed := (MenuDepth > 0) And (Wnds^[MenuW[0]].K1 = mnStart);
   Raised(2, TaskY + 4, StartW + 1, TaskY + 25, Pressed);
   If Pressed Then D := 1 Else D := 0;
   PaintIcon(icLogo, 6 + D, TaskY + 7 + D, 16);
@@ -12099,12 +12180,13 @@ Begin
     If K < 0 Then Break;
     X1 := StartW + 8 + I * TaskBtnW;
     X2 := X1 + TaskBtnW - 4;
-    Pressed := (K = ActiveWin) And Not Wnds[K].Min;
+    Pressed := (K = ActiveWin) And Not Wnds^[K].Min;
     Raised(X1, TaskY + 4, X2, TaskY + 25, Pressed);
     If Pressed Then Dither(X1 + 2, TaskY + 6, X2 - 2, TaskY + 23, cWhite, 0);
-    If Wnds[K].IKind <> ikNone Then PaintIcon(Wnds[K].K4, X1 + 4, TaskY + 7, 16)
+    If Wnds^[K].IKind <> ikNone Then
+      PaintIcon(Wnds^[K].K4, X1 + 4, TaskY + 7, 16)
     Else PaintIcon(icApp, X1 + 4, TaskY + 7, 16);
-    T := Fit(Wnds[K].Text, X2 - X1 - 26);
+    T := Fit(Wnds^[K].Text, X2 - X1 - 26);
     If Pressed Then OutBold(X1 + 23, TaskY + 8, T, cBlack)
     Else OutTxt(X1 + 23, TaskY + 7, T, cBlack);
   End;
@@ -12121,8 +12203,8 @@ End;
 
 Procedure TaskbarChanged;
 Begin
-  If (TaskbarW >= 0) And Wnds[TaskbarW].Used Then
-    Wnds[TaskbarW].KNeedPaint := True;
+  If (TaskbarW >= 0) And Wnds^[TaskbarW].Used Then
+    Wnds^[TaskbarW].KNeedPaint := True;
 End;
 
 Procedure OpenStartMenu; Forward;
@@ -12133,7 +12215,7 @@ Procedure VolPopOpen; Forward;
 Procedure TaskbarMouse(Msg, X, Y : LongInt);
 Var I, N, X1, X2, K : LongInt;
 Begin
-  X := X + Wnds[TaskbarW].X; Y := Y + Wnds[TaskbarW].Y;
+  X := X + Wnds^[TaskbarW].X; Y := Y + Wnds^[TaskbarW].Y;
   { icone de volume : clic, double-clic, clic droit }
   If TrayVolOn And InRect(X, Y, TrayX + 2, TaskY + 4, TrayX + 22,
                           TaskY + 25) Then
@@ -12162,7 +12244,7 @@ Begin
   If Msg <> WM_LBUTTONDOWN Then Exit;
   If InRect(X, Y, 2, TaskY + 4, StartW + 1, TaskY + 25) Then
   Begin
-    If (MenuDepth > 0) And (Wnds[MenuW[0]].K1 = mnStart) Then CloseMenus(0)
+    If (MenuDepth > 0) And (Wnds^[MenuW[0]].K1 = mnStart) Then CloseMenus(0)
     Else OpenStartMenu;
     Exit;
   End;
@@ -12182,7 +12264,7 @@ Begin
     Begin
       K := TaskWin(I);
       If K < 0 Then Exit;
-      If Wnds[K].Min Then RestoreW(K)
+      If Wnds^[K].Min Then RestoreW(K)
       Else If K = ActiveWin Then MinimizeW(K)
       Else ActivateW(K);
       Exit;
@@ -12775,9 +12857,9 @@ Begin
   MenuW[Lv] := KCreate(ikMenu, '', 0, X, Y, WW, HH, WS_POPUP,
                        WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
   If MenuW[Lv] < 0 Then Exit;
-  Wnds[MenuW[Lv]].K1 := M;
-  Wnds[MenuW[Lv]].K2 := -1;
-  Wnds[MenuW[Lv]].K3 := Lv;
+  Wnds^[MenuW[Lv]].K1 := M;
+  Wnds^[MenuW[Lv]].K2 := -1;
+  Wnds^[MenuW[Lv]].K3 := Lv;
   ShowW(MenuW[Lv], True, False);
   ZTop(MenuW[Lv]);
   MenuDepth := Lv + 1;
@@ -12788,7 +12870,7 @@ Procedure CloseMenus(Lv : LongInt);
 Var I : LongInt;
 Begin
   For I := MenuDepth - 1 DownTo Lv Do
-    If (MenuW[I] >= 0) And Wnds[MenuW[I]].Used Then DestroyW(MenuW[I]);
+    If (MenuW[I] >= 0) And Wnds^[MenuW[I]].Used Then DestroyW(MenuW[I]);
   If MenuDepth > Lv Then MenuDepth := Lv;
   TaskbarChanged;
 End;
@@ -12823,8 +12905,8 @@ Procedure PaintMenu(W : LongInt);
 Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH, K : LongInt;
     T, A : String;
 Begin
-  X := Wnds[W].X; Y := Wnds[W].Y; WW := Wnds[W].W; HH := Wnds[W].H;
-  M := Wnds[W].K1;
+  X := Wnds^[W].X; Y := Wnds^[W].Y; WW := Wnds^[W].W; HH := Wnds^[W].H;
+  M := Wnds^[W].K1;
   IH := MenuItemH(M);
   Edge(X, Y, X + WW - 1, Y + HH - 1, cSilver, cBlack);
   Edge(X + 1, Y + 1, X + WW - 2, Y + HH - 2, cWhite, cGray);
@@ -12850,7 +12932,7 @@ Begin
     Else
     Begin
       Fg := cBlack;
-      If I = Wnds[W].K2 Then
+      If I = Wnds^[W].K2 Then
       Begin
         FBar(TX - 4, YY, X + WW - 4, YY + IH - 1, cNavy);
         Fg := cWhite;
@@ -12867,7 +12949,7 @@ Begin
         T := Copy(T, 1, K - 1);
         If Cmd = cmGray Then
         Begin
-          If I <> Wnds[W].K2 Then
+          If I <> Wnds^[W].K2 Then
             OutTxt(X + WW - 15 - TextW(A), YY + 3, A, cWhite);
           OutTxt(X + WW - 16 - TextW(A), YY + 2, A, cGray);
         End
@@ -12877,7 +12959,7 @@ Begin
       Else If Cmd = cmGray Then
       Begin
         { element indisponible : grave, comme Windows 95 }
-        If I <> Wnds[W].K2 Then OutTxt(TX + 23, YY + 3, T, cWhite);
+        If I <> Wnds^[W].K2 Then OutTxt(TX + 23, YY + 3, T, cWhite);
         OutTxt(TX + 22, YY + 2, T, cGray);
       End
       Else OutTxt(TX + 22, YY + 2, T, Fg);
@@ -12892,10 +12974,10 @@ Var I, YY, Cmd, Sub, Ic, H : LongInt; T : String;
 Begin
   MenuHitItem := -1;
   YY := 3;
-  For I := 0 To MenuCount(Wnds[W].K1) - 1 Do
+  For I := 0 To MenuCount(Wnds^[W].K1) - 1 Do
   Begin
-    MenuItem(Wnds[W].K1, I, T, Cmd, Sub, Ic);
-    If T = '-' Then H := 8 Else H := MenuItemH(Wnds[W].K1);
+    MenuItem(Wnds^[W].K1, I, T, Cmd, Sub, Ic);
+    If T = '-' Then H := 8 Else H := MenuItemH(Wnds^[W].K1);
     If (Y >= YY) And (Y < YY + H) And (T <> '-') Then
     Begin
       MenuHitItem := I;
@@ -12910,18 +12992,18 @@ Procedure MenuMouse(W, Msg, X, Y : LongInt);
 Var I, IY, Cmd, Sub, Ic, Lv : LongInt; T : String;
 Begin
   I := MenuHitItem(W, Y, IY);
-  Lv := Wnds[W].K3;
+  Lv := Wnds^[W].K3;
   If I < 0 Then Exit;
-  MenuItem(Wnds[W].K1, I, T, Cmd, Sub, Ic);
+  MenuItem(Wnds^[W].K1, I, T, Cmd, Sub, Ic);
   If Msg = WM_MOUSEMOVE Then
   Begin
-    If Wnds[W].K2 <> I Then
+    If Wnds^[W].K2 <> I Then
     Begin
-      Wnds[W].K2 := I;
+      Wnds^[W].K2 := I;
       KRepaint(W);
       If Sub <> 0 Then
-        OpenMenu(Lv + 1, Sub, Wnds[W].X + Wnds[W].W - 3,
-                 Wnds[W].Y + IY - 3, False)
+        OpenMenu(Lv + 1, Sub, Wnds^[W].X + Wnds^[W].W - 3,
+                 Wnds^[W].Y + IY - 3, False)
       Else
         CloseMenus(Lv + 1);
     End;
@@ -12990,7 +13072,7 @@ Procedure MbBtnRect(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt);
 Var CX1, CY1, CX2, CY2, N : LongInt;
 Begin
   KClient(W, CX1, CY1, CX2, CY2);
-  N := MbCount(Wnds[W].K2);
+  N := MbCount(Wnds^[W].K2);
   X1 := (CX1 + CX2) Div 2 - (N * 90 - 6) Div 2 + I * 90;
   X2 := X1 + 83;
   Y2 := CY2 - 10; Y1 := Y2 - 22;
@@ -13018,8 +13100,8 @@ Begin
                WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
   If W >= 0 Then
   Begin
-    Wnds[W].KS := Text;
-    Wnds[W].K1 := 0; Wnds[W].K2 := Typ; Wnds[W].K3 := Ic;
+    Wnds^[W].KS := Text;
+    Wnds^[W].K1 := 0; Wnds^[W].K2 := Typ; Wnds^[W].K3 := Ic;
     ShowW(W, True, True);
     If Ic = icError Then KBeep;
   End;
@@ -13032,16 +13114,16 @@ Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
   TX := X1 + 16;
-  If Wnds[W].K3 <> 0 Then
+  If Wnds^[W].K3 <> 0 Then
   Begin
-    PaintIcon(Wnds[W].K3, X1 + 14, Y1 + 14, 32);
+    PaintIcon(Wnds^[W].K3, X1 + 14, Y1 + 14, 32);
     TX := X1 + 62;
   End;
-  WrapText(TX, Y1 + 18, X2 - TX - 10, Wnds[W].KS, cBlack, True);
-  For I := 0 To MbCount(Wnds[W].K2) - 1 Do
+  WrapText(TX, Y1 + 18, X2 - TX - 10, Wnds^[W].KS, cBlack, True);
+  For I := 0 To MbCount(Wnds^[W].K2) - 1 Do
   Begin
     MbBtnRect(W, I, BX1, BY1, BX2, BY2);
-    PushButton(BX1, BY1, BX2, BY2, MbText(MbId(Wnds[W].K2, I)),
+    PushButton(BX1, BY1, BX2, BY2, MbText(MbId(Wnds^[W].K2, I)),
                (PressWin = W) And (PressBtn = I), I = 0);
   End;
 End;
@@ -13067,7 +13149,7 @@ Begin
       'Impossibile formattare il disco.',
       'No se puede formatear el disco.'), $10);
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And (Wnds[I].IKind = ikExplorer) Then KRepaint(I);
+    If Wnds^[I].Used And (Wnds^[I].IKind = ikExplorer) Then KRepaint(I);
 End;
 
 Procedure DoShutdown(Mode : LongInt); Forward;
@@ -13079,8 +13161,8 @@ Begin
   If (W = NoteAskW) And (NoteAskW >= 0) Then
   Begin
     NoteAskW := -1;
-    Wnds[W].K1 := Res;
-    Wnds[W].DlgEnded := True;
+    Wnds^[W].K1 := Res;
+    Wnds^[W].DlgEnded := True;
     ShowW(W, False, False);
     NoteAskEnd(Res);
     Exit;
@@ -13090,8 +13172,8 @@ Begin
     RebootAskW := -1;
     If Res = IDYES Then
     Begin
-      Wnds[W].K1 := Res;
-      Wnds[W].DlgEnded := True;
+      Wnds^[W].K1 := Res;
+      Wnds^[W].DlgEnded := True;
       ShowW(W, False, False);
       DoShutdown(1);
     End;
@@ -13101,16 +13183,16 @@ Begin
     FmtAskW := -1;
     If Res = IDYES Then FormatDisk0;
   End;
-  Wnds[W].K1 := Res;
-  Wnds[W].DlgEnded := True;
+  Wnds^[W].K1 := Res;
+  Wnds^[W].DlgEnded := True;
   ShowW(W, False, False);
 End;
 
 Procedure MsgBoxMouse(W, Msg, X, Y : LongInt);
 Var I, X1, Y1, X2, Y2 : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
-  For I := 0 To MbCount(Wnds[W].K2) - 1 Do
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  For I := 0 To MbCount(Wnds^[W].K2) - 1 Do
   Begin
     MbBtnRect(W, I, X1, Y1, X2, Y2);
     If InRect(X, Y, X1, Y1, X2, Y2) Then
@@ -13125,7 +13207,7 @@ Begin
       Then
       Begin
         PressWin := -1; CaptureWin := -1;
-        MsgBoxEnd(W, MbId(Wnds[W].K2, I));
+        MsgBoxEnd(W, MbId(Wnds^[W].K2, I));
       End;
       Exit;
     End;
@@ -13156,8 +13238,8 @@ Begin
     MsgBoxModal := 0;
     Exit;
   End;
-  While Not Wnds[W].DlgEnded Do KYield;
-  R := Wnds[W].K1;
+  While Not Wnds^[W].DlgEnded Do KYield;
+  R := Wnds^[W].K1;
   DestroyW(W);
   MsgBoxModal := R;
 End;
@@ -13166,11 +13248,11 @@ Function ModalBlocked(T : LongInt) : Boolean;
 Var I : LongInt;
 Begin
   ModalBlocked := False;
-  If (T < 0) Or (Wnds[T].IKind = ikTaskbar) Or (Wnds[T].IKind = ikMenu) Then
+  If (T < 0) Or (Wnds^[T].IKind = ikTaskbar) Or (Wnds^[T].IKind = ikMenu) Then
     Exit;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And Wnds[I].Visible And (I <> T) And
-       ((Wnds[I].IKind = ikMsgBox) Or (Wnds[I].IKind = ikShutdown)) Then
+    If Wnds^[I].Used And Wnds^[I].Visible And (I <> T) And
+       ((Wnds^[I].IKind = ikMsgBox) Or (Wnds^[I].IKind = ikShutdown)) Then
     Begin
       ModalBlocked := True;
       Exit;
@@ -13186,7 +13268,7 @@ Procedure NoteOpen(Path : String); Forward;
 Function ExpDirLba(W : LongInt; Var Lba, Size : LongInt) : Boolean;
 Var Fl, Tm : LongInt;
 Begin
-  ExpDirLba := IsoLookup(Copy(Wnds[W].KS, 3, 255), Lba, Size, Fl, Tm);
+  ExpDirLba := IsoLookup(Copy(Wnds^[W].KS, 3, 255), Lba, Size, Fl, Tm);
 End;
 
 Var
@@ -13198,7 +13280,7 @@ Function ExpEntry(W, I : LongInt; Var Nm : String; Var Fl, Size : LongInt)
 Var DL, DS, Lba, Tm, V, Idx, K : LongInt; Ok : Boolean;
 Begin
   ExpEntry := False;
-  If Wnds[W].KS = '' Then
+  If Wnds^[W].KS = '' Then
   Begin
     { lecteurs : C:, D: (CD-ROM), puis les autres volumes FAT }
     Fl := 2; Size := 0;
@@ -13219,10 +13301,10 @@ Begin
     End;
     Exit;
   End;
-  If FatVolOf(Wnds[W].KS) >= 0 Then
+  If FatVolOf(Wnds^[W].KS) >= 0 Then
   Begin
     { volume FAT : reprendre le parcours precedent si possible }
-    If (ExpCW = W) And (ExpCS = Wnds[W].KS) And (ExpCI < I) Then
+    If (ExpCW = W) And (ExpCS = Wnds^[W].KS) And (ExpCI < I) Then
     Begin
       K := ExpCI; Idx := ExpCIdx;
     End
@@ -13233,7 +13315,7 @@ Begin
     Ok := True;
     While Ok And (K < I) Do
     Begin
-      Ok := FatDirEntry(Wnds[W].KS, 0, Idx);
+      Ok := FatDirEntry(Wnds^[W].KS, 0, Idx);
       Inc(K);
     End;
     If Not Ok Then
@@ -13241,7 +13323,7 @@ Begin
       ExpCW := -1;
       Exit;
     End;
-    ExpCW := W; ExpCS := Wnds[W].KS; ExpCI := I; ExpCIdx := Idx;
+    ExpCW := W; ExpCS := Wnds^[W].KS; ExpCI := I; ExpCIdx := Idx;
     Nm := FfName; Size := FfSize;
     If (FfAttr And $10) <> 0 Then Fl := 2 Else Fl := 0;
     ExpEntry := True;
@@ -13274,10 +13356,10 @@ Begin
   PaintIcon(icFolder, X1 + 8, Y1 + 7, 16);
   Arrow(X1 + 13, Y1 + 11, 2, cBlack);
   Sunken(X1 + 36, Y1 + 4, X2 - 4, Y1 + 26, cWhite);
-  If Wnds[W].KS = '' Then
+  If Wnds^[W].KS = '' Then
     OutTxt(X1 + 42, Y1 + 7, L('Poste de travail', 'My Computer',
            'Arbeitsplatz', 'Risorse del computer', 'Mi PC'), cBlack)
-  Else OutTxt(X1 + 42, Y1 + 7, Wnds[W].KS, cBlack);
+  Else OutTxt(X1 + 42, Y1 + 7, Wnds^[W].KS, cBlack);
   Y1 := Y1 + 30;
   Sunken(X1, Y1, X2, Y2 - 22, cWhite);
   Edge(X1, Y2 - 19, X2, Y2, cGray, cWhite);
@@ -13288,13 +13370,13 @@ Begin
   While ExpEntry(W, I, Nm, Fl, Size) Do
   Begin
     X := X1 + 6 + (I Mod Cols) * 100;
-    Y := Y1 + 6 + (I Div Cols) * 70 - Wnds[W].K2 * 70;
+    Y := Y1 + 6 + (I Div Cols) * 70 - Wnds^[W].K2 * 70;
     If (Y > Y1 - 70) And (Y < Y2) Then
     Begin
       PaintIcon(ExpIcon(Nm, Fl), X + 32, Y, 32);
-      DrawLabel(X, Y + 34, 96, Nm, I = Wnds[W].K1, cBlack);
+      DrawLabel(X, Y + 34, 96, Nm, I = Wnds^[W].K1, cBlack);
     End;
-    If I = Wnds[W].K1 Then
+    If I = Wnds^[W].K1 Then
     Begin
       S := Nm;
       If (Fl And 2) = 0 Then S := S + ' : ' + IntStr(Size) + ' ' +
@@ -13303,7 +13385,7 @@ Begin
     Inc(I); Inc(N);
   End;
   SetClip(X1, Y1, X2, Y2);
-  If Wnds[W].K1 < 0 Then
+  If Wnds^[W].K1 < 0 Then
     S := IntStr(N) + ' ' + L('objet(s)', 'object(s)', 'Objekt(e)',
                               'oggetti', 'objeto(s)');
   OutTxt(X1 + 4, Y2 - 17, Fit(S, X2 - X1 - 8), cBlack);
@@ -13313,7 +13395,7 @@ Procedure ExpOpenItem(W, I : LongInt);
 Var Nm, P, E : String; Fl, Size : LongInt;
 Begin
   If Not ExpEntry(W, I, Nm, Fl, Size) Then Exit;
-  If Wnds[W].KS = '' Then
+  If Wnds^[W].KS = '' Then
   Begin
     If (I = 0) And (VolN = 0) And (DiskN > 0) Then
     Begin
@@ -13345,14 +13427,14 @@ Begin
         'C: es un disco virtual en memoria.'), $40);
       Exit;
     End;
-    If I = 0 Then Wnds[W].KS := 'C:'
-    Else If I = 1 Then Wnds[W].KS := 'D:'
-    Else Wnds[W].KS := Chr(VolLetter[I - 1]) + ':';
+    If I = 0 Then Wnds^[W].KS := 'C:'
+    Else If I = 1 Then Wnds^[W].KS := 'D:'
+    Else Wnds^[W].KS := Chr(VolLetter[I - 1]) + ':';
   End
   Else
   Begin
-    P := Wnds[W].KS + '\' + Nm;
-    If (Fl And 2) <> 0 Then Wnds[W].KS := P
+    P := Wnds^[W].KS + '\' + Nm;
+    If (Fl And 2) <> 0 Then Wnds^[W].KS := P
     Else
     Begin
       E := Copy(Nm, Pos('.', Nm) + 1, 3);
@@ -13361,22 +13443,22 @@ Begin
       Exit;
     End;
   End;
-  Wnds[W].K1 := -1; Wnds[W].K2 := 0;
+  Wnds^[W].K1 := -1; Wnds^[W].K2 := 0;
   KRepaint(W);
 End;
 
 Procedure ExpUp(W : LongInt);
 Var P : LongInt;
 Begin
-  If Wnds[W].KS = '' Then Exit;
-  If Length(Wnds[W].KS) <= 2 Then Wnds[W].KS := ''
+  If Wnds^[W].KS = '' Then Exit;
+  If Length(Wnds^[W].KS) <= 2 Then Wnds^[W].KS := ''
   Else
   Begin
-    P := Length(Wnds[W].KS);
-    While (P > 0) And (Wnds[W].KS[P] <> '\') Do Dec(P);
-    Wnds[W].KS := Copy(Wnds[W].KS, 1, P - 1);
+    P := Length(Wnds^[W].KS);
+    While (P > 0) And (Wnds^[W].KS[P] <> '\') Do Dec(P);
+    Wnds^[W].KS := Copy(Wnds^[W].KS, 1, P - 1);
   End;
-  Wnds[W].K1 := -1; Wnds[W].K2 := 0;
+  Wnds^[W].K1 := -1; Wnds^[W].K2 := 0;
   KRepaint(W);
 End;
 
@@ -13384,7 +13466,7 @@ Procedure ExpMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, Cols, I, Fl, Size : LongInt; Nm : String;
 Begin
   If (Msg <> WM_LBUTTONDOWN) And (Msg <> WM_LBUTTONDBLCLK) Then Exit;
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
   If InRect(X, Y, X1 + 4, Y1 + 4, X1 + 29, Y1 + 26) Then
   Begin
@@ -13394,13 +13476,13 @@ Begin
   Y1 := Y1 + 30;
   Cols := Max(1, (X2 - X1 - 8) Div 100);
   If (X < X1 + 6) Or (Y < Y1 + 6) Then Exit;
-  I := ((Y - Y1 - 6) Div 70 + Wnds[W].K2) * Cols + (X - X1 - 6) Div 100;
+  I := ((Y - Y1 - 6) Div 70 + Wnds^[W].K2) * Cols + (X - X1 - 6) Div 100;
   If (X - X1 - 6) Div 100 >= Cols Then Exit;
   If Not ExpEntry(W, I, Nm, Fl, Size) Then I := -1;
   If (Msg = WM_LBUTTONDBLCLK) And (I >= 0) Then ExpOpenItem(W, I)
-  Else If I <> Wnds[W].K1 Then
+  Else If I <> Wnds^[W].K1 Then
   Begin
-    Wnds[W].K1 := I;
+    Wnds^[W].K1 := I;
     KRepaint(W);
   End;
 End;
@@ -13445,9 +13527,9 @@ End;
 
 Procedure NoteSetTitle(W : LongInt);
 Begin
-  Wnds[W].Text := NoteTitle + ' - ' + L('Bloc-notes', 'Notepad', 'Editor',
+  Wnds^[W].Text := NoteTitle + ' - ' + L('Bloc-notes', 'Notepad', 'Editor',
                   'Blocco note', 'Bloc de notas');
-  Wnds[W].NeedNc := True;
+  Wnds^[W].NeedNc := True;
   TaskbarChanged;
 End;
 
@@ -13455,8 +13537,8 @@ End;
 Procedure NoteLoad(W : LongInt; Path : String);
 Var A, Size, R, Wr, B : LongInt; CR : Boolean;
 Begin
-  B := Wnds[W].Extra;
-  Wnds[W].K1 := 0; Wnds[W].K2 := 0; Wnds[W].K3 := 0;
+  B := Wnds^[W].Extra;
+  Wnds^[W].K1 := 0; Wnds^[W].K2 := 0; Wnds^[W].K3 := 0;
   NoteSel := -1; NoteLeft := 0; NoteDirty := False;
   NoteUndoOk := False; NoteGroup := False;
   NotePath := '';
@@ -13488,7 +13570,7 @@ Begin
         End;
       End;
       KFree(A);
-      Wnds[W].K1 := Wr;
+      Wnds^[W].K1 := Wr;
       NotePath := FullPath(Path);
     End
     Else
@@ -13512,7 +13594,7 @@ Begin
                  Or WS_MINIMIZEBOX Or WS_MAXIMIZEBOX, WS_EX_CLIENTEDGE);
     If W < 0 Then Exit;
     Own := HeapOwner; HeapOwner := 0;
-    Wnds[W].Extra := KAlloc(NoteMax + 16);
+    Wnds^[W].Extra := KAlloc(NoteMax + 16);
     If NoteUndoBuf = 0 Then NoteUndoBuf := KAlloc(NoteMax + 16);
     HeapOwner := Own;
   End;
@@ -13526,7 +13608,7 @@ Function NoteWrite(W : LongInt; Path : String) : Boolean;
 Var B, N, T, I, K, H, Own : LongInt; Ok : Boolean;
 Begin
   NoteWrite := False; Ok := False;
-  B := Wnds[W].Extra; N := Wnds[W].K1;
+  B := Wnds^[W].Extra; N := Wnds^[W].K1;
   Own := HeapOwner; HeapOwner := 0;
   T := KAlloc(N * 2 + 16);
   HeapOwner := Own;
@@ -13567,15 +13649,15 @@ End;
 
 Procedure NoteSelRange(W : LongInt; Var A, B : LongInt);
 Begin
-  A := Min(NoteSel, Wnds[W].K2); B := Max(NoteSel, Wnds[W].K2);
+  A := Min(NoteSel, Wnds^[W].K2); B := Max(NoteSel, Wnds^[W].K2);
 End;
 
 { Copie pour Annuler (debut d'un groupe de modifications) }
 Procedure NoteSnap(W : LongInt);
 Begin
   If NoteGroup Or (NoteUndoBuf = 0) Then Exit;
-  MoveMem(Wnds[W].Extra, NoteUndoBuf, Wnds[W].K1);
-  NoteUndoLen := Wnds[W].K1; NoteUndoPos := Wnds[W].K2;
+  MoveMem(Wnds^[W].Extra, NoteUndoBuf, Wnds^[W].K1);
+  NoteUndoLen := Wnds^[W].K1; NoteUndoPos := Wnds^[W].K2;
   NoteUndoOk := True;
 End;
 
@@ -13583,16 +13665,16 @@ Procedure NoteUndo(W : LongInt);
 Var I, T, B : LongInt;
 Begin
   If Not NoteUndoOk Then Exit;
-  B := Wnds[W].Extra;
+  B := Wnds^[W].Extra;
   { echange : un second Annuler retablit }
-  For I := 0 To Max(NoteUndoLen, Wnds[W].K1) - 1 Do
+  For I := 0 To Max(NoteUndoLen, Wnds^[W].K1) - 1 Do
   Begin
     T := Mem[0:B + I];
     Mem[0:B + I] := Mem[0:NoteUndoBuf + I];
     Mem[0:NoteUndoBuf + I] := T;
   End;
-  T := Wnds[W].K1; Wnds[W].K1 := NoteUndoLen; NoteUndoLen := T;
-  T := Wnds[W].K2; Wnds[W].K2 := Min(NoteUndoPos, Wnds[W].K1);
+  T := Wnds^[W].K1; Wnds^[W].K1 := NoteUndoLen; NoteUndoLen := T;
+  T := Wnds^[W].K2; Wnds^[W].K2 := Min(NoteUndoPos, Wnds^[W].K1);
   NoteUndoPos := T;
   NoteSel := -1; NoteDirty := True; NoteGroup := False;
 End;
@@ -13606,9 +13688,9 @@ Begin
   NoteSelRange(W, A, B);
   NoteSel := -1;
   If A = B Then Exit;
-  Bf := Wnds[W].Extra; N := Wnds[W].K1;
+  Bf := Wnds^[W].Extra; N := Wnds^[W].K1;
   MoveMem(Bf + B, Bf + A, N - B);
-  Wnds[W].K1 := N - (B - A); Wnds[W].K2 := A;
+  Wnds^[W].K1 := N - (B - A); Wnds^[W].K2 := A;
   NoteDirty := True;
   NoteDelSel := True;
 End;
@@ -13617,16 +13699,16 @@ End;
 Procedure NoteInsert(W, Src, N : LongInt);
 Var I, C, Bf, Len, P : LongInt;
 Begin
-  Bf := Wnds[W].Extra;
+  Bf := Wnds^[W].Extra;
   For I := 0 To N - 1 Do
   Begin
     C := Mem[0:Src + I];
     If (C = 10) Or (C = 0) Then Continue;
-    Len := Wnds[W].K1; P := Wnds[W].K2;
+    Len := Wnds^[W].K1; P := Wnds^[W].K2;
     If Len >= NoteMax Then Exit;
     MoveMem(Bf + P, Bf + P + 1, Len - P);
     Mem[0:Bf + P] := C;
-    Wnds[W].K1 := Len + 1; Wnds[W].K2 := P + 1;
+    Wnds^[W].K1 := Len + 1; Wnds^[W].K2 := P + 1;
   End;
   NoteDirty := True;
 End;
@@ -13646,8 +13728,8 @@ Begin
   K := 0;
   For I := A To B - 1 Do
   Begin
-    Mem[0:ClipBuf + K] := Mem[0:Wnds[W].Extra + I]; Inc(K);
-    If Mem[0:Wnds[W].Extra + I] = 13 Then
+    Mem[0:ClipBuf + K] := Mem[0:Wnds^[W].Extra + I]; Inc(K);
+    If Mem[0:Wnds^[W].Extra + I] = 13 Then
     Begin
       Mem[0:ClipBuf + K] := 10; Inc(K);
     End;
@@ -13660,14 +13742,14 @@ End;
 Procedure NoteScroll(W : LongInt);
 Var B, N, C, X1, Y1, X2, Y2, Rows, Cols, Ln, P, Col : LongInt;
 Begin
-  B := Wnds[W].Extra; N := Wnds[W].K1; C := Wnds[W].K2;
+  B := Wnds^[W].Extra; N := Wnds^[W].K1; C := Wnds^[W].K2;
   KClient(W, X1, Y1, X2, Y2);
   Rows := Max(1, (Y2 - Y1 - 24) Div 16);
   Cols := Max(1, (X2 - X1 - 6) Div 8);
-  If C < Wnds[W].K3 Then Wnds[W].K3 := NLineStart(B, C)
+  If C < Wnds^[W].K3 Then Wnds^[W].K3 := NLineStart(B, C)
   Else
   Begin
-    Ln := 0; P := Wnds[W].K3;
+    Ln := 0; P := Wnds^[W].K3;
     While P < NLineStart(B, C) Do
     Begin
       P := NLineEnd(B, P, N) + 1;
@@ -13675,7 +13757,7 @@ Begin
     End;
     While Ln >= Rows Do
     Begin
-      Wnds[W].K3 := NLineEnd(B, Wnds[W].K3, N) + 1;
+      Wnds^[W].K3 := NLineEnd(B, Wnds^[W].K3, N) + 1;
       Dec(Ln);
     End;
   End;
@@ -13716,9 +13798,9 @@ Begin
   FBar(X1, Y1, X2, Y1 + 19, cSilver);
   HLine(X1, X2, Y1 + 19, cGray);
   M := -1;
-  If (MenuDepth > 0) And (MenuW[0] >= 0) And Wnds[MenuW[0]].Used Then
-    If (Wnds[MenuW[0]].K1 >= mnNFile) And (Wnds[MenuW[0]].K1 <= mnNHelp) Then
-      M := Wnds[MenuW[0]].K1 - mnNFile;
+  If (MenuDepth > 0) And (MenuW[0] >= 0) And Wnds^[MenuW[0]].Used Then
+    If (Wnds^[MenuW[0]].K1 >= mnNFile) And (Wnds^[MenuW[0]].K1 <= mnNHelp) Then
+      M := Wnds^[MenuW[0]].K1 - mnNFile;
   For I := 0 To 3 Do
   Begin
     MX := NoteMenuX(W, I);
@@ -13728,12 +13810,12 @@ Begin
     OutTxt(MX, Y1 + 2, NoteMenuTitle(I), cBlack);
   End;
   FBar(X1, Y1 + 20, X2, Y2, cWhite);
-  B := Wnds[W].Extra; N := Wnds[W].K1;
+  B := Wnds^[W].Extra; N := Wnds^[W].K1;
   Rows := (Y2 - Y1 - 24) Div 16;
   Cols := (X2 - X1 - 6) Div 8;
   SA := -1; SB := -1;
   If NoteSel >= 0 Then NoteSelRange(W, SA, SB);
-  P := Wnds[W].K3;
+  P := Wnds^[W].K3;
   For R := 0 To Rows - 1 Do
   Begin
     If P > N Then Exit;
@@ -13758,9 +13840,9 @@ Begin
        (E - P - NoteLeft < Cols) Then
       FBar(X1 + 3 + (E - P - NoteLeft) * 8, Y1 + 22 + R * 16,
            X1 + 6 + (E - P - NoteLeft) * 8, Y1 + 37 + R * 16, cNavy);
-    If (Wnds[W].K2 >= P) And (Wnds[W].K2 <= E) And (W = ActiveWin) Then
+    If (Wnds^[W].K2 >= P) And (Wnds^[W].K2 <= E) And (W = ActiveWin) Then
     Begin
-      CC := Wnds[W].K2 - P - NoteLeft;
+      CC := Wnds^[W].K2 - P - NoteLeft;
       If (CC >= 0) And (CC <= Cols) Then
         VLine(X1 + 3 + CC * 8, Y1 + 22 + R * 16, Y1 + 36 + R * 16, cBlack);
     End;
@@ -13773,10 +13855,10 @@ Function NoteHit(W, X, Y : LongInt) : LongInt;
 Var X1, Y1, X2, Y2, B, N, P, R, Col : LongInt;
 Begin
   KClient(W, X1, Y1, X2, Y2);
-  B := Wnds[W].Extra; N := Wnds[W].K1;
+  B := Wnds^[W].Extra; N := Wnds^[W].K1;
   R := (Y - Y1 - 22) Div 16;
   If Y < Y1 + 22 Then R := 0;
-  P := Wnds[W].K3;
+  P := Wnds^[W].K3;
   While (R > 0) And (NLineEnd(B, P, N) < N) Do
   Begin
     P := NLineEnd(B, P, N) + 1;
@@ -13790,7 +13872,7 @@ End;
 Procedure NoteMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, I, MX : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
   If (Msg = WM_LBUTTONDOWN) And (Y < Y1 + 20) Then
   Begin
@@ -13810,22 +13892,22 @@ Begin
   End;
   If Msg = WM_LBUTTONDOWN Then
   Begin
-    Wnds[W].K2 := NoteHit(W, X, Y);
-    NoteSel := Wnds[W].K2;
+    Wnds^[W].K2 := NoteHit(W, X, Y);
+    NoteSel := Wnds^[W].K2;
     NoteGroup := False;
     CaptureWin := W;
     KRepaint(W);
   End
   Else If (Msg = WM_MOUSEMOVE) And (CaptureWin = W) Then
   Begin
-    Wnds[W].K2 := NoteHit(W, X, Y);
+    Wnds^[W].K2 := NoteHit(W, X, Y);
     NoteScroll(W);
     KRepaint(W);
   End
   Else If Msg = WM_LBUTTONUP Then
   Begin
     CaptureWin := -1;
-    If NoteSel = Wnds[W].K2 Then NoteSel := -1;
+    If NoteSel = Wnds^[W].K2 Then NoteSel := -1;
     KRepaint(W);
   End;
 End;
@@ -13885,8 +13967,8 @@ Procedure NoteFindNext(W : LongInt; Quiet : Boolean);
 Var B, N, P, I, K : LongInt; Ok : Boolean; C1, C2 : Char;
 Begin
   If NoteFind = '' Then Exit;
-  B := Wnds[W].Extra; N := Wnds[W].K1;
-  P := Wnds[W].K2;
+  B := Wnds^[W].Extra; N := Wnds^[W].K1;
+  P := Wnds^[W].K2;
   For I := P To N - Length(NoteFind) Do
   Begin
     Ok := True;
@@ -13905,7 +13987,7 @@ Begin
     End;
     If Ok Then
     Begin
-      NoteSel := I; Wnds[W].K2 := I + Length(NoteFind);
+      NoteSel := I; Wnds^[W].K2 := I + Length(NoteFind);
       NoteGroup := False;
       NoteScroll(W);
       KRepaint(W);
@@ -13923,7 +14005,7 @@ End;
 Procedure NoteKey(W, VK, Ch : LongInt);
 Var B, N, C, LS, LE, Col, Old : LongInt; Sh, Ctl : Boolean; T : String;
 Begin
-  B := Wnds[W].Extra; N := Wnds[W].K1; C := Wnds[W].K2;
+  B := Wnds^[W].Extra; N := Wnds^[W].K1; C := Wnds^[W].K2;
   Sh := (KeyState[$10] And $80) <> 0;
   Ctl := (KeyState[$11] And $80) <> 0;
   { raccourcis }
@@ -13986,7 +14068,7 @@ Begin
         If NoteSel < 0 Then NoteSel := Old;
       End
       Else NoteSel := -1;
-      Wnds[W].K2 := C;
+      Wnds^[W].K2 := C;
       NoteGroup := False;
     End;
     $2E :
@@ -13995,7 +14077,7 @@ Begin
       If Not NoteDelSel(W) And (C < N) Then
       Begin
         MoveMem(B + C + 1, B + C, N - C - 1);
-        Wnds[W].K1 := N - 1;
+        Wnds^[W].K1 := N - 1;
         NoteDirty := True;
       End;
     End;
@@ -14005,7 +14087,7 @@ Begin
       If Not NoteDelSel(W) And (C > 0) Then
       Begin
         MoveMem(B + C, B + C - 1, N - C);
-        Wnds[W].K1 := N - 1; Wnds[W].K2 := C - 1;
+        Wnds^[W].K1 := N - 1; Wnds^[W].K2 := C - 1;
         NoteDirty := True;
       End;
     End;
@@ -14054,7 +14136,7 @@ Begin
     End;
     cmNSelAll :
     Begin
-      NoteSel := 0; Wnds[W].K2 := Wnds[W].K1;
+      NoteSel := 0; Wnds^[W].K2 := Wnds^[W].K1;
     End;
     cmNTime :
     Begin
@@ -14066,18 +14148,18 @@ Begin
     End;
     cmNFind :
     Begin
-      If (FindW >= 0) And Wnds[FindW].Used And
-         (Wnds[FindW].IKind = ikFind) Then
+      If (FindW >= 0) And Wnds^[FindW].Used And
+         (Wnds^[FindW].IKind = ikFind) Then
         ActivateW(FindW)
       Else
       Begin
         FindW := KCreate(ikFind, L('Rechercher', 'Find', 'Suchen', 'Trova',
-                         'Buscar'), icNotepad, Wnds[W].X + 40, Wnds[W].Y + 80,
+                         'Buscar'), icNotepad, Wnds^[W].X + 40, Wnds^[W].Y + 80,
                          380, 130, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
                          WS_EX_DLGMODALFRAME Or WS_EX_TOOLWINDOW);
         If FindW >= 0 Then
         Begin
-          Wnds[FindW].KS := NoteFind;
+          Wnds^[FindW].KS := NoteFind;
           ShowW(FindW, True, True);
         End;
       End;
@@ -14094,7 +14176,7 @@ Begin
       Exit;
     End;
   End;
-  If (W >= 0) And Wnds[W].Used Then
+  If (W >= 0) And Wnds^[W].Used Then
   Begin
     NoteScroll(W);
     KRepaint(W);
@@ -14110,8 +14192,8 @@ Begin
   OutTxt(X1 + 10, Y1 + 14, L('Rechercher :', 'Find what:', 'Suchen nach:',
          'Trova:', 'Buscar:'), cBlack);
   Sunken(X1 + 110, Y1 + 10, X2 - 110, Y1 + 32, cWhite);
-  OutTxt(X1 + 114, Y1 + 13, Fit(Wnds[W].KS, X2 - X1 - 230), cBlack);
-  VLine(X1 + 114 + TextW(Fit(Wnds[W].KS, X2 - X1 - 230)), Y1 + 12, Y1 + 29,
+  OutTxt(X1 + 114, Y1 + 13, Fit(Wnds^[W].KS, X2 - X1 - 230), cBlack);
+  VLine(X1 + 114 + TextW(Fit(Wnds^[W].KS, X2 - X1 - 230)), Y1 + 12, Y1 + 29,
         cBlack);
   CheckBox(X1 + 10, Y1 + 50, L('Respecter la casse', 'Match case',
            'Gro'#225'-/Kleinschreibung', 'Maiuscole/minuscole',
@@ -14133,7 +14215,7 @@ Var N : LongInt;
 Begin
   If B = 0 Then
   Begin
-    NoteFind := Wnds[W].KS;
+    NoteFind := Wnds^[W].KS;
     N := KFindKind(ikNotepad);
     If N >= 0 Then NoteFindNext(N, False);
   End
@@ -14148,7 +14230,7 @@ Procedure FindMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt;
 Begin
   If Msg = WM_LBUTTONDBLCLK Then Msg := WM_LBUTTONDOWN;
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
   If (Msg = WM_LBUTTONDOWN) And InRect(X, Y, X1 + 10, Y1 + 48, X1 + 200,
                                         Y1 + 66) Then
@@ -14193,9 +14275,9 @@ Procedure FindKey(W, VK, Ch : LongInt);
 Begin
   If VK = $0D Then FindAction(W, 0)
   Else If VK = $1B Then FindAction(W, 1)
-  Else If VK = 8 Then Delete(Wnds[W].KS, Length(Wnds[W].KS), 1)
-  Else If (Ch >= 32) And (Length(Wnds[W].KS) < 60) Then
-    Wnds[W].KS := Wnds[W].KS + Chr(Ch);
+  Else If VK = 8 Then Delete(Wnds^[W].KS, Length(Wnds^[W].KS), 1)
+  Else If (Ch >= 32) And (Length(Wnds^[W].KS) < 60) Then
+    Wnds^[W].KS := Wnds^[W].KS + Chr(Ch);
   KRepaint(W);
 End;
 
@@ -14240,7 +14322,7 @@ Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2, N : LongInt; T : String;
 Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
-  Case Wnds[W].IKind Of
+  Case Wnds^[W].IKind Of
     ikAbout :
     Begin
       PaintIcon(icLogo, X1 + 14, Y1 + 14, 64);
@@ -14280,8 +14362,8 @@ Begin
       OutTxt(X1 + 12, Y1 + 68, L('Ouvrir :', 'Open:', #153'ffnen:', 'Apri:',
              'Abrir:'), cBlack);
       Sunken(X1 + 84, Y1 + 64, X2 - 12, Y1 + 87, cWhite);
-      OutTxt(X1 + 89, Y1 + 68, Wnds[W].KS, cBlack);
-      VLine(X1 + 89 + TextW(Wnds[W].KS), Y1 + 67, Y1 + 83, cBlack);
+      OutTxt(X1 + 89, Y1 + 68, Wnds^[W].KS, cBlack);
+      VLine(X1 + 89 + TextW(Wnds^[W].KS), Y1 + 67, Y1 + 83, cBlack);
       N := 2;
     End;
     ikShutdown :
@@ -14291,7 +14373,7 @@ Begin
              'Are you sure you want to:', 'M'#148'chten Sie wirklich:',
              'Si desidera:', #168'Est'#160' seguro de que desea:'), cBlack);
       For I := 0 To 2 Do
-        RadioButton(X1 + 60, Y1 + 38 + I * 24, ShutText(I), I = Wnds[W].K1);
+        RadioButton(X1 + 60, Y1 + 38 + I * 24, ShutText(I), I = Wnds^[W].K1);
       N := 2;
     End;
   Else
@@ -14300,7 +14382,7 @@ Begin
   For I := 0 To N - 1 Do
   Begin
     DlgBtnRect(W, I, N, BX1, BY1, BX2, BY2);
-    If Wnds[W].IKind = ikShutdown Then
+    If Wnds^[W].IKind = ikShutdown Then
     Begin
       If I = 0 Then T := L('Oui', 'Yes', 'Ja', 'S'#141, 'S'#161)
       Else T := L('Non', 'No', 'Nein', 'No', 'No');
@@ -14314,10 +14396,10 @@ End;
 Procedure DialogAction(W, B : LongInt);
 Var S : String; K : LongInt;
 Begin
-  K := Wnds[W].IKind;
+  K := Wnds^[W].IKind;
   If K = ikRun Then
   Begin
-    S := Trim(Wnds[W].KS);
+    S := Trim(Wnds^[W].KS);
     DestroyW(W);
     If (B = 0) And (S <> '') Then
       If Not NetRunCmd(S) And Not RunExe(S, '') Then
@@ -14330,7 +14412,7 @@ Begin
   End;
   If K = ikShutdown Then
   Begin
-    K := Wnds[W].K1;
+    K := Wnds^[W].K1;
     DestroyW(W);
     DimOn := False;
     MarkAll;
@@ -14343,16 +14425,16 @@ End;
 Procedure DialogMouse(W, Msg, X, Y : LongInt);
 Var I, N, X1, Y1, X2, Y2, CX1, CY1, CX2, CY2 : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
-  If Wnds[W].IKind = ikAbout Then N := 1 Else N := 2;
-  If (Wnds[W].IKind = ikShutdown) And (Msg = WM_LBUTTONDOWN) Then
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  If Wnds^[W].IKind = ikAbout Then N := 1 Else N := 2;
+  If (Wnds^[W].IKind = ikShutdown) And (Msg = WM_LBUTTONDOWN) Then
   Begin
     KClient(W, CX1, CY1, CX2, CY2);
     For I := 0 To 2 Do
       If InRect(X, Y, CX1 + 60, CY1 + 38 + I * 24, CX2 - 8,
                 CY1 + 54 + I * 24) Then
       Begin
-        Wnds[W].K1 := I;
+        Wnds^[W].K1 := I;
         KRepaint(W);
       End;
   End;
@@ -14392,7 +14474,7 @@ Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cWhite);
   PaintIcon(icHelp, X1 + 10, Y1 + 10, 32);
-  OutBold(X1 + 52, Y1 + 18, Wnds[W].Text, cNavy);
+  OutBold(X1 + 52, Y1 + 18, Wnds^[W].Text, cNavy);
   WrapText(X1 + 12, Y1 + 54, X2 - X1 - 24, L(
     'Double-cliquez sur un programme .EXE du bureau ou du Poste de ' +
     'travail pour l''ex'#130'cuter : Pasdows charge les vrais programmes ' +
@@ -14560,20 +14642,20 @@ Begin
   DDCleared := False;
   If TaskbarW >= 0 Then MoveW(TaskbarW, 0, TaskY, ScrW, TaskH, True);
   For W := 0 To MaxWnd - 1 Do
-    If Wnds[W].Used And Not IsChildW(W) And (W <> TaskbarW) Then
+    If Wnds^[W].Used And Not IsChildW(W) And (W <> TaskbarW) Then
     Begin
-      If Wnds[W].Max Then
-        MoveW(W, -Wnds[W].CL, -Wnds[W].CL, ScrW + 2 * Wnds[W].CL,
-              TaskY + 2 * Wnds[W].CL, True)
+      If Wnds^[W].Max Then
+        MoveW(W, -Wnds^[W].CL, -Wnds^[W].CL, ScrW + 2 * Wnds^[W].CL,
+              TaskY + 2 * Wnds^[W].CL, True)
       Else
       Begin
-        X := Wnds[W].X; Y := Wnds[W].Y;
-        If X + 60 > ScrW Then X := Max(0, ScrW - Wnds[W].W);
-        If Y + 30 > TaskY Then Y := Max(0, TaskY - Wnds[W].H);
-        If (X <> Wnds[W].X) Or (Y <> Wnds[W].Y) Then
-          MoveW(W, X, Y, Wnds[W].W, Wnds[W].H, True);
+        X := Wnds^[W].X; Y := Wnds^[W].Y;
+        If X + 60 > ScrW Then X := Max(0, ScrW - Wnds^[W].W);
+        If Y + 30 > TaskY Then Y := Max(0, TaskY - Wnds^[W].H);
+        If (X <> Wnds^[W].X) Or (Y <> Wnds^[W].Y) Then
+          MoveW(W, X, Y, Wnds^[W].W, Wnds^[W].H, True);
       End;
-      If Wnds[W].IKind = ikNone Then
+      If Wnds^[W].IKind = ikNone Then
         PostMsgW(W, $7E, 8, (ScrH Shl 16) Or ScrW);  { WM_DISPLAYCHANGE }
     End;
   If CurX >= ScrW Then CurX := ScrW - 1;
@@ -14729,14 +14811,14 @@ Begin
   GroupBox(GX1, GY, GX2, GY + 104, L('Palette de couleurs', 'Color palette',
            'Farbpalette', 'Tavolozza dei colori', 'Paleta de colores'));
   Sunken(GX1 + 10, GY + 20, GX2 - 10, GY + 43, cWhite);
-  OutTxt(GX1 + 15, GY + 24, DepthName(Wnds[W].K1), cBlack);
+  OutTxt(GX1 + 15, GY + 24, DepthName(Wnds^[W].K1), cBlack);
   Raised(GX2 - 28, GY + 22, GX2 - 12, GY + 41, False);
   Arrow(GX2 - 23, GY + 30, 1, cBlack);
   Sunken(GX1 + 10, GY + 56, GX2 - 10, GY + 76, cWhite);
   For I := GX1 + 12 To GX2 - 12 Do
     VLine(I, GY + 58, GY + 74,
           SpectrumIdx(((I - GX1 - 12) * 255) Div Max(1, GX2 - GX1 - 24),
-                      Wnds[W].K1 = 4));
+                      Wnds^[W].K1 = 4));
   { zone d'ecran }
   GroupBox(CX + 42, GY, X2 - 16, GY + 104, L('Zone d'''#130'cran',
            'Desktop area', 'Desktop-Bereich', 'Area dello schermo',
@@ -14747,11 +14829,11 @@ Begin
   OutTxt(X2 - 28 - TextW(T), GY + 20, T, cBlack);
   Sunken(SX1, GY + 46, SX2, GY + 50, cSilver);
   If ResN > 1 Then
-    PX := SX1 + (Wnds[W].K2 * (SX2 - SX1)) Div (ResN - 1)
+    PX := SX1 + (Wnds^[W].K2 * (SX2 - SX1)) Div (ResN - 1)
   Else PX := SX1;
   Raised(PX - 5, GY + 38, PX + 5, GY + 60, False);
-  T := IntStr(ResW[Wnds[W].K2]) + L(' par ', ' by ', ' x ', ' x ', ' por ') +
-       IntStr(ResH[Wnds[W].K2]) + L(' pixels', ' pixels', ' Pixel',
+  T := IntStr(ResW[Wnds^[W].K2]) + L(' par ', ' by ', ' x ', ' x ', ' por ') +
+       IntStr(ResH[Wnds^[W].K2]) + L(' pixels', ' pixels', ' Pixel',
        ' pixel', ' p'#161'xeles');
   OutCenter(CX + 42, X2 - 16, GY + 72, T, cBlack);
   { boutons }
@@ -14772,8 +14854,8 @@ End;
 Procedure DispOpen;
 Var I, X, Y : LongInt;
 Begin
-  If (DispW >= 0) And Wnds[DispW].Used And
-     (Wnds[DispW].IKind = ikDisplay) Then
+  If (DispW >= 0) And Wnds^[DispW].Used And
+     (Wnds^[DispW].IKind = ikDisplay) Then
   Begin
     ActivateW(DispW);
     Exit;
@@ -14786,12 +14868,12 @@ Begin
                    icDisplay, X, Y, 460, 384,
                    WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
   If DispW < 0 Then Exit;
-  Wnds[DispW].K1 := DispCurBpp;
-  DispRes(Wnds[DispW].K1);
-  Wnds[DispW].K2 := 0;
+  Wnds^[DispW].K1 := DispCurBpp;
+  DispRes(Wnds^[DispW].K1);
+  Wnds^[DispW].K2 := 0;
   For I := 0 To ResN - 1 Do
-    If (ResW[I] = ScrW) And (ResH[I] = ScrH) Then Wnds[DispW].K2 := I;
-  Wnds[DispW].K3 := 0;
+    If (ResW[I] = ScrW) And (ResH[I] = ScrH) Then Wnds^[DispW].K2 := I;
+  Wnds^[DispW].K3 := 0;
   ShowW(DispW, True, True);
 End;
 
@@ -14799,15 +14881,15 @@ End;
 Procedure DispSetDepth(B : LongInt);
 Var I, OW, OH, K : LongInt;
 Begin
-  If (DispW < 0) Or Not Wnds[DispW].Used Then Exit;
-  DispRes(Wnds[DispW].K1);
-  OW := ResW[Wnds[DispW].K2]; OH := ResH[Wnds[DispW].K2];
-  Wnds[DispW].K1 := B;
+  If (DispW < 0) Or Not Wnds^[DispW].Used Then Exit;
+  DispRes(Wnds^[DispW].K1);
+  OW := ResW[Wnds^[DispW].K2]; OH := ResH[Wnds^[DispW].K2];
+  Wnds^[DispW].K1 := B;
   DispRes(B);
   K := 0;
   For I := 0 To ResN - 1 Do
     If ResW[I] * ResH[I] <= OW * OH Then K := I;
-  Wnds[DispW].K2 := K;
+  Wnds^[DispW].K2 := K;
   KRepaint(DispW);
 End;
 
@@ -14815,9 +14897,9 @@ End;
 Procedure DispApply(W : LongInt);
 Var B, RW, RH, I : LongInt;
 Begin
-  B := Wnds[W].K1;
+  B := Wnds^[W].K1;
   DispRes(B);
-  RW := ResW[Wnds[W].K2]; RH := ResH[Wnds[W].K2];
+  RW := ResW[Wnds^[W].K2]; RH := ResH[Wnds^[W].K2];
   If (B = DispCurBpp) And (RW = ScrW) And (RH = ScrH) Then Exit;
   CmosWrite($7A, B);
   CmosWrite($7C, RW Div 8);
@@ -14828,8 +14910,8 @@ Begin
      (Not SvOn And KSetMode(I))) Then
   Begin
     { la boite reste centree dans le nouvel ecran }
-    MoveW(W, Max(0, (ScrW - Wnds[W].W) Div 2),
-          Max(0, (TaskY - Wnds[W].H) Div 2), Wnds[W].W, Wnds[W].H, True);
+    MoveW(W, Max(0, (ScrW - Wnds^[W].W) Div 2),
+          Max(0, (TaskY - Wnds^[W].H) Div 2), Wnds^[W].W, Wnds^[W].H, True);
     Exit;
   End;
   RebootAskW := MsgBoxOpen(L('Modification des param'#138'tres syst'#138'me',
@@ -14877,9 +14959,9 @@ Begin
   Else K := ((X - SX1) * (ResN - 1) + (SX2 - SX1) Div 2) Div (SX2 - SX1);
   If K < 0 Then K := 0;
   If K > ResN - 1 Then K := ResN - 1;
-  If K <> Wnds[W].K2 Then
+  If K <> Wnds^[W].K2 Then
   Begin
-    Wnds[W].K2 := K;
+    Wnds^[W].K2 := K;
     KRepaint(W);
   End;
 End;
@@ -14887,16 +14969,16 @@ End;
 Procedure DisplayMouse(W, Msg, X, Y : LongInt);
 Var I, CX, GY, GX1, GX2, SX1, SX2, BX1, BY1, BX2, BY2 : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   DispRects(W, CX, GY, GX1, GX2, SX1, SX2);
-  DispRes(Wnds[W].K1);
-  If Wnds[W].K3 = 1 Then
+  DispRes(Wnds^[W].K1);
+  If Wnds^[W].K3 = 1 Then
   Begin
     { curseur de la zone d'ecran tire a la souris }
     DispSlide(W, X);
     If Msg = WM_LBUTTONUP Then
     Begin
-      Wnds[W].K3 := 0;
+      Wnds^[W].K3 := 0;
       CaptureWin := -1;
     End;
     Exit;
@@ -14911,7 +14993,7 @@ Begin
     End;
     If InRect(X, Y, SX1 - 8, GY + 34, SX2 + 8, GY + 64) Then
     Begin
-      Wnds[W].K3 := 1;
+      Wnds^[W].K3 := 1;
       CaptureWin := W;
       DispSlide(W, X);
       Exit;
@@ -14949,17 +15031,17 @@ End;
 
 Procedure DisplayKey(W, VK : LongInt);
 Begin
-  DispRes(Wnds[W].K1);
+  DispRes(Wnds^[W].K1);
   If VK = $0D Then DispAction(W, 0)
   Else If VK = $1B Then DispAction(W, 1)
-  Else If (VK = $25) And (Wnds[W].K2 > 0) Then
+  Else If (VK = $25) And (Wnds^[W].K2 > 0) Then
   Begin
-    Dec(Wnds[W].K2);
+    Dec(Wnds^[W].K2);
     KRepaint(W);
   End
-  Else If (VK = $27) And (Wnds[W].K2 < ResN - 1) Then
+  Else If (VK = $27) And (Wnds^[W].K2 < ResN - 1) Then
   Begin
-    Inc(Wnds[W].K2);
+    Inc(Wnds^[W].K2);
     KRepaint(W);
   End;
 End;
@@ -15016,7 +15098,7 @@ End;
 
 Procedure DtOpen;
 Begin
-  If (DtW >= 0) And Wnds[DtW].Used And (Wnds[DtW].IKind = ikDateTime) Then
+  If (DtW >= 0) And Wnds^[DtW].Used And (Wnds^[DtW].IKind = ikDateTime) Then
   Begin
     ActivateW(DtW);
     Exit;
@@ -15302,7 +15384,7 @@ End;
 Procedure DateTimeMouse(W, Msg, X, Y : LongInt);
 Var I, J, X1, Y1, X2, Y2, CX1, CY1, CX2, CY2, D, F : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, CX1, CY1, CX2, CY2);
   If (Msg = WM_LBUTTONUP) And (DtPress >= 0) Then
   Begin
@@ -15460,7 +15542,7 @@ End;
 { Chaque seconde (tache 0) : l'horloge de la boite suit l'heure }
 Procedure DtTick;
 Begin
-  If (DtW < 0) Or Not Wnds[DtW].Used Or (Wnds[DtW].IKind <> ikDateTime) Then
+  If (DtW < 0) Or Not Wnds^[DtW].Used Or (Wnds^[DtW].IKind <> ikDateTime) Then
     Exit;
   If DtTimeSet Or (DtTab <> 0) Then Exit;
   If RtcSec = DtSec Then Exit;
@@ -15552,7 +15634,7 @@ Begin
   W := KCreate(ikVolPop, '', 0, ScrW - 84, TaskY - 152, 80, 150, WS_POPUP,
                WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
   If W < 0 Then Exit;
-  Wnds[W].K1 := 0; Wnds[W].K2 := -1;
+  Wnds^[W].K1 := 0; Wnds^[W].K2 := -1;
   MenuW[0] := W; MenuDepth := 1;
   ShowW(W, True, False);
   ZTop(W);
@@ -15561,7 +15643,7 @@ End;
 Procedure PaintVolPop(W : LongInt);
 Var X, Y, WW, HH : LongInt;
 Begin
-  X := Wnds[W].X; Y := Wnds[W].Y; WW := Wnds[W].W; HH := Wnds[W].H;
+  X := Wnds^[W].X; Y := Wnds^[W].Y; WW := Wnds^[W].W; HH := Wnds^[W].H;
   Edge(X, Y, X + WW - 1, Y + HH - 1, cSilver, cBlack);
   Edge(X + 1, Y + 1, X + WW - 2, Y + HH - 2, cWhite, cGray);
   FBar(X + 2, Y + 2, X + WW - 3, Y + HH - 3, cSilver);
@@ -15575,33 +15657,33 @@ Procedure VolSlideTo(W, Y, Y1, Y2, Line : LongInt);
 Begin
   MixSet(Line, ((Y2 - Y) * 255) Div Max(1, Y2 - Y1), MixBal(Line));
   KRepaint(W);
-  If (MixW0 >= 0) And Wnds[MixW0].Used Then KRepaint(MixW0);
+  If (MixW0 >= 0) And Wnds^[MixW0].Used Then KRepaint(MixW0);
 End;
 
 Procedure VolPopMouse(W, Msg, X, Y : LongInt);
 Begin
-  X := X + Wnds[W].X; Y := Y + Wnds[W].Y;
+  X := X + Wnds^[W].X; Y := Y + Wnds^[W].Y;
   If Msg = WM_LBUTTONDOWN Then
   Begin
-    If InRect(X, Y, Wnds[W].X + 20, Wnds[W].Y + 22, Wnds[W].X + 48,
-              Wnds[W].Y + 120) Then
+    If InRect(X, Y, Wnds^[W].X + 20, Wnds^[W].Y + 22, Wnds^[W].X + 48,
+              Wnds^[W].Y + 120) Then
     Begin
-      Wnds[W].K2 := 0; CaptureWin := W;
-      VolSlideTo(W, Y, Wnds[W].Y + 30, Wnds[W].Y + 112, 0);
+      Wnds^[W].K2 := 0; CaptureWin := W;
+      VolSlideTo(W, Y, Wnds^[W].Y + 30, Wnds^[W].Y + 112, 0);
     End
-    Else If Y >= Wnds[W].Y + 122 Then
+    Else If Y >= Wnds^[W].Y + 122 Then
     Begin
       MixMute[0] := Not MixMute[0];
       SndApplyVol;
       KRepaint(W); TaskbarChanged;
-      If (MixW0 >= 0) And Wnds[MixW0].Used Then KRepaint(MixW0);
+      If (MixW0 >= 0) And Wnds^[MixW0].Used Then KRepaint(MixW0);
     End;
   End
-  Else If (Msg = WM_MOUSEMOVE) And (Wnds[W].K2 = 0) Then
-    VolSlideTo(W, Y, Wnds[W].Y + 30, Wnds[W].Y + 112, 0)
+  Else If (Msg = WM_MOUSEMOVE) And (Wnds^[W].K2 = 0) Then
+    VolSlideTo(W, Y, Wnds^[W].Y + 30, Wnds^[W].Y + 112, 0)
   Else If Msg = WM_LBUTTONUP Then
   Begin
-    Wnds[W].K2 := -1; CaptureWin := -1;
+    Wnds^[W].K2 := -1; CaptureWin := -1;
   End;
 End;
 
@@ -15609,7 +15691,7 @@ End;
   CD audio, ligne) : balance, volume, Muet }
 Procedure MixerOpen;
 Begin
-  If (MixW0 >= 0) And Wnds[MixW0].Used And (Wnds[MixW0].IKind = ikMixer) Then
+  If (MixW0 >= 0) And Wnds^[MixW0].Used And (Wnds^[MixW0].IKind = ikMixer) Then
   Begin
     ActivateW(MixW0);
     Exit;
@@ -15619,7 +15701,7 @@ Begin
                    WS_OVERLAPPED Or WS_CAPTION Or WS_SYSMENU Or
                    WS_MINIMIZEBOX, 0);
   If MixW0 < 0 Then Exit;
-  Wnds[MixW0].K2 := -1;
+  Wnds^[MixW0].K2 := -1;
   ShowW(MixW0, True, True);
 End;
 
@@ -15672,8 +15754,8 @@ End;
 Procedure MixerMouse(W, Msg, X, Y : LongInt);
 Var I, X1, Y1, X2, Y2, CX, K : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
-  K := Wnds[W].K2;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  K := Wnds^[W].K2;
   If (Msg = WM_MOUSEMOVE) And (K >= 0) Then
   Begin
     MixCol(W, K Mod 10, X1, Y1, X2, Y2);
@@ -15689,7 +15771,7 @@ Begin
   End;
   If Msg = WM_LBUTTONUP Then
   Begin
-    Wnds[W].K2 := -1; CaptureWin := -1;
+    Wnds^[W].K2 := -1; CaptureWin := -1;
     Exit;
   End;
   If Msg <> WM_LBUTTONDOWN Then Exit;
@@ -15706,16 +15788,16 @@ Begin
     End;
     If InRect(X, Y, X1 + 10, Y1 + 48, X2 - 10, Y1 + 68) Then
     Begin
-      Wnds[W].K2 := 10 + I; CaptureWin := W;
-      MixerMouse(W, WM_MOUSEMOVE, X - Wnds[W].X - Wnds[W].CL,
-                 Y - Wnds[W].Y - Wnds[W].CT);
+      Wnds^[W].K2 := 10 + I; CaptureWin := W;
+      MixerMouse(W, WM_MOUSEMOVE, X - Wnds^[W].X - Wnds^[W].CL,
+                 Y - Wnds^[W].Y - Wnds^[W].CT);
       Exit;
     End;
     If InRect(X, Y, CX - 16, Y1 + 96, CX + 12, Y2 - 32) Then
     Begin
-      Wnds[W].K2 := I; CaptureWin := W;
-      MixerMouse(W, WM_MOUSEMOVE, X - Wnds[W].X - Wnds[W].CL,
-                 Y - Wnds[W].Y - Wnds[W].CT);
+      Wnds^[W].K2 := I; CaptureWin := W;
+      MixerMouse(W, WM_MOUSEMOVE, X - Wnds^[W].X - Wnds^[W].CL,
+                 Y - Wnds^[W].Y - Wnds^[W].CT);
       Exit;
     End;
   End;
@@ -15725,7 +15807,7 @@ End;
   (Wave et MIDI), volume et icone de la barre des taches }
 Procedure AudioOpen;
 Begin
-  If (AudW >= 0) And Wnds[AudW].Used And (Wnds[AudW].IKind = ikAudio) Then
+  If (AudW >= 0) And Wnds^[AudW].Used And (Wnds^[AudW].IKind = ikAudio) Then
   Begin
     ActivateW(AudW);
     Exit;
@@ -15737,7 +15819,7 @@ Begin
                   Max(0, (TaskY - 300) Div 2), 400, 300,
                   WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
   If AudW < 0 Then Exit;
-  Wnds[AudW].K2 := -1;
+  Wnds^[AudW].K2 := -1;
   ShowW(AudW, True, True);
 End;
 
@@ -15793,29 +15875,29 @@ End;
 Procedure AudioMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
-  If (Wnds[W].K2 = 0) And ((Msg = WM_MOUSEMOVE) Or (Msg = WM_LBUTTONDOWN))
+  If (Wnds^[W].K2 = 0) And ((Msg = WM_MOUSEMOVE) Or (Msg = WM_LBUTTONDOWN))
   Then
   Begin
     MixSet(0, ((X - X1 - 160) * 255) Div Max(1, X2 - 30 - X1 - 160),
            MixBal(0));
     KRepaint(W); TaskbarChanged;
-    If (MixW0 >= 0) And Wnds[MixW0].Used Then KRepaint(MixW0);
+    If (MixW0 >= 0) And Wnds^[MixW0].Used Then KRepaint(MixW0);
     Exit;
   End;
-  If (Msg = WM_LBUTTONUP) And (Wnds[W].K2 = 0) Then
+  If (Msg = WM_LBUTTONUP) And (Wnds^[W].K2 = 0) Then
   Begin
-    Wnds[W].K2 := -1; CaptureWin := -1;
+    Wnds^[W].K2 := -1; CaptureWin := -1;
     Exit;
   End;
   If Msg = WM_LBUTTONDOWN Then
   Begin
     If InRect(X, Y, X1 + 152, Y1 + 72, X2 - 22, Y1 + 100) Then
     Begin
-      Wnds[W].K2 := 0; CaptureWin := W;
-      AudioMouse(W, WM_MOUSEMOVE, X - Wnds[W].X - Wnds[W].CL,
-                 Y - Wnds[W].Y - Wnds[W].CT);
+      Wnds^[W].K2 := 0; CaptureWin := W;
+      AudioMouse(W, WM_MOUSEMOVE, X - Wnds^[W].X - Wnds^[W].CL,
+                 Y - Wnds^[W].Y - Wnds^[W].CT);
       Exit;
     End;
     If InRect(X, Y, X1 + 16, Y1 + 216, X2 - 16, Y1 + 232) Then
@@ -16345,6 +16427,40 @@ Begin
   CpuName := S;
 End;
 
+{ Frequence approchee (compteur de cycles pendant 50 ms ; 0 sans TSC) }
+Function CpuMhz : LongInt;
+Var A, D, L0, H0, L1, H1, T, N : LongInt;
+Begin
+  CpuMhz := 0;
+  If Pos('80386', CpuName) > 0 Then Exit;
+  asm
+    push ebx
+    mov eax,1
+    db 0Fh,0A2h
+    mov D,edx
+    pop ebx
+  end;
+  If (D And $10) = 0 Then Exit;
+  T := Ticks; N := 0;
+  While (Ticks = T) And (N < 50000000) Do Inc(N);
+  If Ticks = T Then Exit;
+  asm
+    db 0Fh,31h
+    mov L0,eax
+    mov H0,edx
+  end;
+  T := Ticks;
+  While Ticks - T < 50 Do ;
+  asm
+    db 0Fh,31h
+    mov L1,eax
+    mov H1,edx
+  end;
+  A := (L1 Shr 1) - (L0 Shr 1) + (H1 - H0) * $7FFFFFFF;
+  If A < 0 Then Exit;
+  CpuMhz := A Div 25000;
+End;
+
 Procedure DmBuildRows;
 Var C, D : LongInt; Any : Boolean;
 Begin
@@ -16368,7 +16484,7 @@ End;
 
 Procedure SysOpen;
 Begin
-  If (SysW >= 0) And Wnds[SysW].Used And (Wnds[SysW].IKind = ikSysProps) Then
+  If (SysW >= 0) And Wnds^[SysW].Used And (Wnds^[SysW].IKind = ikSysProps) Then
   Begin
     ActivateW(SysW);
     Exit;
@@ -16381,7 +16497,7 @@ Begin
                   Max(0, (TaskY - 430) Div 2), 440, 430,
                   WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
   If SysW < 0 Then Exit;
-  Wnds[SysW].K1 := 1; Wnds[SysW].K2 := 0; Wnds[SysW].K3 := 0;
+  Wnds^[SysW].K1 := 1; Wnds^[SysW].K2 := 0; Wnds^[SysW].K3 := 0;
   ShowW(SysW, True, True);
 End;
 
@@ -16463,8 +16579,8 @@ Var X1, Y1, X2, Y2, I, R, Y, X, Vis, LX1, LY1, LX2, LY2, Ic, Fg, BX1, BY1,
 Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
-  TabStrip(W, 2, Wnds[W].K1, SysTab0, SysTab1);
-  If Wnds[W].K1 = 0 Then
+  TabStrip(W, 2, Wnds^[W].K1, SysTab0, SysTab1);
+  If Wnds^[W].K1 = 0 Then
   Begin
     PaintIcon(icComputer, X1 + 40, Y1 + 70, 64);
     X := X1 + 200; Y := Y1 + 50;
@@ -16499,11 +16615,11 @@ Begin
     DmList(W, LX1, LY1, LX2, LY2, Vis);
     Sunken(LX1, LY1, LX2, LY2, cWhite);
     DmBuildRows;
-    If Wnds[W].K2 >= RowN Then Wnds[W].K2 := RowN - 1;
-    If Wnds[W].K3 > Max(0, RowN - Vis) Then Wnds[W].K3 := Max(0, RowN - Vis);
-    For R := Wnds[W].K3 To Min(RowN - 1, Wnds[W].K3 + Vis - 1) Do
+    If Wnds^[W].K2 >= RowN Then Wnds^[W].K2 := RowN - 1;
+    If Wnds^[W].K3 > Max(0, RowN - Vis) Then Wnds^[W].K3 := Max(0, RowN - Vis);
+    For R := Wnds^[W].K3 To Min(RowN - 1, Wnds^[W].K3 + Vis - 1) Do
     Begin
-      Y := LY1 + 3 + (R - Wnds[W].K3) * 18;
+      Y := LY1 + 3 + (R - Wnds^[W].K3) * 18;
       Case RowKind[R] Of
         0 : Begin
               X := LX1 + 6; Ic := icComputer;
@@ -16527,7 +16643,7 @@ Begin
       End;
       PaintIcon(Ic, X, Y, 16);
       Fg := cBlack;
-      If R = Wnds[W].K2 Then
+      If R = Wnds^[W].K2 Then
       Begin
         FBar(X + 19, Y, X + 22 + TextW(T), Y + 16, cNavy);
         Fg := cWhite;
@@ -16542,7 +16658,7 @@ Begin
       Arrow(LX2 - 12, LY1 + 8, 2, cBlack);
       Raised(LX2 - 17, LY2 - 17, LX2 - 2, LY2 - 2, False);
       Arrow(LX2 - 12, LY2 - 11, 1, cBlack);
-      TY := LY1 + 18 + (Wnds[W].K3 * (LY2 - LY1 - 52)) Div
+      TY := LY1 + 18 + (Wnds^[W].K3 * (LY2 - LY1 - 52)) Div
             Max(1, RowN - Vis);
       Raised(LX2 - 17, TY, LX2 - 2, TY + 16, False);
     End;
@@ -16579,7 +16695,7 @@ End;
 
 Procedure DevPropsOpen(D : LongInt);
 Begin
-  If (DevPW >= 0) And Wnds[DevPW].Used Then DestroyW(DevPW);
+  If (DevPW >= 0) And Wnds^[DevPW].Used Then DestroyW(DevPW);
   DevPW := KCreate(ikDevProps, L('Propri'#130't'#130's de ', 'Properties of ',
                    'Eigenschaften von ', 'Propriet'#133' di ',
                    'Propiedades de ') + Fit(DevName[D], 220), DevIco[D],
@@ -16587,7 +16703,7 @@ Begin
                    440, 360, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
                    WS_EX_DLGMODALFRAME);
   If DevPW < 0 Then Exit;
-  Wnds[DevPW].K1 := D;
+  Wnds^[DevPW].K1 := D;
   ShowW(DevPW, True, True);
 End;
 
@@ -16596,7 +16712,7 @@ Var X1, Y1, X2, Y2, D, Y, P, BX1, BY1, BX2, BY2 : LongInt; R, T, V : String;
 Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
-  D := Wnds[W].K1;
+  D := Wnds^[W].K1;
   PaintIcon(DevIco[D], X1 + 14, Y1 + 12, 32);
   OutTxt(X1 + 60, Y1 + 20, Fit(DevName[D], X2 - X1 - 70), cBlack);
   HLine(X1 + 12, X2 - 12, Y1 + 52, cGray);
@@ -16651,7 +16767,7 @@ End;
 Procedure DevPropsMouse(W, Msg, X, Y : LongInt);
 Var BX1, BY1, BX2, BY2 : LongInt;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   DlgBtnRect(W, 0, 1, BX1, BY1, BX2, BY2);
   If InRect(X, Y, BX1, BY1, BX2, BY2) Then
   Begin
@@ -16693,7 +16809,7 @@ Procedure SysPropsMouse(W, Msg, X, Y : LongInt);
 Var I, LX1, LY1, LX2, LY2, Vis, R, BX1, BY1, BX2, BY2, X0 : LongInt;
     Dbl : Boolean;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   Dbl := Msg = WM_LBUTTONDBLCLK;
   If Dbl Then Msg := WM_LBUTTONDOWN;
   If Msg = WM_LBUTTONDOWN Then
@@ -16701,12 +16817,12 @@ Begin
     I := TabHit(W, 2, X, Y, SysTab0, SysTab1);
     If I >= 0 Then
     Begin
-      Wnds[W].K1 := I;
+      Wnds^[W].K1 := I;
       KRepaint(W);
       Exit;
     End;
   End;
-  If (Wnds[W].K1 = 1) And (Msg = WM_LBUTTONDOWN) Then
+  If (Wnds^[W].K1 = 1) And (Msg = WM_LBUTTONDOWN) Then
   Begin
     DmList(W, LX1, LY1, LX2, LY2, Vis);
     DmBuildRows;
@@ -16714,22 +16830,22 @@ Begin
     Begin
       If (RowN > Vis) And (X >= LX2 - 17) Then
       Begin
-        If Y < LY1 + 18 Then Wnds[W].K3 := Max(0, Wnds[W].K3 - 1)
+        If Y < LY1 + 18 Then Wnds^[W].K3 := Max(0, Wnds^[W].K3 - 1)
         Else If Y > LY2 - 18 Then
-          Wnds[W].K3 := Min(RowN - Vis, Wnds[W].K3 + 1)
+          Wnds^[W].K3 := Min(RowN - Vis, Wnds^[W].K3 + 1)
         Else If Y < (LY1 + LY2) Div 2 Then
-          Wnds[W].K3 := Max(0, Wnds[W].K3 - Vis)
-        Else Wnds[W].K3 := Min(RowN - Vis, Wnds[W].K3 + Vis);
+          Wnds^[W].K3 := Max(0, Wnds^[W].K3 - Vis)
+        Else Wnds^[W].K3 := Min(RowN - Vis, Wnds^[W].K3 + Vis);
         KRepaint(W);
         Exit;
       End;
-      R := Wnds[W].K3 + (Y - LY1 - 3) Div 18;
+      R := Wnds^[W].K3 + (Y - LY1 - 3) Div 18;
       If (R >= 0) And (R < RowN) Then
       Begin
         X0 := LX1 + 26;
         If (RowKind[R] = 1) And (X >= X0 - 16) And (X <= X0 - 4) Then
           DmActivate(W, R)
-        Else If (R = Wnds[W].K2) And (Dbl Or ((DmClickR = R) And
+        Else If (R = Wnds^[W].K2) And (Dbl Or ((DmClickR = R) And
                 (Ticks - DmClickT < 700))) Then
         Begin
           DmClickR := -1;
@@ -16737,7 +16853,7 @@ Begin
         End
         Else
         Begin
-          Wnds[W].K2 := R;
+          Wnds^[W].K2 := R;
           DmClickR := R; DmClickT := Ticks;
           KRepaint(W);
         End;
@@ -16751,16 +16867,16 @@ Begin
       Begin
         If I = 0 Then
         Begin
-          If (Wnds[W].K2 >= 0) And (Wnds[W].K2 < RowN) Then
+          If (Wnds^[W].K2 >= 0) And (Wnds^[W].K2 < RowN) Then
           Begin
-            If RowKind[Wnds[W].K2] = 2 Then DevPropsOpen(RowIdx[Wnds[W].K2])
-            Else DmActivate(W, Wnds[W].K2);
+            If RowKind[Wnds^[W].K2] = 2 Then DevPropsOpen(RowIdx[Wnds^[W].K2])
+            Else DmActivate(W, Wnds^[W].K2);
           End;
         End
         Else
         Begin
           DevScan;
-          Wnds[W].K2 := 0; Wnds[W].K3 := 0;
+          Wnds^[W].K2 := 0; Wnds^[W].K3 := 0;
           KRepaint(W);
         End;
         Exit;
@@ -16807,10 +16923,10 @@ Begin
     SysW := -1;
     Exit;
   End;
-  If Wnds[W].K1 <> 1 Then Exit;
+  If Wnds^[W].K1 <> 1 Then Exit;
   DmBuildRows;
   DmList(W, LX1, LY1, LX2, LY2, Vis);
-  R := Wnds[W].K2;
+  R := Wnds^[W].K2;
   Case VK Of
     $26 : If R > 0 Then Dec(R);
     $28 : If R < RowN - 1 Then Inc(R);
@@ -16818,9 +16934,9 @@ Begin
     $27 : If RowKind[R] = 1 Then CatOpen[RowIdx[R]] := True;
     $0D : DmActivate(W, R);
   End;
-  Wnds[W].K2 := R;
-  If R < Wnds[W].K3 Then Wnds[W].K3 := R;
-  If R >= Wnds[W].K3 + Vis Then Wnds[W].K3 := R - Vis + 1;
+  Wnds^[W].K2 := R;
+  If R < Wnds^[W].K3 Then Wnds^[W].K3 := R;
+  If R >= Wnds^[W].K3 + Vis Then Wnds^[W].K3 := R - Vis + 1;
   KRepaint(W);
 End;
 
@@ -16869,7 +16985,7 @@ End;
 Procedure FdOpen(Mode, Owner : LongInt; Const Dir, Name : String);
 Var T : String;
 Begin
-  If (FdW >= 0) And Wnds[FdW].Used And (Wnds[FdW].IKind = ikFileDlg) Then
+  If (FdW >= 0) And Wnds^[FdW].Used And (Wnds^[FdW].IKind = ikFileDlg) Then
     DestroyW(FdW);
   FdMode := Mode; FdOwner := Owner;
   FdDir := Dir;
@@ -16995,7 +17111,7 @@ Procedure FdClose(Ok : Boolean);
 Var W : LongInt;
 Begin
   FdOk := Ok; FdDone := True;
-  If (FdW >= 0) And Wnds[FdW].Used Then DestroyW(FdW);
+  If (FdW >= 0) And Wnds^[FdW].Used Then DestroyW(FdW);
   FdW := -1;
   If FdOwner <> 0 Then Exit;
   W := KFindKind(ikNotepad);
@@ -17052,7 +17168,7 @@ End;
 Procedure FileDlgMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, LX1, LY1, LX2, LY2, Vis, R, I : LongInt; Dbl : Boolean;
 Begin
-  X := X + Wnds[W].X + Wnds[W].CL; Y := Y + Wnds[W].Y + Wnds[W].CT;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
   Dbl := Msg = WM_LBUTTONDBLCLK;
   If Dbl Then Msg := WM_LBUTTONDOWN;
@@ -17098,7 +17214,7 @@ Begin
           FdClickR := -1;
           FdName := FdNm[R];
           FdAccept;
-          If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+          If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
           Exit;
         End;
         FdSel := R; FdClickR := R; FdClickT := Ticks;
@@ -17122,7 +17238,7 @@ Begin
       Begin
         PressWin := -1; CaptureWin := -1;
         If I = 0 Then FdAccept Else FdClose(False);
-        If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+        If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
       End;
       Exit;
     End;
@@ -17157,7 +17273,7 @@ Begin
     If (Ch >= 32) And (Ch < 256) And (Length(FdName) < 60) Then
       FdName := FdName + Chr(Ch);
   End;
-  If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+  If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
 End;
 
 { Reorganiser les icones du bureau (Poste de travail et Corbeille
@@ -17209,7 +17325,7 @@ Begin
   Begin
     FdDir := Chr(65 + Cmd - cmFdDrive) + ':';
     FdRefresh;
-    If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+    If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
     Exit;
   End;
   If (Cmd >= cmFdType) And (Cmd < cmFdType + 8) Then
@@ -17217,7 +17333,7 @@ Begin
     FdFiltI := Cmd - cmFdType;
     FdMask := FdFiltPat[FdFiltI];
     FdRefresh;
-    If (FdW >= 0) And Wnds[FdW].Used Then KRepaint(FdW);
+    If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
     Exit;
   End;
   If (Cmd >= cmTzBase) And (Cmd < cmTzBase + TzCount) Then
@@ -17243,16 +17359,16 @@ Begin
                    WS_SYSMENU Or WS_THICKFRAME Or WS_MINIMIZEBOX Or
                    WS_MAXIMIZEBOX, 0);
       If W < 0 Then Exit;
-      Wnds[W].K1 := -1;
-      If Cmd = cmExplorer Then Wnds[W].KS := 'D:' Else Wnds[W].KS := '';
+      Wnds^[W].K1 := -1;
+      If Cmd = cmExplorer Then Wnds^[W].KS := 'D:' Else Wnds^[W].KS := '';
       If Cmd = cmExplorer Then
       Begin
-        Wnds[W].Text := L('Explorateur', 'Exploring', 'Explorer',
+        Wnds^[W].Text := L('Explorateur', 'Exploring', 'Explorer',
                           'Esplora', 'Explorando') + ' - ' + VolLabel;
-        Wnds[W].K4 := icExplorer;
+        Wnds^[W].K4 := icExplorer;
       End
       Else
-        Wnds[W].Text := L('Poste de travail', 'My Computer', 'Arbeitsplatz',
+        Wnds^[W].Text := L('Poste de travail', 'My Computer', 'Arbeitsplatz',
                           'Risorse del computer', 'Mi PC');
       ShowW(W, True, True);
     End;
@@ -17373,15 +17489,15 @@ Begin
     ActivateW(-1);
     Exit;
   End;
-  If (MenuDepth > 0) And (Wnds[W].IKind <> ikMenu) And
-     (Wnds[W].IKind <> ikVolPop) And (Msg = WM_LBUTTONDOWN) Then
+  If (MenuDepth > 0) And (Wnds^[W].IKind <> ikMenu) And
+     (Wnds^[W].IKind <> ikVolPop) And (Msg = WM_LBUTTONDOWN) Then
     CloseMenus(0);
   { boites internes : un second clic rapide reste un clic (compteurs,
     curseurs) ; l'arbre du Gestionnaire de peripheriques s'en sert }
-  If (Msg = WM_LBUTTONDBLCLK) And (Wnds[W].IKind >= ikDisplay) And
-     (Wnds[W].IKind <= ikDevProps) And (Wnds[W].IKind <> ikSysProps) Then
+  If (Msg = WM_LBUTTONDBLCLK) And (Wnds^[W].IKind >= ikDisplay) And
+     (Wnds^[W].IKind <= ikDevProps) And (Wnds^[W].IKind <> ikSysProps) Then
     Msg := WM_LBUTTONDOWN;
-  Case Wnds[W].IKind Of
+  Case Wnds^[W].IKind Of
     ikTaskbar : TaskbarMouse(Msg, X, Y);
     ikMenu : MenuMouse(W, Msg, X, Y);
     ikMsgBox : MsgBoxMouse(W, Msg, X, Y);
@@ -17491,8 +17607,8 @@ Begin
   DW := ConCols * ConCW - (X2 - X1 + 1);
   DH := ConRows * ConChH - (Y2 - Y1 + 1);
   If (DW <> 0) Or (DH <> 0) Then
-    MoveW(ConW, Wnds[ConW].X, Wnds[ConW].Y, Wnds[ConW].W + DW,
-          Wnds[ConW].H + DH, False);
+    MoveW(ConW, Wnds^[ConW].X, Wnds^[ConW].Y, Wnds^[ConW].W + DW,
+          Wnds^[ConW].H + DH, False);
   ConClear;
   ShowW(ConW, True, True);
 End;
@@ -17742,12 +17858,12 @@ Begin
     Begin
       I := ActiveWin;
       If I < 0 Then KCommand(cmShutdown)
-      Else If Wnds[I].IKind <> ikNone Then
+      Else If Wnds^[I].IKind <> ikNone Then
       Begin
-        If Wnds[I].IKind = ikMsgBox Then MsgBoxEnd(I, IDCANCEL)
-        Else If Wnds[I].IKind = ikShutdown Then DialogAction(I, 1)
-        Else If Wnds[I].IKind = ikNotepad Then KCommand(cmNExit)
-        Else If Wnds[I].IKind = ikFileDlg Then FdClose(False)
+        If Wnds^[I].IKind = ikMsgBox Then MsgBoxEnd(I, IDCANCEL)
+        Else If Wnds^[I].IKind = ikShutdown Then DialogAction(I, 1)
+        Else If Wnds^[I].IKind = ikNotepad Then KCommand(cmNExit)
+        Else If Wnds^[I].IKind = ikFileDlg Then FdClose(False)
         Else DestroyW(I);
       End
       Else PostMsgW(I, WM_CLOSE, 0, 0);
@@ -17758,7 +17874,7 @@ Begin
       For I := 0 To ZCnt - 1 Do
         If IsTaskWin(ZList[I]) And (ZList[I] <> ActiveWin) Then
         Begin
-          If Wnds[ZList[I]].Min Then RestoreW(ZList[I])
+          If Wnds^[ZList[I]].Min Then RestoreW(ZList[I])
           Else ActivateW(ZList[I]);
           Exit;
         End;
@@ -17778,33 +17894,33 @@ Begin
     Exit;
   End;
   If Msg <> WM_KEYDOWN Then Exit;
-  If (Wnds[W].IKind >= ikButton) And (Wnds[W].IKind <= ikMdiClient) Then
+  If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) Then
   Begin
     I := TopOf(W);
-    If (VK = $0D) And (Wnds[I].IKind = ikDialog) Then
+    If (VK = $0D) And (Wnds^[I].IKind = ikDialog) Then
       PostMsgW(I, WM_COMMAND, IDOK, 0)
-    Else If (VK = $1B) And (Wnds[I].IKind = ikDialog) Then
+    Else If (VK = $1B) And (Wnds^[I].IKind = ikDialog) Then
       PostMsgW(I, WM_COMMAND, IDCANCEL, 0)
-    Else If (Ch <> 0) And (Wnds[W].IKind = ikEdit) Then
+    Else If (Ch <> 0) And (Wnds^[W].IKind = ikEdit) Then
       KWndProc(W, WM_CHAR, Ch, 0);
     Exit;
   End;
-  Case Wnds[W].IKind Of
+  Case Wnds^[W].IKind Of
     ikMsgBox :
-      If VK = $0D Then MsgBoxEnd(W, MbId(Wnds[W].K2, 0))
-      Else If VK = $1B Then MsgBoxEnd(W, MbId(Wnds[W].K2,
-                                       MbCount(Wnds[W].K2) - 1));
+      If VK = $0D Then MsgBoxEnd(W, MbId(Wnds^[W].K2, 0))
+      Else If VK = $1B Then MsgBoxEnd(W, MbId(Wnds^[W].K2,
+                                       MbCount(Wnds^[W].K2) - 1));
     ikRun :
       If VK = $0D Then DialogAction(W, 0)
       Else If VK = $1B Then DialogAction(W, 1)
       Else If VK = 8 Then
       Begin
-        Delete(Wnds[W].KS, Length(Wnds[W].KS), 1);
+        Delete(Wnds^[W].KS, Length(Wnds^[W].KS), 1);
         KRepaint(W);
       End
-      Else If (Ch >= 32) And (Length(Wnds[W].KS) < 30) Then
+      Else If (Ch >= 32) And (Length(Wnds^[W].KS) < 30) Then
       Begin
-        Wnds[W].KS := Wnds[W].KS + Chr(Ch);
+        Wnds^[W].KS := Wnds^[W].KS + Chr(Ch);
         KRepaint(W);
       End;
     ikShutdown :
@@ -17812,8 +17928,8 @@ Begin
       Else If VK = $1B Then DialogAction(W, 1)
       Else If (VK = $26) Or (VK = $28) Then
       Begin
-        If VK = $26 Then Wnds[W].K1 := (Wnds[W].K1 + 2) Mod 3
-        Else Wnds[W].K1 := (Wnds[W].K1 + 1) Mod 3;
+        If VK = $26 Then Wnds^[W].K1 := (Wnds^[W].K1 + 2) Mod 3
+        Else Wnds^[W].K1 := (Wnds^[W].K1 + 1) Mod 3;
         KRepaint(W);
       End;
     ikAbout : If (VK = $0D) Or (VK = $1B) Then DestroyW(W);
@@ -17831,14 +17947,15 @@ Begin
     ikConsole : ConKeyIn(VK, Ch);
     ikExplorer :
       If VK = 8 Then ExpUp(W)
-      Else If (VK = $0D) And (Wnds[W].K1 >= 0) Then ExpOpenItem(W, Wnds[W].K1);
+      Else If (VK = $0D) And (Wnds^[W].K1 >= 0) Then
+        ExpOpenItem(W, Wnds^[W].K1);
   End;
 End;
 
 Procedure KActivated(W : LongInt);
 Begin
   If MenuDepth > 0 Then
-    If (W < 0) Or (Wnds[W].IKind <> ikMenu) Then CloseMenus(0);
+    If (W < 0) Or (Wnds^[W].IKind <> ikMenu) Then CloseMenus(0);
 End;
 
 { Fond d'une boite de dialogue d'un programme ; ses controles sont
@@ -17849,19 +17966,19 @@ Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And IsChildW(I) And (Wnds[I].Parent = W) Then
+    If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = W) Then
       InvalAll(I, True);
 End;
 
 { Dessiner une fenetre interne de premier niveau }
 Procedure KPaint(W : LongInt);
 Begin
-  If Not Wnds[W].Used Or (Wnds[W].Surf.Bits = 0) Then Exit;
-  Wnds[W].KNeedPaint := False;
-  SetR(Wnds[W].Upd, 0, 0, 0, 0);
+  If Not Wnds^[W].Used Or (Wnds^[W].Surf.Bits = 0) Then Exit;
+  Wnds^[W].KNeedPaint := False;
+  SetR(Wnds^[W].Upd, 0, 0, 0, 0);
   NcPaint(W);
-  SetTarget(Wnds[W].Surf, Wnds[W].X, Wnds[W].Y);
-  Case Wnds[W].IKind Of
+  SetTarget(Wnds^[W].Surf, Wnds^[W].X, Wnds^[W].Y);
+  Case Wnds^[W].IKind Of
     ikTaskbar : PaintTaskbar(W);
     ikMenu : PaintMenu(W);
     ikMsgBox : PaintMsgBox(W);
@@ -17890,9 +18007,9 @@ End;
 Procedure ConPaintRows;
 Var X1, Y1, X2, Y2 : LongInt;
 Begin
-  If (ConW < 0) Or Not Wnds[ConW].Used Or (Wnds[ConW].Surf.Bits = 0) Then
+  If (ConW < 0) Or Not Wnds^[ConW].Used Or (Wnds^[ConW].Surf.Bits = 0) Then
     Exit;
-  SetTarget(Wnds[ConW].Surf, Wnds[ConW].X, Wnds[ConW].Y);
+  SetTarget(Wnds^[ConW].Surf, Wnds^[ConW].X, Wnds^[ConW].Y);
   PaintConsole(ConW);
   If ConPR1 < ConPR0 Then Exit;
   KClient(ConW, X1, Y1, X2, Y2);
@@ -17904,16 +18021,16 @@ End;
 Procedure KPaintAll;
 Var I : LongInt;
 Begin
-  If ConRowsDue And (ConW >= 0) And Wnds[ConW].Used And
-     Not Wnds[ConW].KNeedPaint And Wnds[ConW].Visible Then ConPaintRows;
+  If ConRowsDue And (ConW >= 0) And Wnds^[ConW].Used And
+     Not Wnds^[ConW].KNeedPaint And Wnds^[ConW].Visible Then ConPaintRows;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And Not IsChildW(I) Then
+    If Wnds^[I].Used And Not IsChildW(I) Then
     Begin
-      If Wnds[I].IKind <> ikNone Then
+      If Wnds^[I].IKind <> ikNone Then
       Begin
-        If Wnds[I].KNeedPaint Then KPaint(I);
+        If Wnds^[I].KNeedPaint Then KPaint(I);
       End
-      Else If Wnds[I].NeedNc Then NcPaint(I);
+      Else If Wnds^[I].NeedNc Then NcPaint(I);
     End;
   ReadRtc;
   DtTick;
@@ -17948,30 +18065,30 @@ Var S : TSurf; OX, OY, X1, Y1, X2, Y2, Typ, I, A : LongInt; Clip : TRect;
 Begin
   If Not WndVisible(W) Then Exit;
   If Not WndTarget(W, False, S, OX, OY, Clip) Then Exit;
-  SetR(Wnds[W].Upd, 0, 0, 0, 0);
+  SetR(Wnds^[W].Upd, 0, 0, 0, 0);
   SetTarget(S, 0, 0);
   ClipX1 := Clip.L; ClipY1 := Clip.T; ClipX2 := Clip.R - 1;
   ClipY2 := Clip.B - 1;
-  X1 := OX; Y1 := OY; X2 := OX + Wnds[W].W - 1; Y2 := OY + Wnds[W].H - 1;
-  If Wnds[W].Enabled Then Fg := cBlack Else Fg := cGray;
-  T := Wnds[W].Text;
+  X1 := OX; Y1 := OY; X2 := OX + Wnds^[W].W - 1; Y2 := OY + Wnds^[W].H - 1;
+  If Wnds^[W].Enabled Then Fg := cBlack Else Fg := cGray;
+  T := Wnds^[W].Text;
   I := Pos('&', T);
   If I > 0 Then Delete(T, I, 1);
-  Case Wnds[W].IKind Of
+  Case Wnds^[W].IKind Of
     ikButton :
     Begin
-      Typ := Wnds[W].Style And BS_TYPEMASK;
+      Typ := Wnds^[W].Style And BS_TYPEMASK;
       If Typ = BS_GROUPBOX Then GroupBox(X1, Y1 + 7, X2, Y2, T)
       Else If (Typ = BS_CHECKBOX) Or (Typ = BS_AUTOCHECKBOX) Or
               (Typ = BS_3STATE) Then
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
         Sunken(X1, (Y1 + Y2) Div 2 - 6, X1 + 12, (Y1 + Y2) Div 2 + 6, cWhite);
-        If Wnds[W].K1 <> 0 Then
+        If Wnds^[W].K1 <> 0 Then
           For I := 0 To 2 Do
             DLine(X1 + 3, (Y1 + Y2) Div 2 - 1 + I, X1 + 5,
                   (Y1 + Y2) Div 2 + 1 + I, cBlack);
-        If Wnds[W].K1 <> 0 Then
+        If Wnds^[W].K1 <> 0 Then
           For I := 0 To 2 Do
             DLine(X1 + 5, (Y1 + Y2) Div 2 + 1 + I, X1 + 9,
                   (Y1 + Y2) Div 2 - 3 + I, cBlack);
@@ -17980,30 +18097,30 @@ Begin
       Else If (Typ = BS_RADIOBUTTON) Or (Typ = BS_AUTORADIOBUTTON) Then
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
-        RadioButton(X1, (Y1 + Y2) Div 2 - 7, T, Wnds[W].K1 <> 0);
+        RadioButton(X1, (Y1 + Y2) Div 2 - 7, T, Wnds^[W].K1 <> 0);
       End
       Else
-        PushButton(X1, Y1, X2, Y2, T, Wnds[W].K2 <> 0,
-                   (Wnds[W].Style And 1) <> 0);
+        PushButton(X1, Y1, X2, Y2, T, Wnds^[W].K2 <> 0,
+                   (Wnds^[W].Style And 1) <> 0);
     End;
     ikStatic :
     Begin
-      Typ := Wnds[W].Style And $1F;
+      Typ := Wnds^[W].Style And $1F;
       If (Typ = 7) Or (Typ = 8) Or (Typ = 9) Then
         Edge(X1, Y1, X2, Y2, cGray, cWhite)
       Else If Typ = 3 Then PaintIcon(icApp, X1, Y1, 32)
       Else
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
-        If Typ = 1 Then WrapText(X1 + (Wnds[W].W - TextW(T)) Div 2, Y1,
-                                 Wnds[W].W, T, Fg, True)
-        Else WrapText(X1, Y1, Wnds[W].W, T, Fg, True);
+        If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2, Y1,
+                                 Wnds^[W].W, T, Fg, True)
+        Else WrapText(X1, Y1, Wnds^[W].W, T, Fg, True);
       End;
     End;
     ikEdit :
     Begin
       Sunken(X1, Y1, X2, Y2, cWhite);
-      OutTxt(X1 + 4, Y1 + (Wnds[W].H - 16) Div 2, Fit(T, Wnds[W].W - 8),
+      OutTxt(X1 + 4, Y1 + (Wnds^[W].H - 16) Div 2, Fit(T, Wnds^[W].W - 8),
              cBlack);
       If W = FocusWin Then
         VLine(X1 + 4 + TextW(T), Y1 + 3, Y2 - 3, cBlack);
@@ -18011,11 +18128,11 @@ Begin
     ikListBox, ikComboBox :
     Begin
       Sunken(X1, Y1, X2, Y2, cWhite);
-      A := Wnds[W].Extra;
-      For I := 0 To Wnds[W].K1 - 1 Do
+      A := Wnds^[W].Extra;
+      For I := 0 To Wnds^[W].K1 - 1 Do
         If Y1 + 2 + I * 16 < Y2 - 16 Then
         Begin
-          If I = Wnds[W].K2 Then
+          If I = Wnds^[W].K2 Then
           Begin
             FBar(X1 + 2, Y1 + 2 + I * 16, X2 - 2, Y1 + 17 + I * 16, cNavy);
             OutTxt(X1 + 4, Y1 + 2 + I * 16, PStr(MemL[0:A + I * 4]), cWhite);
@@ -18038,26 +18155,26 @@ End;
 Procedure LBAdd(W : LongInt; S : String);
 Var A : LongInt;
 Begin
-  If Wnds[W].Extra = 0 Then Wnds[W].Extra := KAlloc(LBItemMax * 4);
-  If Wnds[W].K1 >= LBItemMax Then Exit;
+  If Wnds^[W].Extra = 0 Then Wnds^[W].Extra := KAlloc(LBItemMax * 4);
+  If Wnds^[W].K1 >= LBItemMax Then Exit;
   A := KAlloc(Length(S) + 1);
   PutPStr(A, S, 256);
-  MemL[0:Wnds[W].Extra + Wnds[W].K1 * 4] := A;
-  Inc(Wnds[W].K1);
+  MemL[0:Wnds^[W].Extra + Wnds^[W].K1 * 4] := A;
+  Inc(Wnds^[W].K1);
 End;
 
 Procedure LBClear(W : LongInt);
 Var I : LongInt;
 Begin
-  For I := 0 To Wnds[W].K1 - 1 Do KFree(MemL[0:Wnds[W].Extra + I * 4]);
-  Wnds[W].K1 := 0; Wnds[W].K2 := -1;
+  For I := 0 To Wnds^[W].K1 - 1 Do KFree(MemL[0:Wnds^[W].Extra + I * 4]);
+  Wnds^[W].K1 := 0; Wnds^[W].K2 := -1;
 End;
 
 Procedure Notify(W, Code : LongInt);
 Begin
-  If (Wnds[W].Parent >= 0) Then
-    PostMsgW(Wnds[W].Parent, WM_COMMAND, (Code Shl 16) Or
-             (Wnds[W].Id And $FFFF), HwndOf(W));
+  If (Wnds^[W].Parent >= 0) Then
+    PostMsgW(Wnds^[W].Parent, WM_COMMAND, (Code Shl 16) Or
+             (Wnds^[W].Id And $FFFF), HwndOf(W));
 End;
 
 { Procedure des controles et des fenetres internes }
@@ -18065,19 +18182,19 @@ Function KWndProc(W, Msg, WP, LP : LongInt) : LongInt;
 Var Typ, I, N : LongInt; S : String;
 Begin
   KWndProc := 0;
-  If (Wnds[W].IKind = ikDialog) And (Wnds[W].DlgProc <> 0) And
+  If (Wnds^[W].IKind = ikDialog) And (Wnds^[W].DlgProc <> 0) And
      Not KillingApp Then
   Begin
-    I := CallProc(Wnds[W].DlgProc, HwndOf(W), Msg, WP, LP);
+    I := CallProc(Wnds^[W].DlgProc, HwndOf(W), Msg, WP, LP);
     If I <> 0 Then
     Begin
       If (Msg = WM_CTLCOLORMSGBOX) Or ((Msg > WM_CTLCOLORMSGBOX) And
          (Msg <= WM_CTLCOLORSTATIC)) Or (Msg = WM_INITDIALOG) Then
         KWndProc := I
-      Else KWndProc := Wnds[W].DlgResult;
+      Else KWndProc := Wnds^[W].DlgResult;
       Exit;
     End;
-    If Not Wnds[W].Used Then Exit;
+    If Not Wnds^[W].Used Then Exit;
     If Msg = WM_CLOSE Then
     Begin
       PostMsgW(W, WM_COMMAND, IDCANCEL, 0);
@@ -18085,100 +18202,100 @@ Begin
     End;
     If Msg = WM_PAINT Then
     Begin
-      Wnds[W].KNeedPaint := True;
+      Wnds^[W].KNeedPaint := True;
       Exit;
     End;
   End;
   Case Msg Of
     WM_NCCREATE : KWndProc := 1;
     WM_CREATE :
-      If Wnds[W].IKind In [ikListBox, ikComboBox] Then Wnds[W].K2 := -1;
+      If Wnds^[W].IKind In [ikListBox, ikComboBox] Then Wnds^[W].K2 := -1;
     WM_CLOSE :
       If Not IsChildW(W) Then
       Begin
-        If Wnds[W].IKind = ikMsgBox Then MsgBoxEnd(W, IDCANCEL)
-        Else If Wnds[W].IKind = ikShutdown Then DialogAction(W, 1)
-        Else If Wnds[W].IKind = ikNotepad Then KCommand(cmNExit)
-        Else If Wnds[W].IKind = ikFileDlg Then FdClose(False)
+        If Wnds^[W].IKind = ikMsgBox Then MsgBoxEnd(W, IDCANCEL)
+        Else If Wnds^[W].IKind = ikShutdown Then DialogAction(W, 1)
+        Else If Wnds^[W].IKind = ikNotepad Then KCommand(cmNExit)
+        Else If Wnds^[W].IKind = ikFileDlg Then FdClose(False)
         Else DestroyW(W);
       End;
     WM_SETTEXT :
     Begin
-      Wnds[W].Text := PStr(LP);
+      Wnds^[W].Text := PStr(LP);
       KWndProc := 1;
-      If IsChildW(W) Then InvalAll(W, True) Else Wnds[W].NeedNc := True;
+      If IsChildW(W) Then InvalAll(W, True) Else Wnds^[W].NeedNc := True;
     End;
     WM_GETTEXT :
     Begin
-      PutPStr(LP, Wnds[W].Text, WP);
-      KWndProc := Min(Length(Wnds[W].Text), Max(0, WP - 1));
+      PutPStr(LP, Wnds^[W].Text, WP);
+      KWndProc := Min(Length(Wnds^[W].Text), Max(0, WP - 1));
     End;
-    WM_GETTEXTLENGTH : KWndProc := Length(Wnds[W].Text);
+    WM_GETTEXTLENGTH : KWndProc := Length(Wnds^[W].Text);
     WM_PAINT : If IsChildW(W) Then DrawCtl(W);
-    WM_SETFONT : Wnds[W].Font := WP;
-    WM_GETFONT : KWndProc := Wnds[W].Font;
+    WM_SETFONT : Wnds^[W].Font := WP;
+    WM_GETFONT : KWndProc := Wnds^[W].Font;
     WM_ENABLE : InvalAll(W, True);
-    BM_GETCHECK : KWndProc := Wnds[W].K1;
+    BM_GETCHECK : KWndProc := Wnds^[W].K1;
     BM_SETCHECK :
     Begin
-      Wnds[W].K1 := WP;
+      Wnds^[W].K1 := WP;
       InvalAll(W, True);
     End;
-    BM_GETSTATE : KWndProc := Wnds[W].K1 Or (Wnds[W].K2 Shl 2);
+    BM_GETSTATE : KWndProc := Wnds^[W].K1 Or (Wnds^[W].K2 Shl 2);
     WM_LBUTTONDOWN :
-      If Wnds[W].IKind = ikButton Then
+      If Wnds^[W].IKind = ikButton Then
       Begin
-        Wnds[W].K2 := 1;
+        Wnds^[W].K2 := 1;
         CaptureWin := W;
         InvalAll(W, True);
       End
-      Else If Wnds[W].IKind In [ikListBox, ikComboBox] Then
+      Else If Wnds^[W].IKind In [ikListBox, ikComboBox] Then
       Begin
         I := ((LP Shr 16) And $FFFF - 2) Div 16;
-        If (I >= 0) And (I < Wnds[W].K1) Then
+        If (I >= 0) And (I < Wnds^[W].K1) Then
         Begin
-          Wnds[W].K2 := I;
+          Wnds^[W].K2 := I;
           InvalAll(W, True);
           Notify(W, 1);
         End;
       End;
     WM_LBUTTONUP :
-      If (Wnds[W].IKind = ikButton) And (Wnds[W].K2 <> 0) Then
+      If (Wnds^[W].IKind = ikButton) And (Wnds^[W].K2 <> 0) Then
       Begin
-        Wnds[W].K2 := 0;
+        Wnds^[W].K2 := 0;
         If CaptureWin = W Then CaptureWin := -1;
-        Typ := Wnds[W].Style And BS_TYPEMASK;
-        If Typ = BS_AUTOCHECKBOX Then Wnds[W].K1 := 1 - Wnds[W].K1;
+        Typ := Wnds^[W].Style And BS_TYPEMASK;
+        If Typ = BS_AUTOCHECKBOX Then Wnds^[W].K1 := 1 - Wnds^[W].K1;
         If Typ = BS_AUTORADIOBUTTON Then
         Begin
           For I := 0 To MaxWnd - 1 Do
-            If Wnds[I].Used And (Wnds[I].Parent = Wnds[W].Parent) And
-               (Wnds[I].IKind = ikButton) And
-               ((Wnds[I].Style And BS_TYPEMASK) = BS_AUTORADIOBUTTON) Then
+            If Wnds^[I].Used And (Wnds^[I].Parent = Wnds^[W].Parent) And
+               (Wnds^[I].IKind = ikButton) And
+               ((Wnds^[I].Style And BS_TYPEMASK) = BS_AUTORADIOBUTTON) Then
             Begin
-              Wnds[I].K1 := 0;
+              Wnds^[I].K1 := 0;
               InvalAll(I, True);
             End;
-          Wnds[W].K1 := 1;
+          Wnds^[W].K1 := 1;
         End;
         InvalAll(W, True);
         Notify(W, BN_CLICKED);
       End;
     WM_LBUTTONDBLCLK :
-      If Wnds[W].IKind In [ikListBox, ikComboBox] Then Notify(W, 2);
+      If Wnds^[W].IKind In [ikListBox, ikComboBox] Then Notify(W, 2);
     WM_CHAR :
-      If Wnds[W].IKind = ikEdit Then
+      If Wnds^[W].IKind = ikEdit Then
       Begin
-        If WP = 8 Then Delete(Wnds[W].Text, Length(Wnds[W].Text), 1)
-        Else If (WP >= 32) And (Length(Wnds[W].Text) < 120) Then
-          Wnds[W].Text := Wnds[W].Text + Chr(WP);
+        If WP = 8 Then Delete(Wnds^[W].Text, Length(Wnds^[W].Text), 1)
+        Else If (WP >= 32) And (Length(Wnds^[W].Text) < 120) Then
+          Wnds^[W].Text := Wnds^[W].Text + Chr(WP);
         InvalAll(W, True);
         Notify(W, $300);
       End;
     LB_ADDSTRING, CB_ADDSTRING :
     Begin
       LBAdd(W, PStr(LP));
-      KWndProc := Wnds[W].K1 - 1;
+      KWndProc := Wnds^[W].K1 - 1;
       InvalAll(W, True);
     End;
     LB_RESETCONTENT, CB_RESETCONTENT :
@@ -18188,22 +18305,22 @@ Begin
     End;
     LB_SETCURSEL, CB_SETCURSEL :
     Begin
-      Wnds[W].K2 := WP;
+      Wnds^[W].K2 := WP;
       InvalAll(W, True);
     End;
-    LB_GETCURSEL, CB_GETCURSEL : KWndProc := Wnds[W].K2;
-    LB_GETCOUNT, $146 : KWndProc := Wnds[W].K1;
+    LB_GETCURSEL, CB_GETCURSEL : KWndProc := Wnds^[W].K2;
+    LB_GETCOUNT, $146 : KWndProc := Wnds^[W].K1;
     LB_GETTEXT, $148 :
-      If (WP >= 0) And (WP < Wnds[W].K1) Then
+      If (WP >= 0) And (WP < Wnds^[W].K1) Then
       Begin
-        S := PStr(MemL[0:Wnds[W].Extra + WP * 4]);
+        S := PStr(MemL[0:Wnds^[W].Extra + WP * 4]);
         PutPStr(LP, S, 256);
         KWndProc := Length(S);
       End
       Else KWndProc := -1;
     LB_GETTEXTLEN, $149 :
-      If (WP >= 0) And (WP < Wnds[W].K1) Then
-        KWndProc := StrLenZ(MemL[0:Wnds[W].Extra + WP * 4])
+      If (WP >= 0) And (WP < Wnds^[W].K1) Then
+        KWndProc := StrLenZ(MemL[0:Wnds^[W].Extra + WP * 4])
       Else KWndProc := -1;
   End;
   N := 0;
@@ -19071,7 +19188,7 @@ Begin
   ConTitle := PStr(P);
   If ConW >= 0 Then
   Begin
-    Wnds[ConW].Text := ConTitle;
+    Wnds^[ConW].Text := ConTitle;
     KRepaint(ConW);
     TaskbarChanged;
   End;
@@ -19151,8 +19268,8 @@ Begin
     { peripherique nul : lectures vides, ecritures ignorees }
     I := KObjNew(koFile);
     If I < 0 Then Exit;
-    KObjs[I].F1 := -1; KObjs[I].F4 := -2; KObjs[I].F5 := 1;
-    KObjs[I].Name := 'NUL';
+    KObjs^[I].F1 := -1; KObjs^[I].F4 := -2; KObjs^[I].F5 := 1;
+    KObjs^[I].Name := 'NUL';
     KOpenFile := KHandle(I);
     Exit;
   End;
@@ -19175,13 +19292,13 @@ Begin
       SetErr(4);
       Exit;
     End;
-    KObjs[I].F1 := -1;
-    KObjs[I].F2 := FoSize[F];
-    KObjs[I].F3 := 0;
-    KObjs[I].F4 := -1000 - F;
-    KObjs[I].F5 := Ord(Wr);
-    KObjs[I].F6 := FoTime[F];
-    KObjs[I].Name := Path;
+    KObjs^[I].F1 := -1;
+    KObjs^[I].F2 := FoSize[F];
+    KObjs^[I].F3 := 0;
+    KObjs^[I].F4 := -1000 - F;
+    KObjs^[I].F5 := Ord(Wr);
+    KObjs^[I].F6 := FoTime[F];
+    KObjs^[I].Name := Path;
     If (Disp = 4) And Not FoDirty[F] Then SetErr(183) Else SetErr(0);
     KOpenFile := KHandle(I);
     Exit;
@@ -19243,13 +19360,13 @@ Begin
     SetErr(4);
     Exit;
   End;
-  KObjs[I].F1 := Lba;
-  If Ram >= 0 Then KObjs[I].F2 := RamFiles[Ram].Size Else KObjs[I].F2 := Size;
-  KObjs[I].F3 := 0;
-  KObjs[I].F4 := Ram;
-  KObjs[I].F5 := Ord(Wr);
-  KObjs[I].F6 := Time;
-  KObjs[I].Name := Path;
+  KObjs^[I].F1 := Lba;
+  If Ram >= 0 Then KObjs^[I].F2 := RamFiles[Ram].Size Else KObjs^[I].F2 := Size;
+  KObjs^[I].F3 := 0;
+  KObjs^[I].F4 := Ram;
+  KObjs^[I].F5 := Ord(Wr);
+  KObjs^[I].F6 := Time;
+  KObjs^[I].Name := Path;
   SetErr(0);
   KOpenFile := KHandle(I);
 End;
@@ -19272,14 +19389,14 @@ Begin
     SetErr(ErrInvalidHandle);
     Exit;
   End;
-  If KObjs[I].Kind = koThread Then
+  If KObjs^[I].Kind = koThread Then
   Begin
     { la tache continue ; l'objet sera libere a sa fin }
-    If (KObjs[I].F1 >= 0) And Threads[KObjs[I].F1].Used Then Exit;
+    If (KObjs^[I].F1 >= 0) And Threads[KObjs^[I].F1].Used Then Exit;
   End;
-  If (KObjs[I].Kind = koFile) And (KObjs[I].F4 <= -1000) Then
-    FatClose(-1000 - KObjs[I].F4);
-  KObjs[I].Used := False;
+  If (KObjs^[I].Kind = koFile) And (KObjs^[I].F4 <= -1000) Then
+    FatClose(-1000 - KObjs^[I].F4);
+  KObjs^[I].Used := False;
 End;
 
 Function KReadFile(H, Buf, N : LongInt; Var Got : LongInt) : Boolean;
@@ -19301,28 +19418,28 @@ Begin
     Exit;
   End;
   If N < 0 Then N := 0;
-  If KObjs[I].F4 <= -1000 Then
+  If KObjs^[I].F4 <= -1000 Then
   Begin
-    R := -1000 - KObjs[I].F4;
+    R := -1000 - KObjs^[I].F4;
     FatIoErr := False;
-    Got := FatRead(R, KObjs[I].F3, N, Buf);
-    KObjs[I].F3 := KObjs[I].F3 + Got;
-    KObjs[I].F2 := FoSize[R];
+    Got := FatRead(R, KObjs^[I].F3, N, Buf);
+    KObjs^[I].F3 := KObjs^[I].F3 + Got;
+    KObjs^[I].F2 := FoSize[R];
     If FatIoErr Then SetErr(30);
     KReadFile := Not FatIoErr;
     Exit;
   End;
-  If KObjs[I].F3 + N > KObjs[I].F2 Then N := KObjs[I].F2 - KObjs[I].F3;
+  If KObjs^[I].F3 + N > KObjs^[I].F2 Then N := KObjs^[I].F2 - KObjs^[I].F3;
   If N < 0 Then N := 0;
-  R := KObjs[I].F4;
-  If R >= 0 Then MoveMem(RamFiles[R].Data + KObjs[I].F3, Buf, N)
+  R := KObjs^[I].F4;
+  If R >= 0 Then MoveMem(RamFiles[R].Data + KObjs^[I].F3, Buf, N)
   Else If N > 0 Then
-    If Not CdReadBytes(KObjs[I].F1, KObjs[I].F3, N, Buf) Then
+    If Not CdReadBytes(KObjs^[I].F1, KObjs^[I].F3, N, Buf) Then
     Begin
       SetErr(30);
       Exit;
     End;
-  KObjs[I].F3 := KObjs[I].F3 + N;
+  KObjs^[I].F3 := KObjs^[I].F3 + N;
   Got := N;
   KReadFile := True;
 End;
@@ -19352,19 +19469,19 @@ Begin
     Exit;
   End;
   I := KObjOf(H, koFile);
-  If (I >= 0) And (KObjs[I].F4 = -2) Then
+  If (I >= 0) And (KObjs^[I].F4 = -2) Then
   Begin
     KWriteFile := N;                               { NUL }
     Exit;
   End;
-  If (I >= 0) And (KObjs[I].F4 <= -1000) And (KObjs[I].F5 <> 0) Then
+  If (I >= 0) And (KObjs^[I].F4 <= -1000) And (KObjs^[I].F5 <> 0) Then
   Begin
-    R := -1000 - KObjs[I].F4;
+    R := -1000 - KObjs^[I].F4;
     FatIoErr := False;
-    E := FatWrite(R, KObjs[I].F3, N, Buf);
+    E := FatWrite(R, KObjs^[I].F3, N, Buf);
     If E < 0 Then E := 0;
-    KObjs[I].F3 := KObjs[I].F3 + E;
-    KObjs[I].F2 := FoSize[R];
+    KObjs^[I].F3 := KObjs^[I].F3 + E;
+    KObjs^[I].F2 := FoSize[R];
     If (E < N) Or FatIoErr Then
     Begin
       If FatIoErr Then SetErr(29) Else SetErr(112);
@@ -19373,25 +19490,25 @@ Begin
     KWriteFile := E;
     Exit;
   End;
-  If (I < 0) Or (KObjs[I].F4 < 0) Then
+  If (I < 0) Or (KObjs^[I].F4 < 0) Then
   Begin
     SetErr(ErrAccessDenied);
     Exit;
   End;
-  R := KObjs[I].F4;
-  E := KObjs[I].F3 + N;
+  R := KObjs^[I].F4;
+  E := KObjs^[I].F3 + N;
   If Not RamReserve(R, E) Then
   Begin
     SetErr(112);
     Exit;
   End;
-  If KObjs[I].F3 > RamFiles[R].Size Then
-    FillMem(RamFiles[R].Data + RamFiles[R].Size, KObjs[I].F3 -
+  If KObjs^[I].F3 > RamFiles[R].Size Then
+    FillMem(RamFiles[R].Data + RamFiles[R].Size, KObjs^[I].F3 -
             RamFiles[R].Size, 0);
-  MoveMem(Buf, RamFiles[R].Data + KObjs[I].F3, N);
-  KObjs[I].F3 := E;
+  MoveMem(Buf, RamFiles[R].Data + KObjs^[I].F3, N);
+  KObjs^[I].F3 := E;
   If E > RamFiles[R].Size Then RamFiles[R].Size := E;
-  KObjs[I].F2 := RamFiles[R].Size;
+  KObjs^[I].F2 := RamFiles[R].Size;
   RamFiles[R].Time := DosNow;
   KWriteFile := N;
 End;
@@ -19416,16 +19533,16 @@ Begin
   End;
   Case Method Of
     0 : P := Dist;
-    1 : P := KObjs[I].F3 + Dist;
+    1 : P := KObjs^[I].F3 + Dist;
   Else
-    P := KObjs[I].F2 + Dist;
+    P := KObjs^[I].F2 + Dist;
   End;
   If P < 0 Then
   Begin
     SetErr(131);
     Exit;
   End;
-  KObjs[I].F3 := P;
+  KObjs^[I].F3 := P;
   If PHigh <> 0 Then MemL[0:PHigh] := 0;
   SetFilePointer := P;
 End;
@@ -19435,7 +19552,7 @@ Var I : LongInt;
 Begin
   I := KObjOf(H, koFile);
   If PHigh <> 0 Then MemL[0:PHigh] := 0;
-  If I < 0 Then GetFileSize := -1 Else GetFileSize := KObjs[I].F2;
+  If I < 0 Then GetFileSize := -1 Else GetFileSize := KObjs^[I].F2;
 End;
 
 Function SetEndOfFile(H : LongInt) : LongInt;
@@ -19443,20 +19560,20 @@ Var I : LongInt;
 Begin
   SetEndOfFile := 0;
   I := KObjOf(H, koFile);
-  If (I >= 0) And (KObjs[I].F4 <= -1000) And (KObjs[I].F5 <> 0) Then
+  If (I >= 0) And (KObjs^[I].F4 <= -1000) And (KObjs^[I].F5 <> 0) Then
   Begin
-    If Not FatSetSize(-1000 - KObjs[I].F4, KObjs[I].F3) Then
+    If Not FatSetSize(-1000 - KObjs^[I].F4, KObjs^[I].F3) Then
     Begin
       SetErr(112);
       Exit;
     End;
-    KObjs[I].F2 := KObjs[I].F3;
+    KObjs^[I].F2 := KObjs^[I].F3;
     SetEndOfFile := 1;
     Exit;
   End;
-  If (I < 0) Or (KObjs[I].F4 < 0) Then Exit;
-  RamFiles[KObjs[I].F4].Size := KObjs[I].F3;
-  KObjs[I].F2 := KObjs[I].F3;
+  If (I < 0) Or (KObjs^[I].F4 < 0) Then Exit;
+  RamFiles[KObjs^[I].F4].Size := KObjs^[I].F3;
+  KObjs^[I].F2 := KObjs^[I].F3;
   SetEndOfFile := 1;
 End;
 
@@ -19478,9 +19595,9 @@ Begin
   GetFileTime := 0;
   I := KObjOf(H, koFile);
   If I < 0 Then Exit;
-  If PC <> 0 Then DosToFileTime(KObjs[I].F6, PC);
-  If PA <> 0 Then DosToFileTime(KObjs[I].F6, PA);
-  If PW <> 0 Then DosToFileTime(KObjs[I].F6, PW);
+  If PC <> 0 Then DosToFileTime(KObjs^[I].F6, PC);
+  If PA <> 0 Then DosToFileTime(KObjs^[I].F6, PA);
+  If PW <> 0 Then DosToFileTime(KObjs^[I].F6, PW);
   GetFileTime := 1;
 End;
 
@@ -19855,15 +19972,15 @@ Function FindStep(I, P : LongInt) : Boolean;
 Var Nm : String; Lba, Size, Fl, Tm, DL, DS, Attr, R, Idx : LongInt;
 Begin
   FindStep := False;
-  If KObjs[I].F2 = 2 Then
+  If KObjs^[I].F2 = 2 Then
   Begin
     { volume FAT : noms longs et noms courts }
-    Idx := KObjs[I].F1;
-    While FatDirEntry(KObjs[I].Name, 0, Idx) Do
+    Idx := KObjs^[I].F1;
+    While FatDirEntry(KObjs^[I].Name, 0, Idx) Do
     Begin
-      KObjs[I].F1 := Idx;
-      If MatchMask(UpStr(FfName), KObjs[I].Mask) Or
-         MatchMask(UpStr(FfShort), KObjs[I].Mask) Then
+      KObjs^[I].F1 := Idx;
+      If MatchMask(UpStr(FfName), KObjs^[I].Mask) Or
+         MatchMask(UpStr(FfShort), KObjs^[I].Mask) Then
       Begin
         FillMem(P, 318, 0);
         Attr := FfAttr And $37;
@@ -19879,17 +19996,17 @@ Begin
         Exit;
       End;
     End;
-    KObjs[I].F1 := Idx;
+    KObjs^[I].F1 := Idx;
     Exit;
   End;
-  If KObjs[I].F2 = 0 Then
+  If KObjs^[I].F2 = 0 Then
   Begin
-    If Copy(KObjs[I].Name, 1, 2) = 'D:' Then
-      If IsoLookup(Copy(KObjs[I].Name, 3, 255), DL, DS, Fl, Tm) Then
-        While IsoDirEntry(DL, DS, KObjs[I].F1, Nm, Lba, Size, Fl, Tm) Do
+    If Copy(KObjs^[I].Name, 1, 2) = 'D:' Then
+      If IsoLookup(Copy(KObjs^[I].Name, 3, 255), DL, DS, Fl, Tm) Then
+        While IsoDirEntry(DL, DS, KObjs^[I].F1, Nm, Lba, Size, Fl, Tm) Do
         Begin
-          Inc(KObjs[I].F1);
-          If MatchMask(Nm, KObjs[I].Mask) Then
+          Inc(KObjs^[I].F1);
+          If MatchMask(Nm, KObjs^[I].Mask) Then
           Begin
             FillMem(P, 318, 0);
             If (Fl And 2) <> 0 Then Attr := $11 Else Attr := $21;
@@ -19904,15 +20021,15 @@ Begin
             Exit;
           End;
         End;
-    KObjs[I].F2 := 1;
-    KObjs[I].F1 := 0;
+    KObjs^[I].F2 := 1;
+    KObjs^[I].F1 := 0;
   End;
-  While KObjs[I].F1 < MaxRam Do
+  While KObjs^[I].F1 < MaxRam Do
   Begin
-    R := KObjs[I].F1;
-    Inc(KObjs[I].F1);
-    If RamFiles[R].Used And (ParentDir(RamFiles[R].Path) = KObjs[I].Name)
-       And MatchMask(BaseName(RamFiles[R].Path), KObjs[I].Mask) Then
+    R := KObjs^[I].F1;
+    Inc(KObjs^[I].F1);
+    If RamFiles[R].Used And (ParentDir(RamFiles[R].Path) = KObjs^[I].Name)
+       And MatchMask(BaseName(RamFiles[R].Path), KObjs^[I].Mask) Then
     Begin
       FillMem(P, 318, 0);
       MemL[0:P] := RamFiles[R].Attr;
@@ -19932,18 +20049,18 @@ Begin
   I := KObjNew(koFind);
   If I < 0 Then Exit;
   S := FullPath(PStr(PName));
-  KObjs[I].Name := ParentDir(S);
-  If Length(KObjs[I].Name) = 3 Then
-    KObjs[I].Name := Copy(KObjs[I].Name, 1, 3);
-  KObjs[I].Mask := Copy(BaseName(S), 1, 63);
-  If Length(KObjs[I].Name) = 3 Then
-    KObjs[I].Name := Copy(KObjs[I].Name, 1, 2) + '\';
-  If KObjs[I].Name = 'D:\' Then KObjs[I].Name := 'D:';
-  If FatVolOf(KObjs[I].Name) >= 0 Then KObjs[I].F2 := 2;
+  KObjs^[I].Name := ParentDir(S);
+  If Length(KObjs^[I].Name) = 3 Then
+    KObjs^[I].Name := Copy(KObjs^[I].Name, 1, 3);
+  KObjs^[I].Mask := Copy(BaseName(S), 1, 63);
+  If Length(KObjs^[I].Name) = 3 Then
+    KObjs^[I].Name := Copy(KObjs^[I].Name, 1, 2) + '\';
+  If KObjs^[I].Name = 'D:\' Then KObjs^[I].Name := 'D:';
+  If FatVolOf(KObjs^[I].Name) >= 0 Then KObjs^[I].F2 := 2;
   If FindStep(I, P) Then FindFirstFileA := KHandle(I)
   Else
   Begin
-    KObjs[I].Used := False;
+    KObjs^[I].Used := False;
     SetErr(ErrFileNotFound);
   End;
 End;
@@ -19961,7 +20078,7 @@ Function FindClose(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   I := KObjOf(H, koFind);
-  If I >= 0 Then KObjs[I].Used := False;
+  If I >= 0 Then KObjs^[I].Used := False;
   FindClose := 1;
 End;
 
@@ -20672,6 +20789,8 @@ Begin
     Exit;
   End;
   KLog('CreateThread ' + IntStr(T) + ' -> ' + HexStr(Start, 8));
+  { CREATE_SUSPENDED : la tache attend ResumeThread }
+  If (Flags And 4) <> 0 Then Threads[T].Susp := 1;
   If PTid <> 0 Then MemL[0:PTid] := ThreadId(T);
   CreateThread := KHandle(Threads[T].KObj);
 End;
@@ -20691,9 +20810,53 @@ Begin
   GetThreadPriority := 0;
 End;
 
-Function ResumeThread(H : LongInt) : LongInt;
+{ Tache designee par une poignee (-2 : la tache courante), -1 sinon }
+Function ThreadOfH(H : LongInt) : LongInt;
+Var I, T : LongInt;
 Begin
-  ResumeThread := 1;
+  T := -1;
+  If H = -2 Then T := CurT
+  Else
+  Begin
+    I := KObjOf(H, koThread);
+    If I >= 0 Then T := KObjs^[I].F1;
+  End;
+  If (T >= 0) And (T < MaxThread) Then
+    If Not Threads[T].Used Or (Threads[T].State = tsDead) Then T := -1;
+  If T >= MaxThread Then T := -1;
+  ThreadOfH := T;
+End;
+
+{ ResumeThread : decremente le compteur de suspension, la tache repart
+  quand il revient a 0 ; rend l'ancien compteur }
+Function ResumeThread(H : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  ResumeThread := -1;
+  T := ThreadOfH(H);
+  If T < 0 Then Exit;
+  ResumeThread := Threads[T].Susp;
+  If Threads[T].Susp > 0 Then Dec(Threads[T].Susp);
+End;
+
+{ SuspendThread : la tache ne recoit plus le processeur tant que son
+  compteur n'est pas revenu a 0 (une tache qui se suspend elle-meme
+  attend ici son ResumeThread) }
+Function SuspendThread(H : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  SuspendThread := -1;
+  T := ThreadOfH(H);
+  If T < 0 Then Exit;
+  { la tache 0 (bureau) ne peut pas etre arretee }
+  If T = 0 Then
+  Begin
+    SuspendThread := 0;
+    Exit;
+  End;
+  SuspendThread := Threads[T].Susp;
+  If Threads[T].Susp < 127 Then Inc(Threads[T].Susp);
+  If T = CurT Then KBlock;
 End;
 
 Function GetExitCodeThread(H, P : LongInt) : LongInt;
@@ -20702,8 +20865,8 @@ Begin
   I := KObjOf(H, koThread);
   If (I >= 0) And (P <> 0) Then
   Begin
-    If KObjs[I].F2 <> 0 Then MemL[0:P] := 0
-    Else MemL[0:P] := Threads[KObjs[I].F1].ExitCode;
+    If KObjs^[I].F2 <> 0 Then MemL[0:P] := 0
+    Else MemL[0:P] := Threads[KObjs^[I].F1].ExitCode;
   End;
   GetExitCodeThread := Ord(I >= 0);
 End;
@@ -20717,7 +20880,7 @@ Begin
     CreateSemaphoreA := 0;
     Exit;
   End;
-  KObjs[I].F1 := Init; KObjs[I].F2 := Mx;
+  KObjs^[I].F1 := Init; KObjs^[I].F2 := Mx;
   CreateSemaphoreA := KHandle(I);
 End;
 
@@ -20727,8 +20890,8 @@ Begin
   ReleaseSemaphore := 0;
   I := KObjOf(H, koSemaphore);
   If I < 0 Then Exit;
-  If Prev <> 0 Then MemL[0:Prev] := KObjs[I].F1;
-  KObjs[I].F1 := Min(KObjs[I].F1 + N, KObjs[I].F2);
+  If Prev <> 0 Then MemL[0:Prev] := KObjs^[I].F1;
+  KObjs^[I].F1 := Min(KObjs^[I].F1 + N, KObjs^[I].F2);
   ReleaseSemaphore := 1;
 End;
 
@@ -20741,7 +20904,7 @@ Begin
     CreateEventA := 0;
     Exit;
   End;
-  KObjs[I].F1 := Ord(Init <> 0); KObjs[I].F2 := Ord(Manual <> 0);
+  KObjs^[I].F1 := Ord(Init <> 0); KObjs^[I].F2 := Ord(Manual <> 0);
   CreateEventA := KHandle(I);
 End;
 
@@ -20749,7 +20912,7 @@ Function SetEvent(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   I := KObjOf(H, koEvent);
-  If I >= 0 Then KObjs[I].F1 := 1;
+  If I >= 0 Then KObjs^[I].F1 := 1;
   SetEvent := Ord(I >= 0);
 End;
 
@@ -20757,7 +20920,7 @@ Function ResetEvent(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   I := KObjOf(H, koEvent);
-  If I >= 0 Then KObjs[I].F1 := 0;
+  If I >= 0 Then KObjs^[I].F1 := 0;
   ResetEvent := Ord(I >= 0);
 End;
 
@@ -20774,8 +20937,8 @@ Begin
   { mutex nomme deja cree : meme objet, ERROR_ALREADY_EXISTS }
   If Name <> 0 Then
     For I := 0 To MaxKObj - 1 Do
-      If KObjs[I].Used And (KObjs[I].Kind = koMutex) And
-         (KObjs[I].Name = UpStr(PStr(Name))) Then
+      If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
+         (KObjs^[I].Name = UpStr(PStr(Name))) Then
       Begin
         SetErr(183);
         CreateMutexA := KHandle(I);
@@ -20787,10 +20950,10 @@ Begin
     CreateMutexA := 0;
     Exit;
   End;
-  If Name <> 0 Then KObjs[I].Name := UpStr(PStr(Name));
+  If Name <> 0 Then KObjs^[I].Name := UpStr(PStr(Name));
   If Own <> 0 Then
   Begin
-    KObjs[I].F1 := ThreadId(CurT); KObjs[I].F2 := 1;
+    KObjs^[I].F1 := ThreadId(CurT); KObjs^[I].F2 := 1;
   End;
   CreateMutexA := KHandle(I);
 End;
@@ -20801,10 +20964,10 @@ Begin
   I := KObjOf(H, koMutex);
   If I >= 0 Then
   Begin
-    Dec(KObjs[I].F2);
-    If KObjs[I].F2 <= 0 Then
+    Dec(KObjs^[I].F2);
+    If KObjs^[I].F2 <= 0 Then
     Begin
-      KObjs[I].F1 := 0; KObjs[I].F2 := 0;
+      KObjs^[I].F1 := 0; KObjs^[I].F2 := 0;
     End;
   End;
   ReleaseMutex := Ord(I >= 0);
@@ -21139,7 +21302,7 @@ Begin
   GTab := 0; GTop := -1;
   If Dcs[D].Wnd >= 0 Then
   Begin
-    If Not Wnds[Dcs[D].Wnd].Used Then Exit;
+    If Not Wnds^[Dcs[D].Wnd].Used Then Exit;
     If Not WndTarget(Dcs[D].Wnd, Dcs[D].Client, S, OX, OY, Clip) Then Exit;
     GTop := TopOf(Dcs[D].Wnd);
   End
@@ -21183,10 +21346,10 @@ End;
 Procedure DcDirty(X1, Y1, X2, Y2 : LongInt);
 Begin
   If GTop >= 0 Then
-    MarkDirty(Wnds[GTop].X + Max(X1 - DOX, GClip.L),
-              Wnds[GTop].Y + Max(Y1 - DOY, GClip.T),
-              Wnds[GTop].X + Min(X2 - DOX + 1, GClip.R),
-              Wnds[GTop].Y + Min(Y2 - DOY + 1, GClip.B))
+    MarkDirty(Wnds^[GTop].X + Max(X1 - DOX, GClip.L),
+              Wnds^[GTop].Y + Max(Y1 - DOY, GClip.T),
+              Wnds^[GTop].X + Min(X2 - DOX + 1, GClip.R),
+              Wnds^[GTop].Y + Min(Y2 - DOY + 1, GClip.B))
   Else If (GDc >= 0) And Dcs[GDc].Screen Then
     MarkDirty(X1, Y1, X2 + 1, Y2 + 1);
 End;
@@ -23339,6 +23502,18 @@ End;
 { Informations sur le peripherique, impression                       }
 { ------------------------------------------------------------------ }
 
+{ Profondeur annoncee aux programmes : celle de la carte (16, 24 ou 32
+  bits ; 15 bits est annonce 16 comme sous Windows), 8 bits sinon. Les
+  programmes qui exigent la couleur 16 bits fonctionnent donc en
+  High Color ou True Color et refusent le mode 256 couleurs, comme sous
+  Windows 95 (l'ecran reste compose en 256 couleurs par Pasdows) }
+Function HiBits : LongInt;
+Begin
+  If ScrBpp >= 24 Then HiBits := ScrBpp
+  Else If ScrBpp >= 15 Then HiBits := 16
+  Else HiBits := 8;
+End;
+
 Function GetDeviceCaps(Hdc, I : LongInt) : LongInt;
 Begin
   Case I Of
@@ -23348,24 +23523,29 @@ Begin
     6 : GetDeviceCaps := 127;
     8 : GetDeviceCaps := ScrW;      { HORZRES }
     10 : GetDeviceCaps := ScrH;     { VERTRES }
-    12 : GetDeviceCaps := 8;        { BITSPIXEL }
+    12 : GetDeviceCaps := HiBits;   { BITSPIXEL }
     14 : GetDeviceCaps := 1;        { PLANES }
     16 : GetDeviceCaps := -1;
     18 : GetDeviceCaps := 0;
     20 : GetDeviceCaps := 0;
     22 : GetDeviceCaps := 0;
-    24 : GetDeviceCaps := 20;       { NUMCOLORS }
+    24 : If HiBits > 8 Then GetDeviceCaps := -1
+         Else GetDeviceCaps := 20;  { NUMCOLORS }
     26 : GetDeviceCaps := 0;
     28 : GetDeviceCaps := 1;
-    38 : GetDeviceCaps := $7F99;    { RASTERCAPS (avec RC_PALETTE) }
+    38 : If HiBits > 8 Then GetDeviceCaps := $7E99
+         Else GetDeviceCaps := $7F99; { RASTERCAPS, RC_PALETTE en 8 bits }
     40 : GetDeviceCaps := 36;
     42 : GetDeviceCaps := 36;
     44 : GetDeviceCaps := 51;
     88 : GetDeviceCaps := 96;       { LOGPIXELSX }
     90 : GetDeviceCaps := 96;
-    104 : GetDeviceCaps := 256;     { SIZEPALETTE }
-    106 : GetDeviceCaps := 20;      { NUMRESERVED }
-    108 : GetDeviceCaps := 18;      { COLORRES }
+    104 : If HiBits > 8 Then GetDeviceCaps := 0
+          Else GetDeviceCaps := 256; { SIZEPALETTE }
+    106 : If HiBits > 8 Then GetDeviceCaps := 0
+          Else GetDeviceCaps := 20; { NUMRESERVED }
+    108 : If HiBits > 8 Then GetDeviceCaps := HiBits
+          Else GetDeviceCaps := 18; { COLORRES }
     116 : GetDeviceCaps := 60;      { VREFRESH }
   Else
     GetDeviceCaps := 0;
@@ -23554,8 +23734,8 @@ Begin
   W := WndOf(H);
   GetClassNameA := 0;
   If W < 0 Then Exit;
-  PutPStr(Buf, Classes[Wnds[W].Cls].Name, N);
-  GetClassNameA := Length(Classes[Wnds[W].Cls].Name);
+  PutPStr(Buf, Classes[Wnds^[W].Cls].Name, N);
+  GetClassNameA := Length(Classes[Wnds^[W].Cls].Name);
 End;
 
 Function SetClassLongA(H, I, V : LongInt) : LongInt;
@@ -23564,7 +23744,7 @@ Begin
   SetClassLongA := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
-  C := Wnds[W].Cls;
+  C := Wnds^[W].Cls;
   Case I Of
     -10 : Begin SetClassLongA := Classes[C].Brush; Classes[C].Brush := V End;
     -12 : Begin SetClassLongA := Classes[C].Cursor; Classes[C].Cursor := V End;
@@ -23586,7 +23766,7 @@ Begin
   GetClassLongA := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
-  C := Wnds[W].Cls;
+  C := Wnds^[W].Cls;
   Case I Of
     -10 : GetClassLongA := Classes[C].Brush;
     -12 : GetClassLongA := Classes[C].Cursor;
@@ -23636,8 +23816,8 @@ Begin
   R := CreateW(Ex, C, Nm, Style, X, Y, W, H, P, Menu, Inst, Param);
   If (R >= 0) And Not IsChildW(R) Then
     KLog('Fenetre ' + HexStr(HwndOf(R), 8) + ' ' + Classes[C].Name + ' "' +
-         Nm + '" ' + IntStr(Wnds[R].X) + ',' + IntStr(Wnds[R].Y) + ' ' +
-         IntStr(Wnds[R].W) + 'x' + IntStr(Wnds[R].H) + ' style ' +
+         Nm + '" ' + IntStr(Wnds^[R].X) + ',' + IntStr(Wnds^[R].Y) + ' ' +
+         IntStr(Wnds^[R].W) + 'x' + IntStr(Wnds^[R].H) + ' style ' +
          HexStr(Style, 8));
   CreateWindowExA := HwndOf(R);
 End;
@@ -23663,7 +23843,7 @@ Begin
   ShowWindow := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
-  ShowWindow := Ord(Wnds[W].Visible);
+  ShowWindow := Ord(Wnds^[W].Visible);
   Case Cmd Of
     0 : ShowW(W, False, False);
     2, 6, 7 :
@@ -23703,7 +23883,7 @@ Function IsWindowEnabled(H : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  IsWindowEnabled := Ord((W >= 0) And Wnds[W].Enabled);
+  IsWindowEnabled := Ord((W >= 0) And Wnds^[W].Enabled);
 End;
 
 Function EnableWindow(H, En : LongInt) : LongInt;
@@ -23712,10 +23892,10 @@ Begin
   W := WndOf(H);
   EnableWindow := 0;
   If W < 0 Then Exit;
-  EnableWindow := Ord(Not Wnds[W].Enabled);
-  If Wnds[W].Enabled <> (En <> 0) Then
+  EnableWindow := Ord(Not Wnds^[W].Enabled);
+  If Wnds^[W].Enabled <> (En <> 0) Then
   Begin
-    Wnds[W].Enabled := En <> 0;
+    Wnds^[W].Enabled := En <> 0;
     SendMsgW(W, WM_ENABLE, En, 0);
   End;
 End;
@@ -23724,14 +23904,14 @@ Function IsIconic(H : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  IsIconic := Ord((W >= 0) And Wnds[W].Min);
+  IsIconic := Ord((W >= 0) And Wnds^[W].Min);
 End;
 
 Function IsZoomed(H : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  IsZoomed := Ord((W >= 0) And Wnds[W].Max);
+  IsZoomed := Ord((W >= 0) And Wnds^[W].Max);
 End;
 
 Function IsChild(HP, H : LongInt) : LongInt;
@@ -23741,7 +23921,7 @@ Begin
   W := WndOf(H); P := WndOf(HP);
   While (W >= 0) And IsChildW(W) Do
   Begin
-    W := Wnds[W].Parent;
+    W := Wnds^[W].Parent;
     If W = P Then
     Begin
       IsChild := 1;
@@ -23756,8 +23936,8 @@ Begin
   W := WndOf(H);
   GetParent := 0;
   If W < 0 Then Exit;
-  If IsChildW(W) Then GetParent := HwndOf(Wnds[W].Parent)
-  Else GetParent := HwndOf(Wnds[W].Owner);
+  If IsChildW(W) Then GetParent := HwndOf(Wnds^[W].Parent)
+  Else GetParent := HwndOf(Wnds^[W].Owner);
 End;
 
 Function SetParent(H, HP : LongInt) : LongInt;
@@ -23766,8 +23946,8 @@ Begin
   W := WndOf(H); P := WndOf(HP);
   SetParent := 0;
   If W < 0 Then Exit;
-  SetParent := HwndOf(Wnds[W].Parent);
-  If IsChildW(W) And (P >= 0) Then Wnds[W].Parent := P;
+  SetParent := HwndOf(Wnds^[W].Parent);
+  If IsChildW(W) And (P >= 0) Then Wnds^[W].Parent := P;
 End;
 
 Function GetDesktopWindow : LongInt;
@@ -23783,15 +23963,16 @@ Begin
   GetWindow := 0;
   W := WndOf(H);
   Case Cmd Of
-    4 : If (W >= 0) And Not IsChildW(W) Then GetWindow := HwndOf(Wnds[W].Owner);
+    4 : If (W >= 0) And Not IsChildW(W) Then
+          GetWindow := HwndOf(Wnds^[W].Owner);
     5 :
     Begin
       Best := -1; BS := -1;
       For I := 0 To MaxWnd - 1 Do
-        If Wnds[I].Used And IsChildW(I) And ((Wnds[I].Parent = W) Or
-           ((H = HDesktop) And (W < 0))) And (Wnds[I].Seq > BS) Then
+        If Wnds^[I].Used And IsChildW(I) And ((Wnds^[I].Parent = W) Or
+           ((H = HDesktop) And (W < 0))) And (Wnds^[I].Seq > BS) Then
         Begin
-          Best := I; BS := Wnds[I].Seq;
+          Best := I; BS := Wnds^[I].Seq;
         End;
       If H = HDesktop Then
       Begin
@@ -23821,14 +24002,14 @@ Begin
       Best := -1;
       If Cmd = 2 Then BS := -1 Else BS := $7FFFFFFF;
       For I := 0 To MaxWnd - 1 Do
-        If Wnds[I].Used And IsChildW(I) And
-           (Wnds[I].Parent = Wnds[W].Parent) And (I <> W) Then
-          If ((Cmd = 2) And (Wnds[I].Seq < Wnds[W].Seq) And
-              (Wnds[I].Seq > BS)) Or
-             ((Cmd = 3) And (Wnds[I].Seq > Wnds[W].Seq) And
-              (Wnds[I].Seq < BS)) Then
+        If Wnds^[I].Used And IsChildW(I) And
+           (Wnds^[I].Parent = Wnds^[W].Parent) And (I <> W) Then
+          If ((Cmd = 2) And (Wnds^[I].Seq < Wnds^[W].Seq) And
+              (Wnds^[I].Seq > BS)) Or
+             ((Cmd = 3) And (Wnds^[I].Seq > Wnds^[W].Seq) And
+              (Wnds^[I].Seq < BS)) Then
           Begin
-            Best := I; BS := Wnds[I].Seq;
+            Best := I; BS := Wnds^[I].Seq;
           End;
       GetWindow := HwndOf(Best);
     End;
@@ -23920,17 +24101,17 @@ Begin
   If W < 0 Then Exit;
   If (Flags And 1) <> 0 Then
   Begin
-    CX := Wnds[W].W; CY := Wnds[W].H;
+    CX := Wnds^[W].W; CY := Wnds^[W].H;
   End;
   If (Flags And 2) <> 0 Then
   Begin
-    X := Wnds[W].X; Y := Wnds[W].Y;
+    X := Wnds^[W].X; Y := Wnds^[W].Y;
   End;
   If Not IsChildW(W) And ((Flags And 4) = 0) Then
   Begin
-    If After = -1 Then Wnds[W].ExStyle := Wnds[W].ExStyle Or WS_EX_TOPMOST
+    If After = -1 Then Wnds^[W].ExStyle := Wnds^[W].ExStyle Or WS_EX_TOPMOST
     Else If After = -2 Then
-      Wnds[W].ExStyle := Wnds[W].ExStyle And Not WS_EX_TOPMOST;
+      Wnds^[W].ExStyle := Wnds^[W].ExStyle And Not WS_EX_TOPMOST;
     If After = 1 Then ZBottom(W) Else ZTop(W);
     DirtyWnd(W);
   End;
@@ -23938,7 +24119,7 @@ Begin
   If (Flags And $40) <> 0 Then ShowW(W, True, (Flags And $10) = 0);
   If (Flags And $80) <> 0 Then ShowW(W, False, False);
   If ((Flags And $10) = 0) And ((Flags And $80) = 0) And Not IsChildW(W) And
-     Wnds[W].Visible And ((Flags And 4) = 0) Then ActivateW(W);
+     Wnds^[W].Visible And ((Flags And 4) = 0) Then ActivateW(W);
   SetWindowPos := 1;
 End;
 
@@ -23970,7 +24151,7 @@ Begin
     GetClientRect := 0;
     Exit;
   End
-  Else SetR(R, 0, 0, Wnds[W].CR - Wnds[W].CL, Wnds[W].CB - Wnds[W].CT);
+  Else SetR(R, 0, 0, Wnds^[W].CR - Wnds^[W].CL, Wnds^[W].CB - Wnds^[W].CT);
   PutRectAt(P, R);
   GetClientRect := 1;
 End;
@@ -24087,7 +24268,7 @@ Var W : LongInt;
 Begin
   W := WndOf(H);
   GetWindowTextLengthA := 0;
-  If W >= 0 Then GetWindowTextLengthA := Length(Wnds[W].Text);
+  If W >= 0 Then GetWindowTextLengthA := Length(Wnds^[W].Text);
 End;
 
 Function GetWindowLongA(H, I : LongInt) : LongInt;
@@ -24097,27 +24278,27 @@ Begin
   W := WndOf(H);
   If W < 0 Then Exit;
   Case I Of
-    -4 : If Wnds[W].Proc <> 0 Then GetWindowLongA := Wnds[W].Proc
-         Else GetWindowLongA := KProcToken + Wnds[W].IKind;
-    -6 : GetWindowLongA := Wnds[W].Inst;
-    -8 : GetWindowLongA := HwndOf(Wnds[W].Owner);
-    -12 : GetWindowLongA := Wnds[W].Id;
+    -4 : If Wnds^[W].Proc <> 0 Then GetWindowLongA := Wnds^[W].Proc
+         Else GetWindowLongA := KProcToken + Wnds^[W].IKind;
+    -6 : GetWindowLongA := Wnds^[W].Inst;
+    -8 : GetWindowLongA := HwndOf(Wnds^[W].Owner);
+    -12 : GetWindowLongA := Wnds^[W].Id;
     -16 :
     Begin
-      GetWindowLongA := Wnds[W].Style;
-      If Wnds[W].Visible Then GetWindowLongA := Wnds[W].Style Or WS_VISIBLE;
+      GetWindowLongA := Wnds^[W].Style;
+      If Wnds^[W].Visible Then GetWindowLongA := Wnds^[W].Style Or WS_VISIBLE;
     End;
-    -20 : GetWindowLongA := Wnds[W].ExStyle;
-    -21 : GetWindowLongA := Wnds[W].UserData;
+    -20 : GetWindowLongA := Wnds^[W].ExStyle;
+    -21 : GetWindowLongA := Wnds^[W].UserData;
   Else
-    If (Wnds[W].IKind = ikDialog) And (I = 4) Then
-      GetWindowLongA := Wnds[W].DlgProc
-    Else If (Wnds[W].IKind = ikDialog) And (I = 0) Then
-      GetWindowLongA := Wnds[W].DlgResult
-    Else If (I >= 0) And (I + 4 <= Wnds[W].ExtraSz) Then
-      GetWindowLongA := MemL[0:Wnds[W].Extra + I]
-    Else If (Wnds[W].IKind = ikDialog) And (I = 8) Then
-      GetWindowLongA := Wnds[W].UserData;
+    If (Wnds^[W].IKind = ikDialog) And (I = 4) Then
+      GetWindowLongA := Wnds^[W].DlgProc
+    Else If (Wnds^[W].IKind = ikDialog) And (I = 0) Then
+      GetWindowLongA := Wnds^[W].DlgResult
+    Else If (I >= 0) And (I + 4 <= Wnds^[W].ExtraSz) Then
+      GetWindowLongA := MemL[0:Wnds^[W].Extra + I]
+    Else If (Wnds^[W].IKind = ikDialog) And (I = 8) Then
+      GetWindowLongA := Wnds^[W].UserData;
   End;
 End;
 
@@ -24130,25 +24311,25 @@ Begin
   SetWindowLongA := GetWindowLongA(H, I);
   Case I Of
     -4 :
-      If (V >= KProcToken) And (V < KProcToken + 64) Then Wnds[W].Proc := 0
-      Else Wnds[W].Proc := V;
-    -6 : Wnds[W].Inst := V;
-    -8 : Wnds[W].Owner := WndOf(V);
-    -12 : Wnds[W].Id := V;
+      If (V >= KProcToken) And (V < KProcToken + 64) Then Wnds^[W].Proc := 0
+      Else Wnds^[W].Proc := V;
+    -6 : Wnds^[W].Inst := V;
+    -8 : Wnds^[W].Owner := WndOf(V);
+    -12 : Wnds^[W].Id := V;
     -16 :
     Begin
-      Wnds[W].Style := V And Not WS_VISIBLE;
+      Wnds^[W].Style := V And Not WS_VISIBLE;
       CalcNc(W);
-      Wnds[W].NeedNc := True;
+      Wnds^[W].NeedNc := True;
     End;
-    -20 : Wnds[W].ExStyle := V;
-    -21 : Wnds[W].UserData := V;
+    -20 : Wnds^[W].ExStyle := V;
+    -21 : Wnds^[W].UserData := V;
   Else
-    If (Wnds[W].IKind = ikDialog) And (I = 4) Then Wnds[W].DlgProc := V
-    Else If (Wnds[W].IKind = ikDialog) And (I = 0) Then Wnds[W].DlgResult := V
-    Else If (I >= 0) And (I + 4 <= Wnds[W].ExtraSz) Then
-      MemL[0:Wnds[W].Extra + I] := V
-    Else If (Wnds[W].IKind = ikDialog) And (I = 8) Then Wnds[W].UserData := V;
+    If (Wnds^[W].IKind = ikDialog) And (I = 4) Then Wnds^[W].DlgProc := V
+    Else If (Wnds^[W].IKind = ikDialog) And (I = 0) Then Wnds^[W].DlgResult := V
+    Else If (I >= 0) And (I + 4 <= Wnds^[W].ExtraSz) Then
+      MemL[0:Wnds^[W].Extra + I] := V
+    Else If (Wnds^[W].IKind = ikDialog) And (I = 8) Then Wnds^[W].UserData := V;
   End;
 End;
 
@@ -24157,9 +24338,9 @@ Var W : LongInt;
 Begin
   GetWindowWord := 0;
   W := WndOf(H);
-  If (W >= 0) And (I >= 0) And (I + 2 <= Wnds[W].ExtraSz) Then
-    GetWindowWord := MemW[0:Wnds[W].Extra + I]
-  Else If (W >= 0) And (I = -12) Then GetWindowWord := Wnds[W].Id And $FFFF;
+  If (W >= 0) And (I >= 0) And (I + 2 <= Wnds^[W].ExtraSz) Then
+    GetWindowWord := MemW[0:Wnds^[W].Extra + I]
+  Else If (W >= 0) And (I = -12) Then GetWindowWord := Wnds^[W].Id And $FFFF;
 End;
 
 Function SetWindowWord(H, I, V : LongInt) : LongInt;
@@ -24167,10 +24348,10 @@ Var W : LongInt;
 Begin
   SetWindowWord := 0;
   W := WndOf(H);
-  If (W >= 0) And (I >= 0) And (I + 2 <= Wnds[W].ExtraSz) Then
+  If (W >= 0) And (I >= 0) And (I + 2 <= Wnds^[W].ExtraSz) Then
   Begin
-    SetWindowWord := MemW[0:Wnds[W].Extra + I];
-    MemW[0:Wnds[W].Extra + I] := V;
+    SetWindowWord := MemW[0:Wnds^[W].Extra + I];
+    MemW[0:Wnds^[W].Extra + I] := V;
   End;
 End;
 
@@ -24243,7 +24424,7 @@ Begin
   If H = $FFFF Then
   Begin
     For I := 0 To ZCnt - 1 Do
-      If Wnds[ZList[I]].Used And (Wnds[ZList[I]].IKind = ikNone) Then
+      If Wnds^[ZList[I]].Used And (Wnds^[ZList[I]].IKind = ikNone) Then
         SendMsgW(ZList[I], Msg, WP, LP);
     Exit;
   End;
@@ -24261,7 +24442,7 @@ Begin
   If H = $FFFF Then
   Begin
     For I := 0 To ZCnt - 1 Do
-      If Wnds[ZList[I]].Used And (Wnds[ZList[I]].IKind = ikNone) Then
+      If Wnds^[ZList[I]].Used And (Wnds^[ZList[I]].IKind = ikNone) Then
         PostMsgW(ZList[I], Msg, WP, LP);
     PostMessageA := 1;
     Exit;
@@ -24383,10 +24564,10 @@ Begin
   If W < 0 Then Exit;
   DispatchMessageA := SendMsgW(W, Msg, MemL[0:P + 8], MemL[0:P + 12]);
   { WM_PAINT non traite : valider pour ne pas boucler }
-  If (Msg = WM_PAINT) And Wnds[W].Used Then
+  If (Msg = WM_PAINT) And Wnds^[W].Used Then
   Begin
-    SetR(Wnds[W].Upd, 0, 0, 0, 0);
-    Wnds[W].UpdErase := False;
+    SetR(Wnds^[W].Upd, 0, 0, 0, 0);
+    Wnds^[W].UpdErase := False;
   End;
 End;
 
@@ -24445,16 +24626,16 @@ Begin
   W := WndOf(H);
   GetDC := 0;
   If W < 0 Then Exit;
-  If (Classes[Wnds[W].Cls].Style And CS_OWNDC) <> 0 Then
+  If (Classes[Wnds^[W].Cls].Style And CS_OWNDC) <> 0 Then
   Begin
-    If (Wnds[W].OwnDC = 0) Or (DcOf(Wnds[W].OwnDC) < 0) Then
+    If (Wnds^[W].OwnDC = 0) Or (DcOf(Wnds^[W].OwnDC) < 0) Then
     Begin
-      Wnds[W].OwnDC := DcNew(W, True);
-      If Wnds[W].OwnDC <> 0 Then Dcs[DcOf(Wnds[W].OwnDC)].Owned := True;
+      Wnds^[W].OwnDC := DcNew(W, True);
+      If Wnds^[W].OwnDC <> 0 Then Dcs[DcOf(Wnds^[W].OwnDC)].Owned := True;
     End;
-    D := DcOf(Wnds[W].OwnDC);
+    D := DcOf(Wnds^[W].OwnDC);
     If D >= 0 Then Dcs[D].HasPaint := False;
-    GetDC := Wnds[W].OwnDC;
+    GetDC := Wnds^[W].OwnDC;
     Exit;
   End;
   GetDC := DcNew(W, True);
@@ -24487,7 +24668,7 @@ Function KBrushOf(Br : LongInt) : LongInt; Forward;
 Procedure EraseBkgnd(W, Hdc : LongInt);
 Var B, D : LongInt;
 Begin
-  B := KBrushOf(Classes[Wnds[W].Cls].Brush);
+  B := KBrushOf(Classes[Wnds^[W].Cls].Brush);
   D := DcOf(Hdc);
   If (B < 0) Or Not DcBegin(D) Then Exit;
   BrushFill(ClipX1, ClipY1, ClipX2, ClipY2, B);
@@ -24501,10 +24682,10 @@ Begin
   BeginPaint := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
-  R := Wnds[W].Upd;
-  Er := Wnds[W].UpdErase;
-  SetR(Wnds[W].Upd, 0, 0, 0, 0);
-  Wnds[W].UpdErase := False;
+  R := Wnds^[W].Upd;
+  Er := Wnds^[W].UpdErase;
+  SetR(Wnds^[W].Upd, 0, 0, 0, 0);
+  Wnds^[W].UpdErase := False;
   Hdc := GetDC(H);
   D := DcOf(Hdc);
   If D >= 0 Then
@@ -24562,7 +24743,7 @@ Function ValidateRect(H, P : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  If W >= 0 Then SetR(Wnds[W].Upd, 0, 0, 0, 0);
+  If W >= 0 Then SetR(Wnds^[W].Upd, 0, 0, 0, 0);
   ValidateRect := 1;
 End;
 
@@ -24578,8 +24759,8 @@ Begin
   W := WndOf(H);
   I := GdiOf(Rgn, goRegion);
   If (W < 0) Or (I < 0) Then Exit;
-  Gdis^[I].I1 := Wnds[W].Upd.L; Gdis^[I].I2 := Wnds[W].Upd.T;
-  Gdis^[I].I3 := Wnds[W].Upd.R; Gdis^[I].I4 := Wnds[W].Upd.B;
+  Gdis^[I].I1 := Wnds^[W].Upd.L; Gdis^[I].I2 := Wnds^[W].Upd.T;
+  Gdis^[I].I3 := Wnds^[W].Upd.R; Gdis^[I].I4 := Wnds^[W].Upd.B;
   GetUpdateRgn := RgnType(I);
 End;
 
@@ -24589,7 +24770,7 @@ Begin
   W := WndOf(H);
   GetUpdateRect := 0;
   If W < 0 Then Exit;
-  If P <> 0 Then PutRectAt(P, Wnds[W].Upd);
+  If P <> 0 Then PutRectAt(P, Wnds^[W].Upd);
   GetUpdateRect := Ord(HasUpdate(W));
 End;
 
@@ -24599,9 +24780,9 @@ Begin
   UpdateWindow := 1;
   W := WndOf(H);
   If (W < 0) Or Not HasUpdate(W) Then Exit;
-  If Wnds[W].IKind <> ikNone Then Exit;
+  If Wnds^[W].IKind <> ikNone Then Exit;
   SendMsgW(W, WM_PAINT, 0, 0);
-  SetR(Wnds[W].Upd, 0, 0, 0, 0);
+  SetR(Wnds^[W].Upd, 0, 0, 0, 0);
 End;
 
 Function RedrawWindow(H, P, Rgn, Flags : LongInt) : LongInt;
@@ -24872,7 +25053,7 @@ Begin
   GetRectAt(P, R);
   If (Flags And 1) <> 0 Then FBar(R.L, R.T, R.R - 1, R.B - 1, cNavy)
   Else FBar(R.L, R.T, R.R - 1, R.B - 1, cGray);
-  OutBold(R.L + 4, R.T + 1, Fit(Wnds[W].Text, R.R - R.L - 8), cWhite);
+  OutBold(R.L + 4, R.T + 1, Fit(Wnds^[W].Text, R.R - R.L - 8), cWhite);
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
@@ -25144,11 +25325,11 @@ Begin
   If W < 0 Then Exit;
   If Bar = 1 Then
   Begin
-    SetScrollPos := Wnds[W].VScrollPos; Wnds[W].VScrollPos := Pos0;
+    SetScrollPos := Wnds^[W].VScrollPos; Wnds^[W].VScrollPos := Pos0;
   End
   Else
   Begin
-    SetScrollPos := Wnds[W].HScrollPos; Wnds[W].HScrollPos := Pos0;
+    SetScrollPos := Wnds^[W].HScrollPos; Wnds^[W].HScrollPos := Pos0;
   End;
 End;
 
@@ -25158,8 +25339,8 @@ Begin
   GetScrollPos := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
-  If Bar = 1 Then GetScrollPos := Wnds[W].VScrollPos
-  Else GetScrollPos := Wnds[W].HScrollPos;
+  If Bar = 1 Then GetScrollPos := Wnds^[W].VScrollPos
+  Else GetScrollPos := Wnds^[W].HScrollPos;
 End;
 
 Function SetScrollRange(H, Bar, Mn, Mx, Redraw : LongInt) : LongInt;
@@ -26243,7 +26424,7 @@ Function GetMenu(H : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  If W < 0 Then GetMenu := 0 Else GetMenu := Wnds[W].Menu;
+  If W < 0 Then GetMenu := 0 Else GetMenu := Wnds^[W].Menu;
 End;
 
 Function SetMenu(H, M : LongInt) : LongInt;
@@ -26252,7 +26433,7 @@ Begin
   W := WndOf(H);
   SetMenu := 0;
   If W < 0 Then Exit;
-  Wnds[W].Menu := M;
+  Wnds^[W].Menu := M;
   { la barre de menus n'est pas affichee : pas de changement du cadre }
   SetMenu := 1;
 End;
@@ -26268,8 +26449,8 @@ Begin
   W := WndOf(H);
   GetSystemMenu := 0;
   If W < 0 Then Exit;
-  If Wnds[W].K1 = 0 Then Wnds[W].K1 := MenuNew;
-  GetSystemMenu := Wnds[W].K1;
+  If Wnds^[W].K1 = 0 Then Wnds^[W].K1 := MenuNew;
+  GetSystemMenu := Wnds^[W].K1;
 End;
 
 Function TrackPopupMenu(H, Flags, X, Y, Res, Hw, P : LongInt) : LongInt;
@@ -26305,8 +26486,8 @@ Begin
         EndPaint(H, C);
         KFree(C);
       End;
-      SetR(Wnds[W].Upd, 0, 0, 0, 0);
-      Wnds[W].UpdErase := False;
+      SetR(Wnds^[W].Upd, 0, 0, 0, 0);
+      Wnds^[W].UpdErase := False;
     End;
     WM_ERASEBKGND :
     Begin
@@ -26315,23 +26496,23 @@ Begin
     End;
     WM_SETTEXT :
     Begin
-      Wnds[W].Text := PStr(LP);
-      Wnds[W].NeedNc := True;
+      Wnds^[W].Text := PStr(LP);
+      Wnds^[W].NeedNc := True;
       TaskbarChanged;
       DefWindowProcA := 1;
     End;
     WM_GETTEXT :
     Begin
-      PutPStr(LP, Wnds[W].Text, WP);
-      DefWindowProcA := Min(Length(Wnds[W].Text), Max(0, WP - 1));
+      PutPStr(LP, Wnds^[W].Text, WP);
+      DefWindowProcA := Min(Length(Wnds^[W].Text), Max(0, WP - 1));
     End;
-    WM_GETTEXTLENGTH : DefWindowProcA := Length(Wnds[W].Text);
+    WM_GETTEXTLENGTH : DefWindowProcA := Length(Wnds^[W].Text);
     WM_SYSCOMMAND : SysCommand(TopOf(W), WP);
     WM_SYSKEYDOWN :
       If WP = $73 Then PostMsgW(TopOf(W), WM_CLOSE, 0, 0);
     WM_SETCURSOR :
     Begin
-      C := Classes[Wnds[W].Cls].Cursor;
+      C := Classes[Wnds^[W].Cls].Cursor;
       If C <> 0 Then SetCursor(C);
       DefWindowProcA := Ord(C <> 0);
     End;
@@ -26467,11 +26648,11 @@ Begin
   W := CreateW(Ex, Cls, Title, (Style And Not WS_VISIBLE) And
                Not WS_CHILD, X, Y, CX, CY, WndOf(Parent), 0, Inst, Lp);
   If W < 0 Then Exit;
-  Wnds[W].Proc := 0;
-  Wnds[W].IKind := ikDialog;
-  Wnds[W].DlgProc := Proc;
-  Wnds[W].Thread := CurT;
-  Wnds[W].K4 := icApp;
+  Wnds^[W].Proc := 0;
+  Wnds^[W].IKind := ikDialog;
+  Wnds^[W].DlgProc := Proc;
+  Wnds^[W].Thread := CurT;
+  Wnds^[W].K4 := icApp;
   Focus := -1;
   For I := 0 To N - 1 Do
   Begin
@@ -26513,16 +26694,16 @@ Begin
                  X * 2, Y * 2, CX * 2, CY * 2, W, Id, Inst, 0);
     If C >= 0 Then
     Begin
-      If (IStyle And WS_VISIBLE) <> 0 Then Wnds[C].Visible := True;
-      If (IStyle And WS_DISABLED) <> 0 Then Wnds[C].Enabled := False;
+      If (IStyle And WS_VISIBLE) <> 0 Then Wnds^[C].Visible := True;
+      If (IStyle And WS_DISABLED) <> 0 Then Wnds^[C].Enabled := False;
       If (Focus < 0) And ((IStyle And $10000) <> 0) Then Focus := C;
     End;
   End;
   If Proc <> 0 Then
     If CallProc(Proc, HwndOf(W), WM_INITDIALOG, HwndOf(Focus), Lp) <> 0 Then
       If Focus >= 0 Then SetFocusW(Focus);
-  If Wnds[W].Used And ((Style And WS_VISIBLE) <> 0) Then ShowW(W, True, True);
-  Wnds[W].KNeedPaint := True;
+  If Wnds^[W].Used And ((Style And WS_VISIBLE) <> 0) Then ShowW(W, True, True);
+  Wnds^[W].KNeedPaint := True;
   DlgCreate := W;
 End;
 
@@ -26548,9 +26729,9 @@ Begin
   DlgRun := -1;
   If W < 0 Then Exit;
   P := WndOf(Parent);
-  If P >= 0 Then Wnds[P].Enabled := False;
+  If P >= 0 Then Wnds^[P].Enabled := False;
   ShowW(W, True, True);
-  While Wnds[W].Used And Not Wnds[W].DlgEnded Do
+  While Wnds^[W].Used And Not Wnds^[W].DlgEnded Do
   Begin
     If KPeekMsg(CurT, M, 0, 0, 0, True) Then
     Begin
@@ -26571,13 +26752,13 @@ Begin
       Threads[CurT].State := tsReady;
     End;
   End;
-  If P >= 0 Then Wnds[P].Enabled := True;
-  If Wnds[W].Used Then
+  If P >= 0 Then Wnds^[P].Enabled := True;
+  If Wnds^[W].Used Then
   Begin
-    DlgRun := Wnds[W].DlgResult;
+    DlgRun := Wnds^[W].DlgResult;
     DestroyW(W);
   End;
-  If (P >= 0) And Wnds[P].Used Then ActivateW(P);
+  If (P >= 0) And Wnds^[P].Used Then ActivateW(P);
 End;
 
 Function DialogBoxParamA(Inst, Name, Parent, Proc, Lp : LongInt) : LongInt;
@@ -26603,8 +26784,8 @@ Begin
   W := WndOf(H);
   EndDialog := 0;
   If W < 0 Then Exit;
-  Wnds[W].DlgResult := Res;
-  Wnds[W].DlgEnded := True;
+  Wnds^[W].DlgResult := Res;
+  Wnds^[W].DlgEnded := True;
   ShowW(W, False, False);
   EndDialog := 1;
 End;
@@ -26627,8 +26808,8 @@ Begin
   W := WndOf(H);
   If W < 0 Then Exit;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And IsChildW(I) And (Wnds[I].Parent = W) And
-       (Wnds[I].Id = Id) Then
+    If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = W) And
+       (Wnds^[I].Id = Id) Then
     Begin
       GetDlgItem := HwndOf(I);
       Exit;
@@ -26639,7 +26820,7 @@ Function GetDlgCtrlID(H : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  If W < 0 Then GetDlgCtrlID := 0 Else GetDlgCtrlID := Wnds[W].Id;
+  If W < 0 Then GetDlgCtrlID := 0 Else GetDlgCtrlID := Wnds^[W].Id;
 End;
 
 Function SetDlgItemTextA(H, Id, S : LongInt) : LongInt;
@@ -26665,7 +26846,7 @@ Begin
   GetDlgItemInt := 0;
   W := WndOf(GetDlgItem(H, Id));
   If W < 0 Then Exit;
-  Val(Trim(Wnds[W].Text), V, E);
+  Val(Trim(Wnds^[W].Text), V, E);
   If POk <> 0 Then MemL[0:POk] := Ord(E = 0);
   If E = 0 Then GetDlgItemInt := V;
 End;
@@ -26699,7 +26880,7 @@ Var W, M, Hw : LongInt;
 Begin
   IsDialogMessageA := 0;
   W := WndOf(H);
-  If (W < 0) Or (Wnds[W].IKind <> ikDialog) Then Exit;
+  If (W < 0) Or (Wnds^[W].IKind <> ikDialog) Then Exit;
   Hw := WndOf(MemL[0:P]);
   If (Hw <> W) And ((Hw < 0) Or (TopOf(Hw) <> W)) Then Exit;
   M := MemL[0:P + 4];
@@ -26827,6 +27008,9 @@ Type
     Used : Boolean;
     Paused : Boolean;
     Rate, Cb, Inst, CbType, QN, LastEnd, PauseAt : LongInt;
+    { position de lecture : octets ecrits, base (octets, instant) et
+      alignement des blocs (waveOutGetPosition) }
+    Wr, PB, PT, Blk : LongInt;
   End;
 
 Var
@@ -26861,6 +27045,7 @@ Var
   SbOk, Sb16, OplOk : Boolean;
   SbBase, SbIrq, SbDma8, SbDma16, SbVer : LongInt;
   SbPlaying, SbPaused : Boolean;
+  DSOwn : Boolean;                       { carte prise par DirectSound }
   SbDev : LongInt;                       { peripherique waveOut sur la carte }
   SbBits, SbChans, SbRate : LongInt;     { format du programme }
   SbOBits, SbOChans : LongInt;           { format envoye a la carte }
@@ -27072,6 +27257,8 @@ End;
 
 { Remplir la moitie H du tampon DMA avec la suite des tampons du
   peripherique SbDev (format carte), sinon du silence }
+Procedure DSMixInto(D, N : LongInt); Forward;
+
 Procedure SbFill(H : LongInt);
 Var D, P, Hdr, Len, B, V, Got, SBy, Fr, K, L, R : LongInt;
 Begin
@@ -27132,6 +27319,7 @@ Begin
     Else FillMem(D + P, SbHalf - P, $80);
   End;
   If Got = 0 Then Inc(SbSilent) Else SbSilent := 0;
+  DSMixInto(D, SbHalf);
   SbQueued := SbQueued + SbHalf;
 End;
 
@@ -27255,7 +27443,7 @@ End;
 Procedure SbStart;
 Var TC, N, Md : LongInt;
 Begin
-  If Not SbOk Or SbPlaying Or (SbDev < 0) Then Exit;
+  If Not SbOk Or SbPlaying Or ((SbDev < 0) And Not DSOwn) Then Exit;
   If Sb16 Then
   Begin
     SbOBits := SbBits; SbOChans := SbChans;
@@ -27473,6 +27661,8 @@ End;
 
 { Appelee par la tache 0 : rendre les tampons dont la duree est passee }
 Procedure PlaySoundPoll; Forward;
+Function DSAnyPlaying : Boolean; Forward;
+Procedure DSPoll; Forward;
 
 Procedure RunWave;
 Var I : LongInt;
@@ -27488,7 +27678,8 @@ Begin
         While (WaveDevs[I].QN > 0) And (SbCopyK > 0) And
               (SbPlayed >= WaveQEnd[I * MaxWaveQ]) Do
           WaveDone(I, 0);
-        If SbPlaying And (WaveDevs[I].QN = 0) And (SbSilent >= 2) Then
+        If SbPlaying And (WaveDevs[I].QN = 0) And (SbSilent >= 2) And
+           Not DSAnyPlaying Then
           SbStop;
       End
       Else
@@ -27496,6 +27687,7 @@ Begin
           WaveDone(I, 0);
     End;
   PlaySoundPoll;
+  DSPoll;
   InWave := False;
 End;
 
@@ -27541,7 +27733,8 @@ Begin
   If Fmt <> 0 Then
     If MemL[0:Fmt + 8] > 0 Then WaveDevs[I].Rate := MemL[0:Fmt + 8];
   { la carte son prend le premier peripherique ouvert (PCM) }
-  If SbOk And (SbDev < 0) And (Fmt <> 0) And (MemW[0:Fmt] = 1) Then
+  If SbOk And (SbDev < 0) And Not DSOwn And (Fmt <> 0) And
+     (MemW[0:Fmt] = 1) Then
   Begin
     SbDev := I;
     SbChans := Max(1, Min(2, MemW[0:Fmt + 2]));
@@ -27554,6 +27747,10 @@ Begin
   WaveDevs[I].CbType := Flags And $70000;
   WaveDevs[I].QN := 0;
   WaveDevs[I].LastEnd := Ticks;
+  WaveDevs[I].Wr := 0; WaveDevs[I].PB := 0; WaveDevs[I].PT := Ticks;
+  WaveDevs[I].Blk := 1;
+  If Fmt <> 0 Then
+    If MemW[0:Fmt + 12] > 0 Then WaveDevs[I].Blk := MemW[0:Fmt + 12];
   If PH <> 0 Then MemL[0:PH] := HWaveBase + I;
   WaveNotify(I, WOM_OPEN, 0);
 End;
@@ -27601,6 +27798,20 @@ Begin
   waveOutUnprepareHeader := 0;
 End;
 
+{ Octets deja joues par le peripherique I (estimes d'apres l'horloge,
+  sans depasser ce qui a ete ecrit) }
+Function WavePosB(I : LongInt) : LongInt;
+Var E, P, R : LongInt;
+Begin
+  If WaveDevs[I].Paused Then E := WaveDevs[I].PauseAt Else E := Ticks;
+  E := E - WaveDevs[I].PT;
+  If E < 0 Then E := 0;
+  R := WaveDevs[I].Rate;
+  P := WaveDevs[I].PB + (E Div 1000) * R + ((E Mod 1000) * R) Div 1000;
+  If (P < 0) Or (P > WaveDevs[I].Wr) Then P := WaveDevs[I].Wr;
+  WavePosB := P;
+End;
+
 Function waveOutWrite(H, Hdr, N : LongInt) : LongInt;
 Var I, Len, R, St, Q, F : LongInt;
 Begin
@@ -27620,6 +27831,14 @@ Begin
   End;
   MemL[0:Hdr + 16] := (MemL[0:Hdr + 16] Or 16) And Not 1;
   Len := MemL[0:Hdr + 4]; R := WaveDevs[I].Rate;
+  { file vide : la lecture (re)part maintenant }
+  If Q = 0 Then
+  Begin
+    WaveDevs[I].PB := WavePosB(I);
+    WaveDevs[I].PT := Ticks;
+    If WaveDevs[I].Paused Then WaveDevs[I].PT := WaveDevs[I].PauseAt;
+  End;
+  WaveDevs[I].Wr := WaveDevs[I].Wr + Len;
   St := Max(Ticks, WaveDevs[I].LastEnd);
   WaveDevs[I].LastEnd := St + (Len Div R) * 1000 + ((Len Mod R) * 1000) Div R;
   F := IntOff;
@@ -27642,6 +27861,7 @@ Begin
   While WaveDevs[I].QN > 0 Do WaveDone(I, 0);
   WaveDevs[I].LastEnd := Ticks;
   WaveDevs[I].Paused := False;
+  WaveDevs[I].Wr := 0; WaveDevs[I].PB := 0; WaveDevs[I].PT := Ticks;
   waveOutReset := 0;
 End;
 
@@ -27676,6 +27896,7 @@ Begin
     For K := 0 To WaveDevs[I].QN - 1 Do
       WaveQEnd[I * MaxWaveQ + K] := WaveQEnd[I * MaxWaveQ + K] + D;
     WaveDevs[I].LastEnd := WaveDevs[I].LastEnd + D;
+    WaveDevs[I].PT := WaveDevs[I].PT + D;
     WaveDevs[I].Paused := False;
     If (I = SbDev) And SbPlaying And SbPaused Then
     Begin
@@ -28039,10 +28260,12 @@ Procedure CoUninitialize;
 Begin
 End;
 
+Function DXCoCreate(Clsid, Iid, PP : LongInt) : LongInt; Forward;
+
 Function CoCreateInstance(Clsid, Outer, Ctx, Iid, PP : LongInt) : LongInt;
 Begin
   If PP <> 0 Then MemL[0:PP] := 0;
-  CoCreateInstance := LongInt($80040154);
+  CoCreateInstance := DXCoCreate(Clsid, Iid, PP);
 End;
 
 Function CoTaskMemAlloc(Size : LongInt) : LongInt;
@@ -28305,6 +28528,13 @@ Begin
   RegSetStr(S, 'DevicePath', 'C:\WINDOWS\INF');
   RegSetStr(S, 'MediaPath', 'C:\WINDOWS\MEDIA');
   RegWalk(2, S + '\App Paths', True);
+  RegSetStr('Hardware\Description\System\CentralProcessor\0',
+            'ProcessorNameString', CpuName);
+  RegSetStr('Hardware\Description\System\CentralProcessor\0',
+            '~MHz', IntStr(CpuMhz));
+  RegSetStr('Software\Microsoft\DirectX', 'Version', '4.08.00.0400');
+  RegSetStr('Software\Microsoft\DirectX', 'InstalledVersion',
+            '4.08.00.0400');
   RegWalk(2, S + '\Uninstall', True);
   RegWalk(2, 'System\CurrentControlSet\Control', True);
   RegWalk(1, 'Software\Microsoft\Windows\CurrentVersion\Explorer', True);
@@ -28564,13 +28794,14 @@ End;
 
 Const
   MaxMod = 16;
-  SysDllN = 21;
+  SysDllN = 27;
   SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
     'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
     'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
     'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
     'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL', 'WS2_32.DLL',
-    'ICMP.DLL', 'WININET.DLL');
+    'ICMP.DLL', 'WININET.DLL', 'D3DIM.DLL', 'D3DIM700.DLL', 'D3D8.DLL',
+    'DINPUT8.DLL', 'DPLAYX.DLL', 'DPLAY.DLL');
 
 Type
   TModule = Record
@@ -28887,6 +29118,9 @@ Function IsWsDll(Dll : String) : Boolean; Forward;
 Function WsOrdName(N : LongInt) : String; Forward;
 Procedure NetAppExit; Forward;
 
+Procedure DXAppDone; Forward;
+Function DXOrdName(Dll : String; N : LongInt) : String; Forward;
+
 Function ResolveImport(Dll, Name : String; Ordinal : LongInt) : LongInt;
 Var M, A : LongInt; Nm : String;
 Begin
@@ -28898,8 +29132,11 @@ Begin
     If Name <> '' Then A := KernelExport('WS_' + Name);
   End;
   { importations par ordinal des DLL systeme connues }
+  If (Name = '') Then Name := DXOrdName(Dll, Ordinal);
   If (Name = '') And (UpStr(BaseName(Dll)) = 'MSVFW32.DLL') And
      (Ordinal = 2) Then Name := 'VideoForWindowsVersion';
+  If (Name = '') And (UpStr(BaseName(Dll)) = 'COMCTL32.DLL') And
+     (Ordinal = 17) Then Name := 'InitCommonControls';
   If (A = 0) And Not IsSysDll(Dll) Then
   Begin
     M := FindModule(Dll);
@@ -29019,7 +29256,10 @@ Begin
     VSize := MemL[0:S + 8]; VAddr := MemL[0:S + 12];
     RawSize := MemL[0:S + 16]; RawPtr := MemL[0:S + 20];
     If (VSize = 0) Or (RawSize < VSize) Then VSize := RawSize;
-    If (RawSize > 0) And (RawPtr + VSize <= FSize) Then
+    { sans donnees dans le fichier (PointerToRawData = 0, comme la
+      section .bss de certains editeurs de liens) : la section reste a
+      zero, comme sous Windows }
+    If (RawSize > 0) And (RawPtr > 0) And (RawPtr + VSize <= FSize) Then
       MoveMem(F + RawPtr, Load + VAddr, Min(VSize, RawSize));
     S := S + 40;
   End;
@@ -29197,6 +29437,11 @@ Begin
   If (P >= 0) And (P < $10000) Then
   Begin
     If M >= 0 Then GetProcAddress := ModuleExport(M, '', P)
+    Else If (M < 0) And (H >= HDllBase) And
+            (H < HDllBase + SysDllN * $10000) And
+            (DXOrdName(SysDlls[(H - HDllBase) Div $10000], P) <> '') Then
+      GetProcAddress := KernelExport(DXOrdName(SysDlls[(H - HDllBase) Div
+                                     $10000], P))
     Else If Ws And (WsOrdName(P) <> '') Then
       GetProcAddress := KernelExport('WS_' + WsOrdName(P));
     Exit;
@@ -29429,11 +29674,11 @@ Begin
   DosStop;
   NetAppExit;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And (Wnds[I].Thread > 0) And
-       Threads[Wnds[I].Thread].IsApp And Not ThrW16[Wnds[I].Thread] Then
+    If Wnds^[I].Used And (Wnds^[I].Thread > 0) And
+       Threads[Wnds^[I].Thread].IsApp And Not ThrW16[Wnds^[I].Thread] Then
     Begin
-      Wnds[I].Proc := 0;
-      Wnds[I].IKind := ikStatic;
+      Wnds^[I].Proc := 0;
+      Wnds^[I].IKind := ikStatic;
       DestroyW(I);
     End;
   For I := 1 To MaxThread - 1 Do
@@ -29443,9 +29688,9 @@ Begin
   For I := 0 To MaxTimer - 1 Do WTimers[I].Used := False;
   For I := 0 To MaxMMTimer - 1 Do MMTimers[I].Used := False;
   For I := 0 To MaxKObj - 1 Do
-    If KObjs[I].Used And (KObjs[I].Kind In [koFile, koFind]) And
+    If KObjs^[I].Used And (KObjs^[I].Kind In [koFile, koFind]) And
        (KObjOwner[I] = 1) Then
-      KObjs[I].Used := False;
+      KObjs^[I].Used := False;
   For I := 0 To MaxDC - 1 Do
     If Dcs[I].Used And (Gdis^[Dcs[I].Gdi].Owner = 1) Then DcFree(I);
   For I := 0 To MaxGdi - 1 Do
@@ -29456,13 +29701,14 @@ Begin
     If Classes[I].Used And (Classes[I].IKind = ikNone) And
        ((Classes[I].Inst <= 0) Or (Classes[I].Inst > $FFFF)) Then
       Classes[I].Used := False;
+  DXAppDone;
   KFreeOwner(1);
   StubArea := 0;
   HeapOwner := 0;
   AppRunning := False;
   AppBase := 0;
   DDShow := False;
-  If AppProcObj >= 0 Then KObjs[AppProcObj].F2 := 1;
+  If AppProcObj >= 0 Then KObjs^[AppProcObj].F2 := 1;
   CaptureWin := -1;
   CurHide := 0;
   CursorErase;
@@ -29659,7 +29905,7 @@ Var I : LongInt;
 Begin
   I := KObjOf(H, koProcess);
   If P <> 0 Then
-    If (I >= 0) And (KObjs[I].F2 = 0) Then MemL[0:P] := 259
+    If (I >= 0) And (KObjs^[I].F2 = 0) Then MemL[0:P] := 259
     Else MemL[0:P] := 0;
   GetExitCodeProcess := 1;
 End;
@@ -29689,7 +29935,7 @@ Begin
   Begin
     P := ChainExec; A := ChainArgs;
     ChainExec := '';
-    If (ChainObj >= 0) And KObjs[ChainObj].Used Then KObjs[ChainObj].F2 := 1;
+    If (ChainObj >= 0) And KObjs^[ChainObj].Used Then KObjs^[ChainObj].F2 := 1;
     ChainObj := -1;
     If Not RunExe(P, A) Then
     Begin
@@ -29752,8 +29998,8 @@ Begin
   If Name = 0 Then Exit;
   S := UpStr(PStr(Name));
   For I := 0 To MaxKObj - 1 Do
-    If KObjs[I].Used And (KObjs[I].Kind = koMutex) And
-       (KObjs[I].Name = S) Then
+    If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
+       (KObjs^[I].Name = S) Then
     Begin
       OpenMutexA := KHandle(I);
       Exit;
@@ -29922,9 +30168,9 @@ Begin
   If I < 0 Then Exit;
   Sz := SzLo;
   If (Sz = 0) And (HFile <> -1) Then Sz := GetFileSize(HFile, 0);
-  KObjs[I].F1 := HFile;
-  KObjs[I].F2 := Sz;
-  KObjs[I].F3 := Prot;
+  KObjs^[I].F1 := HFile;
+  KObjs^[I].F2 := Sz;
+  KObjs^[I].F3 := Prot;
   CreateFileMappingA := KHandle(I);
 End;
 
@@ -29934,8 +30180,8 @@ Begin
   ViewFlush := 1;
   I := KObjOf(ViewMap[V], koMapping);
   If I < 0 Then Exit;
-  H := KObjs[I].F1;
-  If (H = -1) Or ((KObjs[I].F3 And 4) = 0) Then Exit;
+  H := KObjs^[I].F1;
+  If (H = -1) Or ((KObjs^[I].F3 And 4) = 0) Then Exit;
   SetFilePointer(H, ViewOfs[V], 0, 0);
   N := KWriteFile(H, ViewAddr[V], ViewSize[V]);
 End;
@@ -29950,15 +30196,15 @@ Begin
   For K := MaxView - 1 DownTo 0 Do
     If ViewAddr[K] = 0 Then V := K;
   If V < 0 Then Exit;
-  If (N = 0) Or (OfsLo + N > KObjs[I].F2) Then N := KObjs[I].F2 - OfsLo;
+  If (N = 0) Or (OfsLo + N > KObjs^[I].F2) Then N := KObjs^[I].F2 - OfsLo;
   If N <= 0 Then N := 1;
   A := KAlloc(N + 4096);
   If A = 0 Then Exit;
   FillMem(A, N, 0);
-  If KObjs[I].F1 <> -1 Then
+  If KObjs^[I].F1 <> -1 Then
   Begin
-    SetFilePointer(KObjs[I].F1, OfsLo, 0, 0);
-    KReadFile(KObjs[I].F1, A, N, Got);
+    SetFilePointer(KObjs^[I].F1, OfsLo, 0, 0);
+    KReadFile(KObjs^[I].F1, A, N, Got);
   End;
   ViewAddr[V] := A; ViewMap[V] := HMap; ViewOfs[V] := OfsLo;
   ViewSize[V] := N;
@@ -30451,6 +30697,851 @@ End;
 Function SetMapMode(Hdc, M : LongInt) : LongInt;
 Begin
   SetMapMode := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ GDI : origines et etendues (mode MM_TEXT), visibilite               }
+{ ------------------------------------------------------------------ }
+
+Function OffsetViewportOrgEx(Hdc, X, Y, P : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  D := DcOf(Hdc);
+  OffsetViewportOrgEx := 0;
+  If D < 0 Then Exit;
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := Dcs[D].VpX; MemL[0:P + 4] := Dcs[D].VpY;
+  End;
+  Dcs[D].VpX := Dcs[D].VpX + X; Dcs[D].VpY := Dcs[D].VpY + Y;
+  OffsetViewportOrgEx := 1;
+End;
+
+{ En MM_TEXT, les etendues valent toujours 1 x 1 et ne changent pas }
+Function ExtOne(Hdc, P : LongInt) : LongInt;
+Begin
+  ExtOne := 0;
+  If DcOf(Hdc) < 0 Then Exit;
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 1; MemL[0:P + 4] := 1;
+  End;
+  ExtOne := 1;
+End;
+
+Function SetViewportExtEx(Hdc, X, Y, P : LongInt) : LongInt;
+Begin
+  SetViewportExtEx := ExtOne(Hdc, P);
+End;
+
+Function SetWindowExtEx(Hdc, X, Y, P : LongInt) : LongInt;
+Begin
+  SetWindowExtEx := ExtOne(Hdc, P);
+End;
+
+Function ScaleViewportExtEx(Hdc, XN, XD, YN, YD, P : LongInt) : LongInt;
+Begin
+  ScaleViewportExtEx := ExtOne(Hdc, P);
+End;
+
+Function ScaleWindowExtEx(Hdc, XN, XD, YN, YD, P : LongInt) : LongInt;
+Begin
+  ScaleWindowExtEx := ExtOne(Hdc, P);
+End;
+
+Function GetViewportExtEx(Hdc, P : LongInt) : LongInt;
+Begin
+  GetViewportExtEx := ExtOne(Hdc, P);
+End;
+
+Function GetWindowExtEx(Hdc, P : LongInt) : LongInt;
+Begin
+  GetWindowExtEx := ExtOne(Hdc, P);
+End;
+
+{ Le dessin est toujours decoupe a la surface du DC : tout est dit
+  visible (comme un DC sans region de decoupage) }
+Function PtVisible(Hdc, X, Y : LongInt) : LongInt;
+Begin
+  PtVisible := Ord(DcOf(Hdc) >= 0);
+End;
+
+Function RectVisible(Hdc, P : LongInt) : LongInt;
+Begin
+  RectVisible := Ord(DcOf(Hdc) >= 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ USER : classes etendues, placement, texte avec tabulations         }
+{ ------------------------------------------------------------------ }
+
+{ WNDCLASSEX = cbSize + WNDCLASS + hIconSm }
+Function RegisterClassExA(P : LongInt) : LongInt;
+Begin
+  RegisterClassExA := 0;
+  If P = 0 Then Exit;
+  RegisterClassExA := RegisterClassA(P + 4);
+End;
+
+Function GetClassInfoExA(Inst, Name, P : LongInt) : LongInt;
+Begin
+  GetClassInfoExA := 0;
+  If P = 0 Then Exit;
+  GetClassInfoExA := GetClassInfoA(Inst, Name, P + 4);
+  MemL[0:P] := 48; MemL[0:P + 44] := 0;
+End;
+
+{ WINDOWPLACEMENT : length, flags, showCmd, ptMin, ptMax, rcNormal }
+Function GetWindowPlacement(H, P : LongInt) : LongInt;
+Var W, C : LongInt;
+Begin
+  GetWindowPlacement := 0;
+  W := WndOf(H);
+  If (W < 0) Or (P = 0) Then Exit;
+  FillMem(P + 4, 40, 0);
+  MemL[0:P] := 44;
+  C := 1;
+  If Wnds^[W].Min Then C := 2
+  Else If Wnds^[W].Max Then C := 3;
+  MemL[0:P + 8] := C;
+  MemL[0:P + 12] := -1; MemL[0:P + 16] := -1;
+  MemL[0:P + 20] := -1; MemL[0:P + 24] := -1;
+  GetWindowRect(H, P + 28);
+  GetWindowPlacement := 1;
+End;
+
+Function SetWindowPlacement(H, P : LongInt) : LongInt;
+Var X, Y : LongInt;
+Begin
+  SetWindowPlacement := 0;
+  If (WndOf(H) < 0) Or (P = 0) Then Exit;
+  X := MemL[0:P + 28]; Y := MemL[0:P + 32];
+  If MemL[0:P + 8] <> 3 Then
+    MoveWindow(H, X, Y, MemL[0:P + 36] - X, MemL[0:P + 40] - Y, 1);
+  ShowWindow(H, MemL[0:P + 8]);
+  SetWindowPlacement := 1;
+End;
+
+Function SetMenuItemBitmaps(Mn, Pos0, Flags, BUn, BCh : LongInt) : LongInt;
+Begin
+  SetMenuItemBitmaps := 1;
+End;
+
+{ Position de la tabulation qui suit X (taquets en Tabs, decalage Org) }
+Function NextTab(X, NT, Tabs, Org : LongInt) : LongInt;
+Var I, T, St, R : LongInt;
+Begin
+  R := -1;
+  If (NT <= 0) Or (Tabs = 0) Then
+  Begin
+    St := 64;
+    If (NT = 1) And (Tabs <> 0) And (MemL[0:Tabs] > 0) Then
+      St := MemL[0:Tabs];
+    R := Org + ((X - Org) Div St + 1) * St;
+  End
+  Else
+  Begin
+    For I := 0 To NT - 1 Do
+    Begin
+      T := Org + MemL[0:Tabs + I * 4];
+      If (R < 0) And (T > X) Then R := T;
+    End;
+    If R < 0 Then R := X + 8;
+  End;
+  NextTab := R;
+End;
+
+Function TabbedTextDo(Hdc, X, Y, Str, N, NT, Tabs, Org : LongInt;
+                      Draw : Boolean) : LongInt;
+Var I, A, CX, H : LongInt; Sz : Array[0..1] Of LongInt;
+Begin
+  CX := X; A := 0; H := 16;
+  For I := 0 To N Do
+    If (I = N) Or (Mem[0:Str + I] = 9) Then
+    Begin
+      If I > A Then
+      Begin
+        GetTextExtentPoint32A(Hdc, Str + A, I - A, LongInt(@Sz));
+        If Draw Then TextOutA(Hdc, CX, Y, Str + A, I - A);
+        CX := CX + Sz[0]; H := Sz[1];
+      End;
+      If I < N Then CX := NextTab(CX, NT, Tabs, Org);
+      A := I + 1;
+    End;
+  TabbedTextDo := (H Shl 16) Or ((CX - X) And $FFFF);
+End;
+
+Function TabbedTextOutA(Hdc, X, Y, Str, N, NT, Tabs, Org : LongInt)
+  : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Str);
+  TabbedTextOutA := TabbedTextDo(Hdc, X, Y, Str, N, NT, Tabs, Org, True);
+End;
+
+Function GetTabbedTextExtentA(Hdc, Str, N, NT, Tabs : LongInt) : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Str);
+  GetTabbedTextExtentA := TabbedTextDo(Hdc, 0, 0, Str, N, NT, Tabs, 0,
+                                       False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ KERNEL32 : messages d'erreur, poignees, fichiers, divers           }
+{ ------------------------------------------------------------------ }
+
+Function SysErrText(Id : LongInt) : String;
+Var S : String;
+Begin
+  Case Id Of
+    0 : S := L('L''operation a reussi.', 'The operation completed ' +
+              'successfully.', 'Der Vorgang wurde erfolgreich beendet.',
+              'Operazione completata.', 'La operacion se completo.');
+    2 : S := L('Le fichier specifie est introuvable.', 'The system ' +
+              'cannot find the file specified.', 'Die Datei wurde ' +
+              'nicht gefunden.', 'File non trovato.', 'No se encuentra ' +
+              'el archivo.');
+    3 : S := L('Le chemin d''acces specifie est introuvable.', 'The ' +
+              'system cannot find the path specified.', 'Der Pfad ' +
+              'wurde nicht gefunden.', 'Percorso non trovato.',
+              'No se encuentra la ruta.');
+    5 : S := L('Acces refuse.', 'Access is denied.', 'Zugriff ' +
+              'verweigert.', 'Accesso negato.', 'Acceso denegado.');
+    6 : S := L('Handle non valide.', 'The handle is invalid.',
+              'Ungultiges Handle.', 'Handle non valido.',
+              'Identificador no valido.');
+    8 : S := L('Memoire insuffisante pour traiter cette commande.',
+              'Not enough storage is available to process this ' +
+              'command.', 'Nicht genug Speicher.', 'Memoria ' +
+              'insufficiente.', 'Memoria insuficiente.');
+    87 : S := L('Parametre incorrect.', 'The parameter is incorrect.',
+               'Falscher Parameter.', 'Parametro non corretto.',
+               'Parametro incorrecto.');
+    112 : S := L('Espace insuffisant sur le disque.', 'There is not ' +
+                'enough space on the disk.', 'Nicht genug Speicherplatz ' +
+                'auf dem Datentrager.', 'Spazio su disco insufficiente.',
+                'Espacio en disco insuficiente.');
+    120 : S := L('Cette fonction n''est pas prise en charge.', 'This ' +
+                'function is not supported on this system.', 'Funktion ' +
+                'nicht unterstutzt.', 'Funzione non supportata.',
+                'Funcion no admitida.');
+  Else
+    S := L('Erreur ', 'Error ', 'Fehler ', 'Errore ', 'Error ') +
+         IntStr(Id) + '.';
+  End;
+  SysErrText := S + #13#10;
+End;
+
+Var
+  FmT, FmN : LongInt;                 { tampon de FormatMessageA }
+
+Procedure FmPut(Ch : LongInt);
+Begin
+  If FmN < 4095 Then
+  Begin
+    Mem[0:FmT + FmN] := Ch;
+    Inc(FmN);
+  End;
+End;
+
+Procedure FmPutS(Const S : String);
+Var J : LongInt;
+Begin
+  For J := 1 To Length(S) Do FmPut(Ord(S[J]));
+End;
+
+{ FormatMessageA : FROM_STRING, FROM_SYSTEM (FROM_HMODULE : comme
+  FROM_SYSTEM), insertions %1..%99 (avec !d! !s! !u! !x! !c!), %0 %n
+  %% %. %t ; ALLOCATE_BUFFER (LocalAlloc) }
+Function FormatMessageA(Flags, Src, Id, Lang, Buf, Size, Args : LongInt)
+  : LongInt;
+Var T, Fm, N, I, K, V, C, Mx : LongInt; Spec, Ins : String;
+    Own : Boolean;
+Begin
+  FormatMessageA := 0;
+  T := KAlloc(4096);
+  If T = 0 Then Exit;
+  Own := False;
+  If (Flags And $400) <> 0 Then Fm := Src
+  Else
+  Begin
+    Ins := SysErrText(Id);
+    Fm := KAlloc(Length(Ins) + 1);
+    PutPStr(Fm, Ins, Length(Ins) + 1);
+    Own := True;
+  End;
+  Mx := Flags And $FF;
+  FmT := T; FmN := 0; I := 0;
+  While (Fm <> 0) And (Mem[0:Fm + I] <> 0) Do
+  Begin
+    C := Mem[0:Fm + I];
+    Inc(I);
+    If (C = Ord('%')) And ((Flags And $200) = 0) Then
+    Begin
+      C := Mem[0:Fm + I];
+      If C <> 0 Then Inc(I);
+      If (C >= Ord('1')) And (C <= Ord('9')) Then
+      Begin
+        K := C - Ord('0');
+        If (Mem[0:Fm + I] >= Ord('0')) And (Mem[0:Fm + I] <= Ord('9')) Then
+        Begin
+          K := K * 10 + Mem[0:Fm + I] - Ord('0');
+          Inc(I);
+        End;
+        Spec := 's';
+        If Mem[0:Fm + I] = Ord('!') Then
+        Begin
+          Spec := '';
+          Inc(I);
+          While (Mem[0:Fm + I] <> 0) And (Mem[0:Fm + I] <> Ord('!')) Do
+          Begin
+            Spec := Spec + Chr(Mem[0:Fm + I]);
+            Inc(I);
+          End;
+          If Mem[0:Fm + I] = Ord('!') Then Inc(I);
+        End;
+        V := 0;
+        If Args <> 0 Then V := MemL[0:Args + (K - 1) * 4];
+        If Spec <> '' Then C := Ord(Spec[Length(Spec)]) Else C := Ord('s');
+        Case Chr(C) Of
+          'd', 'i' : FmPutS(IntStr(V));
+          'u' : If V >= 0 Then FmPutS(IntStr(V))
+                Else FmPutS(IntStr(V Shr 1 Div 5) + IntStr(V Mod 10));
+          'x' :
+          Begin
+            Ins := HexStr(V, 1);
+            For K := 1 To Length(Ins) Do
+              If Ins[K] In ['A'..'F'] Then Ins[K] := Chr(Ord(Ins[K]) + 32);
+            FmPutS(Ins);
+          End;
+          'X' : FmPutS(HexStr(V, 1));
+          'c' : FmPut(V And $FF);
+        Else
+          Begin
+            K := 0;
+            If V <> 0 Then
+              While Mem[0:V + K] <> 0 Do
+              Begin
+                FmPut(Mem[0:V + K]);
+                Inc(K);
+              End;
+          End;
+        End;
+      End
+      Else If C = Ord('0') Then Break
+      Else If C = Ord('n') Then
+      Begin
+        FmPut(13); FmPut(10);
+      End
+      Else If C = Ord('t') Then FmPut(9)
+      Else If C <> 0 Then FmPut(C);
+    End
+    Else If (Mx <> 0) And ((C = 13) Or (C = 10)) Then
+    Begin
+      If (C = 13) And (Mem[0:Fm + I] = 10) Then Inc(I);
+      FmPut(32);
+    End
+    Else FmPut(C);
+  End;
+  N := FmN;
+  Mem[0:T + N] := 0;
+  If Own Then KFree(Fm);
+  If (Flags And $100) <> 0 Then
+  Begin
+    If Buf <> 0 Then
+    Begin
+      V := LocalAlloc(0, Max(N + 1, Size));
+      MoveMem(T, V, N + 1);
+      MemL[0:Buf] := V;
+    End;
+  End
+  Else
+  Begin
+    If N >= Size Then
+    Begin
+      KFree(T);
+      SetErr(122);
+      Exit;
+    End;
+    MoveMem(T, Buf, N + 1);
+  End;
+  KFree(T);
+  FormatMessageA := N;
+End;
+
+Function HeapValidate(Heap, Flags, P : LongInt) : LongInt;
+Begin
+  HeapValidate := 1;
+End;
+
+Procedure DebugBreak;
+Begin
+  KLog('DebugBreak');
+End;
+
+{ Copie d'une poignee : les pseudo-poignees de la tache courante
+  deviennent une vraie poignee, les autres sont partagees }
+Function DuplicateHandle(SP, H, TP, PH, Acc, Inh, Opt : LongInt)
+  : LongInt;
+Var R : LongInt;
+Begin
+  R := H;
+  If H = -2 Then R := KHandle(Threads[CurT].KObj);
+  If PH <> 0 Then MemL[0:PH] := R;
+  DuplicateHandle := 1;
+End;
+
+Procedure FatalAppExitA(Act, Msg : LongInt);
+Begin
+  KLog('FatalAppExit : ' + PStr(Msg));
+  MessageBoxA(0, Msg, 0, $10);
+  ExitProcess(255);
+End;
+
+Function GetProcessVersion(Pid : LongInt) : LongInt;
+Begin
+  GetProcessVersion := $00040000;
+End;
+
+{ Verrous de fichiers : un seul programme a la fois, toujours accordes }
+Function LockFile(H, OL, OH, NL, NH : LongInt) : LongInt;
+Begin
+  LockFile := 1;
+End;
+
+Function UnlockFile(H, OL, OH, NL, NH : LongInt) : LongInt;
+Begin
+  UnlockFile := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ WINMM : manette de jeu (aucune) et fichiers RIFF (mmio)            }
+{ ------------------------------------------------------------------ }
+
+Function joyGetNumDevs : LongInt;
+Begin
+  joyGetNumDevs := 0;
+End;
+
+Function joyGetDevCapsA(Id, P, N : LongInt) : LongInt;
+Begin
+  joyGetDevCapsA := 167;
+End;
+
+Function joyGetPos(Id, P : LongInt) : LongInt;
+Begin
+  joyGetPos := 167;
+End;
+
+Function joyGetPosEx(Id, P : LongInt) : LongInt;
+Begin
+  joyGetPosEx := 167;
+End;
+
+Function joyGetThreshold(Id, P : LongInt) : LongInt;
+Begin
+  joyGetThreshold := 167;
+End;
+
+Function joySetThreshold(Id, V : LongInt) : LongInt;
+Begin
+  joySetThreshold := 167;
+End;
+
+Function joySetCapture(H, Id, Per, Chg : LongInt) : LongInt;
+Begin
+  joySetCapture := 167;
+End;
+
+Function joyReleaseCapture(Id : LongInt) : LongInt;
+Begin
+  joyReleaseCapture := 0;
+End;
+
+Function waveOutGetPosition(H, P, N : LongInt) : LongInt;
+Var I, B, R : LongInt;
+Begin
+  waveOutGetPosition := 5;
+  I := WaveOf(H);
+  If I < 0 Then Exit;
+  waveOutGetPosition := 11;
+  If (P = 0) Or (N < 8) Then Exit;
+  B := WavePosB(I); R := Max(WaveDevs[I].Rate, 1);
+  Case MemL[0:P] Of
+    1 : MemL[0:P + 4] := (B Div R) * 1000 + ((B Mod R) * 1000) Div R;
+    2 : MemL[0:P + 4] := B Div Max(WaveDevs[I].Blk, 1);
+  Else
+    MemL[0:P] := 4;
+    MemL[0:P + 4] := B;
+  End;
+  waveOutGetPosition := 0;
+End;
+
+Const
+  MaxMmio = 16;
+  HMmioBase = $6D10000;
+
+Type
+  TMmio = Record
+    Used : Boolean;
+    FH : LongInt;                     { fichier, ou 0 pour la memoire }
+    MP, MN, MPos : LongInt;           { fichier en memoire }
+    Dirty : Boolean;
+  End;
+
+Var
+  Mmios : Array[0..MaxMmio - 1] Of TMmio;
+
+Function MmioOf(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := H - HMmioBase;
+  If (I < 0) Or (I >= MaxMmio) Then I := -1
+  Else If Not Mmios[I].Used Then I := -1;
+  MmioOf := I;
+End;
+
+Function MmioSeekK(I, Off, Org : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  If Mmios[I].FH <> 0 Then
+    R := SetFilePointer(Mmios[I].FH, Off, 0, Org)
+  Else
+  Begin
+    R := Off;
+    If Org = 1 Then R := Mmios[I].MPos + Off
+    Else If Org = 2 Then R := Mmios[I].MN + Off;
+    If (R < 0) Or (R > Mmios[I].MN) Then R := -1
+    Else Mmios[I].MPos := R;
+  End;
+  MmioSeekK := R;
+End;
+
+Function MmioReadK(I, Buf, N : LongInt) : LongInt;
+Var Got : LongInt;
+Begin
+  Got := -1;
+  If N < 0 Then N := 0;
+  If Mmios[I].FH <> 0 Then
+  Begin
+    If ReadFile(Mmios[I].FH, Buf, N, LongInt(@Got), 0) = 0 Then Got := -1;
+  End
+  Else
+  Begin
+    Got := Min(N, Mmios[I].MN - Mmios[I].MPos);
+    If Got < 0 Then Got := 0;
+    MoveMem(Mmios[I].MP + Mmios[I].MPos, Buf, Got);
+    Mmios[I].MPos := Mmios[I].MPos + Got;
+  End;
+  MmioReadK := Got;
+End;
+
+Function MmioWriteK(I, Buf, N : LongInt) : LongInt;
+Var Got : LongInt;
+Begin
+  Got := -1;
+  If N < 0 Then N := 0;
+  If Mmios[I].FH <> 0 Then
+  Begin
+    If WriteFile(Mmios[I].FH, Buf, N, LongInt(@Got), 0) = 0 Then Got := -1;
+  End
+  Else
+  Begin
+    Got := Min(N, Mmios[I].MN - Mmios[I].MPos);
+    If Got < 0 Then Got := 0;
+    MoveMem(Buf, Mmios[I].MP + Mmios[I].MPos, Got);
+    Mmios[I].MPos := Mmios[I].MPos + Got;
+  End;
+  MmioWriteK := Got;
+End;
+
+{ MMIOINFO : dwFlags +0, fccIOProc +4, pIOProc +8, wErrorRet +12,
+  htask +16, cchBuffer +20, pchBuffer +24, ..., adwInfo +48,
+  hmmio +68 ; lecture et ecriture de fichiers (DOS) et de memoire (MEM) }
+Function mmioOpenA(Name, Info, Flags : LongInt) : LongInt;
+Var I, K, H, Acc, Disp : LongInt;
+Begin
+  mmioOpenA := 0;
+  If Info <> 0 Then MemW[0:Info + 12] := 0;
+  { MMIO_PARSE : nom complet ; MMIO_EXIST : le fichier existe-t-il ? }
+  If (Flags And $100) <> 0 Then
+  Begin
+    If Name <> 0 Then
+      PutPStr(Name, FullPath(PStr(Name)), 128);
+    mmioOpenA := 1;
+    Exit;
+  End;
+  If (Flags And $200) <> 0 Then
+  Begin
+    mmioOpenA := DeleteFileA(Name);
+    Exit;
+  End;
+  I := -1;
+  For K := MaxMmio - 1 DownTo 0 Do
+    If Not Mmios[K].Used Then I := K;
+  If I < 0 Then
+  Begin
+    If Info <> 0 Then MemW[0:Info + 12] := 260;
+    Exit;
+  End;
+  Mmios[I].FH := 0; Mmios[I].MP := 0; Mmios[I].MN := 0;
+  Mmios[I].MPos := 0; Mmios[I].Dirty := False;
+  If (Info <> 0) And (MemL[0:Info + 4] = $204D454D) Then
+  Begin
+    { 'MEM ' : fichier en memoire (pchBuffer, cchBuffer) }
+    Mmios[I].MP := MemL[0:Info + 24];
+    Mmios[I].MN := MemL[0:Info + 20];
+    If Mmios[I].MP = 0 Then
+    Begin
+      Mmios[I].MP := KAlloc(Max(Mmios[I].MN, 1));
+      FillMem(Mmios[I].MP, Max(Mmios[I].MN, 1), 0);
+    End;
+  End
+  Else
+  Begin
+    Acc := LongInt($80000000); Disp := 3;
+    Case Flags And 3 Of
+      1 : Acc := $40000000;
+      2 : Acc := LongInt($C0000000);
+    End;
+    If (Flags And $1000) <> 0 Then Disp := 2;
+    H := CreateFileA(Name, Acc, 1, 0, Disp, $80, 0);
+    If (H = 0) Or (H = -1) Then
+    Begin
+      If Info <> 0 Then MemW[0:Info + 12] := 257;
+      Exit;
+    End;
+    Mmios[I].FH := H;
+  End;
+  Mmios[I].Used := True;
+  If Info <> 0 Then
+  Begin
+    MemL[0:Info] := Flags;
+    MemL[0:Info + 68] := HMmioBase + I;
+  End;
+  mmioOpenA := HMmioBase + I;
+End;
+
+Function mmioClose(H, Flags : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioClose := 5;
+  I := MmioOf(H);
+  If I < 0 Then Exit;
+  If Mmios[I].FH <> 0 Then CloseHandle(Mmios[I].FH);
+  Mmios[I].Used := False;
+  mmioClose := 0;
+End;
+
+Function mmioRead(H, Buf, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioRead := -1;
+  I := MmioOf(H);
+  If I >= 0 Then mmioRead := MmioReadK(I, Buf, N);
+End;
+
+Function mmioWrite(H, Buf, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioWrite := -1;
+  I := MmioOf(H);
+  If I >= 0 Then mmioWrite := MmioWriteK(I, Buf, N);
+End;
+
+Function mmioSeek(H, Off, Org : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioSeek := -1;
+  I := MmioOf(H);
+  If I >= 0 Then mmioSeek := MmioSeekK(I, Off, Org);
+End;
+
+Function mmioFlush(H, Flags : LongInt) : LongInt;
+Begin
+  mmioFlush := 0;
+End;
+
+Function mmioFOURCC(A, B, C, D : LongInt) : LongInt;
+Begin
+  mmioFOURCC := (A And $FF) Or ((B And $FF) Shl 8) Or ((C And $FF) Shl 16)
+                Or ((D And $FF) Shl 24);
+End;
+
+Function mmioStringToFOURCCA(P, Flags : LongInt) : LongInt;
+Var I, R, C : LongInt;
+Begin
+  R := 0;
+  For I := 0 To 3 Do
+  Begin
+    C := 32;
+    If (P <> 0) And (StrLenZ(P) > I) Then C := Mem[0:P + I];
+    If ((Flags And $10) <> 0) And (C >= 97) And (C <= 122) Then C := C - 32;
+    R := R Or (C Shl (I * 8));
+  End;
+  mmioStringToFOURCCA := R;
+End;
+
+{ MMCKINFO : ckid +0, cksize +4, fccType +8, dwDataOffset +12,
+  dwFlags +16 }
+Function mmioDescend(H, Ck, Par, Flags : LongInt) : LongInt;
+Var I, Pos0, Fin, Id, Sz, Ty, Want, WantT : LongInt;
+    Hd : Array[0..2] Of LongInt; Ok : Boolean;
+Begin
+  mmioDescend := 5;
+  I := MmioOf(H);
+  If (I < 0) Or (Ck = 0) Then Exit;
+  Fin := MaxLongInt;
+  If Par <> 0 Then Fin := MemL[0:Par + 12] + MemL[0:Par + 4];
+  Want := 0; WantT := 0;
+  If (Flags And $10) <> 0 Then Want := MemL[0:Ck];
+  If (Flags And $20) <> 0 Then
+  Begin
+    Want := $46464952; WantT := MemL[0:Ck + 8];
+  End;
+  If (Flags And $40) <> 0 Then
+  Begin
+    Want := $5453494C; WantT := MemL[0:Ck + 8];
+  End;
+  mmioDescend := 265;
+  Repeat
+    Pos0 := MmioSeekK(I, 0, 1);
+    If (Pos0 < 0) Or (Pos0 + 8 > Fin) Then Exit;
+    If MmioReadK(I, LongInt(@Hd), 8) <> 8 Then Exit;
+    Id := Hd[0]; Sz := Hd[1]; Ty := 0;
+    If (Id = $46464952) Or (Id = $5453494C) Then
+    Begin
+      If MmioReadK(I, LongInt(@Hd[2]), 4) <> 4 Then Exit;
+      Ty := Hd[2];
+    End;
+    Ok := (Want = 0) Or ((Id = Want) And ((WantT = 0) Or (Ty = WantT)));
+    If Not Ok Then
+      If MmioSeekK(I, Pos0 + 8 + Sz + (Sz And 1), 0) < 0 Then Exit;
+  Until Ok;
+  MemL[0:Ck] := Id; MemL[0:Ck + 4] := Sz; MemL[0:Ck + 8] := Ty;
+  MemL[0:Ck + 12] := Pos0 + 8; MemL[0:Ck + 16] := 0;
+  mmioDescend := 0;
+End;
+
+Function mmioAscend(H, Ck, Flags : LongInt) : LongInt;
+Var I, Sz, P, E : LongInt;
+Begin
+  mmioAscend := 5;
+  I := MmioOf(H);
+  If (I < 0) Or (Ck = 0) Then Exit;
+  Sz := MemL[0:Ck + 4];
+  { MMIO_DIRTY : le morceau ecrit prend la taille atteinte }
+  If (MemL[0:Ck + 16] And $10000000) <> 0 Then
+  Begin
+    P := MmioSeekK(I, 0, 1);
+    Sz := P - MemL[0:Ck + 12];
+    MemL[0:Ck + 4] := Sz;
+    MmioSeekK(I, MemL[0:Ck + 12] - 4, 0);
+    MmioWriteK(I, LongInt(@Sz), 4);
+    MemL[0:Ck + 16] := MemL[0:Ck + 16] And Not $10000000;
+  End;
+  E := MemL[0:Ck + 12] + Sz;
+  If (Sz And 1) <> 0 Then
+  Begin
+    MmioSeekK(I, E, 0);
+    If (MemL[0:Ck + 16] And $20000000) <> 0 Then
+    Begin
+      P := 0;
+      MmioWriteK(I, LongInt(@P), 1);
+    End;
+    Inc(E);
+  End;
+  If MmioSeekK(I, E, 0) < 0 Then
+  Begin
+    mmioAscend := 264;
+    Exit;
+  End;
+  mmioAscend := 0;
+End;
+
+{ MMIO_CREATERIFF $20, MMIO_CREATELIST $40 }
+Function mmioCreateChunk(H, Ck, Flags : LongInt) : LongInt;
+Var I, P, N : LongInt; Hd : Array[0..2] Of LongInt;
+Begin
+  mmioCreateChunk := 5;
+  I := MmioOf(H);
+  If (I < 0) Or (Ck = 0) Then Exit;
+  If (Flags And $20) <> 0 Then MemL[0:Ck] := $46464952;
+  If (Flags And $40) <> 0 Then MemL[0:Ck] := $5453494C;
+  P := MmioSeekK(I, 0, 1);
+  Hd[0] := MemL[0:Ck]; Hd[1] := MemL[0:Ck + 4]; Hd[2] := MemL[0:Ck + 8];
+  N := 8;
+  If (Hd[0] = $46464952) Or (Hd[0] = $5453494C) Then N := 12;
+  If MmioWriteK(I, LongInt(@Hd), N) <> N Then
+  Begin
+    mmioCreateChunk := 259;
+    Exit;
+  End;
+  MemL[0:Ck + 12] := P + 8;
+  MemL[0:Ck + 16] := $10000000;
+  mmioCreateChunk := 0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ WINSPOOL, COMDLG32, COMCTL32                                       }
+{ ------------------------------------------------------------------ }
+
+{ Aucune imprimante n'est installee }
+Function OpenPrinterA(Name, PH, Def : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  SetErr(1801);
+  OpenPrinterA := 0;
+End;
+
+Function ClosePrinter(H : LongInt) : LongInt;
+Begin
+  ClosePrinter := 1;
+End;
+
+Function DocumentPropertiesA(Wnd, Prn, Name, POut, PIn, Mode : LongInt)
+  : LongInt;
+Begin
+  DocumentPropertiesA := -1;
+End;
+
+Function EnumPrintersA(Fl, Name, Lvl, Buf, Cb, PNeed, PRet : LongInt)
+  : LongInt;
+Begin
+  If PNeed <> 0 Then MemL[0:PNeed] := 0;
+  If PRet <> 0 Then MemL[0:PRet] := 0;
+  EnumPrintersA := 1;
+End;
+
+{ Titre d'un fichier : son nom sans le chemin }
+Function GetFileTitleA(Path, Buf, N : LongInt) : LongInt;
+Var S : String; K : LongInt;
+Begin
+  S := PStr(Path);
+  K := Length(S);
+  While (K > 0) And (S[K] <> '\') And (S[K] <> '/') And (S[K] <> ':') Do
+    Dec(K);
+  S := Copy(S, K + 1, 255);
+  If (S = '') Then
+  Begin
+    GetFileTitleA := -1;
+    Exit;
+  End;
+  If (Buf = 0) Or (N <= Length(S)) Then
+  Begin
+    GetFileTitleA := Length(S) + 1;
+    Exit;
+  End;
+  PutPStr(Buf, S, N);
+  GetFileTitleA := 0;
+End;
+
+Procedure InitCommonControls;
+Begin
+End;
+
+Function InitCommonControlsEx(P : LongInt) : LongInt;
+Begin
+  InitCommonControlsEx := 1;
 End;
 
 Function MessageBoxIndirectA(P : LongInt) : LongInt;
@@ -33622,7 +34713,7 @@ Begin
   W := WndOf(H);
   If W < 0 Then Exit;
   N := M - $400;
-  K := Wnds[W].IKind;
+  K := Wnds^[W].IKind;
   If K = ikEdit Then
   Begin
     M := $B0 + N;
@@ -33706,8 +34797,8 @@ Function SendMsg16(H, M, WP, LP : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
-  If (W >= 0) And (Pr16Of(Wnds[W].Proc) >= 0) Then
-    SendMsg16 := CallWnd16(Wnds[W].Proc, H, M, WP, LP, False)
+  If (W >= 0) And (Pr16Of(Wnds^[W].Proc) >= 0) Then
+    SendMsg16 := CallWnd16(Wnds^[W].Proc, H, M, WP, LP, False)
   Else SendMsg16 := CallWnd16(0, H, M, WP, LP, False);
 End;
 
@@ -33851,10 +34942,10 @@ Begin
        ')');
   KillingApp := True;
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And (Wnds[I].Thread = CurT) Then
+    If Wnds^[I].Used And (Wnds^[I].Thread = CurT) Then
     Begin
-      Wnds[I].Proc := 0;
-      Wnds[I].IKind := ikStatic;
+      Wnds^[I].Proc := 0;
+      Wnds^[I].IKind := ikStatic;
       DestroyW(I);
     End;
   KillingApp := False;
@@ -33863,8 +34954,8 @@ Begin
     If Gdis^[I].Used And (Gdis^[I].Owner = Own) And Not Gdis^[I].Stock Then
       Gdis^[I].Used := False;
   For I := 0 To MaxKObj - 1 Do
-    If KObjs[I].Used And (KObjOwner[I] = Own) And
-       (KObjs[I].Kind In [koFile, koFind]) Then KObjs[I].Used := False;
+    If KObjs^[I].Used And (KObjOwner[I] = Own) And
+       (KObjs^[I].Kind In [koFile, koFind]) Then KObjs^[I].Used := False;
   M := T16Mod[CurT];
   If (M >= 0) And NeUsed[M] And Not NeDll[M] Then
   Begin
@@ -34228,9 +35319,9 @@ Begin
   If Cls <> 0 Then C := UpStr(PStr(Cls));
   If Name <> 0 Then N := PStr(Name);
   For I := 0 To MaxWnd - 1 Do
-    If Wnds[I].Used And Not IsChildW(I) And (Wnds[I].IKind = ikNone) Then
-      If ((C = '') Or (UpStr(Classes[Wnds[I].Cls].Name) = C)) And
-         ((Name = 0) Or (Wnds[I].Text = N)) Then
+    If Wnds^[I].Used And Not IsChildW(I) And (Wnds^[I].IKind = ikNone) Then
+      If ((C = '') Or (UpStr(Classes[Wnds^[I].Cls].Name) = C)) And
+         ((Name = 0) Or (Wnds^[I].Text = N)) Then
       Begin
         FindWin := HwndOf(I);
         Exit;
@@ -35086,9 +36177,9 @@ Begin
       P := A(1);
       H := MemW[0:P];
       K := WndOf(H);
-      If (K >= 0) And (Pr16Of(Wnds[K].Proc) >= 0) And
+      If (K >= 0) And (Pr16Of(Wnds^[K].Proc) >= 0) And
          (MemW[0:P + 2] <> $113) Then
-        SetDXAX(CallWnd16(Wnds[K].Proc, H, MemW[0:P + 2], MemW[0:P + 4],
+        SetDXAX(CallWnd16(Wnds^[K].Proc, H, MemW[0:P + 2], MemW[0:P + 4],
                           MemL[0:P + 6], False))
       Else
       Begin
@@ -35162,7 +36253,7 @@ Begin
     2224 :
     Begin
       K := WndOf(A(1));
-      If K >= 0 Then SetAX($8000 + Wnds[K].Thread);
+      If K >= 0 Then SetAX($8000 + Wnds^[K].Thread);
     End;
     2286 : SetAX(GetDesktopWindow);
     2420 :
@@ -35281,44 +36372,113 @@ Begin
 End;
 
 { ==================================================================== }
-{ Partie 15 - DirectX : DirectDraw, DirectSound, DirectInput, DSETUP   }
+{ Partie 15 - DirectX : DirectDraw, Direct3D, DirectSound, DirectInput }
 { ==================================================================== }
-{ DirectX est integre au noyau comme les autres DLL systeme (DDRAW.DLL,
-  DSOUND.DLL, DINPUT.DLL, DSETUP.DLL) : les objets COM sont des blocs
-  dont le premier mot pointe sur une table de methodes ; chaque methode
-  est une fonction du noyau exportee en stdcall.
-  Objet : +0 table, +4 references, +8 sorte (1 DirectDraw, 2 vue
-  DirectDraw2, 3 surface, 4 palette, 5 decoupeur, 6 DirectSound,
-  7 tampon de son, 8 DirectInput, 9 peripherique d'entree).
-  DirectDraw : affichage 640x480 en 256 couleurs ; en mode exclusif la
-  surface primaire est copiee telle quelle sur l'ecran (FlushScreen) et
-  sa palette devient la palette materielle. DirectSound : tampons
-  muets dont la position de lecture avance en temps reel (comme la
-  carte son muette). DirectInput : clavier (codes de balayage) et
-  souris (deplacements relatifs). }
+{ DirectX 7 (et Direct3D 8) est integre au noyau comme les autres DLL
+  systeme (DDRAW, D3DIM, D3D8, DSOUND, DINPUT, DINPUT8, DPLAYX, DSETUP).
+  Objets COM : chaque objet (le "coeur") porte un en-tete de 64 octets :
+    +0 table de methodes, +4 references, +8 sorte, +12 coeur,
+    +16 version (case), +20..+51 vues (8 cases), donnees a partir de +64.
+  Une interface d'une autre version (IDirectDrawSurface7, IDirect3D3...)
+  est une "vue" : petit bloc (table, 0, sorte, coeur, case) qui renvoie
+  au meme coeur ; les references sont comptees sur le coeur. Chaque
+  methode commence par T := Cor(T).
+  Sortes : 1 DirectDraw, 3 surface, 4 palette, 5 decoupeur,
+  6 DirectSound, 7 tampon de son, 8 DirectInput, 9 peripherique
+  d'entree, 10 notification de son, 11..30 Direct3D, 31.. DirectPlay
+  et DirectMusic.
+  DirectDraw : en mode exclusif, le mode demande (8, 16, 24 ou 32 bits)
+  est donne a la carte par DISPI (Bochs, QEMU, VirtualBox) ou par la
+  carte VMware SVGA II ; sinon l'image est agrandie (facteur entier) et
+  centree dans le mode du bureau. La surface primaire est convertie vers
+  la memoire video ligne par ligne (bande modifiee seulement). En
+  fenetre, la primaire est l'ecran : les transferts vers elle passent
+  par le contexte de la fenetre du decoupeur. }
 
 Const
   DD_OK = 0;
+  S_FALSE = 1;
   E_NOTIMPL = LongInt($80004001);
   E_NOINTERFACE = LongInt($80004002);
+  E_POINTER = LongInt($80004003);
+  E_FAIL = LongInt($80004005);
+  E_OUTOFMEMORY = LongInt($8007000E);
   DDERR_INVALIDPARAMS = LongInt($80070057);
+  DDERR_ALREADYINITIALIZED = LongInt($88760005);
+  DDERR_INVALIDCAPS = LongInt($88760064);
+  DDERR_CANNOTATTACHSURFACE = LongInt($8876006E);
   DDERR_INVALIDMODE = LongInt($88760078);
+  DDERR_INVALIDOBJECT = LongInt($88760082);
+  DDERR_INVALIDPIXELFORMAT = LongInt($88760091);
+  DDERR_NOCLIPPERATTACHED = LongInt($887600CD);
+  DDERR_NOCOLORKEY = LongInt($887600D7);
+  DDERR_NOEXCLUSIVEMODE = LongInt($887600E1);
+  DDERR_NOTFLIPPABLE = LongInt($887600E6);
   DDERR_NOTFOUND = LongInt($887600FF);
+  DDERR_NOOVERLAYHW = LongInt($88760104);
+  DDERR_SURFACEALREADYATTACHED = LongInt($8876019A);
+  DDERR_SURFACENOTATTACHED = LongInt($887601A6);
   DDERR_WASSTILLDRAWING = LongInt($8876021C);
+  DDERR_PRIMARYSURFACEALREADYEXISTS = LongInt($88760234);
+  DDERR_NOPALETTEATTACHED = LongInt($8876023C);
+  DDERR_CANTCREATEDC = LongInt($88760245);
+  DDERR_NOTLOCKED = LongInt($88760248);
+  DDERR_NODC = LongInt($8876024A);
+  DDERR_NOTPALETTIZED = LongInt($8876024D);
+  DDERR_DCALREADYCREATED = LongInt($8876026C);
+  DDERR_NOTINITIALIZED = LongInt($800401F0);
+  CLASS_E_NOAGGREGATION = LongInt($80040110);
+  REGDB_E_CLASSNOTREG = LongInt($80040154);
+
+  { surfaces : capacites }
+  dcBack = $4; dcComplex = $8; dcFlip = $10; dcFront = $20;
+  dcOffscreen = $40; dcPrimary = $200; dcSysMem = $800;
+  dcTexture = $1000; dc3D = $2000; dcVidMem = $4000; dcVisible = $8000;
+  dcZBuf = $20000; dcOwnDC = $40000; dcMipMap = $400000;
+  dcLocalVid = $10000000;
 
 Var
-  VtDD, VtDD2, VtSurf, VtPal, VtClip, VtDS, VtDSB, VtDI, VtDID : LongInt;
-  DDCoopWnd, DDCoopFl, DDBpp : LongInt;
-  DDPrimary : LongInt;
-
-{ Table de methodes : VtNew puis VtAdd('nom,nom,...') (listes courtes,
-  une chaine Pascal est limitee a 255 caracteres) }
-Var
+  { modes et affichage }
+  DXObj, DXPrim : LongInt;         { objet DirectDraw, primaire (coeurs) }
+  DXW, DXH, DXBpp : LongInt;       { mode DirectDraw }
+  DXModeSet : Boolean;             { mode demande par SetDisplayMode }
+  DXHw : Boolean;                  { la carte est dans ce mode }
+  DXOldW, DXOldH, DXOldB : LongInt;
+  DXChanged : Boolean;             { mode du bureau change par DirectDraw }
+  DXScale, DXX0, DXY0 : LongInt;
+  DXDirt0, DXDirt1 : LongInt;      { bande de lignes modifiees }
+  DXLast : LongInt;                { dernier affichage (Ticks) }
+  DXFlipT : LongInt;               { dernier Flip }
+  DXCoopWnd, DXCoopFl : LongInt;
+  DXRow, DXRowSz : LongInt;        { ligne de travail }
+  DXLut, DXLutKey : LongInt;       { 565 -> pixel ecran }
+  DXIdx : LongInt;                 { RGB 555 -> indice (mot, $FFFF a faire) }
+  DXIdxVer : LongInt;
+  DXGam : Array[0..767] Of Byte;
+  DXGamOn : Boolean;
+  DXUniq : LongInt;
+  { tables de methodes }
+  VtDD1, VtDD2, VtDD4, VtDD7 : LongInt;
+  VtS1, VtS2, VtS3, VtS4, VtS7, VtGam, VtPal, VtClip : LongInt;
+  VtDS, VtDS8, VtDSB, VtDSB8, VtDS3B, VtDS3L, VtDSN, VtDSC, VtKsP : LongInt;
+  VtDIA, VtDIW, VtDI8A, VtDI8W, VtDIDA, VtDIDW, VtDID8A, VtDID8W : LongInt;
   VtCur, VtCnt : LongInt;
+
+Procedure DXScrRow(Y : LongInt); Forward;
+
+{ Table de methodes : VtNew puis VtAdd('nom,nom,...') }
+{ Bloc du systeme (garde a la fin du programme) }
+Function KAllocSys(N : LongInt) : LongInt;
+Var H : LongInt;
+Begin
+  H := HeapOwner; HeapOwner := 0;
+  KAllocSys := KAlloc(N);
+  HeapOwner := H;
+End;
 
 Function VtNew : LongInt;
 Begin
-  VtCur := KAlloc(256);
+  VtCur := KAllocSys(512);
   VtCnt := 0;
   VtNew := VtCur;
 End;
@@ -35338,6 +36498,7 @@ Begin
       Nm := S; S := '';
     End;
     Nm := Trim(Nm);
+    If Nm = '' Then Continue;
     MemL[0:VtCur + VtCnt * 4] := KernelExport(Nm);
     If MemL[0:VtCur + VtCnt * 4] = 0 Then
       KLog('DirectX : methode absente ' + Nm);
@@ -35345,15 +36506,94 @@ Begin
   End;
 End;
 
+{ ------------------------------------------------------------------ }
+{ COM : coeurs et vues                                               }
+{ ------------------------------------------------------------------ }
+
 Function ComNew(Vt, Kind, Size : LongInt) : LongInt;
 Var O : LongInt;
 Begin
+  If Size < 64 Then Size := 64;
   O := KAlloc(Size);
   FillMem(O, Size, 0);
   MemL[0:O] := Vt;
   MemL[0:O + 4] := 1;
   MemL[0:O + 8] := Kind;
+  MemL[0:O + 12] := O;
   ComNew := O;
+End;
+
+{ Coeur d'une interface }
+Function Cor(T : LongInt) : LongInt;
+Begin
+  Cor := T;
+  If T <> 0 Then Cor := MemL[0:T + 12];
+End;
+
+{ Version (case) de l'interface T }
+Function IfVer(T : LongInt) : LongInt;
+Begin
+  IfVer := MemL[0:T + 16];
+End;
+
+{ Vue de la case K (table Vt) du coeur C, creee au besoin }
+Function ComView(C, K, Vt : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  V := MemL[0:C + 20 + K * 4];
+  If V = 0 Then
+  Begin
+    If MemL[0:C] = 0 Then
+    Begin
+      { coeur sans interface propre : il devient cette vue }
+      MemL[0:C] := Vt; MemL[0:C + 16] := K; V := C;
+    End
+    Else
+    Begin
+      V := KAlloc(20);
+      MemL[0:V] := Vt; MemL[0:V + 4] := 0; MemL[0:V + 8] := MemL[0:C + 8];
+      MemL[0:V + 12] := C; MemL[0:V + 16] := K;
+    End;
+    MemL[0:C + 20 + K * 4] := V;
+  End;
+  ComView := V;
+End;
+
+Function COMAddRef(T : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  MemL[0:C + 4] := MemL[0:C + 4] + 1;
+  COMAddRef := MemL[0:C + 4];
+End;
+
+Procedure ComDestroy(C : LongInt); Forward;
+
+Function COMRelease(T : LongInt) : LongInt;
+Var C, R, K, V : LongInt;
+Begin
+  C := Cor(T);
+  R := MemL[0:C + 4] - 1;
+  If R < 0 Then R := 0;
+  MemL[0:C + 4] := R;
+  COMRelease := R;
+  If R > 0 Then Exit;
+  ComDestroy(C);
+  For K := 0 To 7 Do
+  Begin
+    V := MemL[0:C + 20 + K * 4];
+    If (V <> 0) And (V <> C) Then KFree(V);
+  End;
+  MemL[0:C] := 0;
+  KFree(C);
+End;
+
+{ Rendre la vue K du coeur C dans *Ppv (avec une reference) }
+Function ComGive(C, K, Vt, Ppv : LongInt) : LongInt;
+Begin
+  MemL[0:Ppv] := ComView(C, K, Vt);
+  COMAddRef(C);
+  ComGive := DD_OK;
 End;
 
 Function GuidIs(P, D1 : LongInt) : Boolean;
@@ -35361,7 +36601,27 @@ Begin
   GuidIs := (P <> 0) And (MemL[0:P] = D1);
 End;
 
-{ Methodes non ecrites, selon le nombre d'arguments (This compris) }
+{ IID_IUnknown : 00000000-0000-0000-C000-000000000046 }
+Function GuidUnk(P : LongInt) : Boolean;
+Begin
+  GuidUnk := (P <> 0) And (MemL[0:P] = 0) And (MemL[0:P + 4] = 0) And
+             (MemL[0:P + 8] = $C0);
+End;
+
+Function COMQIUnk(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  COMQIUnk := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    COMQIUnk := DD_OK;
+  End;
+End;
+
+{ Methodes sans effet ou non disponibles (selon le nombre d'arguments) }
 Function DXNI1(T : LongInt) : LongInt;
 Begin
   DXNI1 := E_NOTIMPL;
@@ -35407,175 +36667,1640 @@ Begin
   DXOK3 := DD_OK;
 End;
 
-Function COMAddRef(T : LongInt) : LongInt;
-Begin
-  MemL[0:T + 4] := MemL[0:T + 4] + 1;
-  COMAddRef := MemL[0:T + 4];
-End;
-
-Procedure SurfFreeK(S : LongInt);
-Begin
-  If S = DDPrimary Then
-  Begin
-    DDPrimary := 0;
-    DDShow := False;
-    DefaultPalette;
-    MarkAll;
-  End
-  Else If MemL[0:S + 24] <> 0 Then KFree(MemL[0:S + 24]);
-  If MemL[0:S + 32] <> 0 Then SurfFreeK(MemL[0:S + 32]);
-End;
-
-Function COMRelease(T : LongInt) : LongInt;
-Var R : LongInt;
-Begin
-  R := MemL[0:T + 4] - 1;
-  MemL[0:T + 4] := R;
-  COMRelease := R;
-  If R > 0 Then Exit;
-  If MemL[0:T + 8] = 3 Then SurfFreeK(T);
-  If (MemL[0:T + 8] = 7) And (MemL[0:T + 16] <> 0) Then
-    KFree(MemL[0:T + 16]);
-  If MemL[0:T + 8] = 1 Then
-  Begin
-    DDShow := False;
-    DDCoopFl := 0;
-    MarkAll;
-  End;
-End;
-
-Function COMQIUnk(T, Riid, Ppv : LongInt) : LongInt;
-Begin
-  COMQIUnk := E_NOINTERFACE;
-  If Ppv = 0 Then Exit;
-  MemL[0:Ppv] := 0;
-  If GuidIs(Riid, 0) Then
-  Begin
-    MemL[0:Ppv] := T;
-    COMAddRef(T);
-    COMQIUnk := DD_OK;
-  End;
-End;
-
-{ ------------------------------------------------------------------ }
-{ DirectDraw                                                         }
-{ ------------------------------------------------------------------ }
-
-Procedure DDInitVt;
-Begin
-  If VtDD <> 0 Then Exit;
-  VtDD := VtNew;
-  VtAdd('DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,');
-  VtAdd('DD_CreatePalette,DD_CreateSurface,DXNI3,DD_EnumDisplayModes,');
-  VtAdd('DXNI5,DD_FlipToGDISurface,DD_GetCaps,DD_GetDisplayMode,DXNI3,');
-  VtAdd('DXNI2,DD_GetMonitorFrequency,DD_GetScanLine,DD_GetVBStatus,');
-  VtAdd('DXOK2,DD_RestoreDisplayMode,DD_SetCooperativeLevel,');
-  VtAdd('DD_SetDisplayMode,DD_WaitForVB');
-  VtDD2 := VtNew;
-  VtAdd('DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,');
-  VtAdd('DD_CreatePalette,DD_CreateSurface,DXNI3,DD_EnumDisplayModes,');
-  VtAdd('DXNI5,DD_FlipToGDISurface,DD_GetCaps,DD_GetDisplayMode,DXNI3,');
-  VtAdd('DXNI2,DD_GetMonitorFrequency,DD_GetScanLine,DD_GetVBStatus,');
-  VtAdd('DXOK2,DD_RestoreDisplayMode,DD_SetCooperativeLevel,');
-  VtAdd('DD_SetDisplayMode2,DD_WaitForVB,DD_GetAvailableVidMem');
-  VtSurf := VtNew;
-  VtAdd('SF_QI,COMAddRef,COMRelease,DXOK2,DXNI2,SF_Blt,');
-  VtAdd('DXNI4,SF_BltFast,DXOK3,DXNI3,DXNI4,SF_Flip,SF_GetAttachedSurface,');
-  VtAdd('DXOK2,SF_GetCaps,DXNI2,SF_GetColorKey,SF_GetDC,DXOK2,DXNI3,');
-  VtAdd('SF_GetPalette,SF_GetPixelFormat,SF_GetSurfaceDesc,DXOK3,DXOK1,');
-  VtAdd('SF_Lock,SF_ReleaseDC,DXOK1,SF_SetClipper,SF_SetColorKey,DXNI3,');
-  VtAdd('SF_SetPalette,SF_Unlock,DXNI6,DXNI2,DXNI3,SF_GetDDInterface,');
-  VtAdd('DXOK2,DXOK2,DXNI3');
-  VtPal := VtNew;
-  VtAdd('COMQIUnk,COMAddRef,COMRelease,PL_GetCaps,');
-  VtAdd('PL_GetEntries,DXOK4,PL_SetEntries');
-  VtClip := VtNew;
-  VtAdd('COMQIUnk,COMAddRef,COMRelease,DXNI4,CL_GetHWnd,');
-  VtAdd('DXOK3,CL_IsClipListChanged,DXOK3,CL_SetHWnd');
-End;
-
 Function DXOK4(T, A, B, C : LongInt) : LongInt;
 Begin
   DXOK4 := DD_OK;
 End;
 
-Function DirectDrawCreate(Guid, PDD, Outer : LongInt) : LongInt;
+Function DXOK5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DXOK5 := DD_OK;
+End;
+
+Function DXOK6(T, A, B, C, D, E : LongInt) : LongInt;
+Begin
+  DXOK6 := DD_OK;
+End;
+
+Function DXNoOv3(T, A, B : LongInt) : LongInt;
+Begin
+  DXNoOv3 := DDERR_NOOVERLAYHW;
+End;
+
+Function DXNoOv2(T, A : LongInt) : LongInt;
+Begin
+  DXNoOv2 := DDERR_NOOVERLAYHW;
+End;
+
+Function DXNoOv4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DXNoOv4 := DDERR_NOOVERLAYHW;
+End;
+
+Function DXNoOv6(T, A, B, C, D, E : LongInt) : LongInt;
+Begin
+  DXNoOv6 := DDERR_NOOVERLAYHW;
+End;
+
+{ Appel d'un rappel stdcall a 2, 3 ou 4 arguments }
+Function DXCall2(Cb, A, B : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,B
+    push eax
+    mov eax,A
+    push eax
+    mov eax,Cb
+    call eax
+    mov R,eax
+  end;
+  DXCall2 := R;
+End;
+
+Function DXCall3(Cb, A, B, C : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,C
+    push eax
+    mov eax,B
+    push eax
+    mov eax,A
+    push eax
+    mov eax,Cb
+    call eax
+    mov R,eax
+  end;
+  DXCall3 := R;
+End;
+
+Function DXCall4(Cb, A, B, C, D : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,D
+    push eax
+    mov eax,C
+    push eax
+    mov eax,B
+    push eax
+    mov eax,A
+    push eax
+    mov eax,Cb
+    call eax
+    mov R,eax
+  end;
+  DXCall4 := R;
+End;
+
+Function DXCall5(Cb, A, B, C, D, E : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,E
+    push eax
+    mov eax,D
+    push eax
+    mov eax,C
+    push eax
+    mov eax,B
+    push eax
+    mov eax,A
+    push eax
+    mov eax,Cb
+    call eax
+    mov R,eax
+  end;
+  DXCall5 := R;
+End;
+
+Function DXCall6(Cb, A, B, C, D, E, F : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,F
+    push eax
+    mov eax,E
+    push eax
+    mov eax,D
+    push eax
+    mov eax,C
+    push eax
+    mov eax,B
+    push eax
+    mov eax,A
+    push eax
+    mov eax,Cb
+    call eax
+    mov R,eax
+  end;
+  DXCall6 := R;
+End;
+
+{ Chaine Pascal -> memoire (zero final), ANSI ou UTF-16 }
+Procedure DXPutS(A : LongInt; S : String; Wide : Boolean);
+Var I : LongInt;
+Begin
+  If Wide Then
+  Begin
+    For I := 1 To Length(S) Do MemW[0:A + (I - 1) * 2] := Ord(S[I]);
+    MemW[0:A + Length(S) * 2] := 0;
+  End
+  Else
+  Begin
+    For I := 1 To Length(S) Do Mem[0:A + I - 1] := Ord(S[I]);
+    Mem[0:A + Length(S)] := 0;
+  End;
+End;
+
+{ Nouvelle chaine (zero final) dans un bloc du noyau }
+Function DXStr(S : String; Wide : Boolean) : LongInt;
+Var A : LongInt;
+Begin
+  A := KAlloc(Length(S) * 2 + 4);
+  DXPutS(A, S, Wide);
+  DXStr := A;
+End;
+
+Procedure DXGuid(P, D1, D2, D3, D4, D5 : LongInt);
+Begin
+  MemL[0:P] := D1; MemW[0:P + 4] := D2; MemW[0:P + 6] := D3;
+  MemL[0:P + 8] := D4; MemL[0:P + 12] := D5;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Formats de pixels                                                  }
+{ ------------------------------------------------------------------ }
+
+{ Position et largeur d'un masque de bits }
+Function MaskPos(M : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := 0;
+  If M = 0 Then
+  Begin
+    MaskPos := 0;
+    Exit;
+  End;
+  While ((M Shr P) And 1) = 0 Do Inc(P);
+  MaskPos := P;
+End;
+
+Function MaskLen(M : LongInt) : LongInt;
+Var P, N : LongInt;
+Begin
+  N := 0;
+  For P := 0 To 31 Do If ((M Shr P) And 1) <> 0 Then Inc(N);
+  MaskLen := N;
+End;
+
+{ Composante de L bits en P -> 8 bits, et inversement }
+Function ChanGet(V, P, L : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  ChanGet := 0;
+  If L <= 0 Then Exit;
+  C := (V Shr P) And ((1 Shl L) - 1);
+  If L >= 8 Then ChanGet := (C Shr (L - 8)) And 255
+  Else ChanGet := ((C Shl (8 - L)) Or (C Shr Max(0, 2 * L - 8))) And 255;
+End;
+
+Function ChanPut(C, P, L : LongInt) : LongInt;
+Begin
+  ChanPut := 0;
+  If L <= 0 Then Exit;
+  If L >= 8 Then C := C Shl (L - 8) Else C := C Shr (8 - L);
+  ChanPut := C Shl P;
+End;
+
+{ Masques standard d'une profondeur : 8 palette, 15 = 555, 16 = 565 }
+Procedure StdMasks(Bpp : LongInt; Var R, G, B : LongInt);
+Begin
+  Case Bpp Of
+    15 : Begin R := $7C00; G := $3E0; B := $1F; End;
+    16 : Begin R := $F800; G := $7E0; B := $1F; End;
+    24, 32 : Begin R := $FF0000; G := $FF00; B := $FF; End;
+  Else
+    Begin R := 0; G := 0; B := 0; End;
+  End;
+End;
+
+{ DDPIXELFORMAT (32 octets) }
+Procedure PFFill(P, Bpp : LongInt);
+Var R, G, B : LongInt;
+Begin
+  FillMem(P, 32, 0);
+  MemL[0:P] := 32;
+  If Bpp <= 8 Then
+  Begin
+    MemL[0:P + 4] := $60;              { RGB, PALETTEINDEXED8 }
+    MemL[0:P + 12] := 8;
+    Exit;
+  End;
+  StdMasks(Bpp, R, G, B);
+  If Bpp = 15 Then Bpp := 16;
+  MemL[0:P + 4] := $40;
+  MemL[0:P + 12] := Bpp;
+  MemL[0:P + 16] := R; MemL[0:P + 20] := G; MemL[0:P + 24] := B;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Surfaces : coeur                                                   }
+{ ------------------------------------------------------------------ }
+{ +64 largeur, +68 hauteur, +72 pas, +76 bits, +80 capacites,
+  +84 capacites 2, +88 bits par pixel, +92 drapeaux DDPF, +96 rouge,
+  +100 vert, +104 bleu, +108 alpha (ou masque Z), +112 FourCC,
+  +116 suivante (chaine d'echange ou mipmap), +120 tampon Z attache,
+  +124 palette, +128 decoupeur, +132/+136 cle source, +140/+144 cle
+  destination, +148 cles actives (1 source, 2 destination), +152 DC,
+  +156 bitmap GDI, +160 bits a liberer, +164 racine de la chaine,
+  +168 DirectDraw, +172 unicite, +176 donnees privees, +180 LOD,
+  +184 priorite, +188 texture Direct3D, +192 verrous, +196 DC 8 bits,
+  +200 copie du DC, +204 niveau mipmap, +208 primaire,
+  +212 surface Direct3D 8 (+216 pool, +220 usage), +224 perdue,
+  +228 coeur parent (mipmap, tampon arriere), +232 niveaux mipmap,
+  +236 drapeaux de creation, +240..+268 position et largeur des
+  composantes R, G, B, A, +272 sorte (1 palette 8 bits, 2 565, 3 555,
+  4 888, 5 X888, 6 A8888, 0 autre) }
+
+Const
+  SfSize = 288;
+
+{ Positions des composantes et sorte du format }
+Procedure SfInfo(S : LongInt);
+Var K, B : LongInt;
+Begin
+  For K := 0 To 3 Do
+  Begin
+    MemL[0:S + 240 + K * 8] := MaskPos(MemL[0:S + 96 + K * 4]);
+    MemL[0:S + 244 + K * 8] := MaskLen(MemL[0:S + 96 + K * 4]);
+  End;
+  B := MemL[0:S + 88];
+  K := 0;
+  If (MemL[0:S + 92] And $20) <> 0 Then K := 1
+  Else If (B = 16) And (MemL[0:S + 96] = $F800) And
+          (MemL[0:S + 100] = $7E0) And (MemL[0:S + 104] = $1F) Then K := 2
+  Else If (B = 16) And (MemL[0:S + 96] = $7C00) And
+          (MemL[0:S + 100] = $3E0) And (MemL[0:S + 104] = $1F) And
+          (MemL[0:S + 108] = 0) Then K := 3
+  Else If (B >= 24) And (MemL[0:S + 96] = $FF0000) And
+          (MemL[0:S + 100] = $FF00) And (MemL[0:S + 104] = $FF) Then
+  Begin
+    If B = 24 Then K := 4
+    Else If MemL[0:S + 108] = 0 Then K := 5
+    Else If MemL[0:S + 108] = LongInt($FF000000) Then K := 6;
+  End;
+  MemL[0:S + 272] := K;
+End;
+
+Function SfBytes(S : LongInt) : LongInt;
+Begin
+  SfBytes := (MemL[0:S + 88] + 7) Div 8;
+End;
+
+Function SfPal(S : LongInt) : Boolean;
+Begin
+  SfPal := (MemL[0:S + 92] And $20) <> 0;
+End;
+
+{ Pixel brut (X, Y) }
+Function SfGet(S, X, Y : LongInt) : LongInt;
+Var A : LongInt;
+Begin
+  A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+  Case SfBytes(S) Of
+    1 : SfGet := Mem[0:A + X];
+    2 : SfGet := MemW[0:A + X * 2];
+    3 : SfGet := MemW[0:A + X * 3] Or (Mem[0:A + X * 3 + 2] Shl 16);
+  Else
+    SfGet := MemL[0:A + X * 4];
+  End;
+End;
+
+Procedure SfSet(S, X, Y, V : LongInt);
+Var A : LongInt;
+Begin
+  A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+  Case SfBytes(S) Of
+    1 : Mem[0:A + X] := V;
+    2 : MemW[0:A + X * 2] := V;
+    3 :
+    Begin
+      MemW[0:A + X * 3] := V; Mem[0:A + X * 3 + 2] := V Shr 16;
+    End;
+  Else
+    MemL[0:A + X * 4] := V;
+  End;
+End;
+
+{ Couleur d'une palette de surface (ou du systeme) -> 00RRGGBB }
+Function SfPalRGB(S, I : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := 0;
+  If S <> 0 Then P := MemL[0:S + 124];
+  If P <> 0 Then
+  Begin
+    P := P + 68 + (I And 255) * 4;
+    SfPalRGB := (Mem[0:P] Shl 16) Or (Mem[0:P + 1] Shl 8) Or Mem[0:P + 2];
+  End
+  Else
+    SfPalRGB := (SysPal[(I And 255) * 3] Shl 16) Or
+                (SysPal[(I And 255) * 3 + 1] Shl 8) Or
+                SysPal[(I And 255) * 3 + 2];
+End;
+
+{ Pixel brut -> AARRGGBB (alpha FF sans masque alpha) }
+Function SfToRGB(S, V : LongInt) : LongInt;
+Var R, G, B, A : LongInt;
+Begin
+  Case MemL[0:S + 272] Of
+    1 :
+    Begin
+      SfToRGB := LongInt($FF000000) Or SfPalRGB(S, V);
+      Exit;
+    End;
+    2 :
+    Begin
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      SfToRGB := LongInt($FF000000) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                 (((G Shl 2) Or (G Shr 4)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+      Exit;
+    End;
+    4, 5 :
+    Begin
+      SfToRGB := LongInt($FF000000) Or (V And $FFFFFF);
+      Exit;
+    End;
+    6 :
+    Begin
+      SfToRGB := V;
+      Exit;
+    End;
+  End;
+  R := ChanGet(V, MemL[0:S + 240], MemL[0:S + 244]);
+  G := ChanGet(V, MemL[0:S + 248], MemL[0:S + 252]);
+  B := ChanGet(V, MemL[0:S + 256], MemL[0:S + 260]);
+  If MemL[0:S + 268] > 0 Then A := ChanGet(V, MemL[0:S + 264], MemL[0:S + 268])
+  Else A := 255;
+  SfToRGB := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+End;
+
+{ RGB 555 -> indice de la palette systeme (table paresseuse) }
+Function DXIdxOf(C : LongInt) : LongInt;
+Var K, V : LongInt;
+Begin
+  If (DXIdx = 0) Or (DXIdxVer <> PalVer) Then
+  Begin
+    If DXIdx = 0 Then DXIdx := KAllocSys(65536 * 2 + 16);
+    FillMem(DXIdx, 65536 * 2, $FF);
+    DXIdxVer := PalVer;
+  End;
+  K := ((C Shr 9) And $7C00) Or ((C Shr 6) And $3E0) Or ((C Shr 3) And $1F);
+  V := MemW[0:DXIdx + K * 2];
+  If V = $FFFF Then
+  Begin
+    V := NearestIdx((C Shr 16) And 255, (C Shr 8) And 255, C And 255);
+    MemW[0:DXIdx + K * 2] := V;
+  End;
+  DXIdxOf := V;
+End;
+
+Function SfFromRGB(S, C : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  Case MemL[0:S + 272] Of
+    1 :
+    Begin
+      SfFromRGB := DXIdxOf(C);
+      Exit;
+    End;
+    2 :
+    Begin
+      SfFromRGB := ((C Shr 8) And $F800) Or ((C Shr 5) And $7E0) Or
+                   ((C Shr 3) And $1F);
+      Exit;
+    End;
+    4, 5 :
+    Begin
+      SfFromRGB := C And $FFFFFF;
+      Exit;
+    End;
+    6 :
+    Begin
+      SfFromRGB := C;
+      Exit;
+    End;
+  End;
+  V := ChanPut((C Shr 16) And 255, MemL[0:S + 240], MemL[0:S + 244]) Or
+       ChanPut((C Shr 8) And 255, MemL[0:S + 248], MemL[0:S + 252]) Or
+       ChanPut(C And 255, MemL[0:S + 256], MemL[0:S + 260]);
+  If MemL[0:S + 268] > 0 Then
+    V := V Or ChanPut((C Shr 24) And 255, MemL[0:S + 264], MemL[0:S + 268]);
+  SfFromRGB := V;
+End;
+
+Function SfSameFmt(A, B : LongInt) : Boolean;
+Begin
+  SfSameFmt := (MemL[0:A + 88] = MemL[0:B + 88]) And
+               (MemL[0:A + 96] = MemL[0:B + 96]) And
+               (MemL[0:A + 100] = MemL[0:B + 100]) And
+               (MemL[0:A + 104] = MemL[0:B + 104]) And
+               (SfPal(A) = SfPal(B));
+End;
+
+{ DDSURFACEDESC (108) ou DDSURFACEDESC2 (124) de la surface }
+Procedure SfDesc(S, P : LongInt; V2 : Boolean);
+Var N : LongInt;
+Begin
+  If V2 Then N := 124 Else N := 108;
+  FillMem(P, N, 0);
+  MemL[0:P] := N;
+  MemL[0:P + 4] := 1 Or 2 Or 4 Or 8 Or $1000;
+  MemL[0:P + 8] := MemL[0:S + 68];
+  MemL[0:P + 12] := MemL[0:S + 64];
+  MemL[0:P + 16] := MemL[0:S + 72];
+  FillMem(P + 72, 32, 0);
+  MemL[0:P + 72] := 32;
+  MemL[0:P + 76] := MemL[0:S + 92];
+  MemL[0:P + 80] := MemL[0:S + 112];
+  MemL[0:P + 84] := MemL[0:S + 88];
+  MemL[0:P + 88] := MemL[0:S + 96]; MemL[0:P + 92] := MemL[0:S + 100];
+  MemL[0:P + 96] := MemL[0:S + 104]; MemL[0:P + 100] := MemL[0:S + 108];
+  If (MemL[0:S + 92] And $400) <> 0 Then
+  Begin
+    { tampon Z : profondeur et masque }
+    MemL[0:P + 24] := MemL[0:S + 88];
+    MemL[0:P + 4] := MemL[0:P + 4] Or $40;
+  End;
+  MemL[0:P + 104] := MemL[0:S + 80];
+  If V2 Then MemL[0:P + 108] := MemL[0:S + 84];
+  If MemL[0:S + 208] <> 0 Then
+  Begin
+    { primaire : nombre de tampons arriere }
+    N := 0;
+    If MemL[0:S + 116] <> 0 Then
+    Begin
+      N := 1;
+      If MemL[0:MemL[0:S + 116] + 116] <> 0 Then N := 2;
+    End;
+    MemL[0:P + 20] := N;
+    If N > 0 Then MemL[0:P + 4] := MemL[0:P + 4] Or $20;
+  End;
+  If (MemL[0:S + 80] And dcMipMap) <> 0 Then
+  Begin
+    MemL[0:P + 24] := MemL[0:S + 232];
+    MemL[0:P + 4] := MemL[0:P + 4] Or $20000;
+  End;
+  If (MemL[0:S + 148] And 1) <> 0 Then
+  Begin
+    MemL[0:P + 4] := MemL[0:P + 4] Or $10000;
+    MemL[0:P + 64] := MemL[0:S + 132]; MemL[0:P + 68] := MemL[0:S + 136];
+  End;
+  If (MemL[0:S + 148] And 2) <> 0 Then
+  Begin
+    MemL[0:P + 4] := MemL[0:P + 4] Or $4000;
+    MemL[0:P + 48] := MemL[0:S + 140]; MemL[0:P + 52] := MemL[0:S + 144];
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Affichage de la primaire (mode exclusif)                           }
+{ ------------------------------------------------------------------ }
+
+Function DXDispBpp : LongInt;
+Begin
+  If VgaPlanar Then DXDispBpp := 8
+  Else DXDispBpp := ScrBpp;
+End;
+
+{ Geometrie : facteur et origine dans l'ecran }
+Procedure DXGeom;
+Begin
+  If (DXW <= 0) Or (DXH <= 0) Then
+  Begin
+    DXScale := 1; DXX0 := 0; DXY0 := 0;
+    Exit;
+  End;
+  DXScale := Min(ScrW Div DXW, ScrH Div DXH);
+  If DXScale < 1 Then DXScale := 1;
+  If DXScale > 4 Then DXScale := 4;
+  DXX0 := ((ScrW - Min(DXW * DXScale, ScrW)) Div 2) And Not 7;
+  DXY0 := (ScrH - Min(DXH * DXScale, ScrH)) Div 2;
+End;
+
+{ Le format de la primaire est celui de la memoire video }
+Function DXSameScreen : Boolean;
+Begin
+  DXSameScreen := False;
+  If VgaPlanar Or DXGamOn Or (DXScale <> 1) Then Exit;
+  If DXBpp <> ScrBpp Then Exit;
+  Case ScrBpp Of
+    8 : DXSameScreen := True;
+    16 : DXSameScreen := (RMs = 5) And (RPs = 11) And (GMs = 6) And
+                         (GPs = 5) And (BMs = 5) And (BPs = 0);
+    24, 32 : DXSameScreen := (RMs = 8) And (RPs = 16) And (GMs = 8) And
+                             (GPs = 8) And (BMs = 8) And (BPs = 0);
+  End;
+End;
+
+{ R, G, B (8 bits) -> pixel de la memoire video }
+Function DXScrPix(R, G, B : LongInt) : LongInt;
+Begin
+  If DXGamOn Then
+  Begin
+    R := DXGam[R]; G := DXGam[256 + G]; B := DXGam[512 + B];
+  End;
+  DXScrPix := ((R Shr (8 - RMs)) Shl RPs) Or ((G Shr (8 - GMs)) Shl GPs) Or
+              ((B Shr (8 - BMs)) Shl BPs);
+End;
+
+{ Table 565 -> pixel ecran, refaite si le format de l'ecran change }
+Procedure DXLutMake;
+Var K, V, R, G, B : LongInt;
+Begin
+  K := ScrBpp * 1000000 + RPs * 10000 + GPs * 100 + BPs + RMs * 7 +
+       GMs * 3 + Ord(DXGamOn) * 77777;
+  If (DXLut <> 0) And (DXLutKey = K) Then Exit;
+  If DXLut = 0 Then DXLut := KAllocSys(65536 * 4 + 16);
+  DXLutKey := K;
+  For V := 0 To 65535 Do
+  Begin
+    R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+    MemL[0:DXLut + V * 4] := DXScrPix((R Shl 3) Or (R Shr 2),
+                                      (G Shl 2) Or (G Shr 4),
+                                      (B Shl 3) Or (B Shr 2));
+  End;
+End;
+
+{ Ligne Y de l'ecran (mode exclusif) : bords noirs et image convertie }
+Procedure DXScrRow(Y : LongInt);
+Var SY, SA, X, N, V, D, DB, I, K, S : LongInt; Idx : Boolean;
+Begin
+  If DXPrim = 0 Then Exit;
+  If DXRowSz < ScrW * 4 + 64 Then
+  Begin
+    If DXRow <> 0 Then KFree(DXRow);
+    DXRowSz := ScrW * 4 + 64;
+    DXRow := KAllocSys(DXRowSz);
+  End;
+  S := DXScale;
+  D := Lfb + Y * LfbPitch;
+  DB := ScrBytes;
+  Idx := (DXBpp = 8) Or VgaPlanar Or (ScrBpp <= 8);
+  N := Min(DXW * S, ScrW - DXX0);
+  If (Y < DXY0) Or (Y >= DXY0 + DXH * S) Then
+  Begin
+    { hors de l'image }
+    FillMem(DXRow, ScrW, 0);
+    If VgaPlanar Then VgaWriteRow(Y, 0, (ScrW - 1) Shr 3, DXRow)
+    Else FillMem(D, ScrW * DB, 0);
+    Exit;
+  End;
+  SY := (Y - DXY0) Div S;
+  SA := MemL[0:DXPrim + 76] + SY * MemL[0:DXPrim + 72];
+  If DXSameScreen And (DXX0 = 0) And (N = DXW) Then
+  Begin
+    MoveMem(SA, D, N * DB);
+    If N < ScrW Then FillMem(D + N * DB, (ScrW - N) * DB, 0);
+    Exit;
+  End;
+  If Idx Then
+  Begin
+    { indices 8 bits, puis sortie par la palette de l'ecran }
+    FillMem(DXRow, ScrW, 0);
+    If DXBpp = 8 Then
+    Begin
+      If S = 1 Then MoveMem(SA, DXRow + DXX0, N)
+      Else
+        For X := 0 To N - 1 Do
+          Mem[0:DXRow + DXX0 + X] := Mem[0:SA + X Div S];
+    End
+    Else
+      For X := 0 To N - 1 Do
+      Begin
+        I := X Div S;
+        Case DXBpp Of
+          16 :
+          Begin
+            V := MemW[0:SA + I * 2];
+            K := ((V Shr 8) And $F8) Shl 16 Or ((V Shr 3) And $FC) Shl 8 Or
+                 ((V Shl 3) And $F8);
+          End;
+          24 : K := MemW[0:SA + I * 3] Or (Mem[0:SA + I * 3 + 2] Shl 16);
+        Else
+          K := MemL[0:SA + I * 4] And $FFFFFF;
+        End;
+        Mem[0:DXRow + DXX0 + X] := DXIdxOf(K);
+      End;
+    If VgaPlanar Then VgaWriteRow(Y, 0, (ScrW - 1) Shr 3, DXRow)
+    Else OutRow(DXRow, D, ScrW);
+    Exit;
+  End;
+  { couleurs directes vers couleurs directes }
+  If DXX0 > 0 Then FillMem(D, DXX0 * DB, 0);
+  If DXX0 + N < ScrW Then
+    FillMem(D + (DXX0 + N) * DB, (ScrW - DXX0 - N) * DB, 0);
+  D := D + DXX0 * DB;
+  If DXBpp = 16 Then DXLutMake;
+  For X := 0 To N - 1 Do
+  Begin
+    I := X Div S;
+    Case DXBpp Of
+      16 : V := MemL[0:DXLut + MemW[0:SA + I * 2] * 4];
+      24 : V := DXScrPix(Mem[0:SA + I * 3 + 2], Mem[0:SA + I * 3 + 1],
+                         Mem[0:SA + I * 3]);
+    Else
+      Begin
+        K := MemL[0:SA + I * 4];
+        V := DXScrPix((K Shr 16) And 255, (K Shr 8) And 255, K And 255);
+      End;
+    End;
+    Case DB Of
+      2 : MemW[0:D + X * 2] := V;
+      3 :
+      Begin
+        MemW[0:D + X * 3] := V; Mem[0:D + X * 3 + 2] := V Shr 16;
+      End;
+    Else
+      MemL[0:D + X * 4] := V;
+    End;
+  End;
+End;
+
+{ Lignes de l'ecran [Y0, Y1) recomposees (pointeur efface) }
+Procedure DXScrRows(Y0, Y1 : LongInt);
+Var Y : LongInt;
+Begin
+  If Y0 < 0 Then Y0 := 0;
+  If Y1 > ScrH Then Y1 := ScrH;
+  For Y := Y0 To Y1 - 1 Do DXScrRow(Y);
+  If SvOn Then SvAdd(0, Y0, ScrW, Y1);
+End;
+
+{ Afficher la bande modifiee de la primaire }
+Procedure DXPresent;
+Var Y0, Y1 : LongInt; Cur : Boolean;
+Begin
+  If Not DXOn Or (DXPrim = 0) Then Exit;
+  DXGeom;
+  Cur := CurShownB;
+  If Not DDCleared Then
+  Begin
+    DDCleared := True;
+    DXScrRows(0, ScrH);
+  End
+  Else If DXDirt1 > DXDirt0 Then
+  Begin
+    Y0 := DXY0 + DXDirt0 * DXScale;
+    Y1 := DXY0 + DXDirt1 * DXScale;
+    DXScrRows(Y0, Y1);
+  End
+  Else Exit;
+  DXDirt0 := 0; DXDirt1 := 0;
+  DDDirty := False;
+  DXLast := Ticks;
+  If Cur Or (CurHide >= 0) Then CursorDraw;
+  If SvOn Then SvFlush;
+End;
+
+{ Lignes [Y0, Y1) de la primaire modifiees ; affichees tout de suite si
+  Now (Flip, Unlock) ou au plus tard 10 ms apres }
+Procedure DXTouch(Y0, Y1 : LongInt; Now : Boolean);
+Begin
+  If Not DXOn Then Exit;
+  If Y0 < 0 Then Y0 := 0;
+  If Y1 > DXH Then Y1 := DXH;
+  If Y1 <= Y0 Then Exit;
+  If DXDirt1 <= DXDirt0 Then
+  Begin
+    DXDirt0 := Y0; DXDirt1 := Y1;
+  End
+  Else
+  Begin
+    DXDirt0 := Min(DXDirt0, Y0); DXDirt1 := Max(DXDirt1, Y1);
+  End;
+  DDDirty := True;
+  If Now Or (Ticks - DXLast >= 10) Then DXPresent;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Modes d'affichage                                                  }
+{ ------------------------------------------------------------------ }
+
+Const
+  DXModeN = 13;
+  DXModeW : Array[0..DXModeN - 1] Of LongInt = (320, 320, 400, 512, 640,
+    640, 800, 1024, 1152, 1280, 1280, 1600, 1920);
+  DXModeH : Array[0..DXModeN - 1] Of LongInt = (200, 240, 300, 384, 400,
+    480, 600, 768, 864, 960, 1024, 1200, 1080);
+
+{ Le mode W x H x B est-il possible (carte ou agrandissement) ? }
+Function DXModeOk(W, H, B : LongInt) : Boolean;
+Var V : LongInt;
+Begin
+  DXModeOk := False;
+  If (B <> 8) And (B <> 16) And (B <> 24) And (B <> 32) Then Exit;
+  If (W < 160) Or (H < 100) Or (W > 2048) Or (H > 1536) Then Exit;
+  If SvOn Then
+  Begin
+    DXModeOk := (W <= Max(ScrW, 1920)) And (H <= Max(ScrH, 1440));
+    Exit;
+  End;
+  If DispiOk And Not VgaPlanar Then
+  Begin
+    V := DispiVram;
+    If V = 0 Then V := 8 * 1024 * 1024;
+    DXModeOk := W * H * Max(4, (B + 7) Div 8) <= V;
+    Exit;
+  End;
+  DXModeOk := (W <= ScrW) And (H <= ScrH);
+End;
+
+{ Donner a la carte le mode W x H x B (DISPI ou SVGA) }
+Function DXHwSet(W, H, B : LongInt) : Boolean;
+Var HB : LongInt;
+Begin
+  DXHwSet := False;
+  If VgaPlanar Then Exit;
+  If (W = ScrW) And (H = ScrH) And ((B = ScrBpp) Or SvOn) Then
+  Begin
+    DXHwSet := True;
+    Exit;
+  End;
+  If Not DispiOk And Not SvOn Then Exit;
+  HB := B;
+  If SvOn Then HB := 32;
+  If Not DXChanged Then
+  Begin
+    DXOldW := ScrW; DXOldH := ScrH; DXOldB := ScrBpp;
+  End;
+  If KSetModeWH(W, H, HB) Then
+  Begin
+    DXChanged := True;
+    DXHwSet := (ScrW = W) And (ScrH = H);
+  End;
+End;
+
+{ Revenir au mode du bureau }
+Procedure DXRestoreMode;
+Begin
+  If DXChanged Then
+  Begin
+    DXChanged := False;
+    KSetModeWH(DXOldW, DXOldH, DXOldB);
+  End;
+  DXModeSet := False;
+  DXHw := False;
+End;
+
+{ Fin de l'affichage exclusif }
+Procedure DXLeave;
+Begin
+  If DXOn Then
+  Begin
+    DXOn := False;
+    DDShow := False;
+    DefaultPalette;
+  End;
+  DXRestoreMode;
+  DXGamOn := False;
+  MarkAll;
+End;
+
+{ Fin du programme : retour au bureau }
+Procedure DXAppExit;
+Begin
+  DXLeave;
+  DXObj := 0; DXPrim := 0;
+  DXCoopWnd := 0; DXCoopFl := 0;
+  DXW := 0; DXH := 0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectDraw : surfaces, palettes, decoupeurs                        }
+{ ------------------------------------------------------------------ }
+
+Const
+  DXMaxSf = 1024;
+
+Var
+  DXSfs : Array[0..DXMaxSf - 1] Of LongInt;    { surfaces vivantes }
+  DXLockR : Array[0..3] Of LongInt;            { verrou de la primaire }
+  DXLockAll : Boolean;
+
+Function D3DQueryDD(C, Riid, Ppv : LongInt) : LongInt; Forward;
+Function D3DQuerySurf(C, Riid, Ppv : LongInt) : LongInt; Forward;
+Procedure D3DSurfGone(S : LongInt); Forward;
+Procedure ComDestroyX(C, K : LongInt); Forward;
+Procedure DDInitVt; Forward;
+
+Function SfVt(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0 : SfVt := VtS1;
+    1 : SfVt := VtS2;
+    2 : SfVt := VtS3;
+    3 : SfVt := VtS4;
+  Else
+    SfVt := VtS7;
+  End;
+End;
+
+{ Interface de surface d'une version de DirectDraw (0 DD1/DD2, 2 DD4,
+  3 DD7) : case de surface 0 (Surface), 3 (Surface4), 4 (Surface7) }
+Function SfSlotOf(DDV : LongInt) : LongInt;
+Begin
+  If DDV >= 3 Then SfSlotOf := 4
+  Else If DDV = 2 Then SfSlotOf := 3
+  Else SfSlotOf := 0;
+End;
+
+Procedure SfReg(S : LongInt; On : Boolean);
+Var I : LongInt;
+Begin
+  For I := 0 To DXMaxSf - 1 Do
+    If On And (DXSfs[I] = 0) Then
+    Begin
+      DXSfs[I] := S;
+      Exit;
+    End
+    Else If Not On And (DXSfs[I] = S) Then
+    Begin
+      DXSfs[I] := 0;
+      Exit;
+    End;
+End;
+
+{ Nouvelle surface : coeur, format et memoire }
+Function SfNew(W, H, Bpp, PFl, RM, GM, BM, AM, Caps, Slot : LongInt)
+  : LongInt;
+Var S, P : LongInt;
+Begin
+  S := ComNew(0, 3, SfSize);
+  ComView(S, Slot, SfVt(Slot));
+  If W < 1 Then W := 1;
+  If H < 1 Then H := 1;
+  MemL[0:S + 64] := W; MemL[0:S + 68] := H;
+  MemL[0:S + 88] := Bpp; MemL[0:S + 92] := PFl;
+  MemL[0:S + 96] := RM; MemL[0:S + 100] := GM; MemL[0:S + 104] := BM;
+  MemL[0:S + 108] := AM;
+  P := ((W * ((Bpp + 7) Div 8)) + 3) And Not 3;
+  MemL[0:S + 72] := P;
+  MemL[0:S + 76] := KAlloc(P * H + 16);
+  If MemL[0:S + 76] = 0 Then
+  Begin
+    KFree(S);
+    SfNew := 0;
+    Exit;
+  End;
+  FillMem(MemL[0:S + 76], P * H, 0);
+  MemL[0:S + 160] := MemL[0:S + 76];
+  MemL[0:S + 80] := Caps;
+  Inc(DXUniq);
+  MemL[0:S + 172] := DXUniq;
+  MemL[0:S + 168] := DXObj;
+  SfInfo(S);
+  SfReg(S, True);
+  SfNew := S;
+End;
+
+{ Surface au format d'affichage (primaire et tampons arriere) }
+Function SfNewDisp(W, H, Bpp, Caps, Slot : LongInt) : LongInt;
+Var R, G, B, Fl : LongInt;
+Begin
+  Fl := $40;
+  If Bpp <= 8 Then
+  Begin
+    Bpp := 8; Fl := $60; R := 0; G := 0; B := 0;
+  End
+  Else If (Bpp = ScrBpp) And Not DXOn And (RMs > 0) Then
+  Begin
+    { primaire en fenetre : format de la memoire video }
+    R := ((1 Shl RMs) - 1) Shl RPs; G := ((1 Shl GMs) - 1) Shl GPs;
+    B := ((1 Shl BMs) - 1) Shl BPs;
+    If Bpp = 15 Then Bpp := 16;
+  End
+  Else
+  Begin
+    StdMasks(Bpp, R, G, B);
+    If Bpp = 15 Then Bpp := 16;
+  End;
+  SfNewDisp := SfNew(W, H, Bpp, Fl, R, G, B, 0, Caps, Slot);
+End;
+
+Procedure ComDestroy(C : LongInt);
+Var K, I, B : LongInt;
+Begin
+  K := MemL[0:C + 8];
+  Case K Of
+    1 :
+    Begin
+      If C = DXObj Then
+      Begin
+        DXLeave;
+        DXObj := 0;
+        DXCoopFl := 0; DXCoopWnd := 0;
+      End;
+    End;
+    3 :
+    Begin
+      SfReg(C, False);
+      D3DSurfGone(C);
+      If C = DXPrim Then
+      Begin
+        DXPrim := 0;
+        If DXOn Then
+        Begin
+          DXOn := False; DDShow := False;
+          DefaultPalette;
+          MarkAll;
+        End;
+      End;
+      { chaine d'echange et mipmaps : surfaces dependantes }
+      B := MemL[0:C + 116];
+      If (B <> 0) And (MemL[0:B + 228] = C) Then
+      Begin
+        MemL[0:B + 228] := 0;
+        COMRelease(B);
+      End;
+      B := MemL[0:C + 120];
+      If B <> 0 Then COMRelease(B);
+      If MemL[0:C + 124] <> 0 Then COMRelease(MemL[0:C + 124]);
+      If MemL[0:C + 128] <> 0 Then COMRelease(MemL[0:C + 128]);
+      If MemL[0:C + 160] <> 0 Then KFree(MemL[0:C + 160]);
+      If MemL[0:C + 176] <> 0 Then
+      Begin
+        For I := 0 To 7 Do
+          If MemL[0:MemL[0:C + 176] + I * 28 + 16] <> 0 Then
+            KFree(MemL[0:MemL[0:C + 176] + I * 28 + 16]);
+        KFree(MemL[0:C + 176]);
+      End;
+      If MemL[0:C + 196] <> 0 Then KFree(MemL[0:C + 196]);
+      If MemL[0:C + 200] <> 0 Then KFree(MemL[0:C + 200]);
+    End;
+    5 :
+      If MemL[0:C + 68] <> 0 Then KFree(MemL[0:C + 68]);
+  End;
+  ComDestroyX(C, K);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Palettes : +64 drapeaux, +68 entrees (256 x 4), +1092 nombre       }
+{ ------------------------------------------------------------------ }
+
+Function PalCount(Fl : LongInt) : LongInt;
+Begin
+  If (Fl And 4) <> 0 Then PalCount := 256
+  Else If (Fl And 1) <> 0 Then PalCount := 16
+  Else If (Fl And $200) <> 0 Then PalCount := 4
+  Else If (Fl And $100) <> 0 Then PalCount := 2
+  Else PalCount := 256;
+End;
+
+{ Palette de la primaire : palette materielle }
+Procedure PalApply(P : LongInt);
+Var I, E : LongInt;
+Begin
+  For I := 0 To MemL[0:P + 1092] - 1 Do
+  Begin
+    E := P + 68 + I * 4;
+    SysPalSet(I, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
+  End;
+  Inc(PalVer);
+  DacAll;
+  If DXOn And ((ScrBpp > 8) Or VgaPlanar) Then DXTouch(0, DXH, False)
+  Else If Not DXOn Then MarkAll;
+End;
+
+Function PalOfPrim(P : LongInt) : Boolean;
+Begin
+  PalOfPrim := (DXPrim <> 0) And (MemL[0:DXPrim + 124] = P) And
+               (MemL[0:DXPrim + 88] = 8);
+End;
+
+Function DD_CreatePalette(T, Fl, PEnt, PPal, Outer : LongInt) : LongInt;
+Var P, N : LongInt;
+Begin
+  DD_CreatePalette := DDERR_INVALIDPARAMS;
+  If PPal = 0 Then Exit;
+  MemL[0:PPal] := 0;
+  If Outer <> 0 Then
+  Begin
+    DD_CreatePalette := CLASS_E_NOAGGREGATION;
+    Exit;
+  End;
+  P := ComNew(VtPal, 4, 1100);
+  MemL[0:P + 64] := Fl;
+  N := PalCount(Fl);
+  MemL[0:P + 1092] := N;
+  If PEnt <> 0 Then
+  Begin
+    If (Fl And 2) <> 0 Then
+      For N := 0 To PalCount(Fl) - 1 Do
+        MemL[0:P + 68 + N * 4] := Mem[0:PEnt + N]
+    Else MoveMem(PEnt, P + 68, PalCount(Fl) * 4);
+  End;
+  MemL[0:PPal] := P;
+  DD_CreatePalette := DD_OK;
+End;
+
+Function PL_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 64] Or $400;
+  PL_GetCaps := DD_OK;
+End;
+
+Function PL_GetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  PL_GetEntries := DDERR_INVALIDPARAMS;
+  If (PEnt = 0) Or (Start < 0) Or (Start + N > MemL[0:T + 1092]) Then Exit;
+  MoveMem(T + 68 + Start * 4, PEnt, N * 4);
+  PL_GetEntries := DD_OK;
+End;
+
+Function PL_SetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  PL_SetEntries := DDERR_INVALIDPARAMS;
+  If (PEnt = 0) Or (Start < 0) Or (Start + N > MemL[0:T + 1092]) Then Exit;
+  MoveMem(PEnt, T + 68 + Start * 4, N * 4);
+  If PalOfPrim(T) Then PalApply(T);
+  Inc(DXUniq);
+  PL_SetEntries := DD_OK;
+End;
+
+Function PL_Initialize(T, DD, Fl, P : LongInt) : LongInt;
+Begin
+  PL_Initialize := DDERR_ALREADYINITIALIZED;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Decoupeurs : +64 fenetre, +68 liste (RGNDATA), +72 taille          }
+{ ------------------------------------------------------------------ }
+
+Function DD_CreateClipper(T, Fl, PClip, Outer : LongInt) : LongInt;
+Begin
+  DD_CreateClipper := DDERR_INVALIDPARAMS;
+  If PClip = 0 Then Exit;
+  MemL[0:PClip] := ComNew(VtClip, 5, 80);
+  DD_CreateClipper := DD_OK;
+End;
+
+Function DirectDrawCreateClipper(Fl, PClip, Outer : LongInt) : LongInt;
+Begin
+  DDInitVt;
+  DirectDrawCreateClipper := DD_CreateClipper(0, Fl, PClip, Outer);
+End;
+
+{ Rectangle (ecran) d'un decoupeur ; False sans limite }
+Function ClipRect(C : LongInt; Var L, T, R, B : LongInt) : Boolean;
+Var P, H : LongInt; Q : Array[0..3] Of LongInt;
+Begin
+  ClipRect := False;
+  If C = 0 Then Exit;
+  H := MemL[0:C + 64];
+  If (H <> 0) And (WndOfH(H) >= 0) Then
+  Begin
+    GetClientRect(H, LongInt(@Q));
+    Q[2] := Q[2] - Q[0]; Q[3] := Q[3] - Q[1];
+    Q[0] := 0; Q[1] := 0;
+    ClientToScreen(H, LongInt(@Q));
+    L := Q[0]; T := Q[1]; R := Q[0] + Q[2]; B := Q[1] + Q[3];
+    ClipRect := True;
+  End
+  Else If MemL[0:C + 68] <> 0 Then
+  Begin
+    P := MemL[0:C + 68];
+    L := MemL[0:P + 16]; T := MemL[0:P + 20];
+    R := MemL[0:P + 24]; B := MemL[0:P + 28];
+    ClipRect := True;
+  End;
+End;
+
+Function CL_GetClipList(T, PRect, PRgn, PSize : LongInt) : LongInt;
+Var L, Tp, R, B, N : LongInt;
+Begin
+  T := Cor(T);
+  CL_GetClipList := DDERR_INVALIDPARAMS;
+  If PSize = 0 Then Exit;
+  If Not ClipRect(T, L, Tp, R, B) Then
+  Begin
+    L := 0; Tp := 0; R := ScrW; B := ScrH;
+  End;
+  If PRect <> 0 Then
+  Begin
+    L := Max(L, MemL[0:PRect]); Tp := Max(Tp, MemL[0:PRect + 4]);
+    R := Min(R, MemL[0:PRect + 8]); B := Min(B, MemL[0:PRect + 12]);
+  End;
+  N := 48;
+  If PRgn = 0 Then
+  Begin
+    MemL[0:PSize] := N;
+    CL_GetClipList := DD_OK;
+    Exit;
+  End;
+  If MemL[0:PSize] < N Then
+  Begin
+    MemL[0:PSize] := N;
+    CL_GetClipList := LongInt($887600B4);   { DDERR_REGIONTOOSMALL }
+    Exit;
+  End;
+  MemL[0:PRgn] := 32; MemL[0:PRgn + 4] := 1; MemL[0:PRgn + 8] := 1;
+  MemL[0:PRgn + 12] := 16;
+  MemL[0:PRgn + 16] := L; MemL[0:PRgn + 20] := Tp;
+  MemL[0:PRgn + 24] := R; MemL[0:PRgn + 28] := B;
+  MemL[0:PRgn + 32] := L; MemL[0:PRgn + 36] := Tp;
+  MemL[0:PRgn + 40] := R; MemL[0:PRgn + 44] := B;
+  CL_GetClipList := DD_OK;
+End;
+
+Function CL_GetHWnd(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 64];
+  CL_GetHWnd := DD_OK;
+End;
+
+Function CL_Initialize(T, DD, Fl : LongInt) : LongInt;
+Begin
+  CL_Initialize := DD_OK;
+End;
+
+Function CL_IsClipListChanged(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  CL_IsClipListChanged := DD_OK;
+End;
+
+Function CL_SetClipList(T, PRgn, Fl : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  T := Cor(T);
+  If MemL[0:T + 68] <> 0 Then KFree(MemL[0:T + 68]);
+  MemL[0:T + 68] := 0;
+  If PRgn <> 0 Then
+  Begin
+    N := 32 + MemL[0:PRgn + 8] * 16;
+    MemL[0:T + 68] := KAlloc(N + 16);
+    MoveMem(PRgn, MemL[0:T + 68], N);
+  End;
+  CL_SetClipList := DD_OK;
+End;
+
+Function CL_SetHWnd(T, Fl, H : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 64] := H;
+  CL_SetHWnd := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Transferts entre surfaces                                          }
+{ ------------------------------------------------------------------ }
+
+{ Copie de SRect (S) vers DRect (D) : agrandissement, cles de couleur
+  (Ks : source, Kd : destination, intervalles bruts), miroirs, et
+  conversion de format si les deux surfaces different }
+Procedure SfXfer(D, DL, DT, DR, DB, S, SL, ST, SR, SB : LongInt;
+                 Ks, Kd : Boolean; KS0, KS1, KD0, KD1 : LongInt;
+                 MirX, MirY : Boolean);
+Var X, Y, SX, SY, DW, DH, SW, SH, X0, X1, Y0, Y1, V, DA, SA, BY, N,
+    Tmp, Y2, DPitch, SPitch : LongInt;
+    Same, Plain : Boolean;
+Begin
+  DW := DR - DL; DH := DB - DT; SW := SR - SL; SH := SB - ST;
+  If (DW <= 0) Or (DH <= 0) Or (SW <= 0) Or (SH <= 0) Then Exit;
+  X0 := Max(DL, 0); X1 := Min(DR, MemL[0:D + 64]);
+  Y0 := Max(DT, 0); Y1 := Min(DB, MemL[0:D + 68]);
+  If (X0 >= X1) Or (Y0 >= Y1) Then Exit;
+  Same := SfSameFmt(D, S);
+  BY := SfBytes(D);
+  DPitch := MemL[0:D + 72]; SPitch := MemL[0:S + 72];
+  Plain := Same And Not Ks And Not Kd And Not MirX And Not MirY And
+           (DW = SW) And (DH = SH);
+  If Plain Then
+  Begin
+    { copie directe, sens choisi si les zones se recouvrent }
+    SX := SL + (X0 - DL);
+    N := X1 - X0;
+    If SX < 0 Then
+    Begin
+      X0 := X0 - SX; N := N + SX; SX := 0;
+    End;
+    If SX + N > MemL[0:S + 64] Then N := MemL[0:S + 64] - SX;
+    If N <= 0 Then Exit;
+    If (S = D) And (ST < DT) Then
+    Begin
+      For Y := Y1 - 1 DownTo Y0 Do
+      Begin
+        SY := ST + (Y - DT);
+        If (SY < 0) Or (SY >= MemL[0:S + 68]) Then Continue;
+        MoveMem(MemL[0:S + 76] + SY * SPitch + SX * BY,
+                MemL[0:D + 76] + Y * DPitch + X0 * BY, N * BY);
+      End;
+    End
+    Else
+      For Y := Y0 To Y1 - 1 Do
+      Begin
+        SY := ST + (Y - DT);
+        If (SY < 0) Or (SY >= MemL[0:S + 68]) Then Continue;
+        MoveMem(MemL[0:S + 76] + SY * SPitch + SX * BY,
+                MemL[0:D + 76] + Y * DPitch + X0 * BY, N * BY);
+      End;
+    Exit;
+  End;
+  { recouvrement avec agrandissement ou cles : passer par une copie }
+  Tmp := 0;
+  If S = D Then
+  Begin
+    Tmp := KAlloc(SPitch * MemL[0:S + 68] + 16);
+    If Tmp = 0 Then Exit;
+    MoveMem(MemL[0:S + 76], Tmp, SPitch * MemL[0:S + 68]);
+  End;
+  For Y := Y0 To Y1 - 1 Do
+  Begin
+    If MirY Then Y2 := DB - 1 - (Y - DT) Else Y2 := Y;
+    SY := ST + ((Y - DT) * SH) Div DH;
+    If (SY < 0) Or (SY >= MemL[0:S + 68]) Then Continue;
+    If Tmp <> 0 Then SA := Tmp + SY * SPitch
+    Else SA := MemL[0:S + 76] + SY * SPitch;
+    DA := MemL[0:D + 76] + Y2 * DPitch;
+    For X := X0 To X1 - 1 Do
+    Begin
+      If MirX Then SX := SL + ((DW - 1 - (X - DL)) * SW) Div DW
+      Else SX := SL + ((X - DL) * SW) Div DW;
+      If (SX < 0) Or (SX >= MemL[0:S + 64]) Then Continue;
+      Case SfBytes(S) Of
+        1 : V := Mem[0:SA + SX];
+        2 : V := MemW[0:SA + SX * 2];
+        3 : V := MemW[0:SA + SX * 3] Or (Mem[0:SA + SX * 3 + 2] Shl 16);
+      Else
+        V := MemL[0:SA + SX * 4];
+      End;
+      If Ks Then
+        If (V >= KS0) And (V <= KS1) Then Continue;
+      If Kd Then
+      Begin
+        N := SfGet(D, X, Y2);
+        If (N < KD0) Or (N > KD1) Then Continue;
+      End;
+      If Not Same Then V := SfFromRGB(D, SfToRGB(S, V));
+      Case BY Of
+        1 : Mem[0:DA + X] := V;
+        2 : MemW[0:DA + X * 2] := V;
+        3 :
+        Begin
+          MemW[0:DA + X * 3] := V; Mem[0:DA + X * 3 + 2] := V Shr 16;
+        End;
+      Else
+        MemL[0:DA + X * 4] := V;
+      End;
+    End;
+  End;
+  If Tmp <> 0 Then KFree(Tmp);
+End;
+
+{ Remplir un rectangle d'une valeur brute }
+Procedure SfFill(D, L, T, R, B, V : LongInt);
+Var X, Y, A, BY : LongInt;
+Begin
+  L := Max(L, 0); T := Max(T, 0);
+  R := Min(R, MemL[0:D + 64]); B := Min(B, MemL[0:D + 68]);
+  If (L >= R) Or (T >= B) Then Exit;
+  BY := SfBytes(D);
+  For Y := T To B - 1 Do
+  Begin
+    A := MemL[0:D + 76] + Y * MemL[0:D + 72];
+    Case BY Of
+      1 : FillMem(A + L, R - L, V);
+      2 :
+        If (V And 255) = ((V Shr 8) And 255) Then
+          FillMem(A + L * 2, (R - L) * 2, V)
+        Else For X := L To R - 1 Do MemW[0:A + X * 2] := V;
+      3 :
+        For X := L To R - 1 Do
+        Begin
+          MemW[0:A + X * 3] := V; Mem[0:A + X * 3 + 2] := V Shr 16;
+        End;
+    Else
+      If (V = 0) Or (V = -1) Then FillMem(A + L * 4, (R - L) * 4, V)
+      Else For X := L To R - 1 Do MemL[0:A + X * 4] := V;
+    End;
+  End;
+End;
+
+{ Primaire en fenetre : rectangle (coordonnees ecran) envoye a l'ecran
+  par le contexte de la fenetre du decoupeur (ou de l'ecran) }
+Procedure DXWinPush(S, L, T, R, B : LongInt);
+Var H, Hdc, Bmi, Buf, W, Hh, X, Y, Pitch, SA, I, CL, CT, CR, CB
+    : LongInt;
+    Pt : Array[0..1] Of LongInt;
+Begin
+  L := Max(L, 0); T := Max(T, 0);
+  R := Min(R, MemL[0:S + 64]); B := Min(B, MemL[0:S + 68]);
+  H := 0;
+  If MemL[0:S + 128] <> 0 Then
+  Begin
+    H := MemL[0:MemL[0:S + 128] + 64];
+    If ClipRect(MemL[0:S + 128], CL, CT, CR, CB) Then
+    Begin
+      L := Max(L, CL); T := Max(T, CT); R := Min(R, CR); B := Min(B, CB);
+    End;
+  End;
+  If (L >= R) Or (T >= B) Then Exit;
+  W := R - L; Hh := B - T;
+  Pitch := (W + 3) And Not 3;
+  Buf := KAlloc(Pitch * Hh + 16);
+  Bmi := KAlloc(40 + 1024);
+  If (Buf = 0) Or (Bmi = 0) Then Exit;
+  For Y := 0 To Hh - 1 Do
+  Begin
+    SA := MemL[0:S + 76] + (T + Y) * MemL[0:S + 72];
+    If MemL[0:S + 88] = 8 Then MoveMem(SA + L, Buf + Y * Pitch, W)
+    Else
+      For X := 0 To W - 1 Do
+        Mem[0:Buf + Y * Pitch + X] := DXIdxOf(SfToRGB(S, SfGet(S, L + X,
+                                                         T + Y)));
+  End;
+  FillMem(Bmi, 40, 0);
+  MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -Hh;
+  MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
+  MemL[0:Bmi + 32] := 256;
+  For I := 0 To 255 Do
+    MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
+      (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+  If (H <> 0) And (WndOfH(H) >= 0) Then
+  Begin
+    Pt[0] := 0; Pt[1] := 0;
+    ClientToScreen(H, LongInt(@Pt));
+    Hdc := GetDC(H);
+    SetDIBitsToDevice(Hdc, L - Pt[0], T - Pt[1], W, Hh, 0, 0, 0, Hh, Buf,
+                      Bmi, 0);
+    ReleaseDC(H, Hdc);
+  End
+  Else
+  Begin
+    Hdc := GetDC(0);
+    SetDIBitsToDevice(Hdc, L, T, W, Hh, 0, 0, 0, Hh, Buf, Bmi, 0);
+    ReleaseDC(0, Hdc);
+  End;
+  KFree(Buf); KFree(Bmi);
+End;
+
+{ Surface modifiee dans le rectangle (L, T, R, B) }
+Procedure SfTouched(S, L, T, R, B : LongInt; Now : Boolean);
+Begin
+  If MemL[0:S + 208] = 0 Then Exit;
+  If DXOn And (S = DXPrim) Then DXTouch(T, B, Now)
+  Else If Not DXOn Then DXWinPush(S, L, T, R, B);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Objet DirectDraw : +64 fenetre, +68 niveau de cooperation          }
+{ ------------------------------------------------------------------ }
+
+Function DDVt(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0 : DDVt := VtDD1;
+    1 : DDVt := VtDD2;
+    2 : DDVt := VtDD4;
+  Else
+    DDVt := VtDD7;
+  End;
+End;
+
+Procedure DDInitVt;
+Var I : LongInt; S1, S2 : String;
+Begin
+  If VtDD1 <> 0 Then Exit;
+  S1 := 'DD_QI,COMAddRef,COMRelease,DXOK1,DD_CreateClipper,' +
+        'DD_CreatePalette,DD_CreateSurface,DD_DuplicateSurface,';
+  S2 := 'DD_EnumDisplayModes,DD_EnumSurfaces,DD_FlipToGDISurface,' +
+        'DD_GetCaps,DD_GetDisplayMode,DD_GetFourCCCodes,';
+  For I := 0 To 3 Do
+  Begin
+    Case I Of
+      0 : VtDD1 := VtNew;
+      1 : VtDD2 := VtNew;
+      2 : VtDD4 := VtNew;
+      3 : VtDD7 := VtNew;
+    End;
+    VtAdd(S1); VtAdd(S2);
+    VtAdd('DD_GetGDISurface,DD_GetMonitorFrequency,DD_GetScanLine,');
+    VtAdd('DD_GetVBStatus,DD_Initialize,DD_RestoreDisplayMode,');
+    VtAdd('DD_SetCooperativeLevel');
+    If I = 0 Then VtAdd('DD_SetDisplayMode') Else VtAdd('DD_SetDisplayMode2');
+    VtAdd('DD_WaitForVB');
+    If I >= 1 Then VtAdd('DD_GetAvailableVidMem');
+    If I >= 2 Then
+      VtAdd('DD_GetSurfaceFromDC,DXOK1,DXOK1,DD_GetDeviceIdentifier');
+    If I >= 3 Then VtAdd('DXNI4,DXOK3');
+  End;
+  S1 := 'SF_QI,COMAddRef,COMRelease,SF_AddAttached,DXNoOv2,SF_Blt,DXNI4,' +
+        'SF_BltFast,SF_DeleteAttached,SF_EnumAttached,DXNoOv4,SF_Flip,';
+  S2 := 'SF_GetAttached,DXOK2,SF_GetCaps,SF_GetClipper,SF_GetColorKey,' +
+        'SF_GetDC,DXOK2,DXNoOv3,SF_GetPalette,SF_GetPixelFormat,';
+  For I := 0 To 4 Do
+  Begin
+    Case I Of
+      0 : VtS1 := VtNew;
+      1 : VtS2 := VtNew;
+      2 : VtS3 := VtNew;
+      3 : VtS4 := VtNew;
+      4 : VtS7 := VtNew;
+    End;
+    VtAdd(S1); VtAdd(S2);
+    VtAdd('SF_GetSurfaceDesc,SF_Initialize,DXOK1,SF_Lock,SF_ReleaseDC,');
+    VtAdd('DXOK1,SF_SetClipper,SF_SetColorKey,DXNoOv3,SF_SetPalette,');
+    VtAdd('SF_Unlock,DXNoOv6,DXNoOv2,DXNoOv3');
+    If I >= 1 Then VtAdd('SF_GetDDInterface,DXOK2,DXOK2');
+    If I >= 2 Then VtAdd('SF_SetSurfaceDesc');
+    If I >= 3 Then
+    Begin
+      VtAdd('SF_SetPrivateData,SF_GetPrivateData,SF_FreePrivateData,');
+      VtAdd('SF_GetUniqueness,SF_ChangeUniqueness');
+    End;
+    If I >= 4 Then VtAdd('SF_SetPriority,SF_GetPriority,SF_SetLOD,SF_GetLOD');
+  End;
+  VtGam := VtNew;
+  VtAdd('GM_QI,COMAddRef,COMRelease,GM_GetGammaRamp,GM_SetGammaRamp');
+  VtPal := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,PL_GetCaps,PL_GetEntries,');
+  VtAdd('PL_Initialize,PL_SetEntries');
+  VtClip := VtNew;
+  VtAdd('COMQIUnk,COMAddRef,COMRelease,CL_GetClipList,CL_GetHWnd,');
+  VtAdd('CL_Initialize,CL_IsClipListChanged,CL_SetClipList,CL_SetHWnd');
+  For I := 0 To 767 Do DXGam[I] := I And 255;
+End;
+
+Function DDNewObj(Slot : LongInt) : LongInt;
 Var O : LongInt;
 Begin
   DDInitVt;
+  O := ComNew(0, 1, 80);
+  ComView(O, Slot, DDVt(Slot));
+  DXObj := O;
+  If DXW = 0 Then
+  Begin
+    DXW := ScrW; DXH := ScrH; DXBpp := DXDispBpp;
+    If DXBpp = 15 Then DXBpp := 16;
+  End;
+  DDNewObj := O;
+End;
+
+Function DirectDrawCreate(Guid, PDD, Outer : LongInt) : LongInt;
+Begin
   DirectDrawCreate := DDERR_INVALIDPARAMS;
   If PDD = 0 Then Exit;
-  O := ComNew(VtDD, 1, 32);
-  MemL[0:PDD] := O;
-  If DDW = 0 Then
+  MemL[0:PDD] := 0;
+  If Outer <> 0 Then
   Begin
-    DDW := 640; DDH := 480; DDBpp := 8;
+    DirectDrawCreate := CLASS_E_NOAGGREGATION;
+    Exit;
   End;
+  MemL[0:PDD] := DDNewObj(0);
   KLog('DirectDraw : objet cree');
   DirectDrawCreate := DD_OK;
 End;
 
-Function DirectDrawEnumerateA(Cb, Ctx : LongInt) : LongInt;
-Var S1, S2 : String;
+Function DirectDrawCreateEx(Guid, PDD, Iid, Outer : LongInt) : LongInt;
 Begin
-  S1 := 'Pasdows 95 VESA' + #0;
-  S2 := 'display' + #0;
-  If W16Buf = 0 Then W16Buf := KAlloc(4096);
-  MemL[0:W16Buf] := 0;
-  MemL[0:W16Buf + 4] := LongInt(@S1[1]);
-  MemL[0:W16Buf + 8] := LongInt(@S2[1]);
-  MemL[0:W16Buf + 12] := Ctx;
-  CallStd(Cb, W16Buf, 4);
-  DirectDrawEnumerateA := DD_OK;
+  DirectDrawCreateEx := DDERR_INVALIDPARAMS;
+  If PDD = 0 Then Exit;
+  MemL[0:PDD] := 0;
+  If Not GuidIs(Iid, LongInt($15E65EC0)) Then Exit;
+  MemL[0:PDD] := DDNewObj(3);
+  KLog('DirectDraw 7 : objet cree');
+  DirectDrawCreateEx := DD_OK;
+End;
+
+{ Nom de la carte graphique et identifiants PCI }
+Function DXCardName : String;
+Begin
+  If SvOn Then DXCardName := 'VMware SVGA II'
+  Else If VbGfx Then DXCardName := 'VirtualBox Graphics Adapter'
+  Else If DispiOk Then DXCardName := 'Carte graphique VGA standard (VBE)'
+  Else DXCardName := 'Carte graphique VESA';
+End;
+
+Function DXCardId : LongInt;
+Begin
+  If SvOn Then DXCardId := $040515AD
+  Else If VbGfx Then DXCardId := LongInt($BEEF80EE)
+  Else If DispiOk Then DXCardId := $11111234
+  Else DXCardId := 0;
+End;
+
+Function DDEnumK(Cb, Ctx : LongInt; Wide, Ex : Boolean) : LongInt;
+Var D, N : LongInt;
+Begin
+  D := DXStr('Pilote d''affichage principal', Wide);
+  N := DXStr('display', Wide);
+  If Ex Then DXCall5(Cb, 0, D, N, Ctx, 0)
+  Else DXCall4(Cb, 0, D, N, Ctx);
+  KFree(D); KFree(N);
+  DDEnumK := DD_OK;
+End;
+
+Function DirectDrawEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectDrawEnumerateA := DDEnumK(Cb, Ctx, False, False);
+End;
+
+Function DirectDrawEnumerateW(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectDrawEnumerateW := DDEnumK(Cb, Ctx, True, False);
+End;
+
+Function DirectDrawEnumerateExA(Cb, Ctx, Fl : LongInt) : LongInt;
+Begin
+  DirectDrawEnumerateExA := DDEnumK(Cb, Ctx, False, True);
+End;
+
+Function DirectDrawEnumerateExW(Cb, Ctx, Fl : LongInt) : LongInt;
+Begin
+  DirectDrawEnumerateExW := DDEnumK(Cb, Ctx, True, True);
 End;
 
 Function DD_QI(T, Riid, Ppv : LongInt) : LongInt;
-Var O : LongInt;
+Var C, K : LongInt;
 Begin
   DD_QI := E_NOINTERFACE;
   If Ppv = 0 Then Exit;
   MemL[0:Ppv] := 0;
-  If GuidIs(Riid, LongInt($6C14DB80)) Or GuidIs(Riid, 0) Then
-  Begin
-    MemL[0:Ppv] := T;
-    COMAddRef(T);
-    DD_QI := DD_OK;
-  End
-  Else If GuidIs(Riid, LongInt($B3A6F3E0)) Then
-  Begin
-    O := ComNew(VtDD2, 2, 32);
-    MemL[0:Ppv] := O;
-    DD_QI := DD_OK;
-  End;
+  C := Cor(T);
+  K := -1;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($6C14DB80)) Then K := 0
+  Else If GuidIs(Riid, LongInt($B3A6F3E0)) Then K := 1
+  Else If GuidIs(Riid, LongInt($9C59509A)) Then K := 2
+  Else If GuidIs(Riid, LongInt($15E65EC0)) Then K := 3;
+  If K >= 0 Then DD_QI := ComGive(C, K, DDVt(K), Ppv)
+  Else DD_QI := D3DQueryDD(C, Riid, Ppv);
+End;
+
+Function DD_Initialize(T, Guid : LongInt) : LongInt;
+Begin
+  DD_Initialize := DD_OK;
 End;
 
 Function DD_SetCooperativeLevel(T, H, Fl : LongInt) : LongInt;
 Begin
-  DDCoopWnd := H;
-  DDCoopFl := Fl;
   KLog('DirectDraw : niveau de cooperation ' + HexStr(Fl, 4));
+  If (Fl And $11) <> $11 Then
+  Begin
+    { retour au bureau }
+    If DXOn Or DXChanged Then DXLeave;
+  End;
+  DXCoopWnd := H;
+  DXCoopFl := Fl;
+  T := Cor(T);
+  MemL[0:T + 64] := H; MemL[0:T + 68] := Fl;
   DD_SetCooperativeLevel := DD_OK;
+End;
+
+Function DXSetMode(W, H, B : LongInt) : LongInt;
+Begin
+  KLog('DirectDraw : mode ' + IntStr(W) + 'x' + IntStr(H) + 'x' +
+       IntStr(B));
+  DXSetMode := DDERR_INVALIDMODE;
+  If B = 15 Then B := 16;
+  If Not DXModeOk(W, H, B) Then Exit;
+  DXHw := DXHwSet(W, H, B);
+  DXW := W; DXH := H; DXBpp := B;
+  DXModeSet := True;
+  DDCleared := False;
+  DXGeom;
+  If DXHw Then KLog('DirectDraw : mode donne a la carte')
+  Else KLog('DirectDraw : mode simule (facteur ' + IntStr(DXScale) + ')');
+  DXSetMode := DD_OK;
 End;
 
 Function DD_SetDisplayMode(T, W, H, Bpp : LongInt) : LongInt;
 Begin
-  DD_SetDisplayMode := DDERR_INVALIDMODE;
-  KLog('DirectDraw : mode ' + IntStr(W) + 'x' + IntStr(H) + 'x' +
-       IntStr(Bpp));
-  If (Bpp <> 8) Or (W > ScrW) Or (H > ScrH) Or (W <= 0) Or (H <= 0) Then
-    Exit;
-  DDW := W; DDH := H; DDBpp := 8;
-  DD_SetDisplayMode := DD_OK;
+  DD_SetDisplayMode := DXSetMode(W, H, Bpp);
 End;
 
 Function DD_SetDisplayMode2(T, W, H, Bpp, Rate, Fl : LongInt) : LongInt;
 Begin
-  DD_SetDisplayMode2 := DD_SetDisplayMode(T, W, H, Bpp);
+  DD_SetDisplayMode2 := DXSetMode(W, H, Bpp);
 End;
 
 Function DD_RestoreDisplayMode(T : LongInt) : LongInt;
 Begin
-  DDW := 640; DDH := 480;
+  DXRestoreMode;
+  DXW := ScrW; DXH := ScrH; DXBpp := DXDispBpp;
+  If DXBpp = 15 Then DXBpp := 16;
+  DDCleared := False;
   DD_RestoreDisplayMode := DD_OK;
 End;
 
@@ -35584,71 +38309,161 @@ Begin
   DD_FlipToGDISurface := DD_OK;
 End;
 
-{ DDSURFACEDESC (108 octets) d'une surface 8 bits }
-Procedure DDFillDesc(P, W, H, Pitch, Bits, Caps : LongInt);
+{ Description d'un mode d'affichage (DDSURFACEDESC ou 2) }
+Procedure DDModeDesc(P, W, H, B : LongInt; V2 : Boolean);
+Var Bpp, R, G, Bm : LongInt;
 Begin
-  FillMem(P, 108, 0);
-  MemL[0:P] := 108;
-  MemL[0:P + 4] := $100F Or $800;
-  MemL[0:P + 8] := H;
-  MemL[0:P + 12] := W;
-  MemL[0:P + 16] := Pitch;
-  MemL[0:P + 36] := Bits;
-  MemL[0:P + 72] := 32;
-  MemL[0:P + 76] := $60;
-  MemL[0:P + 84] := 8;
-  MemL[0:P + 104] := Caps;
+  If V2 Then FillMem(P, 124, 0) Else FillMem(P, 108, 0);
+  If V2 Then MemL[0:P] := 124 Else MemL[0:P] := 108;
+  MemL[0:P + 4] := 2 Or 4 Or 8 Or $1000 Or $40000;
+  MemL[0:P + 8] := H; MemL[0:P + 12] := W;
+  Bpp := B;
+  If Bpp = 15 Then Bpp := 16;
+  MemL[0:P + 16] := W * ((Bpp + 7) Div 8);
+  MemL[0:P + 24] := 60;
+  PFFill(P + 72, B);
+  If (B = ScrBpp) And (B > 8) And (RMs > 0) And Not DXModeSet And
+     (W = ScrW) And (H = ScrH) Then
+  Begin
+    R := ((1 Shl RMs) - 1) Shl RPs; G := ((1 Shl GMs) - 1) Shl GPs;
+    Bm := ((1 Shl BMs) - 1) Shl BPs;
+    MemL[0:P + 88] := R; MemL[0:P + 92] := G; MemL[0:P + 96] := Bm;
+  End;
+End;
+
+Function DD_GetDisplayMode(T, P : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  V := IfVer(T);
+  DD_GetDisplayMode := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  If DXModeSet Then DDModeDesc(P, DXW, DXH, DXBpp, V >= 2)
+  Else DDModeDesc(P, ScrW, ScrH, DXDispBpp, V >= 2);
+  DD_GetDisplayMode := DD_OK;
 End;
 
 Function DD_EnumDisplayModes(T, Fl, PDesc, Ctx, Cb : LongInt) : LongInt;
-Var D, K, W, H : LongInt;
+Var V, D, K, B, W, H, I : LongInt; V2, Ok : Boolean;
 Begin
+  V := IfVer(T);
+  V2 := V >= 2;
+  DD_EnumDisplayModes := DDERR_INVALIDPARAMS;
+  If Cb = 0 Then Exit;
   D := KAlloc(128);
-  For K := 0 To 2 Do
+  For I := 0 To 3 Do
   Begin
-    Case K Of
-      0 : Begin W := 320; H := 200 End;
-      1 : Begin W := 320; H := 240 End;
+    Case I Of
+      0 : B := 8;
+      1 : B := 16;
+      2 : B := 24;
     Else
-      W := 640; H := 480;
+      B := 32;
     End;
-    DDFillDesc(D, W, H, W, 0, 0);
-    MemL[0:D + 4] := $1006;
-    If W16Buf = 0 Then W16Buf := KAlloc(4096);
-    MemL[0:W16Buf] := D;
-    MemL[0:W16Buf + 4] := Ctx;
-    If CallStd(Cb, W16Buf, 2) = 0 Then Break;
+    For K := 0 To DXModeN - 1 Do
+    Begin
+      W := DXModeW[K]; H := DXModeH[K];
+      If Not DXModeOk(W, H, B) Then Continue;
+      Ok := True;
+      If PDesc <> 0 Then
+      Begin
+        If ((MemL[0:PDesc + 4] And 4) <> 0) And
+           (MemL[0:PDesc + 12] <> W) Then Ok := False;
+        If ((MemL[0:PDesc + 4] And 2) <> 0) And
+           (MemL[0:PDesc + 8] <> H) Then Ok := False;
+        If ((MemL[0:PDesc + 4] And $1000) <> 0) And
+           (MemL[0:PDesc + 84] <> B) Then Ok := False;
+      End;
+      If Not Ok Then Continue;
+      DDModeDesc(D, W, H, B, V2);
+      If DXCall2(Cb, D, Ctx) = 0 Then
+      Begin
+        KFree(D);
+        DD_EnumDisplayModes := DD_OK;
+        Exit;
+      End;
+    End;
   End;
   KFree(D);
   DD_EnumDisplayModes := DD_OK;
 End;
 
-Function DD_GetDisplayMode(T, P : LongInt) : LongInt;
+Function DD_EnumSurfaces(T, Fl, PDesc, Ctx, Cb : LongInt) : LongInt;
+Var V, I, S, D, Sl : LongInt; Ok : Boolean;
 Begin
-  DDFillDesc(P, DDW, DDH, DDW, 0, 0);
-  MemL[0:P + 4] := $100E;
-  DD_GetDisplayMode := DD_OK;
+  V := IfVer(T);
+  DD_EnumSurfaces := DD_OK;
+  If (Cb = 0) Or ((Fl And 1) = 0) Then Exit;     { DOESEXIST seulement }
+  D := KAlloc(128);
+  Sl := SfSlotOf(V);
+  For I := 0 To DXMaxSf - 1 Do
+  Begin
+    S := DXSfs[I];
+    If S = 0 Then Continue;
+    Ok := True;
+    If (PDesc <> 0) And ((Fl And 2) = 0) And
+       ((MemL[0:PDesc + 4] And 1) <> 0) Then
+      Ok := (MemL[0:S + 80] And MemL[0:PDesc + 104]) =
+            MemL[0:PDesc + 104];
+    If Not Ok Then Continue;
+    SfDesc(S, D, V >= 2);
+    COMAddRef(S);
+    If DXCall3(Cb, ComView(S, Sl, SfVt(Sl)), D, Ctx) = 0 Then Break;
+  End;
+  KFree(D);
 End;
 
-{ DDCAPS : capacites materielles et logicielles }
+{ DDCAPS : capacites (identiques en materiel et en emulation) }
 Function DD_GetCaps(T, PHal, PHel : LongInt) : LongInt;
-Var K, P, Sz : LongInt;
+Var K, P, Sz, C, I : LongInt;
 Begin
   For K := 0 To 1 Do
   Begin
     If K = 0 Then P := PHal Else P := PHel;
     If P = 0 Then Continue;
     Sz := MemL[0:P];
-    If (Sz <= 0) Or (Sz > 512) Then Sz := 316;
+    If (Sz < 100) Or (Sz > 512) Then Sz := 316;
     FillMem(P + 4, Sz - 4, 0);
-    MemL[0:P + 4] := $40 Or $200 Or $400000 Or $04000000 Or $08000000;
-    MemL[0:P + 16] := $200;
-    MemL[0:P + 28] := 4;
-    MemL[0:P + 60] := 4 * 1024 * 1024;
-    MemL[0:P + 64] := 4 * 1024 * 1024;
-    MemL[0:P + 72] := $240;
+    MemL[0:P + 4] := 1 Or $40 Or $200 Or $400 Or $8000 Or $20000 Or
+                     $100000 Or $400000 Or $4000000 Or $10000000 Or
+                     $20000000 Or $40000000 Or LongInt($80000000);
+    MemL[0:P + 8] := $1000 Or $20000 Or $80000;
+    MemL[0:P + 12] := $201;
+    MemL[0:P + 16] := $3FCC0;
+    MemL[0:P + 24] := 4 Or $40;
+    MemL[0:P + 56] := $500;
+    MemL[0:P + 60] := 16 * 1024 * 1024;
+    MemL[0:P + 64] := 12 * 1024 * 1024;
+    MemL[0:P + 100 + 24] := 1 Shl 12;          { SRCCOPY }
+    C := dcBack Or dcComplex Or dcFlip Or dcFront Or dcOffscreen Or
+         $100 Or dcPrimary Or dcSysMem Or dcTexture Or dc3D Or dcVidMem Or
+         dcZBuf Or dcMipMap Or dcLocalVid;
+    MemL[0:P + 132] := C;
+    If Sz >= 304 Then
+      For I := 0 To 2 Do
+      Begin
+        MemL[0:P + 172 + I * 44] := MemL[0:P + 4];
+        MemL[0:P + 176 + I * 44] := $201;
+        MemL[0:P + 180 + I * 44] := $3FCC0;
+        MemL[0:P + 184 + I * 44 + 24] := 1 Shl 12;
+      End;
+    If Sz >= 380 Then MemL[0:P + 364] := C;
   End;
   DD_GetCaps := DD_OK;
+End;
+
+Function DD_GetFourCCCodes(T, PN, PCodes : LongInt) : LongInt;
+Begin
+  If PN <> 0 Then MemL[0:PN] := 0;
+  DD_GetFourCCCodes := DD_OK;
+End;
+
+Function DD_GetGDISurface(T, PP : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  V := IfVer(T);
+  DD_GetGDISurface := DDERR_NOTFOUND;
+  If (PP = 0) Or (DXPrim = 0) Then Exit;
+  DD_GetGDISurface := ComGive(DXPrim, SfSlotOf(V), SfVt(SfSlotOf(V)), PP);
 End;
 
 Function DD_GetMonitorFrequency(T, P : LongInt) : LongInt;
@@ -35659,364 +38474,451 @@ End;
 
 Function DD_GetScanLine(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := (Ticks * 31) Mod 525;
+  If P <> 0 Then MemL[0:P] := ((Ticks Mod 17) * Max(DXH, 480)) Div 17;
   DD_GetScanLine := DD_OK;
 End;
 
 Function DD_GetVBStatus(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := Ord(Ticks Mod 16 < 2);
+  If P <> 0 Then MemL[0:P] := Ord(Ticks Mod 17 < 2);
   DD_GetVBStatus := DD_OK;
 End;
 
 Function DD_WaitForVB(T, Fl, Ev : LongInt) : LongInt;
 Begin
-  KSleep(16 - Ticks Mod 16);
+  If Fl <> 4 Then KSleep(17 - Ticks Mod 17);
   DD_WaitForVB := DD_OK;
 End;
 
 Function DD_GetAvailableVidMem(T, Caps, PTot, PFree : LongInt) : LongInt;
 Begin
-  If PTot <> 0 Then MemL[0:PTot] := 4 * 1024 * 1024;
-  If PFree <> 0 Then MemL[0:PFree] := 4 * 1024 * 1024;
+  If PTot <> 0 Then MemL[0:PTot] := 16 * 1024 * 1024;
+  If PFree <> 0 Then MemL[0:PFree] := 12 * 1024 * 1024;
   DD_GetAvailableVidMem := DD_OK;
 End;
 
-{ Surface : +12 largeur, +16 hauteur, +20 pas, +24 bits, +28 capacites,
-  +32 tampon arriere attache, +36 palette, +40/+44 cle de couleur
-  source, +48 cle active, +52 DC, +56 decoupeur }
-Function SurfMake(W, H, Caps, Bits : LongInt) : LongInt;
-Var S : LongInt;
+Function DD_GetSurfaceFromDC(T, Hdc, PP : LongInt) : LongInt;
+Var V, I, S : LongInt;
 Begin
-  S := ComNew(VtSurf, 3, 64);
-  MemL[0:S + 12] := W; MemL[0:S + 16] := H;
-  MemL[0:S + 20] := (W + 3) And Not 3;
-  If Bits = 0 Then
+  V := IfVer(T);
+  DD_GetSurfaceFromDC := DDERR_NOTFOUND;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  For I := 0 To DXMaxSf - 1 Do
   Begin
-    Bits := KAlloc(MemL[0:S + 20] * H + 16);
-    FillMem(Bits, MemL[0:S + 20] * H, 0);
-  End
-  Else MemL[0:S + 20] := W;
-  MemL[0:S + 24] := Bits;
-  MemL[0:S + 28] := Caps;
-  SurfMake := S;
+    S := DXSfs[I];
+    If (S <> 0) And (MemL[0:S + 152] = Hdc) And (Hdc <> 0) Then
+    Begin
+      DD_GetSurfaceFromDC := ComGive(S, SfSlotOf(V), SfVt(SfSlotOf(V)),
+                                     PP);
+      Exit;
+    End;
+  End;
 End;
 
-Function DD_CreateSurface(T, PDesc, PSurf, Outer : LongInt) : LongInt;
-Var Fl, Caps, W, H, S, B, N : LongInt;
+{ DDDEVICEIDENTIFIER (1072 octets) et 2 (1076) }
+Function DD_GetDeviceIdentifier(T, P, Fl : LongInt) : LongInt;
+Var V, Id : LongInt;
 Begin
+  V := IfVer(T);
+  DD_GetDeviceIdentifier := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  If V >= 3 Then FillMem(P, 1076, 0) Else FillMem(P, 1072, 0);
+  DXPutS(P, 'VMM32.VXD', False);
+  DXPutS(P + 512, DXCardName, False);
+  MemL[0:P + 1024] := $00000400; MemL[0:P + 1028] := $00040004;
+  Id := DXCardId;
+  MemL[0:P + 1032] := Id And $FFFF;
+  MemL[0:P + 1036] := (Id Shr 16) And $FFFF;
+  DXGuid(P + 1052, LongInt($D7B71F83), $6340, $11CF, LongInt($A000534E),
+         $35C9AE00);
+  MemL[0:P + 1052] := MemL[0:P + 1052] Xor Id;
+  If V >= 3 Then MemL[0:P + 1068] := 1;
+  DD_GetDeviceIdentifier := DD_OK;
+End;
+
+{ Creation d'une surface (DDSURFACEDESC ou DDSURFACEDESC2) }
+Function DD_CreateSurface(T, PDesc, PSurf, Outer : LongInt) : LongInt;
+Var V, Sl, Fl, Caps, Caps2, W, H, S, B, P, N, K, Bpp, PFl, RM, GM, BM,
+    AM, Prev, Lv : LongInt;
+    V2, Excl : Boolean;
+Begin
+  V := IfVer(T);
+  T := Cor(T);
   DD_CreateSurface := DDERR_INVALIDPARAMS;
   If (PDesc = 0) Or (PSurf = 0) Then Exit;
+  MemL[0:PSurf] := 0;
+  Sl := SfSlotOf(V);
+  V2 := V >= 2;
   Fl := MemL[0:PDesc + 4];
-  Caps := 0;
-  If (Fl And 1) <> 0 Then Caps := MemL[0:PDesc + 104];
-  If (Caps And $200) <> 0 Then
+  Caps := 0; Caps2 := 0;
+  If (Fl And 1) <> 0 Then
   Begin
-    { surface primaire : l'ecran }
-    If DDBufSz < DDW * DDH Then
+    Caps := MemL[0:PDesc + 104];
+    If V2 Then Caps2 := MemL[0:PDesc + 108];
+  End;
+  If (Caps And dcPrimary) <> 0 Then
+  Begin
+    If DXPrim <> 0 Then
     Begin
-      If DDBuf <> 0 Then KFree(DDBuf);
-      DDBufSz := DDW * DDH;
-      DDBuf := KAlloc(DDBufSz + 16);
+      DD_CreateSurface := DDERR_PRIMARYSURFACEALREADYEXISTS;
+      Exit;
     End;
-    FillMem(DDBuf, DDW * DDH, 0);
-    S := SurfMake(DDW, DDH, Caps Or $20 Or $4000, DDBuf);
-    DDPrimary := S;
-    If (DDCoopFl And $11) = $11 Then
-    Begin
-      DDShow := True;
-      DDDirty := True;
-      DDCleared := False;
-    End;
+    Excl := (DXCoopFl And $11) = $11;
     N := 0;
     If (Fl And $20) <> 0 Then N := MemL[0:PDesc + 20];
-    If N > 0 Then
+    If N > 3 Then N := 3;
+    Caps := Caps Or dcVisible Or dcVidMem Or dcLocalVid;
+    If N > 0 Then Caps := Caps Or dcFront Or dcFlip Or dcComplex;
+    If Excl Then
     Begin
-      B := SurfMake(DDW, DDH, (Caps And Not $220) Or 4 Or $4000, 0);
-      MemL[0:S + 32] := B;
+      If Not DXModeSet Then
+      Begin
+        DXW := ScrW; DXH := ScrH; DXBpp := DXDispBpp;
+        If DXBpp = 15 Then DXBpp := 16;
+        DXHw := True;
+      End;
+      DXOn := True;
+      S := SfNewDisp(DXW, DXH, DXBpp, Caps, Sl);
+      If S = 0 Then
+      Begin
+        DXOn := False;
+        DD_CreateSurface := E_OUTOFMEMORY;
+        Exit;
+      End;
+      MemL[0:S + 208] := 1;
+      DXPrim := S;
+      DXOn := True; DDShow := True;
+      DDCleared := False; DDDirty := True;
+      DXDirt0 := 0; DXDirt1 := 0;
+      DXGeom;
+      DXPresent;
+    End
+    Else
+    Begin
+      S := SfNewDisp(ScrW, ScrH, DXDispBpp, Caps, Sl);
+      If S = 0 Then
+      Begin
+        DD_CreateSurface := E_OUTOFMEMORY;
+        Exit;
+      End;
+      MemL[0:S + 208] := 2;
+      DXPrim := S;
     End;
-    KLog('DirectDraw : surface primaire ' + IntStr(DDW) + 'x' +
-         IntStr(DDH) + ', ' + IntStr(N) + ' tampon(s) arriere');
-  End
-  Else
+    Prev := S;
+    For K := 1 To N Do
+    Begin
+      B := SfNewDisp(MemL[0:S + 64], MemL[0:S + 68], MemL[0:S + 88],
+                     (Caps And Not (dcPrimary Or dcFront Or dcVisible)) Or
+                     dcFlip Or dcComplex, Sl);
+      If K = 1 Then MemL[0:B + 80] := MemL[0:B + 80] Or dcBack;
+      If MemL[0:S + 88] = 8 Then
+      Begin
+        MemL[0:B + 92] := MemL[0:S + 92]; SfInfo(B);
+      End;
+      MemL[0:B + 164] := S;
+      MemL[0:Prev + 116] := B;
+      MemL[0:B + 228] := Prev;
+      Prev := B;
+    End;
+    MemL[0:S + 164] := S;
+    KLog('DirectDraw : surface primaire ' + IntStr(MemL[0:S + 64]) + 'x' +
+         IntStr(MemL[0:S + 68]) + 'x' + IntStr(MemL[0:S + 88]) + ', ' +
+         IntStr(N) + ' tampon(s) arriere');
+    MemL[0:PSurf] := S;
+    DD_CreateSurface := DD_OK;
+    Exit;
+  End;
+  W := DXW; H := DXH;
+  If (Fl And 4) <> 0 Then W := MemL[0:PDesc + 12];
+  If (Fl And 2) <> 0 Then H := MemL[0:PDesc + 8];
+  If (W <= 0) Or (H <= 0) Or (W > 4096) Or (H > 4096) Then Exit;
+  If DXModeSet Then Bpp := DXBpp Else Bpp := DXDispBpp;
+  If Bpp = 15 Then Bpp := 16;
+  PFl := $40; RM := 0; GM := 0; BM := 0; AM := 0;
+  If Bpp = 8 Then PFl := $60 Else StdMasks(Bpp, RM, GM, BM);
+  If Not DXModeSet And (Bpp = ScrBpp) And (Bpp > 8) And (RMs > 0) Then
   Begin
-    W := MemL[0:PDesc + 12]; H := MemL[0:PDesc + 8];
-    If ((Fl And 4) = 0) Or (W <= 0) Then W := DDW;
-    If ((Fl And 2) = 0) Or (H <= 0) Then H := DDH;
-    S := SurfMake(W, H, Caps Or $40, 0);
+    RM := ((1 Shl RMs) - 1) Shl RPs; GM := ((1 Shl GMs) - 1) Shl GPs;
+    BM := ((1 Shl BMs) - 1) Shl BPs;
+  End;
+  If (Caps And dcZBuf) <> 0 Then
+  Begin
+    Bpp := 16;
+    If (Fl And $40) <> 0 Then Bpp := MemL[0:PDesc + 24];
+    PFl := $400; RM := 0; GM := 0; BM := 0; AM := $FFFF;
+    If ((Fl And $1000) <> 0) And ((MemL[0:PDesc + 76] And $400) <> 0) Then
+    Begin
+      Bpp := MemL[0:PDesc + 84];
+      If MemL[0:PDesc + 92] <> 0 Then AM := MemL[0:PDesc + 92];
+    End;
+    If Bpp = 32 Then
+    Begin
+      If AM = $FFFF Then AM := $FFFFFF;
+    End
+    Else If Bpp = 24 Then AM := $FFFFFF
+    Else Bpp := 16;
+  End
+  Else If (Fl And $1000) <> 0 Then
+  Begin
+    P := PDesc + 72;
+    If (MemL[0:P + 4] And ($04 Or $08 Or $10 Or $20000 Or $80000)) <> 0
+    Then
+    Begin
+      If (MemL[0:P + 4] And $20) = 0 Then
+      Begin
+        DD_CreateSurface := DDERR_INVALIDPIXELFORMAT;
+        Exit;
+      End;
+    End;
+    If (MemL[0:P + 4] And $20) <> 0 Then
+    Begin
+      Bpp := 8; PFl := $60; RM := 0; GM := 0; BM := 0;
+    End
+    Else If (MemL[0:P + 4] And $40) <> 0 Then
+    Begin
+      Bpp := MemL[0:P + 12];
+      PFl := $40;
+      RM := MemL[0:P + 16]; GM := MemL[0:P + 20]; BM := MemL[0:P + 24];
+      If (MemL[0:P + 4] And 1) <> 0 Then
+      Begin
+        AM := MemL[0:P + 28]; PFl := PFl Or 1;
+      End;
+    End
+    Else If (MemL[0:P + 4] And 2) <> 0 Then
+    Begin
+      { alpha seul (DDPF_ALPHA) : 8 bits }
+      Bpp := 8; PFl := 1; AM := $FF;
+    End;
+    If (Bpp <> 8) And (Bpp <> 16) And (Bpp <> 24) And (Bpp <> 32) Then
+    Begin
+      DD_CreateSurface := DDERR_INVALIDPIXELFORMAT;
+      Exit;
+    End;
+  End;
+  If (Caps And (dcTexture Or dcOffscreen Or dc3D Or dcZBuf Or dcBack)) = 0
+  Then Caps := Caps Or dcOffscreen;
+  If (Caps And dcSysMem) = 0 Then Caps := Caps Or dcVidMem Or dcLocalVid;
+  N := 1;
+  If (Caps And dcMipMap) <> 0 Then
+  Begin
+    If (Fl And $20000) <> 0 Then N := MemL[0:PDesc + 24]
+    Else
+    Begin
+      N := 1; K := Max(W, H);
+      While K > 1 Do
+      Begin
+        Inc(N); K := K Div 2;
+      End;
+    End;
+    If N < 1 Then N := 1;
+    If N > 12 Then N := 12;
+  End;
+  S := 0; Prev := 0;
+  For Lv := 0 To N - 1 Do
+  Begin
+    B := SfNew(W, H, Bpp, PFl, RM, GM, BM, AM, Caps, Sl);
+    If B = 0 Then
+    Begin
+      If S <> 0 Then COMRelease(S);
+      DD_CreateSurface := E_OUTOFMEMORY;
+      Exit;
+    End;
+    MemL[0:B + 84] := Caps2;
+    MemL[0:B + 204] := Lv;
+    MemL[0:B + 232] := N - Lv;
     If (Fl And $10000) <> 0 Then
     Begin
-      MemL[0:S + 40] := MemL[0:PDesc + 64];
-      MemL[0:S + 44] := MemL[0:PDesc + 68];
-      MemL[0:S + 48] := 1;
+      MemL[0:B + 132] := MemL[0:PDesc + 64];
+      MemL[0:B + 136] := MemL[0:PDesc + 68];
+      MemL[0:B + 148] := MemL[0:B + 148] Or 1;
     End;
+    If (Fl And $4000) <> 0 Then
+    Begin
+      MemL[0:B + 140] := MemL[0:PDesc + 48];
+      MemL[0:B + 144] := MemL[0:PDesc + 52];
+      MemL[0:B + 148] := MemL[0:B + 148] Or 2;
+    End;
+    If (Lv = 0) And ((Fl And $800) <> 0) And (MemL[0:PDesc + 36] <> 0) Then
+    Begin
+      { memoire fournie par le programme }
+      KFree(MemL[0:B + 160]);
+      MemL[0:B + 160] := 0;
+      MemL[0:B + 76] := MemL[0:PDesc + 36];
+      If (Fl And 8) <> 0 Then MemL[0:B + 72] := MemL[0:PDesc + 16];
+    End;
+    If S = 0 Then S := B
+    Else
+    Begin
+      MemL[0:Prev + 116] := B;
+      MemL[0:B + 228] := Prev;
+    End;
+    Prev := B;
+    W := Max(1, W Div 2); H := Max(1, H Div 2);
   End;
   MemL[0:PSurf] := S;
   DD_CreateSurface := DD_OK;
 End;
 
-Function DD_CreatePalette(T, Fl, PEnt, PPal, Outer : LongInt) : LongInt;
-Var P : LongInt;
+Function DD_DuplicateSurface(T, Src, PDst : LongInt) : LongInt;
+Var S, D, K : LongInt;
 Begin
-  P := ComNew(VtPal, 4, 16 + 1024);
-  If PEnt <> 0 Then MoveMem(PEnt, P + 16, 1024);
-  MemL[0:P + 12] := Fl;
-  If PPal <> 0 Then MemL[0:PPal] := P;
-  DD_CreatePalette := DD_OK;
-End;
-
-Function DD_CreateClipper(T, Fl, PClip, Outer : LongInt) : LongInt;
-Begin
-  If PClip <> 0 Then MemL[0:PClip] := ComNew(VtClip, 5, 16);
-  DD_CreateClipper := DD_OK;
-End;
-
-{ Palette : +12 drapeaux, +16 entrees ; appliquee a l'ecran si elle est
-  celle de la surface primaire }
-Procedure PalApply(P : LongInt);
-Var I, E : LongInt;
-Begin
-  For I := 0 To 255 Do
+  DD_DuplicateSurface := DDERR_INVALIDPARAMS;
+  If (Src = 0) Or (PDst = 0) Then Exit;
+  K := IfVer(Src);
+  S := Cor(Src);
+  If MemL[0:S + 208] <> 0 Then
   Begin
-    E := P + 16 + I * 4;
-    SysPalSet(I, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
+    DD_DuplicateSurface := DDERR_INVALIDCAPS;
+    Exit;
   End;
-  Inc(PalVer);
-  DacAll;
+  D := ComNew(0, 3, SfSize);
+  MoveMem(S + 64, D + 64, SfSize - 64);
+  ComView(D, K, SfVt(K));
+  MemL[0:D + 160] := 0; MemL[0:D + 116] := 0; MemL[0:D + 120] := 0;
+  MemL[0:D + 124] := 0; MemL[0:D + 128] := 0; MemL[0:D + 152] := 0;
+  MemL[0:D + 176] := 0; MemL[0:D + 196] := 0; MemL[0:D + 200] := 0;
+  MemL[0:D + 188] := 0; MemL[0:D + 228] := 0; MemL[0:D + 212] := 0;
+  SfReg(D, True);
+  MemL[0:PDst] := D;
+  DD_DuplicateSurface := DD_OK;
 End;
 
-Function PL_GetCaps(T, P : LongInt) : LongInt;
-Begin
-  If P <> 0 Then MemL[0:P] := 4 Or $400;
-  PL_GetCaps := DD_OK;
-End;
-
-Function PL_GetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
-Begin
-  If (Start >= 0) And (Start + N <= 256) Then
-    MoveMem(T + 16 + Start * 4, PEnt, N * 4);
-  PL_GetEntries := DD_OK;
-End;
-
-Function PL_SetEntries(T, Fl, Start, N, PEnt : LongInt) : LongInt;
-Begin
-  PL_SetEntries := DDERR_INVALIDPARAMS;
-  If (Start < 0) Or (Start + N > 256) Then Exit;
-  MoveMem(PEnt, T + 16 + Start * 4, N * 4);
-  If (DDPrimary <> 0) And (MemL[0:DDPrimary + 36] = T) Then PalApply(T);
-  PL_SetEntries := DD_OK;
-End;
-
-Function CL_GetHWnd(T, P : LongInt) : LongInt;
-Begin
-  If P <> 0 Then MemL[0:P] := MemL[0:T + 12];
-  CL_GetHWnd := DD_OK;
-End;
-
-Function CL_IsClipListChanged(T, P : LongInt) : LongInt;
-Begin
-  If P <> 0 Then MemL[0:P] := 0;
-  CL_IsClipListChanged := DD_OK;
-End;
-
-Function CL_SetHWnd(T, Fl, H : LongInt) : LongInt;
-Begin
-  MemL[0:T + 12] := H;
-  CL_SetHWnd := DD_OK;
-End;
-
-{ Surfaces }
+{ ------------------------------------------------------------------ }
+{ Surfaces : methodes                                                }
+{ ------------------------------------------------------------------ }
 
 Function SF_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C, K : LongInt;
 Begin
   SF_QI := E_NOINTERFACE;
   If Ppv = 0 Then Exit;
   MemL[0:Ppv] := 0;
-  If GuidIs(Riid, 0) Or GuidIs(Riid, LongInt($6C14DB81)) Or
-     GuidIs(Riid, LongInt($57805885)) Or GuidIs(Riid, LongInt($DA044E00))
-  Then
+  C := Cor(T);
+  K := -1;
+  If GuidUnk(Riid) Then K := IfVer(T)
+  Else If GuidIs(Riid, LongInt($6C14DB81)) Then K := 0
+  Else If GuidIs(Riid, LongInt($57805885)) Then K := 1
+  Else If GuidIs(Riid, LongInt($DA044E00)) Then K := 2
+  Else If GuidIs(Riid, LongInt($0B2B8630)) Then K := 3
+  Else If GuidIs(Riid, LongInt($06675A80)) Then K := 4;
+  If K >= 0 Then
   Begin
-    MemL[0:Ppv] := T;
-    COMAddRef(T);
-    SF_QI := DD_OK;
-  End;
-End;
-
-{ Mise a jour de l'ecran apres un changement de la surface primaire }
-Procedure SurfTouched(S : LongInt);
-Var R : TRect; Y : LongInt;
-Begin
-  If S <> DDPrimary Then Exit;
-  If DDShow Then
-  Begin
-    DDDirty := True;
+    SF_QI := ComGive(C, K, SfVt(K), Ppv);
     Exit;
   End;
-  { fenetre : la primaire est l'ecran, recopiee dans le tampon }
-  For Y := 0 To Min(DDH, ScrH) - 1 Do
-    MoveMem(DDBuf + Y * DDW, Back.Bits + Y * Back.Pitch, Min(DDW, ScrW));
-  SetR(R, 0, 0, ScrW, ScrH);
-  MarkDirty(R);
+  If GuidIs(Riid, LongInt($69C11C3E)) Then
+  Begin
+    { IDirectDrawGammaControl (primaire) }
+    SF_QI := ComGive(C, 5, VtGam, Ppv);
+    Exit;
+  End;
+  SF_QI := D3DQuerySurf(C, Riid, Ppv);
+End;
+
+Function SF_GetDDInterface(T, PP : LongInt) : LongInt;
+Begin
+  SF_GetDDInterface := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or (DXObj = 0) Then Exit;
+  MemL[0:PP] := DXObj;
+  COMAddRef(DXObj);
+  SF_GetDDInterface := DD_OK;
+End;
+
+Function SF_Initialize(T, DD, P : LongInt) : LongInt;
+Begin
+  SF_Initialize := DDERR_ALREADYINITIALIZED;
+End;
+
+Function SF_GetCaps(T, P : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  V := IfVer(T);
+  T := Cor(T);
+  SF_GetCaps := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:P] := MemL[0:T + 80];
+  If V >= 3 Then
+  Begin
+    MemL[0:P + 4] := MemL[0:T + 84]; MemL[0:P + 8] := 0;
+    MemL[0:P + 12] := 0;
+  End;
+  SF_GetCaps := DD_OK;
 End;
 
 Function SF_GetSurfaceDesc(T, P : LongInt) : LongInt;
+Var V : LongInt;
 Begin
-  DDFillDesc(P, MemL[0:T + 12], MemL[0:T + 16], MemL[0:T + 20],
-             MemL[0:T + 24], MemL[0:T + 28]);
+  V := IfVer(T);
+  T := Cor(T);
+  SF_GetSurfaceDesc := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  SfDesc(T, P, V >= 3);
   SF_GetSurfaceDesc := DD_OK;
 End;
 
-Function SF_Lock(T, PRect, PDesc, Fl, Ev : LongInt) : LongInt;
+Function SF_GetPixelFormat(T, P : LongInt) : LongInt;
 Begin
-  SF_GetSurfaceDesc(T, PDesc);
+  T := Cor(T);
+  SF_GetPixelFormat := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  FillMem(P, 32, 0);
+  MemL[0:P] := 32;
+  MemL[0:P + 4] := MemL[0:T + 92];
+  MemL[0:P + 8] := MemL[0:T + 112];
+  MemL[0:P + 12] := MemL[0:T + 88];
+  If (MemL[0:T + 92] And $400) <> 0 Then MemL[0:P + 20] := MemL[0:T + 108]
+  Else
+  Begin
+    MemL[0:P + 16] := MemL[0:T + 96]; MemL[0:P + 20] := MemL[0:T + 100];
+    MemL[0:P + 24] := MemL[0:T + 104]; MemL[0:P + 28] := MemL[0:T + 108];
+  End;
+  SF_GetPixelFormat := DD_OK;
+End;
+
+Function SF_Lock(T, PRect, PDesc, Fl, Ev : LongInt) : LongInt;
+Var V, A : LongInt;
+Begin
+  V := IfVer(T);
+  T := Cor(T);
+  SF_Lock := DDERR_INVALIDPARAMS;
+  If PDesc = 0 Then Exit;
+  SfDesc(T, PDesc, V >= 3);
+  MemL[0:PDesc + 4] := MemL[0:PDesc + 4] Or $800;
+  A := MemL[0:T + 76];
   If PRect <> 0 Then
-    MemL[0:PDesc + 36] := MemL[0:T + 24] + MemL[0:PRect + 4] *
-                          MemL[0:T + 20] + MemL[0:PRect];
+  Begin
+    A := A + MemL[0:PRect + 4] * MemL[0:T + 72] +
+         MemL[0:PRect] * SfBytes(T);
+    If T = DXPrim Then
+    Begin
+      MoveMem(PRect, LongInt(@DXLockR), 16);
+      DXLockAll := False;
+    End;
+  End
+  Else If T = DXPrim Then DXLockAll := True;
+  MemL[0:PDesc + 36] := A;
+  MemL[0:T + 192] := MemL[0:T + 192] + 1;
   SF_Lock := DD_OK;
 End;
 
 Function SF_Unlock(T, P : LongInt) : LongInt;
 Begin
-  SurfTouched(T);
+  T := Cor(T);
+  If MemL[0:T + 192] > 0 Then MemL[0:T + 192] := MemL[0:T + 192] - 1;
+  Inc(DXUniq);
+  MemL[0:T + 172] := DXUniq;
+  If MemL[0:T + 208] <> 0 Then
+  Begin
+    If DXLockAll Then
+      SfTouched(T, 0, 0, MemL[0:T + 64], MemL[0:T + 68], True)
+    Else
+      SfTouched(T, DXLockR[0], DXLockR[1], DXLockR[2], DXLockR[3], True);
+  End;
   SF_Unlock := DD_OK;
 End;
 
-Function SF_GetCaps(T, P : LongInt) : LongInt;
-Begin
-  If P <> 0 Then MemL[0:P] := MemL[0:T + 28];
-  SF_GetCaps := DD_OK;
-End;
-
-Function SF_GetPixelFormat(T, P : LongInt) : LongInt;
-Begin
-  FillMem(P, 32, 0);
-  MemL[0:P] := 32; MemL[0:P + 4] := $60; MemL[0:P + 12] := 8;
-  SF_GetPixelFormat := DD_OK;
-End;
-
-Function SF_GetAttachedSurface(T, PCaps, PSurf : LongInt) : LongInt;
-Begin
-  SF_GetAttachedSurface := DDERR_NOTFOUND;
-  If (PSurf = 0) Or (MemL[0:T + 32] = 0) Then Exit;
-  MemL[0:PSurf] := MemL[0:T + 32];
-  COMAddRef(MemL[0:T + 32]);
-  SF_GetAttachedSurface := DD_OK;
-End;
-
-{ Echange des tampons de la chaine primaire / arriere }
-Function SF_Flip(T, Ovr, Fl : LongInt) : LongInt;
-Var B, Tmp : LongInt;
-Begin
-  SF_Flip := DD_OK;
-  B := MemL[0:T + 32];
-  If B = 0 Then Exit;
-  If T = DDPrimary Then
-  Begin
-    { la primaire garde DDBuf : on y recopie le tampon arriere, qui
-      recoit l'ancienne image (echange) }
-    Tmp := KAlloc(DDW * DDH);
-    MoveMem(DDBuf, Tmp, DDW * DDH);
-    MoveMem(MemL[0:B + 24], DDBuf, DDW * DDH);
-    MoveMem(Tmp, MemL[0:B + 24], DDW * DDH);
-    KFree(Tmp);
-    SurfTouched(T);
-  End
-  Else
-  Begin
-    Tmp := MemL[0:T + 24];
-    MemL[0:T + 24] := MemL[0:B + 24];
-    MemL[0:B + 24] := Tmp;
-  End;
-End;
-
-Function SF_GetColorKey(T, Fl, P : LongInt) : LongInt;
-Begin
-  If P <> 0 Then
-  Begin
-    MemL[0:P] := MemL[0:T + 40]; MemL[0:P + 4] := MemL[0:T + 44];
-  End;
-  SF_GetColorKey := DD_OK;
-End;
-
-Function SF_SetColorKey(T, Fl, P : LongInt) : LongInt;
-Begin
-  If P = 0 Then MemL[0:T + 48] := 0
-  Else
-  Begin
-    MemL[0:T + 40] := MemL[0:P]; MemL[0:T + 44] := MemL[0:P + 4];
-    MemL[0:T + 48] := 1;
-  End;
-  SF_SetColorKey := DD_OK;
-End;
-
-Function SF_SetPalette(T, P : LongInt) : LongInt;
-Begin
-  MemL[0:T + 36] := P;
-  If P <> 0 Then COMAddRef(P);
-  If (T = DDPrimary) And (P <> 0) And DDShow Then
-  Begin
-    PalApply(P);
-    DDDirty := True;
-  End;
-  SF_SetPalette := DD_OK;
-End;
-
-Function SF_GetPalette(T, PP : LongInt) : LongInt;
-Begin
-  SF_GetPalette := DDERR_NOTFOUND;
-  If (PP = 0) Or (MemL[0:T + 36] = 0) Then Exit;
-  MemL[0:PP] := MemL[0:T + 36];
-  COMAddRef(MemL[0:T + 36]);
-  SF_GetPalette := DD_OK;
-End;
-
-Function SF_SetClipper(T, C : LongInt) : LongInt;
-Begin
-  MemL[0:T + 56] := C;
-  SF_SetClipper := DD_OK;
-End;
-
-Function SF_GetDDInterface(T, P : LongInt) : LongInt;
-Begin
-  SF_GetDDInterface := E_NOTIMPL;
-End;
-
-{ Transfert de SRect (src) vers DRect (dst) avec mise a l'echelle et
-  cle de couleur source eventuelle }
-Procedure SurfBlt(D, DL, DT, DR, DB, S, SL, ST, SR, SB : LongInt;
-                  Key : Boolean);
-Var X, Y, SX, SY, DW, DH, SW, SH, V, K, DA, SA : LongInt;
-Begin
-  If DL < 0 Then DL := 0;
-  If DT < 0 Then DT := 0;
-  If DR > MemL[0:D + 12] Then DR := MemL[0:D + 12];
-  If DB > MemL[0:D + 16] Then DB := MemL[0:D + 16];
-  DW := DR - DL; DH := DB - DT; SW := SR - SL; SH := SB - ST;
-  If (DW <= 0) Or (DH <= 0) Or (SW <= 0) Or (SH <= 0) Then Exit;
-  K := MemL[0:S + 40] And $FF;
-  For Y := 0 To DH - 1 Do
-  Begin
-    SY := ST + (Y * SH) Div DH;
-    If (SY < 0) Or (SY >= MemL[0:S + 16]) Then Continue;
-    DA := MemL[0:D + 24] + (DT + Y) * MemL[0:D + 20] + DL;
-    SA := MemL[0:S + 24] + SY * MemL[0:S + 20];
-    If (DW = SW) And Not Key And (SL >= 0) And
-       (SL + SW <= MemL[0:S + 12]) Then
-    Begin
-      MoveMem(SA + SL, DA, DW);
-      Continue;
-    End;
-    For X := 0 To DW - 1 Do
-    Begin
-      SX := SL + (X * SW) Div DW;
-      If (SX < 0) Or (SX >= MemL[0:S + 12]) Then Continue;
-      V := Mem[0:SA + SX];
-      If Key And (V = K) Then Continue;
-      Mem[0:DA + X] := V;
-    End;
-  End;
-End;
-
+{ Rectangle donne ou surface entiere }
 Procedure RectOr(P, W, H : LongInt; Var L, T, R, B : LongInt);
 Begin
   If P = 0 Then
@@ -36031,425 +38933,3048 @@ Begin
 End;
 
 Function SF_Blt(T, PDst, Src, PSrc, Fl, Fx : LongInt) : LongInt;
-Var DL, DT, DR, DB, SL, ST, SR, SB, Y, C : LongInt;
+Var DL, DT, DR, DB, SL, ST, SR, SB, CL, CT, CR, CB, KS0, KS1, KD0, KD1,
+    FxF, Rop : LongInt;
+    Ks, Kd, MX, MY : Boolean;
 Begin
-  RectOr(PDst, MemL[0:T + 12], MemL[0:T + 16], DL, DT, DR, DB);
-  If (Fl And $400) <> 0 Then
+  T := Cor(T);
+  Src := Cor(Src);
+  SF_Blt := DD_OK;
+  RectOr(PDst, MemL[0:T + 64], MemL[0:T + 68], DL, DT, DR, DB);
+  If (MemL[0:T + 208] = 2) And (PDst = 0) And (MemL[0:T + 128] <> 0) Then
+    If ClipRect(MemL[0:T + 128], CL, CT, CR, CB) Then
+    Begin
+      DL := CL; DT := CT; DR := CR; DB := CB;
+    End;
+  If (MemL[0:T + 128] <> 0) And (MemL[0:T + 208] <> 2) Then
+    If ClipRect(MemL[0:T + 128], CL, CT, CR, CB) And (PDst <> 0) And
+       ((Fl And $400) <> 0) Then
+    Begin
+      DL := Max(DL, CL); DT := Max(DT, CT);
+      DR := Min(DR, CR); DB := Min(DB, CB);
+    End;
+  Rop := $CC0020;
+  If ((Fl And $20000) <> 0) And (Fx <> 0) Then Rop := MemL[0:Fx + 8];
+  If ((Fl And ($400 Or $2000000)) <> 0) Or (Rop = $42) Or
+     (Rop = $FF0062) Then
   Begin
-    { DDBLT_COLORFILL }
-    C := 0;
-    If Fx <> 0 Then C := MemL[0:Fx + 80] And $FF;
-    If DL < 0 Then DL := 0;
-    If DT < 0 Then DT := 0;
-    If DR > MemL[0:T + 12] Then DR := MemL[0:T + 12];
-    If DB > MemL[0:T + 16] Then DB := MemL[0:T + 16];
-    For Y := DT To DB - 1 Do
-      If DR > DL Then
-        FillMem(MemL[0:T + 24] + Y * MemL[0:T + 20] + DL, DR - DL, C);
+    { COLORFILL, DEPTHFILL, BLACKNESS, WHITENESS }
+    KS0 := 0;
+    If ((Fl And ($400 Or $2000000)) <> 0) And (Fx <> 0) Then
+      KS0 := MemL[0:Fx + 80];
+    If Rop = $FF0062 Then KS0 := -1;
+    SfFill(T, DL, DT, DR, DB, KS0);
   End
   Else If Src <> 0 Then
   Begin
-    RectOr(PSrc, MemL[0:Src + 12], MemL[0:Src + 16], SL, ST, SR, SB);
-    SurfBlt(T, DL, DT, DR, DB, Src, SL, ST, SR, SB,
-            ((Fl And $8000) <> 0) And (MemL[0:Src + 48] <> 0));
+    RectOr(PSrc, MemL[0:Src + 64], MemL[0:Src + 68], SL, ST, SR, SB);
+    Ks := False; Kd := False; MX := False; MY := False;
+    KS0 := 0; KS1 := 0; KD0 := 0; KD1 := 0;
+    If ((Fl And $10000) <> 0) And (Fx <> 0) Then
+    Begin
+      Ks := True; KS0 := MemL[0:Fx + 92]; KS1 := MemL[0:Fx + 96];
+    End
+    Else If ((Fl And $8000) <> 0) And ((MemL[0:Src + 148] And 1) <> 0) Then
+    Begin
+      Ks := True; KS0 := MemL[0:Src + 132]; KS1 := MemL[0:Src + 136];
+    End;
+    If ((Fl And $4000) <> 0) And (Fx <> 0) Then
+    Begin
+      Kd := True; KD0 := MemL[0:Fx + 84]; KD1 := MemL[0:Fx + 88];
+    End
+    Else If ((Fl And $2000) <> 0) And ((MemL[0:T + 148] And 2) <> 0) Then
+    Begin
+      Kd := True; KD0 := MemL[0:T + 140]; KD1 := MemL[0:T + 144];
+    End;
+    If KS1 < KS0 Then KS1 := KS0;
+    If KD1 < KD0 Then KD1 := KD0;
+    If ((Fl And $800) <> 0) And (Fx <> 0) Then
+    Begin
+      FxF := MemL[0:Fx + 4];
+      MX := (FxF And 2) <> 0; MY := (FxF And 4) <> 0;
+    End;
+    SfXfer(T, DL, DT, DR, DB, Src, SL, ST, SR, SB, Ks, Kd, KS0, KS1, KD0,
+           KD1, MX, MY);
   End;
-  SurfTouched(T);
-  SF_Blt := DD_OK;
+  Inc(DXUniq);
+  MemL[0:T + 172] := DXUniq;
+  SfTouched(T, DL, DT, DR, DB, False);
 End;
 
 Function SF_BltFast(T, X, Y, Src, PSrc, Trans : LongInt) : LongInt;
-Var SL, ST, SR, SB : LongInt;
+Var SL, ST, SR, SB, KS0, KS1, KD0, KD1 : LongInt; Ks, Kd : Boolean;
 Begin
+  T := Cor(T);
+  Src := Cor(Src);
   SF_BltFast := DDERR_INVALIDPARAMS;
   If Src = 0 Then Exit;
-  RectOr(PSrc, MemL[0:Src + 12], MemL[0:Src + 16], SL, ST, SR, SB);
-  SurfBlt(T, X, Y, X + SR - SL, Y + SB - ST, Src, SL, ST, SR, SB,
-          ((Trans And 1) <> 0) And (MemL[0:Src + 48] <> 0));
-  SurfTouched(T);
+  RectOr(PSrc, MemL[0:Src + 64], MemL[0:Src + 68], SL, ST, SR, SB);
+  Ks := ((Trans And 1) <> 0) And ((MemL[0:Src + 148] And 1) <> 0);
+  Kd := ((Trans And 2) <> 0) And ((MemL[0:T + 148] And 2) <> 0);
+  KS0 := MemL[0:Src + 132]; KS1 := Max(KS0, MemL[0:Src + 136]);
+  KD0 := MemL[0:T + 140]; KD1 := Max(KD0, MemL[0:T + 144]);
+  SfXfer(T, X, Y, X + SR - SL, Y + SB - ST, Src, SL, ST, SR, SB, Ks, Kd,
+         KS0, KS1, KD0, KD1, False, False);
+  Inc(DXUniq);
+  MemL[0:T + 172] := DXUniq;
+  SfTouched(T, X, Y, X + SR - SL, Y + SB - ST, False);
   SF_BltFast := DD_OK;
 End;
 
-{ Contexte GDI sur la surface : DIB 8 bits (haut en bas) partageant la
-  memoire de la surface, table de couleurs = palette systeme }
-Function SF_GetDC(T, PHdc : LongInt) : LongInt;
-Var B, Hdc, I : LongInt;
+Function SF_GetColorKey(T, Fl, P : LongInt) : LongInt;
+Var K : LongInt;
 Begin
+  T := Cor(T);
+  SF_GetColorKey := DDERR_NOCOLORKEY;
+  If P = 0 Then Exit;
+  If (Fl And 8) <> 0 Then K := 1 Else K := 2;
+  If (MemL[0:T + 148] And K) = 0 Then Exit;
+  If K = 1 Then
+  Begin
+    MemL[0:P] := MemL[0:T + 132]; MemL[0:P + 4] := MemL[0:T + 136];
+  End
+  Else
+  Begin
+    MemL[0:P] := MemL[0:T + 140]; MemL[0:P + 4] := MemL[0:T + 144];
+  End;
+  SF_GetColorKey := DD_OK;
+End;
+
+Function SF_SetColorKey(T, Fl, P : LongInt) : LongInt;
+Var K : LongInt;
+Begin
+  T := Cor(T);
+  SF_SetColorKey := DD_OK;
+  If (Fl And ($4 Or $10)) <> 0 Then Exit;       { cles d'incrustation }
+  If (Fl And 8) <> 0 Then K := 1 Else K := 2;
+  If P = 0 Then
+  Begin
+    MemL[0:T + 148] := MemL[0:T + 148] And Not K;
+    Exit;
+  End;
+  If K = 1 Then
+  Begin
+    MemL[0:T + 132] := MemL[0:P]; MemL[0:T + 136] := MemL[0:P + 4];
+  End
+  Else
+  Begin
+    MemL[0:T + 140] := MemL[0:P]; MemL[0:T + 144] := MemL[0:P + 4];
+  End;
+  MemL[0:T + 148] := MemL[0:T + 148] Or K;
+  Inc(DXUniq);
+End;
+
+Function SF_SetPalette(T, P : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  T := Cor(T);
+  P := Cor(P);
+  O := MemL[0:T + 124];
+  If P <> 0 Then COMAddRef(P);
+  MemL[0:T + 124] := P;
+  If O <> 0 Then COMRelease(O);
+  If (P <> 0) And (T = DXPrim) And (MemL[0:T + 88] = 8) Then PalApply(P);
+  SF_SetPalette := DD_OK;
+End;
+
+Function SF_GetPalette(T, PP : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  SF_GetPalette := DDERR_NOPALETTEATTACHED;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  If MemL[0:T + 124] = 0 Then Exit;
+  MemL[0:PP] := MemL[0:T + 124];
+  COMAddRef(MemL[0:T + 124]);
+  SF_GetPalette := DD_OK;
+End;
+
+Function SF_SetClipper(T, C : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  T := Cor(T);
+  C := Cor(C);
+  O := MemL[0:T + 128];
+  If C <> 0 Then COMAddRef(C);
+  MemL[0:T + 128] := C;
+  If O <> 0 Then COMRelease(O);
+  SF_SetClipper := DD_OK;
+End;
+
+Function SF_GetClipper(T, PP : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  SF_GetClipper := DDERR_NOCLIPPERATTACHED;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  If MemL[0:T + 128] = 0 Then Exit;
+  MemL[0:PP] := MemL[0:T + 128];
+  COMAddRef(MemL[0:T + 128]);
+  SF_GetClipper := DD_OK;
+End;
+
+{ Surfaces attachees : chaine (+116) et tampon Z (+120) }
+Function SF_GetAttached(T, PCaps, PSurf : LongInt) : LongInt;
+Var V, C, S, K : LongInt;
+Begin
+  V := IfVer(T);
+  T := Cor(T);
+  SF_GetAttached := DDERR_NOTFOUND;
+  If (PSurf = 0) Or (PCaps = 0) Then Exit;
+  MemL[0:PSurf] := 0;
+  C := MemL[0:PCaps];
+  S := 0;
+  If (C And dcZBuf) <> 0 Then S := MemL[0:T + 120]
+  Else If (C And (dcBack Or dcFlip Or dcMipMap Or dcTexture Or dc3D)) <> 0
+  Then
+  Begin
+    S := MemL[0:T + 116];
+    If (S = 0) And ((C And dcFlip) <> 0) And (MemL[0:T + 164] <> 0) And
+       (MemL[0:T + 164] <> T) Then S := MemL[0:T + 164];
+  End;
+  If S = 0 Then Exit;
+  If (MemL[0:S + 80] And C) <> C Then
+  Begin
+    If Not (((C And dcFlip) <> 0) And ((MemL[0:S + 80] And dcFlip) <> 0))
+    Then Exit;
+  End;
+  K := V;
+  SF_GetAttached := ComGive(S, K, SfVt(K), PSurf);
+End;
+
+Function SF_AddAttached(T, A : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  A := Cor(A);
+  SF_AddAttached := DDERR_CANNOTATTACHSURFACE;
+  If A = 0 Then Exit;
+  If (MemL[0:A + 80] And dcZBuf) <> 0 Then
+  Begin
+    If MemL[0:T + 120] <> 0 Then
+    Begin
+      SF_AddAttached := DDERR_SURFACEALREADYATTACHED;
+      Exit;
+    End;
+    COMAddRef(A);
+    MemL[0:T + 120] := A;
+    SF_AddAttached := DD_OK;
+  End
+  Else If MemL[0:T + 116] = 0 Then
+  Begin
+    COMAddRef(A);
+    MemL[0:T + 116] := A;
+    SF_AddAttached := DD_OK;
+  End;
+End;
+
+Function SF_DeleteAttached(T, Fl, A : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  A := Cor(A);
+  SF_DeleteAttached := DDERR_SURFACENOTATTACHED;
+  If (A = 0) Or (A = MemL[0:T + 120]) Then
+  Begin
+    If MemL[0:T + 120] <> 0 Then COMRelease(MemL[0:T + 120]);
+    MemL[0:T + 120] := 0;
+    SF_DeleteAttached := DD_OK;
+  End
+  Else If A = MemL[0:T + 116] Then
+  Begin
+    MemL[0:T + 116] := 0;
+    COMRelease(A);
+    SF_DeleteAttached := DD_OK;
+  End;
+End;
+
+Function SF_EnumAttached(T, Ctx, Cb : LongInt) : LongInt;
+Var V, D, S, K : LongInt;
+Begin
+  V := IfVer(T);
+  T := Cor(T);
+  SF_EnumAttached := DD_OK;
+  If Cb = 0 Then Exit;
+  D := KAlloc(128);
+  For K := 0 To 1 Do
+  Begin
+    If K = 0 Then S := MemL[0:T + 116] Else S := MemL[0:T + 120];
+    If S = 0 Then Continue;
+    SfDesc(S, D, V >= 3);
+    COMAddRef(S);
+    If DXCall3(Cb, ComView(S, V, SfVt(V)), D, Ctx) = 0 Then Break;
+  End;
+  KFree(D);
+End;
+
+{ Echange de la chaine : les memoires tournent (avant <- arriere) }
+Function SF_Flip(T, Ovr, Fl : LongInt) : LongInt;
+Var Chain : Array[0..3] Of LongInt; N, I, B, W : LongInt;
+Begin
+  T := Cor(T);
+  Ovr := Cor(Ovr);
+  SF_Flip := DDERR_NOTFLIPPABLE;
+  If MemL[0:T + 116] = 0 Then Exit;
+  N := 0; B := T;
+  While (B <> 0) And (N < 4) Do
+  Begin
+    Chain[N] := B; Inc(N);
+    B := MemL[0:B + 116];
+  End;
+  If Ovr <> 0 Then
+  Begin
+    B := MemL[0:T + 76];
+    MemL[0:T + 76] := MemL[0:Ovr + 76]; MemL[0:Ovr + 76] := B;
+    B := MemL[0:T + 160];
+    MemL[0:T + 160] := MemL[0:Ovr + 160]; MemL[0:Ovr + 160] := B;
+  End
+  Else
+  Begin
+    B := MemL[0:Chain[0] + 76]; W := MemL[0:Chain[0] + 160];
+    For I := 0 To N - 2 Do
+    Begin
+      MemL[0:Chain[I] + 76] := MemL[0:Chain[I + 1] + 76];
+      MemL[0:Chain[I] + 160] := MemL[0:Chain[I + 1] + 160];
+    End;
+    MemL[0:Chain[N - 1] + 76] := B;
+    MemL[0:Chain[N - 1] + 160] := W;
+  End;
+  Inc(DXUniq);
+  If MemL[0:T + 208] <> 0 Then
+  Begin
+    { cadence de l'ecran (60 Hz) sauf DDFLIP_NOVSYNC }
+    If (Fl And 8) = 0 Then
+    Begin
+      W := Ticks - DXFlipT;
+      If (W >= 0) And (W < 16) Then KSleep(16 - W);
+    End;
+    DXFlipT := Ticks;
+    SfTouched(T, 0, 0, MemL[0:T + 64], MemL[0:T + 68], True);
+  End;
+  SF_Flip := DD_OK;
+End;
+
+{ Contexte GDI : surface 8 bits directement ; en couleurs directes,
+  copie en 256 couleurs (palette systeme) dont les pixels changes sont
+  reconvertis a ReleaseDC }
+Function SF_GetDC(T, PHdc : LongInt) : LongInt;
+Var B, Hdc, I, X, Y, W, H, P, Sh, A : LongInt;
+Begin
+  T := Cor(T);
   SF_GetDC := DDERR_INVALIDPARAMS;
   If PHdc = 0 Then Exit;
+  MemL[0:PHdc] := 0;
+  If MemL[0:T + 152] <> 0 Then
+  Begin
+    SF_GetDC := DDERR_DCALREADYCREATED;
+    Exit;
+  End;
+  If MemL[0:T + 208] = 2 Then
+  Begin
+    Hdc := GetDC(0);
+    MemL[0:T + 152] := Hdc;
+    MemL[0:PHdc] := Hdc;
+    SF_GetDC := DD_OK;
+    Exit;
+  End;
+  SF_GetDC := DDERR_CANTCREATEDC;
+  If (MemL[0:T + 92] And $400) <> 0 Then Exit;
   B := GdiNew(goBitmap);
   If B < 0 Then Exit;
-  Gdis^[B].I1 := MemL[0:T + 24];
-  Gdis^[B].I2 := MemL[0:T + 12]; Gdis^[B].I3 := MemL[0:T + 16];
-  Gdis^[B].I4 := 8; Gdis^[B].I5 := MemL[0:T + 20];
+  W := MemL[0:T + 64]; H := MemL[0:T + 68];
+  If MemL[0:T + 88] = 8 Then
+  Begin
+    Gdis^[B].I1 := MemL[0:T + 76];
+    Gdis^[B].I5 := MemL[0:T + 72];
+  End
+  Else
+  Begin
+    P := (W + 3) And Not 3;
+    Sh := KAlloc(P * H + 16);
+    A := KAlloc(P * H + 16);
+    If (Sh = 0) Or (A = 0) Then
+    Begin
+      Gdis^[B].Used := False;
+      Exit;
+    End;
+    For Y := 0 To H - 1 Do
+      For X := 0 To W - 1 Do
+        Mem[0:Sh + Y * P + X] := DXIdxOf(SfToRGB(T, SfGet(T, X, Y)));
+    MoveMem(Sh, A, P * H);
+    MemL[0:T + 196] := Sh; MemL[0:T + 200] := A;
+    Gdis^[B].I1 := Sh;
+    Gdis^[B].I5 := P;
+  End;
+  Gdis^[B].I2 := W; Gdis^[B].I3 := H;
+  Gdis^[B].I4 := 8;
   Gdis^[B].I7 := 1 Or 2 Or 8;
   Gdis^[B].I6 := KAlloc(1024);
   For I := 0 To 255 Do
-    MemL[0:Gdis^[B].I6 + I * 4] := (SysPal[I * 3] Shl 16) Or
-      (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+    If MemL[0:T + 88] = 8 Then
+      MemL[0:Gdis^[B].I6 + I * 4] := SfPalRGB(T, I)
+    Else
+      MemL[0:Gdis^[B].I6 + I * 4] := (SysPal[I * 3] Shl 16) Or
+        (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
   Hdc := CreateCompatibleDC(0);
   SelectObject(Hdc, GdiH(B));
-  MemL[0:T + 52] := Hdc;
-  MemL[0:T + 60] := B;
+  MemL[0:T + 152] := Hdc;
+  MemL[0:T + 156] := B;
   MemL[0:PHdc] := Hdc;
   SF_GetDC := DD_OK;
 End;
 
 Function SF_ReleaseDC(T, Hdc : LongInt) : LongInt;
-Var B : LongInt;
+Var B, X, Y, W, H, P, Sh, A, V : LongInt;
 Begin
+  T := Cor(T);
+  SF_ReleaseDC := DDERR_NODC;
+  If (Hdc = 0) Or (MemL[0:T + 152] <> Hdc) Then Exit;
+  MemL[0:T + 152] := 0;
+  If MemL[0:T + 208] = 2 Then
+  Begin
+    ReleaseDC(0, Hdc);
+    SF_ReleaseDC := DD_OK;
+    Exit;
+  End;
   DeleteDC(Hdc);
-  B := MemL[0:T + 60];
-  If (B >= 0) And (MemL[0:T + 52] = Hdc) Then
+  B := MemL[0:T + 156];
+  Sh := MemL[0:T + 196]; A := MemL[0:T + 200];
+  If Sh <> 0 Then
+  Begin
+    W := MemL[0:T + 64]; H := MemL[0:T + 68];
+    P := (W + 3) And Not 3;
+    For Y := 0 To H - 1 Do
+      For X := 0 To W - 1 Do
+      Begin
+        V := Mem[0:Sh + Y * P + X];
+        If V <> Mem[0:A + Y * P + X] Then
+          SfSet(T, X, Y, SfFromRGB(T, LongInt($FF000000) Or
+                (SysPal[V * 3] Shl 16) Or (SysPal[V * 3 + 1] Shl 8) Or
+                SysPal[V * 3 + 2]));
+      End;
+    KFree(Sh); KFree(A);
+    MemL[0:T + 196] := 0; MemL[0:T + 200] := 0;
+  End;
+  If (B >= 0) And Gdis^[B].Used Then
   Begin
     If Gdis^[B].I6 <> 0 Then KFree(Gdis^[B].I6);
     Gdis^[B].I6 := 0;
     Gdis^[B].Used := False;
   End;
-  MemL[0:T + 52] := 0;
-  SurfTouched(T);
+  Inc(DXUniq);
+  MemL[0:T + 172] := DXUniq;
+  SfTouched(T, 0, 0, MemL[0:T + 64], MemL[0:T + 68], True);
   SF_ReleaseDC := DD_OK;
 End;
 
+Function SF_SetSurfaceDesc(T, P, Fl : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  SF_SetSurfaceDesc := DDERR_INVALIDPARAMS;
+  If (P = 0) Or ((MemL[0:P + 4] And $800) = 0) Then Exit;
+  If MemL[0:T + 160] <> 0 Then KFree(MemL[0:T + 160]);
+  MemL[0:T + 160] := 0;
+  MemL[0:T + 76] := MemL[0:P + 36];
+  If (MemL[0:P + 4] And 4) <> 0 Then MemL[0:T + 64] := MemL[0:P + 12];
+  If (MemL[0:P + 4] And 2) <> 0 Then MemL[0:T + 68] := MemL[0:P + 8];
+  If (MemL[0:P + 4] And 8) <> 0 Then MemL[0:T + 72] := MemL[0:P + 16];
+  SF_SetSurfaceDesc := DD_OK;
+End;
+
+{ Donnees privees : 8 entrees (GUID 16, donnees, taille, drapeaux) }
+Function SfPrivFind(T, G : LongInt; Make : Boolean) : LongInt;
+Var I, L, E : LongInt;
+Begin
+  SfPrivFind := 0;
+  L := MemL[0:T + 176];
+  If L = 0 Then
+  Begin
+    If Not Make Then Exit;
+    L := KAlloc(8 * 28);
+    FillMem(L, 8 * 28, 0);
+    MemL[0:T + 176] := L;
+  End;
+  For I := 0 To 7 Do
+  Begin
+    E := L + I * 28;
+    If (MemL[0:E + 16] <> 0) And (MemL[0:E] = MemL[0:G]) And
+       (MemL[0:E + 4] = MemL[0:G + 4]) And (MemL[0:E + 8] = MemL[0:G + 8]) And
+       (MemL[0:E + 12] = MemL[0:G + 12]) Then
+    Begin
+      SfPrivFind := E;
+      Exit;
+    End;
+  End;
+  If Make Then
+    For I := 0 To 7 Do
+      If MemL[0:L + I * 28 + 16] = 0 Then
+      Begin
+        SfPrivFind := L + I * 28;
+        Exit;
+      End;
+End;
+
+Function SF_SetPrivateData(T, G, D, N, Fl : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  T := Cor(T);
+  SF_SetPrivateData := DDERR_INVALIDPARAMS;
+  If (G = 0) Or (N < 0) Then Exit;
+  E := SfPrivFind(T, G, True);
+  If E = 0 Then
+  Begin
+    SF_SetPrivateData := E_OUTOFMEMORY;
+    Exit;
+  End;
+  If MemL[0:E + 16] <> 0 Then KFree(MemL[0:E + 16]);
+  MoveMem(G, E, 16);
+  MemL[0:E + 16] := KAlloc(N + 4);
+  If D <> 0 Then MoveMem(D, MemL[0:E + 16], N);
+  MemL[0:E + 20] := N; MemL[0:E + 24] := Fl;
+  SF_SetPrivateData := DD_OK;
+End;
+
+Function SF_GetPrivateData(T, G, D, PN : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  T := Cor(T);
+  SF_GetPrivateData := DDERR_NOTFOUND;
+  If (G = 0) Or (PN = 0) Then Exit;
+  E := SfPrivFind(T, G, False);
+  If E = 0 Then Exit;
+  If (D = 0) Or (MemL[0:PN] < MemL[0:E + 20]) Then
+  Begin
+    MemL[0:PN] := MemL[0:E + 20];
+    SF_GetPrivateData := LongInt($887600BE);        { MOREDATA }
+    Exit;
+  End;
+  MoveMem(MemL[0:E + 16], D, MemL[0:E + 20]);
+  MemL[0:PN] := MemL[0:E + 20];
+  SF_GetPrivateData := DD_OK;
+End;
+
+Function SF_FreePrivateData(T, G : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  T := Cor(T);
+  SF_FreePrivateData := DDERR_NOTFOUND;
+  If G = 0 Then Exit;
+  E := SfPrivFind(T, G, False);
+  If E = 0 Then Exit;
+  KFree(MemL[0:E + 16]);
+  MemL[0:E + 16] := 0;
+  SF_FreePrivateData := DD_OK;
+End;
+
+Function SF_GetUniqueness(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 172];
+  SF_GetUniqueness := DD_OK;
+End;
+
+Function SF_ChangeUniqueness(T : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  Inc(DXUniq);
+  MemL[0:T + 172] := DXUniq;
+  SF_ChangeUniqueness := DD_OK;
+End;
+
+Function SF_SetPriority(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 184] := P;
+  SF_SetPriority := DD_OK;
+End;
+
+Function SF_GetPriority(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 184];
+  SF_GetPriority := DD_OK;
+End;
+
+Function SF_SetLOD(T, L : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 180] := L;
+  SF_SetLOD := DD_OK;
+End;
+
+Function SF_GetLOD(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 180];
+  SF_GetLOD := DD_OK;
+End;
+
+{ IDirectDrawGammaControl : rampes 3 x 256 mots }
+Function GM_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  GM_QI := SF_QI(T, Riid, Ppv);
+End;
+
+Function GM_GetGammaRamp(T, Fl, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GM_GetGammaRamp := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  For I := 0 To 767 Do MemW[0:P + I * 2] := DXGam[I] * 257;
+  GM_GetGammaRamp := DD_OK;
+End;
+
+Function GM_SetGammaRamp(T, Fl, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GM_SetGammaRamp := DD_OK;
+  DXGamOn := False;
+  For I := 0 To 767 Do
+  Begin
+    If P <> 0 Then DXGam[I] := MemW[0:P + I * 2] Shr 8
+    Else DXGam[I] := I And 255;
+    If DXGam[I] <> (I And 255) Then DXGamOn := True;
+  End;
+  If DXOn Then DXTouch(0, DXH, True);
+End;
+
 { ------------------------------------------------------------------ }
-{ DirectSound (muet) : tampon +12 taille, +16 donnees, +20 lecture,  }
-{ +24 en boucle, +28 debut (Ticks), +32 octets/s, +36 position de    }
-{ depart, +40 WAVEFORMATEX, +60 volume, +64 balance, +68 frequence   }
+{ DirectSound : tampons melanges dans le DMA de la Sound Blaster     }
 { ------------------------------------------------------------------ }
+{ Le melangeur (DSMixInto) est appele par l'interruption de la carte
+  (SbFill) : chaque tampon en lecture est lu a sa frequence, multiplie
+  par ses gains gauche et droit (volume, balance, position 3D calcules
+  hors interruption) et ajoute a la moitie du tampon DMA (au son de
+  waveOut s'il y en a). Sans carte, les positions avancent avec le
+  temps. Tampon : +64 taille, +68 donnees, +72 en lecture, +76 boucle,
+  +80 position (octets), +84 fraction, +88 WAVEFORMATEX, +108 volume,
+  +112 balance, +116 frequence, +120 drapeaux DSBCAPS, +124 primaire,
+  +128 nombre de notifications, +132 notifications, +136 primaire de
+  l'objet, +140 gain gauche, +144 gain droit (0..4096), +148 bloc,
+  +152 DirectSound, +160 donnees a liberer, +164 arrete a la fin,
+  +168 notifications en attente, +172 DS3DBUFFER (64 octets) }
+
+Const
+  DSERR_ALLOCATED = LongInt($8878000A);
+  DSERR_CONTROLUNAVAIL = LongInt($8878001E);
+  DSERR_INVALIDCALL = LongInt($88780032);
+  DSERR_BADFORMAT = LongInt($88780064);
+  DSERR_NODRIVER = LongInt($88780078);
+  DSERR_ALREADYINITIALIZED = LongInt($88780082);
+  DSERR_OBJECTNOTFOUND = LongInt($88781161);
+  DSMaxB = 64;
+
+Var
+  DSBufs : Array[0..DSMaxB - 1] Of LongInt;
+  DSMixBuf : LongInt;              { 2 x 16384 entiers }
+  DSVolT : Array[0..100] Of LongInt;
+  DSLis : Array[0..15] Of LongInt; { DS3DLISTENER }
+  DSClock, DSPrimFmt : LongInt;
+  DSEvQ : Array[0..31] Of LongInt; { evenements a signaler }
+  DSEvN : LongInt;
+  DSCoop : LongInt;
+
+Function DSAnyPlaying : Boolean;
+Var I : LongInt;
+Begin
+  DSAnyPlaying := False;
+  For I := 0 To DSMaxB - 1 Do
+    If (DSBufs[I] <> 0) And (MemL[0:DSBufs[I] + 72] <> 0) And
+       (MemL[0:DSBufs[I] + 124] = 0) Then
+    Begin
+      DSAnyPlaying := True;
+      Exit;
+    End;
+End;
+
+{ Evenement a signaler (hors interruption) }
+Procedure DSEvent(H : LongInt);
+Begin
+  If (H = 0) Or (DSEvN >= 32) Then Exit;
+  DSEvQ[DSEvN] := H;
+  Inc(DSEvN);
+End;
+
+Procedure DSFire;
+Var I, N, F : LongInt; Q : Array[0..31] Of LongInt;
+Begin
+  If DSEvN = 0 Then Exit;
+  F := IntOff;
+  N := DSEvN;
+  For I := 0 To N - 1 Do Q[I] := DSEvQ[I];
+  DSEvN := 0;
+  IntRestore(F);
+  For I := 0 To N - 1 Do SetEvent(Q[I]);
+End;
+
+{ Notifications franchies entre les positions A et B (octets) }
+Procedure DSNotifyRange(Bf, A, B : LongInt; Wrap : Boolean);
+Var I, L, O : LongInt;
+Begin
+  L := MemL[0:Bf + 132];
+  If L = 0 Then Exit;
+  For I := 0 To MemL[0:Bf + 128] - 1 Do
+  Begin
+    O := MemL[0:L + I * 8];
+    If O = -1 Then Continue;
+    If Wrap Then
+    Begin
+      If (O >= A) Or (O < B) Then DSEvent(MemL[0:L + I * 8 + 4]);
+    End
+    Else If (O >= A) And (O < B) Then DSEvent(MemL[0:L + I * 8 + 4]);
+  End;
+End;
+
+Procedure DSNotifyStop(Bf : LongInt);
+Var I, L : LongInt;
+Begin
+  L := MemL[0:Bf + 132];
+  If L = 0 Then Exit;
+  For I := 0 To MemL[0:Bf + 128] - 1 Do
+    If MemL[0:L + I * 8] = -1 Then DSEvent(MemL[0:L + I * 8 + 4]);
+End;
+
+{ Avancer le tampon Bf de N trames de sortie (frequence ORate) et, si
+  Mix <> 0, ajouter ses echantillons (gauche, droite) }
+Procedure DSRun(Bf, N, ORate, Mix : LongInt);
+Var Step, Pos, Fr, Sz, Ba, Bits, Ch, D, I, L, R, GL, GR, A, P0, Adv
+    : LongInt;
+    Wrapped : Boolean;
+Begin
+  If MemL[0:Bf + 72] = 0 Then Exit;
+  Sz := MemL[0:Bf + 64]; D := MemL[0:Bf + 68];
+  Ba := Max(1, MemW[0:Bf + 88 + 12]);
+  Bits := MemW[0:Bf + 88 + 14]; Ch := MemW[0:Bf + 88 + 2];
+  Fr := MemL[0:Bf + 116];
+  If Fr <= 0 Then Fr := MemL[0:Bf + 88 + 4];
+  If (Sz < Ba) Or (Fr <= 0) Or (ORate <= 0) Then Exit;
+  Step := (Fr Div 100) * 65536 Div (ORate Div 100);
+  If Step <= 0 Then Step := 1;
+  Pos := MemL[0:Bf + 80]; A := MemL[0:Bf + 84];
+  GL := MemL[0:Bf + 140]; GR := MemL[0:Bf + 144];
+  P0 := Pos; Wrapped := False;
+  For I := 0 To N - 1 Do
+  Begin
+    If Mix <> 0 Then
+    Begin
+      If Bits = 16 Then
+      Begin
+        L := MemW[0:D + Pos];
+        If L >= 32768 Then L := L - 65536;
+        If Ch >= 2 Then
+        Begin
+          R := MemW[0:D + Pos + 2];
+          If R >= 32768 Then R := R - 65536;
+        End
+        Else R := L;
+      End
+      Else
+      Begin
+        L := (Mem[0:D + Pos] - 128) Shl 8;
+        If Ch >= 2 Then R := (Mem[0:D + Pos + 1] - 128) Shl 8 Else R := L;
+      End;
+      MemL[0:Mix + I * 8] := MemL[0:Mix + I * 8] + (L * GL) Div 4096;
+      MemL[0:Mix + I * 8 + 4] := MemL[0:Mix + I * 8 + 4] + (R * GR) Div 4096;
+    End;
+    A := A + Step;
+    Adv := A Shr 16;
+    A := A And $FFFF;
+    If Adv > 0 Then
+    Begin
+      Pos := Pos + Adv * Ba;
+      If Pos + Ba > Sz Then
+      Begin
+        If MemL[0:Bf + 76] <> 0 Then
+        Begin
+          DSNotifyRange(Bf, P0, Sz, False);
+          Pos := Pos Mod Sz;
+          Pos := Pos - Pos Mod Ba;
+          P0 := 0;
+          Wrapped := True;
+        End
+        Else
+        Begin
+          DSNotifyRange(Bf, P0, Sz, False);
+          MemL[0:Bf + 72] := 0;
+          MemL[0:Bf + 80] := 0; MemL[0:Bf + 84] := 0;
+          MemL[0:Bf + 164] := 1;
+          DSNotifyStop(Bf);
+          Exit;
+        End;
+      End;
+    End;
+  End;
+  DSNotifyRange(Bf, P0, Pos, False);
+  MemL[0:Bf + 80] := Pos; MemL[0:Bf + 84] := A;
+End;
+
+{ Melanger dans la moitie D (N octets) au format de la carte : appele
+  par l'interruption de la carte }
+Procedure DSMixInto(D, N : LongInt);
+Var Fr, Bpf, I, L, R, V, B : LongInt; Any : Boolean;
+Begin
+  If DSMixBuf = 0 Then Exit;
+  Bpf := (SbOBits Div 8) * SbOChans;
+  If Bpf <= 0 Then Exit;
+  Fr := N Div Bpf;
+  If Fr > 16384 Then Fr := 16384;
+  Any := False;
+  For I := 0 To DSMaxB - 1 Do
+  Begin
+    B := DSBufs[I];
+    If (B <> 0) And (MemL[0:B + 72] <> 0) And
+       ((MemL[0:B + 124] = 0) Or (DSCoop = 4)) Then
+    Begin
+      If Not Any Then FillMem(DSMixBuf, Fr * 8, 0);
+      Any := True;
+      DSRun(B, Fr, SbRate, DSMixBuf);
+    End;
+  End;
+  DSClock := DSClock + Fr;
+  If Not Any Then Exit;
+  SbSilent := 0;
+  For I := 0 To Fr - 1 Do
+  Begin
+    L := MemL[0:DSMixBuf + I * 8]; R := MemL[0:DSMixBuf + I * 8 + 4];
+    If SbOChans = 1 Then
+    Begin
+      L := (L + R) Div 2;
+      If SbOBits = 16 Then
+      Begin
+        V := MemW[0:D + I * 2];
+        If V >= 32768 Then V := V - 65536;
+        V := V + L;
+        If V > 32767 Then V := 32767;
+        If V < -32768 Then V := -32768;
+        MemW[0:D + I * 2] := V;
+      End
+      Else
+      Begin
+        V := (Mem[0:D + I] - 128) * 256 + L;
+        If V > 32767 Then V := 32767;
+        If V < -32768 Then V := -32768;
+        Mem[0:D + I] := (V Div 256) + 128;
+      End;
+    End
+    Else If SbOBits = 16 Then
+    Begin
+      V := MemW[0:D + I * 4];
+      If V >= 32768 Then V := V - 65536;
+      V := V + L;
+      If V > 32767 Then V := 32767;
+      If V < -32768 Then V := -32768;
+      MemW[0:D + I * 4] := V;
+      V := MemW[0:D + I * 4 + 2];
+      If V >= 32768 Then V := V - 65536;
+      V := V + R;
+      If V > 32767 Then V := 32767;
+      If V < -32768 Then V := -32768;
+      MemW[0:D + I * 4 + 2] := V;
+    End
+    Else
+    Begin
+      V := (Mem[0:D + I * 2] - 128) * 256 + L;
+      If V > 32767 Then V := 32767;
+      If V < -32768 Then V := -32768;
+      Mem[0:D + I * 2] := (V Div 256) + 128;
+      V := (Mem[0:D + I * 2 + 1] - 128) * 256 + R;
+      If V > 32767 Then V := 32767;
+      If V < -32768 Then V := -32768;
+      Mem[0:D + I * 2 + 1] := (V Div 256) + 128;
+    End;
+  End;
+End;
+
+{ Sans carte son (ou carte arretee) : faire avancer les tampons }
+Var
+  DSLastT : LongInt;
+
+Procedure DSPoll;
+Var N, I : LongInt;
+Begin
+  If Not (SbOk And SbPlaying) Then
+  Begin
+    N := ((Ticks - DSLastT) * 22050) Div 1000;
+    If N > 0 Then
+    Begin
+      DSLastT := Ticks;
+      If N > 44100 Then N := 44100;
+      For I := 0 To DSMaxB - 1 Do
+        If DSBufs[I] <> 0 Then DSRun(DSBufs[I], N, 22050, 0);
+    End;
+  End
+  Else DSLastT := Ticks;
+  DSFire;
+  If DSOwn And SbPlaying And (SbDev < 0) And (SbSilent >= 4) And
+     Not DSAnyPlaying Then SbStop;
+End;
+
+{ Demarrer la carte pour DirectSound si elle est libre }
+Procedure DSCardStart;
+Begin
+  If Not SbOk Or SbPlaying Then Exit;
+  If SbDev < 0 Then
+  Begin
+    DSOwn := True;
+    If Sb16 Then
+    Begin
+      SbBits := 16; SbChans := 2;
+    End
+    Else
+    Begin
+      SbBits := 8; SbChans := 1;
+    End;
+    SbRate := 22050;
+  End;
+  SbStart;
+End;
+
+{ Gains d'un tampon : volume, balance et position 3D }
+Function DSVol(V : LongInt) : LongInt;
+Begin
+  If V > 0 Then V := 0;
+  If V < -10000 Then V := -10000;
+  DSVol := DSVolT[(-V) Div 100];
+End;
+
+Function DSFl(L : LongInt) : Double;
+Var F : Single;
+Begin
+  MemL[0:LongInt(@F)] := L;
+  DSFl := F;
+End;
+
+Function DSLo(D : Double) : LongInt;
+Var F : Single;
+Begin
+  F := D;
+  DSLo := MemL[0:LongInt(@F)];
+End;
+
+Procedure DSGains(B : LongInt);
+Var Base, GL, GR, P : LongInt;
+    X, Y, Z, D, Mn, Mx, Att, RX, RY, RZ, Pn, FX, FY, FZ, TX, TY, TZ,
+    Ro : Double;
+Begin
+  Base := DSVol(MemL[0:B + 108]);
+  P := MemL[0:B + 112];
+  GL := Base; GR := Base;
+  If P > 0 Then GL := (Base * DSVol(-P)) Div 4096
+  Else If P < 0 Then GR := (Base * DSVol(P)) Div 4096;
+  If ((MemL[0:B + 120] And $10) <> 0) And (MemL[0:B + 172 + 60] <> 2) Then
+  Begin
+    X := DSFl(MemL[0:B + 176]); Y := DSFl(MemL[0:B + 180]);
+    Z := DSFl(MemL[0:B + 184]);
+    If MemL[0:B + 172 + 60] = 0 Then
+    Begin
+      X := X - DSFl(DSLis[1]); Y := Y - DSFl(DSLis[2]);
+      Z := Z - DSFl(DSLis[3]);
+    End;
+    D := Sqrt(X * X + Y * Y + Z * Z);
+    Mn := DSFl(MemL[0:B + 172 + 52]); Mx := DSFl(MemL[0:B + 172 + 56]);
+    If Mn <= 0 Then Mn := 1;
+    Ro := DSFl(DSLis[14]);
+    Att := 1;
+    If D > Mn Then
+    Begin
+      If D > Mx Then D := Mx;
+      Att := 1 / (1 + Ro * (D / Mn - 1));
+    End;
+    { droite de l'auditeur = haut x avant }
+    FX := DSFl(DSLis[7]); FY := DSFl(DSLis[8]); FZ := DSFl(DSLis[9]);
+    TX := DSFl(DSLis[10]); TY := DSFl(DSLis[11]); TZ := DSFl(DSLis[12]);
+    RX := TY * FZ - TZ * FY; RY := TZ * FX - TX * FZ; RZ := TX * FY - TY * FX;
+    Pn := 0;
+    If D > 0.0001 Then
+      Pn := (X * RX + Y * RY + Z * RZ) / (D * Sqrt(RX * RX + RY * RY +
+            RZ * RZ) + 0.0001);
+    If Pn > 1 Then Pn := 1;
+    If Pn < -1 Then Pn := -1;
+    If Pn > 0 Then
+    Begin
+      GL := Round(GL * Att * (1 - Pn * 0.75)); GR := Round(GR * Att);
+    End
+    Else
+    Begin
+      GL := Round(GL * Att); GR := Round(GR * Att * (1 + Pn * 0.75));
+    End;
+  End;
+  MemL[0:B + 140] := GL; MemL[0:B + 144] := GR;
+End;
+
+Procedure DSGainsAll;
+Var I : LongInt;
+Begin
+  For I := 0 To DSMaxB - 1 Do
+    If DSBufs[I] <> 0 Then DSGains(DSBufs[I]);
+End;
 
 Procedure DSInitVt;
+Var I : LongInt; F : Double;
 Begin
   If VtDS <> 0 Then Exit;
   VtDS := VtNew;
-  VtAdd('COMQIUnk,COMAddRef,COMRelease,DS_CreateSoundBuffer,');
-  VtAdd('DS_GetCaps,DS_DuplicateSoundBuffer,DXOK3,DXOK1,DS_GetSpeakerConfig,');
-  VtAdd('DXOK2,DXOK2');
+  VtAdd('DS_QI,COMAddRef,COMRelease,DS_CreateSoundBuffer,DS_GetCaps,');
+  VtAdd('DS_DuplicateSoundBuffer,DS_SetCooperativeLevel,DXOK1,');
+  VtAdd('DS_GetSpeakerConfig,DXOK2,DXOK2');
+  VtDS8 := VtNew;
+  VtAdd('DS_QI,COMAddRef,COMRelease,DS_CreateSoundBuffer,DS_GetCaps,');
+  VtAdd('DS_DuplicateSoundBuffer,DS_SetCooperativeLevel,DXOK1,');
+  VtAdd('DS_GetSpeakerConfig,DXOK2,DXOK2,DS_VerifyCert');
   VtDSB := VtNew;
-  VtAdd('COMQIUnk,COMAddRef,COMRelease,DSB_GetCaps,');
-  VtAdd('DSB_GetCurrentPosition,DSB_GetFormat,DSB_GetVolume,DSB_GetPan,');
-  VtAdd('DSB_GetFrequency,DSB_GetStatus,DXOK3,DSB_Lock,DSB_Play,');
-  VtAdd('DSB_SetCurrentPosition,DXOK2,DSB_SetVolume,DSB_SetPan,');
+  VtAdd('DSB_QI,COMAddRef,COMRelease,DSB_GetCaps,DSB_GetCurrentPosition,');
+  VtAdd('DSB_GetFormat,DSB_GetVolume,DSB_GetPan,DSB_GetFrequency,');
+  VtAdd('DSB_GetStatus,DSB_Initialize,DSB_Lock,DSB_Play,');
+  VtAdd('DSB_SetCurrentPosition,DSB_SetFormat,DSB_SetVolume,DSB_SetPan,');
   VtAdd('DSB_SetFrequency,DSB_Stop,DXOK5,DXOK1');
+  VtDSB8 := VtNew;
+  VtAdd('DSB_QI,COMAddRef,COMRelease,DSB_GetCaps,DSB_GetCurrentPosition,');
+  VtAdd('DSB_GetFormat,DSB_GetVolume,DSB_GetPan,DSB_GetFrequency,');
+  VtAdd('DSB_GetStatus,DSB_Initialize,DSB_Lock,DSB_Play,');
+  VtAdd('DSB_SetCurrentPosition,DSB_SetFormat,DSB_SetVolume,DSB_SetPan,');
+  VtAdd('DSB_SetFrequency,DSB_Stop,DXOK5,DXOK1,DSB_SetFX,DXOK4,');
+  VtAdd('DSB_GetObjectInPath');
+  VtDS3B := VtNew;
+  VtAdd('DSB_QI,COMAddRef,COMRelease,D3B_GetAll,D3B_GetConeAngles,');
+  VtAdd('D3B_GetConeOrient,D3B_GetConeVol,D3B_GetMax,D3B_GetMin,');
+  VtAdd('D3B_GetMode,D3B_GetPos,D3B_GetVel,D3B_SetAll,D3B_SetConeAngles,');
+  VtAdd('D3B_SetConeOrient,D3B_SetConeVol,D3B_SetMax,D3B_SetMin,');
+  VtAdd('D3B_SetMode,D3B_SetPos,D3B_SetVel');
+  VtDS3L := VtNew;
+  VtAdd('DSB_QI,COMAddRef,COMRelease,D3L_GetAll,D3L_GetDist,');
+  VtAdd('D3L_GetDoppler,D3L_GetOrient,D3L_GetPos,D3L_GetRolloff,');
+  VtAdd('D3L_GetVel,D3L_SetAll,D3L_SetDist,D3L_SetDoppler,D3L_SetOrient,');
+  VtAdd('D3L_SetPos,D3L_SetRolloff,D3L_SetVel,D3L_Commit');
+  VtDSN := VtNew;
+  VtAdd('DSB_QI,COMAddRef,COMRelease,DSN_SetPositions');
+  F := 4096;
+  For I := 0 To 100 Do
+  Begin
+    DSVolT[I] := Round(F);
+    F := F * 0.891250938;
+  End;
+  DSVolT[100] := 0;
+  { auditeur : a l'origine, regarde vers +Z, haut +Y }
+  FillMem(LongInt(@DSLis), 64, 0);
+  DSLis[0] := 64;
+  DSLis[9] := DSLo(1.0); DSLis[11] := DSLo(1.0);
+  DSLis[13] := DSLo(1.0); DSLis[14] := DSLo(1.0); DSLis[15] := DSLo(1.0);
+  If DSMixBuf = 0 Then DSMixBuf := KAllocSys(16384 * 8 + 16);
 End;
 
-Function DXOK5(T, A, B, C, D : LongInt) : LongInt;
+Function DSNew(Slot : LongInt) : LongInt;
+Var O : LongInt;
 Begin
-  DXOK5 := DD_OK;
+  DSInitVt;
+  O := ComNew(0, 6, 80);
+  If Slot = 0 Then ComView(O, 0, VtDS) Else ComView(O, 1, VtDS8);
+  DSNew := O;
 End;
 
 Function DirectSoundCreate(Guid, PDS, Outer : LongInt) : LongInt;
 Begin
-  DSInitVt;
   DirectSoundCreate := DDERR_INVALIDPARAMS;
   If PDS = 0 Then Exit;
-  MemL[0:PDS] := ComNew(VtDS, 6, 32);
-  KLog('DirectSound : objet cree (son muet)');
+  MemL[0:PDS] := 0;
+  If Outer <> 0 Then
+  Begin
+    DirectSoundCreate := CLASS_E_NOAGGREGATION;
+    Exit;
+  End;
+  MemL[0:PDS] := DSNew(0);
+  If SbOk Then KLog('DirectSound : objet cree (' + SbName + ')')
+  Else KLog('DirectSound : objet cree (sans carte son)');
   DirectSoundCreate := DD_OK;
 End;
 
-Function DirectSoundEnumerateA(Cb, Ctx : LongInt) : LongInt;
-Var S1, S2 : String;
+Function DirectSoundCreate8(Guid, PDS, Outer : LongInt) : LongInt;
 Begin
-  S1 := 'Pasdows Son' + #0;
-  S2 := '' + #0;
-  If W16Buf = 0 Then W16Buf := KAlloc(4096);
-  MemL[0:W16Buf] := 0;
-  MemL[0:W16Buf + 4] := LongInt(@S1[1]);
-  MemL[0:W16Buf + 8] := LongInt(@S2[1]);
-  MemL[0:W16Buf + 12] := Ctx;
-  CallStd(Cb, W16Buf, 4);
-  DirectSoundEnumerateA := DD_OK;
+  DirectSoundCreate8 := DDERR_INVALIDPARAMS;
+  If PDS = 0 Then Exit;
+  MemL[0:PDS] := DSNew(1);
+  KLog('DirectSound 8 : objet cree');
+  DirectSoundCreate8 := DD_OK;
+End;
+
+Function DSEnumK(Cb, Ctx : LongInt; Wide : Boolean) : LongInt;
+Var D, M, G : LongInt;
+Begin
+  DSEnumK := DD_OK;
+  If Cb = 0 Then Exit;
+  D := DXStr('Pilote de son principal', Wide);
+  M := DXStr('', Wide);
+  If DXCall4(Cb, 0, D, M, Ctx) <> 0 Then
+  Begin
+    KFree(D); KFree(M);
+    If SbOk Then
+    Begin
+      G := KAlloc(16);
+      DXGuid(G, LongInt($BD6DD71A), $3DEB, $11D1, LongInt($C000B1B4),
+             LongInt($4FB7F3C2));
+      If Sb16 Then D := DXStr(SbName, Wide) Else D := DXStr(SbName, Wide);
+      M := DXStr('SB16.VXD', Wide);
+      DXCall4(Cb, G, D, M, Ctx);
+      KFree(G);
+    End
+    Else
+    Begin
+      D := 0; M := 0;
+    End;
+  End;
+  If D <> 0 Then KFree(D);
+  If M <> 0 Then KFree(M);
+End;
+
+Function DirectSoundEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectSoundEnumerateA := DSEnumK(Cb, Ctx, False);
+End;
+
+Function DirectSoundEnumerateW(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectSoundEnumerateW := DSEnumK(Cb, Ctx, True);
+End;
+
+Function DirectSoundCaptureCreate(Guid, PP, Outer : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  DirectSoundCaptureCreate := DSERR_NODRIVER;
+End;
+
+Function DirectSoundCaptureCreate8(Guid, PP, Outer : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  DirectSoundCaptureCreate8 := DSERR_NODRIVER;
+End;
+
+Function DirectSoundCaptureEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectSoundCaptureEnumerateA := DD_OK;
+End;
+
+Function DirectSoundCaptureEnumerateW(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectSoundCaptureEnumerateW := DD_OK;
+End;
+
+Function DirectSoundFullDuplexCreate(A, B, C, D, E, F, G, H, I, J : LongInt)
+  : LongInt;
+Begin
+  DirectSoundFullDuplexCreate := DSERR_NODRIVER;
+End;
+
+Function GetDeviceID(Src, Dst : LongInt) : LongInt;
+Begin
+  GetDeviceID := DDERR_INVALIDPARAMS;
+  If Dst = 0 Then Exit;
+  DXGuid(Dst, LongInt($BD6DD71A), $3DEB, $11D1, LongInt($C000B1B4),
+         LongInt($4FB7F3C2));
+  GetDeviceID := DD_OK;
+End;
+
+Function DS_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  DS_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($279AFA83)) Then
+    DS_QI := ComGive(C, 0, VtDS, Ppv)
+  Else If GuidIs(Riid, LongInt($C50A7E93)) Then
+    DS_QI := ComGive(C, 1, VtDS8, Ppv);
+End;
+
+Function DS_SetCooperativeLevel(T, H, L : LongInt) : LongInt;
+Begin
+  DSCoop := L;
+  DS_SetCooperativeLevel := DD_OK;
+End;
+
+Function DS_VerifyCert(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  DS_VerifyCert := DD_OK;
 End;
 
 Function DS_GetCaps(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then
-  Begin
-    FillMem(P + 4, 92, 0);
-    MemL[0:P + 4] := $F0F;
-    MemL[0:P + 8] := 100; MemL[0:P + 12] := 100000;
-  End;
+  DS_GetCaps := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  FillMem(P + 4, 92, 0);
+  MemL[0:P + 4] := $F0F Or $10;
+  If Not SbOk Then MemL[0:P + 4] := MemL[0:P + 4] Or $20;
+  MemL[0:P + 8] := 100; MemL[0:P + 12] := 100000;
+  MemL[0:P + 16] := 1;
+  MemL[0:P + 88] := 2;
   DS_GetCaps := DD_OK;
 End;
 
 Function DS_GetSpeakerConfig(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := 4;
+  If P <> 0 Then
+  Begin
+    If Sb16 Or Not SbOk Then MemL[0:P] := 4 Else MemL[0:P] := 3;
+  End;
   DS_GetSpeakerConfig := DD_OK;
 End;
 
-Function DS_CreateSoundBuffer(T, PDesc, PBuf, Outer : LongInt) : LongInt;
-Var B, Sz, Fmt : LongInt;
+Procedure DSBReg(B : LongInt; On : Boolean);
+Var I : LongInt;
 Begin
+  For I := 0 To DSMaxB - 1 Do
+    If On And (DSBufs[I] = 0) Then
+    Begin
+      DSBufs[I] := B;
+      Exit;
+    End
+    Else If Not On And (DSBufs[I] = B) Then
+    Begin
+      DSBufs[I] := 0;
+      Exit;
+    End;
+End;
+
+Function DS_CreateSoundBuffer(T, PDesc, PBuf, Outer : LongInt) : LongInt;
+Var V, B, Sz, Fmt, Fl, I : LongInt;
+Begin
+  V := IfVer(T);
+  T := Cor(T);
   DS_CreateSoundBuffer := DDERR_INVALIDPARAMS;
   If (PDesc = 0) Or (PBuf = 0) Then Exit;
-  B := ComNew(VtDSB, 7, 96);
+  MemL[0:PBuf] := 0;
+  Fl := MemL[0:PDesc + 4];
   Sz := MemL[0:PDesc + 8];
   Fmt := MemL[0:PDesc + 16];
-  If (MemL[0:PDesc + 4] And 1) <> 0 Then Sz := 16384;
-  If Sz <= 0 Then Sz := 4096;
-  MemL[0:B + 12] := Sz;
-  MemL[0:B + 16] := KAlloc(Sz + 16);
-  FillMem(MemL[0:B + 16], Sz, 0);
-  MemL[0:B + 32] := 22050;
-  If Fmt <> 0 Then
+  B := ComNew(0, 7, 256);
+  If V = 1 Then ComView(B, 1, VtDSB8) Else ComView(B, 0, VtDSB);
+  If (Fl And 1) <> 0 Then
   Begin
-    MoveMem(Fmt, B + 40, 18);
-    If MemL[0:Fmt + 8] > 0 Then MemL[0:B + 32] := MemL[0:Fmt + 8];
-    MemL[0:B + 68] := MemL[0:Fmt + 4];
+    { tampon primaire : format de la carte }
+    Sz := 16384;
+    MemL[0:B + 124] := 1;
+    MemW[0:B + 88] := 1;
+    MemW[0:B + 88 + 2] := 2;
+    MemL[0:B + 88 + 4] := 22050;
+    MemW[0:B + 88 + 14] := 16;
+    If Not Sb16 And SbOk Then
+    Begin
+      MemW[0:B + 88 + 2] := 1; MemW[0:B + 88 + 14] := 8;
+    End;
+  End
+  Else
+  Begin
+    If (Fmt = 0) Or (Sz < 4) Or (Sz > 16 * 1024 * 1024) Then
+    Begin
+      KFree(B);
+      Exit;
+    End;
+    If (MemW[0:Fmt] <> 1) Or ((MemW[0:Fmt + 14] <> 8) And
+       (MemW[0:Fmt + 14] <> 16)) Or (MemW[0:Fmt + 2] < 1) Or
+       (MemW[0:Fmt + 2] > 2) Then
+    Begin
+      KFree(B);
+      DS_CreateSoundBuffer := DSERR_BADFORMAT;
+      Exit;
+    End;
+    MoveMem(Fmt, B + 88, 16);
   End;
+  MemW[0:B + 88 + 12] := MemW[0:B + 88 + 2] * (MemW[0:B + 88 + 14] Div 8);
+  MemL[0:B + 88 + 8] := MemL[0:B + 88 + 4] * MemW[0:B + 88 + 12];
+  MemL[0:B + 64] := Sz;
+  MemL[0:B + 68] := KAlloc(Sz + 16);
+  If MemL[0:B + 68] = 0 Then
+  Begin
+    KFree(B);
+    DS_CreateSoundBuffer := E_OUTOFMEMORY;
+    Exit;
+  End;
+  If MemW[0:B + 88 + 14] = 8 Then FillMem(MemL[0:B + 68], Sz, $80)
+  Else FillMem(MemL[0:B + 68], Sz, 0);
+  MemL[0:B + 160] := MemL[0:B + 68];
+  MemL[0:B + 120] := Fl Or 8;
+  MemL[0:B + 152] := T;
+  { DS3DBUFFER par defaut : distances 1 et 1e9 }
+  MemL[0:B + 172] := 64;
+  MemL[0:B + 172 + 28] := 360; MemL[0:B + 172 + 32] := 360;
+  MemL[0:B + 172 + 44] := DSLo(1.0);
+  MemL[0:B + 172 + 52] := DSLo(1.0);
+  MemL[0:B + 172 + 56] := DSLo(1000000000.0);
+  DSGains(B);
+  DSBReg(B, True);
   MemL[0:PBuf] := B;
   DS_CreateSoundBuffer := DD_OK;
+  I := 0;
 End;
 
 Function DS_DuplicateSoundBuffer(T, Src, PDst : LongInt) : LongInt;
+Var B, S : LongInt;
 Begin
-  If (Src <> 0) And (PDst <> 0) Then
-  Begin
-    MemL[0:PDst] := Src;
-    COMAddRef(Src);
-  End;
+  DS_DuplicateSoundBuffer := DDERR_INVALIDPARAMS;
+  If (Src = 0) Or (PDst = 0) Then Exit;
+  S := Cor(Src);
+  B := ComNew(0, 7, 256);
+  ComView(B, 0, VtDSB);
+  MoveMem(S + 64, B + 64, 256 - 64);
+  MemL[0:B + 72] := 0; MemL[0:B + 80] := 0; MemL[0:B + 84] := 0;
+  MemL[0:B + 160] := 0; MemL[0:B + 128] := 0; MemL[0:B + 132] := 0;
+  DSGains(B);
+  DSBReg(B, True);
+  MemL[0:PDst] := B;
   DS_DuplicateSoundBuffer := DD_OK;
 End;
 
-{ Position de lecture courante d'un tampon (avance en temps reel) }
-Function DSBPos(B : LongInt) : LongInt;
-Var P, N : LongInt;
+Function DSB_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C : LongInt;
 Begin
-  P := MemL[0:B + 36];
-  If MemL[0:B + 20] <> 0 Then
-  Begin
-    N := ((Ticks - MemL[0:B + 28]) Div 10) * (MemL[0:B + 32] Div 100);
-    P := P + N;
-    If P >= MemL[0:B + 12] Then
-    Begin
-      If MemL[0:B + 24] <> 0 Then P := P Mod MemL[0:B + 12]
-      Else
-      Begin
-        P := 0;
-        MemL[0:B + 20] := 0;
-        MemL[0:B + 36] := 0;
-      End;
-    End;
-  End;
-  DSBPos := P;
+  DSB_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($279AFA85)) Then
+    DSB_QI := ComGive(C, 0, VtDSB, Ppv)
+  Else If GuidIs(Riid, LongInt($6825A449)) Then
+    DSB_QI := ComGive(C, 1, VtDSB8, Ppv)
+  Else If GuidIs(Riid, LongInt($279AFA86)) And
+          ((MemL[0:C + 120] And $10) <> 0) Then
+    DSB_QI := ComGive(C, 2, VtDS3B, Ppv)
+  Else If GuidIs(Riid, LongInt($279AFA84)) And (MemL[0:C + 124] <> 0) Then
+    DSB_QI := ComGive(C, 3, VtDS3L, Ppv)
+  Else If GuidIs(Riid, LongInt($B0210783)) Then
+    DSB_QI := ComGive(C, 4, VtDSN, Ppv);
 End;
 
 Function DSB_GetCaps(T, P : LongInt) : LongInt;
 Begin
+  T := Cor(T);
   If P <> 0 Then
   Begin
-    MemL[0:P + 4] := 8; MemL[0:P + 8] := MemL[0:T + 12];
+    MemL[0:P + 4] := MemL[0:T + 120];
+    MemL[0:P + 8] := MemL[0:T + 64];
     MemL[0:P + 12] := 0; MemL[0:P + 16] := 0;
   End;
   DSB_GetCaps := DD_OK;
 End;
 
 Function DSB_GetCurrentPosition(T, PPlay, PWrite : LongInt) : LongInt;
-Var P : LongInt;
+Var P, Ba : LongInt;
 Begin
-  P := DSBPos(T);
+  T := Cor(T);
+  DSPoll;
+  P := MemL[0:T + 80];
+  Ba := Max(1, MemW[0:T + 88 + 12]);
   If PPlay <> 0 Then MemL[0:PPlay] := P;
-  If PWrite <> 0 Then MemL[0:PWrite] := (P + 512) Mod MemL[0:T + 12];
+  If PWrite <> 0 Then
+  Begin
+    If MemL[0:T + 72] <> 0 Then
+      MemL[0:PWrite] := (P + ((MemL[0:T + 88 + 8] Div 100) * 2 Div Ba) *
+                         Ba) Mod MemL[0:T + 64]
+    Else MemL[0:PWrite] := P;
+  End;
   DSB_GetCurrentPosition := DD_OK;
 End;
 
 Function DSB_GetFormat(T, P, N, PN : LongInt) : LongInt;
 Begin
-  If (P <> 0) And (N >= 16) Then MoveMem(T + 40, P, Min(N, 18));
+  T := Cor(T);
+  If (P <> 0) And (N >= 16) Then
+  Begin
+    FillMem(P, Min(N, 18), 0);
+    MoveMem(T + 88, P, 16);
+  End;
   If PN <> 0 Then MemL[0:PN] := 18;
   DSB_GetFormat := DD_OK;
 End;
 
 Function DSB_GetVolume(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := MemL[0:T + 60];
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 108];
   DSB_GetVolume := DD_OK;
 End;
 
 Function DSB_GetPan(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := MemL[0:T + 64];
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 112];
   DSB_GetPan := DD_OK;
 End;
 
 Function DSB_GetFrequency(T, P : LongInt) : LongInt;
 Begin
-  If P <> 0 Then MemL[0:P] := MemL[0:T + 68];
+  T := Cor(T);
+  If P <> 0 Then
+  Begin
+    If MemL[0:T + 116] > 0 Then MemL[0:P] := MemL[0:T + 116]
+    Else MemL[0:P] := MemL[0:T + 88 + 4];
+  End;
   DSB_GetFrequency := DD_OK;
 End;
 
 Function DSB_GetStatus(T, P : LongInt) : LongInt;
 Begin
-  DSBPos(T);
+  T := Cor(T);
+  DSPoll;
   If P <> 0 Then
-    MemL[0:P] := Ord(MemL[0:T + 20] <> 0) Or (Ord(MemL[0:T + 24] <> 0) * 4);
+  Begin
+    MemL[0:P] := $10;
+    If MemL[0:T + 72] <> 0 Then
+    Begin
+      MemL[0:P] := MemL[0:P] Or 1;
+      If MemL[0:T + 76] <> 0 Then MemL[0:P] := MemL[0:P] Or 4;
+    End
+    Else If MemL[0:T + 164] <> 0 Then MemL[0:P] := MemL[0:P] Or $20;
+  End;
   DSB_GetStatus := DD_OK;
+End;
+
+Function DSB_Initialize(T, DS, Desc : LongInt) : LongInt;
+Begin
+  DSB_Initialize := DSERR_ALREADYINITIALIZED;
 End;
 
 Function DSB_Lock(T, Ofs, N, P1, N1, P2, N2, Fl : LongInt) : LongInt;
 Var Sz, A : LongInt;
 Begin
-  Sz := MemL[0:T + 12];
-  If (Fl And 1) <> 0 Then Ofs := (DSBPos(T) + 512) Mod Sz;
+  T := Cor(T);
+  Sz := MemL[0:T + 64];
+  If (Fl And 1) <> 0 Then DSB_GetCurrentPosition(T, 0, LongInt(@Ofs));
   If (Fl And 2) <> 0 Then
   Begin
     Ofs := 0; N := Sz;
   End;
   If N > Sz Then N := Sz;
+  If N < 0 Then N := 0;
   Ofs := Ofs Mod Sz;
+  If Ofs < 0 Then Ofs := 0;
   A := Min(N, Sz - Ofs);
-  If P1 <> 0 Then MemL[0:P1] := MemL[0:T + 16] + Ofs;
+  If P1 <> 0 Then MemL[0:P1] := MemL[0:T + 68] + Ofs;
   If N1 <> 0 Then MemL[0:N1] := A;
   If P2 <> 0 Then
   Begin
-    If N > A Then MemL[0:P2] := MemL[0:T + 16] Else MemL[0:P2] := 0;
+    If N > A Then MemL[0:P2] := MemL[0:T + 68] Else MemL[0:P2] := 0;
   End;
   If N2 <> 0 Then MemL[0:N2] := N - A;
   DSB_Lock := DD_OK;
 End;
 
-Function DSB_Play(T, R1, R2, Fl : LongInt) : LongInt;
+Function DSB_Play(T, R1, Prio, Fl : LongInt) : LongInt;
 Begin
-  If MemL[0:T + 20] = 0 Then
+  T := Cor(T);
+  MemL[0:T + 76] := Fl And 1;
+  MemL[0:T + 164] := 0;
+  If MemL[0:T + 72] = 0 Then
   Begin
-    MemL[0:T + 28] := Ticks;
-    MemL[0:T + 20] := 1;
+    DSPoll;
+    MemL[0:T + 72] := 1;
   End;
-  MemL[0:T + 24] := Fl And 1;
+  DSCardStart;
   DSB_Play := DD_OK;
 End;
 
 Function DSB_Stop(T : LongInt) : LongInt;
 Begin
-  MemL[0:T + 36] := DSBPos(T);
-  MemL[0:T + 20] := 0;
+  T := Cor(T);
+  If MemL[0:T + 72] <> 0 Then
+  Begin
+    MemL[0:T + 72] := 0;
+    DSNotifyStop(T);
+    DSFire;
+  End;
   DSB_Stop := DD_OK;
 End;
 
 Function DSB_SetCurrentPosition(T, P : LongInt) : LongInt;
+Var Ba : LongInt;
 Begin
-  MemL[0:T + 36] := P Mod MemL[0:T + 12];
-  MemL[0:T + 28] := Ticks;
+  T := Cor(T);
+  Ba := Max(1, MemW[0:T + 88 + 12]);
+  If MemL[0:T + 64] > 0 Then P := P Mod MemL[0:T + 64];
+  If P < 0 Then P := 0;
+  MemL[0:T + 80] := P - P Mod Ba;
+  MemL[0:T + 84] := 0;
   DSB_SetCurrentPosition := DD_OK;
+End;
+
+Function DSB_SetFormat(T, Fmt : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  DSB_SetFormat := DSERR_INVALIDCALL;
+  If MemL[0:T + 124] = 0 Then Exit;
+  DSB_SetFormat := DD_OK;
+  If Fmt = 0 Then Exit;
+  If (MemW[0:Fmt] = 1) And ((MemW[0:Fmt + 14] = 8) Or
+     (MemW[0:Fmt + 14] = 16)) Then
+  Begin
+    MoveMem(Fmt, T + 88, 16);
+    MemW[0:T + 88 + 12] := MemW[0:T + 88 + 2] * (MemW[0:T + 88 + 14] Div 8);
+  End;
 End;
 
 Function DSB_SetVolume(T, V : LongInt) : LongInt;
 Begin
-  MemL[0:T + 60] := V;
+  T := Cor(T);
+  DSB_SetVolume := DDERR_INVALIDPARAMS;
+  If (V > 0) Or (V < -10000) Then Exit;
+  MemL[0:T + 108] := V;
+  DSGains(T);
   DSB_SetVolume := DD_OK;
 End;
 
 Function DSB_SetPan(T, V : LongInt) : LongInt;
 Begin
-  MemL[0:T + 64] := V;
+  T := Cor(T);
+  DSB_SetPan := DDERR_INVALIDPARAMS;
+  If (V > 10000) Or (V < -10000) Then Exit;
+  MemL[0:T + 112] := V;
+  DSGains(T);
   DSB_SetPan := DD_OK;
 End;
 
 Function DSB_SetFrequency(T, V : LongInt) : LongInt;
 Begin
-  MemL[0:T + 68] := V;
-  If V > 0 Then
-    MemL[0:T + 32] := V * MemW[0:T + 40 + 12];
+  T := Cor(T);
+  DSB_SetFrequency := DDERR_INVALIDPARAMS;
+  If (V <> 0) And ((V < 100) Or (V > 200000)) Then Exit;
+  MemL[0:T + 116] := V;
   DSB_SetFrequency := DD_OK;
 End;
 
+Function DSB_SetFX(T, N, PDesc, PRes : LongInt) : LongInt;
+Begin
+  If N = 0 Then DSB_SetFX := DD_OK Else DSB_SetFX := DSERR_CONTROLUNAVAIL;
+End;
+
+Function DSB_GetObjectInPath(T, G, I, Iid, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  DSB_GetObjectInPath := DSERR_OBJECTNOTFOUND;
+End;
+
+{ IDirectSoundNotify : DSBPOSITIONNOTIFY (position, evenement) }
+Function DSN_SetPositions(T, N, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  DSN_SetPositions := DDERR_INVALIDPARAMS;
+  If (N < 0) Or (N > 1024) Or ((N > 0) And (P = 0)) Then Exit;
+  If MemL[0:T + 132] <> 0 Then KFree(MemL[0:T + 132]);
+  MemL[0:T + 132] := 0;
+  MemL[0:T + 128] := 0;
+  If N > 0 Then
+  Begin
+    MemL[0:T + 132] := KAlloc(N * 8 + 8);
+    MoveMem(P, MemL[0:T + 132], N * 8);
+    MemL[0:T + 128] := N;
+  End;
+  DSN_SetPositions := DD_OK;
+End;
+
+{ IDirectSound3DBuffer : DS3DBUFFER en +172 }
+Function D3B_GetAll(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MoveMem(T + 176, P + 4, 60);
+  D3B_GetAll := DD_OK;
+End;
+
+Function D3B_SetAll(T, P, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MoveMem(P + 4, T + 176, 60);
+  DSGains(T);
+  D3B_SetAll := DD_OK;
+End;
+
+Function D3B_GetConeAngles(T, PIn, PO : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If PIn <> 0 Then MemL[0:PIn] := MemL[0:T + 200];
+  If PO <> 0 Then MemL[0:PO] := MemL[0:T + 204];
+  D3B_GetConeAngles := DD_OK;
+End;
+
+Function D3B_SetConeAngles(T, I, O, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 200] := I; MemL[0:T + 204] := O;
+  D3B_SetConeAngles := DD_OK;
+End;
+
+Function D3B_GetConeOrient(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MoveMem(T + 208, P, 12);
+  D3B_GetConeOrient := DD_OK;
+End;
+
+Function D3B_SetConeOrient(T, X, Y, Z, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 208] := X; MemL[0:T + 212] := Y; MemL[0:T + 216] := Z;
+  D3B_SetConeOrient := DD_OK;
+End;
+
+Function D3B_GetConeVol(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 220];
+  D3B_GetConeVol := DD_OK;
+End;
+
+Function D3B_SetConeVol(T, V, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 220] := V;
+  D3B_SetConeVol := DD_OK;
+End;
+
+Function D3B_GetMax(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 228];
+  D3B_GetMax := DD_OK;
+End;
+
+Function D3B_SetMax(T, V, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 228] := V;
+  DSGains(T);
+  D3B_SetMax := DD_OK;
+End;
+
+Function D3B_GetMin(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 224];
+  D3B_GetMin := DD_OK;
+End;
+
+Function D3B_SetMin(T, V, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 224] := V;
+  DSGains(T);
+  D3B_SetMin := DD_OK;
+End;
+
+Function D3B_GetMode(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MemL[0:P] := MemL[0:T + 232];
+  D3B_GetMode := DD_OK;
+End;
+
+Function D3B_SetMode(T, V, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 232] := V;
+  DSGains(T);
+  D3B_SetMode := DD_OK;
+End;
+
+Function D3B_GetPos(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MoveMem(T + 176, P, 12);
+  D3B_GetPos := DD_OK;
+End;
+
+Function D3B_SetPos(T, X, Y, Z, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 176] := X; MemL[0:T + 180] := Y; MemL[0:T + 184] := Z;
+  DSGains(T);
+  D3B_SetPos := DD_OK;
+End;
+
+Function D3B_GetVel(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If P <> 0 Then MoveMem(T + 188, P, 12);
+  D3B_GetVel := DD_OK;
+End;
+
+Function D3B_SetVel(T, X, Y, Z, Ap : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 188] := X; MemL[0:T + 192] := Y; MemL[0:T + 196] := Z;
+  D3B_SetVel := DD_OK;
+End;
+
+{ IDirectSound3DListener : DS3DLISTENER global (DSLis) }
+Function D3L_GetAll(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(LongInt(@DSLis) + 4, P + 4, 60);
+  D3L_GetAll := DD_OK;
+End;
+
+Function D3L_SetAll(T, P, Ap : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(P + 4, LongInt(@DSLis) + 4, 60);
+  DSGainsAll;
+  D3L_SetAll := DD_OK;
+End;
+
+Function D3L_GetDist(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := DSLis[13];
+  D3L_GetDist := DD_OK;
+End;
+
+Function D3L_SetDist(T, V, Ap : LongInt) : LongInt;
+Begin
+  DSLis[13] := V;
+  D3L_SetDist := DD_OK;
+End;
+
+Function D3L_GetDoppler(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := DSLis[15];
+  D3L_GetDoppler := DD_OK;
+End;
+
+Function D3L_SetDoppler(T, V, Ap : LongInt) : LongInt;
+Begin
+  DSLis[15] := V;
+  D3L_SetDoppler := DD_OK;
+End;
+
+Function D3L_GetRolloff(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := DSLis[14];
+  D3L_GetRolloff := DD_OK;
+End;
+
+Function D3L_SetRolloff(T, V, Ap : LongInt) : LongInt;
+Begin
+  DSLis[14] := V;
+  DSGainsAll;
+  D3L_SetRolloff := DD_OK;
+End;
+
+Function D3L_GetOrient(T, PF, PT : LongInt) : LongInt;
+Begin
+  If PF <> 0 Then MoveMem(LongInt(@DSLis) + 28, PF, 12);
+  If PT <> 0 Then MoveMem(LongInt(@DSLis) + 40, PT, 12);
+  D3L_GetOrient := DD_OK;
+End;
+
+Function D3L_SetOrient(T, FX, FY, FZ, TX, TY, TZ, Ap : LongInt) : LongInt;
+Begin
+  DSLis[7] := FX; DSLis[8] := FY; DSLis[9] := FZ;
+  DSLis[10] := TX; DSLis[11] := TY; DSLis[12] := TZ;
+  DSGainsAll;
+  D3L_SetOrient := DD_OK;
+End;
+
+Function D3L_GetPos(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(LongInt(@DSLis) + 4, P, 12);
+  D3L_GetPos := DD_OK;
+End;
+
+Function D3L_SetPos(T, X, Y, Z, Ap : LongInt) : LongInt;
+Begin
+  DSLis[1] := X; DSLis[2] := Y; DSLis[3] := Z;
+  DSGainsAll;
+  D3L_SetPos := DD_OK;
+End;
+
+Function D3L_GetVel(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(LongInt(@DSLis) + 16, P, 12);
+  D3L_GetVel := DD_OK;
+End;
+
+Function D3L_SetVel(T, X, Y, Z, Ap : LongInt) : LongInt;
+Begin
+  DSLis[4] := X; DSLis[5] := Y; DSLis[6] := Z;
+  D3L_SetVel := DD_OK;
+End;
+
+Function D3L_Commit(T : LongInt) : LongInt;
+Begin
+  DSGainsAll;
+  D3L_Commit := DD_OK;
+End;
+
 { ------------------------------------------------------------------ }
-{ DirectInput : peripherique +12 sorte (1 clavier, 2 souris)          }
+{ DirectInput : clavier et souris (versions 1 a 8, ANSI et UTF-16)   }
 { ------------------------------------------------------------------ }
+{ Peripherique : +64 sorte (1 clavier, 2 souris), +68 acquis,
+  +72 cooperation, +76 evenement, +80 objets du format (decalage,
+  cible), +84 nombre, +88 taille des donnees, +92 taille du tampon,
+  +96 tampon (16 octets par evenement), +100 tete, +104 nombre,
+  +108 debordement, +112 sequence, +116 axes absolus, +120/+124/+128
+  deplacements X Y Z, +132/+136 position absolue, +140 boutons,
+  +144 etat precedent du clavier (256) et appuis (256), +148 format
+  donne, +152 DirectInput 8, +156 UTF-16
+  Cible d'un objet : sorte * 65536 + indice (1 axe, 2 bouton, 3 touche) }
+
+Const
+  DI_OK = 0;
+  DI_NOEFFECT = 1;
+  DI_BUFFEROVERFLOW = 1;
+  DIERR_NOTACQUIRED = LongInt($8007000C);
+  DIERR_NOTINITIALIZED = LongInt($80070015);
+  DIERR_INPUTLOST = LongInt($8007001E);
+  DIERR_OBJECTNOTFOUND = LongInt($80070002);
+  DIERR_ACQUIRED = LongInt($800700AA);
+  DIERR_DEVICENOTREG = LongInt($80040154);
+  DIERR_UNSUPPORTED = LongInt($80004001);
+  DIMaxD = 16;
+
+Var
+  DIDevs : Array[0..DIMaxD - 1] Of LongInt;
+
+Function DIVtObj(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0, 2, 4 : DIVtObj := VtDIA;
+    1, 3, 5 : DIVtObj := VtDIW;
+    6 : DIVtObj := VtDI8A;
+  Else
+    DIVtObj := VtDI8W;
+  End;
+End;
+
+Function DIVtDev(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0 : DIVtDev := VtDIDA;
+    1 : DIVtDev := VtDIDW;
+    2 : DIVtDev := VtDID8A;
+  Else
+    DIVtDev := VtDID8W;
+  End;
+End;
 
 Procedure DIInitVt;
+Var I : LongInt;
 Begin
-  If VtDI <> 0 Then Exit;
-  VtDI := VtNew;
-  VtAdd('COMQIUnk,COMAddRef,COMRelease,DI_CreateDevice,');
-  VtAdd('DI_EnumDevices,DI_GetDeviceStatus,DXOK3,DXOK3');
-  VtDID := VtNew;
-  VtAdd('COMQIUnk,COMAddRef,COMRelease,DID_GetCapabilities,');
-  VtAdd('DXOK4,DXNI3,DXOK3,DXOK1,DXOK1,DID_GetDeviceState,DID_GetDeviceData,');
-  VtAdd('DXOK2,DXOK2,DXOK3,DXNI4,DXNI2,DXOK3,DXOK4');
+  If VtDIA <> 0 Then Exit;
+  For I := 0 To 3 Do
+  Begin
+    Case I Of
+      0 : VtDIA := VtNew;
+      1 : VtDIW := VtNew;
+      2 : VtDI8A := VtNew;
+      3 : VtDI8W := VtNew;
+    End;
+    VtAdd('DI_QI,COMAddRef,COMRelease,DI_CreateDevice,DI_EnumDevices,');
+    VtAdd('DI_GetDeviceStatus,DXOK3,DI_Initialize,DI_FindDevice');
+    If I < 2 Then VtAdd('DI_CreateDeviceEx')
+    Else VtAdd('DI_EnumBySemantics,DXNI5');
+  End;
+  For I := 0 To 3 Do
+  Begin
+    Case I Of
+      0 : VtDIDA := VtNew;
+      1 : VtDIDW := VtNew;
+      2 : VtDID8A := VtNew;
+      3 : VtDID8W := VtNew;
+    End;
+    VtAdd('DID_QI,COMAddRef,COMRelease,DID_GetCapabilities,');
+    VtAdd('DID_EnumObjects,DID_GetProperty,DID_SetProperty,DID_Acquire,');
+    VtAdd('DID_Unacquire,DID_GetDeviceState,DID_GetDeviceData,');
+    VtAdd('DID_SetDataFormat,DID_SetEventNotification,DID_SetCoop,');
+    VtAdd('DID_GetObjectInfo,DID_GetDeviceInfo,DXOK3,DID_Initialize,');
+    VtAdd('DXNI5,DID_EnumEffects,DXNI3,DXNI2,DXNI2,DID_EnumCreated,');
+    VtAdd('DXNI2,DID_Poll,DXNI5,DXNI5,DXNI5');
+    If I >= 2 Then VtAdd('DXNI4,DXNI4,DXNI2');
+  End;
+End;
+
+Function DINew(Slot : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  DIInitVt;
+  O := ComNew(0, 8, 64);
+  ComView(O, Slot, DIVtObj(Slot));
+  DINew := O;
+End;
+
+{ Interface d'un objet DirectInput d'apres l'IID (-1 inconnue) }
+Function DISlotOf(Riid : LongInt) : LongInt;
+Begin
+  DISlotOf := -1;
+  If Riid = 0 Then Exit;
+  Case MemL[0:Riid] Of
+    LongInt($89521360) : DISlotOf := 0;
+    LongInt($89521361) : DISlotOf := 1;
+    LongInt($5944E662) : DISlotOf := 2;
+    LongInt($5944E663) : DISlotOf := 3;
+    LongInt($9A4CB684) : DISlotOf := 4;
+    LongInt($9A4CB685) : DISlotOf := 5;
+    LongInt($BF798030) : DISlotOf := 6;
+    LongInt($BF798031) : DISlotOf := 7;
+  End;
 End;
 
 Function DirectInputCreateA(Inst, Ver, PDI, Outer : LongInt) : LongInt;
 Begin
-  DIInitVt;
   DirectInputCreateA := DDERR_INVALIDPARAMS;
   If PDI = 0 Then Exit;
-  MemL[0:PDI] := ComNew(VtDI, 8, 32);
-  KLog('DirectInput : objet cree');
-  DirectInputCreateA := DD_OK;
+  MemL[0:PDI] := DINew(4);
+  KLog('DirectInput : objet cree (version ' + HexStr(Ver, 4) + ')');
+  DirectInputCreateA := DI_OK;
 End;
 
-Function DI_CreateDevice(T, Guid, PDev, Outer : LongInt) : LongInt;
-Var D : LongInt;
+Function DirectInputCreateW(Inst, Ver, PDI, Outer : LongInt) : LongInt;
 Begin
-  DI_CreateDevice := DDERR_NOTFOUND;
-  If (PDev = 0) Or (Guid = 0) Then Exit;
-  D := ComNew(VtDID, 9, 32);
-  If MemL[0:Guid] = LongInt($6F1D2B61) Then MemL[0:D + 12] := 1
-  Else If MemL[0:Guid] = LongInt($6F1D2B60) Then MemL[0:D + 12] := 2
-  Else Exit;
-  MemL[0:PDev] := D;
-  DI_CreateDevice := DD_OK;
+  DirectInputCreateW := DDERR_INVALIDPARAMS;
+  If PDI = 0 Then Exit;
+  MemL[0:PDI] := DINew(5);
+  DirectInputCreateW := DI_OK;
+End;
+
+Function DirectInputCreateEx(Inst, Ver, Riid, PDI, Outer : LongInt)
+  : LongInt;
+Var K : LongInt;
+Begin
+  DirectInputCreateEx := DDERR_INVALIDPARAMS;
+  If PDI = 0 Then Exit;
+  MemL[0:PDI] := 0;
+  K := DISlotOf(Riid);
+  If (K < 0) Or (K >= 6) Then
+  Begin
+    DirectInputCreateEx := E_NOINTERFACE;
+    Exit;
+  End;
+  MemL[0:PDI] := DINew(K);
+  DirectInputCreateEx := DI_OK;
+End;
+
+Function DirectInput8Create(Inst, Ver, Riid, PDI, Outer : LongInt)
+  : LongInt;
+Var K : LongInt;
+Begin
+  DirectInput8Create := DDERR_INVALIDPARAMS;
+  If PDI = 0 Then Exit;
+  MemL[0:PDI] := 0;
+  K := DISlotOf(Riid);
+  If K < 6 Then
+  Begin
+    DirectInput8Create := E_NOINTERFACE;
+    Exit;
+  End;
+  MemL[0:PDI] := DINew(K);
+  KLog('DirectInput 8 : objet cree');
+  DirectInput8Create := DI_OK;
+End;
+
+Function DI_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C, K : LongInt;
+Begin
+  DI_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  If GuidUnk(Riid) Then K := IfVer(T) Else K := DISlotOf(Riid);
+  If (K >= 6) <> (IfVer(T) >= 6) Then K := -1;
+  If K >= 0 Then DI_QI := ComGive(C, K, DIVtObj(K), Ppv);
+End;
+
+Function DI_Initialize(T, Inst, Ver : LongInt) : LongInt;
+Begin
+  DI_Initialize := DI_OK;
+End;
+
+{ DIDEVICEINSTANCE de la souris (2) ou du clavier (1) }
+Procedure DIDevInst(P, K : LongInt; Wide, Di8 : Boolean);
+Var N, T : LongInt; Nm : String;
+Begin
+  If Wide Then N := 1100 Else N := 580;
+  FillMem(P, N, 0);
+  MemL[0:P] := N;
+  If K = 2 Then
+  Begin
+    DXGuid(P + 4, LongInt($6F1D2B60), $D5A0, $11CF, LongInt($A000C7BF),
+           $DE5C9E26);
+    Nm := 'Souris';
+    If Di8 Then T := $212 Else T := $202;
+  End
+  Else
+  Begin
+    DXGuid(P + 4, LongInt($6F1D2B61), $D5A0, $11CF, LongInt($A000C7BF),
+           $DE5C9E26);
+    Nm := 'Clavier';
+    If Di8 Then T := $413 Else T := $403;
+  End;
+  MoveMem(P + 4, P + 20, 16);
+  MemL[0:P + 36] := T;
+  If Wide Then
+  Begin
+    DXPutS(P + 40, Nm, True); DXPutS(P + 560, Nm, True);
+    MemW[0:P + 1096] := 1;
+    If K = 2 Then MemW[0:P + 1098] := 2 Else MemW[0:P + 1098] := 6;
+  End
+  Else
+  Begin
+    DXPutS(P + 40, Nm, False); DXPutS(P + 300, Nm, False);
+    MemW[0:P + 576] := 1;
+    If K = 2 Then MemW[0:P + 578] := 2 Else MemW[0:P + 578] := 6;
+  End;
 End;
 
 Function DI_EnumDevices(T, Typ, Cb, Ctx, Fl : LongInt) : LongInt;
+Var V, P, K : LongInt; W, D8 : Boolean;
 Begin
-  DI_EnumDevices := DD_OK;
+  V := IfVer(T);
+  DI_EnumDevices := DI_OK;
+  If Cb = 0 Then Exit;
+  W := Odd(V); D8 := V >= 6;
+  P := KAlloc(1200);
+  For K := 1 To 2 Do
+  Begin
+    { filtres : 0 tous ; DI : 2 souris, 3 clavier ; DI8 : 2 et 12h
+      pointeurs, 3 et 13h claviers }
+    If (Typ <> 0) And Not (D8 And (Typ = 1)) Then
+    Begin
+      If (K = 2) And (Typ <> 2) And (Typ <> $12) Then Continue;
+      If (K = 1) And (Typ <> 3) And (Typ <> $13) Then Continue;
+    End;
+    DIDevInst(P, K, W, D8);
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
 End;
 
-Function DI_GetDeviceStatus(T, Guid : LongInt) : LongInt;
+Function DI_GetDeviceStatus(T, G : LongInt) : LongInt;
 Begin
-  DI_GetDeviceStatus := DD_OK;
+  DI_GetDeviceStatus := DIERR_DEVICENOTREG;
+  If G = 0 Then Exit;
+  If (MemL[0:G] = LongInt($6F1D2B60)) Or (MemL[0:G] = LongInt($6F1D2B61))
+  Then DI_GetDeviceStatus := DI_OK;
+End;
+
+Function DI_FindDevice(T, G, Nm, PG : LongInt) : LongInt;
+Begin
+  DI_FindDevice := DIERR_DEVICENOTREG;
+End;
+
+Function DI_EnumBySemantics(T, User, Fmt, Cb, Ctx, Fl : LongInt) : LongInt;
+Begin
+  DI_EnumBySemantics := DI_OK;
+End;
+
+Function DIDevKind(G : LongInt) : LongInt;
+Begin
+  DIDevKind := 0;
+  If G = 0 Then Exit;
+  Case MemL[0:G] Of
+    LongInt($6F1D2B60), LongInt($6F1D2B80), LongInt($6F1D2B81) :
+      DIDevKind := 2;
+    LongInt($6F1D2B61), LongInt($6F1D2B82), LongInt($6F1D2B83) :
+      DIDevKind := 1;
+  End;
+End;
+
+Procedure DIReg(D : LongInt; On : Boolean);
+Var I : LongInt;
+Begin
+  For I := 0 To DIMaxD - 1 Do
+    If On And (DIDevs[I] = 0) Then
+    Begin
+      DIDevs[I] := D;
+      Exit;
+    End
+    Else If Not On And (DIDevs[I] = D) Then
+    Begin
+      DIDevs[I] := 0;
+      Exit;
+    End;
+End;
+
+Function DIMakeDev(V, K, PDev : LongInt) : LongInt;
+Var D, Sl : LongInt;
+Begin
+  D := ComNew(0, 9, 192);
+  If V >= 6 Then Sl := 2 + Ord(Odd(V)) Else Sl := Ord(Odd(V));
+  ComView(D, Sl, DIVtDev(Sl));
+  MemL[0:D + 64] := K;
+  MemL[0:D + 152] := Ord(V >= 6);
+  MemL[0:D + 156] := Ord(Odd(V));
+  MemL[0:D + 116] := Ord(K = 1);
+  MemL[0:D + 144] := KAlloc(512);
+  FillMem(MemL[0:D + 144], 512, 0);
+  DIReg(D, True);
+  MemL[0:PDev] := D;
+  DIMakeDev := DI_OK;
+End;
+
+Function DI_CreateDevice(T, G, PDev, Outer : LongInt) : LongInt;
+Var V, K : LongInt;
+Begin
+  V := IfVer(T);
+  DI_CreateDevice := DDERR_INVALIDPARAMS;
+  If (PDev = 0) Or (G = 0) Then Exit;
+  MemL[0:PDev] := 0;
+  K := DIDevKind(G);
+  If K = 0 Then
+  Begin
+    DI_CreateDevice := DIERR_DEVICENOTREG;
+    Exit;
+  End;
+  DI_CreateDevice := DIMakeDev(V, K, PDev);
+End;
+
+Function DI_CreateDeviceEx(T, G, Riid, PDev, Outer : LongInt) : LongInt;
+Begin
+  DI_CreateDeviceEx := DI_CreateDevice(T, G, PDev, Outer);
+End;
+
+Function DID_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C, K, V : LongInt;
+Begin
+  DID_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  V := IfVer(T);
+  K := -1;
+  If GuidUnk(Riid) Then K := V
+  Else
+    Case MemL[0:Riid] Of
+      LongInt($5944E680), LongInt($5944E682), LongInt($57D7C6BC) : K := 0;
+      LongInt($5944E681), LongInt($5944E683), LongInt($57D7C6BD) : K := 1;
+      LongInt($54D41080) : K := 2;
+      LongInt($54D41081) : K := 3;
+    End;
+  If (K >= 0) And ((K >= 2) <> (V >= 2)) Then K := -1;
+  If K >= 0 Then DID_QI := ComGive(C, K, DIVtDev(K), Ppv);
+End;
+
+Function DID_Initialize(T, Inst, Ver, G : LongInt) : LongInt;
+Begin
+  DID_Initialize := DI_OK;
 End;
 
 Function DID_GetCapabilities(T, P : LongInt) : LongInt;
+Var D8 : Boolean;
 Begin
-  If P <> 0 Then
+  T := Cor(T);
+  DID_GetCapabilities := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  D8 := MemL[0:T + 152] <> 0;
+  If MemL[0:P] >= 44 Then FillMem(P + 4, 40, 0) Else FillMem(P + 4, 20, 0);
+  MemL[0:P + 4] := 1;
+  If MemL[0:T + 64] = 1 Then
   Begin
-    FillMem(P + 4, 40, 0);
-    MemL[0:P + 4] := 5;
-    If MemL[0:T + 12] = 1 Then
+    If D8 Then MemL[0:P + 8] := $413 Else MemL[0:P + 8] := $403;
+    MemL[0:P + 16] := 128;
+  End
+  Else
+  Begin
+    If D8 Then MemL[0:P + 8] := $212 Else MemL[0:P + 8] := $202;
+    MemL[0:P + 12] := 3; MemL[0:P + 16] := 3;
+  End;
+  DID_GetCapabilities := DI_OK;
+End;
+
+Function DID_GetDeviceInfo(T, P : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  T := Cor(T);
+  DID_GetDeviceInfo := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  N := MemL[0:P];
+  DIDevInst(P, MemL[0:T + 64], MemL[0:T + 156] <> 0, MemL[0:T + 152] <> 0);
+  If (N > 0) And (N < MemL[0:P]) Then MemL[0:P] := N;
+  DID_GetDeviceInfo := DI_OK;
+End;
+
+{ Nom d'une touche (code DIK) }
+Function DIKeyName(K : LongInt) : String;
+Const
+  N1 : String[60] = 'Echap 1 2 3 4 5 6 7 8 9 0 - = RetArr Tab Q W E R T ';
+  N2 : String[60] = 'Y U I O P [ ] Entree Ctrl A S D F G H J K L ; ';
+Var S, N : String; I, J : LongInt;
+Begin
+  S := '';
+  If (K >= 1) And (K <= $27) Then
+  Begin
+    N := N1 + N2;
+    J := 0; I := 1;
+    While (I <= Length(N)) And (J < K - 1) Do
     Begin
-      MemL[0:P + 8] := 3; MemL[0:P + 16] := 128;
+      If N[I] = ' ' Then Inc(J);
+      Inc(I);
+    End;
+    While (I <= Length(N)) And (N[I] <> ' ') Do
+    Begin
+      S := S + N[I];
+      Inc(I);
+    End;
+  End
+  Else
+    Case K Of
+      $2A : S := 'Maj gauche';
+      $36 : S := 'Maj droite';
+      $38 : S := 'Alt';
+      $39 : S := 'Espace';
+      $C8 : S := 'Haut';
+      $D0 : S := 'Bas';
+      $CB : S := 'Gauche';
+      $CD : S := 'Droite';
+      $9D : S := 'Ctrl droite';
+    End;
+  If S = '' Then S := 'Touche ' + HexStr(K, 2);
+  DIKeyName := S;
+End;
+
+{ DIDEVICEOBJECTINSTANCE de l'objet (cible C, decalage Ofs) }
+Procedure DIObjInst(T, P, C, Ofs : LongInt; Wide : Boolean);
+Var N, Kd, I : LongInt; Nm : String;
+Begin
+  If Wide Then N := 576 Else N := 316;
+  If (MemL[0:P] > 0) And (MemL[0:P] < N) Then N := MemL[0:P];
+  FillMem(P, N, 0);
+  MemL[0:P] := N;
+  Kd := C Shr 16; I := C And $FFFF;
+  Case Kd Of
+    1 :
+    Begin
+      DXGuid(P + 4, LongInt($A36D02E0) + I, $C9F3, $11CF,
+             LongInt($AA0055BF), $00004C04);
+      MemL[0:P + 24] := 1 Or (I Shl 8);
+      Case I Of
+        0 : Nm := 'Axe X';
+        1 : Nm := 'Axe Y';
+      Else
+        Nm := 'Molette';
+      End;
+    End;
+    2 :
+    Begin
+      DXGuid(P + 4, LongInt($A36D02F0), $C9F3, $11CF, LongInt($AA0055BF),
+             $00004C04);
+      MemL[0:P + 24] := 4 Or (I Shl 8);
+      Nm := 'Bouton ' + IntStr(I);
+    End;
+  Else
+    Begin
+      DXGuid(P + 4, $55728220, $D33C, $11CF, LongInt($A000C7BF),
+             $DE5C9E26);
+      MemL[0:P + 24] := 4 Or (I Shl 8);
+      Nm := DIKeyName(I);
+    End;
+  End;
+  MemL[0:P + 20] := Ofs;
+  DXPutS(P + 32, Nm, Wide);
+End;
+
+{ Decalage de l'objet C dans le format courant (ou format standard) }
+Function DIOfsOf(T, C : LongInt) : LongInt;
+Var I, L : LongInt;
+Begin
+  L := MemL[0:T + 80];
+  If L <> 0 Then
+  Begin
+    DIOfsOf := -1;
+    For I := 0 To MemL[0:T + 84] - 1 Do
+      If MemL[0:L + I * 8 + 4] = C Then
+      Begin
+        DIOfsOf := MemL[0:L + I * 8];
+        Exit;
+      End;
+    Exit;
+  End;
+  Case C Shr 16 Of
+    1 : DIOfsOf := (C And $FFFF) * 4;
+    2 : DIOfsOf := 12 + (C And $FFFF);
+  Else
+    DIOfsOf := C And $FFFF;
+  End;
+End;
+
+Function DID_EnumObjects(T, Cb, Ctx, Fl : LongInt) : LongInt;
+Var P, I, C, O : LongInt; Wide : Boolean;
+Begin
+  T := Cor(T);
+  DID_EnumObjects := DI_OK;
+  If Cb = 0 Then Exit;
+  Wide := MemL[0:T + 156] <> 0;
+  P := KAlloc(600);
+  If MemL[0:T + 64] = 2 Then
+  Begin
+    For I := 0 To 5 Do
+    Begin
+      If I < 3 Then C := $10000 + I Else C := $20000 + I - 3;
+      If (Fl <> 0) And ((((Fl And 3) = 0) And (I < 3)) Or
+         (((Fl And $C) = 0) And (I >= 3))) Then Continue;
+      O := DIOfsOf(T, C);
+      MemL[0:P] := 0;
+      DIObjInst(T, P, C, Max(O, 0), Wide);
+      If DXCall2(Cb, P, Ctx) = 0 Then Break;
+    End;
+  End
+  Else
+    For I := 1 To 255 Do
+    Begin
+      If (I > $58) And (I < $9C) And (I <> $9C) Then Continue;
+      MemL[0:P] := 0;
+      DIObjInst(T, P, $30000 + I, I, Wide);
+      If DXCall2(Cb, P, Ctx) = 0 Then Break;
+    End;
+  KFree(P);
+End;
+
+{ Objet designe par (Obj, How) : DIPH_DEVICE 0, BYOFFSET 1, BYID 2 }
+Function DIObjOf(T, Obj, How : LongInt) : LongInt;
+Var I, L : LongInt;
+Begin
+  DIObjOf := -1;
+  If How = 1 Then
+  Begin
+    L := MemL[0:T + 80];
+    If L <> 0 Then
+    Begin
+      For I := 0 To MemL[0:T + 84] - 1 Do
+        If MemL[0:L + I * 8] = Obj Then
+        Begin
+          DIObjOf := MemL[0:L + I * 8 + 4];
+          Exit;
+        End;
+      Exit;
+    End;
+    If MemL[0:T + 64] = 1 Then DIObjOf := $30000 + (Obj And 255)
+    Else If Obj < 12 Then DIObjOf := $10000 + Obj Div 4
+    Else DIObjOf := $20000 + Obj - 12;
+  End
+  Else If How = 2 Then
+  Begin
+    If MemL[0:T + 64] = 1 Then DIObjOf := $30000 + ((Obj Shr 8) And 255)
+    Else If (Obj And 3) <> 0 Then DIObjOf := $10000 + ((Obj Shr 8) And 255)
+    Else DIObjOf := $20000 + ((Obj Shr 8) And 255);
+  End;
+End;
+
+Function DID_GetObjectInfo(T, P, Obj, How : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  T := Cor(T);
+  DID_GetObjectInfo := DIERR_OBJECTNOTFOUND;
+  If P = 0 Then Exit;
+  C := DIObjOf(T, Obj, How);
+  If C < 0 Then Exit;
+  DIObjInst(T, P, C, Max(0, DIOfsOf(T, C)), MemL[0:T + 156] <> 0);
+  DID_GetObjectInfo := DI_OK;
+End;
+
+{ Format de donnees : DIDATAFORMAT (taille, taille objet, drapeaux,
+  taille des donnees, nombre, objets) ; DIOBJECTDATAFORMAT (GUID *,
+  decalage, type, drapeaux) }
+Function DID_SetDataFormat(T, F : LongInt) : LongInt;
+Var N, I, O, G, Ty, Inst, Kd, C, L, Used, Na, Nb : LongInt;
+    Taken : Array[0..255] Of Byte;
+Begin
+  T := Cor(T);
+  DID_SetDataFormat := DDERR_INVALIDPARAMS;
+  If F = 0 Then Exit;
+  If MemL[0:T + 68] <> 0 Then
+  Begin
+    DID_SetDataFormat := DIERR_ACQUIRED;
+    Exit;
+  End;
+  N := MemL[0:F + 16];
+  If (N < 0) Or (N > 512) Then Exit;
+  If MemL[0:T + 80] <> 0 Then KFree(MemL[0:T + 80]);
+  L := KAlloc(N * 8 + 8);
+  MemL[0:T + 80] := L;
+  MemL[0:T + 88] := MemL[0:F + 12];
+  If (MemL[0:F + 8] And 1) <> 0 Then MemL[0:T + 116] := 1
+  Else If MemL[0:T + 64] = 2 Then MemL[0:T + 116] := 0;
+  FillMem(LongInt(@Taken), 256, 0);
+  Used := 0;
+  Na := 0; Nb := 0;
+  For I := 0 To N - 1 Do
+  Begin
+    O := MemL[0:F + 20] + I * 16;
+    G := MemL[0:O];
+    Ty := MemL[0:O + 8];
+    Inst := (Ty Shr 8) And $FFFF;
+    Kd := 0;
+    If G <> 0 Then
+    Begin
+      Case MemL[0:G] Of
+        LongInt($A36D02E0) : Begin Kd := 1; Inst := 0; End;
+        LongInt($A36D02E1) : Begin Kd := 1; Inst := 1; End;
+        LongInt($A36D02E2) : Begin Kd := 1; Inst := 2; End;
+        LongInt($A36D02F0) : Kd := 2;
+        $55728220 : Kd := 3;
+      End;
+    End
+    Else If (Ty And 3) <> 0 Then Kd := 1
+    Else If (Ty And $C) <> 0 Then
+    Begin
+      If MemL[0:T + 64] = 1 Then Kd := 3 Else Kd := 2;
+    End;
+    If (Kd = 2) And (MemL[0:T + 64] = 1) Then Kd := 3;
+    If Kd = 0 Then Continue;
+    If (Kd = 1) And (MemL[0:T + 64] = 1) Then Continue;
+    If Inst = $FFFF Then
+    Begin
+      { premiere instance libre }
+      If Kd = 1 Then
+      Begin
+        Inst := Na;
+        Inc(Na);
+      End
+      Else If Kd = 2 Then
+      Begin
+        Inst := Nb;
+        Inc(Nb);
+      End
+      Else
+      Begin
+        Inst := 1;
+        While (Inst < 255) And (Taken[Inst] <> 0) Do Inc(Inst);
+      End;
     End
     Else
     Begin
-      MemL[0:P + 8] := 2; MemL[0:P + 12] := 2; MemL[0:P + 16] := 3;
+      If Kd = 1 Then Na := Max(Na, Inst + 1);
+      If Kd = 2 Then Nb := Max(Nb, Inst + 1);
     End;
+    If (Kd = 3) And (Inst < 256) Then Taken[Inst] := 1;
+    If (Kd = 1) And (Inst > 2) Then Continue;
+    If (Kd = 2) And (Inst > 7) Then Continue;
+    C := (Kd Shl 16) Or (Inst And $FFFF);
+    MemL[0:L + Used * 8] := MemL[0:O + 4];
+    MemL[0:L + Used * 8 + 4] := C;
+    Inc(Used);
   End;
-  DID_GetCapabilities := DD_OK;
+  MemL[0:T + 84] := Used;
+  MemL[0:T + 148] := 1;
+  DID_SetDataFormat := DI_OK;
 End;
 
-Function DID_GetDeviceState(T, N, P : LongInt) : LongInt;
+Function DID_SetCoop(T, H, Fl : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 72] := Fl;
+  DID_SetCoop := DI_OK;
+End;
+
+Function DID_SetEventNotification(T, H : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  MemL[0:T + 76] := H;
+  DID_SetEventNotification := DI_OK;
+End;
+
+{ Ajouter un evenement au tampon du peripherique }
+Procedure DIPush(T, C, V : LongInt);
+Var Ofs, B, N, E : LongInt;
+Begin
+  N := MemL[0:T + 92];
+  B := MemL[0:T + 96];
+  If (N <= 0) Or (B = 0) Then Exit;
+  Ofs := DIOfsOf(T, C);
+  If Ofs < 0 Then Exit;
+  If MemL[0:T + 104] >= N Then
+  Begin
+    MemL[0:T + 108] := 1;
+    Exit;
+  End;
+  E := B + ((MemL[0:T + 100] + MemL[0:T + 104]) Mod N) * 16;
+  MemL[0:E] := Ofs; MemL[0:E + 4] := V; MemL[0:E + 8] := Ticks;
+  Inc(DXUniq);
+  MemL[0:E + 12] := DXUniq;
+  MemL[0:T + 104] := MemL[0:T + 104] + 1;
+End;
+
+{ Nouvelles entrees (appelee par ProcessInput et par les methodes) }
+Procedure DIHook;
+Var I, J, D, Dx, Dy, Bt, F, S, Old, K, V : LongInt; Ev : Boolean;
+Begin
+  F := IntOff;
+  Dx := DIMX; Dy := DIMY; Bt := DIMBtn;
+  DIMX := 0; DIMY := 0;
+  IntRestore(F);
+  For I := 0 To DIMaxD - 1 Do
+  Begin
+    D := DIDevs[I];
+    If (D = 0) Or (MemL[0:D + 68] = 0) Then Continue;
+    Ev := False;
+    If MemL[0:D + 64] = 2 Then
+    Begin
+      MemL[0:D + 120] := MemL[0:D + 120] + Dx;
+      MemL[0:D + 124] := MemL[0:D + 124] + Dy;
+      MemL[0:D + 132] := MemL[0:D + 132] + Dx;
+      MemL[0:D + 136] := MemL[0:D + 136] + Dy;
+      If Dx <> 0 Then
+      Begin
+        If MemL[0:D + 116] <> 0 Then DIPush(D, $10000, MemL[0:D + 132])
+        Else DIPush(D, $10000, Dx);
+        Ev := True;
+      End;
+      If Dy <> 0 Then
+      Begin
+        If MemL[0:D + 116] <> 0 Then DIPush(D, $10001, MemL[0:D + 136])
+        Else DIPush(D, $10001, Dy);
+        Ev := True;
+      End;
+      Old := MemL[0:D + 140];
+      For J := 0 To 2 Do
+        If ((Old Xor Bt) And (1 Shl J)) <> 0 Then
+        Begin
+          DIPush(D, $20000 + J, Ord((Bt And (1 Shl J)) <> 0) * $80);
+          Ev := True;
+        End;
+      MemL[0:D + 140] := Bt;
+    End
+    Else
+    Begin
+      S := MemL[0:D + 144];
+      For K := 1 To 255 Do
+      Begin
+        V := ScanDown[K];
+        If (V <> Mem[0:S + K]) Then
+        Begin
+          DIPush(D, $30000 + K, V);
+          If V <> 0 Then Mem[0:S + 256 + K] := $80;
+          Mem[0:S + K] := V;
+          Ev := True;
+        End
+        Else If (V = 0) And (ScanHit[K] <> 0) And
+                (Mem[0:S + 256 + K] = 0) Then
+        Begin
+          { appui et relachement entre deux lectures }
+          DIPush(D, $30000 + K, $80);
+          DIPush(D, $30000 + K, 0);
+          Mem[0:S + 256 + K] := $80;
+          Ev := True;
+        End;
+      End;
+    End;
+    If Ev And (MemL[0:D + 76] <> 0) Then SetEvent(MemL[0:D + 76]);
+  End;
+  For K := 1 To 255 Do ScanHit[K] := 0;
+End;
+
+Function DID_Acquire(T : LongInt) : LongInt;
 Var I : LongInt;
 Begin
-  If MemL[0:T + 12] = 1 Then
+  T := Cor(T);
+  If MemL[0:T + 68] <> 0 Then
   Begin
-    For I := 0 To Min(N, 256) - 1 Do
-    Begin
-      Mem[0:P + I] := ScanDown[I] Or ScanHit[I];
-      ScanHit[I] := 0;
-    End;
-  End
-  Else If N >= 16 Then
-  Begin
-    MemL[0:P] := DIMX; MemL[0:P + 4] := DIMY; MemL[0:P + 8] := 0;
-    DIMX := 0; DIMY := 0;
-    Mem[0:P + 12] := Ord((DIMBtn And 1) <> 0) * $80;
-    Mem[0:P + 13] := Ord((DIMBtn And 2) <> 0) * $80;
-    Mem[0:P + 14] := 0; Mem[0:P + 15] := 0;
+    DID_Acquire := DI_NOEFFECT;
+    Exit;
   End;
-  DID_GetDeviceState := DD_OK;
+  DIHook;
+  MemL[0:T + 68] := 1;
+  MemL[0:T + 120] := 0; MemL[0:T + 124] := 0; MemL[0:T + 128] := 0;
+  MemL[0:T + 140] := DIMBtn;
+  For I := 0 To 255 Do Mem[0:MemL[0:T + 144] + I] := ScanDown[I];
+  FillMem(MemL[0:T + 144] + 256, 256, 0);
+  DID_Acquire := DI_OK;
 End;
 
-Function DID_GetDeviceData(T, Sz, P, PN, Fl : LongInt) : LongInt;
+Function DID_Unacquire(T : LongInt) : LongInt;
 Begin
-  If PN <> 0 Then MemL[0:PN] := 0;
-  DID_GetDeviceData := DD_OK;
+  T := Cor(T);
+  If MemL[0:T + 68] = 0 Then
+  Begin
+    DID_Unacquire := DI_NOEFFECT;
+    Exit;
+  End;
+  MemL[0:T + 68] := 0;
+  DID_Unacquire := DI_OK;
+End;
+
+Function DID_Poll(T : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  DID_Poll := DIERR_NOTACQUIRED;
+  If MemL[0:T + 68] = 0 Then Exit;
+  KYield;
+  DIHook;
+  DID_Poll := DI_NOEFFECT;
+End;
+
+{ Etat instantane : objets du format (ou format standard) }
+Function DID_GetDeviceState(T, N, P : LongInt) : LongInt;
+Var I, L, C, O, K, V, S, Cnt : LongInt;
+Begin
+  T := Cor(T);
+  DID_GetDeviceState := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  If MemL[0:T + 68] = 0 Then
+  Begin
+    DID_GetDeviceState := DIERR_NOTACQUIRED;
+    Exit;
+  End;
+  KYield;
+  DIHook;
+  FillMem(P, N, 0);
+  L := MemL[0:T + 80];
+  S := MemL[0:T + 144];
+  If L <> 0 Then Cnt := MemL[0:T + 84]
+  Else If MemL[0:T + 64] = 1 Then Cnt := 255
+  Else Cnt := 6;
+  For I := 0 To Cnt - 1 Do
+  Begin
+    If L <> 0 Then
+    Begin
+      O := MemL[0:L + I * 8]; C := MemL[0:L + I * 8 + 4];
+    End
+    Else If MemL[0:T + 64] = 1 Then
+    Begin
+      C := $30001 + I; O := I + 1;
+    End
+    Else
+    Begin
+      If I < 3 Then C := $10000 + I Else C := $20000 + I - 3;
+      O := DIOfsOf(T, C);
+    End;
+    K := C And $FFFF;
+    Case C Shr 16 Of
+      1 :
+      Begin
+        If MemL[0:T + 116] <> 0 Then
+        Begin
+          If K = 0 Then V := MemL[0:T + 132]
+          Else If K = 1 Then V := MemL[0:T + 136] Else V := 0;
+        End
+        Else If K = 0 Then V := MemL[0:T + 120]
+        Else If K = 1 Then V := MemL[0:T + 124] Else V := 0;
+        If O + 4 <= N Then MemL[0:P + O] := V;
+      End;
+      2 :
+        If O < N Then
+          Mem[0:P + O] := Ord((MemL[0:T + 140] And (1 Shl K)) <> 0) * $80;
+      3 :
+        If (O < N) And (K < 256) Then
+        Begin
+          Mem[0:P + O] := Mem[0:S + K] Or Mem[0:S + 256 + K];
+          Mem[0:S + 256 + K] := 0;
+        End;
+    End;
+  End;
+  MemL[0:T + 120] := 0; MemL[0:T + 124] := 0;
+  DID_GetDeviceState := DI_OK;
+End;
+
+{ Donnees tamponnees : DIDEVICEOBJECTDATA (16 ou 20 octets) }
+Function DID_GetDeviceData(T, Sz, P, PN, Fl : LongInt) : LongInt;
+Var Want, Got, B, E, N, R : LongInt;
+Begin
+  T := Cor(T);
+  DID_GetDeviceData := DDERR_INVALIDPARAMS;
+  If PN = 0 Then Exit;
+  If MemL[0:T + 68] = 0 Then
+  Begin
+    DID_GetDeviceData := DIERR_NOTACQUIRED;
+    Exit;
+  End;
+  If MemL[0:T + 92] <= 0 Then
+  Begin
+    MemL[0:PN] := 0;
+    DID_GetDeviceData := DIERR_NOTINITIALIZED;
+    Exit;
+  End;
+  KYield;
+  DIHook;
+  Want := MemL[0:PN];
+  B := MemL[0:T + 96]; N := MemL[0:T + 92];
+  Got := 0;
+  While (Got < Want) And (Got < MemL[0:T + 104]) Do
+  Begin
+    E := B + ((MemL[0:T + 100] + Got) Mod N) * 16;
+    If P <> 0 Then
+    Begin
+      If Sz > 16 Then FillMem(P + Got * Sz, Sz, 0);
+      MoveMem(E, P + Got * Sz, 16);
+    End;
+    Inc(Got);
+  End;
+  If (Fl And 1) = 0 Then
+  Begin
+    MemL[0:T + 100] := (MemL[0:T + 100] + Got) Mod N;
+    MemL[0:T + 104] := MemL[0:T + 104] - Got;
+  End;
+  MemL[0:PN] := Got;
+  R := DI_OK;
+  If MemL[0:T + 108] <> 0 Then
+  Begin
+    R := DI_BUFFEROVERFLOW;
+    MemL[0:T + 108] := 0;
+  End;
+  DID_GetDeviceData := R;
+End;
+
+{ Proprietes : DIPROPHEADER (taille, taille en-tete, objet, comment) }
+Function DID_GetProperty(T, G, H : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  T := Cor(T);
+  DID_GetProperty := DDERR_INVALIDPARAMS;
+  If H = 0 Then Exit;
+  DID_GetProperty := DI_OK;
+  Case G Of
+    1 : MemL[0:H + 16] := MemL[0:T + 92];
+    2 : MemL[0:H + 16] := Ord(MemL[0:T + 116] = 0);
+    3 :
+    Begin
+      C := DIObjOf(T, MemL[0:H + 8], MemL[0:H + 12]);
+      If C = $10002 Then MemL[0:H + 16] := 120 Else MemL[0:H + 16] := 1;
+    End;
+    5, 6 : MemL[0:H + 16] := 0;
+    20 :
+    Begin
+      C := DIObjOf(T, MemL[0:H + 8], MemL[0:H + 12]);
+      If (C Shr 16) <> 3 Then
+      Begin
+        DID_GetProperty := DIERR_OBJECTNOTFOUND;
+        Exit;
+      End;
+      DXPutS(H + 16, DIKeyName(C And 255), True);
+    End;
+    23 :
+    Begin
+      C := DIObjOf(T, MemL[0:H + 8], MemL[0:H + 12]);
+      MemL[0:H + 16] := C And 255;
+    End;
+  Else
+    DID_GetProperty := DIERR_UNSUPPORTED;
+  End;
+End;
+
+Function DID_SetProperty(T, G, H : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  T := Cor(T);
+  DID_SetProperty := DDERR_INVALIDPARAMS;
+  If H = 0 Then Exit;
+  DID_SetProperty := DI_OK;
+  Case G Of
+    1 :
+    Begin
+      If MemL[0:T + 68] <> 0 Then
+      Begin
+        DID_SetProperty := DIERR_ACQUIRED;
+        Exit;
+      End;
+      N := MemL[0:H + 16];
+      If N > 4096 Then N := 4096;
+      If MemL[0:T + 96] <> 0 Then KFree(MemL[0:T + 96]);
+      MemL[0:T + 96] := 0;
+      If N > 0 Then MemL[0:T + 96] := KAlloc(N * 16 + 16);
+      MemL[0:T + 92] := N;
+      MemL[0:T + 100] := 0; MemL[0:T + 104] := 0;
+    End;
+    2 : MemL[0:T + 116] := Ord(MemL[0:H + 16] = 0);
+  Else
+    DID_SetProperty := DI_NOEFFECT;
+  End;
+End;
+
+Function DID_EnumEffects(T, Cb, Ctx, Ty : LongInt) : LongInt;
+Begin
+  DID_EnumEffects := DI_OK;
+End;
+
+Function DID_EnumCreated(T, Cb, Ctx, Fl : LongInt) : LongInt;
+Begin
+  DID_EnumCreated := DI_OK;
 End;
 
 { ------------------------------------------------------------------ }
-{ DSETUP.DLL : DirectX 3 est deja present dans Pasdows               }
+{ Fin des objets, fin du programme, CoCreateInstance                 }
+{ ------------------------------------------------------------------ }
+
+Procedure D3DDestroy(C, K : LongInt); Forward;
+Function DXCoCreateX(Clsid, PO : LongInt) : LongInt; Forward;
+
+Procedure ComDestroyX(C, K : LongInt);
+Begin
+  Case K Of
+    7 :
+    Begin
+      MemL[0:C + 72] := 0;
+      DSBReg(C, False);
+      If MemL[0:C + 160] <> 0 Then KFree(MemL[0:C + 160]);
+      If MemL[0:C + 132] <> 0 Then KFree(MemL[0:C + 132]);
+    End;
+    9 :
+    Begin
+      DIReg(C, False);
+      If MemL[0:C + 80] <> 0 Then KFree(MemL[0:C + 80]);
+      If MemL[0:C + 96] <> 0 Then KFree(MemL[0:C + 96]);
+      If MemL[0:C + 144] <> 0 Then KFree(MemL[0:C + 144]);
+    End;
+  Else
+    If K >= 11 Then D3DDestroy(C, K);
+  End;
+End;
+
+{ Fin du programme : son arrete, peripheriques oublies, bureau rendu
+  (les blocs du programme sont liberes par KFreeOwner) }
+Procedure DXAppDone;
+Var I : LongInt;
+Begin
+  For I := 0 To DSMaxB - 1 Do DSBufs[I] := 0;
+  For I := 0 To DIMaxD - 1 Do DIDevs[I] := 0;
+  For I := 0 To DXMaxSf - 1 Do DXSfs[I] := 0;
+  If DSOwn Then
+  Begin
+    If SbPlaying And (SbDev < 0) Then SbStop;
+    DSOwn := False;
+  End;
+  DSEvN := 0;
+  DXAppExit;
+End;
+
+{ CLSID connus de DirectX (CoCreateInstance) }
+Function DXCoCreate(Clsid, Iid, PP : LongInt) : LongInt;
+Var O, R : LongInt;
+Begin
+  DXCoCreate := REGDB_E_CLASSNOTREG;
+  If (Clsid = 0) Or (PP = 0) Then Exit;
+  O := 0;
+  R := REGDB_E_CLASSNOTREG;
+  Case MemL[0:Clsid] Of
+    LongInt($D7B70EE0), LongInt($3C305196) :
+      R := DirectDrawCreate(0, LongInt(@O), 0);
+    LongInt($593817A0) : R := DirectDrawCreateClipper(0, LongInt(@O), 0);
+    LongInt($47D4D946) : R := DirectSoundCreate(0, LongInt(@O), 0);
+    LongInt($3901CC3F) : R := DirectSoundCreate8(0, LongInt(@O), 0);
+    LongInt($25E609E0) : R := DirectInputCreateA(0, $700, LongInt(@O), 0);
+    LongInt($25E609E4) :
+    Begin
+      DIInitVt;
+      O := DINew(6);
+      R := DD_OK;
+    End;
+  Else
+    R := DXCoCreateX(Clsid, LongInt(@O));
+  End;
+  If (R <> DD_OK) Or (O = 0) Then
+  Begin
+    DXCoCreate := R;
+    Exit;
+  End;
+  { QueryInterface(O, Iid, PP) puis Release }
+  R := DXCall3(MemL[0:MemL[0:O]], O, Iid, PP);
+  COMRelease(O);
+  DXCoCreate := R;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DirectPlay : objets sans fournisseur de service (aucune connexion  }
+{ proposee) ; lobby : le programme n'est jamais lance par un lobby   }
+{ ------------------------------------------------------------------ }
+
+Const
+  DPERR_NOCONNECTION = LongInt($887700AA);
+  DPERR_UNAVAILABLE = LongInt($887700FA);
+  DPERR_UNINITIALIZED = LongInt($88770140);
+  DPERR_NOTLOBBIED = LongInt($8877042E);
+
+Var
+  VtDP, VtDPA, VtDPL, VtDPLA : LongInt;
+
+Function DPE1(T : LongInt) : LongInt;
+Begin
+  DPE1 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE2(T, A : LongInt) : LongInt;
+Begin
+  DPE2 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE3(T, A, B : LongInt) : LongInt;
+Begin
+  DPE3 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DPE4 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DPE5 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE6(T, A, B, C, D, E : LongInt) : LongInt;
+Begin
+  DPE6 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE7(T, A, B, C, D, E, F : LongInt) : LongInt;
+Begin
+  DPE7 := DPERR_UNINITIALIZED;
+End;
+
+Function DPE10(T, A, B, C, D, E, F, G, H, I : LongInt) : LongInt;
+Begin
+  DPE10 := DPERR_UNINITIALIZED;
+End;
+
+Function DPNL4(T, A, B, C : LongInt) : LongInt;
+Begin
+  DPNL4 := DPERR_NOTLOBBIED;
+End;
+
+Function DPUn3(T, A, B : LongInt) : LongInt;
+Begin
+  DPUn3 := DPERR_UNAVAILABLE;
+End;
+
+Function DPUn5(T, A, B, C, D : LongInt) : LongInt;
+Begin
+  DPUn5 := DPERR_UNAVAILABLE;
+End;
+
+Function DPUn7(T, A, B, C, D, E, F : LongInt) : LongInt;
+Begin
+  DPUn7 := DPERR_UNAVAILABLE;
+End;
+
+Function D3DCoCreate(Clsid, PO : LongInt) : LongInt; Forward;
+
+Procedure DPInitVt;
+Var I : LongInt;
+Begin
+  If VtDP <> 0 Then Exit;
+  For I := 0 To 1 Do
+  Begin
+    If I = 0 Then VtDP := VtNew Else VtDPA := VtNew;
+    VtAdd('DP_QI,COMAddRef,COMRelease,DPE3,DXOK1,DPE6,DPE7,DPE3,DPE2,DPE2,');
+    VtAdd('DPE6,DPE5,DPE5,DPE6,DPE3,DPE5,DPE4,DPE3,DPE4,DPE4,DPE5,DPE4,');
+    VtAdd('DPE3,DXOK2,DPE3,DPE6,DPE6,DPE5,DPE4,DPE5,DPE4,DPE3,');
+    VtAdd('DPE3,DPE7,DPE3,DXOK5,DPE6,DPE5,DPUn3,DPE5,DPE5,DPE4,DPE3,DPE3,');
+    VtAdd('DPE3,DPE5,DPE3,DPE3,DPE3,DPE10,DPE6,DPE3,DPE4');
+  End;
+  For I := 0 To 1 Do
+  Begin
+    If I = 0 Then VtDPL := VtNew Else VtDPLA := VtNew;
+    VtAdd('DPL_QI,COMAddRef,COMRelease,DPNL4,DPUn7,DPUn5,DXOK5,DXOK4,');
+    VtAdd('DPNL4,DPNL6,DPUn5,DPUn5,DPNL4,DPNL4,DPUn5,DPUn5,DXOK3,');
+    VtAdd('DXOK3,DPNL2');
+  End;
+End;
+
+Function DPNL6(T, A, B, C, D, E : LongInt) : LongInt;
+Begin
+  DPNL6 := DPERR_NOTLOBBIED;
+End;
+
+Function DPNL2(T, A : LongInt) : LongInt;
+Begin
+  DPNL2 := DPERR_NOTLOBBIED;
+End;
+
+Function DP_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  DP_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  If GuidUnk(Riid) Then DP_QI := ComGive(C, IfVer(T), MemL[0:T], Ppv)
+  Else If GuidIs(Riid, LongInt($9D460580)) Or
+          GuidIs(Riid, LongInt($133EFE41)) Or
+          GuidIs(Riid, LongInt($0AB1C531)) Then
+    DP_QI := ComGive(C, 1, VtDPA, Ppv)
+  Else If GuidIs(Riid, LongInt($2B74F7C0)) Or
+          GuidIs(Riid, LongInt($133EFE40)) Or
+          GuidIs(Riid, LongInt($0AB1C530)) Then
+    DP_QI := ComGive(C, 0, VtDP, Ppv);
+End;
+
+Function DPL_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  DPL_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  If GuidUnk(Riid) Then DPL_QI := ComGive(C, IfVer(T), MemL[0:T], Ppv)
+  Else If GuidIs(Riid, LongInt($26C66A70)) Or
+          GuidIs(Riid, LongInt($1BB4AF80)) Or
+          GuidIs(Riid, LongInt($2DB72491)) Then
+    DPL_QI := ComGive(C, 1, VtDPLA, Ppv)
+  Else If GuidIs(Riid, LongInt($AF465C71)) Or
+          GuidIs(Riid, LongInt($0194C220)) Or
+          GuidIs(Riid, LongInt($2DB72490)) Then
+    DPL_QI := ComGive(C, 0, VtDPL, Ppv);
+End;
+
+Function DPNew(Lobby, Ansi : Boolean) : LongInt;
+Var O : LongInt;
+Begin
+  DPInitVt;
+  If Lobby Then O := ComNew(0, 32, 64) Else O := ComNew(0, 31, 64);
+  If Lobby And Ansi Then ComView(O, 1, VtDPLA)
+  Else If Lobby Then ComView(O, 0, VtDPL)
+  Else If Ansi Then ComView(O, 1, VtDPA)
+  Else ComView(O, 0, VtDP);
+  DPNew := O;
+End;
+
+Function DirectPlayCreate(G, PP, Outer : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  DirectPlayCreate := DPERR_UNAVAILABLE;
+End;
+
+Function DirectPlayEnumerateA(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectPlayEnumerateA := DD_OK;
+End;
+
+Function DirectPlayEnumerateW(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectPlayEnumerateW := DD_OK;
+End;
+
+Function DirectPlayEnumerate(Cb, Ctx : LongInt) : LongInt;
+Begin
+  DirectPlayEnumerate := DD_OK;
+End;
+
+Function DirectPlayLobbyCreateA(G, PP, Outer, D, N : LongInt) : LongInt;
+Begin
+  DirectPlayLobbyCreateA := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := DPNew(True, True);
+  DirectPlayLobbyCreateA := DD_OK;
+End;
+
+Function DirectPlayLobbyCreateW(G, PP, Outer, D, N : LongInt) : LongInt;
+Begin
+  DirectPlayLobbyCreateW := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := DPNew(True, False);
+  DirectPlayLobbyCreateW := DD_OK;
+End;
+
+Function DXCoCreateX(Clsid, PO : LongInt) : LongInt;
+Begin
+  DXCoCreateX := REGDB_E_CLASSNOTREG;
+  Case MemL[0:Clsid] Of
+    LongInt($D1EB6D20) :
+    Begin
+      MemL[0:PO] := DPNew(False, True);
+      DXCoCreateX := DD_OK;
+    End;
+    LongInt($2FE8F810) :
+    Begin
+      MemL[0:PO] := DPNew(True, True);
+      DXCoCreateX := DD_OK;
+    End;
+  Else
+    DXCoCreateX := D3DCoCreate(Clsid, PO);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DSETUP.DLL : DirectX est integre a Pasdows                         }
 { ------------------------------------------------------------------ }
 
 Function DirectXSetup(H, Root, Fl : LongInt) : LongInt;
@@ -36460,7 +41985,12 @@ End;
 
 Function DirectXSetupA(H, Root, Fl : LongInt) : LongInt;
 Begin
-  DirectXSetupA := 0;
+  DirectXSetupA := DirectXSetup(H, Root, Fl);
+End;
+
+Function DirectXSetupW(H, Root, Fl : LongInt) : LongInt;
+Begin
+  DirectXSetupW := DirectXSetup(H, Root, Fl);
 End;
 
 Function DirectXDeviceDriverSetup(H, Drv, Dir, Fl : LongInt) : LongInt;
@@ -36468,10 +41998,15 @@ Begin
   DirectXDeviceDriverSetup := 0;
 End;
 
+Function DirectXDeviceDriverSetupA(H, Drv, Dir, Fl : LongInt) : LongInt;
+Begin
+  DirectXDeviceDriverSetupA := 0;
+End;
+
 Function DirectXSetupGetVersion(PVer, PRev : LongInt) : LongInt;
 Begin
-  If PVer <> 0 Then MemL[0:PVer] := $00040004;
-  If PRev <> 0 Then MemL[0:PRev] := $00000044;
+  If PVer <> 0 Then MemL[0:PVer] := $00040008;
+  If PRev <> 0 Then MemL[0:PRev] := $00000190;
   DirectXSetupGetVersion := 1;
 End;
 
@@ -36485,9 +42020,5419 @@ Begin
   DirectXRegisterApplication := 1;
 End;
 
+Function DirectXRegisterApplicationA(H, P : LongInt) : LongInt;
+Begin
+  DirectXRegisterApplicationA := 1;
+End;
+
 Function DirectXUnRegisterApplication(H, P : LongInt) : LongInt;
 Begin
   DirectXUnRegisterApplication := 1;
+End;
+
+{ Nom des fonctions importees par ordinal (DSOUND, DPLAYX, DPLAY) }
+Function DXOrdName(Dll : String; N : LongInt) : String;
+Var S : String;
+Begin
+  S := '';
+  Dll := UpStr(BaseName(Dll));
+  If Pos('.', Dll) = 0 Then Dll := Dll + '.DLL';
+  If Dll = 'DSOUND.DLL' Then
+    Case N Of
+      1 : S := 'DirectSoundCreate';
+      2 : S := 'DirectSoundEnumerateA';
+      3 : S := 'DirectSoundEnumerateW';
+      6 : S := 'DirectSoundCaptureCreate';
+      7 : S := 'DirectSoundCaptureEnumerateA';
+      8 : S := 'DirectSoundCaptureEnumerateW';
+      9 : S := 'GetDeviceID';
+      10 : S := 'DirectSoundFullDuplexCreate';
+      11 : S := 'DirectSoundCreate8';
+      12 : S := 'DirectSoundCaptureCreate8';
+    End
+  Else If Dll = 'DPLAYX.DLL' Then
+    Case N Of
+      1 : S := 'DirectPlayCreate';
+      2 : S := 'DirectPlayEnumerateA';
+      3 : S := 'DirectPlayEnumerateW';
+      4 : S := 'DirectPlayLobbyCreateA';
+      5 : S := 'DirectPlayLobbyCreateW';
+      9 : S := 'DirectPlayEnumerate';
+    End
+  Else If Dll = 'DPLAY.DLL' Then
+    Case N Of
+      1 : S := 'DirectPlayCreate';
+      2 : S := 'DirectPlayEnumerate';
+    End;
+  DXOrdName := S;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Direct3D : moteur logiciel commun (D3D 1 a 7 et Direct3D 8)        }
+{ ------------------------------------------------------------------ }
+{ Sommets (FVF) transformes par Monde x Vue x Projection, eclaires
+  (lumieres directionnelles, ponctuelles et projecteurs, materiau),
+  brouillard de sommet, decoupes dans le volume de vision (6 plans),
+  projetes dans la fenetre d'affichage puis rasterises : triangles
+  par lignes horizontales (centres des pixels aux coordonnees
+  entieres), couleurs de Gouraud ou unies, textures corrigees en
+  perspective (par segments de 16 pixels), deux etages de melange
+  (COLOROP / ALPHAOP), cle de couleur, test alpha, tampon Z (16, 24
+  ou 32 bits), melange alpha, specularite et brouillard. Cible : toute
+  surface DirectDraw (8, 16, 24 ou 32 bits). }
+
+Type
+  TMat = Array[0..15] Of Double;
+  TLit = Record
+    Typ, On : LongInt;
+    Dif, Spe, Amb : Array[0..3] Of Double;
+    Pos, Dir : Array[0..2] Of Double;
+    Rng, Fall, A0, A1, A2, Th, Ph : Double;
+  End;
+  TVtx = Record
+    X, Y, Z, W : Double;          { coordonnees de decoupage }
+    SX, SY, SZ, RW : Double;      { ecran, Z, 1/w }
+    A, R, G, B, SR, SG, SB, F : Double;
+    U0, V0, U1, V1 : Double;
+    CF : LongInt;
+  End;
+  TVtxArr = Array[0..65535] Of TVtx;
+  PVtxArr = ^TVtxArr;
+  TD3D = Record
+    RT, ZB, Ver, InScene, UseTSS, LegBlend : LongInt;
+    VX, VY, VW, VH : LongInt;
+    VMinZ, VMaxZ, ClX, ClY, ClW, ClH : Double;
+    Wld, Viw, Prj, WV, WVP : TMat;
+    MOk : Boolean;
+    RS : Array[0..255] Of LongInt;
+    TS : Array[0..255] Of LongInt;
+    Tex : Array[0..7] Of LongInt;
+    Mt : Array[0..16] Of Double;
+    Lt : Array[0..15] Of TLit;
+    LS : Array[0..15] Of LongInt;
+    VPCur, D3DObj, Core : LongInt;
+    VPs : Array[0..15] Of LongInt;
+    BFvf, BPt, BN, BBuf, BMax, BIdx, BIn : LongInt;
+    Tris, Verts : LongInt;
+    ClipU, ClipI : LongInt;
+    SBRec : LongInt;
+    D8 : LongInt;
+  End;
+  PD3D = ^TD3D;
+
+Const
+  { etats de rendu utiles }
+  rsTexHandle = 1; rsPersp = 4; rsZEnable = 7; rsFill = 8; rsShade = 9;
+  rsZWrite = 14; rsATest = 15; rsLastPix = 16; rsTexMag = 17;
+  rsTexMin = 18; rsSrcBl = 19; rsDstBl = 20; rsTexBlend = 21; rsCull = 22;
+  rsZFunc = 23; rsARef = 24; rsAFunc = 25; rsDither = 26; rsABlend = 27;
+  rsFog = 28; rsSpecular = 29; rsFogColor = 34; rsFogTable = 35;
+  rsFogStart = 36; rsFogEnd = 37; rsFogDens = 38; rsCKey = 41;
+  rsTFactor = 60; rsWrap0 = 128; rsClipping = 136; rsLighting = 137;
+  rsAmbient = 139; rsFogVtx = 140; rsColorVtx = 141; rsLocalView = 142;
+  rsNormalize = 143; rsDifSrc = 145; rsSpcSrc = 146; rsAmbSrc = 147;
+  rsEmiSrc = 148;
+  { etats d'etage de texture }
+  tsCOp = 1; tsCA1 = 2; tsCA2 = 3; tsAOp = 4; tsAA1 = 5; tsAA2 = 6;
+  tsTCI = 11; tsAddr = 12; tsAddrU = 13; tsAddrV = 14; tsMag = 16;
+  tsMin = 17; tsMip = 18;
+
+Var
+  D3G : PD3D;                       { peripherique courant }
+  DV : PVtxArr;                     { sommets traites }
+  DVCap : LongInt;
+  DVBase : LongInt;
+  D3DStrideOvr : LongInt;          { pas impose (Direct3D 8), 0 sinon }
+  D8Pal : LongInt;                 { palette courante des textures P8 }
+  DC : Array[0..15] Of TVtx;        { polygone en decoupe }
+  DC2 : Array[0..15] Of TVtx;
+  LtV : Array[0..15] Of TLit;      { lumieres dans l'espace de la vue }
+  { format des sommets d'entree }
+  VFStride, VFPos, VFNrm, VFDif, VFSpc, VFTexN, VFRhw : LongInt;
+  VFTex : Array[0..7] Of LongInt;
+  VFTexD : Array[0..7] Of LongInt;
+  { etat de rasterisation (par appel) }
+  RBits, RPitch, RBy, RKind, RW, RH, RTs : LongInt;
+  ZBits, ZPitch, ZBy, ZMax : LongInt;
+  RZOn, RZWr, RZFn, RShade, RABl, RSrc, RDst, RATst, RAFn, RARef : LongInt;
+  RCKey, RFogOn, RFogC, RSpec, RTFac, RCull, RFill : LongInt;
+  TxOn : Array[0..1] Of Boolean;
+  TxBits, TxPitch, TxW, TxH, TxKind, TxBy, TxKey, TxKeyOn, TxAddrU,
+    TxAddrV, TxS, TxMagLin : Array[0..1] Of LongInt;
+  TxPal : Array[0..255] Of LongInt;
+  TxCOp, TxCA1, TxCA2, TxAOp, TxAA1, TxAA2, TxTci : Array[0..1] Of LongInt;
+  NStage : LongInt;
+  ClipL, ClipT, ClipR, ClipB : LongInt;
+  D3DStats : LongInt;
+
+{ Choisir le peripherique du coeur C }
+Function DevSel(C : LongInt) : Boolean;
+Var P : LongInt;
+Begin
+  P := MemL[0:C + 64];
+  Move(P, D3G, 4);
+  DevSel := P <> 0;
+End;
+
+Function FlL(L : LongInt) : Double;
+Var F : Single;
+Begin
+  MemL[0:LongInt(@F)] := L;
+  FlL := F;
+End;
+
+Function LFl(D : Double) : LongInt;
+Var F : Single;
+Begin
+  F := D;
+  LFl := MemL[0:LongInt(@F)];
+End;
+
+Function FlM(A : LongInt) : Double;
+Begin
+  FlM := FlL(MemL[0:A]);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Matrices (lignes, v' = v x M)                                       }
+{ ------------------------------------------------------------------ }
+
+Procedure MatId(Var M : TMat);
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do M[I] := 0;
+  M[0] := 1; M[5] := 1; M[10] := 1; M[15] := 1;
+End;
+
+Procedure MatMul(Var R : TMat; Var A, B : TMat);
+Var I, J : LongInt; T : TMat;
+Begin
+  For I := 0 To 3 Do
+    For J := 0 To 3 Do
+      T[I * 4 + J] := A[I * 4] * B[J] + A[I * 4 + 1] * B[4 + J] +
+                      A[I * 4 + 2] * B[8 + J] + A[I * 4 + 3] * B[12 + J];
+  R := T;
+End;
+
+Procedure MatLoad(Var M : TMat; P : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do M[I] := FlM(P + I * 4);
+End;
+
+Procedure MatStore(Var M : TMat; P : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do MemL[0:P + I * 4] := LFl(M[I]);
+End;
+
+Procedure D3DMats;
+Begin
+  If D3G^.MOk Then Exit;
+  MatMul(D3G^.WV, D3G^.Wld, D3G^.Viw);
+  MatMul(D3G^.WVP, D3G^.WV, D3G^.Prj);
+  D3G^.MOk := True;
+End;
+
+{ Matrice de transformation : 1 monde, 2 vue, 3 projection (D3D7 :
+  1 = D3DTRANSFORMSTATE_WORLD ; D3D8 : 256 = monde, 2 vue, 3 proj.) }
+Function D3DMatOf(K : LongInt; Var M : TMat) : Boolean;
+Begin
+  D3DMatOf := True;
+  Case K Of
+    1, 256 : M := D3G^.Wld;
+    2 : M := D3G^.Viw;
+    3 : M := D3G^.Prj;
+  Else
+    D3DMatOf := False;
+  End;
+End;
+
+Procedure D3DMatSet(K : LongInt; Var M : TMat);
+Begin
+  Case K Of
+    1, 256 : D3G^.Wld := M;
+    2 : D3G^.Viw := M;
+    3 : D3G^.Prj := M;
+  End;
+  D3G^.MOk := False;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Etat initial                                                       }
+{ ------------------------------------------------------------------ }
+
+Procedure D3DDefaults;
+Var I : LongInt;
+Begin
+  FillMem(LongInt(@D3G^.RS), SizeOf(D3G^.RS), 0);
+  FillMem(LongInt(@D3G^.TS), SizeOf(D3G^.TS), 0);
+  MatId(D3G^.Wld); MatId(D3G^.Viw); MatId(D3G^.Prj);
+  D3G^.MOk := False;
+  D3G^.RS[rsPersp] := 1;
+  D3G^.RS[rsZEnable] := Ord(D3G^.ZB <> 0);
+  D3G^.RS[rsFill] := 3; D3G^.RS[rsShade] := 2; D3G^.RS[rsZWrite] := 1;
+  D3G^.RS[rsLastPix] := 1; D3G^.RS[rsTexMag] := 1; D3G^.RS[rsTexMin] := 1;
+  D3G^.RS[rsSrcBl] := 2; D3G^.RS[rsDstBl] := 1; D3G^.RS[rsTexBlend] := 2;
+  D3G^.RS[rsCull] := 3; D3G^.RS[rsZFunc] := 4; D3G^.RS[rsAFunc] := 8;
+  D3G^.RS[rsFogStart] := 0; D3G^.RS[rsFogEnd] := LFl(1.0);
+  D3G^.RS[rsFogDens] := LFl(1.0);
+  D3G^.RS[rsTFactor] := -1;
+  D3G^.RS[rsClipping] := 1; D3G^.RS[rsLighting] := 1;
+  D3G^.RS[rsColorVtx] := 1; D3G^.RS[rsLocalView] := 1;
+  D3G^.RS[rsDifSrc] := 1; D3G^.RS[rsSpcSrc] := 2;
+  D3G^.RS[rsAmbSrc] := 0; D3G^.RS[rsEmiSrc] := 0;
+  If D3G^.Ver < 7 Then D3G^.RS[rsLighting] := 0;
+  For I := 0 To 7 Do
+  Begin
+    D3G^.TS[I * 32 + tsCOp] := 1; D3G^.TS[I * 32 + tsAOp] := 1;
+    D3G^.TS[I * 32 + tsCA1] := 2; D3G^.TS[I * 32 + tsCA2] := 1;
+    D3G^.TS[I * 32 + tsAA1] := 2; D3G^.TS[I * 32 + tsAA2] := 1;
+    D3G^.TS[I * 32 + tsTCI] := I;
+    D3G^.TS[I * 32 + tsAddr] := 1;
+    D3G^.TS[I * 32 + tsAddrU] := 1; D3G^.TS[I * 32 + tsAddrV] := 1;
+    D3G^.TS[I * 32 + tsMag] := 1; D3G^.TS[I * 32 + tsMin] := 1;
+    D3G^.TS[I * 32 + tsMip] := 1;
+    D3G^.Tex[I] := 0;
+  End;
+  D3G^.TS[tsCOp] := 4; D3G^.TS[tsAOp] := 2;
+  For I := 0 To 16 Do D3G^.Mt[I] := 0;
+  For I := 0 To 15 Do
+  Begin
+    FillMem(LongInt(@D3G^.Lt[I]), SizeOf(TLit), 0);
+    D3G^.LS[I] := 0;
+  End;
+  D3G^.LS[3] := 2;
+  D3G^.ClX := -1; D3G^.ClY := 1; D3G^.ClW := 2; D3G^.ClH := 2;
+  D3G^.VMinZ := 0; D3G^.VMaxZ := 1;
+  If D3G^.RT <> 0 Then
+  Begin
+    D3G^.VX := 0; D3G^.VY := 0;
+    D3G^.VW := MemL[0:D3G^.RT + 64]; D3G^.VH := MemL[0:D3G^.RT + 68];
+  End;
+  D3G^.LegBlend := 2;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Format des sommets (FVF)                                           }
+{ ------------------------------------------------------------------ }
+
+Procedure FvfParse(F : LongInt);
+Var O, N, I, K : LongInt;
+Begin
+  O := 0;
+  VFRhw := 0;
+  Case F And $E Of
+    2 : O := 12;
+    4 :
+    Begin
+      O := 16; VFRhw := 1;
+    End;
+    6 : O := 16;
+    8 : O := 20;
+    $A : O := 24;
+    $C : O := 28;
+    $E : O := 32;
+  End;
+  VFPos := 0;
+  VFNrm := -1; VFDif := -1; VFSpc := -1;
+  If (F And $10) <> 0 Then
+  Begin
+    VFNrm := O; O := O + 12;
+  End;
+  If (F And $20) <> 0 Then O := O + 4;
+  If (F And $40) <> 0 Then
+  Begin
+    VFDif := O; O := O + 4;
+  End;
+  If (F And $80) <> 0 Then
+  Begin
+    VFSpc := O; O := O + 4;
+  End;
+  N := (F Shr 8) And 15;
+  If N > 8 Then N := 8;
+  VFTexN := N;
+  For I := 0 To N - 1 Do
+  Begin
+    VFTex[I] := O;
+    K := (F Shr (16 + I * 2)) And 3;
+    Case K Of
+      0 : VFTexD[I] := 2;
+      1 : VFTexD[I] := 3;
+      2 : VFTexD[I] := 4;
+    Else
+      VFTexD[I] := 1;
+    End;
+    O := O + VFTexD[I] * 4;
+  End;
+  VFStride := O;
+End;
+
+{ Types de sommets de D3D 2 : 1 D3DVERTEX, 2 D3DLVERTEX, 3 D3DTLVERTEX }
+Function VtToFvf(T : LongInt) : LongInt;
+Begin
+  Case T Of
+    1 : VtToFvf := $112;
+    2 : VtToFvf := $1E2;
+  Else
+    VtToFvf := $1C4;
+  End;
+End;
+
+Procedure D3DGrow(N : LongInt);
+Var H, P : LongInt;
+Begin
+  If N <= DVCap Then Exit;
+  If DVCap > 0 Then
+  Begin
+    P := 0;
+    Move(DV, P, 4);
+    KFree(P);
+  End;
+  DVCap := Max(N, 1024);
+  H := HeapOwner; HeapOwner := 0;
+  P := KAlloc(DVCap * SizeOf(TVtx) + 16);
+  HeapOwner := H;
+  Move(P, DV, 4);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Eclairage d'un sommet (espace de la vue)                           }
+{ ------------------------------------------------------------------ }
+
+{ Lumieres (espace du monde) ramenees dans l'espace de la vue }
+Procedure D3DLightsView;
+Var I : LongInt; X, Y, Z, D : Double; M : TMat;
+Begin
+  M := D3G^.Viw;
+  For I := 0 To 15 Do
+  Begin
+    LtV[I] := D3G^.Lt[I];
+    If LtV[I].On = 0 Then Continue;
+    If LtV[I].Typ = 4 Then
+    Begin
+      { parallele : direction depuis la position }
+      LtV[I].Typ := 3;
+      LtV[I].Dir[0] := -LtV[I].Pos[0]; LtV[I].Dir[1] := -LtV[I].Pos[1];
+      LtV[I].Dir[2] := -LtV[I].Pos[2];
+    End;
+    X := LtV[I].Pos[0]; Y := LtV[I].Pos[1]; Z := LtV[I].Pos[2];
+    LtV[I].Pos[0] := X * M[0] + Y * M[4] + Z * M[8] + M[12];
+    LtV[I].Pos[1] := X * M[1] + Y * M[5] + Z * M[9] + M[13];
+    LtV[I].Pos[2] := X * M[2] + Y * M[6] + Z * M[10] + M[14];
+    X := LtV[I].Dir[0]; Y := LtV[I].Dir[1]; Z := LtV[I].Dir[2];
+    LtV[I].Dir[0] := X * M[0] + Y * M[4] + Z * M[8];
+    LtV[I].Dir[1] := X * M[1] + Y * M[5] + Z * M[9];
+    LtV[I].Dir[2] := X * M[2] + Y * M[6] + Z * M[10];
+    D := Sqrt(LtV[I].Dir[0] * LtV[I].Dir[0] + LtV[I].Dir[1] *
+              LtV[I].Dir[1] + LtV[I].Dir[2] * LtV[I].Dir[2]);
+    If D > 0.000001 Then
+    Begin
+      LtV[I].Dir[0] := LtV[I].Dir[0] / D; LtV[I].Dir[1] := LtV[I].Dir[1] / D;
+      LtV[I].Dir[2] := LtV[I].Dir[2] / D;
+    End;
+  End;
+End;
+
+Procedure D3DLight(PX, PY, PZ, NX, NY, NZ : Double; DifC, SpcC : LongInt;
+                   Var V : TVtx);
+Var I, Src : LongInt;
+    MdR, MdG, MdB, MdA, MaR, MaG, MaB, MsR, MsG, MsB, MeR, MeG, MeB,
+    DR, DG, DB, AR, AG, AB, SR, SG, SB, LX, LY, LZ, D, At, Sp, NL, HX,
+    HY, HZ, NH, VX, VY, VZ, Rho, Ct, Cp, X, Y, Z : Double;
+Begin
+  D := Sqrt(NX * NX + NY * NY + NZ * NZ);
+  If D > 0.000001 Then
+  Begin
+    NX := NX / D; NY := NY / D; NZ := NZ / D;
+  End;
+  MdR := D3G^.Mt[0]; MdG := D3G^.Mt[1]; MdB := D3G^.Mt[2];
+  MdA := D3G^.Mt[3];
+  MaR := D3G^.Mt[4]; MaG := D3G^.Mt[5]; MaB := D3G^.Mt[6];
+  MsR := D3G^.Mt[8]; MsG := D3G^.Mt[9]; MsB := D3G^.Mt[10];
+  MeR := D3G^.Mt[12]; MeG := D3G^.Mt[13]; MeB := D3G^.Mt[14];
+  If D3G^.RS[rsColorVtx] <> 0 Then
+  Begin
+    Src := D3G^.RS[rsDifSrc];
+    If (Src = 1) And (DifC <> 0) Then
+    Begin
+      MdA := ((DifC Shr 24) And 255) / 255;
+      MdR := ((DifC Shr 16) And 255) / 255;
+      MdG := ((DifC Shr 8) And 255) / 255; MdB := (DifC And 255) / 255;
+    End;
+    If (D3G^.RS[rsAmbSrc] = 1) And (DifC <> 0) Then
+    Begin
+      MaR := ((DifC Shr 16) And 255) / 255;
+      MaG := ((DifC Shr 8) And 255) / 255; MaB := (DifC And 255) / 255;
+    End;
+    If (D3G^.RS[rsSpcSrc] = 2) And (SpcC <> 0) Then
+    Begin
+      MsR := ((SpcC Shr 16) And 255) / 255;
+      MsG := ((SpcC Shr 8) And 255) / 255; MsB := (SpcC And 255) / 255;
+    End;
+  End;
+  I := D3G^.RS[rsAmbient];
+  AR := ((I Shr 16) And 255) / 255; AG := ((I Shr 8) And 255) / 255;
+  AB := (I And 255) / 255;
+  DR := 0; DG := 0; DB := 0; SR := 0; SG := 0; SB := 0;
+  For I := 0 To 15 Do
+  Begin
+    If LtV[I].On = 0 Then Continue;
+    At := 1; Sp := 1;
+    If LtV[I].Typ = 3 Then
+    Begin
+      LX := -LtV[I].Dir[0]; LY := -LtV[I].Dir[1];
+      LZ := -LtV[I].Dir[2];
+    End
+    Else
+    Begin
+      LX := LtV[I].Pos[0] - PX; LY := LtV[I].Pos[1] - PY;
+      LZ := LtV[I].Pos[2] - PZ;
+      D := Sqrt(LX * LX + LY * LY + LZ * LZ);
+      If (LtV[I].Rng > 0) And (D > LtV[I].Rng) Then Continue;
+      If D > 0.000001 Then
+      Begin
+        LX := LX / D; LY := LY / D; LZ := LZ / D;
+      End;
+      X := LtV[I].A0 + LtV[I].A1 * D + LtV[I].A2 * D * D;
+      If X > 0.000001 Then At := 1 / X;
+      If LtV[I].Typ = 2 Then
+      Begin
+        Rho := -(LX * LtV[I].Dir[0] + LY * LtV[I].Dir[1] +
+                 LZ * LtV[I].Dir[2]);
+        Ct := Cos(LtV[I].Th / 2); Cp := Cos(LtV[I].Ph / 2);
+        If Rho <= Cp Then Continue;
+        If (Rho < Ct) And (Ct > Cp) Then Sp := (Rho - Cp) / (Ct - Cp);
+      End;
+    End;
+    At := At * Sp;
+    AR := AR + LtV[I].Amb[0] * At; AG := AG + LtV[I].Amb[1] * At;
+    AB := AB + LtV[I].Amb[2] * At;
+    NL := NX * LX + NY * LY + NZ * LZ;
+    If NL <= 0 Then Continue;
+    DR := DR + LtV[I].Dif[0] * NL * At;
+    DG := DG + LtV[I].Dif[1] * NL * At;
+    DB := DB + LtV[I].Dif[2] * NL * At;
+    If (D3G^.RS[rsSpecular] <> 0) And (D3G^.Mt[16] > 0) Then
+    Begin
+      If D3G^.RS[rsLocalView] <> 0 Then
+      Begin
+        D := Sqrt(PX * PX + PY * PY + PZ * PZ);
+        If D > 0.000001 Then
+        Begin
+          VX := -PX / D; VY := -PY / D; VZ := -PZ / D;
+        End
+        Else
+        Begin
+          VX := 0; VY := 0; VZ := -1;
+        End;
+      End
+      Else
+      Begin
+        VX := 0; VY := 0; VZ := -1;
+      End;
+      HX := LX + VX; HY := LY + VY; HZ := LZ + VZ;
+      D := Sqrt(HX * HX + HY * HY + HZ * HZ);
+      If D > 0.000001 Then
+      Begin
+        NH := (NX * HX + NY * HY + NZ * HZ) / D;
+        If NH > 0 Then
+        Begin
+          NH := Exp(D3G^.Mt[16] * Ln(NH)) * At;
+          SR := SR + LtV[I].Spe[0] * NH;
+          SG := SG + LtV[I].Spe[1] * NH;
+          SB := SB + LtV[I].Spe[2] * NH;
+        End;
+      End;
+    End;
+  End;
+  X := MeR + MaR * AR + MdR * DR;
+  Y := MeG + MaG * AG + MdG * DG;
+  Z := MeB + MaB * AB + MdB * DB;
+  If X > 1 Then X := 1;
+  If Y > 1 Then Y := 1;
+  If Z > 1 Then Z := 1;
+  If X < 0 Then X := 0;
+  If Y < 0 Then Y := 0;
+  If Z < 0 Then Z := 0;
+  If MdA > 1 Then MdA := 1;
+  If MdA < 0 Then MdA := 0;
+  V.R := X * 255; V.G := Y * 255; V.B := Z * 255; V.A := MdA * 255;
+  X := MsR * SR; Y := MsG * SG; Z := MsB * SB;
+  If X > 1 Then X := 1;
+  If Y > 1 Then Y := 1;
+  If Z > 1 Then Z := 1;
+  V.SR := X * 255; V.SG := Y * 255; V.SB := Z * 255;
+End;
+
+{ Facteur de brouillard (1 sans brouillard, 0 tout brouillard) }
+Function D3DFogOf(D : Double) : Double;
+Var Md : LongInt; S, E, De, F : Double;
+Begin
+  Md := D3G^.RS[rsFogVtx];
+  If Md = 0 Then Md := D3G^.RS[rsFogTable];
+  If (D3G^.Ver <= 3) And (D3G^.LS[4] <> 0) Then Md := D3G^.LS[4];
+  If Md = 0 Then Md := 3;
+  S := FlL(D3G^.RS[rsFogStart]); E := FlL(D3G^.RS[rsFogEnd]);
+  De := FlL(D3G^.RS[rsFogDens]);
+  If D3G^.Ver <= 3 Then
+  Begin
+    If D3G^.LS[5] <> 0 Then S := FlL(D3G^.LS[5]);
+    If D3G^.LS[6] <> 0 Then E := FlL(D3G^.LS[6]);
+    If D3G^.LS[7] <> 0 Then De := FlL(D3G^.LS[7]);
+  End;
+  Case Md Of
+    1 : F := Exp(-De * D);
+    2 : F := Exp(-(De * D) * (De * D));
+  Else
+    If E - S > 0.000001 Then F := (E - D) / (E - S) Else F := 1;
+  End;
+  If F < 0 Then F := 0;
+  If F > 1 Then F := 1;
+  D3DFogOf := F;
+End;
+
+{ Traiter N sommets (format courant VF*, pas VFStride) de Src vers DV }
+Procedure D3DProcess(Src, N : LongInt; Light : Boolean);
+Var I, J, A, C, S, K, T : LongInt; X, Y, Z, W, PX, PY, PZ, NX, NY, NZ,
+    NX2, NY2, NZ2 : Double;
+    M : TMat;
+Begin
+  D3DGrow(DVBase + N);
+  D3DMats;
+  M := D3G^.WVP;
+  For I := 0 To N - 1 Do
+  Begin
+    J := DVBase + I;
+    A := Src + I * VFStride;
+    X := FlM(A); Y := FlM(A + 4); Z := FlM(A + 8);
+    If VFDif >= 0 Then C := MemL[0:A + VFDif] Else C := -1;
+    If VFSpc >= 0 Then S := MemL[0:A + VFSpc] Else S := 0;
+    If VFRhw <> 0 Then
+    Begin
+      W := FlM(A + 12);
+      DV^[J].SX := X; DV^[J].SY := Y; DV^[J].SZ := Z;
+      If Abs(W) < 0.0000001 Then W := 1;
+      DV^[J].RW := W;
+      DV^[J].X := X; DV^[J].Y := Y; DV^[J].Z := Z; DV^[J].W := 1 / W;
+      DV^[J].CF := 0;
+    End
+    Else
+    Begin
+      DV^[J].X := X * M[0] + Y * M[4] + Z * M[8] + M[12];
+      DV^[J].Y := X * M[1] + Y * M[5] + Z * M[9] + M[13];
+      DV^[J].Z := X * M[2] + Y * M[6] + Z * M[10] + M[14];
+      DV^[J].W := X * M[3] + Y * M[7] + Z * M[11] + M[15];
+      DV^[J].CF := -1;
+    End;
+    DV^[J].A := (C Shr 24) And 255; DV^[J].R := (C Shr 16) And 255;
+    DV^[J].G := (C Shr 8) And 255; DV^[J].B := C And 255;
+    DV^[J].SR := (S Shr 16) And 255; DV^[J].SG := (S Shr 8) And 255;
+    DV^[J].SB := S And 255;
+    DV^[J].F := 1;
+    If (VFRhw <> 0) And (VFSpc >= 0) Then
+      DV^[J].F := ((S Shr 24) And 255) / 255;
+    If (VFRhw = 0) And (Light Or (D3G^.RS[rsFog] <> 0)) Then
+    Begin
+      PX := X * D3G^.WV[0] + Y * D3G^.WV[4] + Z * D3G^.WV[8] + D3G^.WV[12];
+      PY := X * D3G^.WV[1] + Y * D3G^.WV[5] + Z * D3G^.WV[9] + D3G^.WV[13];
+      PZ := X * D3G^.WV[2] + Y * D3G^.WV[6] + Z * D3G^.WV[10] + D3G^.WV[14];
+      If Light And (VFNrm >= 0) Then
+      Begin
+        NX := FlM(A + VFNrm); NY := FlM(A + VFNrm + 4);
+        NZ := FlM(A + VFNrm + 8);
+        NX2 := NX * D3G^.WV[0] + NY * D3G^.WV[4] + NZ * D3G^.WV[8];
+        NY2 := NX * D3G^.WV[1] + NY * D3G^.WV[5] + NZ * D3G^.WV[9];
+        NZ2 := NX * D3G^.WV[2] + NY * D3G^.WV[6] + NZ * D3G^.WV[10];
+        If VFDif < 0 Then C := 0;
+        D3DLight(PX, PY, PZ, NX2, NY2, NZ2, C, S, DV^[J]);
+      End;
+      If D3G^.RS[rsFog] <> 0 Then DV^[J].F := D3DFogOf(Abs(PZ));
+    End;
+    DV^[J].U0 := 0; DV^[J].V0 := 0; DV^[J].U1 := 0; DV^[J].V1 := 0;
+    For K := 0 To 1 Do
+    Begin
+      T := D3G^.TS[K * 32 + tsTCI] And $FFFF;
+      If (D3G^.Ver <= 2) Then T := 0;
+      If T < VFTexN Then
+      Begin
+        If K = 0 Then
+        Begin
+          DV^[J].U0 := FlM(A + VFTex[T]);
+          If VFTexD[T] > 1 Then DV^[J].V0 := FlM(A + VFTex[T] + 4);
+        End
+        Else
+        Begin
+          DV^[J].U1 := FlM(A + VFTex[T]);
+          If VFTexD[T] > 1 Then DV^[J].V1 := FlM(A + VFTex[T] + 4);
+        End;
+      End;
+    End;
+  End;
+  D3G^.Verts := D3G^.Verts + N;
+End;
+
+{ Projection dans la fenetre d'affichage }
+Procedure D3DProject(Var V : TVtx);
+Var IW : Double;
+Begin
+  If V.CF = 0 Then Exit;
+  If Abs(V.W) < 0.0000001 Then IW := 10000000 Else IW := 1 / V.W;
+  V.SX := D3G^.VX + ((V.X * IW - D3G^.ClX) / D3G^.ClW) * D3G^.VW;
+  V.SY := D3G^.VY + ((D3G^.ClY - V.Y * IW) / D3G^.ClH) * D3G^.VH;
+  V.SZ := D3G^.VMinZ + V.Z * IW * (D3G^.VMaxZ - D3G^.VMinZ);
+  V.RW := IW;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Decoupage (polygone dans DC, N sommets) : 6 plans                  }
+{ ------------------------------------------------------------------ }
+
+Function PlaneD(Var V : TVtx; P : LongInt) : Double;
+Begin
+  Case P Of
+    0 : PlaneD := V.X - D3G^.ClX * V.W;
+    1 : PlaneD := (D3G^.ClX + D3G^.ClW) * V.W - V.X;
+    2 : PlaneD := V.Y - (D3G^.ClY - D3G^.ClH) * V.W;
+    3 : PlaneD := D3G^.ClY * V.W - V.Y;
+    4 : PlaneD := V.Z;
+  Else
+    PlaneD := V.W - V.Z;
+  End;
+End;
+
+Procedure VLerp(Var R : TVtx; Var A, B : TVtx; T : Double);
+Begin
+  R.X := A.X + (B.X - A.X) * T; R.Y := A.Y + (B.Y - A.Y) * T;
+  R.Z := A.Z + (B.Z - A.Z) * T; R.W := A.W + (B.W - A.W) * T;
+  R.A := A.A + (B.A - A.A) * T; R.R := A.R + (B.R - A.R) * T;
+  R.G := A.G + (B.G - A.G) * T; R.B := A.B + (B.B - A.B) * T;
+  R.SR := A.SR + (B.SR - A.SR) * T; R.SG := A.SG + (B.SG - A.SG) * T;
+  R.SB := A.SB + (B.SB - A.SB) * T; R.F := A.F + (B.F - A.F) * T;
+  R.U0 := A.U0 + (B.U0 - A.U0) * T; R.V0 := A.V0 + (B.V0 - A.V0) * T;
+  R.U1 := A.U1 + (B.U1 - A.U1) * T; R.V1 := A.V1 + (B.V1 - A.V1) * T;
+  R.CF := -1;
+End;
+
+Function D3DClipPoly(N : LongInt) : LongInt;
+Var P, I, J, M : LongInt; DA, DB : Double;
+Begin
+  For P := 0 To 5 Do
+  Begin
+    If N < 3 Then
+    Begin
+      D3DClipPoly := 0;
+      Exit;
+    End;
+    M := 0;
+    For I := 0 To N - 1 Do
+    Begin
+      J := (I + 1) Mod N;
+      DA := PlaneD(DC[I], P); DB := PlaneD(DC[J], P);
+      If DA >= 0 Then
+      Begin
+        If M < 15 Then
+        Begin
+          DC2[M] := DC[I]; Inc(M);
+        End;
+      End;
+      If ((DA >= 0) And (DB < 0)) Or ((DA < 0) And (DB >= 0)) Then
+        If M < 15 Then
+        Begin
+          VLerp(DC2[M], DC[I], DC[J], DA / (DA - DB));
+          Inc(M);
+        End;
+    End;
+    For I := 0 To M - 1 Do DC[I] := DC2[I];
+    N := M;
+  End;
+  D3DClipPoly := N;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Rasterisation                                                      }
+{ ------------------------------------------------------------------ }
+
+Function Mul8(A, B : LongInt) : LongInt;
+Begin
+  Mul8 := (A * B + 128) Div 255;
+End;
+
+Function Clamp8(V : LongInt) : LongInt;
+Begin
+  If V < 0 Then V := 0;
+  If V > 255 Then V := 255;
+  Clamp8 := V;
+End;
+
+Function CmpOk(Fn, A, B : LongInt) : Boolean;
+Begin
+  Case Fn Of
+    1 : CmpOk := False;
+    2 : CmpOk := A < B;
+    3 : CmpOk := A = B;
+    4 : CmpOk := A <= B;
+    5 : CmpOk := A > B;
+    6 : CmpOk := A <> B;
+    7 : CmpOk := A >= B;
+  Else
+    CmpOk := True;
+  End;
+End;
+
+{ Texel brut -> ARGB selon la sorte du format }
+Function TxDecode(K, V : LongInt) : LongInt;
+Var R, G, B, A : LongInt;
+Begin
+  Case TxKind[K] Of
+    1 : TxDecode := TxPal[V And 255];
+    2 :
+    Begin
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      TxDecode := LongInt($FF000000) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                  (((G Shl 2) Or (G Shr 4)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+    End;
+    3, 7 :
+    Begin
+      R := (V Shr 10) And 31; G := (V Shr 5) And 31; B := V And 31;
+      A := 255;
+      If (TxKind[K] = 7) And ((V And $8000) = 0) Then A := 0;
+      TxDecode := (A Shl 24) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                  (((G Shl 3) Or (G Shr 2)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+    End;
+    8 :
+    Begin
+      A := (V Shr 12) And 15; R := (V Shr 8) And 15; G := (V Shr 4) And 15;
+      B := V And 15;
+      TxDecode := ((A * 17) Shl 24) Or ((R * 17) Shl 16) Or
+                  ((G * 17) Shl 8) Or (B * 17);
+    End;
+    4, 5 : TxDecode := LongInt($FF000000) Or (V And $FFFFFF);
+    6 : TxDecode := V;
+  Else
+    TxDecode := SfToRGB(TxS[K], V);
+  End;
+End;
+
+{ Coordonnee de texel (16.16) -> indice selon le mode d'adressage }
+Function TxAddr(C, N, Md : LongInt) : LongInt;
+Var X : LongInt;
+Begin
+  If C >= 0 Then X := C Shr 16
+  Else X := -1 - ((-C - 1) Shr 16);
+  Case Md Of
+    3, 4 :
+    Begin
+      If X < 0 Then X := 0;
+      If X >= N Then X := N - 1;
+    End;
+    2 :
+    Begin
+      X := X Mod (2 * N);
+      If X < 0 Then X := X + 2 * N;
+      If X >= N Then X := 2 * N - 1 - X;
+    End;
+  Else
+    If (N And (N - 1)) = 0 Then X := X And (N - 1)
+    Else
+    Begin
+      X := X Mod N;
+      If X < 0 Then X := X + N;
+    End;
+  End;
+  TxAddr := X;
+End;
+
+{ Texel de l'etage K en (U, V) 16.16 ; -1 dans Hit si cle de couleur }
+Function TxFetch(K, U, V : LongInt; Var Keyed : Boolean) : LongInt;
+Var X, Y, A, Raw : LongInt;
+Begin
+  X := TxAddr(U, TxW[K], TxAddrU[K]);
+  Y := TxAddr(V, TxH[K], TxAddrV[K]);
+  A := TxBits[K] + Y * TxPitch[K];
+  Case TxBy[K] Of
+    1 : Raw := Mem[0:A + X];
+    2 : Raw := MemW[0:A + X * 2];
+    3 : Raw := MemW[0:A + X * 3] Or (Mem[0:A + X * 3 + 2] Shl 16);
+  Else
+    Raw := MemL[0:A + X * 4];
+  End;
+  If (TxKeyOn[K] <> 0) And (Raw = TxKey[K]) Then Keyed := True;
+  TxFetch := TxDecode(K, Raw);
+End;
+
+{ Argument d'un etage : 0 diffuse, 1 courant, 2 texture, 3 facteur,
+  4 speculaire ; 10h complement, 20h alpha replique }
+Function TxArg(Ar, Dif, Cur, Tex, Spe : LongInt) : LongInt;
+Var V, A : LongInt;
+Begin
+  Case Ar And 7 Of
+    0 : V := Dif;
+    1 : V := Cur;
+    2 : V := Tex;
+    3 : V := RTFac;
+    4 : V := Spe;
+  Else
+    V := Cur;
+  End;
+  If (Ar And $10) <> 0 Then V := V Xor -1;
+  If (Ar And $20) <> 0 Then
+  Begin
+    A := (V Shr 24) And 255;
+    V := (A Shl 24) Or (A Shl 16) Or (A Shl 8) Or A;
+  End;
+  TxArg := V;
+End;
+
+{ Operation d'etage sur une composante (decalage Sh) }
+Function TxOpC(Op, A1, A2, Sh, Dif, Tex, Cur : LongInt) : LongInt;
+Var X, Y, R, T : LongInt;
+Begin
+  X := (A1 Shr Sh) And 255; Y := (A2 Shr Sh) And 255;
+  Case Op Of
+    2 : R := X;
+    3 : R := Y;
+    4 : R := Mul8(X, Y);
+    5 : R := Clamp8(Mul8(X, Y) * 2);
+    6 : R := Clamp8(Mul8(X, Y) * 4);
+    7 : R := Clamp8(X + Y);
+    8 : R := Clamp8(X + Y - 128);
+    9 : R := Clamp8((X + Y - 128) * 2);
+    10 : R := Clamp8(X - Y);
+    11 : R := Clamp8(X + Y - Mul8(X, Y));
+    12, 13, 14, 16 :
+    Begin
+      Case Op Of
+        12 : T := (Dif Shr 24) And 255;
+        13 : T := (Tex Shr 24) And 255;
+        14 : T := (RTFac Shr 24) And 255;
+      Else
+        T := (Cur Shr 24) And 255;
+      End;
+      R := Clamp8(Mul8(X, T) + Mul8(Y, 255 - T));
+    End;
+    15 : R := Clamp8(X + Mul8(Y, 255 - ((Tex Shr 24) And 255)));
+    18 : R := Clamp8(X + Mul8((A1 Shr 24) And 255, Y));
+    20 : R := Clamp8(X + Mul8(255 - ((A1 Shr 24) And 255), Y));
+  Else
+    R := Mul8(X, Y);
+  End;
+  TxOpC := R;
+End;
+
+{ Melange des etages : couleur finale (avant brouillard) }
+Function D3DShade(Dif, Spe : LongInt; Var T0, T1 : LongInt) : LongInt;
+Var K, Cur, Tex, A1, A2, R, G, B, A, Op : LongInt;
+Begin
+  Cur := Dif;
+  For K := 0 To NStage - 1 Do
+  Begin
+    If K = 0 Then Tex := T0 Else Tex := T1;
+    Op := TxCOp[K];
+    If Op <= 1 Then Break;
+    A1 := TxArg(TxCA1[K], Dif, Cur, Tex, Spe);
+    A2 := TxArg(TxCA2[K], Dif, Cur, Tex, Spe);
+    R := TxOpC(Op, A1, A2, 16, Dif, Tex, Cur);
+    G := TxOpC(Op, A1, A2, 8, Dif, Tex, Cur);
+    B := TxOpC(Op, A1, A2, 0, Dif, Tex, Cur);
+    Op := TxAOp[K];
+    If Op <= 1 Then A := (Cur Shr 24) And 255
+    Else
+    Begin
+      A1 := TxArg(TxAA1[K], Dif, Cur, Tex, Spe);
+      A2 := TxArg(TxAA2[K], Dif, Cur, Tex, Spe);
+      A := TxOpC(Op, A1, A2, 24, Dif, Tex, Cur);
+    End;
+    Cur := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+  End;
+  D3DShade := Cur;
+End;
+
+{ Melange de texture des versions 1 et 2 (D3DRENDERSTATE_TEXTUREMAPBLEND) }
+Function D3DLegacy(Dif, Tex : LongInt; HasA : Boolean) : LongInt;
+Var A, R, G, B, T : LongInt;
+Begin
+  Case D3G^.LegBlend Of
+    1, 5, 7 : D3DLegacy := Tex;
+    3 :
+    Begin
+      T := (Tex Shr 24) And 255;
+      R := Mul8((Tex Shr 16) And 255, T) + Mul8((Dif Shr 16) And 255, 255 - T);
+      G := Mul8((Tex Shr 8) And 255, T) + Mul8((Dif Shr 8) And 255, 255 - T);
+      B := Mul8(Tex And 255, T) + Mul8(Dif And 255, 255 - T);
+      D3DLegacy := (Dif And LongInt($FF000000)) Or (Clamp8(R) Shl 16) Or
+                   (Clamp8(G) Shl 8) Or Clamp8(B);
+    End;
+    8 :
+    Begin
+      R := Clamp8(((Tex Shr 16) And 255) + ((Dif Shr 16) And 255));
+      G := Clamp8(((Tex Shr 8) And 255) + ((Dif Shr 8) And 255));
+      B := Clamp8((Tex And 255) + (Dif And 255));
+      D3DLegacy := (Dif And LongInt($FF000000)) Or (R Shl 16) Or (G Shl 8)
+                   Or B;
+    End;
+  Else
+    Begin
+      R := Mul8((Tex Shr 16) And 255, (Dif Shr 16) And 255);
+      G := Mul8((Tex Shr 8) And 255, (Dif Shr 8) And 255);
+      B := Mul8(Tex And 255, Dif And 255);
+      If D3G^.LegBlend = 4 Then
+        A := Mul8((Tex Shr 24) And 255, (Dif Shr 24) And 255)
+      Else If HasA Then A := (Tex Shr 24) And 255
+      Else A := (Dif Shr 24) And 255;
+      D3DLegacy := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+    End;
+  End;
+End;
+
+{ Facteur de melange (D3DBLEND) pour la source S et la destination D }
+Function BlFac(F, S, D, Sh : LongInt) : LongInt;
+Var SA, DA : LongInt;
+Begin
+  SA := (S Shr 24) And 255; DA := (D Shr 24) And 255;
+  Case F Of
+    1 : BlFac := 0;
+    2 : BlFac := 255;
+    3 : BlFac := (S Shr Sh) And 255;
+    4 : BlFac := 255 - ((S Shr Sh) And 255);
+    5, 12 : BlFac := SA;
+    6, 13 : BlFac := 255 - SA;
+    7 : BlFac := DA;
+    8 : BlFac := 255 - DA;
+    9 : BlFac := (D Shr Sh) And 255;
+    10 : BlFac := 255 - ((D Shr Sh) And 255);
+    11 : BlFac := Min(SA, 255 - DA);
+  Else
+    BlFac := 255;
+  End;
+End;
+
+{ Pixel de la cible -> ARGB et inversement }
+Function RtGet(A : LongInt) : LongInt;
+Var V, R, G, B : LongInt;
+Begin
+  Case RKind Of
+    1 : RtGet := LongInt($FF000000) Or SfPalRGB(RTs, Mem[0:A]);
+    2 :
+    Begin
+      V := MemW[0:A];
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      RtGet := LongInt($FF000000) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+               (((G Shl 2) Or (G Shr 4)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+    End;
+    4 : RtGet := LongInt($FF000000) Or MemW[0:A] Or (Mem[0:A + 2] Shl 16);
+    5, 6 : RtGet := MemL[0:A];
+  Else
+    Begin
+      Case RBy Of
+        1 : V := Mem[0:A];
+        2 : V := MemW[0:A];
+        3 : V := MemW[0:A] Or (Mem[0:A + 2] Shl 16);
+      Else
+        V := MemL[0:A];
+      End;
+      RtGet := SfToRGB(RTs, V);
+    End;
+  End;
+End;
+
+Procedure RtPut(A, C : LongInt);
+Var V : LongInt;
+Begin
+  Case RKind Of
+    1 : Mem[0:A] := DXIdxOf(C);
+    2 : MemW[0:A] := ((C Shr 8) And $F800) Or ((C Shr 5) And $7E0) Or
+                     ((C Shr 3) And $1F);
+    3 : MemW[0:A] := ((C Shr 9) And $7C00) Or ((C Shr 6) And $3E0) Or
+                     ((C Shr 3) And $1F);
+    4 :
+    Begin
+      MemW[0:A] := C; Mem[0:A + 2] := C Shr 16;
+    End;
+    5 : MemL[0:A] := C And $FFFFFF;
+    6 : MemL[0:A] := C;
+  Else
+    Begin
+      V := SfFromRGB(RTs, C);
+      Case RBy Of
+        1 : Mem[0:A] := V;
+        2 : MemW[0:A] := V;
+        3 :
+        Begin
+          MemW[0:A] := V; Mem[0:A + 2] := V Shr 16;
+        End;
+      Else
+        MemL[0:A] := V;
+      End;
+    End;
+  End;
+End;
+
+{ Ecrire un pixel (tests, melange) ; Z en 24 bits (0..FFFFFFh) }
+Procedure D3DPixel(X, Y, Z, Dif, Spe, Fog, U0, V0, U1, V1 : LongInt);
+Var ZA, ZO, CA, C, T0, T1, D, A, R, G, B, FS, FD : LongInt;
+    Keyed : Boolean;
+Begin
+  ZA := 0;
+  If RZOn <> 0 Then
+  Begin
+    ZA := ZBits + Y * ZPitch + X * ZBy;
+    If ZBy = 2 Then
+    Begin
+      ZO := MemW[0:ZA]; Z := Z Shr 8;
+    End
+    Else ZO := MemL[0:ZA] And $FFFFFF;
+    If Not CmpOk(RZFn, Z, ZO) Then Exit;
+  End;
+  Keyed := False;
+  T0 := -1; T1 := -1;
+  If TxOn[0] Then T0 := TxFetch(0, U0, V0, Keyed);
+  If TxOn[1] Then T1 := TxFetch(1, U1, V1, Keyed);
+  If Keyed And (RCKey <> 0) Then Exit;
+  If D3G^.UseTSS <> 0 Then C := D3DShade(Dif, Spe, T0, T1)
+  Else If TxOn[0] Then
+    C := D3DLegacy(Dif, T0, (TxKind[0] = 6) Or (TxKind[0] = 7) Or
+                   (TxKind[0] = 8))
+  Else C := Dif;
+  If RATst <> 0 Then
+    If Not CmpOk(RAFn, (C Shr 24) And 255, RARef) Then Exit;
+  If RSpec <> 0 Then
+  Begin
+    R := Clamp8(((C Shr 16) And 255) + ((Spe Shr 16) And 255));
+    G := Clamp8(((C Shr 8) And 255) + ((Spe Shr 8) And 255));
+    B := Clamp8((C And 255) + (Spe And 255));
+    C := (C And LongInt($FF000000)) Or (R Shl 16) Or (G Shl 8) Or B;
+  End;
+  If (RFogOn <> 0) And (Fog < 255) Then
+  Begin
+    R := Mul8((C Shr 16) And 255, Fog) + Mul8((RFogC Shr 16) And 255,
+                                               255 - Fog);
+    G := Mul8((C Shr 8) And 255, Fog) + Mul8((RFogC Shr 8) And 255, 255 - Fog);
+    B := Mul8(C And 255, Fog) + Mul8(RFogC And 255, 255 - Fog);
+    C := (C And LongInt($FF000000)) Or (Clamp8(R) Shl 16) Or
+         (Clamp8(G) Shl 8) Or Clamp8(B);
+  End;
+  CA := RBits + Y * RPitch + X * RBy;
+  If RABl <> 0 Then
+  Begin
+    D := RtGet(CA);
+    If (RSrc = 12) Or (RSrc = 13) Then
+    Begin
+      If RSrc = 12 Then FS := 5 Else FS := 6;
+      FD := 11 - FS;
+    End
+    Else
+    Begin
+      FS := RSrc; FD := RDst;
+    End;
+    R := Clamp8(Mul8((C Shr 16) And 255, BlFac(FS, C, D, 16)) +
+                Mul8((D Shr 16) And 255, BlFac(FD, C, D, 16)));
+    G := Clamp8(Mul8((C Shr 8) And 255, BlFac(FS, C, D, 8)) +
+                Mul8((D Shr 8) And 255, BlFac(FD, C, D, 8)));
+    B := Clamp8(Mul8(C And 255, BlFac(FS, C, D, 0)) +
+                Mul8(D And 255, BlFac(FD, C, D, 0)));
+    A := Clamp8(Mul8((C Shr 24) And 255, BlFac(FS, C, D, 24)) +
+                Mul8((D Shr 24) And 255, BlFac(FD, C, D, 24)));
+    C := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+  End;
+  RtPut(CA, C);
+  If (RZOn <> 0) And (RZWr <> 0) Then
+  Begin
+    If ZBy = 2 Then MemW[0:ZA] := Z
+    Else MemL[0:ZA] := (MemL[0:ZA] And LongInt($FF000000)) Or Z;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Triangle (sommets ecran)                                           }
+{ ------------------------------------------------------------------ }
+
+Const
+  NAt = 14;  { z, 1/w, a, r, g, b, sr, sg, sb, fog, u0/w, v0/w, u1/w, v1/w }
+
+Type
+  TAt = Array[0..NAt - 1] Of Double;
+
+Procedure VAttr(Var V : TVtx; Var At : TAt);
+Begin
+  At[0] := V.SZ; At[1] := V.RW;
+  At[2] := V.A; At[3] := V.R; At[4] := V.G; At[5] := V.B;
+  At[6] := V.SR; At[7] := V.SG; At[8] := V.SB; At[9] := V.F * 255;
+  At[10] := V.U0 * V.RW; At[11] := V.V0 * V.RW;
+  At[12] := V.U1 * V.RW; At[13] := V.V1 * V.RW;
+End;
+
+Function DRound(D : Double) : LongInt;
+Begin
+  If D > 2000000000 Then D := 2000000000;
+  If D < -2000000000 Then D := -2000000000;
+  DRound := Round(D);
+End;
+
+Procedure D3DLine(Var P, Q : TVtx); Forward;
+Procedure D3DPoint(Var P : TVtx); Forward;
+
+Procedure D3DTri(Var V0, V1, V2 : TVtx);
+Var A0, A1, A2, DX, DY, AT : TAt;
+    X0, Y0, X1, Y1, X2, Y2, Ar, YA, YB, XL, XR, T, W, U, V, U2, VV2,
+    UE, VE, UE2, VE3 : Double;
+    K, Y, YBeg, YEnd, XS, XE, X, Z, DZ, C0, CR, CG, CB, CA, SR, SG, SB, FF,
+    DCA, DCR, DCG, DCB, DSR, DSG, DSB, DFF, Seg, N, IU, IV, IU2, IV2,
+    DU, DV2, DU2, DV3, Dif, Spe : LongInt;
+    Flat : Boolean;
+Begin
+  X0 := V0.SX; Y0 := V0.SY; X1 := V1.SX; Y1 := V1.SY; X2 := V2.SX;
+  Y2 := V2.SY;
+  Ar := (X1 - X0) * (Y2 - Y0) - (X2 - X0) * (Y1 - Y0);
+  If Abs(Ar) < 0.0001 Then Exit;
+  If (RCull = 2) And (Ar > 0) Then Exit;
+  If (RCull = 3) And (Ar < 0) Then Exit;
+  If RFill = 1 Then
+  Begin
+    D3DPoint(V0); D3DPoint(V1); D3DPoint(V2);
+    Exit;
+  End;
+  If RFill = 2 Then
+  Begin
+    D3DLine(V0, V1); D3DLine(V1, V2); D3DLine(V2, V0);
+    Exit;
+  End;
+  Inc(D3G^.Tris);
+  VAttr(V0, A0); VAttr(V1, A1); VAttr(V2, A2);
+  Flat := RShade = 1;
+  If Flat Then
+    For K := 2 To 8 Do
+    Begin
+      A1[K] := A0[K]; A2[K] := A0[K];
+    End;
+  For K := 0 To NAt - 1 Do
+  Begin
+    DX[K] := ((A1[K] - A0[K]) * (Y2 - Y0) - (A2[K] - A0[K]) * (Y1 - Y0)) / Ar;
+    DY[K] := ((A2[K] - A0[K]) * (X1 - X0) - (A1[K] - A0[K]) * (X2 - X0)) / Ar;
+  End;
+  YA := Y0; YB := Y0;
+  If Y1 < YA Then YA := Y1;
+  If Y2 < YA Then YA := Y2;
+  If Y1 > YB Then YB := Y1;
+  If Y2 > YB Then YB := Y2;
+  YBeg := DRound(YA + 0.4999999);
+  If YBeg < YA Then Inc(YBeg);
+  YEnd := DRound(YB + 0.4999999) - 1;
+  If YBeg < ClipT Then YBeg := ClipT;
+  If YEnd > ClipB - 1 Then YEnd := ClipB - 1;
+  For Y := YBeg To YEnd Do
+  Begin
+    { intersections des aretes avec la ligne Y }
+    XL := 1E30; XR := -1E30;
+    For K := 0 To 2 Do
+    Begin
+      Case K Of
+        0 : Begin YA := Y0; T := X0; W := Y1; U := X1; End;
+        1 : Begin YA := Y1; T := X1; W := Y2; U := X2; End;
+      Else
+        Begin YA := Y2; T := X2; W := Y0; U := X0; End;
+      End;
+      If YA = W Then Continue;
+      If YA < W Then
+      Begin
+        If (Y < YA) Or (Y >= W) Then Continue;
+      End
+      Else If (Y < W) Or (Y >= YA) Then Continue;
+      V := T + (Y - YA) * (U - T) / (W - YA);
+      If V < XL Then XL := V;
+      If V > XR Then XR := V;
+    End;
+    If XL > XR Then Continue;
+    XS := DRound(XL + 0.4999999);
+    If XS < XL Then Inc(XS);
+    XE := DRound(XR + 0.4999999) - 1;
+    If XS < ClipL Then XS := ClipL;
+    If XE > ClipR - 1 Then XE := ClipR - 1;
+    If XS > XE Then Continue;
+    For K := 0 To NAt - 1 Do
+      AT[K] := A0[K] + DX[K] * (XS - X0) + DY[K] * (Y - Y0);
+    Z := DRound(AT[0] * 16777215); DZ := DRound(DX[0] * 16777215);
+    CA := DRound(AT[2] * 65536); CR := DRound(AT[3] * 65536);
+    CG := DRound(AT[4] * 65536); CB := DRound(AT[5] * 65536);
+    SR := DRound(AT[6] * 65536); SG := DRound(AT[7] * 65536);
+    SB := DRound(AT[8] * 65536); FF := DRound(AT[9] * 65536);
+    DCA := DRound(DX[2] * 65536); DCR := DRound(DX[3] * 65536);
+    DCG := DRound(DX[4] * 65536); DCB := DRound(DX[5] * 65536);
+    DSR := DRound(DX[6] * 65536); DSG := DRound(DX[7] * 65536);
+    DSB := DRound(DX[8] * 65536); DFF := DRound(DX[9] * 65536);
+    X := XS;
+    While X <= XE Do
+    Begin
+      { segment de 16 pixels : coordonnees de texture exactes aux bouts }
+      N := Min(16, XE - X + 1);
+      IU := 0; IV := 0; IU2 := 0; IV2 := 0; DU := 0; DV2 := 0; DU2 := 0;
+      DV3 := 0;
+      If TxOn[0] Or TxOn[1] Then
+      Begin
+        W := AT[1] + DX[1] * (X - XS);
+        T := AT[1] + DX[1] * (X + N - XS);
+        If Abs(W) < 1E-12 Then W := 1E-12;
+        If Abs(T) < 1E-12 Then T := 1E-12;
+        U := (AT[10] + DX[10] * (X - XS)) / W;
+        V := (AT[11] + DX[11] * (X - XS)) / W;
+        UE := (AT[10] + DX[10] * (X + N - XS)) / T;
+        VE := (AT[11] + DX[11] * (X + N - XS)) / T;
+        IU := DRound(U * TxW[0] * 65536 - 32768);
+        IV := DRound(V * TxH[0] * 65536 - 32768);
+        DU := (DRound(UE * TxW[0] * 65536 - 32768) - IU) Div N;
+        DV2 := (DRound(VE * TxH[0] * 65536 - 32768) - IV) Div N;
+        If TxOn[1] Then
+        Begin
+          U2 := (AT[12] + DX[12] * (X - XS)) / W;
+          VV2 := (AT[13] + DX[13] * (X - XS)) / W;
+          UE2 := (AT[12] + DX[12] * (X + N - XS)) / T;
+          VE3 := (AT[13] + DX[13] * (X + N - XS)) / T;
+          IU2 := DRound(U2 * TxW[1] * 65536 - 32768);
+          IV2 := DRound(VV2 * TxH[1] * 65536 - 32768);
+          DU2 := (DRound(UE2 * TxW[1] * 65536 - 32768) - IU2) Div N;
+          DV3 := (DRound(VE3 * TxH[1] * 65536 - 32768) - IV2) Div N;
+        End;
+      End;
+      For K := 0 To N - 1 Do
+      Begin
+        Dif := (Clamp8(CA Div 65536) Shl 24) Or (Clamp8(CR Div 65536) Shl 16)
+               Or (Clamp8(CG Div 65536) Shl 8) Or Clamp8(CB Div 65536);
+        Spe := (Clamp8(SR Div 65536) Shl 16) Or (Clamp8(SG Div 65536) Shl 8)
+               Or Clamp8(SB Div 65536);
+        C0 := Z;
+        If C0 < 0 Then C0 := 0;
+        If C0 > $FFFFFF Then C0 := $FFFFFF;
+        D3DPixel(X, Y, C0, Dif, Spe, Clamp8(FF Div 65536), IU, IV, IU2, IV2);
+        Z := Z + DZ;
+        CA := CA + DCA; CR := CR + DCR; CG := CG + DCG; CB := CB + DCB;
+        SR := SR + DSR; SG := SG + DSG; SB := SB + DSB; FF := FF + DFF;
+        IU := IU + DU; IV := IV + DV2; IU2 := IU2 + DU2; IV2 := IV2 + DV3;
+        Inc(X);
+      End;
+    End;
+  End;
+End;
+
+{ Couleur diffuse et speculaire d'un sommet }
+Function VDif(Var P : TVtx) : LongInt;
+Begin
+  VDif := (Clamp8(DRound(P.A)) Shl 24) Or (Clamp8(DRound(P.R)) Shl 16) Or
+          (Clamp8(DRound(P.G)) Shl 8) Or Clamp8(DRound(P.B));
+End;
+
+Function VSpe(Var P : TVtx) : LongInt;
+Begin
+  VSpe := (Clamp8(DRound(P.SR)) Shl 16) Or (Clamp8(DRound(P.SG)) Shl 8) Or
+          Clamp8(DRound(P.SB));
+End;
+
+Procedure D3DPoint(Var P : TVtx);
+Var X, Y, Z : LongInt;
+Begin
+  X := DRound(P.SX); Y := DRound(P.SY);
+  If (X < ClipL) Or (Y < ClipT) Or (X >= ClipR) Or (Y >= ClipB) Then Exit;
+  Z := DRound(P.SZ * 16777215);
+  If Z < 0 Then Z := 0;
+  If Z > $FFFFFF Then Z := $FFFFFF;
+  D3DPixel(X, Y, Z, VDif(P), VSpe(P), Clamp8(DRound(P.F * 255)),
+           DRound(P.U0 * TxW[0] * 65536), DRound(P.V0 * TxH[0] * 65536),
+           DRound(P.U1 * TxW[1] * 65536), DRound(P.V1 * TxH[1] * 65536));
+End;
+
+Procedure D3DLine(Var P, Q : TVtx);
+Var N, I, X, Y, Z : LongInt; T, DXX, DYY : Double; M : TVtx;
+Begin
+  DXX := Q.SX - P.SX; DYY := Q.SY - P.SY;
+  N := DRound(Abs(DXX));
+  If DRound(Abs(DYY)) > N Then N := DRound(Abs(DYY));
+  If N > 4096 Then N := 4096;
+  If N < 1 Then N := 1;
+  For I := 0 To N - 1 Do
+  Begin
+    T := I / N;
+    M := P;
+    M.SX := P.SX + DXX * T; M.SY := P.SY + DYY * T;
+    M.SZ := P.SZ + (Q.SZ - P.SZ) * T;
+    If RShade <> 1 Then
+    Begin
+      M.A := P.A + (Q.A - P.A) * T; M.R := P.R + (Q.R - P.R) * T;
+      M.G := P.G + (Q.G - P.G) * T; M.B := P.B + (Q.B - P.B) * T;
+    End;
+    M.U0 := P.U0 + (Q.U0 - P.U0) * T; M.V0 := P.V0 + (Q.V0 - P.V0) * T;
+    X := 0; Y := 0; Z := 0;
+    D3DPoint(M);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Preparation d'un dessin : cible, Z, textures, etats                }
+{ ------------------------------------------------------------------ }
+
+Procedure TxBind(K, S : LongInt);
+Var I, P, L, M : LongInt;
+Begin
+  TxOn[K] := False;
+  If S = 0 Then Exit;
+  { niveau de mipmap : le premier (le choix par triangle est fait par
+    la taille de la cible) }
+  TxS[K] := S;
+  TxBits[K] := MemL[0:S + 76]; TxPitch[K] := MemL[0:S + 72];
+  TxW[K] := MemL[0:S + 64]; TxH[K] := MemL[0:S + 68];
+  TxBy[K] := SfBytes(S);
+  TxKind[K] := MemL[0:S + 272];
+  If (MemL[0:S + 88] = 16) And (MemL[0:S + 96] = $7C00) And
+     (MemL[0:S + 108] = $8000) Then TxKind[K] := 7;
+  If (MemL[0:S + 88] = 16) And (MemL[0:S + 96] = $F00) And
+     (MemL[0:S + 108] = $F000) Then TxKind[K] := 8;
+  TxKeyOn[K] := MemL[0:S + 148] And 1;
+  TxKey[K] := MemL[0:S + 132];
+  If (TxKind[K] = 1) And (K = 0) Then
+  Begin
+    P := MemL[0:S + 124];
+    For I := 0 To 255 Do
+    Begin
+      If P <> 0 Then
+      Begin
+        L := P + 68 + I * 4;
+        M := 255;
+        If (MemL[0:P + 64] And $400) <> 0 Then M := Mem[0:L + 3];
+        TxPal[I] := (M Shl 24) Or (Mem[0:L] Shl 16) Or (Mem[0:L + 1] Shl 8)
+                    Or Mem[0:L + 2];
+      End
+      Else If D8Pal <> 0 Then
+      Begin
+        L := D8Pal + I * 4;
+        TxPal[I] := (Mem[0:L + 3] Shl 24) Or (Mem[0:L] Shl 16) Or
+                    (Mem[0:L + 1] Shl 8) Or Mem[0:L + 2];
+      End
+      Else
+        TxPal[I] := LongInt($FF000000) Or (SysPal[I * 3] Shl 16) Or
+                    (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+    End;
+  End;
+  If (TxW[K] <= 0) Or (TxH[K] <= 0) Or (TxBits[K] = 0) Then Exit;
+  TxOn[K] := True;
+End;
+
+Function D3DSetup : Boolean;
+Var Z, K, S, T : LongInt;
+Begin
+  D3DSetup := False;
+  RTs := D3G^.RT;
+  If RTs = 0 Then Exit;
+  RBits := MemL[0:RTs + 76]; RPitch := MemL[0:RTs + 72];
+  RBy := SfBytes(RTs); RKind := MemL[0:RTs + 272];
+  RW := MemL[0:RTs + 64]; RH := MemL[0:RTs + 68];
+  ClipL := Max(0, D3G^.VX); ClipT := Max(0, D3G^.VY);
+  ClipR := Min(RW, D3G^.VX + D3G^.VW); ClipB := Min(RH, D3G^.VY + D3G^.VH);
+  Z := D3G^.ZB;
+  If Z = 0 Then Z := MemL[0:RTs + 120];
+  RZOn := 0;
+  If (D3G^.RS[rsZEnable] <> 0) And (Z <> 0) Then
+  Begin
+    RZOn := 1;
+    ZBits := MemL[0:Z + 76]; ZPitch := MemL[0:Z + 72];
+    ZBy := SfBytes(Z);
+    If ZBy = 3 Then RZOn := 0;
+  End;
+  RZWr := D3G^.RS[rsZWrite];
+  RZFn := D3G^.RS[rsZFunc];
+  If RZFn = 0 Then RZFn := 4;
+  RShade := D3G^.RS[rsShade];
+  RABl := D3G^.RS[rsABlend];
+  RSrc := D3G^.RS[rsSrcBl]; RDst := D3G^.RS[rsDstBl];
+  If RSrc = 0 Then RSrc := 2;
+  If RDst = 0 Then RDst := 1;
+  RATst := D3G^.RS[rsATest]; RAFn := D3G^.RS[rsAFunc];
+  RARef := D3G^.RS[rsARef] And 255;
+  RCKey := D3G^.RS[rsCKey];
+  RFogOn := D3G^.RS[rsFog]; RFogC := D3G^.RS[rsFogColor];
+  RSpec := D3G^.RS[rsSpecular];
+  RTFac := D3G^.RS[rsTFactor];
+  RCull := D3G^.RS[rsCull];
+  RFill := D3G^.RS[rsFill];
+  If RFill = 0 Then RFill := 3;
+  NStage := 0;
+  TxOn[0] := False; TxOn[1] := False;
+  If D3G^.UseTSS <> 0 Then
+  Begin
+    For K := 0 To 1 Do
+    Begin
+      S := D3G^.Tex[K];
+      TxCOp[K] := D3G^.TS[K * 32 + tsCOp];
+      TxCA1[K] := D3G^.TS[K * 32 + tsCA1];
+      TxCA2[K] := D3G^.TS[K * 32 + tsCA2];
+      TxAOp[K] := D3G^.TS[K * 32 + tsAOp];
+      TxAA1[K] := D3G^.TS[K * 32 + tsAA1];
+      TxAA2[K] := D3G^.TS[K * 32 + tsAA2];
+      TxAddrU[K] := D3G^.TS[K * 32 + tsAddrU];
+      TxAddrV[K] := D3G^.TS[K * 32 + tsAddrV];
+      If TxCOp[K] <= 1 Then Break;
+      TxBind(K, S);
+      If Not TxOn[K] Then
+      Begin
+        { etage sans texture : l'argument texture vaut le courant }
+        T := TxCA1[K] And 7;
+        If T = 2 Then TxCA1[K] := (TxCA1[K] And $30) Or 1;
+        T := TxCA2[K] And 7;
+        If T = 2 Then TxCA2[K] := (TxCA2[K] And $30) Or 1;
+        T := TxAA1[K] And 7;
+        If T = 2 Then TxAA1[K] := (TxAA1[K] And $30) Or 1;
+        T := TxAA2[K] And 7;
+        If T = 2 Then TxAA2[K] := (TxAA2[K] And $30) Or 1;
+      End;
+      NStage := K + 1;
+    End;
+  End
+  Else
+  Begin
+    TxBind(0, D3G^.RS[rsTexHandle]);
+    If D3G^.Tex[0] <> 0 Then TxBind(0, D3G^.Tex[0]);
+    TxAddrU[0] := D3G^.RS[3]; TxAddrV[0] := TxAddrU[0];
+    If TxAddrU[0] = 0 Then
+    Begin
+      TxAddrU[0] := 1; TxAddrV[0] := 1;
+    End;
+  End;
+  If Not TxOn[0] Then
+  Begin
+    TxW[0] := 1; TxH[0] := 1;
+  End;
+  If Not TxOn[1] Then
+  Begin
+    TxW[1] := 1; TxH[1] := 1;
+  End;
+  D3DSetup := (ClipL < ClipR) And (ClipT < ClipB);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Primitives                                                         }
+{ ------------------------------------------------------------------ }
+
+Function VInside(Var V : TVtx) : Boolean;
+Var P : LongInt;
+Begin
+  VInside := True;
+  If V.CF = 0 Then Exit;
+  For P := 0 To 5 Do
+    If PlaneD(V, P) < 0 Then
+    Begin
+      VInside := False;
+      Exit;
+    End;
+End;
+
+Procedure D3DTriIdx(I0, I1, I2 : LongInt);
+Var N, K : LongInt;
+Begin
+  If (DV^[I0].CF = 0) And (DV^[I1].CF = 0) And (DV^[I2].CF = 0) Then
+  Begin
+    D3DTri(DV^[I0], DV^[I1], DV^[I2]);
+    Exit;
+  End;
+  If VInside(DV^[I0]) And VInside(DV^[I1]) And VInside(DV^[I2]) Then
+  Begin
+    DC[0] := DV^[I0]; DC[1] := DV^[I1]; DC[2] := DV^[I2];
+    D3DProject(DC[0]); D3DProject(DC[1]); D3DProject(DC[2]);
+    D3DTri(DC[0], DC[1], DC[2]);
+    Exit;
+  End;
+  DC[0] := DV^[I0]; DC[1] := DV^[I1]; DC[2] := DV^[I2];
+  N := D3DClipPoly(3);
+  If N < 3 Then Exit;
+  For K := 0 To N - 1 Do D3DProject(DC[K]);
+  For K := 1 To N - 2 Do D3DTri(DC[0], DC[K], DC[K + 1]);
+End;
+
+Procedure D3DLineIdx(I0, I1 : LongInt);
+Var A, B : TVtx; P : LongInt; DA, DB, T : Double; Ok : Boolean;
+Begin
+  A := DV^[I0]; B := DV^[I1];
+  If (A.CF <> 0) Or (B.CF <> 0) Then
+  Begin
+    Ok := True;
+    For P := 0 To 5 Do
+    Begin
+      DA := PlaneD(A, P); DB := PlaneD(B, P);
+      If (DA < 0) And (DB < 0) Then Ok := False
+      Else If DA < 0 Then
+      Begin
+        T := DA / (DA - DB); VLerp(A, A, B, T);
+      End
+      Else If DB < 0 Then
+      Begin
+        T := DB / (DB - DA); VLerp(B, B, A, T);
+      End;
+    End;
+    If Not Ok Then Exit;
+    D3DProject(A); D3DProject(B);
+  End;
+  D3DLine(A, B);
+End;
+
+Procedure D3DPointIdx(I : LongInt);
+Var A : TVtx;
+Begin
+  A := DV^[I];
+  If Not VInside(A) Then Exit;
+  D3DProject(A);
+  D3DPoint(A);
+End;
+
+{ Indice K de la liste (Idx : adresse, Sz 2 ou 4 octets ; 0 : direct) }
+Function IdxAt(Idx, Sz, K : LongInt) : LongInt;
+Begin
+  If Idx = 0 Then IdxAt := K
+  Else If Sz = 4 Then IdxAt := MemL[0:Idx + K * 4]
+  Else IdxAt := MemW[0:Idx + K * 2];
+End;
+
+{ Dessiner N elements de type Pt (sommets deja traites dans DV) }
+Procedure D3DPrims(Pt, Idx, Sz, N, NV : LongInt);
+Var I, A, B, C : LongInt;
+Begin
+  If Not D3DSetup Then Exit;
+  Case Pt Of
+    1 :
+      For I := 0 To N - 1 Do
+      Begin
+        A := IdxAt(Idx, Sz, I);
+        If A < NV Then D3DPointIdx(A);
+      End;
+    2 :
+      For I := 0 To N Div 2 - 1 Do
+      Begin
+        A := IdxAt(Idx, Sz, I * 2); B := IdxAt(Idx, Sz, I * 2 + 1);
+        If (A < NV) And (B < NV) Then D3DLineIdx(A, B);
+      End;
+    3 :
+      For I := 0 To N - 2 Do
+      Begin
+        A := IdxAt(Idx, Sz, I); B := IdxAt(Idx, Sz, I + 1);
+        If (A < NV) And (B < NV) Then D3DLineIdx(A, B);
+      End;
+    4 :
+      For I := 0 To N Div 3 - 1 Do
+      Begin
+        A := IdxAt(Idx, Sz, I * 3); B := IdxAt(Idx, Sz, I * 3 + 1);
+        C := IdxAt(Idx, Sz, I * 3 + 2);
+        If (A < NV) And (B < NV) And (C < NV) Then D3DTriIdx(A, B, C);
+      End;
+    5 :
+      For I := 0 To N - 3 Do
+      Begin
+        A := IdxAt(Idx, Sz, I); B := IdxAt(Idx, Sz, I + 1);
+        C := IdxAt(Idx, Sz, I + 2);
+        If (A < NV) And (B < NV) And (C < NV) Then
+        Begin
+          If Odd(I) Then D3DTriIdx(A, C, B) Else D3DTriIdx(A, B, C);
+        End;
+      End;
+    6 :
+      For I := 1 To N - 2 Do
+      Begin
+        A := IdxAt(Idx, Sz, 0); B := IdxAt(Idx, Sz, I);
+        C := IdxAt(Idx, Sz, I + 1);
+        If (A < NV) And (B < NV) And (C < NV) Then D3DTriIdx(A, B, C);
+      End;
+  End;
+  If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, False);
+End;
+
+{ Dessin complet : sommets (Src, FVF) puis primitives }
+Procedure D3DDraw(Pt, Fvf, Src, NV, Idx, Sz, NI, Fl : LongInt);
+Var Lit : Boolean;
+Begin
+  If (Src = 0) Or (NV <= 0) Then Exit;
+  FvfParse(Fvf);
+  If D3DStrideOvr > 0 Then VFStride := D3DStrideOvr;
+  Lit := (D3G^.RS[rsLighting] <> 0) And (VFNrm >= 0) And (VFRhw = 0);
+  If (D3G^.Ver <= 3) And (VFNrm >= 0) And (VFRhw = 0) Then
+    Lit := (Fl And $10) = 0;
+  If Lit Then D3DLightsView;
+  D3DProcess(Src, NV, Lit);
+  If Idx = 0 Then NI := NV;
+  D3DPrims(Pt, Idx, Sz, NI, NV);
+End;
+
+{ Effacer : cible (couleur), Z (valeur 0..1) dans les rectangles }
+Procedure D3DClear(N, Rects, Fl, Color, ZV : LongInt);
+Var I, L, T, R, B, V, Z, ZS : LongInt;
+Begin
+  If D3G^.RT = 0 Then Exit;
+  Z := D3G^.ZB;
+  If Z = 0 Then Z := MemL[0:D3G^.RT + 120];
+  If N = 0 Then N := 1;
+  For I := 0 To N - 1 Do
+  Begin
+    If Rects <> 0 Then
+    Begin
+      L := MemL[0:Rects + I * 16]; T := MemL[0:Rects + I * 16 + 4];
+      R := MemL[0:Rects + I * 16 + 8]; B := MemL[0:Rects + I * 16 + 12];
+    End
+    Else
+    Begin
+      L := D3G^.VX; T := D3G^.VY;
+      R := D3G^.VX + D3G^.VW; B := D3G^.VY + D3G^.VH;
+    End;
+    If (Fl And 1) <> 0 Then
+    Begin
+      V := SfFromRGB(D3G^.RT, Color);
+      SfFill(D3G^.RT, L, T, R, B, V);
+    End;
+    If ((Fl And 2) <> 0) And (Z <> 0) Then
+    Begin
+      ZS := SfBytes(Z);
+      If ZS = 2 Then V := DRound(FlL(ZV) * 65535)
+      Else V := DRound(FlL(ZV) * 16777215);
+      SfFill(Z, L, T, R, B, V);
+    End;
+  End;
+  If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Direct3D 1 a 7 : objets                                            }
+{ ------------------------------------------------------------------ }
+{ IDirect3D, 2, 3 et 7 sont des vues de l'objet DirectDraw (cases 4 a
+  7) ; IDirect3DTexture et 2 des vues des surfaces (cases 6 et 7).
+  Sortes : 11 peripherique (+64 etat TD3D, +68 version), 12 fenetre
+  d'affichage (viewport), 13 materiau, 14 lumiere, 15 tampon
+  d'execution, 16 tampon de sommets. Les "handles" de D3D 1 a 3
+  (materiaux, textures, matrices) sont les adresses des objets. }
+
+Var
+  VtD3D1, VtD3D2, VtD3D3, VtD3D7, VtDev1, VtDev2, VtDev3, VtDev7,
+    VtVP1, VtVP2, VtVP3, VtMat1, VtMat2, VtMat3, VtLit, VtTx1, VtTx2,
+    VtEB, VtVB, VtVB7 : LongInt;
+  D3DSbList : Array[0..63] Of LongInt;
+
+Procedure D3DInitVt;
+Begin
+  If VtD3D1 <> 0 Then Exit;
+  VtD3D1 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,DXOK2,D3_EnumDevices,D3_CreateLight,');
+  VtAdd('D3_CreateMaterial,D3_CreateViewport,D3_FindDevice');
+  VtD3D2 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,D3_EnumDevices,D3_CreateLight,');
+  VtAdd('D3_CreateMaterial,D3_CreateViewport,D3_FindDevice,D3_CreateDevice2');
+  VtD3D3 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,D3_EnumDevices,D3_CreateLight,');
+  VtAdd('D3_CreateMaterial,D3_CreateViewport,D3_FindDevice,D3_CreateDevice3,');
+  VtAdd('D3_CreateVB3,D3_EnumZFormats,DXOK1');
+  VtD3D7 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,D3_EnumDevices7,D3_CreateDevice7,');
+  VtAdd('D3_CreateVB7,D3_EnumZFormats,DXOK1');
+  VtDev1 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DXOK4,DV_GetCaps,DV_SwapTex,');
+  VtAdd('DV_CreateEB,DV_GetStats,DV_Execute,DV_AddViewport,DV_DelViewport,');
+  VtAdd('DV_NextViewport,DV_Pick,DV_GetPickRecords,DV_EnumTexFmt1,');
+  VtAdd('DV_CreateMatrix,DV_SetMatrix,DV_GetMatrix,DV_DeleteMatrix,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D');
+  VtDev2 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DV_GetCaps,DV_SwapTex,DV_GetStats,');
+  VtAdd('DV_AddViewport,DV_DelViewport,DV_NextViewport,DV_EnumTexFmt1,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D,DV_SetCurVP,DV_GetCurVP,');
+  VtAdd('DV_SetRT,DV_GetRT,DV_Begin2,DV_BeginIdx2,DV_Vertex,DV_Index,');
+  VtAdd('DV_End,DV_GetRS,DV_SetRS,DV_GetLS,DV_SetLS,DV_SetTransform,');
+  VtAdd('DV_GetTransform,DV_MulTransform,DV_DrawPrim2,DV_DrawIdxPrim2,');
+  VtAdd('DV_SetClipStatus,DV_GetClipStatus');
+  VtDev3 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DV_GetCaps,DV_GetStats,');
+  VtAdd('DV_AddViewport,DV_DelViewport,DV_NextViewport,DV_EnumTexFmt,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D,DV_SetCurVP,DV_GetCurVP,');
+  VtAdd('DV_SetRT,DV_GetRT,DV_Begin,DV_BeginIdx,DV_Vertex,DV_Index,');
+  VtAdd('DV_End,DV_GetRS,DV_SetRS,DV_GetLS,DV_SetLS,DV_SetTransform,');
+  VtAdd('DV_GetTransform,DV_MulTransform,DV_DrawPrim,DV_DrawIdxPrim,');
+  VtAdd('DV_SetClipStatus,DV_GetClipStatus,DV_DrawPrimStr,DV_DrawIdxPrimStr,');
+  VtAdd('DV_DrawPrimVB,DV_DrawIdxPrimVB3,DV_SphereVis,DV_GetTexture,');
+  VtAdd('DV_SetTexture,DV_GetTSS,DV_SetTSS,DV_Validate');
+  VtDev7 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DV_GetCaps7,DV_EnumTexFmt,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D,DV_SetRT,DV_GetRT,');
+  VtAdd('DV_Clear7,DV_SetTransform,DV_GetTransform,DV_SetViewport7,');
+  VtAdd('DV_MulTransform,DV_GetViewport7,DV_SetMaterial7,DV_GetMaterial7,');
+  VtAdd('DV_SetLight7,DV_GetLight7,DV_SetRS,DV_GetRS,DV_BeginSB,DV_EndSB,');
+  VtAdd('DXOK2,DV_DrawPrim,DV_DrawIdxPrim,DV_SetClipStatus,');
+  VtAdd('DV_GetClipStatus,DV_DrawPrimStr,DV_DrawIdxPrimStr,DV_DrawPrimVB,');
+  VtAdd('DV_DrawIdxPrimVB7,DV_SphereVis,DV_GetTexture,DV_SetTexture,');
+  VtAdd('DV_GetTSS,DV_SetTSS,DV_Validate,DV_ApplySB,DV_CaptureSB,');
+  VtAdd('DV_DeleteSB,DV_CreateSB,DV_Load7,DV_LightEnable,DV_GetLightEnable,');
+  VtAdd('DXOK3,DXNI3,DXNI4');
+  VtVP1 := VtNew;
+  VtAdd('VP_QI,COMAddRef,COMRelease,DXOK2,VP_GetViewport,VP_SetViewport,');
+  VtAdd('VP_Transform,DXNI3,VP_SetBack,VP_GetBack,VP_SetBackDepth,');
+  VtAdd('VP_GetBackDepth,VP_Clear,VP_AddLight,VP_DelLight,VP_NextLight');
+  VtVP2 := VtNew;
+  VtAdd('VP_QI,COMAddRef,COMRelease,DXOK2,VP_GetViewport,VP_SetViewport,');
+  VtAdd('VP_Transform,DXNI3,VP_SetBack,VP_GetBack,VP_SetBackDepth,');
+  VtAdd('VP_GetBackDepth,VP_Clear,VP_AddLight,VP_DelLight,VP_NextLight,');
+  VtAdd('VP_GetViewport2,VP_SetViewport2');
+  VtVP3 := VtNew;
+  VtAdd('VP_QI,COMAddRef,COMRelease,DXOK2,VP_GetViewport,VP_SetViewport,');
+  VtAdd('VP_Transform,DXNI3,VP_SetBack,VP_GetBack,VP_SetBackDepth,');
+  VtAdd('VP_GetBackDepth,VP_Clear,VP_AddLight,VP_DelLight,VP_NextLight,');
+  VtAdd('VP_GetViewport2,VP_SetViewport2,VP_SetBackDepth,VP_GetBackDepth,');
+  VtAdd('VP_Clear2');
+  VtMat1 := VtNew;
+  VtAdd('MT_QI,COMAddRef,COMRelease,DXOK2,MT_Set,MT_Get,MT_GetHandle,');
+  VtAdd('DXOK1,DXOK1');
+  VtMat2 := VtNew;
+  VtAdd('MT_QI,COMAddRef,COMRelease,MT_Set,MT_Get,MT_GetHandle');
+  VtMat3 := VtMat2;
+  VtLit := VtNew;
+  VtAdd('LT_QI,COMAddRef,COMRelease,DXOK2,LT_Set,LT_Get');
+  VtTx1 := VtNew;
+  VtAdd('SF_QI,COMAddRef,COMRelease,DXOK3,TX_GetHandle,DXOK3,TX_Load,');
+  VtAdd('DXOK1');
+  VtTx2 := VtNew;
+  VtAdd('SF_QI,COMAddRef,COMRelease,TX_GetHandle,DXOK3,TX_Load');
+  VtEB := VtNew;
+  VtAdd('EB_QI,COMAddRef,COMRelease,DXOK3,EB_Lock,DXOK1,EB_SetData,');
+  VtAdd('EB_GetData,DXNI5,DXOK2');
+  VtVB := VtNew;
+  VtAdd('VB_QI,COMAddRef,COMRelease,VB_Lock,DXOK1,VB_Process,VB_GetDesc,');
+  VtAdd('DXOK3');
+  VtVB7 := VtNew;
+  VtAdd('VB_QI,COMAddRef,COMRelease,VB_Lock,DXOK1,VB_Process,VB_GetDesc,');
+  VtAdd('DXOK3,DXNI6');
+End;
+
+{ ------------------------------------------------------------------ }
+{ Description des peripheriques                                      }
+{ ------------------------------------------------------------------ }
+
+Procedure PrimCaps(P : LongInt);
+Begin
+  FillMem(P, 56, 0);
+  MemL[0:P] := 56;
+  MemL[0:P + 4] := $72;
+  MemL[0:P + 8] := 1 Or $10 Or $20 Or $80 Or $100;
+  MemL[0:P + 12] := $FF;
+  MemL[0:P + 16] := $1FFF;
+  MemL[0:P + 20] := $1FFF;
+  MemL[0:P + 24] := $FF;
+  MemL[0:P + 28] := 2 Or 8 Or $80 Or $200 Or $1000 Or $4000 Or $40000 Or
+                    $80000;
+  MemL[0:P + 32] := 1 Or 4 Or 8 Or $40 Or $80;
+  MemL[0:P + 36] := 1 Or 2 Or 4 Or 8 Or $10 Or $20 Or $100 Or $200 Or
+                    $10000 Or $20000 Or $1000000 Or $2000000;
+  MemL[0:P + 40] := $FF;
+  MemL[0:P + 44] := 7;
+End;
+
+{ D3DDEVICEDESC (versions 1 a 3) ; Hw : peripherique "materiel" }
+Procedure DevDesc(P, Sz : LongInt; Hw : Boolean);
+Begin
+  FillMem(P, Sz, 0);
+  MemL[0:P] := Sz;
+  MemL[0:P + 4] := $FFF;
+  MemL[0:P + 8] := 2;
+  MemL[0:P + 12] := 1 Or $10 Or $40 Or $100 Or $200 Or $400 Or $800 Or
+                    $2000;
+  If Hw Then MemL[0:P + 12] := MemL[0:P + 12] Or $80000;
+  MemL[0:P + 16] := 8; MemL[0:P + 20] := 1;
+  MemL[0:P + 24] := 1;
+  MemL[0:P + 28] := 16; MemL[0:P + 32] := 7; MemL[0:P + 36] := 1;
+  MemL[0:P + 40] := 8;
+  PrimCaps(P + 44); PrimCaps(P + 100);
+  MemL[0:P + 156] := $F00;
+  MemL[0:P + 160] := $500;
+  MemL[0:P + 164] := 0;
+  MemL[0:P + 168] := 65535;
+  If Sz >= 204 Then
+  Begin
+    MemL[0:P + 172] := 1; MemL[0:P + 176] := 1;
+    MemL[0:P + 180] := 2048; MemL[0:P + 184] := 2048;
+  End;
+  If Sz >= 252 Then
+  Begin
+    MemL[0:P + 204] := 8192; MemL[0:P + 208] := 2048;
+    MemL[0:P + 212] := 1;
+    MemL[0:P + 240] := 8;
+    MemL[0:P + 244] := $2BFFF;
+    MemW[0:P + 248] := 2; MemW[0:P + 250] := 2;
+  End;
+End;
+
+{ D3DDEVICEDESC7 }
+Procedure DevDesc7(P, G1 : LongInt; TnL : Boolean);
+Begin
+  FillMem(P, 236, 0);
+  MemL[0:P] := 1 Or $10 Or $40 Or $100 Or $200 Or $400 Or $800 Or $2000 Or
+               $8000 Or $80000;
+  If TnL Then MemL[0:P] := MemL[0:P] Or $10000;
+  PrimCaps(P + 4); PrimCaps(P + 60);
+  MemL[0:P + 116] := $F00; MemL[0:P + 120] := $500;
+  MemL[0:P + 124] := 1; MemL[0:P + 128] := 1;
+  MemL[0:P + 132] := 2048; MemL[0:P + 136] := 2048;
+  MemL[0:P + 140] := 8192; MemL[0:P + 144] := 2048;
+  MemL[0:P + 148] := 1;
+  MemL[0:P + 176] := 8;
+  MemL[0:P + 180] := $2BFFF;
+  MemW[0:P + 184] := 2; MemW[0:P + 186] := 2;
+  MemL[0:P + 188] := 8;
+  MemL[0:P + 192] := LFl(10000000000.0);
+  If G1 <> 0 Then MoveMem(G1, P + 196, 16);
+  MemL[0:P + 216] := $3E;
+End;
+
+Procedure GuidHal(P : LongInt);
+Begin
+  DXGuid(P, LongInt($84E63DE0), $46AA, $11CF, LongInt($00006F81),
+         LongInt($6E1520C0));
+End;
+
+Procedure GuidRGB(P : LongInt);
+Begin
+  DXGuid(P, LongInt($A4665C60), $2673, $11CF, LongInt($AA001AA3),
+         LongInt($5633B900));
+End;
+
+Procedure GuidTnL(P : LongInt);
+Begin
+  DXGuid(P, LongInt($F5049E78), $4861, $11D2, LongInt($A00007A4),
+         LongInt($A82906C9));
+End;
+
+{ ------------------------------------------------------------------ }
+{ IDirect3D (vues de DirectDraw)                                     }
+{ ------------------------------------------------------------------ }
+
+Function D3DQueryDD(C, Riid, Ppv : LongInt) : LongInt;
+Begin
+  D3DQueryDD := E_NOINTERFACE;
+  If Riid = 0 Then Exit;
+  D3DInitVt;
+  Case MemL[0:Riid] Of
+    LongInt($3BBA0080) : D3DQueryDD := ComGive(C, 4, VtD3D1, Ppv);
+    LongInt($6AAE1EC1) : D3DQueryDD := ComGive(C, 5, VtD3D2, Ppv);
+    LongInt($BB223240) : D3DQueryDD := ComGive(C, 6, VtD3D3, Ppv);
+    LongInt($F5049E77) : D3DQueryDD := ComGive(C, 7, VtD3D7, Ppv);
+  End;
+End;
+
+Function D3_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  If GuidUnk(Riid) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    D3_QI := DD_OK;
+    Exit;
+  End;
+  D3_QI := DD_QI(T, Riid, Ppv);
+End;
+
+Function D3_EnumDevices(T, Cb, Ctx : LongInt) : LongInt;
+Var V, G, Hal, Hel, Sz, D, N, K : LongInt;
+Begin
+  V := IfVer(T);
+  D3_EnumDevices := DD_OK;
+  If Cb = 0 Then Exit;
+  Case V Of
+    4 : Sz := 172;
+    5 : Sz := 204;
+  Else
+    Sz := 252;
+  End;
+  G := KAlloc(16); Hal := KAlloc(256); Hel := KAlloc(256);
+  For K := 0 To 1 Do
+  Begin
+    If K = 0 Then
+    Begin
+      GuidRGB(G);
+      DevDesc(Hal, Sz, False);
+      MemL[0:Hal + 4] := 0;
+      DevDesc(Hel, Sz, False);
+      D := DXStr('Emulation RGB de Pasdows', False);
+      N := DXStr('RGB Emulation', False);
+    End
+    Else
+    Begin
+      GuidHal(G);
+      DevDesc(Hal, Sz, True);
+      DevDesc(Hel, Sz, True);
+      D := DXStr('Pasdows Direct3D HAL (' + DXCardName + ')', False);
+      N := DXStr('Direct3D HAL', False);
+    End;
+    V := DXCall6(Cb, G, D, N, Hal, Hel, Ctx);
+    KFree(D); KFree(N);
+    If V = 0 Then Break;
+  End;
+  KFree(G); KFree(Hal); KFree(Hel);
+End;
+
+Function D3_EnumDevices7(T, Cb, Ctx : LongInt) : LongInt;
+Var G, P, D, N, K, R : LongInt;
+Begin
+  D3_EnumDevices7 := DD_OK;
+  If Cb = 0 Then Exit;
+  G := KAlloc(16); P := KAlloc(256);
+  For K := 0 To 2 Do
+  Begin
+    Case K Of
+      0 :
+      Begin
+        GuidRGB(G); DevDesc7(P, G, False);
+        D := DXStr('Emulation RGB de Pasdows', False);
+        N := DXStr('RGB Emulation', False);
+      End;
+      1 :
+      Begin
+        GuidHal(G); DevDesc7(P, G, False);
+        D := DXStr('Pasdows Direct3D HAL', False);
+        N := DXStr('Direct3D HAL', False);
+      End;
+    Else
+      Begin
+        GuidTnL(G); DevDesc7(P, G, True);
+        D := DXStr('Pasdows Direct3D T&L HAL', False);
+        N := DXStr('Direct3D T&L HAL', False);
+      End;
+    End;
+    R := DXCall4(Cb, D, N, P, Ctx);
+    KFree(D); KFree(N);
+    If R = 0 Then Break;
+  End;
+  KFree(G); KFree(P);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Peripheriques Direct3D 1 a 7                                       }
+{ ------------------------------------------------------------------ }
+
+Function DevVt(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0 : DevVt := VtDev1;
+    1 : DevVt := VtDev2;
+    2 : DevVt := VtDev3;
+  Else
+    DevVt := VtDev7;
+  End;
+End;
+
+{ Nouveau peripherique de version Ver sur la surface S (coeur) }
+Function DevNew(S, Ver, PP : LongInt) : LongInt;
+Var C, R, Sl : LongInt;
+Begin
+  DevNew := DDERR_INVALIDPARAMS;
+  If (S = 0) Or (PP = 0) Then Exit;
+  D3DInitVt;
+  Case Ver Of
+    1 : Sl := 0;
+    2 : Sl := 1;
+    3 : Sl := 2;
+  Else
+    Sl := 3;
+  End;
+  C := ComNew(0, 11, 96);
+  ComView(C, Sl, DevVt(Sl));
+  R := KAlloc(SizeOf(TD3D) + 16);
+  If R = 0 Then
+  Begin
+    KFree(C);
+    DevNew := E_OUTOFMEMORY;
+    Exit;
+  End;
+  FillMem(R, SizeOf(TD3D), 0);
+  MemL[0:C + 64] := R;
+  MemL[0:C + 68] := Ver;
+  DevSel(C);
+  COMAddRef(S);
+  D3G^.RT := S;
+  D3G^.Ver := Ver;
+  D3G^.Core := C;
+  D3G^.D3DObj := DXObj;
+  D3DDefaults;
+  D3G^.UseTSS := Ord(Ver >= 7);
+  MemL[0:PP] := C;
+  KLog('Direct3D : peripherique version ' + IntStr(Ver) + ' sur ' +
+       IntStr(MemL[0:S + 64]) + 'x' + IntStr(MemL[0:S + 68]) + 'x' +
+       IntStr(MemL[0:S + 88]));
+  DevNew := DD_OK;
+End;
+
+Function D3DQuerySurf(C, Riid, Ppv : LongInt) : LongInt;
+Begin
+  D3DQuerySurf := E_NOINTERFACE;
+  If Riid = 0 Then Exit;
+  D3DInitVt;
+  Case MemL[0:Riid] Of
+    LongInt($2CDCD9E0) : D3DQuerySurf := ComGive(C, 6, VtTx1, Ppv);
+    LongInt($93281502) : D3DQuerySurf := ComGive(C, 7, VtTx2, Ppv);
+    LongInt($A4665C60), LongInt($84E63DE0), LongInt($F2086B20),
+    LongInt($881949A1), LongInt($50936643) :
+      D3DQuerySurf := DevNew(C, 1, Ppv);
+  End;
+End;
+
+Procedure D3DSurfGone(S : LongInt);
+Begin
+End;
+
+Function D3DCoCreate(Clsid, PO : LongInt) : LongInt;
+Begin
+  D3DCoCreate := REGDB_E_CLASSNOTREG;
+End;
+
+Function D3_CreateDevice2(T, Cls, S, PP : LongInt) : LongInt;
+Begin
+  D3_CreateDevice2 := DevNew(Cor(S), 2, PP);
+End;
+
+Function D3_CreateDevice3(T, Cls, S, PP, Outer : LongInt) : LongInt;
+Begin
+  D3_CreateDevice3 := DevNew(Cor(S), 3, PP);
+End;
+
+Function D3_CreateDevice7(T, Cls, S, PP : LongInt) : LongInt;
+Begin
+  D3_CreateDevice7 := DevNew(Cor(S), 7, PP);
+End;
+
+Function D3_FindDevice(T, PS, PR : LongInt) : LongInt;
+Var Sz : LongInt;
+Begin
+  D3_FindDevice := DDERR_INVALIDPARAMS;
+  If PR = 0 Then Exit;
+  Sz := MemL[0:PR];
+  If Sz < 20 Then Sz := 524;
+  FillMem(PR + 4, Sz - 4, 0);
+  GuidHal(PR + 4);
+  DevDesc(PR + 20, 252, True);
+  DevDesc(PR + 272, 252, True);
+  D3_FindDevice := DD_OK;
+End;
+
+Function DV_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C, K : LongInt;
+Begin
+  DV_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  K := -1;
+  If GuidUnk(Riid) Then K := IfVer(T)
+  Else
+    Case MemL[0:Riid] Of
+      LongInt($64108800) : K := 0;
+      LongInt($93281501) : K := 1;
+      LongInt($B0AB3B60) : K := 2;
+      LongInt($F5049E79) : K := 3;
+    End;
+  If K >= 0 Then DV_QI := ComGive(C, K, DevVt(K), Ppv);
+End;
+
+Function DV_GetDirect3D(T, PP : LongInt) : LongInt;
+Var C, V : LongInt;
+Begin
+  C := Cor(T);
+  DV_GetDirect3D := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(C) Or (D3G^.D3DObj = 0) Then Exit;
+  Case D3G^.Ver Of
+    1 : DV_GetDirect3D := ComGive(D3G^.D3DObj, 4, VtD3D1, PP);
+    2 : DV_GetDirect3D := ComGive(D3G^.D3DObj, 5, VtD3D2, PP);
+    3 : DV_GetDirect3D := ComGive(D3G^.D3DObj, 6, VtD3D3, PP);
+  Else
+    DV_GetDirect3D := ComGive(D3G^.D3DObj, 7, VtD3D7, PP);
+  End;
+  V := 0;
+End;
+
+Function DV_GetCaps(T, PHal, PHel : LongInt) : LongInt;
+Var Sz : LongInt;
+Begin
+  If PHal <> 0 Then
+  Begin
+    Sz := MemL[0:PHal];
+    If (Sz < 172) Or (Sz > 252) Then Sz := 252;
+    DevDesc(PHal, Sz, True);
+  End;
+  If PHel <> 0 Then
+  Begin
+    Sz := MemL[0:PHel];
+    If (Sz < 172) Or (Sz > 252) Then Sz := 252;
+    DevDesc(PHel, Sz, True);
+  End;
+  DV_GetCaps := DD_OK;
+End;
+
+Function DV_GetCaps7(T, P : LongInt) : LongInt;
+Var G : Array[0..3] Of LongInt;
+Begin
+  GuidHal(LongInt(@G));
+  If P <> 0 Then DevDesc7(P, LongInt(@G), False);
+  DV_GetCaps7 := DD_OK;
+End;
+
+Function DV_GetStats(T, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And DevSel(Cor(T)) Then
+  Begin
+    FillMem(P + 4, 20, 0);
+    MemL[0:P + 4] := D3G^.Tris;
+    MemL[0:P + 20] := D3G^.Verts;
+  End;
+  DV_GetStats := DD_OK;
+End;
+
+{ Formats de texture : 565, 1555, 4444, 555, 8888, X888, palette 8 }
+Procedure TexFmt(K, P : LongInt);
+Begin
+  FillMem(P, 32, 0);
+  MemL[0:P] := 32;
+  MemL[0:P + 4] := $40;
+  Case K Of
+    0 :
+    Begin
+      MemL[0:P + 12] := 16; MemL[0:P + 16] := $F800;
+      MemL[0:P + 20] := $7E0; MemL[0:P + 24] := $1F;
+    End;
+    1 :
+    Begin
+      MemL[0:P + 4] := $41; MemL[0:P + 12] := 16; MemL[0:P + 16] := $7C00;
+      MemL[0:P + 20] := $3E0; MemL[0:P + 24] := $1F;
+      MemL[0:P + 28] := $8000;
+    End;
+    2 :
+    Begin
+      MemL[0:P + 4] := $41; MemL[0:P + 12] := 16; MemL[0:P + 16] := $F00;
+      MemL[0:P + 20] := $F0; MemL[0:P + 24] := $F;
+      MemL[0:P + 28] := $F000;
+    End;
+    3 :
+    Begin
+      MemL[0:P + 12] := 16; MemL[0:P + 16] := $7C00;
+      MemL[0:P + 20] := $3E0; MemL[0:P + 24] := $1F;
+    End;
+    4 :
+    Begin
+      MemL[0:P + 4] := $41; MemL[0:P + 12] := 32;
+      MemL[0:P + 16] := $FF0000; MemL[0:P + 20] := $FF00;
+      MemL[0:P + 24] := $FF; MemL[0:P + 28] := LongInt($FF000000);
+    End;
+    5 :
+    Begin
+      MemL[0:P + 12] := 32; MemL[0:P + 16] := $FF0000;
+      MemL[0:P + 20] := $FF00; MemL[0:P + 24] := $FF;
+    End;
+  Else
+    Begin
+      MemL[0:P + 4] := $60; MemL[0:P + 12] := 8;
+    End;
+  End;
+End;
+
+Function DV_EnumTexFmt(T, Cb, Ctx : LongInt) : LongInt;
+Var P, K : LongInt;
+Begin
+  DV_EnumTexFmt := DD_OK;
+  If Cb = 0 Then Exit;
+  P := KAlloc(64);
+  For K := 0 To 6 Do
+  Begin
+    TexFmt(K, P);
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
+End;
+
+Function DV_EnumTexFmt1(T, Cb, Ctx : LongInt) : LongInt;
+Var P, K : LongInt;
+Begin
+  DV_EnumTexFmt1 := DD_OK;
+  If Cb = 0 Then Exit;
+  P := KAlloc(128);
+  For K := 0 To 6 Do
+  Begin
+    FillMem(P, 108, 0);
+    MemL[0:P] := 108;
+    MemL[0:P + 4] := 1 Or $1000;
+    MemL[0:P + 104] := dcTexture;
+    TexFmt(K, P + 72);
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
+End;
+
+Function D3_EnumZFormats(T, Cls, Cb, Ctx : LongInt) : LongInt;
+Var P, K : LongInt;
+Begin
+  D3_EnumZFormats := DD_OK;
+  If Cb = 0 Then Exit;
+  P := KAlloc(64);
+  For K := 0 To 1 Do
+  Begin
+    FillMem(P, 32, 0);
+    MemL[0:P] := 32; MemL[0:P + 4] := $400;
+    If K = 0 Then
+    Begin
+      MemL[0:P + 12] := 16; MemL[0:P + 20] := $FFFF;
+    End
+    Else
+    Begin
+      MemL[0:P + 12] := 32; MemL[0:P + 20] := $FFFFFF;
+    End;
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fenetres d'affichage : +64 X, +68 Y, +72 L, +76 H, +80..+92 volume  }
+{ de decoupage (flottants), +96/+100 Z min/max, +104 materiau de     }
+{ fond, +108 peripherique, +112 surface de fond Z, +116 lumieres,    }
+{ +120 liste (16)                                                    }
+{ ------------------------------------------------------------------ }
+
+Procedure VPApply(VP : LongInt);
+Begin
+  If VP = 0 Then Exit;
+  D3G^.VX := MemL[0:VP + 64]; D3G^.VY := MemL[0:VP + 68];
+  D3G^.VW := MemL[0:VP + 72]; D3G^.VH := MemL[0:VP + 76];
+  D3G^.ClX := FlL(MemL[0:VP + 80]); D3G^.ClY := FlL(MemL[0:VP + 84]);
+  D3G^.ClW := FlL(MemL[0:VP + 88]); D3G^.ClH := FlL(MemL[0:VP + 92]);
+  If Abs(D3G^.ClW) < 0.000001 Then D3G^.ClW := 2;
+  If Abs(D3G^.ClH) < 0.000001 Then D3G^.ClH := 2;
+  D3G^.VMinZ := FlL(MemL[0:VP + 96]); D3G^.VMaxZ := FlL(MemL[0:VP + 100]);
+  If D3G^.VMaxZ <= D3G^.VMinZ Then
+  Begin
+    D3G^.VMinZ := 0; D3G^.VMaxZ := 1;
+  End;
+End;
+
+{ Lumieres et materiau de D3D 1 a 3 (objets) vers l'etat du moteur }
+Procedure D3DLegacySync;
+Var VP, I, L, M, N : LongInt;
+Begin
+  If D3G^.Ver > 3 Then Exit;
+  For I := 0 To 15 Do D3G^.Lt[I].On := 0;
+  VP := D3G^.VPCur;
+  If VP <> 0 Then
+  Begin
+    N := Min(MemL[0:VP + 116], 16);
+    For I := 0 To N - 1 Do
+    Begin
+      L := MemL[0:VP + 120 + I * 4];
+      If L = 0 Then Continue;
+      If (MemL[0:L + 140] And 1) = 0 Then Continue;
+      D3G^.Lt[I].On := 1;
+      D3G^.Lt[I].Typ := MemL[0:L + 68];
+      D3G^.Lt[I].Dif[0] := FlM(L + 72); D3G^.Lt[I].Dif[1] := FlM(L + 76);
+      D3G^.Lt[I].Dif[2] := FlM(L + 80); D3G^.Lt[I].Dif[3] := 1;
+      If (MemL[0:L + 140] And 2) = 0 Then
+      Begin
+        D3G^.Lt[I].Spe[0] := D3G^.Lt[I].Dif[0];
+        D3G^.Lt[I].Spe[1] := D3G^.Lt[I].Dif[1];
+        D3G^.Lt[I].Spe[2] := D3G^.Lt[I].Dif[2];
+      End
+      Else
+      Begin
+        D3G^.Lt[I].Spe[0] := 0; D3G^.Lt[I].Spe[1] := 0;
+        D3G^.Lt[I].Spe[2] := 0;
+      End;
+      D3G^.Lt[I].Amb[0] := 0; D3G^.Lt[I].Amb[1] := 0;
+      D3G^.Lt[I].Amb[2] := 0;
+      D3G^.Lt[I].Pos[0] := FlM(L + 88); D3G^.Lt[I].Pos[1] := FlM(L + 92);
+      D3G^.Lt[I].Pos[2] := FlM(L + 96);
+      D3G^.Lt[I].Dir[0] := FlM(L + 100); D3G^.Lt[I].Dir[1] := FlM(L + 104);
+      D3G^.Lt[I].Dir[2] := FlM(L + 108);
+      D3G^.Lt[I].Rng := FlM(L + 112); D3G^.Lt[I].Fall := FlM(L + 116);
+      D3G^.Lt[I].A0 := FlM(L + 120); D3G^.Lt[I].A1 := FlM(L + 124);
+      D3G^.Lt[I].A2 := FlM(L + 128);
+      If (D3G^.Lt[I].A0 = 0) And (D3G^.Lt[I].A1 = 0) And
+         (D3G^.Lt[I].A2 = 0) Then D3G^.Lt[I].A0 := 1;
+      D3G^.Lt[I].Th := FlM(L + 132); D3G^.Lt[I].Ph := FlM(L + 136);
+    End;
+  End;
+  M := D3G^.LS[1];
+  If M <> 0 Then
+  Begin
+    For I := 0 To 15 Do D3G^.Mt[I] := FlM(M + 68 + I * 4);
+    D3G^.Mt[16] := FlM(M + 132);
+  End
+  Else
+  Begin
+    For I := 0 To 15 Do D3G^.Mt[I] := 0;
+    D3G^.Mt[0] := 1; D3G^.Mt[1] := 1; D3G^.Mt[2] := 1; D3G^.Mt[3] := 1;
+  End;
+  D3G^.RS[rsAmbient] := D3G^.LS[2];
+  D3G^.RS[rsColorVtx] := 0;
+End;
+
+Function D3_CreateViewport(T, PP, Outer : LongInt) : LongInt;
+Var V, C : LongInt;
+Begin
+  V := IfVer(T);
+  D3DInitVt;
+  D3_CreateViewport := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  C := ComNew(0, 12, 192);
+  Case V Of
+    4 : ComView(C, 0, VtVP1);
+    5 : ComView(C, 1, VtVP2);
+  Else
+    ComView(C, 2, VtVP3);
+  End;
+  MemL[0:C + 80] := LFl(-1); MemL[0:C + 84] := LFl(1);
+  MemL[0:C + 88] := LFl(2); MemL[0:C + 92] := LFl(2);
+  MemL[0:C + 100] := LFl(1);
+  MemL[0:PP] := C;
+  D3_CreateViewport := DD_OK;
+End;
+
+Function VP_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  VP_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, $4417C146) Or
+     GuidIs(Riid, LongInt($93281500)) Or GuidIs(Riid, LongInt($B0AB3B61))
+  Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    VP_QI := DD_OK;
+  End;
+End;
+
+{ Recalculer le peripherique si la fenetre est la sienne }
+Procedure VPChanged(C : LongInt);
+Begin
+  If (MemL[0:C + 108] <> 0) And DevSel(MemL[0:C + 108]) Then
+    If D3G^.VPCur = C Then VPApply(C);
+End;
+
+Function VP_SetViewport(T, P : LongInt) : LongInt;
+Var C : LongInt; MX, MY : Double;
+Begin
+  C := Cor(T);
+  VP_SetViewport := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:C + 64] := MemL[0:P + 4]; MemL[0:C + 68] := MemL[0:P + 8];
+  MemL[0:C + 72] := MemL[0:P + 12]; MemL[0:C + 76] := MemL[0:P + 16];
+  MX := FlM(P + 28); MY := FlM(P + 32);
+  If MX <= 0 Then MX := 1;
+  If MY <= 0 Then MY := 1;
+  MemL[0:C + 80] := LFl(-MX); MemL[0:C + 88] := LFl(2 * MX);
+  MemL[0:C + 84] := LFl(MY); MemL[0:C + 92] := LFl(2 * MY);
+  MemL[0:C + 96] := MemL[0:P + 36]; MemL[0:C + 100] := MemL[0:P + 40];
+  VPChanged(C);
+  VP_SetViewport := DD_OK;
+End;
+
+Function VP_GetViewport(T, P : LongInt) : LongInt;
+Var C : LongInt; MX, MY : Double;
+Begin
+  C := Cor(T);
+  VP_GetViewport := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  FillMem(P, 44, 0);
+  MemL[0:P] := 44;
+  MemL[0:P + 4] := MemL[0:C + 64]; MemL[0:P + 8] := MemL[0:C + 68];
+  MemL[0:P + 12] := MemL[0:C + 72]; MemL[0:P + 16] := MemL[0:C + 76];
+  MX := FlL(MemL[0:C + 88]) / 2; MY := FlL(MemL[0:C + 92]) / 2;
+  If MX <= 0 Then MX := 1;
+  If MY <= 0 Then MY := 1;
+  MemL[0:P + 20] := LFl(MemL[0:C + 72] / (2 * MX));
+  MemL[0:P + 24] := LFl(MemL[0:C + 76] / (2 * MY));
+  MemL[0:P + 28] := LFl(MX); MemL[0:P + 32] := LFl(MY);
+  MemL[0:P + 36] := MemL[0:C + 96]; MemL[0:P + 40] := MemL[0:C + 100];
+  VP_GetViewport := DD_OK;
+End;
+
+Function VP_SetViewport2(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  VP_SetViewport2 := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MoveMem(P + 4, C + 64, 40);
+  VPChanged(C);
+  VP_SetViewport2 := DD_OK;
+End;
+
+Function VP_GetViewport2(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  VP_GetViewport2 := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:P] := 44;
+  MoveMem(C + 64, P + 4, 40);
+  VP_GetViewport2 := DD_OK;
+End;
+
+{ D3DTRANSFORMDATA : positions transformees (D3DTLVERTEX en sortie) }
+Function VP_Transform(T, N, D, Fl, POff : LongInt) : LongInt;
+Var C, I, Src, Dst, SS, DS : LongInt; V : TVtx;
+Begin
+  C := Cor(T);
+  VP_Transform := DDERR_INVALIDPARAMS;
+  If (D = 0) Or (MemL[0:C + 108] = 0) Or Not DevSel(MemL[0:C + 108]) Then
+    Exit;
+  VPApply(C);
+  D3DMats;
+  Src := MemL[0:D + 4]; SS := MemL[0:D + 8];
+  Dst := MemL[0:D + 12]; DS := MemL[0:D + 16];
+  For I := 0 To N - 1 Do
+  Begin
+    FvfParse($2);
+    VFStride := SS;
+    DVBase := 0;
+    D3DProcess(Src + I * SS, 1, False);
+    V := DV^[0];
+    D3DProject(V);
+    If Dst <> 0 Then
+    Begin
+      MemL[0:Dst + I * DS] := LFl(V.SX);
+      MemL[0:Dst + I * DS + 4] := LFl(V.SY);
+      MemL[0:Dst + I * DS + 8] := LFl(V.SZ);
+      MemL[0:Dst + I * DS + 12] := LFl(V.RW);
+    End;
+  End;
+  MemL[0:D + 24] := 0;
+  If POff <> 0 Then MemL[0:POff] := 0;
+  VP_Transform := DD_OK;
+End;
+
+Function VP_SetBack(T, H : LongInt) : LongInt;
+Begin
+  MemL[0:Cor(T) + 104] := H;
+  VP_SetBack := DD_OK;
+End;
+
+Function VP_GetBack(T, PH, PV : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := MemL[0:Cor(T) + 104];
+  If PV <> 0 Then MemL[0:PV] := Ord(MemL[0:Cor(T) + 104] <> 0);
+  VP_GetBack := DD_OK;
+End;
+
+Function VP_SetBackDepth(T, S : LongInt) : LongInt;
+Begin
+  MemL[0:Cor(T) + 112] := Cor(S);
+  VP_SetBackDepth := DD_OK;
+End;
+
+Function VP_GetBackDepth(T, PP, PV : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := MemL[0:Cor(T) + 112];
+  If PV <> 0 Then MemL[0:PV] := Ord(MemL[0:Cor(T) + 112] <> 0);
+  VP_GetBackDepth := DD_OK;
+End;
+
+Function VP_Clear2(T, N, Rects, Fl, Color, Z, St : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  VP_Clear2 := DD_OK;
+  If (MemL[0:C + 108] = 0) Or Not DevSel(MemL[0:C + 108]) Then Exit;
+  VPApply(C);
+  D3DClear(N, Rects, Fl, Color, Z);
+End;
+
+Function VP_Clear(T, N, Rects, Fl : LongInt) : LongInt;
+Var C, M, Col : LongInt;
+Begin
+  C := Cor(T);
+  M := MemL[0:C + 104];
+  Col := 0;
+  If M <> 0 Then
+    Col := (Clamp8(DRound(FlM(M + 80) * 255)) Shl 24) Or
+           (Clamp8(DRound(FlM(M + 68) * 255)) Shl 16) Or
+           (Clamp8(DRound(FlM(M + 72) * 255)) Shl 8) Or
+           Clamp8(DRound(FlM(M + 76) * 255));
+  VP_Clear := VP_Clear2(T, N, Rects, Fl, Col, LFl(1.0), 0);
+End;
+
+Function VP_AddLight(T, L : LongInt) : LongInt;
+Var C, N : LongInt;
+Begin
+  C := Cor(T); L := Cor(L);
+  VP_AddLight := DDERR_INVALIDPARAMS;
+  N := MemL[0:C + 116];
+  If (L = 0) Or (N >= 16) Then Exit;
+  COMAddRef(L);
+  MemL[0:C + 120 + N * 4] := L;
+  MemL[0:C + 116] := N + 1;
+  VP_AddLight := DD_OK;
+End;
+
+Function VP_DelLight(T, L : LongInt) : LongInt;
+Var C, N, I, J : LongInt;
+Begin
+  C := Cor(T); L := Cor(L);
+  VP_DelLight := DDERR_INVALIDPARAMS;
+  N := MemL[0:C + 116];
+  For I := 0 To N - 1 Do
+    If MemL[0:C + 120 + I * 4] = L Then
+    Begin
+      For J := I To N - 2 Do
+        MemL[0:C + 120 + J * 4] := MemL[0:C + 120 + J * 4 + 4];
+      MemL[0:C + 116] := N - 1;
+      COMRelease(L);
+      VP_DelLight := DD_OK;
+      Exit;
+    End;
+End;
+
+Function VP_NextLight(T, Ref, PP, Fl : LongInt) : LongInt;
+Var C, N, I, K : LongInt;
+Begin
+  C := Cor(T); Ref := Cor(Ref);
+  VP_NextLight := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  N := MemL[0:C + 116];
+  If N = 0 Then Exit;
+  K := -1;
+  If (Fl And 2) <> 0 Then K := 0
+  Else If (Fl And 4) <> 0 Then K := N - 1
+  Else
+    For I := 0 To N - 2 Do
+      If MemL[0:C + 120 + I * 4] = Ref Then K := I + 1;
+  If K < 0 Then Exit;
+  MemL[0:PP] := MemL[0:C + 120 + K * 4];
+  COMAddRef(MemL[0:PP]);
+  VP_NextLight := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Materiaux (+64 D3DMATERIAL) et lumieres (+64 D3DLIGHT2)            }
+{ ------------------------------------------------------------------ }
+
+Function D3_CreateMaterial(T, PP, Outer : LongInt) : LongInt;
+Var V, C : LongInt;
+Begin
+  V := IfVer(T);
+  D3DInitVt;
+  D3_CreateMaterial := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  C := ComNew(0, 13, 160);
+  If V = 4 Then ComView(C, 0, VtMat1) Else ComView(C, 1, VtMat2);
+  MemL[0:C + 64] := 80;
+  MemL[0:PP] := C;
+  D3_CreateMaterial := DD_OK;
+End;
+
+Function MT_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  MT_QI := COMQIUnk(T, Riid, Ppv);
+  If (Ppv <> 0) And (Riid <> 0) And ((MemL[0:Riid] = $4417C144) Or
+     (MemL[0:Riid] = LongInt($93281503)) Or
+     (MemL[0:Riid] = LongInt($CA9C46F4))) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    MT_QI := DD_OK;
+  End;
+End;
+
+Function MT_Set(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(P + 4, Cor(T) + 68, 76);
+  MT_Set := DD_OK;
+End;
+
+Function MT_Get(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 80;
+    MoveMem(Cor(T) + 68, P + 4, 76);
+  End;
+  MT_Get := DD_OK;
+End;
+
+Function MT_GetHandle(T, Dev, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := Cor(T);
+  MT_GetHandle := DD_OK;
+End;
+
+Function D3_CreateLight(T, PP, Outer : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  D3DInitVt;
+  D3_CreateLight := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  C := ComNew(0, 14, 160);
+  ComView(C, 0, VtLit);
+  MemL[0:C + 64] := 80;
+  MemL[0:C + 140] := 1;
+  MemL[0:PP] := C;
+  D3_CreateLight := DD_OK;
+End;
+
+Function LT_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  LT_QI := COMQIUnk(T, Riid, Ppv);
+End;
+
+Function LT_Set(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  LT_Set := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MoveMem(P + 4, C + 68, 72);
+  If MemL[0:P] >= 80 Then MemL[0:C + 140] := MemL[0:P + 76]
+  Else MemL[0:C + 140] := 1;
+  LT_Set := DD_OK;
+End;
+
+Function LT_Get(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  LT_Get := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MoveMem(C + 68, P + 4, 72);
+  If MemL[0:P] >= 80 Then MemL[0:P + 76] := MemL[0:C + 140];
+  LT_Get := DD_OK;
+End;
+
+{ Textures (vues des surfaces) : la poignee est le coeur }
+Function TX_GetHandle(T, Dev, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := Cor(T);
+  TX_GetHandle := DD_OK;
+End;
+
+Procedure TxCopy(D, S : LongInt);
+Begin
+  While (D <> 0) And (S <> 0) Do
+  Begin
+    SfXfer(D, 0, 0, MemL[0:D + 64], MemL[0:D + 68], S, 0, 0,
+           MemL[0:S + 64], MemL[0:S + 68], False, False, 0, 0, 0, 0, False,
+           False);
+    If MemL[0:S + 124] <> 0 Then
+    Begin
+      If MemL[0:D + 124] = 0 Then SF_SetPalette(D, MemL[0:S + 124])
+      Else MoveMem(MemL[0:S + 124] + 68, MemL[0:D + 124] + 68, 1024);
+    End;
+    MemL[0:D + 132] := MemL[0:S + 132]; MemL[0:D + 136] := MemL[0:S + 136];
+    MemL[0:D + 148] := MemL[0:S + 148];
+    D := MemL[0:D + 116]; S := MemL[0:S + 116];
+  End;
+End;
+
+Function TX_Load(T, Src : LongInt) : LongInt;
+Begin
+  TxCopy(Cor(T), Cor(Src));
+  TX_Load := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Peripheriques : etats, transformations, dessin                     }
+{ ------------------------------------------------------------------ }
+
+Function DV_AddViewport(T, VP : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DV_AddViewport := DDERR_INVALIDPARAMS;
+  VP := Cor(VP);
+  If (VP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  For I := 0 To 15 Do
+    If D3G^.VPs[I] = 0 Then
+    Begin
+      D3G^.VPs[I] := VP;
+      COMAddRef(VP);
+      MemL[0:VP + 108] := Cor(T);
+      DV_AddViewport := DD_OK;
+      Exit;
+    End;
+End;
+
+Function DV_DelViewport(T, VP : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DV_DelViewport := DDERR_INVALIDPARAMS;
+  VP := Cor(VP);
+  If Not DevSel(Cor(T)) Then Exit;
+  For I := 0 To 15 Do
+    If (VP <> 0) And (D3G^.VPs[I] = VP) Then
+    Begin
+      D3G^.VPs[I] := 0;
+      If D3G^.VPCur = VP Then D3G^.VPCur := 0;
+      COMRelease(VP);
+      DV_DelViewport := DD_OK;
+      Exit;
+    End;
+End;
+
+Function DV_NextViewport(T, Ref, PP, Fl : LongInt) : LongInt;
+Var I, K : LongInt;
+Begin
+  DV_NextViewport := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PP] := 0;
+  Ref := Cor(Ref);
+  K := -1;
+  For I := 15 DownTo 0 Do
+    If D3G^.VPs[I] <> 0 Then
+    Begin
+      If (Fl And 4) <> 0 Then
+      Begin
+        If K < 0 Then K := I;
+      End
+      Else If (Fl And 2) <> 0 Then K := I
+      Else If (I > 0) And (D3G^.VPs[I - 1] = Ref) Then K := I;
+    End;
+  If K < 0 Then Exit;
+  MemL[0:PP] := D3G^.VPs[K];
+  COMAddRef(D3G^.VPs[K]);
+  DV_NextViewport := DD_OK;
+End;
+
+Function DV_SetCurVP(T, VP : LongInt) : LongInt;
+Begin
+  DV_SetCurVP := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Then Exit;
+  D3G^.VPCur := Cor(VP);
+  If D3G^.VPCur <> 0 Then
+  Begin
+    MemL[0:D3G^.VPCur + 108] := Cor(T);
+    VPApply(D3G^.VPCur);
+  End;
+  DV_SetCurVP := DD_OK;
+End;
+
+Function DV_GetCurVP(T, PP : LongInt) : LongInt;
+Begin
+  DV_GetCurVP := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PP] := D3G^.VPCur;
+  If D3G^.VPCur = 0 Then Exit;
+  COMAddRef(D3G^.VPCur);
+  DV_GetCurVP := DD_OK;
+End;
+
+Function DV_BeginScene(T : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3G^.InScene := 1;
+  DV_BeginScene := DD_OK;
+End;
+
+Function DV_EndScene(T : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then
+  Begin
+    D3G^.InScene := 0;
+    If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, True);
+  End;
+  DV_EndScene := DD_OK;
+End;
+
+Function DV_SetRT(T, S, Fl : LongInt) : LongInt;
+Begin
+  DV_SetRT := DDERR_INVALIDPARAMS;
+  S := Cor(S);
+  If (S = 0) Or Not DevSel(Cor(T)) Then Exit;
+  COMAddRef(S);
+  If D3G^.RT <> 0 Then COMRelease(D3G^.RT);
+  D3G^.RT := S;
+  If D3G^.Ver <= 3 Then
+  Begin
+    D3G^.VX := 0; D3G^.VY := 0;
+    D3G^.VW := MemL[0:S + 64]; D3G^.VH := MemL[0:S + 68];
+  End;
+  DV_SetRT := DD_OK;
+End;
+
+Function DV_GetRT(T, PP : LongInt) : LongInt;
+Var K : LongInt;
+Begin
+  DV_GetRT := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If D3G^.Ver >= 7 Then K := 4 Else If D3G^.Ver = 3 Then K := 3 Else K := 0;
+  DV_GetRT := ComGive(D3G^.RT, K, SfVt(K), PP);
+End;
+
+{ ---------------------------- blocs d'etats ------------------------ }
+{ Bloc : +0 nombre, +4 capacite, puis (sorte, indice, valeur) ; les
+  valeurs longues (matrices, materiau, lumiere, viewport) sont des
+  blocs alloues. Sortes : 1 etat de rendu, 2 etat d'etage, 3 texture,
+  4 matrice, 5 materiau, 6 lumiere, 7 lumiere active, 8 viewport }
+
+Function SBNew : LongInt;
+Var B : LongInt;
+Begin
+  B := KAlloc(8 + 64 * 12);
+  MemL[0:B] := 0; MemL[0:B + 4] := 64;
+  SBNew := B;
+End;
+
+Procedure SBAdd(Var B : LongInt; K, I, V : LongInt);
+Var N, J, NB : LongInt;
+Begin
+  N := MemL[0:B];
+  For J := 0 To N - 1 Do
+    If (MemL[0:B + 8 + J * 12] = K) And (MemL[0:B + 12 + J * 12] = I) Then
+    Begin
+      If (K >= 4) And (K <> 7) And (MemL[0:B + 16 + J * 12] <> 0) Then
+        KFree(MemL[0:B + 16 + J * 12]);
+      MemL[0:B + 16 + J * 12] := V;
+      Exit;
+    End;
+  If N >= MemL[0:B + 4] Then
+  Begin
+    NB := KAlloc(8 + MemL[0:B + 4] * 2 * 12);
+    MoveMem(B, NB, 8 + N * 12);
+    MemL[0:NB + 4] := MemL[0:B + 4] * 2;
+    KFree(B);
+    B := NB;
+  End;
+  MemL[0:B + 8 + N * 12] := K; MemL[0:B + 12 + N * 12] := I;
+  MemL[0:B + 16 + N * 12] := V;
+  MemL[0:B] := N + 1;
+End;
+
+Function SBCopy(P, N : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  B := KAlloc(N + 4);
+  MoveMem(P, B, N);
+  SBCopy := B;
+End;
+
+{ Enregistrer si un bloc est en cours ; True : ne pas appliquer }
+Function SBRecord(K, I, V : LongInt) : Boolean;
+Var B : LongInt;
+Begin
+  SBRecord := False;
+  If D3G^.SBRec = 0 Then Exit;
+  B := D3G^.SBRec;
+  SBAdd(B, K, I, V);
+  D3G^.SBRec := B;
+  SBRecord := True;
+End;
+
+Procedure D3DSetRS(S, V : LongInt);
+Begin
+  If (S < 0) Or (S > 255) Then Exit;
+  If SBRecord(1, S, V) Then Exit;
+  D3G^.RS[S] := V;
+  If D3G^.Ver <= 3 Then
+    Case S Of
+      rsTexHandle :
+      Begin
+        D3G^.UseTSS := 0; D3G^.Tex[0] := 0;
+      End;
+      rsTexBlend :
+      Begin
+        D3G^.LegBlend := V; D3G^.UseTSS := 0;
+      End;
+    End;
+End;
+
+Procedure D3DSetTSS(St, K, V : LongInt);
+Begin
+  If (St < 0) Or (St > 7) Or (K < 0) Or (K > 31) Then Exit;
+  If SBRecord(2, St * 32 + K, V) Then Exit;
+  D3G^.TS[St * 32 + K] := V;
+  If K = tsAddr Then
+  Begin
+    D3G^.TS[St * 32 + tsAddrU] := V; D3G^.TS[St * 32 + tsAddrV] := V;
+  End;
+  D3G^.UseTSS := 1;
+End;
+
+Procedure D3DSetTex(St, S : LongInt);
+Begin
+  If (St < 0) Or (St > 7) Then Exit;
+  If SBRecord(3, St, S) Then Exit;
+  If S <> 0 Then COMAddRef(S);
+  If D3G^.Tex[St] <> 0 Then COMRelease(D3G^.Tex[St]);
+  D3G^.Tex[St] := S;
+  D3G^.UseTSS := 1;
+End;
+
+Procedure D3DSetMtl(P : LongInt);
+Var I : LongInt;
+Begin
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(5, 0, SBCopy(P, 68));
+    Exit;
+  End;
+  For I := 0 To 16 Do D3G^.Mt[I] := FlM(P + I * 4);
+End;
+
+Procedure D3DSetLight(I, P : LongInt);
+Var K : LongInt;
+Begin
+  If (I < 0) Or (I > 15) Then Exit;
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(6, I, SBCopy(P, 104));
+    Exit;
+  End;
+  D3G^.Lt[I].Typ := MemL[0:P];
+  For K := 0 To 3 Do
+  Begin
+    D3G^.Lt[I].Dif[K] := FlM(P + 4 + K * 4);
+    D3G^.Lt[I].Spe[K] := FlM(P + 20 + K * 4);
+    D3G^.Lt[I].Amb[K] := FlM(P + 36 + K * 4);
+  End;
+  For K := 0 To 2 Do
+  Begin
+    D3G^.Lt[I].Pos[K] := FlM(P + 52 + K * 4);
+    D3G^.Lt[I].Dir[K] := FlM(P + 64 + K * 4);
+  End;
+  D3G^.Lt[I].Rng := FlM(P + 76); D3G^.Lt[I].Fall := FlM(P + 80);
+  D3G^.Lt[I].A0 := FlM(P + 84); D3G^.Lt[I].A1 := FlM(P + 88);
+  D3G^.Lt[I].A2 := FlM(P + 92);
+  D3G^.Lt[I].Th := FlM(P + 96); D3G^.Lt[I].Ph := FlM(P + 100);
+  If (D3G^.Lt[I].A0 = 0) And (D3G^.Lt[I].A1 = 0) And (D3G^.Lt[I].A2 = 0)
+  Then D3G^.Lt[I].A0 := 1;
+End;
+
+Procedure D3DGetLight(I, P : LongInt);
+Var K : LongInt;
+Begin
+  FillMem(P, 104, 0);
+  If (I < 0) Or (I > 15) Then Exit;
+  MemL[0:P] := D3G^.Lt[I].Typ;
+  For K := 0 To 3 Do
+  Begin
+    MemL[0:P + 4 + K * 4] := LFl(D3G^.Lt[I].Dif[K]);
+    MemL[0:P + 20 + K * 4] := LFl(D3G^.Lt[I].Spe[K]);
+    MemL[0:P + 36 + K * 4] := LFl(D3G^.Lt[I].Amb[K]);
+  End;
+  For K := 0 To 2 Do
+  Begin
+    MemL[0:P + 52 + K * 4] := LFl(D3G^.Lt[I].Pos[K]);
+    MemL[0:P + 64 + K * 4] := LFl(D3G^.Lt[I].Dir[K]);
+  End;
+  MemL[0:P + 76] := LFl(D3G^.Lt[I].Rng); MemL[0:P + 80] := LFl(D3G^.Lt[I].Fall);
+  MemL[0:P + 84] := LFl(D3G^.Lt[I].A0); MemL[0:P + 88] := LFl(D3G^.Lt[I].A1);
+  MemL[0:P + 92] := LFl(D3G^.Lt[I].A2);
+  MemL[0:P + 96] := LFl(D3G^.Lt[I].Th); MemL[0:P + 100] := LFl(D3G^.Lt[I].Ph);
+End;
+
+Procedure D3DLightOn(I, On : LongInt);
+Begin
+  If (I < 0) Or (I > 15) Then Exit;
+  If SBRecord(7, I, On) Then Exit;
+  D3G^.Lt[I].On := Ord(On <> 0);
+End;
+
+Procedure D3DSetVP7(P : LongInt);
+Begin
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(8, 0, SBCopy(P, 24));
+    Exit;
+  End;
+  D3G^.VX := MemL[0:P]; D3G^.VY := MemL[0:P + 4];
+  D3G^.VW := MemL[0:P + 8]; D3G^.VH := MemL[0:P + 12];
+  D3G^.VMinZ := FlM(P + 16); D3G^.VMaxZ := FlM(P + 20);
+  If D3G^.VMaxZ <= D3G^.VMinZ Then
+  Begin
+    D3G^.VMinZ := 0; D3G^.VMaxZ := 1;
+  End;
+  D3G^.ClX := -1; D3G^.ClY := 1; D3G^.ClW := 2; D3G^.ClH := 2;
+End;
+
+Procedure D3DSetMatK(K, P : LongInt);
+Var M : TMat;
+Begin
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(4, K, SBCopy(P, 64));
+    Exit;
+  End;
+  MatLoad(M, P);
+  D3DMatSet(K, M);
+End;
+
+{ Appliquer ou relever un bloc }
+Procedure SBApply(B : LongInt; Capture : Boolean);
+Var J, K, I, V, Q : LongInt; M : TMat;
+Begin
+  If B = 0 Then Exit;
+  For J := 0 To MemL[0:B] - 1 Do
+  Begin
+    K := MemL[0:B + 8 + J * 12]; I := MemL[0:B + 12 + J * 12];
+    V := MemL[0:B + 16 + J * 12];
+    If Capture Then
+    Begin
+      Case K Of
+        1 : V := D3G^.RS[I];
+        2 : V := D3G^.TS[I];
+        3 : V := D3G^.Tex[I];
+        4 : If D3DMatOf(I, M) Then MatStore(M, V);
+        5 : For Q := 0 To 16 Do MemL[0:V + Q * 4] := LFl(D3G^.Mt[Q]);
+        6 : D3DGetLight(I, V);
+        7 : V := D3G^.Lt[I].On;
+        8 :
+        Begin
+          MemL[0:V] := D3G^.VX; MemL[0:V + 4] := D3G^.VY;
+          MemL[0:V + 8] := D3G^.VW; MemL[0:V + 12] := D3G^.VH;
+          MemL[0:V + 16] := LFl(D3G^.VMinZ);
+          MemL[0:V + 20] := LFl(D3G^.VMaxZ);
+        End;
+      End;
+      MemL[0:B + 16 + J * 12] := V;
+    End
+    Else
+      Case K Of
+        1 : D3DSetRS(I, V);
+        2 : D3DSetTSS(I Div 32, I Mod 32, V);
+        3 : D3DSetTex(I, V);
+        4 : D3DSetMatK(I, V);
+        5 : D3DSetMtl(V);
+        6 : D3DSetLight(I, V);
+        7 : D3DLightOn(I, V);
+        8 : D3DSetVP7(V);
+      End;
+  End;
+End;
+
+Function DV_BeginSB(T : LongInt) : LongInt;
+Begin
+  DV_BeginSB := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Or (D3G^.SBRec <> 0) Then Exit;
+  D3G^.SBRec := SBNew;
+  DV_BeginSB := DD_OK;
+End;
+
+Function DV_EndSB(T, PH : LongInt) : LongInt;
+Begin
+  DV_EndSB := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Or (D3G^.SBRec = 0) Then Exit;
+  If PH <> 0 Then MemL[0:PH] := D3G^.SBRec;
+  D3G^.SBRec := 0;
+  DV_EndSB := DD_OK;
+End;
+
+Function DV_ApplySB(T, H : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) And (D3G^.SBRec = 0) Then SBApply(H, False);
+  DV_ApplySB := DD_OK;
+End;
+
+Function DV_CaptureSB(T, H : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then SBApply(H, True);
+  DV_CaptureSB := DD_OK;
+End;
+
+Function DV_DeleteSB(T, H : LongInt) : LongInt;
+Var J, K : LongInt;
+Begin
+  If H <> 0 Then
+  Begin
+    For J := 0 To MemL[0:H] - 1 Do
+    Begin
+      K := MemL[0:H + 8 + J * 12];
+      If (K >= 4) And (K <> 7) And (MemL[0:H + 16 + J * 12] <> 0) Then
+        KFree(MemL[0:H + 16 + J * 12]);
+    End;
+    KFree(H);
+  End;
+  DV_DeleteSB := DD_OK;
+End;
+
+{ Bloc de tous les etats (types ALL, PIXEL, VERTEX : tout est pris) }
+Function D3DSBAll : LongInt;
+Var B, I : LongInt;
+Begin
+  B := SBNew;
+  For I := 1 To 255 Do SBAdd(B, 1, I, 0);
+  For I := 0 To 63 Do SBAdd(B, 2, I, 0);
+  For I := 0 To 7 Do SBAdd(B, 3, I, 0);
+  SBAdd(B, 4, 1, KAlloc(64)); SBAdd(B, 4, 2, KAlloc(64));
+  SBAdd(B, 4, 3, KAlloc(64));
+  SBAdd(B, 5, 0, KAlloc(68));
+  For I := 0 To 7 Do
+  Begin
+    SBAdd(B, 6, I, KAlloc(104)); SBAdd(B, 7, I, 0);
+  End;
+  SBAdd(B, 8, 0, KAlloc(24));
+  SBApply(B, True);
+  D3DSBAll := B;
+End;
+
+Function DV_CreateSB(T, Ty, PH : LongInt) : LongInt;
+Begin
+  DV_CreateSB := DDERR_INVALIDPARAMS;
+  If (PH = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PH] := D3DSBAll;
+  DV_CreateSB := DD_OK;
+End;
+
+{ ------------------------------ etats ------------------------------ }
+
+Function DV_SetRS(T, S, V : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DSetRS(S, V);
+  DV_SetRS := DD_OK;
+End;
+
+Function DV_GetRS(T, S, P : LongInt) : LongInt;
+Begin
+  DV_GetRS := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Or (S < 0) Or (S > 255) Then Exit;
+  MemL[0:P] := D3G^.RS[S];
+  DV_GetRS := DD_OK;
+End;
+
+Function DV_SetLS(T, S, V : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) And (S >= 0) And (S <= 15) Then D3G^.LS[S] := V;
+  DV_SetLS := DD_OK;
+End;
+
+Function DV_GetLS(T, S, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And DevSel(Cor(T)) And (S >= 0) And (S <= 15) Then
+    MemL[0:P] := D3G^.LS[S];
+  DV_GetLS := DD_OK;
+End;
+
+Function DV_SetTSS(T, St, K, V : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DSetTSS(St, K, V);
+  DV_SetTSS := DD_OK;
+End;
+
+Function DV_GetTSS(T, St, K, P : LongInt) : LongInt;
+Begin
+  DV_GetTSS := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Or (St < 0) Or (St > 7) Or (K < 0) Or
+     (K > 31) Then Exit;
+  MemL[0:P] := D3G^.TS[St * 32 + K];
+  DV_GetTSS := DD_OK;
+End;
+
+Function DV_SetTexture(T, St, S : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DSetTex(St, Cor(S));
+  DV_SetTexture := DD_OK;
+End;
+
+Function DV_GetTexture(T, St, PP : LongInt) : LongInt;
+Var S, K : LongInt;
+Begin
+  DV_GetTexture := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Or (St < 0) Or (St > 7) Then Exit;
+  S := D3G^.Tex[St];
+  MemL[0:PP] := 0;
+  DV_GetTexture := DD_OK;
+  If S = 0 Then Exit;
+  If D3G^.Ver >= 7 Then K := 4 Else K := 7;
+  If K = 4 Then DV_GetTexture := ComGive(S, 4, VtS7, PP)
+  Else DV_GetTexture := ComGive(S, 7, VtTx2, PP);
+End;
+
+Function DV_Validate(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 1;
+  DV_Validate := DD_OK;
+End;
+
+Function DV_SetClipStatus(T, P : LongInt) : LongInt;
+Begin
+  DV_SetClipStatus := DD_OK;
+End;
+
+Function DV_GetClipStatus(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then FillMem(P, 32, 0);
+  DV_GetClipStatus := DD_OK;
+End;
+
+Function DV_SphereVis(T, C, R, N, Fl, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And (N > 0) Then FillMem(P, N * 4, 0);
+  DV_SphereVis := DD_OK;
+End;
+
+{ --------------------------- transformations ----------------------- }
+
+Function DV_SetTransform(T, K, P : LongInt) : LongInt;
+Begin
+  DV_SetTransform := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetMatK(K, P);
+  DV_SetTransform := DD_OK;
+End;
+
+Function DV_GetTransform(T, K, P : LongInt) : LongInt;
+Var M : TMat;
+Begin
+  DV_GetTransform := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If Not D3DMatOf(K, M) Then MatId(M);
+  MatStore(M, P);
+  DV_GetTransform := DD_OK;
+End;
+
+Function DV_MulTransform(T, K, P : LongInt) : LongInt;
+Var M, A : TMat;
+Begin
+  DV_MulTransform := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If Not D3DMatOf(K, M) Then Exit;
+  MatLoad(A, P);
+  MatMul(M, A, M);
+  D3DMatSet(K, M);
+  DV_MulTransform := DD_OK;
+End;
+
+Function DV_SetViewport7(T, P : LongInt) : LongInt;
+Begin
+  DV_SetViewport7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetVP7(P);
+  DV_SetViewport7 := DD_OK;
+End;
+
+Function DV_GetViewport7(T, P : LongInt) : LongInt;
+Begin
+  DV_GetViewport7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:P] := D3G^.VX; MemL[0:P + 4] := D3G^.VY;
+  MemL[0:P + 8] := D3G^.VW; MemL[0:P + 12] := D3G^.VH;
+  MemL[0:P + 16] := LFl(D3G^.VMinZ); MemL[0:P + 20] := LFl(D3G^.VMaxZ);
+  DV_GetViewport7 := DD_OK;
+End;
+
+Function DV_SetMaterial7(T, P : LongInt) : LongInt;
+Begin
+  DV_SetMaterial7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetMtl(P);
+  DV_SetMaterial7 := DD_OK;
+End;
+
+Function DV_GetMaterial7(T, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DV_GetMaterial7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  For I := 0 To 16 Do MemL[0:P + I * 4] := LFl(D3G^.Mt[I]);
+  DV_GetMaterial7 := DD_OK;
+End;
+
+Function DV_SetLight7(T, I, P : LongInt) : LongInt;
+Begin
+  DV_SetLight7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetLight(I, P);
+  DV_SetLight7 := DD_OK;
+End;
+
+Function DV_GetLight7(T, I, P : LongInt) : LongInt;
+Begin
+  DV_GetLight7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DGetLight(I, P);
+  DV_GetLight7 := DD_OK;
+End;
+
+Function DV_LightEnable(T, I, On : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DLightOn(I, On);
+  DV_LightEnable := DD_OK;
+End;
+
+Function DV_GetLightEnable(T, I, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And DevSel(Cor(T)) And (I >= 0) And (I <= 15) Then
+    MemL[0:P] := D3G^.Lt[I].On;
+  DV_GetLightEnable := DD_OK;
+End;
+
+{ ------------------------------- dessin ---------------------------- }
+
+Procedure DrawK(T, Pt, Fvf, Src, NV, Idx, Sz, NI, Fl : LongInt);
+Begin
+  If Not DevSel(Cor(T)) Then Exit;
+  If D3G^.Ver <= 3 Then
+  Begin
+    If D3G^.VPCur <> 0 Then VPApply(D3G^.VPCur);
+    D3DLegacySync;
+  End;
+  DVBase := 0;
+  D3DDraw(Pt, Fvf, Src, NV, Idx, Sz, NI, Fl);
+End;
+
+Function DV_DrawPrim(T, Pt, Fvf, Src, N, Fl : LongInt) : LongInt;
+Begin
+  DrawK(T, Pt, Fvf, Src, N, 0, 0, 0, Fl);
+  DV_DrawPrim := DD_OK;
+End;
+
+Function DV_DrawIdxPrim(T, Pt, Fvf, Src, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Begin
+  DrawK(T, Pt, Fvf, Src, NV, Idx, 2, NI, Fl);
+  DV_DrawIdxPrim := DD_OK;
+End;
+
+Function DV_DrawPrim2(T, Pt, Vt, Src, N, Fl : LongInt) : LongInt;
+Begin
+  DrawK(T, Pt, VtToFvf(Vt), Src, N, 0, 0, 0, Fl);
+  DV_DrawPrim2 := DD_OK;
+End;
+
+Function DV_DrawIdxPrim2(T, Pt, Vt, Src, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Begin
+  DrawK(T, Pt, VtToFvf(Vt), Src, NV, Idx, 2, NI, Fl);
+  DV_DrawIdxPrim2 := DD_OK;
+End;
+
+{ Donnees espacees (D3DDRAWPRIMITIVESTRIDEDDATA) -> sommets entrelaces }
+Function StridedPack(Fvf, P, N : LongInt) : LongInt;
+Var B, I, K, O, D : LongInt;
+Begin
+  FvfParse(Fvf);
+  B := KAlloc(N * VFStride + 16);
+  For I := 0 To N - 1 Do
+  Begin
+    D := B + I * VFStride;
+    If VFRhw <> 0 Then O := 16 Else O := 12;
+    MoveMem(MemL[0:P] + I * MemL[0:P + 4], D, O);
+    If VFNrm >= 0 Then
+      MoveMem(MemL[0:P + 8] + I * MemL[0:P + 12], D + VFNrm, 12);
+    If VFDif >= 0 Then
+      MemL[0:D + VFDif] := MemL[0:MemL[0:P + 16] + I * MemL[0:P + 20]];
+    If VFSpc >= 0 Then
+      MemL[0:D + VFSpc] := MemL[0:MemL[0:P + 24] + I * MemL[0:P + 28]];
+    For K := 0 To VFTexN - 1 Do
+      MoveMem(MemL[0:P + 32 + K * 8] + I * MemL[0:P + 36 + K * 8],
+              D + VFTex[K], VFTexD[K] * 4);
+  End;
+  StridedPack := B;
+End;
+
+Function DV_DrawPrimStr(T, Pt, Fvf, P, N, Fl : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  DV_DrawPrimStr := DD_OK;
+  If (P = 0) Or (N <= 0) Then Exit;
+  B := StridedPack(Fvf, P, N);
+  DrawK(T, Pt, Fvf, B, N, 0, 0, 0, Fl);
+  KFree(B);
+End;
+
+Function DV_DrawIdxPrimStr(T, Pt, Fvf, P, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Var B : LongInt;
+Begin
+  DV_DrawIdxPrimStr := DD_OK;
+  If (P = 0) Or (NV <= 0) Then Exit;
+  B := StridedPack(Fvf, P, NV);
+  DrawK(T, Pt, Fvf, B, NV, Idx, 2, NI, Fl);
+  KFree(B);
+End;
+
+{ Tampons de sommets : +64 FVF, +68 nombre, +72 donnees, +76 capacites,
+  +80 pas }
+Function DV_DrawPrimVB(T, Pt, VB, St, N, Fl : LongInt) : LongInt;
+Begin
+  VB := Cor(VB);
+  If VB <> 0 Then
+    DrawK(T, Pt, MemL[0:VB + 64], MemL[0:VB + 72] + St * MemL[0:VB + 80], N,
+          0, 0, 0, Fl);
+  DV_DrawPrimVB := DD_OK;
+End;
+
+Function DV_DrawIdxPrimVB7(T, Pt, VB, St, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Begin
+  VB := Cor(VB);
+  If VB <> 0 Then
+    DrawK(T, Pt, MemL[0:VB + 64], MemL[0:VB + 72] + St * MemL[0:VB + 80], NV,
+          Idx, 2, NI, Fl);
+  DV_DrawIdxPrimVB7 := DD_OK;
+End;
+
+Function DV_DrawIdxPrimVB3(T, Pt, VB, Idx, NI, Fl : LongInt) : LongInt;
+Begin
+  VB := Cor(VB);
+  If VB <> 0 Then
+    DrawK(T, Pt, MemL[0:VB + 64], MemL[0:VB + 72], MemL[0:VB + 68], Idx, 2,
+          NI, Fl);
+  DV_DrawIdxPrimVB3 := DD_OK;
+End;
+
+{ Begin / Vertex / Index / End (D3D 2 et 3) }
+Function BeginK(T, Pt, Fvf, Verts, N, Fl : LongInt) : LongInt;
+Begin
+  BeginK := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Then Exit;
+  FvfParse(Fvf);
+  D3G^.BFvf := Fvf; D3G^.BPt := Pt; D3G^.BN := 0; D3G^.BIn := 0;
+  D3G^.BIdx := Verts;
+  If D3G^.BBuf = 0 Then
+  Begin
+    D3G^.BMax := 4096;
+    D3G^.BBuf := KAlloc(D3G^.BMax * 64 + 16);
+  End;
+  If Verts <> 0 Then D3G^.BIn := N;
+  BeginK := DD_OK;
+End;
+
+Function DV_Begin(T, Pt, Fvf, Fl : LongInt) : LongInt;
+Begin
+  DV_Begin := BeginK(T, Pt, Fvf, 0, 0, Fl);
+End;
+
+Function DV_Begin2(T, Pt, Vt, Fl : LongInt) : LongInt;
+Begin
+  DV_Begin2 := BeginK(T, Pt, VtToFvf(Vt), 0, 0, Fl);
+End;
+
+Function DV_BeginIdx(T, Pt, Fvf, Verts, N, Fl : LongInt) : LongInt;
+Begin
+  DV_BeginIdx := BeginK(T, Pt, Fvf, Verts, N, Fl);
+End;
+
+Function DV_BeginIdx2(T, Pt, Vt, Verts, N, Fl : LongInt) : LongInt;
+Begin
+  DV_BeginIdx2 := BeginK(T, Pt, VtToFvf(Vt), Verts, N, Fl);
+End;
+
+Function DV_Vertex(T, P : LongInt) : LongInt;
+Begin
+  DV_Vertex := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Or (D3G^.BBuf = 0) Then Exit;
+  FvfParse(D3G^.BFvf);
+  If D3G^.BN >= D3G^.BMax Then Exit;
+  MoveMem(P, D3G^.BBuf + D3G^.BN * VFStride, VFStride);
+  D3G^.BN := D3G^.BN + 1;
+  DV_Vertex := DD_OK;
+End;
+
+Function DV_Index(T, I : LongInt) : LongInt;
+Begin
+  DV_Index := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Or (D3G^.BBuf = 0) Then Exit;
+  If D3G^.BN >= D3G^.BMax Then Exit;
+  MemW[0:D3G^.BBuf + D3G^.BN * 2] := I;
+  D3G^.BN := D3G^.BN + 1;
+  DV_Index := DD_OK;
+End;
+
+Function DV_End(T, Fl : LongInt) : LongInt;
+Begin
+  DV_End := DD_OK;
+  If Not DevSel(Cor(T)) Or (D3G^.BBuf = 0) Then Exit;
+  If D3G^.BIdx <> 0 Then
+    DrawK(T, D3G^.BPt, D3G^.BFvf, D3G^.BIdx, D3G^.BIn, D3G^.BBuf, 2,
+          D3G^.BN, Fl)
+  Else
+    DrawK(T, D3G^.BPt, D3G^.BFvf, D3G^.BBuf, D3G^.BN, 0, 0, 0, Fl);
+  DevSel(Cor(T));
+  D3G^.BN := 0;
+End;
+
+Function DV_Clear7(T, N, Rects, Fl, Color, Z, St : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DClear(N, Rects, Fl, Color, Z);
+  DV_Clear7 := DD_OK;
+End;
+
+Function DV_SwapTex(T, A, B : LongInt) : LongInt;
+Var Tmp : Array[0..63] Of LongInt;
+Begin
+  A := Cor(A); B := Cor(B);
+  If (A <> 0) And (B <> 0) Then
+  Begin
+    MoveMem(A + 64, LongInt(@Tmp), 52);
+    MoveMem(B + 64, A + 64, 52);
+    MoveMem(LongInt(@Tmp), B + 64, 52);
+    MoveMem(A + 240, LongInt(@Tmp), 36);
+    MoveMem(B + 240, A + 240, 36);
+    MoveMem(LongInt(@Tmp), B + 240, 36);
+  End;
+  DV_SwapTex := DD_OK;
+End;
+
+Function DV_Load7(T, D, PPt, S, PR, Fl : LongInt) : LongInt;
+Var X, Y, L, Tp, R, B : LongInt;
+Begin
+  D := Cor(D); S := Cor(S);
+  DV_Load7 := DDERR_INVALIDPARAMS;
+  If (D = 0) Or (S = 0) Then Exit;
+  If (PR = 0) And (PPt = 0) Then TxCopy(D, S)
+  Else
+  Begin
+    RectOr(PR, MemL[0:S + 64], MemL[0:S + 68], L, Tp, R, B);
+    X := 0; Y := 0;
+    If PPt <> 0 Then
+    Begin
+      X := MemL[0:PPt]; Y := MemL[0:PPt + 4];
+    End;
+    SfXfer(D, X, Y, X + R - L, Y + B - Tp, S, L, Tp, R, B, False, False, 0,
+           0, 0, 0, False, False);
+  End;
+  DV_Load7 := DD_OK;
+End;
+
+{ ------------------- D3D 1 : matrices et tampons d'execution -------- }
+
+Function DV_CreateMatrix(T, PH : LongInt) : LongInt;
+Var M : TMat; B : LongInt;
+Begin
+  DV_CreateMatrix := DDERR_INVALIDPARAMS;
+  If PH = 0 Then Exit;
+  B := KAlloc(64);
+  MatId(M);
+  MatStore(M, B);
+  MemL[0:PH] := B;
+  DV_CreateMatrix := DD_OK;
+End;
+
+Function DV_SetMatrix(T, H, P : LongInt) : LongInt;
+Begin
+  If (H <> 0) And (P <> 0) Then MoveMem(P, H, 64);
+  DV_SetMatrix := DD_OK;
+End;
+
+Function DV_GetMatrix(T, H, P : LongInt) : LongInt;
+Begin
+  If (H <> 0) And (P <> 0) Then MoveMem(H, P, 64);
+  DV_GetMatrix := DD_OK;
+End;
+
+Function DV_DeleteMatrix(T, H : LongInt) : LongInt;
+Begin
+  If H <> 0 Then KFree(H);
+  DV_DeleteMatrix := DD_OK;
+End;
+
+Function DV_Pick(T, EB, VP, Fl, R : LongInt) : LongInt;
+Begin
+  DV_Pick := DD_OK;
+End;
+
+Function DV_GetPickRecords(T, PN, P : LongInt) : LongInt;
+Begin
+  If PN <> 0 Then MemL[0:PN] := 0;
+  DV_GetPickRecords := DD_OK;
+End;
+
+{ Tampon d'execution : +64 taille, +68 donnees, +72 capacites,
+  +76 D3DEXECUTEDATA (48 octets) }
+Function DV_CreateEB(T, PDesc, PP, Outer : LongInt) : LongInt;
+Var C, N : LongInt;
+Begin
+  DV_CreateEB := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PP = 0) Then Exit;
+  N := MemL[0:PDesc + 12];
+  If (N <= 0) Or (N > 16 * 1024 * 1024) Then Exit;
+  C := ComNew(0, 15, 128);
+  ComView(C, 0, VtEB);
+  MemL[0:C + 64] := N;
+  MemL[0:C + 68] := KAlloc(N + 16);
+  FillMem(MemL[0:C + 68], N, 0);
+  MemL[0:C + 72] := MemL[0:PDesc + 8];
+  MemL[0:C + 76] := 48;
+  MemL[0:PP] := C;
+  DV_CreateEB := DD_OK;
+End;
+
+Function EB_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  EB_QI := COMQIUnk(T, Riid, Ppv);
+End;
+
+Function EB_Lock(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  EB_Lock := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:P + 4] := 7;
+  MemL[0:P + 8] := MemL[0:C + 72];
+  MemL[0:P + 12] := MemL[0:C + 64];
+  MemL[0:P + 16] := MemL[0:C + 68];
+  EB_Lock := DD_OK;
+End;
+
+Function EB_SetData(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(P, Cor(T) + 76, 48);
+  EB_SetData := DD_OK;
+End;
+
+Function EB_GetData(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(Cor(T) + 76, P, 48);
+  EB_GetData := DD_OK;
+End;
+
+{ Interpretation d'un tampon d'execution }
+Function DV_Execute(T, EB, VP, Fl : LongInt) : LongInt;
+Var D, VO, VC, P, E, Op, Sz, N, I, Q, A, B, Ok, PF : LongInt;
+    M, M2, M3 : TMat;
+    Setup : Boolean;
+Begin
+  DV_Execute := DDERR_INVALIDPARAMS;
+  EB := Cor(EB);
+  If (EB = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If Cor(VP) <> 0 Then DV_SetCurVP(T, VP);
+  DevSel(Cor(T));
+  D := MemL[0:EB + 68];
+  VO := MemL[0:EB + 80]; VC := MemL[0:EB + 84];
+  P := D + MemL[0:EB + 88];
+  E := P + MemL[0:EB + 92];
+  D3DGrow(VC + 1);
+  Setup := False;
+  While P < E Do
+  Begin
+    Op := Mem[0:P]; Sz := Mem[0:P + 1]; N := MemW[0:P + 2];
+    Q := P + 4;
+    P := Q + Sz * N;
+    Case Op Of
+      1, 2, 3 :
+      Begin
+        If Not Setup Then
+        Begin
+          Setup := D3DSetup;
+          If Not Setup Then Continue;
+        End;
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          Case Op Of
+            1 :
+              For B := MemW[0:A + 2] To MemW[0:A + 2] + MemW[0:A] - 1 Do
+                If B < VC Then D3DPointIdx(B);
+            2 :
+              If (MemW[0:A] < VC) And (MemW[0:A + 2] < VC) Then
+                D3DLineIdx(MemW[0:A], MemW[0:A + 2]);
+          Else
+            If (MemW[0:A] < VC) And (MemW[0:A + 2] < VC) And
+               (MemW[0:A + 4] < VC) Then
+              D3DTriIdx(MemW[0:A], MemW[0:A + 2], MemW[0:A + 4]);
+          End;
+        End;
+      End;
+      4 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If (MemL[0:A] <> 0) And (MemL[0:A + 4] <> 0) Then
+            MoveMem(MemL[0:A + 4], MemL[0:A], 64);
+        End;
+      5 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If (MemL[0:A] <> 0) And (MemL[0:A + 4] <> 0) And
+             (MemL[0:A + 8] <> 0) Then
+          Begin
+            MatLoad(M2, MemL[0:A + 4]); MatLoad(M3, MemL[0:A + 8]);
+            MatMul(M, M2, M3);
+            MatStore(M, MemL[0:A]);
+          End;
+        End;
+      6 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If MemL[0:A + 4] <> 0 Then
+          Begin
+            MatLoad(M, MemL[0:A + 4]);
+            D3DMatSet(MemL[0:A], M);
+          End;
+        End;
+      7 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If (MemL[0:A] >= 0) And (MemL[0:A] <= 15) Then
+            D3G^.LS[MemL[0:A]] := MemL[0:A + 4];
+        End;
+      8 :
+      Begin
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          D3DSetRS(MemL[0:A], MemL[0:A + 4]);
+        End;
+        Setup := False;
+      End;
+      9 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          PF := MemL[0:A] And 7;
+          B := MemW[0:A + 6];
+          Ok := MemL[0:A + 8];
+          If B + Ok > VC Then Ok := VC - B;
+          If Ok <= 0 Then Continue;
+          Case PF Of
+            0 : FvfParse($112);
+            1 : FvfParse($1E2);
+          Else
+            FvfParse($1C4);
+          End;
+          VFStride := 32;
+          D3DLegacySync;
+          If PF = 0 Then D3DLightsView;
+          DVBase := B;
+          D3DProcess(D + VO + MemW[0:A + 4] * 32, Ok, PF = 0);
+          DVBase := 0;
+        End;
+      10 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          TxCopy(MemL[0:A], MemL[0:A + 4]);
+        End;
+      11 : P := E;
+      12 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          Ok := Ord((0 And MemL[0:A]) = MemL[0:A + 4]);
+          If MemL[0:A + 8] <> 0 Then Ok := 1 - Ok;
+          If Ok <> 0 Then
+          Begin
+            If MemL[0:A + 12] = 0 Then P := E
+            Else P := Q - 4 + MemL[0:A + 12];
+            Break;
+          End;
+        End;
+    End;
+  End;
+  DV_Execute := DD_OK;
+End;
+
+{ ------------------------- tampons de sommets ---------------------- }
+
+Function VBNew(PDesc, PP, Slot : LongInt) : LongInt;
+Var C, N, F : LongInt;
+Begin
+  VBNew := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PP = 0) Then Exit;
+  D3DInitVt;
+  F := MemL[0:PDesc + 8]; N := MemL[0:PDesc + 12];
+  If (N <= 0) Or (N > 65536) Then Exit;
+  FvfParse(F);
+  C := ComNew(0, 16, 96);
+  If Slot = 0 Then ComView(C, 0, VtVB) Else ComView(C, 1, VtVB7);
+  MemL[0:C + 64] := F; MemL[0:C + 68] := N;
+  MemL[0:C + 80] := VFStride;
+  MemL[0:C + 72] := KAlloc(N * VFStride + 16);
+  FillMem(MemL[0:C + 72], N * VFStride, 0);
+  MemL[0:C + 76] := MemL[0:PDesc + 4];
+  MemL[0:PP] := C;
+  VBNew := DD_OK;
+End;
+
+Function D3_CreateVB3(T, PDesc, PP, Fl, Outer : LongInt) : LongInt;
+Begin
+  D3_CreateVB3 := VBNew(PDesc, PP, 0);
+End;
+
+Function D3_CreateVB7(T, PDesc, PP, Fl : LongInt) : LongInt;
+Begin
+  D3_CreateVB7 := VBNew(PDesc, PP, 1);
+End;
+
+Function VB_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  VB_QI := COMQIUnk(T, Riid, Ppv);
+End;
+
+Function VB_Lock(T, Fl, PP, PN : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If PP <> 0 Then MemL[0:PP] := MemL[0:C + 72];
+  If PN <> 0 Then MemL[0:PN] := MemL[0:C + 68] * MemL[0:C + 80];
+  VB_Lock := DD_OK;
+End;
+
+Function VB_GetDesc(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 16; MemL[0:P + 4] := MemL[0:C + 76];
+    MemL[0:P + 8] := MemL[0:C + 64]; MemL[0:P + 12] := MemL[0:C + 68];
+  End;
+  VB_GetDesc := DD_OK;
+End;
+
+{ Transformer des sommets d'un tampon source vers ce tampon (ecran) }
+Function VB_Process(T, Op, DI, N, Src, SI, Dev, Fl : LongInt) : LongInt;
+Var C, S, I, A, K : LongInt; V : TVtx; DFvf : LongInt;
+Begin
+  C := Cor(T); S := Cor(Src);
+  VB_Process := DDERR_INVALIDPARAMS;
+  If (S = 0) Or Not DevSel(Cor(Dev)) Then Exit;
+  If (SI + N > MemL[0:S + 68]) Or (DI + N > MemL[0:C + 68]) Then Exit;
+  FvfParse(MemL[0:S + 64]);
+  DVBase := 0;
+  If (Op And $400) <> 0 Then D3DLightsView;
+  D3DProcess(MemL[0:S + 72] + SI * VFStride, N, (Op And $400) <> 0);
+  DFvf := MemL[0:C + 64];
+  FvfParse(DFvf);
+  For I := 0 To N - 1 Do
+  Begin
+    V := DV^[I];
+    D3DProject(V);
+    A := MemL[0:C + 72] + (DI + I) * VFStride;
+    MemL[0:A] := LFl(V.SX); MemL[0:A + 4] := LFl(V.SY);
+    MemL[0:A + 8] := LFl(V.SZ);
+    If VFRhw <> 0 Then MemL[0:A + 12] := LFl(V.RW);
+    If VFDif >= 0 Then MemL[0:A + VFDif] := VDif(V);
+    If VFSpc >= 0 Then
+      MemL[0:A + VFSpc] := VSpe(V) Or (Clamp8(DRound(V.F * 255)) Shl 24);
+    If VFTexN > 0 Then
+    Begin
+      MemL[0:A + VFTex[0]] := LFl(V.U0);
+      MemL[0:A + VFTex[0] + 4] := LFl(V.V0);
+    End;
+    If VFTexN > 1 Then
+    Begin
+      MemL[0:A + VFTex[1]] := LFl(V.U1);
+      MemL[0:A + VFTex[1] + 4] := LFl(V.V1);
+    End;
+    K := 0;
+  End;
+  VB_Process := DD_OK;
+End;
+
+Procedure D8Destroy(C, K : LongInt); Forward;
+
+{ Fin d'un objet Direct3D }
+Procedure D3DDestroy(C, K : LongInt);
+Var I : LongInt;
+Begin
+  Case K Of
+    11 :
+      If DevSel(C) Then
+      Begin
+        If D3G^.RT <> 0 Then COMRelease(D3G^.RT);
+        For I := 0 To 7 Do
+          If D3G^.Tex[I] <> 0 Then COMRelease(D3G^.Tex[I]);
+        If D3G^.BBuf <> 0 Then KFree(D3G^.BBuf);
+        KFree(MemL[0:C + 64]);
+        MemL[0:C + 64] := 0;
+      End;
+    12 :
+      For I := 0 To Min(MemL[0:C + 116], 16) - 1 Do
+        If MemL[0:C + 120 + I * 4] <> 0 Then
+          COMRelease(MemL[0:C + 120 + I * 4]);
+    15, 16 :
+      If MemL[0:C + 68 + 4 * Ord(K = 16)] <> 0 Then
+        KFree(MemL[0:C + 68 + 4 * Ord(K = 16)]);
+    21..27 : D8Destroy(C, K);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Direct3D 8 (D3D8.DLL)                                              }
+{ ------------------------------------------------------------------ }
+{ Le peripherique (sorte 22) utilise le meme moteur (+64 etat TD3D,
+  version 8). Ses ressources enveloppent des surfaces DirectDraw :
+  surface (23, +64 surface, +68 peripherique, +72 conteneur, +76
+  format, +80 usage, +84 reserve), texture (24, +64 niveaux, +68
+  surfaces de niveau (13), +124 peripherique, +128 format, +132
+  usage, +136 reserve, +140 LOD, +144 priorite), tampon de sommets
+  (25) et d'index (26) : +64 donnees, +68 taille, +72 FVF ou format,
+  +76 usage, +80 reserve, +84 peripherique.
+  Peripherique : +68 tampon arriere, +72 tampon Z, +76 primaire (plein
+  ecran), +80 D3DPRESENT_PARAMETERS (52 octets), +132 tampon de
+  sommets du flux 0, +136 pas, +140 tampon d'index, +144 indice de
+  base, +148 nuanceur de sommets (FVF), +152 fenetre, +156 Direct3D8,
+  +160 drapeaux de creation, +164 fenetre de focalisation,
+  +168 enveloppe du tampon arriere, +172 plein ecran.
+  Nuanceurs programmables : non disponibles (version 0 annoncee). }
+
+Const
+  D3DERR_NOTFOUND = LongInt($88760866);
+  D3DERR_NOTAVAILABLE = LongInt($8876086A);
+  D3DERR_INVALIDCALL = LongInt($8876086C);
+
+Var
+  VtD8, VtDev8, VtSf8, VtTx8, VtVB8, VtIB8 : LongInt;
+  D8Pals : Array[0..63] Of LongInt;
+
+Procedure D8InitVt;
+Begin
+  If VtD8 <> 0 Then Exit;
+  D3DInitVt;
+  VtD8 := VtNew;
+  VtAdd('D8_QI,COMAddRef,COMRelease,DXOK2,D8_AdapterCount,D8_AdapterId,');
+  VtAdd('D8_ModeCount,D8_EnumModes,D8_AdapterMode,D8_CheckType,');
+  VtAdd('D8_CheckFormat,D8_CheckMS,DXOK6,D8_GetCaps,D8_Monitor,');
+  VtAdd('D8_CreateDevice');
+  VtDev8 := VtNew;
+  VtAdd('E8_QI,COMAddRef,COMRelease,DXOK1,E8_TexMem,DXOK2,E8_GetD3D,');
+  VtAdd('E8_GetCaps,E8_GetMode,E8_GetParams,DXOK4,DXOK4,E8_ShowCursor,');
+  VtAdd('E8_NoSwap,E8_Reset,E8_Present,E8_GetBack,E8_Raster,E8_SetGamma,');
+  VtAdd('E8_GetGamma,E8_CreateTexture,E8_NA9,E8_NA7,E8_CreateVB,');
+  VtAdd('E8_CreateIB,E8_CreateRT,E8_CreateDS,E8_CreateImage,E8_CopyRects,');
+  VtAdd('E8_UpdateTex,E8_GetFront,E8_SetRT,E8_GetRT,E8_GetDS,');
+  VtAdd('DV_BeginScene,E8_EndScene,DV_Clear7,DV_SetTransform,');
+  VtAdd('DV_GetTransform,DV_MulTransform,DV_SetViewport7,DV_GetViewport7,');
+  VtAdd('DV_SetMaterial7,DV_GetMaterial7,DV_SetLight7,DV_GetLight7,');
+  VtAdd('DV_LightEnable,DV_GetLightEnable,DXOK3,E8_GetClipPlane,DV_SetRS,');
+  VtAdd('DV_GetRS,DV_BeginSB,DV_EndSB,DV_ApplySB,DV_CaptureSB,DV_DeleteSB,');
+  VtAdd('DV_CreateSB,DV_SetClipStatus,DV_GetClipStatus,E8_GetTexture,');
+  VtAdd('E8_SetTexture,DV_GetTSS,DV_SetTSS,DV_Validate,E8_GetInfo,');
+  VtAdd('E8_SetPal,E8_GetPal,E8_SetCurPal,E8_GetCurPal,E8_DrawPrim,');
+  VtAdd('E8_DrawIdxPrim,E8_DrawPrimUP,E8_DrawIdxPrimUP,E8_Process,');
+  VtAdd('E8_CreateVS,E8_SetVS,E8_GetVS,DXOK2,E8_IC4,E8_IC4,E8_IC4,E8_IC4,');
+  VtAdd('E8_SetStream,E8_GetStream,E8_SetIndices,E8_GetIndices,');
+  VtAdd('E8_CreatePS,E8_SetPS,E8_GetPS,DXOK2,E8_IC4,E8_IC4,E8_IC4,');
+  VtAdd('E8_IC4,E8_IC4,DXOK2');
+  VtSf8 := VtNew;
+  VtAdd('S8_QI,COMAddRef,COMRelease,R8_GetDevice,R8_SetPriv,R8_GetPriv,');
+  VtAdd('R8_FreePriv,S8_GetContainer,S8_GetDesc,S8_LockRect,S8_Unlock');
+  VtTx8 := VtNew;
+  VtAdd('T8_QI,COMAddRef,COMRelease,R8_GetDevice,R8_SetPriv,R8_GetPriv,');
+  VtAdd('R8_FreePriv,T8_SetPriority,T8_GetPriority,DXOK1,T8_GetType,');
+  VtAdd('T8_SetLOD,T8_GetLOD,T8_GetLevelCount,T8_GetLevelDesc,');
+  VtAdd('T8_GetSurfaceLevel,T8_LockRect,T8_Unlock,DXOK2');
+  VtVB8 := VtNew;
+  VtAdd('B8_QI,COMAddRef,COMRelease,B8_GetDevice,DXOK5,E8_NF4,DXOK2,');
+  VtAdd('DXNI2,DXOK1,DXOK1,B8_GetType,B8_Lock,DXOK1,B8_GetDesc');
+  VtIB8 := VtVB8;
+End;
+
+Function E8_NF4(T, A, B, C : LongInt) : LongInt;
+Begin
+  E8_NF4 := D3DERR_NOTFOUND;
+End;
+
+Function E8_IC4(T, A, B, C : LongInt) : LongInt;
+Begin
+  E8_IC4 := D3DERR_INVALIDCALL;
+End;
+
+Function E8_NA7(T, A, B, C, D, E, F : LongInt) : LongInt;
+Begin
+  E8_NA7 := D3DERR_NOTAVAILABLE;
+End;
+
+Function E8_NA9(T, A, B, C, D, E, F, G, H : LongInt) : LongInt;
+Begin
+  E8_NA9 := D3DERR_NOTAVAILABLE;
+End;
+
+{ Format D3DFORMAT -> profondeur, masques et drapeaux DDPF }
+Function D8Fmt(F : LongInt; Var Bpp, R, G, B, A, Fl : LongInt) : Boolean;
+Begin
+  D8Fmt := True;
+  R := 0; G := 0; B := 0; A := 0; Fl := $40;
+  Case F Of
+    20 : Begin Bpp := 24; R := $FF0000; G := $FF00; B := $FF; End;
+    21 :
+    Begin
+      Bpp := 32; R := $FF0000; G := $FF00; B := $FF;
+      A := LongInt($FF000000); Fl := $41;
+    End;
+    22 : Begin Bpp := 32; R := $FF0000; G := $FF00; B := $FF; End;
+    23 : Begin Bpp := 16; R := $F800; G := $7E0; B := $1F; End;
+    24 : Begin Bpp := 16; R := $7C00; G := $3E0; B := $1F; End;
+    25 :
+    Begin
+      Bpp := 16; R := $7C00; G := $3E0; B := $1F; A := $8000; Fl := $41;
+    End;
+    26 :
+    Begin
+      Bpp := 16; R := $F00; G := $F0; B := $F; A := $F000; Fl := $41;
+    End;
+    27 : Begin Bpp := 8; R := $E0; G := $1C; B := $3; End;
+    28 : Begin Bpp := 8; A := $FF; Fl := 3; End;
+    30 : Begin Bpp := 16; R := $F00; G := $F0; B := $F; End;
+    41 : Begin Bpp := 8; Fl := $60; End;
+    50 : Begin Bpp := 8; R := $FF; G := $FF; B := $FF; Fl := $20000; End;
+    70, 73, 80 : Begin Bpp := 16; A := $FFFF; Fl := $400; End;
+    71, 75, 77, 79 : Begin Bpp := 32; A := $FFFFFF; Fl := $400; End;
+  Else
+    D8Fmt := False;
+  End;
+End;
+
+{ Format de la surface (inverse) }
+Function D8FmtOf(S : LongInt) : LongInt;
+Var Bp, R, A : LongInt;
+Begin
+  Bp := MemL[0:S + 88]; R := MemL[0:S + 96]; A := MemL[0:S + 108];
+  If MemL[0:S + 220] <> 0 Then
+  Begin
+    D8FmtOf := MemL[0:S + 220];
+    Exit;
+  End;
+  If (MemL[0:S + 92] And $400) <> 0 Then
+  Begin
+    If Bp = 16 Then D8FmtOf := 80 Else D8FmtOf := 77;
+  End
+  Else If (MemL[0:S + 92] And $20) <> 0 Then D8FmtOf := 41
+  Else If Bp = 32 Then
+  Begin
+    If A <> 0 Then D8FmtOf := 21 Else D8FmtOf := 22;
+  End
+  Else If Bp = 24 Then D8FmtOf := 20
+  Else If R = $F800 Then D8FmtOf := 23
+  Else If A = $8000 Then D8FmtOf := 25
+  Else D8FmtOf := 24;
+End;
+
+{ Nouvelle surface DirectDraw au format F (coeur) ; 0 si impossible }
+Function D8Surf(W, H, F, Caps : LongInt) : LongInt;
+Var Bpp, R, G, B, A, Fl, S : LongInt;
+Begin
+  D8Surf := 0;
+  If Not D8Fmt(F, Bpp, R, G, B, A, Fl) Then Exit;
+  DDInitVt;
+  S := SfNew(W, H, Bpp, Fl, R, G, B, A, Caps, 4);
+  If S = 0 Then Exit;
+  MemL[0:S + 220] := F;
+  D8Surf := S;
+End;
+
+Function D8Vt(K : LongInt) : LongInt;
+Begin
+  D8Vt := VtD8;
+End;
+
+Function Direct3DCreate8(Sdk : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  D8InitVt;
+  O := ComNew(0, 21, 64);
+  ComView(O, 0, VtD8);
+  KLog('Direct3D 8 : objet cree (SDK ' + IntStr(Sdk) + ')');
+  Direct3DCreate8 := O;
+End;
+
+Function D8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  D8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, $1DD9E8DA) Then
+    D8_QI := ComGive(Cor(T), 0, VtD8, Ppv);
+End;
+
+Function D8_AdapterCount(T : LongInt) : LongInt;
+Begin
+  D8_AdapterCount := 1;
+End;
+
+Function D8_Monitor(T, A : LongInt) : LongInt;
+Begin
+  D8_Monitor := 1;
+End;
+
+Function D8_AdapterId(T, Ad, Fl, P : LongInt) : LongInt;
+Var Id : LongInt;
+Begin
+  D8_AdapterId := D3DERR_INVALIDCALL;
+  If (P = 0) Or (Ad <> 0) Then Exit;
+  FillMem(P, 1068, 0);
+  DXPutS(P, 'vmm32.vxd', False);
+  DXPutS(P + 512, DXCardName, False);
+  MemL[0:P + 1024] := $00000400; MemL[0:P + 1028] := $00040008;
+  Id := DXCardId;
+  MemL[0:P + 1032] := Id And $FFFF;
+  MemL[0:P + 1036] := (Id Shr 16) And $FFFF;
+  DXGuid(P + 1048, LongInt($D7B71F83), $6340, $11CF, LongInt($A000534E),
+         $35C9AE00);
+  MemL[0:P + 1048] := MemL[0:P + 1048] Xor Id;
+  MemL[0:P + 1064] := 1;
+  D8_AdapterId := DD_OK;
+End;
+
+{ Modes : tailles de DirectDraw en 16 bits (565) puis 32 bits (X888) }
+Function D8ModeAt(K : LongInt; P : LongInt) : Boolean;
+Var I, B, N : LongInt;
+Begin
+  D8ModeAt := False;
+  N := 0;
+  For B := 0 To 1 Do
+    For I := 0 To DXModeN - 1 Do
+      If DXModeOk(DXModeW[I], DXModeH[I], 16 + B * 16) Then
+      Begin
+        If N = K Then
+        Begin
+          If P <> 0 Then
+          Begin
+            MemL[0:P] := DXModeW[I]; MemL[0:P + 4] := DXModeH[I];
+            MemL[0:P + 8] := 60;
+            If B = 0 Then MemL[0:P + 12] := 23 Else MemL[0:P + 12] := 22;
+          End;
+          D8ModeAt := True;
+          Exit;
+        End;
+        Inc(N);
+      End;
+End;
+
+Function D8_ModeCount(T, Ad : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  N := 0;
+  While D8ModeAt(N, 0) Do Inc(N);
+  D8_ModeCount := N;
+End;
+
+Function D8_EnumModes(T, Ad, K, P : LongInt) : LongInt;
+Begin
+  If D8ModeAt(K, P) Then D8_EnumModes := DD_OK
+  Else D8_EnumModes := D3DERR_INVALIDCALL;
+End;
+
+Function D8DispFmt : LongInt;
+Begin
+  Case ScrBpp Of
+    15 : D8DispFmt := 24;
+    16 : D8DispFmt := 23;
+    24 : D8DispFmt := 20;
+    32 : D8DispFmt := 22;
+  Else
+    D8DispFmt := 41;
+  End;
+End;
+
+Function D8_AdapterMode(T, Ad, P : LongInt) : LongInt;
+Begin
+  D8_AdapterMode := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  MemL[0:P] := ScrW; MemL[0:P + 4] := ScrH; MemL[0:P + 8] := 60;
+  MemL[0:P + 12] := D8DispFmt;
+  D8_AdapterMode := DD_OK;
+End;
+
+Function D8RTOk(F : LongInt) : Boolean;
+Begin
+  D8RTOk := (F = 20) Or (F = 21) Or (F = 22) Or (F = 23) Or (F = 24) Or
+            (F = 25);
+End;
+
+Function D8_CheckType(T, Ad, Dt, DF, BF, Win : LongInt) : LongInt;
+Begin
+  If (Ad = 0) And D8RTOk(BF) And ((Win <> 0) Or D8RTOk(DF)) Then
+    D8_CheckType := DD_OK
+  Else D8_CheckType := D3DERR_NOTAVAILABLE;
+End;
+
+Function D8_CheckFormat(T, Ad, Dt, AF, Usage, RT, F : LongInt) : LongInt;
+Var B, R, G, Bl, A, Fl : LongInt; Ok : Boolean;
+Begin
+  Ok := D8Fmt(F, B, R, G, Bl, A, Fl);
+  If (Usage And 2) <> 0 Then Ok := Ok And ((Fl And $400) <> 0);
+  If (Usage And 1) <> 0 Then Ok := Ok And D8RTOk(F);
+  If (RT = 4) Or (RT = 5) Then Ok := False;
+  If Ok Then D8_CheckFormat := DD_OK
+  Else D8_CheckFormat := D3DERR_NOTAVAILABLE;
+End;
+
+Function D8_CheckMS(T, Ad, Dt, F, Win, Ms : LongInt) : LongInt;
+Begin
+  If Ms = 0 Then D8_CheckMS := DD_OK
+  Else D8_CheckMS := D3DERR_NOTAVAILABLE;
+End;
+
+{ D3DCAPS8 (212 octets) }
+Procedure D8Caps(P : LongInt);
+Begin
+  FillMem(P, 212, 0);
+  MemL[0:P] := 1;
+  MemL[0:P + 12] := $20000 Or $80000;
+  MemL[0:P + 20] := 1 Or LongInt($80000000);
+  MemL[0:P + 28] := 1 Or $10 Or $40 Or $100 Or $200 Or $400 Or $800 Or
+                    $2000 Or $8000 Or $10000 Or $80000;
+  MemL[0:P + 32] := $72;
+  MemL[0:P + 36] := 1 Or $10 Or $20 Or $80 Or $100;
+  MemL[0:P + 40] := $FF;
+  MemL[0:P + 44] := $1FFF; MemL[0:P + 48] := $1FFF;
+  MemL[0:P + 52] := $FF;
+  MemL[0:P + 56] := 2 Or 8 Or $80 Or $200 Or $1000 Or $4000 Or $40000 Or
+                    $80000;
+  MemL[0:P + 60] := 1 Or 4 Or 8 Or $80 Or $4000;
+  MemL[0:P + 64] := $100 Or $200 Or $10000 Or $20000 Or $1000000 Or
+                    $2000000;
+  MemL[0:P + 76] := 7;
+  MemL[0:P + 84] := $1F;
+  MemL[0:P + 88] := 2048; MemL[0:P + 92] := 2048;
+  MemL[0:P + 100] := 8192; MemL[0:P + 104] := 2048;
+  MemL[0:P + 108] := 1;
+  MemL[0:P + 112] := LFl(10000000000.0);
+  MemL[0:P + 140] := 8;
+  MemL[0:P + 144] := $2BFFF;
+  MemL[0:P + 148] := 2; MemL[0:P + 152] := 2;
+  MemL[0:P + 156] := $3B;
+  MemL[0:P + 160] := 8;
+  MemL[0:P + 176] := LFl(1.0);
+  MemL[0:P + 180] := $FFFFF; MemL[0:P + 184] := $FFFF;
+  MemL[0:P + 188] := 1; MemL[0:P + 192] := 256;
+  MemL[0:P + 196] := LongInt($FFFE0000);
+  MemL[0:P + 204] := LongInt($FFFF0000);
+End;
+
+Function D8_GetCaps(T, Ad, Dt, P : LongInt) : LongInt;
+Begin
+  D8_GetCaps := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  D8Caps(P);
+  D8_GetCaps := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ressources                                                         }
+{ ------------------------------------------------------------------ }
+
+{ Enveloppe Surface8 d'une surface (une seule par surface, +212) }
+Function S8Wrap(S, Dev : LongInt) : LongInt;
+Var W : LongInt;
+Begin
+  W := MemL[0:S + 212];
+  If W = 0 Then
+  Begin
+    W := ComNew(0, 23, 96);
+    ComView(W, 0, VtSf8);
+    MemL[0:W + 64] := S;
+    COMAddRef(S);
+    MemL[0:W + 68] := Dev;
+    MemL[0:W + 76] := D8FmtOf(S);
+    MemL[0:S + 212] := W;
+    MemL[0:W + 4] := 0;
+  End;
+  COMAddRef(W);
+  S8Wrap := W;
+End;
+
+Function S8Core(W : LongInt) : LongInt;
+Begin
+  S8Core := 0;
+  W := Cor(W);
+  If W = 0 Then Exit;
+  If MemL[0:W + 8] = 23 Then S8Core := MemL[0:W + 64]
+  Else If MemL[0:W + 8] = 3 Then S8Core := W;
+End;
+
+Function S8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  S8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($B96EEBCA)) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    S8_QI := DD_OK;
+  End;
+End;
+
+Function R8_GetDevice(T, PP : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  T := Cor(T);
+  Case MemL[0:T + 8] Of
+    24 : D := MemL[0:T + 124];
+    25, 26 : D := MemL[0:T + 84];
+  Else
+    D := MemL[0:T + 68];
+  End;
+  R8_GetDevice := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (D = 0) Then Exit;
+  MemL[0:PP] := D;
+  COMAddRef(D);
+  R8_GetDevice := DD_OK;
+End;
+
+Function R8Surf(T : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If MemL[0:T + 8] = 24 Then R8Surf := MemL[0:MemL[0:T + 68]]
+  Else R8Surf := MemL[0:T + 64];
+End;
+
+Function R8_SetPriv(T, G, D, N, Fl : LongInt) : LongInt;
+Begin
+  R8_SetPriv := SF_SetPrivateData(R8Surf(T), G, D, N, Fl);
+End;
+
+Function R8_GetPriv(T, G, D, PN : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := SF_GetPrivateData(R8Surf(T), G, D, PN);
+  If R = DDERR_NOTFOUND Then R := D3DERR_NOTFOUND;
+  R8_GetPriv := R;
+End;
+
+Function R8_FreePriv(T, G : LongInt) : LongInt;
+Begin
+  R8_FreePriv := SF_FreePrivateData(R8Surf(T), G);
+End;
+
+Function S8_GetContainer(T, Riid, PP : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  T := Cor(T);
+  S8_GetContainer := D3DERR_INVALIDCALL;
+  If PP = 0 Then Exit;
+  C := MemL[0:T + 72];
+  If C = 0 Then C := MemL[0:T + 68];
+  If C = 0 Then Exit;
+  MemL[0:PP] := C;
+  COMAddRef(C);
+  S8_GetContainer := DD_OK;
+End;
+
+{ D3DSURFACE_DESC }
+Procedure S8Desc(S, Fmt, Usage, Pool, P : LongInt);
+Begin
+  MemL[0:P] := Fmt; MemL[0:P + 4] := 1;
+  MemL[0:P + 8] := Usage; MemL[0:P + 12] := Pool;
+  MemL[0:P + 16] := MemL[0:S + 72] * MemL[0:S + 68];
+  MemL[0:P + 20] := 0;
+  MemL[0:P + 24] := MemL[0:S + 64]; MemL[0:P + 28] := MemL[0:S + 68];
+End;
+
+Function S8_GetDesc(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  S8_GetDesc := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  S8Desc(MemL[0:T + 64], MemL[0:T + 76], MemL[0:T + 80], MemL[0:T + 84],
+         P);
+  S8_GetDesc := DD_OK;
+End;
+
+Procedure LockK(S, PL, PR : LongInt);
+Var A : LongInt;
+Begin
+  A := MemL[0:S + 76];
+  If PR <> 0 Then
+    A := A + MemL[0:PR + 4] * MemL[0:S + 72] + MemL[0:PR] * SfBytes(S);
+  MemL[0:PL] := MemL[0:S + 72];
+  MemL[0:PL + 4] := A;
+End;
+
+Function S8_LockRect(T, PL, PR, Fl : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  S8_LockRect := D3DERR_INVALIDCALL;
+  If PL = 0 Then Exit;
+  LockK(MemL[0:T + 64], PL, PR);
+  S8_LockRect := DD_OK;
+End;
+
+Function S8_Unlock(T : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := MemL[0:Cor(T) + 64];
+  If (S = DXPrim) And DXOn Then DXTouch(0, DXH, True);
+  S8_Unlock := DD_OK;
+End;
+
+{ Textures }
+Function T8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  T8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($E4CDD575)) Or
+     GuidIs(Riid, LongInt($B4211CFA)) Or GuidIs(Riid, $1B36BB7B) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    T8_QI := DD_OK;
+  End;
+End;
+
+Function T8_SetPriority(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  T8_SetPriority := MemL[0:T + 144];
+  MemL[0:T + 144] := P;
+End;
+
+Function T8_GetPriority(T : LongInt) : LongInt;
+Begin
+  T8_GetPriority := MemL[0:Cor(T) + 144];
+End;
+
+Function T8_GetType(T : LongInt) : LongInt;
+Begin
+  T8_GetType := 3;
+End;
+
+Function T8_SetLOD(T, L : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  T8_SetLOD := MemL[0:T + 140];
+  MemL[0:T + 140] := L;
+End;
+
+Function T8_GetLOD(T : LongInt) : LongInt;
+Begin
+  T8_GetLOD := MemL[0:Cor(T) + 140];
+End;
+
+Function T8_GetLevelCount(T : LongInt) : LongInt;
+Begin
+  T8_GetLevelCount := MemL[0:Cor(T) + 64];
+End;
+
+Function T8Lv(T, L : LongInt) : LongInt;
+Begin
+  T8Lv := 0;
+  If (L < 0) Or (L >= MemL[0:T + 64]) Then Exit;
+  T8Lv := MemL[0:MemL[0:T + 68] + L * 4];
+End;
+
+Function T8_GetLevelDesc(T, L, P : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  T := Cor(T);
+  S := T8Lv(T, L);
+  T8_GetLevelDesc := D3DERR_INVALIDCALL;
+  If (S = 0) Or (P = 0) Then Exit;
+  S8Desc(S, MemL[0:T + 128], MemL[0:T + 132], MemL[0:T + 136], P);
+  MemL[0:P + 4] := 1;
+  T8_GetLevelDesc := DD_OK;
+End;
+
+Function T8_GetSurfaceLevel(T, L, PP : LongInt) : LongInt;
+Var S, W : LongInt;
+Begin
+  T := Cor(T);
+  S := T8Lv(T, L);
+  T8_GetSurfaceLevel := D3DERR_INVALIDCALL;
+  If (S = 0) Or (PP = 0) Then Exit;
+  W := S8Wrap(S, MemL[0:T + 124]);
+  MemL[0:W + 72] := T;
+  MemL[0:W + 80] := MemL[0:T + 132]; MemL[0:W + 84] := MemL[0:T + 136];
+  MemL[0:PP] := W;
+  T8_GetSurfaceLevel := DD_OK;
+End;
+
+Function T8_LockRect(T, L, PL, PR, Fl : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  T := Cor(T);
+  S := T8Lv(T, L);
+  T8_LockRect := D3DERR_INVALIDCALL;
+  If (S = 0) Or (PL = 0) Then Exit;
+  LockK(S, PL, PR);
+  T8_LockRect := DD_OK;
+End;
+
+Function T8_Unlock(T, L : LongInt) : LongInt;
+Begin
+  T8_Unlock := DD_OK;
+End;
+
+{ Tampons de sommets et d'index }
+Function B8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  B8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($8AEEEAC7)) Or
+     GuidIs(Riid, $0E689C9A) Or GuidIs(Riid, $1B36BB7B) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    B8_QI := DD_OK;
+  End;
+End;
+
+Function B8_GetDevice(T, PP : LongInt) : LongInt;
+Begin
+  B8_GetDevice := R8_GetDevice(T, PP);
+End;
+
+Function B8_GetType(T : LongInt) : LongInt;
+Begin
+  If MemL[0:Cor(T) + 8] = 25 Then B8_GetType := 6 Else B8_GetType := 7;
+End;
+
+Function B8_Lock(T, Ofs, N, PP, Fl : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  B8_Lock := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (Ofs < 0) Or (Ofs > MemL[0:T + 68]) Then Exit;
+  MemL[0:PP] := MemL[0:T + 64] + Ofs;
+  B8_Lock := DD_OK;
+End;
+
+Function B8_GetDesc(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  B8_GetDesc := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  If MemL[0:T + 8] = 25 Then
+  Begin
+    MemL[0:P] := 100; MemL[0:P + 4] := 6;
+    MemL[0:P + 20] := MemL[0:T + 72];
+  End
+  Else
+  Begin
+    MemL[0:P] := MemL[0:T + 72]; MemL[0:P + 4] := 7;
+  End;
+  MemL[0:P + 8] := MemL[0:T + 76]; MemL[0:P + 12] := MemL[0:T + 80];
+  MemL[0:P + 16] := MemL[0:T + 68];
+  B8_GetDesc := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IDirect3DDevice8                                                   }
+{ ------------------------------------------------------------------ }
+
+{ Format 16 / 32 bits d'un D3DFORMAT d'ecran }
+Function D8Bpp(F : LongInt) : LongInt;
+Begin
+  Case F Of
+    23, 24, 25 : D8Bpp := 16;
+    20 : D8Bpp := 24;
+  Else
+    D8Bpp := 32;
+  End;
+End;
+
+{ Tampons du peripherique C selon D3DPRESENT_PARAMETERS (en +80) }
+Function D8Buffers(C : LongInt) : LongInt;
+Var P, W, H, F, Hw, Q, D, S, ZF, Z : LongInt;
+    R : Array[0..3] Of LongInt;
+Begin
+  D8Buffers := D3DERR_INVALIDCALL;
+  P := C + 80;
+  W := MemL[0:P]; H := MemL[0:P + 4]; F := MemL[0:P + 8];
+  Hw := MemL[0:P + 24];
+  If Hw = 0 Then Hw := MemL[0:C + 164];
+  MemL[0:C + 152] := Hw;
+  If MemL[0:P + 28] <> 0 Then
+  Begin
+    { fenetre : tampon arriere hors ecran }
+    MemL[0:C + 172] := 0;
+    If (W = 0) Or (H = 0) Then
+    Begin
+      R[2] := 640; R[3] := 480;
+      If Hw <> 0 Then GetClientRect(Hw, LongInt(@R));
+      W := Max(1, R[2]); H := Max(1, R[3]);
+    End;
+    If (F = 0) Or Not D8RTOk(F) Then
+    Begin
+      If ScrBpp = 16 Then F := 23 Else F := 22;
+    End;
+    S := D8Surf(W, H, F, dcOffscreen Or dc3D);
+    If S = 0 Then Exit;
+    MemL[0:C + 76] := 0;
+  End
+  Else
+  Begin
+    { plein ecran : mode de la carte, primaire et tampon arriere }
+    MemL[0:C + 172] := 1;
+    If DXObj = 0 Then DDNewObj(3);
+    DXCoopWnd := Hw; DXCoopFl := $11;
+    If DXSetMode(W, H, D8Bpp(F)) <> DD_OK Then Exit;
+    If DXPrim <> 0 Then
+    Begin
+      COMRelease(DXPrim);
+      DXPrim := 0;
+    End;
+    Q := KAlloc(128);
+    FillMem(Q, 124, 0);
+    MemL[0:Q] := 124; MemL[0:Q + 4] := 1 Or $20; MemL[0:Q + 20] := 1;
+    MemL[0:Q + 104] := dcPrimary Or dcFlip Or dcComplex Or dc3D;
+    D := 0;
+    If DD_CreateSurface(DXObj, Q, LongInt(@D), 0) <> DD_OK Then
+    Begin
+      KFree(Q);
+      Exit;
+    End;
+    KFree(Q);
+    MemL[0:C + 76] := D;
+    S := MemL[0:D + 116];
+    COMAddRef(S);
+    F := D8FmtOf(S);
+  End;
+  MemL[0:P] := MemL[0:S + 64]; MemL[0:P + 4] := MemL[0:S + 68];
+  MemL[0:P + 8] := F;
+  MemL[0:C + 68] := S;
+  MemL[0:C + 72] := 0;
+  If MemL[0:P + 32] <> 0 Then
+  Begin
+    ZF := MemL[0:P + 36];
+    If ZF = 0 Then ZF := 80;
+    Z := D8Surf(MemL[0:S + 64], MemL[0:S + 68], ZF, dcZBuf);
+    If Z = 0 Then Z := D8Surf(MemL[0:S + 64], MemL[0:S + 68], 80, dcZBuf);
+    MemL[0:C + 72] := Z;
+  End;
+  If DevSel(C) Then
+  Begin
+    D3G^.RT := S; COMAddRef(S);
+    D3G^.ZB := MemL[0:C + 72];
+    D3DDefaults;
+    D3G^.UseTSS := 1;
+  End;
+  KLog('Direct3D 8 : tampons ' + IntStr(MemL[0:S + 64]) + 'x' +
+       IntStr(MemL[0:S + 68]) + ' format ' + IntStr(F) + ', Z ' +
+       IntStr(Ord(MemL[0:C + 72] <> 0)));
+  D8Buffers := DD_OK;
+End;
+
+Procedure D8FreeBuffers(C : LongInt);
+Begin
+  If DevSel(C) And (D3G^.RT <> 0) Then
+  Begin
+    COMRelease(D3G^.RT);
+    D3G^.RT := 0;
+  End;
+  If MemL[0:C + 68] <> 0 Then COMRelease(MemL[0:C + 68]);
+  If MemL[0:C + 72] <> 0 Then COMRelease(MemL[0:C + 72]);
+  If MemL[0:C + 76] <> 0 Then COMRelease(MemL[0:C + 76]);
+  MemL[0:C + 68] := 0; MemL[0:C + 72] := 0; MemL[0:C + 76] := 0;
+End;
+
+Function D8_CreateDevice(T, Ad, Dt, Hw, Beh, PP, PDev : LongInt)
+  : LongInt;
+Var C, R, E : LongInt;
+Begin
+  D8_CreateDevice := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (PDev = 0) Then Exit;
+  MemL[0:PDev] := 0;
+  D8InitVt;
+  C := ComNew(0, 22, 192);
+  ComView(C, 0, VtDev8);
+  R := KAlloc(SizeOf(TD3D) + 16);
+  FillMem(R, SizeOf(TD3D), 0);
+  MemL[0:C + 64] := R;
+  DevSel(C);
+  D3G^.Ver := 8; D3G^.Core := C; D3G^.D8 := 1;
+  MoveMem(PP, C + 80, 52);
+  MemL[0:C + 156] := Cor(T); COMAddRef(Cor(T));
+  MemL[0:C + 160] := Beh; MemL[0:C + 164] := Hw;
+  MemL[0:C + 148] := $002;
+  E := D8Buffers(C);
+  If E <> DD_OK Then
+  Begin
+    KLog('Direct3D 8 : echec de creation du peripherique');
+    D8_CreateDevice := E;
+    Exit;
+  End;
+  MoveMem(C + 80, PP, 52);
+  MemL[0:PDev] := C;
+  D8_CreateDevice := DD_OK;
+End;
+
+Function E8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  E8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, $7385E5DF) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    E8_QI := DD_OK;
+  End;
+End;
+
+Function E8_TexMem(T : LongInt) : LongInt;
+Begin
+  E8_TexMem := 16 * 1024 * 1024;
+End;
+
+Function E8_GetD3D(T, PP : LongInt) : LongInt;
+Begin
+  E8_GetD3D := D3DERR_INVALIDCALL;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := MemL[0:Cor(T) + 156];
+  COMAddRef(MemL[0:PP]);
+  E8_GetD3D := DD_OK;
+End;
+
+Function E8_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then D8Caps(P);
+  E8_GetCaps := DD_OK;
+End;
+
+Function E8_GetMode(T, P : LongInt) : LongInt;
+Begin
+  E8_GetMode := D8_AdapterMode(0, 0, P);
+End;
+
+Function E8_GetParams(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 0; MemL[0:P + 4] := 1;
+    MemL[0:P + 8] := MemL[0:C + 164]; MemL[0:P + 12] := MemL[0:C + 160];
+  End;
+  E8_GetParams := DD_OK;
+End;
+
+Function E8_ShowCursor(T, Sh : LongInt) : LongInt;
+Begin
+  E8_ShowCursor := 0;
+End;
+
+Function E8_NoSwap(T, P, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  E8_NoSwap := D3DERR_NOTAVAILABLE;
+End;
+
+Function E8_Reset(T, PP : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_Reset := D3DERR_INVALIDCALL;
+  If PP = 0 Then Exit;
+  D8FreeBuffers(C);
+  MoveMem(PP, C + 80, 52);
+  E8_Reset := D8Buffers(C);
+  MoveMem(C + 80, PP, 52);
+End;
+
+{ Fenetre : tampon arriere affiche dans la zone cliente (agrandi) }
+Procedure D8ToWnd(S, Hw, PSrc, PDst : LongInt);
+Var Hdc, Bmi, Buf, W, H, X, Y, Pitch, I, A, SL, ST, SR, SB : LongInt;
+    R : Array[0..3] Of LongInt;
+Begin
+  W := MemL[0:S + 64]; H := MemL[0:S + 68];
+  Pitch := (W + 3) And Not 3;
+  Buf := KAlloc(Pitch * H + 16);
+  Bmi := KAlloc(40 + 1024);
+  If (Buf = 0) Or (Bmi = 0) Then Exit;
+  For Y := 0 To H - 1 Do
+  Begin
+    A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+    For X := 0 To W - 1 Do
+      Case MemL[0:S + 272] Of
+        2 :
+        Begin
+          I := MemW[0:A + X * 2];
+          Mem[0:Buf + Y * Pitch + X] := DXIdxOf(((I Shr 8) And $F8) Shl 16 Or
+            ((I Shr 3) And $FC) Shl 8 Or ((I Shl 3) And $F8));
+        End;
+        5, 6 : Mem[0:Buf + Y * Pitch + X] :=
+                 DXIdxOf(MemL[0:A + X * 4] And $FFFFFF);
+      Else
+        Mem[0:Buf + Y * Pitch + X] := DXIdxOf(SfToRGB(S, SfGet(S, X, Y)));
+      End;
+  End;
+  FillMem(Bmi, 40, 0);
+  MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -H;
+  MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
+  MemL[0:Bmi + 32] := 256;
+  For I := 0 To 255 Do
+    MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
+      (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+  RectOr(PSrc, W, H, SL, ST, SR, SB);
+  R[0] := 0; R[1] := 0; R[2] := W; R[3] := H;
+  If Hw <> 0 Then GetClientRect(Hw, LongInt(@R));
+  If PDst <> 0 Then MoveMem(PDst, LongInt(@R), 16);
+  Hdc := GetDC(Hw);
+  StretchDIBits(Hdc, R[0], R[1], R[2] - R[0], R[3] - R[1], SL, ST,
+                SR - SL, SB - ST, Buf, Bmi, 0, SRCCOPY);
+  ReleaseDC(Hw, Hdc);
+  KFree(Buf); KFree(Bmi);
+End;
+
+Function E8_Present(T, PSrc, PDst, Hw, Dirty : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_Present := DD_OK;
+  If MemL[0:C + 172] <> 0 Then
+  Begin
+    If MemL[0:C + 76] <> 0 Then
+    Begin
+      If MemL[0:C + 80 + 48] = LongInt($80000000) Then
+        SF_Flip(MemL[0:C + 76], 0, 8)
+      Else SF_Flip(MemL[0:C + 76], 0, 0);
+    End;
+  End
+  Else
+  Begin
+    If Hw = 0 Then Hw := MemL[0:C + 152];
+    D8ToWnd(MemL[0:C + 68], Hw, PSrc, PDst);
+    KYield;
+  End;
+End;
+
+Function E8_GetBack(T, I, Ty, PP : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_GetBack := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (MemL[0:C + 68] = 0) Then Exit;
+  MemL[0:PP] := S8Wrap(MemL[0:C + 68], C);
+  MemL[0:MemL[0:PP] + 80] := 1;
+  E8_GetBack := DD_OK;
+End;
+
+Function E8_Raster(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := Ord(Ticks Mod 17 < 2);
+    MemL[0:P + 4] := ((Ticks Mod 17) * 480) Div 17;
+  End;
+  E8_Raster := DD_OK;
+End;
+
+Function E8_SetGamma(T, Fl, P : LongInt) : LongInt;
+Begin
+  GM_SetGammaRamp(0, Fl, P);
+  E8_SetGamma := DD_OK;
+End;
+
+Function E8_GetGamma(T, P : LongInt) : LongInt;
+Begin
+  GM_GetGammaRamp(0, 0, P);
+  E8_GetGamma := DD_OK;
+End;
+
+Function E8_CreateTexture(T, W, H, Lv, Us, F, Pool, PP : LongInt)
+  : LongInt;
+Var C, X, N, K, S, L, Prev : LongInt;
+Begin
+  E8_CreateTexture := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (W <= 0) Or (H <= 0) Then Exit;
+  MemL[0:PP] := 0;
+  N := Lv;
+  If N <= 0 Then
+  Begin
+    N := 1; K := Max(W, H);
+    While K > 1 Do
+    Begin
+      Inc(N); K := K Div 2;
+    End;
+  End;
+  If N > 13 Then N := 13;
+  X := ComNew(0, 24, 160);
+  ComView(X, 0, VtTx8);
+  L := KAlloc(13 * 4 + 4);
+  MemL[0:X + 64] := N; MemL[0:X + 68] := L;
+  MemL[0:X + 124] := Cor(T);
+  MemL[0:X + 128] := F; MemL[0:X + 132] := Us; MemL[0:X + 136] := Pool;
+  Prev := 0;
+  For K := 0 To N - 1 Do
+  Begin
+    S := D8Surf(W, H, F, dcTexture);
+    If S = 0 Then
+    Begin
+      MemL[0:X + 64] := K;
+      COMRelease(X);
+      E8_CreateTexture := D3DERR_INVALIDCALL;
+      If K = 0 Then Exit;
+      Exit;
+    End;
+    MemL[0:S + 216] := X;
+    MemL[0:S + 204] := K;
+    MemL[0:L + K * 4] := S;
+    If Prev <> 0 Then MemL[0:Prev + 116] := S;
+    Prev := S;
+    W := Max(1, W Div 2); H := Max(1, H Div 2);
+  End;
+  C := 0;
+  MemL[0:PP] := X;
+  E8_CreateTexture := DD_OK;
+End;
+
+Function BufNew(K, Len, Us, F, Pool, Dev, PP : LongInt) : LongInt;
+Var X : LongInt;
+Begin
+  BufNew := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (Len <= 0) Or (Len > 64 * 1024 * 1024) Then Exit;
+  D8InitVt;
+  X := ComNew(0, K, 96);
+  If K = 25 Then ComView(X, 0, VtVB8) Else ComView(X, 0, VtIB8);
+  MemL[0:X + 64] := KAlloc(Len + 16);
+  If MemL[0:X + 64] = 0 Then
+  Begin
+    KFree(X);
+    BufNew := E_OUTOFMEMORY;
+    Exit;
+  End;
+  FillMem(MemL[0:X + 64], Len, 0);
+  MemL[0:X + 68] := Len; MemL[0:X + 72] := F; MemL[0:X + 76] := Us;
+  MemL[0:X + 80] := Pool; MemL[0:X + 84] := Dev;
+  MemL[0:PP] := X;
+  BufNew := DD_OK;
+End;
+
+Function E8_CreateVB(T, Len, Us, Fvf, Pool, PP : LongInt) : LongInt;
+Begin
+  E8_CreateVB := BufNew(25, Len, Us, Fvf, Pool, Cor(T), PP);
+End;
+
+Function E8_CreateIB(T, Len, Us, F, Pool, PP : LongInt) : LongInt;
+Begin
+  If (F <> 101) And (F <> 102) Then F := 101;
+  E8_CreateIB := BufNew(26, Len, Us, F, Pool, Cor(T), PP);
+End;
+
+Function SurfOut(S, Dev, Us, PP : LongInt) : LongInt;
+Begin
+  SurfOut := D3DERR_INVALIDCALL;
+  If (S = 0) Or (PP = 0) Then Exit;
+  MemL[0:PP] := S8Wrap(S, Dev);
+  MemL[0:MemL[0:PP] + 80] := Us;
+  COMRelease(S);
+  SurfOut := DD_OK;
+End;
+
+Function E8_CreateRT(T, W, H, F, Ms, Lk, PP : LongInt) : LongInt;
+Begin
+  E8_CreateRT := SurfOut(D8Surf(W, H, F, dcOffscreen Or dc3D), Cor(T), 1,
+                         PP);
+End;
+
+Function E8_CreateDS(T, W, H, F, Ms, PP : LongInt) : LongInt;
+Begin
+  E8_CreateDS := SurfOut(D8Surf(W, H, F, dcZBuf), Cor(T), 2, PP);
+End;
+
+Function E8_CreateImage(T, W, H, F, PP : LongInt) : LongInt;
+Begin
+  E8_CreateImage := SurfOut(D8Surf(W, H, F, dcOffscreen Or dcSysMem),
+                            Cor(T), 0, PP);
+End;
+
+Function E8_CopyRects(T, Src, Rects, N, Dst, Pts : LongInt) : LongInt;
+Var S, D, I, L, Tp, R, B, X, Y : LongInt;
+Begin
+  S := S8Core(Src); D := S8Core(Dst);
+  E8_CopyRects := D3DERR_INVALIDCALL;
+  If (S = 0) Or (D = 0) Then Exit;
+  If (Rects = 0) Or (N = 0) Then
+  Begin
+    X := 0; Y := 0;
+    If Pts <> 0 Then
+    Begin
+      X := MemL[0:Pts]; Y := MemL[0:Pts + 4];
+    End;
+    SfXfer(D, X, Y, X + MemL[0:S + 64], Y + MemL[0:S + 68], S, 0, 0,
+           MemL[0:S + 64], MemL[0:S + 68], False, False, 0, 0, 0, 0, False,
+           False);
+  End
+  Else
+    For I := 0 To N - 1 Do
+    Begin
+      L := MemL[0:Rects + I * 16]; Tp := MemL[0:Rects + I * 16 + 4];
+      R := MemL[0:Rects + I * 16 + 8]; B := MemL[0:Rects + I * 16 + 12];
+      X := L; Y := Tp;
+      If Pts <> 0 Then
+      Begin
+        X := MemL[0:Pts + I * 8]; Y := MemL[0:Pts + I * 8 + 4];
+      End;
+      SfXfer(D, X, Y, X + R - L, Y + B - Tp, S, L, Tp, R, B, False, False,
+             0, 0, 0, 0, False, False);
+    End;
+  If (D = DXPrim) And DXOn Then DXTouch(0, DXH, True);
+  E8_CopyRects := DD_OK;
+End;
+
+Function E8_UpdateTex(T, Src, Dst : LongInt) : LongInt;
+Begin
+  Src := Cor(Src); Dst := Cor(Dst);
+  E8_UpdateTex := D3DERR_INVALIDCALL;
+  If (Src = 0) Or (Dst = 0) Or (MemL[0:Src + 8] <> 24) Or
+     (MemL[0:Dst + 8] <> 24) Then Exit;
+  TxCopy(MemL[0:MemL[0:Dst + 68]], MemL[0:MemL[0:Src + 68]]);
+  E8_UpdateTex := DD_OK;
+End;
+
+Function E8_GetFront(T, Dst : LongInt) : LongInt;
+Var C, S, D : LongInt;
+Begin
+  C := Cor(T);
+  D := S8Core(Dst);
+  E8_GetFront := D3DERR_INVALIDCALL;
+  If D = 0 Then Exit;
+  S := MemL[0:C + 76];
+  If S = 0 Then S := MemL[0:C + 68];
+  SfXfer(D, 0, 0, MemL[0:S + 64], MemL[0:S + 68], S, 0, 0, MemL[0:S + 64],
+         MemL[0:S + 68], False, False, 0, 0, 0, 0, False, False);
+  E8_GetFront := DD_OK;
+End;
+
+Function E8_SetRT(T, RT, ZS : LongInt) : LongInt;
+Var C, S, Z : LongInt;
+Begin
+  C := Cor(T);
+  E8_SetRT := D3DERR_INVALIDCALL;
+  If Not DevSel(C) Then Exit;
+  S := S8Core(RT);
+  If S <> 0 Then
+  Begin
+    COMAddRef(S);
+    If D3G^.RT <> 0 Then COMRelease(D3G^.RT);
+    D3G^.RT := S;
+    D3G^.VX := 0; D3G^.VY := 0;
+    D3G^.VW := MemL[0:S + 64]; D3G^.VH := MemL[0:S + 68];
+  End;
+  Z := S8Core(ZS);
+  D3G^.ZB := Z;
+  E8_SetRT := DD_OK;
+End;
+
+Function E8_GetRT(T, PP : LongInt) : LongInt;
+Begin
+  E8_GetRT := D3DERR_INVALIDCALL;
+  If (PP = 0) Or Not DevSel(Cor(T)) Or (D3G^.RT = 0) Then Exit;
+  MemL[0:PP] := S8Wrap(D3G^.RT, Cor(T));
+  E8_GetRT := DD_OK;
+End;
+
+Function E8_GetDS(T, PP : LongInt) : LongInt;
+Begin
+  E8_GetDS := D3DERR_NOTFOUND;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PP] := 0;
+  If D3G^.ZB = 0 Then Exit;
+  MemL[0:PP] := S8Wrap(D3G^.ZB, Cor(T));
+  E8_GetDS := DD_OK;
+End;
+
+Function E8_EndScene(T : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3G^.InScene := 0;
+  E8_EndScene := DD_OK;
+End;
+
+Function E8_GetClipPlane(T, I, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then FillMem(P, 16, 0);
+  E8_GetClipPlane := DD_OK;
+End;
+
+Function E8_SetTexture(T, St, X : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  X := Cor(X);
+  S := 0;
+  If X <> 0 Then
+  Begin
+    If MemL[0:X + 8] = 24 Then S := MemL[0:MemL[0:X + 68]]
+    Else If MemL[0:X + 8] = 3 Then S := X;
+  End;
+  If DevSel(Cor(T)) Then D3DSetTex(St, S);
+  E8_SetTexture := DD_OK;
+End;
+
+Function E8_GetTexture(T, St, PP : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  E8_GetTexture := D3DERR_INVALIDCALL;
+  If (PP = 0) Or Not DevSel(Cor(T)) Or (St < 0) Or (St > 7) Then Exit;
+  MemL[0:PP] := 0;
+  S := D3G^.Tex[St];
+  E8_GetTexture := DD_OK;
+  If (S = 0) Or (MemL[0:S + 216] = 0) Then Exit;
+  MemL[0:PP] := MemL[0:S + 216];
+  COMAddRef(MemL[0:PP]);
+End;
+
+Function E8_GetInfo(T, Id, P, N : LongInt) : LongInt;
+Begin
+  E8_GetInfo := S_FALSE;
+End;
+
+Function E8_SetPal(T, N, P : LongInt) : LongInt;
+Begin
+  E8_SetPal := D3DERR_INVALIDCALL;
+  If (N < 0) Or (N > 63) Or (P = 0) Then Exit;
+  If D8Pals[N] = 0 Then D8Pals[N] := KAlloc(1024);
+  MoveMem(P, D8Pals[N], 1024);
+  E8_SetPal := DD_OK;
+End;
+
+Function E8_GetPal(T, N, P : LongInt) : LongInt;
+Begin
+  E8_GetPal := D3DERR_INVALIDCALL;
+  If (N < 0) Or (N > 63) Or (P = 0) Or (D8Pals[N] = 0) Then Exit;
+  MoveMem(D8Pals[N], P, 1024);
+  E8_GetPal := DD_OK;
+End;
+
+Var
+  D8CurPal : LongInt;
+
+Function E8_SetCurPal(T, N : LongInt) : LongInt;
+Begin
+  D8CurPal := N;
+  If (N >= 0) And (N <= 63) Then D8Pal := D8Pals[N];
+  E8_SetCurPal := DD_OK;
+End;
+
+Function E8_GetCurPal(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := D8CurPal;
+  E8_GetCurPal := DD_OK;
+End;
+
+{ Nuanceurs : declaration (D3DVSD) -> FVF ; fonction non disponible }
+Function D8DeclFvf(D : LongInt) : LongInt;
+Var Tk, F, R, Ty, N, Tex : LongInt;
+Begin
+  F := 0; Tex := 0;
+  N := 0;
+  While N < 64 Do
+  Begin
+    Tk := MemL[0:D + N * 4];
+    Inc(N);
+    If Tk = -1 Then Break;
+    If (Tk Shr 29) = 2 Then
+    Begin
+      R := Tk And $1F; Ty := (Tk Shr 16) And 15;
+      Case R Of
+        0 : If Ty = 3 Then F := F Or 4 Else F := F Or 2;
+        3 : F := F Or $10;
+        4 : F := F Or $20;
+        5 : F := F Or $40;
+        6 : F := F Or $80;
+        7..14 : Tex := Max(Tex, R - 6);
+      End;
+    End;
+  End;
+  D8DeclFvf := F Or (Tex Shl 8);
+End;
+
+Function E8_CreateVS(T, Decl, Func, PH, Us : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  E8_CreateVS := D3DERR_INVALIDCALL;
+  If (PH = 0) Or (Decl = 0) Or (Func <> 0) Then Exit;
+  B := KAlloc(16);
+  MemL[0:B] := D8DeclFvf(Decl);
+  MemL[0:PH] := B Or 1;
+  E8_CreateVS := DD_OK;
+End;
+
+Function E8_SetVS(T, H : LongInt) : LongInt;
+Begin
+  If (H And 1) <> 0 Then H := MemL[0:H And Not 1];
+  MemL[0:Cor(T) + 148] := H;
+  E8_SetVS := DD_OK;
+End;
+
+Function E8_GetVS(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:Cor(T) + 148];
+  E8_GetVS := DD_OK;
+End;
+
+Function E8_CreatePS(T, Func, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  E8_CreatePS := D3DERR_INVALIDCALL;
+End;
+
+Function E8_SetPS(T, H : LongInt) : LongInt;
+Begin
+  If H = 0 Then E8_SetPS := DD_OK Else E8_SetPS := D3DERR_INVALIDCALL;
+End;
+
+Function E8_GetPS(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  E8_GetPS := DD_OK;
+End;
+
+Function E8_SetStream(T, N, VB, Stride : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_SetStream := D3DERR_INVALIDCALL;
+  If N <> 0 Then Exit;
+  VB := Cor(VB);
+  If VB <> 0 Then COMAddRef(VB);
+  If MemL[0:C + 132] <> 0 Then COMRelease(MemL[0:C + 132]);
+  MemL[0:C + 132] := VB; MemL[0:C + 136] := Stride;
+  E8_SetStream := DD_OK;
+End;
+
+Function E8_GetStream(T, N, PP, PS : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If PP <> 0 Then
+  Begin
+    MemL[0:PP] := MemL[0:C + 132];
+    If MemL[0:PP] <> 0 Then COMAddRef(MemL[0:PP]);
+  End;
+  If PS <> 0 Then MemL[0:PS] := MemL[0:C + 136];
+  E8_GetStream := DD_OK;
+End;
+
+Function E8_SetIndices(T, IB, Base : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  IB := Cor(IB);
+  If IB <> 0 Then COMAddRef(IB);
+  If MemL[0:C + 140] <> 0 Then COMRelease(MemL[0:C + 140]);
+  MemL[0:C + 140] := IB; MemL[0:C + 144] := Base;
+  E8_SetIndices := DD_OK;
+End;
+
+Function E8_GetIndices(T, PP, PB : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If PP <> 0 Then
+  Begin
+    MemL[0:PP] := MemL[0:C + 140];
+    If MemL[0:PP] <> 0 Then COMAddRef(MemL[0:PP]);
+  End;
+  If PB <> 0 Then MemL[0:PB] := MemL[0:C + 144];
+  E8_GetIndices := DD_OK;
+End;
+
+{ Nombre de sommets (ou d'indices) d'un dessin de N primitives }
+Function D8Count(Pt, N : LongInt) : LongInt;
+Begin
+  Case Pt Of
+    1 : D8Count := N;
+    2 : D8Count := N * 2;
+    3 : D8Count := N + 1;
+    4 : D8Count := N * 3;
+  Else
+    D8Count := N + 2;
+  End;
+End;
+
+Procedure D8Draw(C, Pt, Src, Stride, NV, Idx, Sz, NI : LongInt);
+Begin
+  If Not DevSel(C) Then Exit;
+  DVBase := 0;
+  D3DStrideOvr := Stride;
+  D3DDraw(Pt, MemL[0:C + 148], Src, NV, Idx, Sz, NI, 0);
+  D3DStrideOvr := 0;
+End;
+
+Function E8_DrawPrim(T, Pt, St, N : LongInt) : LongInt;
+Var C, VB : LongInt;
+Begin
+  C := Cor(T);
+  VB := MemL[0:C + 132];
+  E8_DrawPrim := D3DERR_INVALIDCALL;
+  If VB = 0 Then Exit;
+  D8Draw(C, Pt, MemL[0:VB + 64] + St * MemL[0:C + 136], MemL[0:C + 136],
+         D8Count(Pt, N), 0, 0, 0);
+  E8_DrawPrim := DD_OK;
+End;
+
+Function E8_DrawIdxPrim(T, Pt, MinI, NV, SI, N : LongInt) : LongInt;
+Var C, VB, IB, Sz : LongInt;
+Begin
+  C := Cor(T);
+  VB := MemL[0:C + 132]; IB := MemL[0:C + 140];
+  E8_DrawIdxPrim := D3DERR_INVALIDCALL;
+  If (VB = 0) Or (IB = 0) Then Exit;
+  If MemL[0:IB + 72] = 102 Then Sz := 4 Else Sz := 2;
+  D8Draw(C, Pt, MemL[0:VB + 64] + MemL[0:C + 144] * MemL[0:C + 136],
+         MemL[0:C + 136], MinI + NV, MemL[0:IB + 64] + SI * Sz, Sz,
+         D8Count(Pt, N));
+  E8_DrawIdxPrim := DD_OK;
+End;
+
+Function E8_DrawPrimUP(T, Pt, N, D, Stride : LongInt) : LongInt;
+Begin
+  D8Draw(Cor(T), Pt, D, Stride, D8Count(Pt, N), 0, 0, 0);
+  E8_DrawPrimUP := DD_OK;
+End;
+
+Function E8_DrawIdxPrimUP(T, Pt, MinI, NV, N, Idx, F, D, Stride : LongInt)
+  : LongInt;
+Var Sz : LongInt;
+Begin
+  If F = 102 Then Sz := 4 Else Sz := 2;
+  D8Draw(Cor(T), Pt, D, Stride, MinI + NV, Idx, Sz, D8Count(Pt, N));
+  E8_DrawIdxPrimUP := DD_OK;
+End;
+
+Function E8_Process(T, SS, DI, N, Dst, Fl : LongInt) : LongInt;
+Var C, VB, D, I, A, F : LongInt; V : TVtx;
+Begin
+  C := Cor(T); D := Cor(Dst);
+  VB := MemL[0:C + 132];
+  E8_Process := D3DERR_INVALIDCALL;
+  If (VB = 0) Or (D = 0) Or Not DevSel(C) Then Exit;
+  FvfParse(MemL[0:C + 148]);
+  VFStride := MemL[0:C + 136];
+  DVBase := 0;
+  D3DLightsView;
+  D3DProcess(MemL[0:VB + 64] + SS * VFStride, N,
+             (D3G^.RS[rsLighting] <> 0) And (VFNrm >= 0));
+  F := MemL[0:D + 72];
+  FvfParse(F);
+  For I := 0 To N - 1 Do
+  Begin
+    V := DV^[I];
+    D3DProject(V);
+    A := MemL[0:D + 64] + (DI + I) * VFStride;
+    If (DI + I + 1) * VFStride > MemL[0:D + 68] Then Break;
+    MemL[0:A] := LFl(V.SX); MemL[0:A + 4] := LFl(V.SY);
+    MemL[0:A + 8] := LFl(V.SZ);
+    If VFRhw <> 0 Then MemL[0:A + 12] := LFl(V.RW);
+    If VFDif >= 0 Then MemL[0:A + VFDif] := VDif(V);
+    If VFSpc >= 0 Then MemL[0:A + VFSpc] := VSpe(V);
+    If VFTexN > 0 Then
+    Begin
+      MemL[0:A + VFTex[0]] := LFl(V.U0);
+      MemL[0:A + VFTex[0] + 4] := LFl(V.V0);
+    End;
+  End;
+  E8_Process := DD_OK;
+End;
+
+{ Fin des objets Direct3D 8 }
+Procedure D8Destroy(C, K : LongInt);
+Var I : LongInt;
+Begin
+  Case K Of
+    22 :
+    Begin
+      D8FreeBuffers(C);
+      If MemL[0:C + 132] <> 0 Then COMRelease(MemL[0:C + 132]);
+      If MemL[0:C + 140] <> 0 Then COMRelease(MemL[0:C + 140]);
+      If MemL[0:C + 156] <> 0 Then COMRelease(MemL[0:C + 156]);
+      D3DDestroy(C, 11);
+      If DXOn Then DXLeave;
+    End;
+    23 :
+    Begin
+      If MemL[0:C + 64] <> 0 Then
+      Begin
+        MemL[0:MemL[0:C + 64] + 212] := 0;
+        COMRelease(MemL[0:C + 64]);
+      End;
+    End;
+    24 :
+    Begin
+      For I := 0 To MemL[0:C + 64] - 1 Do
+        If MemL[0:MemL[0:C + 68] + I * 4] <> 0 Then
+        Begin
+          MemL[0:MemL[0:MemL[0:C + 68] + I * 4] + 116] := 0;
+          COMRelease(MemL[0:MemL[0:C + 68] + I * 4]);
+        End;
+      KFree(MemL[0:C + 68]);
+    End;
+    25, 26 :
+      If MemL[0:C + 64] <> 0 Then KFree(MemL[0:C + 64]);
+  End;
 End;
 
 { ==================================================================== }
@@ -41348,28 +52293,110 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   WS_WSACancelAsyncRequest, WS_WSASetBlockingHook, WS_WSAUnhookBlockingHook,
   WS_WSACancelBlockingCall, WS_WSAIsBlocking, WS_WSARecvEx, IcmpCreateFile,
   IcmpCloseHandle, IcmpSendEcho,
-  DXNI1, DXNI2, DXNI3, DXNI4, DXNI5, DXNI6, DXOK1, DXOK2, DXOK3, COMAddRef,
-  COMRelease, COMQIUnk, DXOK4, DirectDrawCreate, DirectDrawEnumerateA, DD_QI,
-  DD_SetCooperativeLevel, DD_SetDisplayMode, DD_SetDisplayMode2,
-  DD_RestoreDisplayMode, DD_FlipToGDISurface, DD_EnumDisplayModes,
-  DD_GetDisplayMode, DD_GetCaps, DD_GetMonitorFrequency, DD_GetScanLine,
-  DD_GetVBStatus, DD_WaitForVB, DD_GetAvailableVidMem, DD_CreateSurface,
-  DD_CreatePalette, DD_CreateClipper, PL_GetCaps, PL_GetEntries,
-  PL_SetEntries, CL_GetHWnd, CL_IsClipListChanged, CL_SetHWnd, SF_QI,
-  SF_GetSurfaceDesc, SF_Lock, SF_Unlock, SF_GetCaps, SF_GetPixelFormat,
-  SF_GetAttachedSurface, SF_Flip, SF_GetColorKey, SF_SetColorKey,
-  SF_SetPalette, SF_GetPalette, SF_SetClipper, SF_GetDDInterface, SF_Blt,
-  SF_BltFast, SF_GetDC, SF_ReleaseDC, DXOK5, DirectSoundCreate,
-  DirectSoundEnumerateA, DS_GetCaps, DS_GetSpeakerConfig,
-  DS_CreateSoundBuffer, DS_DuplicateSoundBuffer, DSB_GetCaps,
-  DSB_GetCurrentPosition, DSB_GetFormat, DSB_GetVolume, DSB_GetPan,
-  DSB_GetFrequency, DSB_GetStatus, DSB_Lock, DSB_Play, DSB_Stop,
-  DSB_SetCurrentPosition, DSB_SetVolume, DSB_SetPan, DSB_SetFrequency,
-  DirectInputCreateA, DI_CreateDevice, DI_EnumDevices, DI_GetDeviceStatus,
-  DID_GetCapabilities, DID_GetDeviceState, DID_GetDeviceData, DirectXSetup,
-  DirectXSetupA, DirectXDeviceDriverSetup, DirectXSetupGetVersion,
+  { DirectX }
+  DD_GetGDISurface, DD_GetMonitorFrequency, DD_GetScanLine, DD_GetVBStatus,
+  DD_Initialize, DD_RestoreDisplayMode, DD_SetCooperativeLevel,
+  DD_SetDisplayMode, DD_SetDisplayMode2, DD_WaitForVB, DD_GetAvailableVidMem,
+  DD_GetSurfaceFromDC, DXOK1, DD_GetDeviceIdentifier, DXNI4, DXOK3,
+  SF_GetSurfaceDesc, SF_Initialize, SF_Lock, SF_ReleaseDC, SF_SetClipper,
+  SF_SetColorKey, DXNoOv3, SF_SetPalette, SF_Unlock, DXNoOv6, DXNoOv2,
+  SF_GetDDInterface, DXOK2, SF_SetSurfaceDesc, SF_SetPrivateData,
+  SF_GetPrivateData, SF_FreePrivateData, SF_GetUniqueness,
+  SF_ChangeUniqueness, SF_SetPriority, SF_GetPriority, SF_SetLOD, SF_GetLOD,
+  GM_QI, COMAddRef, COMRelease, GM_GetGammaRamp, GM_SetGammaRamp, COMQIUnk,
+  PL_GetCaps, PL_GetEntries, PL_Initialize, PL_SetEntries, CL_GetClipList,
+  CL_GetHWnd, CL_Initialize, CL_IsClipListChanged, CL_SetClipList, CL_SetHWnd,
+  DS_QI, DS_CreateSoundBuffer, DS_GetCaps, DS_DuplicateSoundBuffer,
+  DS_SetCooperativeLevel, DS_GetSpeakerConfig, DS_VerifyCert, DSB_QI,
+  DSB_GetCaps, DSB_GetCurrentPosition, DSB_GetFormat, DSB_GetVolume,
+  DSB_GetPan, DSB_GetFrequency, DSB_GetStatus, DSB_Initialize, DSB_Lock,
+  DSB_Play, DSB_SetCurrentPosition, DSB_SetFormat, DSB_SetVolume, DSB_SetPan,
+  DSB_SetFrequency, DSB_Stop, DXOK5, DSB_SetFX, DXOK4, DSB_GetObjectInPath,
+  D3B_GetAll, D3B_GetConeAngles, D3B_GetConeOrient, D3B_GetConeVol,
+  D3B_GetMax, D3B_GetMin, D3B_GetMode, D3B_GetPos, D3B_GetVel, D3B_SetAll,
+  D3B_SetConeAngles, D3B_SetConeOrient, D3B_SetConeVol, D3B_SetMax,
+  D3B_SetMin, D3B_SetMode, D3B_SetPos, D3B_SetVel, D3L_GetAll, D3L_GetDist,
+  D3L_GetDoppler, D3L_GetOrient, D3L_GetPos, D3L_GetRolloff, D3L_GetVel,
+  D3L_SetAll, D3L_SetDist, D3L_SetDoppler, D3L_SetOrient, D3L_SetPos,
+  D3L_SetRolloff, D3L_SetVel, D3L_Commit, DSN_SetPositions, DI_QI,
+  DI_CreateDevice, DI_EnumDevices, DI_GetDeviceStatus, DI_Initialize,
+  DI_FindDevice, DI_CreateDeviceEx, DI_EnumBySemantics, DXNI5, DID_QI,
+  DID_GetCapabilities, DID_EnumObjects, DID_GetProperty, DID_SetProperty,
+  DID_Acquire, DID_Unacquire, DID_GetDeviceState, DID_GetDeviceData,
+  DID_SetDataFormat, DID_SetEventNotification, DID_SetCoop, DID_GetObjectInfo,
+  DID_GetDeviceInfo, DID_Initialize, DID_EnumEffects, DXNI3, DXNI2,
+  DID_EnumCreated, DID_Poll, DP_QI, DPE3, DPE6, DPE7, DPE2, DPE5, DPE4, DPUn3,
+  DPE10, DPL_QI, DPNL4, DPUn7, DPUn5, DPNL6, DPNL2, D3_QI, D3_EnumDevices,
+  D3_CreateLight, D3_CreateMaterial, D3_CreateViewport, D3_FindDevice,
+  D3_CreateDevice2, D3_CreateDevice3, D3_CreateVB3, D3_EnumZFormats,
+  D3_EnumDevices7, D3_CreateDevice7, D3_CreateVB7, DV_QI, DV_GetCaps,
+  DV_SwapTex, DV_CreateEB, DV_GetStats, DV_Execute, DV_AddViewport,
+  DV_DelViewport, DV_NextViewport, DV_Pick, DV_GetPickRecords, DV_EnumTexFmt1,
+  DV_CreateMatrix, DV_SetMatrix, DV_GetMatrix, DV_DeleteMatrix, DV_BeginScene,
+  DV_EndScene, DV_GetDirect3D, DV_SetCurVP, DV_GetCurVP, DV_SetRT, DV_GetRT,
+  DV_Begin2, DV_BeginIdx2, DV_Vertex, DV_Index, DV_End, DV_GetRS, DV_SetRS,
+  DV_GetLS, DV_SetLS, DV_SetTransform, DV_GetTransform, DV_MulTransform,
+  DV_DrawPrim2, DV_DrawIdxPrim2, DV_SetClipStatus, DV_GetClipStatus,
+  DV_EnumTexFmt, DV_Begin, DV_BeginIdx, DV_DrawPrim, DV_DrawIdxPrim,
+  DV_DrawPrimStr, DV_DrawIdxPrimStr, DV_DrawPrimVB, DV_DrawIdxPrimVB3,
+  DV_SphereVis, DV_GetTexture, DV_SetTexture, DV_GetTSS, DV_SetTSS,
+  DV_Validate, DV_GetCaps7, DV_Clear7, DV_SetViewport7, DV_GetViewport7,
+  DV_SetMaterial7, DV_GetMaterial7, DV_SetLight7, DV_GetLight7, DV_BeginSB,
+  DV_EndSB, DV_DrawIdxPrimVB7, DV_ApplySB, DV_CaptureSB, DV_DeleteSB,
+  DV_CreateSB, DV_Load7, DV_LightEnable, DV_GetLightEnable, VP_QI,
+  VP_GetViewport, VP_SetViewport, VP_Transform, VP_SetBack, VP_GetBack,
+  VP_SetBackDepth, VP_GetBackDepth, VP_Clear, VP_AddLight, VP_DelLight,
+  VP_NextLight, VP_GetViewport2, VP_SetViewport2, VP_Clear2, MT_QI, MT_Set,
+  MT_Get, MT_GetHandle, LT_QI, LT_Set, LT_Get, SF_QI, TX_GetHandle, TX_Load,
+  EB_QI, EB_Lock, EB_SetData, EB_GetData, VB_QI, VB_Lock, VB_Process,
+  VB_GetDesc, DXNI6, D8_QI, D8_AdapterCount, D8_AdapterId, D8_ModeCount,
+  D8_EnumModes, D8_AdapterMode, D8_CheckType, D8_CheckFormat, D8_CheckMS,
+  DXOK6, D8_GetCaps, D8_Monitor, D8_CreateDevice, E8_QI, E8_TexMem, E8_GetD3D,
+  E8_GetCaps, E8_GetMode, E8_GetParams, E8_ShowCursor, E8_NoSwap, E8_Reset,
+  E8_Present, E8_GetBack, E8_Raster, E8_SetGamma, E8_GetGamma,
+  E8_CreateTexture, E8_NA9, E8_NA7, E8_CreateVB, E8_CreateIB, E8_CreateRT,
+  E8_CreateDS, E8_CreateImage, E8_CopyRects, E8_UpdateTex, E8_GetFront,
+  E8_SetRT, E8_GetRT, E8_GetDS, E8_EndScene, E8_GetClipPlane, E8_GetTexture,
+  E8_SetTexture, E8_GetInfo, E8_SetPal, E8_GetPal, E8_SetCurPal, E8_GetCurPal,
+  E8_DrawPrim, E8_DrawIdxPrim, E8_DrawPrimUP, E8_DrawIdxPrimUP, E8_Process,
+  E8_CreateVS, E8_SetVS, E8_GetVS, E8_IC4, E8_SetStream, E8_GetStream,
+  E8_SetIndices, E8_GetIndices, E8_CreatePS, E8_SetPS, E8_GetPS, S8_QI,
+  R8_GetDevice, R8_SetPriv, R8_GetPriv, R8_FreePriv, S8_GetContainer,
+  S8_GetDesc, S8_LockRect, S8_Unlock, T8_QI, T8_SetPriority, T8_GetPriority,
+  T8_GetType, T8_SetLOD, T8_GetLOD, T8_GetLevelCount, T8_GetLevelDesc,
+  T8_GetSurfaceLevel, T8_LockRect, T8_Unlock, B8_QI, B8_GetDevice, E8_NF4,
+  B8_GetType, B8_Lock, B8_GetDesc, DD_QI, DD_CreateClipper, DD_CreatePalette,
+  DD_CreateSurface, DD_DuplicateSurface, DD_EnumDisplayModes, DD_EnumSurfaces,
+  DD_FlipToGDISurface, DD_GetCaps, DD_GetDisplayMode, DD_GetFourCCCodes,
+  SF_AddAttached, SF_Blt, SF_BltFast, SF_DeleteAttached, SF_EnumAttached,
+  DXNoOv4, SF_Flip, SF_GetAttached, SF_GetCaps, SF_GetClipper, SF_GetColorKey,
+  SF_GetDC, SF_GetPalette, SF_GetPixelFormat, D3DQueryDD, D3DQuerySurf,
+  DirectDrawCreateClipper, DirectDrawCreate, DirectDrawCreateEx,
+  DirectDrawEnumerateA, DirectDrawEnumerateW, DirectDrawEnumerateExA,
+  DirectDrawEnumerateExW, DirectSoundCreate, DirectSoundCreate8,
+  DirectSoundEnumerateA, DirectSoundEnumerateW, DirectSoundCaptureCreate,
+  DirectSoundCaptureCreate8, DirectSoundCaptureEnumerateA,
+  DirectSoundCaptureEnumerateW, DirectSoundFullDuplexCreate, GetDeviceID,
+  DirectInputCreateA, DirectInputCreateW, DirectInputCreateEx,
+  DirectInput8Create, D3DCoCreate, DirectPlayCreate, DirectPlayEnumerateA,
+  DirectPlayEnumerateW, DirectPlayEnumerate, DirectPlayLobbyCreateA,
+  DirectPlayLobbyCreateW, DirectXSetup, DirectXSetupA, DirectXSetupW,
+  DirectXDeviceDriverSetup, DirectXDeviceDriverSetupA, DirectXSetupGetVersion,
   DirectXSetupSetCallback, DirectXRegisterApplication,
-  DirectXUnRegisterApplication,
+  DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
+  D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
+  OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
+  ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
+  RegisterClassExA, GetClassInfoExA, GetWindowPlacement, SetWindowPlacement,
+  SetMenuItemBitmaps, TabbedTextOutA, GetTabbedTextExtentA, FormatMessageA,
+  HeapValidate, DebugBreak, DuplicateHandle, FatalAppExitA, GetProcessVersion,
+  LockFile, UnlockFile, SuspendThread, joyGetNumDevs, joyGetDevCapsA,
+  joyGetPos, joyGetPosEx, joyGetThreshold, joySetThreshold, joySetCapture,
+  joyReleaseCapture, waveOutGetPosition, mmioOpenA, mmioClose, mmioRead,
+  mmioWrite, mmioSeek, mmioFlush, mmioFOURCC, mmioStringToFOURCCA,
+  mmioDescend, mmioAscend, mmioCreateChunk, OpenPrinterA, ClosePrinter,
+  DocumentPropertiesA, EnumPrintersA, GetFileTitleA, InitCommonControls,
+  InitCommonControlsEx,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
@@ -49399,7 +60426,7 @@ Begin
   { titre de la console d'avant le programme }
   If (ConW >= 0) And (ConTitle <> '') Then
   Begin
-    Wnds[ConW].Text := ConTitle;
+    Wnds^[ConW].Text := ConTitle;
     KRepaint(ConW);
     TaskbarChanged;
   End;
@@ -49493,7 +60520,7 @@ Begin
   ConEnsure;
   If ConW >= 0 Then
   Begin
-    Wnds[ConW].Text := S;
+    Wnds^[ConW].Text := S;
     KRepaint(ConW);
     TaskbarChanged;
   End;
@@ -50756,7 +61783,7 @@ Begin
     RunWave;
     KPaintAll;
     For I := 0 To MaxWnd - 1 Do
-      If Wnds[I].Used And IsChildW(I) And (Wnds[I].IKind <> ikNone) And
+      If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].IKind <> ikNone) And
          HasUpdate(I) Then DrawCtl(I);
     FlushScreen;
     ReapThreads;
@@ -50793,6 +61820,15 @@ BEGIN
   Move(I, MItemsP, 4);
   I := KAlloc(SizeOf(TGdiArr));
   Move(I, Gdis, 4);
+  I := KAlloc(SizeOf(TWndArr));
+  FillMem(I, SizeOf(TWndArr), 0);
+  Move(I, Wnds, 4);
+  I := KAlloc(SizeOf(TKObjArr));
+  FillMem(I, SizeOf(TKObjArr), 0);
+  Move(I, KObjs, 4);
+  I := KAlloc(SizeOf(TMsgQArr));
+  FillMem(I, SizeOf(TMsgQArr), 0);
+  Move(I, MsgQ, 4);
   Case Mem[0:BootInfo + 3] Mod 5 Of
     1 : Language := _English;
     2 : Language := _Germany;
@@ -50844,7 +61880,7 @@ BEGIN
   InitInput;
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
-  MenuDepth := 0; DeskSel := -1; TaskbarW := -1;
+  MenuDepth := 0; DeskSel := -1; TaskbarW := -1; ZTaskW := -1;
   DeskColor := cTeal;
   InitClasses;
   InitGdi;
@@ -50873,6 +61909,7 @@ BEGIN
   BootStep(BootN);
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,
                       WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
+  ZTaskW := TaskbarW;
   ShowW(TaskbarW, True, False);
   LastMinute := -1;
   PreemptOn := True;
