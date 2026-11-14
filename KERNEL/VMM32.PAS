@@ -1732,11 +1732,203 @@ Begin
   For I := 1 To 4 Do X := Port[DiskCtrl[D]];
 End;
 
+{ ------------------------------------------------------------------ }
+{ Lecteur de disquettes A: (controleur 765, DMA canal 2, IRQ 6)      }
+{ ------------------------------------------------------------------ }
+{ Le lecteur A: (declare dans le CMOS, registre 10h) est le disque
+  FdDisk des fonctions HdRead et HdWrite ; ses secteurs passent par un
+  tampon DMA de 512 octets sous 1 Mo (98000h, dans la page de 64 Ko du
+  tampon du son). Debit essaye a 500 kbit/s (1,44 Mo), puis 250 (720 Ko)
+  et 300 (360 Ko) ; geometrie d'apres le BPB. Un changement de
+  disquette (ligne DSKCHG, port 3F7h) vide le cache et remonte le
+  volume. }
+
+Const
+  FdDisk = 7;                { numero de disque de A: }
+  FdBuf = $98000;
+
+Var
+  FdOk : Boolean;            { lecteur present }
+  FdV : LongInt;             { volume de A: (-1 : aucun) }
+  FdMounted : Boolean;       { disquette lisible dans le lecteur }
+  FdIrqF : Boolean;
+  FdRate, FdSpt, FdHeads, FdSecs, FdLastCyl, FdChk : LongInt;
+  FdRes : Array[0..6] Of LongInt;
+
+Procedure IrqFloppy; Interrupt;
+Begin
+  FdIrqF := True;
+  Port[$20] := $20;
+End;
+
+Function FdWaitIrq : Boolean;
+Var T : LongInt;
+Begin
+  T := Ticks + 1500;
+  While Not FdIrqF And (Ticks - T < 0) Do Idle;
+  FdWaitIrq := FdIrqF;
+  FdIrqF := False;
+End;
+
+Function FdOut(B : LongInt) : Boolean;
+Var N : LongInt;
+Begin
+  FdOut := False;
+  N := 0;
+  While (Port[$3F4] And $C0) <> $80 Do
+  Begin
+    Inc(N);
+    If N > 200000 Then Exit;
+  End;
+  Port[$3F5] := B;
+  FdOut := True;
+End;
+
+Function FdIn : LongInt;
+Var N : LongInt;
+Begin
+  FdIn := -1;
+  N := 0;
+  While (Port[$3F4] And $C0) <> $C0 Do
+  Begin
+    Inc(N);
+    If N > 200000 Then Exit;
+  End;
+  FdIn := Port[$3F5];
+End;
+
+Procedure FdSense;
+Begin
+  FdOut($08);
+  FdRes[0] := FdIn;
+  FdRes[1] := FdIn;
+End;
+
+Procedure FdReset;
+Var I : LongInt;
+Begin
+  FdIrqF := False;
+  Port[$3F2] := 0;
+  For I := 1 To 1000 Do Port[$80] := 0;
+  Port[$3F2] := $1C;
+  FdWaitIrq;
+  For I := 1 To 4 Do FdSense;
+  Port[$3F7] := FdRate;
+  FdOut($03); FdOut($DF); FdOut($02);
+  FdLastCyl := -1;
+End;
+
+Function FdSeek(C, H : LongInt) : Boolean;
+Begin
+  FdIrqF := False;
+  If C = 0 Then
+  Begin
+    FdOut($07); FdOut(0);
+  End
+  Else
+  Begin
+    FdOut($0F); FdOut(H Shl 2); FdOut(C);
+  End;
+  FdWaitIrq;
+  FdSense;
+  FdSeek := (FdRes[0] And $C0) = 0;
+  If (FdRes[0] And $C0) = 0 Then FdLastCyl := C Else FdLastCyl := -1;
+End;
+
+{ Un secteur Lba (lecture ou ecriture) par le tampon DMA }
+Function FdXfer(Lba, Buf : LongInt; Wr : Boolean) : Boolean;
+Var C, H, S, T, I : LongInt;
+Begin
+  FdXfer := False;
+  If (FdSpt <= 0) Or (FdHeads <= 0) Then Exit;
+  C := Lba Div (FdSpt * FdHeads);
+  H := (Lba Div FdSpt) Mod FdHeads;
+  S := Lba Mod FdSpt + 1;
+  For T := 1 To 3 Do
+  Begin
+    If FdLastCyl <> C Then FdSeek(C, H);
+    If Wr Then MoveMem(Buf, FdBuf, 512);
+    { DMA canal 2 : 512 octets en FdBuf }
+    Port[$0A] := 6;
+    Port[$0C] := 0;
+    If Wr Then Port[$0B] := $4A Else Port[$0B] := $46;
+    Port[$04] := FdBuf And $FF; Port[$04] := (FdBuf Shr 8) And $FF;
+    Port[$81] := (FdBuf Shr 16) And $FF;
+    Port[$05] := $FF; Port[$05] := 1;
+    Port[$0A] := 2;
+    FdIrqF := False;
+    If Wr Then FdOut($C5) Else FdOut($E6);
+    FdOut((H Shl 2) Or 0);
+    FdOut(C); FdOut(H); FdOut(S); FdOut(2);
+    FdOut(FdSpt); FdOut($1B); FdOut($FF);
+    FdWaitIrq;
+    For I := 0 To 6 Do FdRes[I] := FdIn;
+    If (FdRes[0] And $C0) = 0 Then
+    Begin
+      If Not Wr Then MoveMem(FdBuf, Buf, 512);
+      FdXfer := True;
+      Exit;
+    End;
+    FdReset;
+  End;
+End;
+
+Function FdRead(Lba, Cnt, Dst : LongInt) : Boolean;
+Var K : LongInt;
+Begin
+  FdRead := False;
+  For K := 0 To Cnt - 1 Do
+    If Not FdXfer(Lba + K, Dst + K * 512, False) Then Exit;
+  FdRead := True;
+End;
+
+Function FdWrite(Lba, Cnt, Src : LongInt) : Boolean;
+Var K : LongInt;
+Begin
+  FdWrite := False;
+  For K := 0 To Cnt - 1 Do
+    If Not FdXfer(Lba + K, Src + K * 512, True) Then Exit;
+  FdWrite := True;
+End;
+
+{ Secteur 0 de la disquette : debit et geometrie ; False sans disquette }
+Function FdProbe : Boolean;
+Const Rates : Array[0..2] Of LongInt = (0, 2, 1);
+Var I : LongInt;
+Begin
+  FdProbe := False;
+  For I := 0 To 2 Do
+  Begin
+    FdRate := Rates[I];
+    FdReset;
+    FdSpt := 18; FdHeads := 2;
+    FdSeek(0, 0);
+    If FdXfer(0, FatScratch, False) Then
+    Begin
+      If (MemW[0:FatScratch + 11] = 512) And
+         (MemW[0:FatScratch + 24] In [8..36]) And
+         (MemW[0:FatScratch + 26] In [1, 2]) Then
+      Begin
+        FdSpt := MemW[0:FatScratch + 24];
+        FdHeads := MemW[0:FatScratch + 26];
+        FdSecs := MemW[0:FatScratch + 19];
+        FdProbe := True;
+      End;
+      Exit;
+    End;
+  End;
+End;
+
 { Lire Cnt secteurs (1..128) a l'adresse Dst }
 Function HdRead(D, Lba, Cnt, Dst : LongInt) : Boolean;
 Var B, K, A : LongInt;
 Begin
   HdRead := False;
+  If D = FdDisk Then
+  Begin
+    HdRead := FdRead(Lba, Cnt, Dst);
+    Exit;
+  End;
   If (Lba < 0) Or (Lba + Cnt > DiskSecs[D]) Then Exit;
   B := DiskBase[D];
   HdSetup(D, Lba, Cnt, $20);
@@ -1761,6 +1953,11 @@ Function HdWrite(D, Lba, Cnt, Src : LongInt) : Boolean;
 Var B, K, A : LongInt;
 Begin
   HdWrite := False;
+  If D = FdDisk Then
+  Begin
+    HdWrite := FdWrite(Lba, Cnt, Src);
+    Exit;
+  End;
   If (Lba < 0) Or (Lba + Cnt > DiskSecs[D]) Then Exit;
   B := DiskBase[D];
   HdSetup(D, Lba, Cnt, $30);
@@ -2292,14 +2489,18 @@ Begin
     End;
 End;
 
+Procedure FdCheck; Forward;
+
 { Volume FAT d'un chemin complet (X:\...) ; -1 sinon }
 Function FatVolOf(Const Path : String) : LongInt;
 Var V, R : LongInt;
 Begin
   R := -1;
+  If FdOk And (Length(Path) >= 2) And (Path[1] = 'A') Then FdCheck;
   If Length(Path) >= 2 Then
     For V := 0 To VolN - 1 Do
-      If Ord(Path[1]) = VolLetter[V] Then R := V;
+      If (Ord(Path[1]) = VolLetter[V]) And ((V <> FdV) Or FdMounted) Then
+        R := V;
   FatVolOf := R;
 End;
 
@@ -2651,6 +2852,48 @@ Begin
        IntStr(VolClus[V]) + ' clusters de ' + IntStr(VolSpc[V] * 512) +
        ' octets, etiquette ' + VolLab[V]);
   VolMount := True;
+End;
+
+{ Monter (ou remonter apres un changement) la disquette de A: }
+Procedure FdMount;
+Var N : LongInt;
+Begin
+  FdChk := Ticks;
+  FdMounted := False;
+  SecInval(FdDisk, 0, $3FFFFFFF);
+  DcVol := -1;
+  If Not FdProbe Then Exit;
+  If FdV < 0 Then
+  Begin
+    If Not VolMount(FdDisk, 0, FdSecs) Then Exit;
+    FdV := VolN - 1;
+  End
+  Else
+  Begin
+    N := VolN;
+    VolN := FdV;
+    If Not VolMount(FdDisk, 0, FdSecs) Then
+    Begin
+      VolN := N;
+      Exit;
+    End;
+    VolN := N;
+  End;
+  VolLetter[FdV] := Ord('A');
+  FdMounted := True;
+End;
+
+{ Disquette changee (ligne DSKCHG) ou absente : remonter le volume }
+Procedure FdCheck;
+Begin
+  If (Port[$3F7] And $80) <> 0 Then
+  Begin
+    If Ticks - FdChk < 1000 Then Exit;
+    FdSeek(1, 0);
+    FdSeek(0, 0);
+    FdMount;
+  End
+  Else If Not FdMounted And (Ticks - FdChk >= 2000) Then FdMount;
 End;
 
 { ==================================================================== }
@@ -5250,6 +5493,19 @@ Begin
          ' esclave=' + IntStr(Ord(DiskSlave[I])) + ', ' +
          IntStr(DiskSecs[I] Div 2048) + ' Mo');
     DiskScan(I);
+  End;
+  { lecteur de disquettes A: (CMOS 10h, quartet haut) }
+  I := CmosRead($10) Shr 4;
+  FdOk := (I > 0) And (I < 6);
+  FdV := -1; FdMounted := False;
+  If FdOk Then
+  Begin
+    SetGate($56, LongInt(@IrqFloppy));
+    Port[$21] := Port[$21] And Not $40;
+    FdChk := Ticks - 5000;
+    FdMount;
+    If FdMounted Then KLog('Disquette : A: montee')
+    Else KLog('Disquette : lecteur A: (vide)');
   End;
   For I := 0 To VolN - 1 Do
     If (VolType[I] = NtfsT) And (NvRO[I] = 0) Then NtLogReset(I);
@@ -17198,7 +17454,9 @@ Function GetLogicalDrives : LongInt;
 Var V, R : LongInt;
 Begin
   R := 12;
-  For V := 0 To VolN - 1 Do R := R Or (1 Shl (VolLetter[V] - 65));
+  If FdOk Then R := R Or 1;
+  For V := 0 To VolN - 1 Do
+    If VolLetter[V] >= 65 Then R := R Or (1 Shl (VolLetter[V] - 65));
   GetLogicalDrives := R;
 End;
 
@@ -26339,13 +26597,16 @@ Var Attr, Size, Time, Lba, Ram : LongInt; S : String;
 Begin
   FindModuleFile := '';
   S := FullPath(Name);
-  If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
+  If (Pos('.', BaseName(Name)) > 0) And
+     PathInfo(S, Attr, Size, Time, Lba, Ram) Then
   Begin
     FindModuleFile := S;
     Exit;
   End;
   If Pos('.', BaseName(Name)) = 0 Then
   Begin
+    { NOM sans extension : NOM.EXE, NOM.COM, puis NOM (comme MS-DOS,
+      README lance README.COM et non le fichier texte README) }
     S := FullPath(Name + '.EXE');
     If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
     Begin
@@ -26354,6 +26615,13 @@ Begin
     End;
     S := FullPath(Name + '.COM');
     If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
+    Begin
+      FindModuleFile := S;
+      Exit;
+    End;
+    S := FullPath(Name);
+    If PathInfo(S, Attr, Size, Time, Lba, Ram) And ((Attr And $10) = 0)
+    Then
     Begin
       FindModuleFile := S;
       Exit;
@@ -38605,6 +38873,7 @@ Const
   VmMaxSft = 64;
   VmKqMax = 64;
   VmMaxFind = 16;
+  ShSig = $48534450;        { 'PDSH' : interpreteur integre }
 
 Var
   VmRam, VmRamBlk : LongInt;    { 1 Mo de la machine (aligne a 4 Ko) }
@@ -40343,19 +40612,27 @@ End;
 Function VmLoad(Path, Tail : String; EnvSeg, Mode, LoadSeg, Reloc : LongInt;
                 Var Psp, Cs, Ip, Ss, Sp : LongInt) : LongInt;
 Var H, Got, I, N, Hdr, Img, MinA, MaxA, Need, Want, Max, Seg, Env,
-    EnvN, Base, R, A, FSize : LongInt; Exe : Boolean; Nm : String;
+    EnvN, Base, R, A, FSize : LongInt; Exe, Sh : Boolean; Nm : String;
 Begin
   VmLoad := 2;
   Psp := 0;
   H := KOpenFile(Path, False, 3);
-  If H = INVALID_HANDLE Then
+  { pas de COMMAND.COM : l'interpreteur integre }
+  Sh := (H = INVALID_HANDLE) And (Mode <> 3) And
+        (UpStr(BaseName(Path)) = 'COMMAND.COM');
+  If (H = INVALID_HANDLE) And Not Sh Then
   Begin
     VmLoad := VmErrOf(2);
     Exit;
   End;
-  FSize := GetFileSize(H, 0);
   FillMem(VmTmp, 64, 0);
-  KReadFile(H, VmTmp, 32, Got);
+  Got := 0;
+  If Sh Then FSize := 16
+  Else
+  Begin
+    FSize := GetFileSize(H, 0);
+    KReadFile(H, VmTmp, 32, Got);
+  End;
   Exe := (Got >= 28) And ((MemW[0:VmTmp] = $5A4D) Or
                           (MemW[0:VmTmp] = $4D5A));
   If Exe Then
@@ -40375,16 +40652,20 @@ Begin
     Img := FSize;
     If Img > $FF00 Then
     Begin
-      CloseHandle(H);
+      If Not Sh Then CloseHandle(H);
       VmLoad := 11;
       Exit;
     End;
     MinA := $1000 - ((Img + 15) Shr 4);
     MaxA := $FFFF;
+    If Sh Then
+    Begin
+      MinA := $F0; MaxA := $F0;
+    End;
   End;
   If Img < 0 Then
   Begin
-    CloseHandle(H);
+    If Not Sh Then CloseHandle(H);
     VmLoad := 11;
     Exit;
   End;
@@ -40402,7 +40683,7 @@ Begin
     Env := McbAlloc((EnvN + 3 + Length(Path) + 15) Shr 4, 1, Max);
     If Env = 0 Then
     Begin
-      CloseHandle(H);
+      If Not Sh Then CloseHandle(H);
       VmLoad := 8;
       Exit;
     End;
@@ -40417,7 +40698,7 @@ Begin
     If Max < Need Then
     Begin
       McbFree(Env);
-      CloseHandle(H);
+      If Not Sh Then CloseHandle(H);
       VmLoad := 8;
       Exit;
     End;
@@ -40426,7 +40707,7 @@ Begin
     If Seg = 0 Then
     Begin
       McbFree(Env);
-      CloseHandle(H);
+      If Not Sh Then CloseHandle(H);
       VmLoad := 8;
       Exit;
     End;
@@ -40471,9 +40752,22 @@ Begin
   End
   Else
   Begin
-    SetFilePointer(H, 0, 0, 0);
-    If Mode = 3 Then KReadFile(H, VmLin(Base, 0), Img, Got)
-    Else KReadFile(H, VmLin(Base, $100), Img, Got);
+    If Sh Then
+    Begin
+      { HLT ; INT 21h ; JMP 100h ; signature ; mode (1 : /C) }
+      A := VmLin(Base, $100);
+      MemL[0:A] := $EB21CDF4; Mem[0:A + 4] := $FB;
+      MemL[0:A + 5] := ShSig;
+      Nm := UpStr(Trim(Tail));
+      Mem[0:A + $10] := Ord(Copy(Nm, 1, 2) = '/C');
+      Mem[0:A + $11] := 0;
+    End
+    Else
+    Begin
+      SetFilePointer(H, 0, 0, 0);
+      If Mode = 3 Then KReadFile(H, VmLin(Base, 0), Img, Got)
+      Else KReadFile(H, VmLin(Base, $100), Img, Got);
+    End;
     Cs := Base; Ip := $100; Ss := Base;
     If Mode <> 3 Then
     Begin
@@ -40482,7 +40776,7 @@ Begin
       VmPutW(Ss, Sp, 0);
     End;
   End;
-  CloseHandle(H);
+  If Not Sh Then CloseHandle(H);
   VmLoad := 0;
 End;
 
@@ -40697,6 +40991,524 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
+{ Interpreteur de commandes integre (COMMAND.COM)                     }
+{ ------------------------------------------------------------------ }
+{ COMSPEC designe C:\COMMAND.COM ; sans ce fichier (l'Invite MS-DOS de
+  Pasdows est un programme Win32), EXEC charge un interpreteur integre :
+  un .COM de 5 octets (HLT ; INT 21h ; JMP 100h) dont le HLT donne la
+  main au moniteur. Les commandes internes sont executees ici ; pour
+  un programme, le moniteur prepare un EXEC (AX=4B00h) que l'INT 21h
+  suivant execute ; a la fin du programme, le JMP ramene au HLT, donc a
+  l'invite. COMMAND /C commande execute une commande puis se termine
+  (outils de l'EDI de Turbo Pascal, commande Fichier > DOS shell). }
+
+Function VmIsShell(Cs, Ip : LongInt) : Boolean;
+Begin
+  VmIsShell := (Ip = $100) And (MemL[0:VmLin(Cs, $105)] = ShSig);
+End;
+
+Function ShCurDir : String;
+Begin
+  If VmDir[VmDrive] = '' Then ShCurDir := Chr(65 + VmDrive) + ':\'
+  Else ShCurDir := Chr(65 + VmDrive) + ':' + VmDir[VmDrive];
+End;
+
+{ Premier mot de S (retire de S) }
+Function ShWord(Var S : String) : String;
+Var P : LongInt;
+Begin
+  S := Trim(S);
+  P := 1;
+  While (P <= Length(S)) And Not (S[P] In [' ', #9, '/', ',', ';', '=']) Do
+    Inc(P);
+  If (P = 1) And (P <= Length(S)) Then P := 2;
+  ShWord := Copy(S, 1, P - 1);
+  S := Trim(Copy(S, P, 255));
+End;
+
+{ Variable de l'environnement du processus courant }
+Function ShEnv(Const Name : String) : String;
+Var A, N : LongInt; T : String;
+Begin
+  ShEnv := '';
+  A := VmLin(MemW[0:VmLin(VmCurPsp, $2C)], 0);
+  N := 0;
+  While (N < 32000) And (Mem[0:A + N] <> 0) Do
+  Begin
+    T := PStr(A + N);
+    If UpStr(Copy(T, 1, Length(Name) + 1)) = Name + '=' Then
+    Begin
+      ShEnv := Copy(T, Length(Name) + 2, 255);
+      Exit;
+    End;
+    While Mem[0:A + N] <> 0 Do Inc(N);
+    Inc(N);
+  End;
+End;
+
+Function ShExists(Const F : String; Var Attr : LongInt) : Boolean;
+Begin
+  PutPStr(VmTmp + 512, F, 256);
+  Attr := GetFileAttributesA(VmTmp + 512);
+  ShExists := Attr <> -1;
+End;
+
+{ Programme N : repertoire courant puis chemins de PATH }
+Function ShFindProg(N : String) : String;
+Const Ext : Array[0..2] Of String[4] = ('.COM', '.EXE', '.BAT');
+Var Dirs, D, F : String; I, P, A : LongInt;
+Begin
+  ShFindProg := '';
+  N := UpStr(N);
+  Dirs := '';
+  If (Pos('\', N) = 0) And (Pos(':', N) = 0) Then Dirs := ShEnv('PATH');
+  D := '';
+  Repeat
+    If D = '' Then F := VmFullPath(N)
+    Else
+    Begin
+      If D[Length(D)] <> '\' Then D := D + '\';
+      F := VmFullPath(D + N);
+    End;
+    If Pos('.', BaseName(F)) > 0 Then
+    Begin
+      If ShExists(F, A) And ((A And $10) = 0) Then
+      Begin
+        ShFindProg := F;
+        Exit;
+      End;
+    End
+    Else
+      For I := 0 To 2 Do
+        If ShExists(F + Ext[I], A) And ((A And $10) = 0) Then
+        Begin
+          ShFindProg := F + Ext[I];
+          Exit;
+        End;
+    If Dirs = '' Then Exit;
+    P := Pos(';', Dirs);
+    If P = 0 Then P := Length(Dirs) + 1;
+    D := Trim(Copy(Dirs, 1, P - 1));
+    Delete(Dirs, 1, P);
+  Until D = '';
+End;
+
+Function ShPad(S : String; N : LongInt; Left : Boolean) : String;
+Begin
+  While Length(S) < N Do
+    If Left Then S := ' ' + S Else S := S + ' ';
+  ShPad := S;
+End;
+
+{ Nombre avec separateur des milliers }
+Function ShNum(V : LongInt) : String;
+Var S, R : String; I : LongInt;
+Begin
+  S := IntStr(V);
+  R := '';
+  For I := Length(S) DownTo 1 Do
+  Begin
+    R := S[I] + R;
+    If ((Length(S) - I) Mod 3 = 2) And (I > 1) Then R := ' ' + R;
+  End;
+  ShNum := R;
+End;
+
+Function Dig2(V : LongInt) : String;
+Begin
+  Dig2 := Chr(48 + (V Div 10) Mod 10) + Chr(48 + V Mod 10);
+End;
+
+Procedure ShDir(Arg : String);
+Var H, Fd, Ok, N, Tot, A, D, T, P, Spc : LongInt; S, Nm, Ex : String;
+Begin
+  While (Arg <> '') And (Arg[1] = '/') Do ShWord(Arg);
+  S := VmFullPath(Arg);
+  If (Arg = '') Or (ShExists(S, A) And ((A And $10) <> 0)) Then
+  Begin
+    If S[Length(S)] <> '\' Then S := S + '\';
+    S := S + '*.*';
+  End
+  Else If Pos('.', BaseName(S)) = 0 Then S := S + '.*';
+  VmConStr(L(' R'#130'pertoire de ', ' Directory of ', ' Verzeichnis von ',
+             ' Directory di ', ' Directorio de ') + ParentDir(S) +
+           #13#10#13#10);
+  Fd := VmTmp + 512;
+  PutPStr(VmTmp, S, 256);
+  H := FindFirstFileA(VmTmp, Fd);
+  N := 0; Tot := 0;
+  Ok := Ord(H <> INVALID_HANDLE);
+  While Ok <> 0 Do
+  Begin
+    Nm := UpStr(PStr(Fd + 304));
+    If Nm = '' Then Nm := UpStr(PStr(Fd + 44));
+    A := MemL[0:Fd];
+    If (A And 6) = 0 Then
+    Begin
+      Ex := '';
+      P := Pos('.', Nm);
+      If (P > 1) Then
+      Begin
+        Ex := Copy(Nm, P + 1, 3);
+        Nm := Copy(Nm, 1, P - 1);
+      End;
+      S := ShPad(Copy(Nm, 1, 8), 9, False) + ShPad(Ex, 4, False);
+      If (A And $10) <> 0 Then S := S + '<REP>         '
+      Else
+      Begin
+        S := S + ShPad(ShNum(MemL[0:Fd + 32]), 13, True) + ' ';
+        Tot := Tot + MemL[0:Fd + 32];
+      End;
+      D := 0; T := 0;
+      FileTimeToDosDateTime(Fd + 20, LongInt(@D), LongInt(@T));
+      S := S + ' ' + Dig2(D And 31) + '/' + Dig2((D Shr 5) And 15) + '/' +
+           Dig2(((D Shr 9) + 80) Mod 100) + '  ' +
+           ShPad(IntStr(T Shr 11), 2, True) + ':' + Dig2((T Shr 5) And 63);
+      VmConStr(S + #13#10);
+      Inc(N);
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  If H <> INVALID_HANDLE Then FindClose(H);
+  VmConStr(ShPad(IntStr(N), 9, True) + L(' fichier(s) ', ' file(s) ',
+           ' Datei(en) ', ' file ', ' archivo(s) ') +
+           ShPad(ShNum(Tot), 14, True) + L(' octets', ' bytes', ' Bytes',
+           ' byte', ' bytes') + #13#10);
+  PutPStr(VmTmp, Chr(65 + VmDrive) + ':\', 8);
+  If GetDiskFreeSpaceA(VmTmp, VmTmp + 16, VmTmp + 20, VmTmp + 24,
+                       VmTmp + 28) <> 0 Then
+  Begin
+    Spc := MemL[0:VmTmp + 16] * MemL[0:VmTmp + 20];
+    If MemL[0:VmTmp + 24] < $7FFFFFFF Div Max(Spc, 1) Then
+      VmConStr(ShPad(ShNum(MemL[0:VmTmp + 24] * Spc), 39, True) +
+               L(' octets libres', ' bytes free', ' Bytes frei',
+                 ' byte liberi', ' bytes libres') + #13#10)
+    Else
+      VmConStr(ShPad(ShNum(MemL[0:VmTmp + 24] * (Spc Div 1024)), 39,
+                     True) + L(' Ko libres', ' KB free', ' KB frei',
+                     ' KB liberi', ' KB libres') + #13#10);
+  End;
+End;
+
+Procedure ShType(Arg : String);
+Var H, N, I, C : LongInt;
+Begin
+  H := KOpenFile(VmFullPath(ShWord(Arg)), False, 3);
+  If H = INVALID_HANDLE Then
+  Begin
+    VmConStr(L('Fichier introuvable', 'File not found',
+               'Datei nicht gefunden', 'File non trovato',
+               'Archivo no encontrado') + #13#10);
+    Exit;
+  End;
+  Repeat
+    If Not KReadFile(H, VmTmp + 512, 256, N) Then N := 0;
+    For I := 0 To N - 1 Do
+    Begin
+      C := Mem[0:VmTmp + 512 + I];
+      If C = 26 Then
+      Begin
+        N := 0;
+        Break;
+      End;
+      VmConOut(C);
+    End;
+  Until N < 256;
+  CloseHandle(H);
+End;
+
+Procedure ShCopy(Arg : String);
+Var Src, Dst : String; A, H1, H2, N, Tot : LongInt;
+Begin
+  Src := VmFullPath(ShWord(Arg));
+  Dst := Trim(Arg);
+  If Dst = '' Then Dst := ShCurDir;
+  Dst := VmFullPath(Dst);
+  If ShExists(Dst, A) And ((A And $10) <> 0) Then
+  Begin
+    If Dst[Length(Dst)] <> '\' Then Dst := Dst + '\';
+    Dst := Dst + BaseName(Src);
+  End;
+  H1 := KOpenFile(Src, False, 3);
+  If H1 = INVALID_HANDLE Then
+  Begin
+    VmConStr(L('Fichier introuvable', 'File not found',
+               'Datei nicht gefunden', 'File non trovato',
+               'Archivo no encontrado') + ' - ' + Src + #13#10);
+    Exit;
+  End;
+  H2 := KOpenFile(Dst, True, 2);
+  If H2 = INVALID_HANDLE Then
+  Begin
+    CloseHandle(H1);
+    VmConStr(L('Impossible de creer ', 'Cannot create ',
+               'Kann nicht erstellen: ', 'Impossibile creare ',
+               'No se puede crear ') + Dst + #13#10);
+    Exit;
+  End;
+  Tot := 0;
+  Repeat
+    If Not KReadFile(H1, VmTmp + 512, 512, N) Then N := 0;
+    If N > 0 Then KWriteFile(H2, VmTmp + 512, N);
+    Tot := Tot + N;
+  Until N < 512;
+  CloseHandle(H1);
+  CloseHandle(H2);
+  VmConStr(L('        1 fichier(s) copie(s)', '        1 file(s) copied',
+             '        1 Datei(en) kopiert', '        1 file copiati',
+             '        1 archivo(s) copiado(s)') + #13#10);
+End;
+
+Procedure ShDel(Arg : String);
+Var S, Dir : String; H, Fd, Ok, A, N : LongInt;
+Begin
+  S := VmFullPath(ShWord(Arg));
+  If ShExists(S, A) And ((A And $10) <> 0) Then
+    S := S + '\*.*';
+  Dir := ParentDir(S);
+  If Dir[Length(Dir)] <> '\' Then Dir := Dir + '\';
+  Fd := VmTmp + 512;
+  PutPStr(VmTmp, S, 256);
+  H := FindFirstFileA(VmTmp, Fd);
+  N := 0;
+  Ok := Ord(H <> INVALID_HANDLE);
+  While Ok <> 0 Do
+  Begin
+    If (MemL[0:Fd] And $17) = 0 Then
+    Begin
+      PutPStr(VmTmp + 300, Dir + PStr(Fd + 44), 200);
+      If DeleteFileA(VmTmp + 300) <> 0 Then Inc(N);
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  If H <> INVALID_HANDLE Then FindClose(H);
+  If N = 0 Then
+    VmConStr(L('Fichier introuvable', 'File not found',
+               'Datei nicht gefunden', 'File non trovato',
+               'Archivo no encontrado') + #13#10);
+End;
+
+{ Changer de repertoire (INT 21h 3Bh et CD) ; False : introuvable }
+Function VmChDir(Const Name : String) : Boolean;
+Var Path : String; D, A : LongInt;
+Begin
+  VmChDir := False;
+  Path := VmFullPath(Name);
+  D := Ord(Path[1]) - 65;
+  If Not VmDriveOk(D) Or (Length(Path) > 66) Then Exit;
+  If Length(Path) > 3 Then
+    If Not ShExists(Path, A) Or ((A And $10) = 0) Then Exit;
+  VmDir[D] := Copy(Path, 3, 66);
+  If VmDir[D] = '\' Then VmDir[D] := '';
+  If D = VmDrive Then
+  Begin
+    CurDirS := Copy(Path, 1, 2) + VmDir[D];
+  End;
+  VmChDir := True;
+End;
+
+Procedure ShExit;
+Begin
+  VS(fEax, $4C00 Or (VmRetCode And $FF));
+  MemL[0:VmF + fEip] := $101;
+End;
+
+{ Executer une ligne ; True : la machine reprend (EXEC ou fin) }
+Function ShExec(Line : String) : Boolean;
+Var Cmd, Arg, F, T : String; P, A, I, Max : LongInt;
+Begin
+  ShExec := False;
+  Arg := Trim(Line);
+  If Arg = '' Then Exit;
+  Cmd := UpStr(ShWord(Arg));
+  { CD.. CD\ : commande collee a son argument }
+  If (Copy(Cmd, 1, 2) = 'CD') And (Length(Cmd) > 2) And
+     (Cmd[3] In ['.', '\']) Then
+  Begin
+    Arg := Copy(Cmd, 3, 255) + ' ' + Arg;
+    Cmd := 'CD';
+  End;
+  If (Length(Cmd) = 2) And (Cmd[2] = ':') Then
+  Begin
+    If VmDriveOk(Ord(Cmd[1]) - 65) Then
+    Begin
+      VmDrive := Ord(Cmd[1]) - 65;
+      CurDirS := Copy(Cmd, 1, 2) + VmDir[VmDrive];
+    End
+    Else VmConStr(L('Lecteur non valide', 'Invalid drive specification',
+                    'Laufwerk ungueltig', 'Unita non valida',
+                    'Unidad no valida') + #13#10);
+  End
+  Else If (Cmd = 'CD') Or (Cmd = 'CHDIR') Then
+  Begin
+    If Arg = '' Then VmConStr(ShCurDir + #13#10)
+    Else If Not VmChDir(Trim(Arg)) Then
+      VmConStr(L('Repertoire non valide', 'Invalid directory',
+                 'Ungueltiges Verzeichnis', 'Directory non valida',
+                 'Directorio no valido') + #13#10);
+  End
+  Else If Cmd = 'DIR' Then ShDir(Arg)
+  Else If Cmd = 'CLS' Then
+  Begin
+    VmScroll(VmPage, 0, 7, 0, 0, 24, 79, True);
+    VmSetCur(VmPage, 0, 0);
+  End
+  Else If Cmd = 'ECHO' Then VmConStr(Arg + #13#10)
+  Else If Cmd = 'VER' Then
+    VmConStr(#13#10'Pasdows 95. [Version ' + KVersion + ']'#13#10 +
+             L('Machine virtuelle MS-DOS 7.00', 'MS-DOS 7.00 virtual machine',
+               'Virtuelle MS-DOS-Maschine 7.00',
+               'Macchina virtuale MS-DOS 7.00',
+               'Maquina virtual MS-DOS 7.00') + #13#10)
+  Else If Cmd = 'TYPE' Then ShType(Arg)
+  Else If (Cmd = 'DEL') Or (Cmd = 'ERASE') Then ShDel(Arg)
+  Else If Cmd = 'COPY' Then ShCopy(Arg)
+  Else If (Cmd = 'MD') Or (Cmd = 'MKDIR') Or (Cmd = 'RD') Or
+          (Cmd = 'RMDIR') Then
+  Begin
+    PutPStr(VmTmp, VmFullPath(ShWord(Arg)), 256);
+    If Cmd[1] = 'M' Then I := CreateDirectoryA(VmTmp, 0)
+    Else I := RemoveDirectoryA(VmTmp);
+    If I = 0 Then
+      VmConStr(L('Impossible de creer ou supprimer le repertoire',
+                 'Unable to create or remove directory',
+                 'Verzeichnis nicht erstellt oder entfernt',
+                 'Impossibile creare o rimuovere la directory',
+                 'No se puede crear o quitar el directorio') + #13#10);
+  End
+  Else If (Cmd = 'REN') Or (Cmd = 'RENAME') Then
+  Begin
+    F := VmFullPath(ShWord(Arg));
+    T := ParentDir(F);
+    If T[Length(T)] <> '\' Then T := T + '\';
+    PutPStr(VmTmp, F, 256);
+    PutPStr(VmTmp + 256, T + UpStr(ShWord(Arg)), 256);
+    If MoveFileA(VmTmp, VmTmp + 256) = 0 Then
+      VmConStr(L('Nom de fichier en double ou fichier introuvable',
+                 'Duplicate file name or file not found',
+                 'Doppelter Dateiname oder Datei nicht gefunden',
+                 'Nome duplicato o file non trovato',
+                 'Nombre duplicado o archivo no encontrado') + #13#10);
+  End
+  Else If (Cmd = 'SET') And (Arg = '') Then
+  Begin
+    A := VmLin(MemW[0:VmLin(VmCurPsp, $2C)], 0);
+    P := 0;
+    While (P < 32000) And (Mem[0:A + P] <> 0) Do
+    Begin
+      VmConStr(PStr(A + P) + #13#10);
+      While Mem[0:A + P] <> 0 Do Inc(P);
+      Inc(P);
+    End;
+  End
+  Else If (Cmd = 'PATH') And (Arg = '') Then
+    VmConStr('PATH=' + ShEnv('PATH') + #13#10)
+  Else If Cmd = 'MEM' Then
+  Begin
+    McbAlloc($FFFF, 0, Max);
+    VmConStr(#13#10 + ShPad(ShNum(655360), 11, True) +
+             L(' octets de memoire conventionnelle',
+               ' bytes total conventional memory',
+               ' Bytes konventioneller Speicher',
+               ' byte di memoria convenzionale',
+               ' bytes de memoria convencional') + #13#10 +
+             ShPad(ShNum(Max * 16), 11, True) +
+             L(' octets disponibles', ' bytes available to MS-DOS',
+               ' Bytes verfuegbar', ' byte disponibili',
+               ' bytes disponibles') + #13#10);
+  End
+  Else If (Cmd = 'HELP') Or (Cmd = '?') Then
+    VmConStr('CD CLS COPY DEL DIR ECHO EXIT MD MEM PATH REN RD SET TYPE ' +
+             'VER X:'#13#10)
+  Else If Cmd = 'EXIT' Then
+  Begin
+    ShExit;
+    ShExec := True;
+  End
+  Else
+  Begin
+    { programme : EXEC prepare dans le PSP de l'interpreteur }
+    F := ShFindProg(Cmd);
+    If F = '' Then
+    Begin
+      VmConStr(L('Commande ou nom de fichier incorrect',
+                 'Bad command or file name', 'Befehl oder Dateiname ungueltig',
+                 'Comando o nome di file non valido',
+                 'Comando o nombre de archivo incorrecto') + #13#10);
+      Exit;
+    End;
+    If (Copy(F, Length(F) - 3, 4) = '.BAT') Or Not IsDosFile(F) Then
+    Begin
+      VmConStr(L('Ce programme ne peut pas etre execute en mode MS-DOS.',
+                 'This program cannot be run in MS-DOS mode.',
+                 'Dieses Programm kann nicht im MS-DOS-Modus laufen.',
+                 'Impossibile eseguire il programma in modalita MS-DOS.',
+                 'Este programa no se puede ejecutar en modo MS-DOS.') +
+               #13#10);
+      Exit;
+    End;
+    P := VR(fCs);
+    PutPStr(VmLin(P, $180), F, 128);
+    If Arg <> '' Then Arg := ' ' + Arg;
+    If Length(Arg) > 120 Then Arg := Copy(Arg, 1, 120);
+    Mem[0:VmLin(P, $140)] := Length(Arg);
+    For I := 1 To Length(Arg) Do Mem[0:VmLin(P, $140 + I)] := Ord(Arg[I]);
+    Mem[0:VmLin(P, $141 + Length(Arg))] := 13;
+    T := Arg;
+    VmFcbName(VmLin(P, $5C), T);
+    VmFcbName(VmLin(P, $6C), T);
+    MemW[0:VmLin(P, $120)] := 0;
+    MemL[0:VmLin(P, $122)] := (P Shl 16) Or $140;
+    MemL[0:VmLin(P, $126)] := (P Shl 16) Or $5C;
+    MemL[0:VmLin(P, $12A)] := (P Shl 16) Or $6C;
+    VSeg(fDs, P); VS(fEdx, $180);
+    VSeg(fEs, P); VS(fEbx, $120);
+    VS(fEax, $4B00);
+    MemL[0:VmF + fEip] := $101;
+    ShExec := True;
+  End;
+End;
+
+{ HLT de l'interpreteur : commandes jusqu'au prochain programme }
+Procedure VmShell;
+Var P, A : LongInt; Line : String;
+Begin
+  P := VR(fCs);
+  A := VmLin(P, $100);
+  If Mem[0:A + $10] = 2 Then
+  Begin
+    ShExit;
+    Exit;
+  End;
+  If Mem[0:A + $10] = 1 Then
+  Begin
+    { COMMAND /C commande }
+    Mem[0:A + $10] := 2;
+    Line := '';
+    For P := 1 To Mem[0:A - $80] Do Line := Line + Chr(Mem[0:A - $80 + P]);
+    Line := Trim(Line);
+    Line := Trim(Copy(Line, 3, 255));
+    If Not ShExec(Line) Then ShExit;
+    Exit;
+  End;
+  If Mem[0:A + $11] = 0 Then
+  Begin
+    Mem[0:A + $11] := 1;
+    VmConStr(#13#10 + L('Tapez EXIT pour revenir au programme.',
+             'Type EXIT to return to the program.',
+             'Geben Sie EXIT ein, um zurueckzukehren.',
+             'Digitare EXIT per tornare al programma.',
+             'Escriba EXIT para volver al programa.') + #13#10);
+  End;
+  Repeat
+    VmConStr(#13#10 + ShCurDir + '>');
+    Line := VmReadLine(126);
+    VmTty(10);
+    If ShExec(Line) Then Exit;
+  Until False;
+End;
+
+{ ------------------------------------------------------------------ }
 { DOS : INT 21h                                                      }
 { ------------------------------------------------------------------ }
 
@@ -40884,9 +41696,14 @@ Var AH, AL, S, H, N, R, P, D, T, Max : LongInt; Path : String;
 Begin
   AH := VRH(fEax); AL := VRL(fEax);
   If VmTrace Then
+  Begin
+    If AH In [$39..$3D, $41, $43, $4B, $4E, $56, $5A, $5B] Then
+      Path := ' "' + Copy(PStr(VmPtr(fDs, fEdx)), 1, 60) + '"'
+    Else Path := '';
     KLog('INT 21h ' + VmRegStr + ' de ' +
          HexStr(VmGetW(VR(fSs), VR(fEsp) + 2), 4) + ':' +
-         HexStr(VmGetW(VR(fSs), VR(fEsp)), 4));
+         HexStr(VmGetW(VR(fSs), VR(fEsp)), 4) + Path);
+  End;
   If Not (AH In [$33, $50, $51, $59, $62, $64]) Then VmDosSave;
   VmSetCF(False);
   Case AH Of
@@ -41061,22 +41878,7 @@ Begin
       Else N := RemoveDirectoryA(VmTmp);
       If N = 0 Then VmFail(VmErrOf(5));
     End;
-    $3B :
-    Begin
-      Path := VmPathAt(VmPtr(fDs, fEdx), 0);
-      D := Ord(Path[1]) - 65;
-      If Not VmDriveOk(D) Then VmFail(3)
-      Else If (Length(Path) > 3) And
-         (((GetFileAttributesA(VmTmp) And $10) = 0) Or
-          (GetFileAttributesA(VmTmp) = -1)) Then VmFail(3)
-      Else If Length(Path) > 66 Then VmFail(3)
-      Else
-      Begin
-        VmDir[D] := Copy(Path, 3, 66);
-        If VmDir[D] = '\' Then VmDir[D] := '';
-        If D = VmDrive Then CurDirS := Copy(Path, 1, 2) + VmDir[D];
-      End;
-    End;
+    $3B : If Not VmChDir(PStr(VmPtr(fDs, fEdx))) Then VmFail(3);
     $3C : VmOpenH(VmPathAt(VmPtr(fDs, fEdx), 0), 2, 2);
     $5B : VmOpenH(VmPathAt(VmPtr(fDs, fEdx), 0), 2, 1);
     $3D : VmOpenH(VmPathAt(VmPtr(fDs, fEdx), 0), AL, 3);
@@ -41900,6 +42702,7 @@ Begin
         VmIF := VmMouBusy = 2;
         VmMouBusy := 0;
       End
+      Else If VmIsShell(Cs, Ip) Then VmShell
       Else If (Cs = VmBios) And (Ip = VmCpmO) Then
       Begin
         { CALL 5 : fonction CL du DOS, puis retour a l'appelant }
@@ -42117,15 +42920,22 @@ Begin
   Mem[0:McbA(Z)] := Ord('Z');
   MemW[0:McbA(Z) + 1] := 0;
   MemW[0:McbA(Z) + 3] := $9FFF - Z;
+  { variables du systeme ; COMSPEC : l'interpreteur de la machine }
   A := VmLin(VmRootEnv, 0);
-  MoveMem(LongInt(@EnvBlk), A, EnvLen);
-  I := EnvLen;
-  If (I > 0) And (Mem[0:A + I - 1] <> 0) Then Inc(I);
-  If Not EnvFind('COMSPEC', S) Then
+  I := 0; S := 0;
+  While (S < EnvLen) And (EnvBlk[S] <> 0) Do
   Begin
-    PutPStr(A + I, E, 64);
-    I := I + Length(E) + 1;
+    E := PStr(LongInt(@EnvBlk) + S);
+    If UpStr(Copy(E, 1, 8)) <> 'COMSPEC=' Then
+    Begin
+      PutPStr(A + I, E, 256);
+      I := I + Length(E) + 1;
+    End;
+    S := S + StrLenZ(LongInt(@EnvBlk) + S) + 1;
   End;
+  E := 'COMSPEC=C:\COMMAND.COM';
+  PutPStr(A + I, E, 64);
+  I := I + Length(E) + 1;
   Mem[0:A + I] := 0;
   MemW[0:A + I + 1] := 1;
   PutPStr(A + I + 3, 'C:\COMMAND.COM', 16);
