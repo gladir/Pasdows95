@@ -983,7 +983,7 @@ Type
     Kind   : LongInt;
     F1, F2, F3, F4, F5, F6 : LongInt;
     Name   : String[127];
-    Mask   : String[15];
+    Mask   : String[63];
   End;
 
   TRamFile = Record
@@ -1534,42 +1534,50 @@ Begin
 End;
 
 { Correspondance avec un masque DOS (* et ?) }
+{ Name correspond-il a Mask ? '*' : toute suite de caracteres (points
+  compris), '?' : un caractere ; '*.*' : tout ; NOM.* accepte aussi NOM
+  sans extension (comme MS-DOS). Comparaison sur le nom entier : un
+  masque HTTPGET.EXE.BAT ne correspond pas a HTTPGET.EXE. }
 Function MatchMask(Name, Mask : String) : Boolean;
-Var NB, NE, MB, ME, P : String; I : LongInt;
 
-  Function MPart(A, B : String) : Boolean;
-  Var K : LongInt;
+  Function Glob(Const N, M : String) : Boolean;
+  Var I, J, SI, SJ : LongInt;
   Begin
-    MPart := False;
-    K := 1;
-    While K <= Length(B) Do
+    I := 1; J := 1; SI := 0; SJ := 0;
+    While I <= Length(N) Do
     Begin
-      If B[K] = '*' Then
+      If (J <= Length(M)) And ((M[J] = '?') Or (M[J] = N[I])) Then
       Begin
-        MPart := True;
-        Exit;
+        Inc(I); Inc(J);
+      End
+      Else If (J <= Length(M)) And (M[J] = '*') Then
+      Begin
+        SJ := J; SI := I; Inc(J);
+      End
+      Else If SJ > 0 Then
+      Begin
+        J := SJ + 1; Inc(SI); I := SI;
+      End
+      Else
+      Begin
+        Glob := False; Exit;
       End;
-      If K > Length(A) Then Exit;
-      If (B[K] <> '?') And (B[K] <> A[K]) Then Exit;
-      Inc(K);
     End;
-    MPart := Length(A) = Length(B);
+    While (J <= Length(M)) And (M[J] = '*') Do Inc(J);
+    Glob := J > Length(M);
   End;
 
 Begin
+  Name := UpStr(Name); Mask := UpStr(Mask);
   If (Mask = '*.*') Or (Mask = '*') Then
   Begin
     MatchMask := True;
     Exit;
   End;
-  I := Pos('.', Name);
-  If I > 0 Then Begin NB := Copy(Name, 1, I - 1); NE := Copy(Name, I + 1, 3) End
-  Else Begin NB := Name; NE := '' End;
-  I := Pos('.', Mask);
-  If I > 0 Then Begin MB := Copy(Mask, 1, I - 1); ME := Copy(Mask, I + 1, 3) End
-  Else Begin MB := Mask; ME := '' End;
-  P := ME;
-  MatchMask := MPart(NB, MB) And MPart(NE, P);
+  MatchMask := Glob(Name, Mask);
+  If (Pos('.', Name) = 0) And (Length(Mask) > 2) And
+     (Copy(Mask, Length(Mask) - 1, 2) = '.*') Then
+    If Glob(Name, Copy(Mask, 1, Length(Mask) - 2)) Then MatchMask := True;
 End;
 
 { Contenu d'un fichier entier dans un bloc du tas ; adresse ou 0 }
@@ -17268,7 +17276,7 @@ Begin
   KObjs[I].Name := ParentDir(S);
   If Length(KObjs[I].Name) = 3 Then
     KObjs[I].Name := Copy(KObjs[I].Name, 1, 3);
-  KObjs[I].Mask := Copy(BaseName(S), 1, 15);
+  KObjs[I].Mask := Copy(BaseName(S), 1, 63);
   If Length(KObjs[I].Name) = 3 Then
     KObjs[I].Name := Copy(KObjs[I].Name, 1, 2) + '\';
   If KObjs[I].Name = 'D:\' Then KObjs[I].Name := 'D:';

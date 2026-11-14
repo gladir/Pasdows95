@@ -383,12 +383,26 @@ End;
 
 Procedure ExtractCommand;
 Var
- I,J:Byte;
+ I,J,K,Q:Byte;
+ Internal:Boolean;
 Begin
  For I:=1 to Length(CmdStr)do Begin
   If Not(CmdStr[I]in['A'..'Z','a'..'z','_','-','0'..'9'])Then Begin
    CurrCommand:=StrToUpper(Copy(CmdStr,1,I-1));
-   ParamList:=TrimL(Copy(CmdStr,I,255));
+   Q:=I;
+   { D:\PROG, \WINDOWS\PROG, PROG.EXE : chemin d'un programme, sauf si
+     le debut est une commande interne collee (CD\, CD.., ECHO.) }
+   If CmdStr[I]in[':','\','.']Then Begin
+    Internal:=False;
+    For K:=Low(CommandList)to High(CommandList)do
+     If CommandList[K]=CurrCommand Then Internal:=True;
+    If Not(Internal)Then Begin
+     While(Q<=Length(CmdStr))and Not(CmdStr[Q]in[' ','/','|','>','<'])do
+      Inc(Q);
+     CurrCommand:=StrToUpper(Copy(CmdStr,1,Q-1));
+    End;
+   End;
+   ParamList:=TrimL(Copy(CmdStr,Q,255));
    For J:=1 to Length(ParamList)do Begin
     Case ParamList[J]of
      '|':Begin
@@ -973,6 +987,15 @@ Begin
                    Else ShowDir:=CurrParam;
   If P>99Then Break;
  Until CurrParam='';
+ { Comme MS-DOS : un chemin qui designe un dossier (C:\, C:, D:\JEUX)
+   liste le contenu de ce dossier. }
+ If(ShowDir[Length(ShowDir)]='\')or(ShowDir[Length(ShowDir)]=':')Then
+  ShowDir:=ShowDir+'*.*'
+ Else If(Pos('*',ShowDir)=0)and(Pos('?',ShowDir)=0)Then Begin
+  FindFirst(ShowDir,Directory,Info);
+  If(DosError=0)and(Info.Attr and Directory=Directory)Then
+   ShowDir:=ShowDir+'\*.*';
+ End;
  CurrDrive:=Path2Drive(ShowDir);
  CurrLabel:=GetDiskLabel(Byte(CurrDrive)-64);
  P:=0;
@@ -2110,7 +2133,7 @@ Var
  FileBat:Text;
  OY:Byte;
  Error:Word;
- PipeS:String;
+ PipeS,BatchName:String;
 Begin
  AddHistory(CmdStr);
   { Change d'unit‚ de disque A:, B:, C:, D:,... }
@@ -2217,6 +2240,16 @@ Restart:
   Close(PipeFile);
  End;
  If Not(CommandFound)Then Begin
+  { fichier de traitement par lots : NOM ou NOM.BAT (sans les
+    parametres de la ligne) }
+  BatchName:='';
+  If Pos('.',CurrCommand)=0Then Begin
+   If(CurrCommand<>'')and FileExist(CurrCommand+'.BAT')Then
+    BatchName:=CurrCommand+'.BAT';
+  End
+   Else
+  If(Copy(CurrCommand,Length(CurrCommand)-3,4)='.BAT')and
+    FileExist(CurrCommand)Then BatchName:=CurrCommand;
   If CmdStr='?'Then Begin
    For I:=Low(CommandList) to High(CommandList)
      do Write(PadRight(CommandList[I],10));
@@ -2224,14 +2257,14 @@ Restart:
    WriteLn;
   End
    Else
-  If FileExist(CmdStr+'.BAT')Then Begin
+  If BatchName<>''Then Begin
    Inc(InCmd);
    If InCmd>20Then Begin
     WriteLn('Limite de 20 fichiers de traitements par lots maximum.');
     Exit;
    End;
    LastEcho:=Echo;
-   Assign(FileBat,CmdStr+'.BAT');
+   Assign(FileBat,BatchName);
    {$I-}Reset(FileBat);{$I+}
    If IOResult=0Then Begin
     While Not EOF(FileBat)do Begin
@@ -2239,10 +2272,10 @@ Restart:
      If(Echo)Then WriteLn(CmdStr);
      RunCommand;
     End;
+    Close(FileBat);
    End
     Else
    WriteLn('Probleme de lecture du fichier de traitement par lot');
-   Close(FileBat);
    Echo:=LastEcho;
    Dec(InCmd);
   End
