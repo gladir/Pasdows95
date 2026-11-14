@@ -7344,6 +7344,15 @@ Var
   InMMTimer : Boolean;
   AppRunning : Boolean;
   TlsUsed  : Array[0..TlsSlots - 1] Of Boolean;
+  { pagination (machine virtuelle DOS) : CR3 de chaque tache et
+    repertoire de pages du noyau (0 : pas de pagination) }
+  ThrCr3   : Array[0..MaxThread - 1] Of LongInt;
+  KPd      : LongInt;
+  SwCr3P, SwCr3N : LongInt;
+  VmOn     : Boolean;           { machine virtuelle DOS en cours }
+  VmT      : LongInt;           { sa tache }
+
+Procedure VmTick(B : LongInt); Forward;
 
 Function ThreadId(T : LongInt) : LongInt;
 Begin
@@ -7375,14 +7384,27 @@ Begin
   NewTib := A;
 End;
 
-{ Changement de contexte vers SwNew (sauvegarde dans [SwSave]) }
+{ Changement de contexte vers SwNew (sauvegarde dans [SwSave]) ; avec
+  la pagination, CR3 de la tache quittee range en [SwCr3P] et celui de
+  la nouvelle (SwCr3N) charge avant de passer sur sa pile : la pile de
+  la tache 0 (sous 90000h) n'existe qu'avec les pages du noyau }
 Procedure SwitchCtx;
 Begin
   asm
     pushad
     pushfd
+    cli
     mov eax,SwSave
     mov [eax],esp
+    mov eax,KPd
+    or eax,eax
+    jz @nopg
+    mov edx,SwCr3P
+    mov eax,cr3
+    mov [edx],eax
+    mov eax,SwCr3N
+    mov cr3,eax
+  @nopg:
     mov esp,SwNew
     popfd
     popad
@@ -7431,6 +7453,8 @@ Begin
   end;
   SwSave := LongInt(@Threads[CurT].Esp);
   SwNew := Threads[N].Esp;
+  SwCr3P := LongInt(@ThrCr3[CurT]);
+  SwCr3N := ThrCr3[N];
   CurT := N;
   HeapOwner := ThrOwner[N];
   If TssBase <> 0 Then MemL[0:TssBase + 4] := ThrEsp0[N];
@@ -7455,6 +7479,9 @@ Begin
     mov eax,[ebp]
     mov F,eax
   end;
+  { code d'un programme DOS (mode V86) : interruptions virtuelles }
+  If VmOn And (CurT = VmT) And ((MemL[0:F + 52] And $20000) <> 0) Then
+    VmTick(F + 12);
   If (CurT <= 0) Or (Ticks - SliceStart < 20) Then Exit;
   If Not Threads[CurT].IsApp Then Exit;
   Eip := MemL[0:F + 44];
@@ -7533,12 +7560,20 @@ Begin
   If T < 0 Then Exit;
   If StackSz < 65536 Then StackSz := 65536;
   If StackSz > 4194304 Then StackSz := 4194304;
+  { pile et TIB au noyau : liberes par ReapThreads seulement. Rendus
+    par KFreeOwner a la fin du programme, ils pouvaient etre realloues
+    (memoire du programme suivant) puis liberes une seconde fois par
+    ReapThreads. }
+  I := HeapOwner; HeapOwner := 0;
   Threads[T].Stack := KAlloc(StackSz);
+  If Threads[T].Stack <> 0 Then
+    Threads[T].Tib := NewTib(T, (Threads[T].Stack + StackSz - 64) And
+                             Not 15, StackSz);
+  HeapOwner := I;
   If Threads[T].Stack = 0 Then Exit;
   Threads[T].Used := True;
   Threads[T].StackSz := StackSz;
   Top := (Threads[T].Stack + StackSz - 64) And Not 15;
-  Threads[T].Tib := NewTib(T, Top, StackSz);
   Threads[T].State := tsReady;
   Threads[T].WakeAt := -1;
   Threads[T].WaitH := 0;
@@ -7552,6 +7587,7 @@ Begin
   ThrOwner[T] := Ord(IsApp);
   ThrW16[T] := False;
   ThrEsp0[T] := (Threads[T].Stack + StackSz - 64) And Not 15;
+  ThrCr3[T] := KPd;
   Threads[T].PaintReq := False;
   Threads[T].KObj := KObjNew(koThread);
   If Threads[T].KObj >= 0 Then KObjs[Threads[T].KObj].F1 := T;
@@ -7896,6 +7932,8 @@ Procedure KPaint(W : LongInt); Forward;
 Function KWndProc(W, Msg, WP, LP : LongInt) : LongInt; Forward;
 Procedure KMouse(W, Msg, X, Y : LongInt); Forward;
 Procedure KKey(W, Msg, VK, Ch : LongInt); Forward;
+Procedure DosKeyIn(Up : Boolean; VK, Ch : LongInt); Forward;
+Procedure DosMouseIn(Msg, X, Y : LongInt); Forward;
 Procedure DeskDraw(R : TRect); Forward;
 Procedure TaskbarChanged; Forward;
 Procedure KActivated(W : LongInt); Forward;
@@ -14707,6 +14745,11 @@ End;
 Procedure KMouse(W, Msg, X, Y : LongInt);
 Var I : LongInt;
 Begin
+  If VmOn And (W = ConW) And (W >= 0) Then
+  Begin
+    DosMouseIn(Msg, X, Y);
+    Exit;
+  End;
   If W < 0 Then
   Begin
     { bureau }
@@ -15141,6 +15184,12 @@ Begin
   If W = -2 Then
   Begin
     If (VK = $0D) And (DeskSel >= 0) Then KCommand(DeskCmd[DeskSel]);
+    Exit;
+  End;
+  { programme MS-DOS : touches enfoncees et relachees }
+  If VmOn And (W = ConW) Then
+  Begin
+    DosKeyIn(Msg = WM_KEYUP, VK, Ch);
     Exit;
   End;
   If Msg <> WM_KEYDOWN Then Exit;
@@ -18330,8 +18379,11 @@ Type
     Owned     : Boolean;      { CS_OWNDC }
   End;
 
+  TGdiArr = Array[0..MaxGdi - 1] Of TGdi;
+  PGdiArr = ^TGdiArr;
+
 Var
-  Gdis      : Array[0..MaxGdi - 1] Of TGdi;
+  Gdis      : PGdiArr;         { alloue dans le tas (place sous 4 Mo) }
   Dcs       : Array[0..MaxDC - 1] Of TDC;
   StockObj  : Array[0..19] Of LongInt;
   DefBmp    : LongInt;        { bitmap monochrome 1x1 par defaut }
@@ -18351,12 +18403,12 @@ Var I : LongInt;
 Begin
   GdiNew := -1;
   For I := 0 To MaxGdi - 1 Do
-    If Not Gdis[I].Used Then
+    If Not Gdis^[I].Used Then
     Begin
-      FillMem(LongInt(@Gdis[I]), SizeOf(TGdi), 0);
-      Gdis[I].Used := True;
-      Gdis[I].Kind := Kind;
-      Gdis[I].Owner := HeapOwner;
+      FillMem(LongInt(@Gdis^[I]), SizeOf(TGdi), 0);
+      Gdis^[I].Used := True;
+      Gdis^[I].Kind := Kind;
+      Gdis^[I].Owner := HeapOwner;
       GdiNew := I;
       Exit;
     End;
@@ -18374,8 +18426,8 @@ Begin
   GdiOf := -1;
   If (H < HGdiBase) Or (H >= HGdiBase + MaxGdi * 4) Then Exit;
   I := (H - HGdiBase) Div 4;
-  If Not Gdis[I].Used Then Exit;
-  If (Kind <> 0) And (Gdis[I].Kind <> Kind) Then Exit;
+  If Not Gdis^[I].Used Then Exit;
+  If (Kind <> 0) And (Gdis^[I].Kind <> Kind) Then Exit;
   GdiOf := I;
 End;
 
@@ -18384,7 +18436,7 @@ Var I : LongInt;
 Begin
   DcOf := -1;
   I := GdiOf(H, goDC);
-  If I >= 0 Then DcOf := Gdis[I].I1;
+  If I >= 0 Then DcOf := Gdis^[I].I1;
 End;
 
 { ------------------------------------------------------------------ }
@@ -18400,18 +18452,18 @@ Begin
   If W < 1 Then W := 1;
   If H < 1 Then H := 1;
   Pitch := (W + 3) And Not 3;
-  Gdis[B].I1 := KAlloc(Pitch * H + 16);
-  If Gdis[B].I1 = 0 Then
+  Gdis^[B].I1 := KAlloc(Pitch * H + 16);
+  If Gdis^[B].I1 = 0 Then
   Begin
-    Gdis[B].Used := False;
+    Gdis^[B].Used := False;
     Exit;
   End;
-  Gdis[B].I2 := W; Gdis[B].I3 := H; Gdis[B].I4 := 8; Gdis[B].I5 := Pitch;
-  Gdis[B].I7 := 2;
+  Gdis^[B].I2 := W; Gdis^[B].I3 := H; Gdis^[B].I4 := 8; Gdis^[B].I5 := Pitch;
+  Gdis^[B].I7 := 2;
   If Mono Then
   Begin
-    Gdis[B].I7 := 2 Or 4;
-    Gdis[B].I4 := 1;
+    Gdis^[B].I7 := 2 Or 4;
+    Gdis^[B].I4 := 1;
   End;
   BmpNew := B;
 End;
@@ -18420,25 +18472,25 @@ End;
 Function BmpSurf(B : LongInt; Var S : TSurf) : Boolean;
 Begin
   BmpSurf := False;
-  If (B < 0) Or (Gdis[B].I4 <> 8) And ((Gdis[B].I7 And 4) = 0) Then Exit;
-  S.W := Gdis[B].I2; S.H := Gdis[B].I3;
-  If (Gdis[B].I7 And 2) <> 0 Then
+  If (B < 0) Or (Gdis^[B].I4 <> 8) And ((Gdis^[B].I7 And 4) = 0) Then Exit;
+  S.W := Gdis^[B].I2; S.H := Gdis^[B].I3;
+  If (Gdis^[B].I7 And 2) <> 0 Then
   Begin
-    S.Bits := Gdis[B].I1; S.Pitch := Gdis[B].I5;
+    S.Bits := Gdis^[B].I1; S.Pitch := Gdis^[B].I5;
   End
   Else
   Begin
-    S.Bits := Gdis[B].I1 + (Gdis[B].I3 - 1) * Gdis[B].I5;
-    S.Pitch := -Gdis[B].I5;
+    S.Bits := Gdis^[B].I1 + (Gdis^[B].I3 - 1) * Gdis^[B].I5;
+    S.Pitch := -Gdis^[B].I5;
   End;
   BmpSurf := True;
 End;
 
 Procedure BmpFree(B : LongInt);
 Begin
-  If (Gdis[B].I7 And 8) = 0 Then KFree(Gdis[B].I1);
-  If Gdis[B].I6 <> 0 Then KFree(Gdis[B].I6);
-  Gdis[B].Used := False;
+  If (Gdis^[B].I7 And 8) = 0 Then KFree(Gdis^[B].I1);
+  If Gdis^[B].I6 <> 0 Then KFree(Gdis^[B].I6);
+  Gdis^[B].Used := False;
 End;
 
 { ------------------------------------------------------------------ }
@@ -18470,7 +18522,7 @@ Begin
       Dcs[I].StretchMode := 1;
       Dcs[I].PolyFill := 1;
       Dcs[I].Gdi := G;
-      Gdis[G].I1 := I;
+      Gdis^[G].I1 := I;
       DcNew := GdiH(G);
       Exit;
     End;
@@ -18480,10 +18532,10 @@ End;
 Procedure DcFree(D : LongInt);
 Begin
   If (D < 0) Or Not Dcs[D].Used Then Exit;
-  If (Dcs[D].Bmp >= 0) And Gdis[Dcs[D].Bmp].Used Then
-    Gdis[Dcs[D].Bmp].I8 := 0;
+  If (Dcs[D].Bmp >= 0) And Gdis^[Dcs[D].Bmp].Used Then
+    Gdis^[Dcs[D].Bmp].I8 := 0;
   If Dcs[D].Saved <> 0 Then KFree(Dcs[D].Saved);
-  Gdis[Dcs[D].Gdi].Used := False;
+  Gdis^[Dcs[D].Gdi].Used := False;
   Dcs[D].Used := False;
 End;
 
@@ -18513,7 +18565,7 @@ Begin
     If Not BmpSurf(B, S) Then Exit;
     OX := 0; OY := 0;
     SetR(Clip, 0, 0, S.W, S.H);
-    GTab := Gdis[B].I6;
+    GTab := Gdis^[B].I6;
   End;
   If Dcs[D].HasClip Then
   Begin
@@ -18594,7 +18646,7 @@ Begin
   I := GdiNew(goPen);
   If I >= 0 Then
   Begin
-    Gdis[I].I1 := Style; Gdis[I].I2 := Width; Gdis[I].I3 := Color;
+    Gdis^[I].I1 := Style; Gdis^[I].I2 := Width; Gdis^[I].I3 := Color;
   End;
   CreatePen := GdiH(I);
 End;
@@ -18608,7 +18660,7 @@ Function CreateSolidBrush(Color : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   I := GdiNew(goBrush);
-  If I >= 0 Then Gdis[I].I2 := Color;
+  If I >= 0 Then Gdis^[I].I2 := Color;
   CreateSolidBrush := GdiH(I);
 End;
 
@@ -18618,7 +18670,7 @@ Begin
   I := GdiNew(goBrush);
   If I >= 0 Then
   Begin
-    Gdis[I].I1 := 2; Gdis[I].I2 := Color; Gdis[I].I3 := Hatch;
+    Gdis^[I].I1 := 2; Gdis^[I].I2 := Color; Gdis^[I].I3 := Hatch;
   End;
   CreateHatchBrush := GdiH(I);
 End;
@@ -18630,15 +18682,15 @@ Begin
   If I >= 0 Then
   Begin
     Case MemL[0:P] Of
-      1 : Gdis[I].I1 := 1;
-      2 : Gdis[I].I1 := 2;
-      3 : Gdis[I].I1 := 3;
+      1 : Gdis^[I].I1 := 1;
+      2 : Gdis^[I].I1 := 2;
+      3 : Gdis^[I].I1 := 3;
     Else
-      Gdis[I].I1 := 0;
+      Gdis^[I].I1 := 0;
     End;
-    Gdis[I].I2 := MemL[0:P + 4];
-    Gdis[I].I3 := MemL[0:P + 8];
-    If Gdis[I].I1 = 3 Then Gdis[I].I4 := GdiOf(MemL[0:P + 8], goBitmap);
+    Gdis^[I].I2 := MemL[0:P + 4];
+    Gdis^[I].I3 := MemL[0:P + 8];
+    If Gdis^[I].I1 = 3 Then Gdis^[I].I4 := GdiOf(MemL[0:P + 8], goBitmap);
   End;
   CreateBrushIndirect := GdiH(I);
 End;
@@ -18649,9 +18701,9 @@ Begin
   I := GdiNew(goBrush);
   If I >= 0 Then
   Begin
-    Gdis[I].I1 := 3;
-    Gdis[I].I4 := GdiOf(Hbm, goBitmap);
-    If Gdis[I].I4 < 0 Then Gdis[I].I1 := 0;
+    Gdis^[I].I1 := 3;
+    Gdis^[I].I4 := GdiOf(Hbm, goBitmap);
+    If Gdis^[I].I4 < 0 Then Gdis^[I].I1 := 0;
   End;
   CreatePatternBrush := GdiH(I);
 End;
@@ -18665,9 +18717,9 @@ Begin
   If I >= 0 Then
   Begin
     B := CreateDIBitmapK(HGlob, 0, Usage);
-    Gdis[I].I1 := 3;
-    Gdis[I].I4 := B;
-    If B < 0 Then Gdis[I].I1 := 0;
+    Gdis^[I].I1 := 3;
+    Gdis^[I].I4 := B;
+    If B < 0 Then Gdis^[I].I1 := 0;
   End;
   CreateDIBPatternBrush := GdiH(I);
 End;
@@ -18679,9 +18731,9 @@ Begin
   I := GdiNew(goFont);
   If I >= 0 Then
   Begin
-    Gdis[I].I1 := H; Gdis[I].I2 := W; Gdis[I].I3 := Weight;
-    Gdis[I].I4 := Italic; Gdis[I].I5 := Under;
-    Gdis[I].Name := Copy(PStr(Face), 1, 31);
+    Gdis^[I].I1 := H; Gdis^[I].I2 := W; Gdis^[I].I3 := Weight;
+    Gdis^[I].I4 := Italic; Gdis^[I].I5 := Under;
+    Gdis^[I].Name := Copy(PStr(Face), 1, 31);
   End;
   CreateFontA := GdiH(I);
 End;
@@ -18720,39 +18772,39 @@ Begin
   StockObj[3] := GdiOf(CreateSolidBrush($404040), 0);
   StockObj[4] := GdiOf(CreateSolidBrush(0), 0);
   StockObj[5] := GdiOf(CreateSolidBrush(0), 0);
-  Gdis[StockObj[5]].I1 := 1;
+  Gdis^[StockObj[5]].I1 := 1;
   StockObj[6] := GdiOf(CreatePen(0, 1, $FFFFFF), 0);
   StockObj[7] := GdiOf(CreatePen(0, 1, 0), 0);
   StockObj[8] := GdiOf(CreatePen(5, 1, 0), 0);
   For I := 10 To 17 Do
     StockObj[I] := GdiOf(CreateFontA(16, 8, 0, 0, 400, 0, 0, 0, 0, 0, 0,
                                      0, 0, 0), 0);
-  Gdis[StockObj[10]].Name := 'Terminal';
-  Gdis[StockObj[13]].Name := 'System';
-  Gdis[StockObj[17]].Name := 'MS Sans Serif';
+  Gdis^[StockObj[10]].Name := 'Terminal';
+  Gdis^[StockObj[13]].Name := 'System';
+  Gdis^[StockObj[17]].Name := 'MS Sans Serif';
   { palette par defaut : les 20 couleurs statiques }
   P := GdiNew(goPalette);
-  Gdis[P].I1 := KAlloc(20 * 4); Gdis[P].I2 := 20;
-  Gdis[P].I3 := KAlloc(256);
+  Gdis^[P].I1 := KAlloc(20 * 4); Gdis^[P].I2 := 20;
+  Gdis^[P].I3 := KAlloc(256);
   For I := 0 To 19 Do
   Begin
     If I < 10 Then B := I Else B := 236 + I;
-    Mem[0:Gdis[P].I1 + I * 4] := SysPal[B * 3];
-    Mem[0:Gdis[P].I1 + I * 4 + 1] := SysPal[B * 3 + 1];
-    Mem[0:Gdis[P].I1 + I * 4 + 2] := SysPal[B * 3 + 2];
-    Mem[0:Gdis[P].I3 + I] := B;
+    Mem[0:Gdis^[P].I1 + I * 4] := SysPal[B * 3];
+    Mem[0:Gdis^[P].I1 + I * 4 + 1] := SysPal[B * 3 + 1];
+    Mem[0:Gdis^[P].I1 + I * 4 + 2] := SysPal[B * 3 + 2];
+    Mem[0:Gdis^[P].I3 + I] := B;
   End;
   StockObj[15] := P;
   DefPal := P;
   For I := 0 To 19 Do
     If StockObj[I] >= 0 Then
     Begin
-      Gdis[StockObj[I]].Stock := True;
-      Gdis[StockObj[I]].Owner := 0;
+      Gdis^[StockObj[I]].Stock := True;
+      Gdis^[StockObj[I]].Owner := 0;
     End;
   DefBmp := BmpNew(1, 1, 1, True);
-  Gdis[DefBmp].Stock := True;
-  Gdis[DefBmp].Owner := 0;
+  Gdis^[DefBmp].Stock := True;
+  Gdis^[DefBmp].Owner := 0;
   SysPalUse := 1;
 End;
 
@@ -18766,11 +18818,11 @@ Begin
     DeleteObject := 0;
     Exit;
   End;
-  If Gdis[I].Stock Then Exit;
-  Case Gdis[I].Kind Of
+  If Gdis^[I].Stock Then Exit;
+  Case Gdis^[I].Kind Of
     goBitmap :
     Begin
-      If Gdis[I].I8 <> 0 Then
+      If Gdis^[I].I8 <> 0 Then
       Begin
         DeleteObject := 0;
         Exit;
@@ -18779,13 +18831,13 @@ Begin
     End;
     goPalette :
     Begin
-      KFree(Gdis[I].I1);
-      KFree(Gdis[I].I3);
-      Gdis[I].Used := False;
+      KFree(Gdis^[I].I1);
+      KFree(Gdis^[I].I3);
+      Gdis^[I].Used := False;
     End;
     goDC : DeleteObject := 0;
   Else
-    Gdis[I].Used := False;
+    Gdis^[I].Used := False;
   End;
 End;
 
@@ -18801,7 +18853,7 @@ Begin
   GetObjectA := 0;
   I := GdiOf(H, 0);
   If I < 0 Then Exit;
-  Case Gdis[I].Kind Of
+  Case Gdis^[I].Kind Of
     goBitmap :
     Begin
       If Buf = 0 Then
@@ -18810,51 +18862,51 @@ Begin
         Exit;
       End;
       FillMem(Buf, Min(N, 84), 0);
-      MemL[0:Buf + 4] := Gdis[I].I2;
-      MemL[0:Buf + 8] := Gdis[I].I3;
-      If (Gdis[I].I7 And 4) <> 0 Then
-        MemL[0:Buf + 12] := ((Gdis[I].I2 + 15) Div 16) * 2
-      Else MemL[0:Buf + 12] := Gdis[I].I5;
+      MemL[0:Buf + 4] := Gdis^[I].I2;
+      MemL[0:Buf + 8] := Gdis^[I].I3;
+      If (Gdis^[I].I7 And 4) <> 0 Then
+        MemL[0:Buf + 12] := ((Gdis^[I].I2 + 15) Div 16) * 2
+      Else MemL[0:Buf + 12] := Gdis^[I].I5;
       MemW[0:Buf + 16] := 1;
-      MemW[0:Buf + 18] := Gdis[I].I4;
-      If (Gdis[I].I7 And 1) <> 0 Then MemL[0:Buf + 20] := Gdis[I].I1;
+      MemW[0:Buf + 18] := Gdis^[I].I4;
+      If (Gdis^[I].I7 And 1) <> 0 Then MemL[0:Buf + 20] := Gdis^[I].I1;
       GetObjectA := 24;
-      If ((Gdis[I].I7 And 1) <> 0) And (N >= 84) Then
+      If ((Gdis^[I].I7 And 1) <> 0) And (N >= 84) Then
       Begin
         B := Buf + 24;
         MemL[0:B] := 40;
-        MemL[0:B + 4] := Gdis[I].I2;
-        If (Gdis[I].I7 And 2) <> 0 Then MemL[0:B + 8] := -Gdis[I].I3
-        Else MemL[0:B + 8] := Gdis[I].I3;
+        MemL[0:B + 4] := Gdis^[I].I2;
+        If (Gdis^[I].I7 And 2) <> 0 Then MemL[0:B + 8] := -Gdis^[I].I3
+        Else MemL[0:B + 8] := Gdis^[I].I3;
         MemW[0:B + 12] := 1;
-        MemW[0:B + 14] := Gdis[I].I4;
-        MemL[0:B + 20] := Gdis[I].I5 * Gdis[I].I3;
+        MemW[0:B + 14] := Gdis^[I].I4;
+        MemL[0:B + 20] := Gdis^[I].I5 * Gdis^[I].I3;
         GetObjectA := 84;
       End;
     End;
     goPen :
     Begin
-      MemL[0:Buf] := Gdis[I].I1; MemL[0:Buf + 4] := Gdis[I].I2;
-      MemL[0:Buf + 8] := 0; MemL[0:Buf + 12] := Gdis[I].I3;
+      MemL[0:Buf] := Gdis^[I].I1; MemL[0:Buf + 4] := Gdis^[I].I2;
+      MemL[0:Buf + 8] := 0; MemL[0:Buf + 12] := Gdis^[I].I3;
       GetObjectA := 16;
     End;
     goBrush :
     Begin
-      MemL[0:Buf] := Gdis[I].I1; MemL[0:Buf + 4] := Gdis[I].I2;
-      MemL[0:Buf + 8] := Gdis[I].I3;
+      MemL[0:Buf] := Gdis^[I].I1; MemL[0:Buf + 4] := Gdis^[I].I2;
+      MemL[0:Buf + 8] := Gdis^[I].I3;
       GetObjectA := 12;
     End;
     goFont :
     Begin
       FillMem(Buf, Min(N, 60), 0);
-      MemL[0:Buf] := Gdis[I].I1; MemL[0:Buf + 4] := Gdis[I].I2;
-      MemL[0:Buf + 16] := Gdis[I].I3;
-      If N >= 60 Then PutPStr(Buf + 28, Gdis[I].Name, 32);
+      MemL[0:Buf] := Gdis^[I].I1; MemL[0:Buf + 4] := Gdis^[I].I2;
+      MemL[0:Buf + 16] := Gdis^[I].I3;
+      If N >= 60 Then PutPStr(Buf + 28, Gdis^[I].Name, 32);
       GetObjectA := Min(N, 60);
     End;
     goPalette :
     Begin
-      MemW[0:Buf] := Gdis[I].I2;
+      MemW[0:Buf] := Gdis^[I].I2;
       GetObjectA := 2;
     End;
   End;
@@ -18873,11 +18925,11 @@ Begin
   Begin
     N := MemW[0:P + 2];
     If N > 256 Then N := 256;
-    Gdis[I].I2 := N;
-    Gdis[I].I1 := KAlloc(Max(N, 1) * 4);
-    Gdis[I].I3 := KAlloc(256);
-    MoveMem(P + 4, Gdis[I].I1, N * 4);
-    For N := 0 To 255 Do Mem[0:Gdis[I].I3 + N] := N;
+    Gdis^[I].I2 := N;
+    Gdis^[I].I1 := KAlloc(Max(N, 1) * 4);
+    Gdis^[I].I3 := KAlloc(256);
+    MoveMem(P + 4, Gdis^[I].I1, N * 4);
+    For N := 0 To 255 Do Mem[0:Gdis^[I].I3 + N] := N;
   End;
   CreatePalette := GdiH(I);
 End;
@@ -18890,12 +18942,12 @@ Begin
   If I < 0 Then Exit;
   If Buf = 0 Then
   Begin
-    GetPaletteEntries := Gdis[I].I2;
+    GetPaletteEntries := Gdis^[I].I2;
     Exit;
   End;
-  N := Min(N, Gdis[I].I2 - Start);
+  N := Min(N, Gdis^[I].I2 - Start);
   If N <= 0 Then Exit;
-  MoveMem(Gdis[I].I1 + Start * 4, Buf, N * 4);
+  MoveMem(Gdis^[I].I1 + Start * 4, Buf, N * 4);
   GetPaletteEntries := N;
 End;
 
@@ -18905,9 +18957,9 @@ Begin
   SetPaletteEntries := 0;
   I := GdiOf(H, goPalette);
   If I < 0 Then Exit;
-  N := Min(N, Gdis[I].I2 - Start);
+  N := Min(N, Gdis^[I].I2 - Start);
   If N <= 0 Then Exit;
-  MoveMem(Buf, Gdis[I].I1 + Start * 4, N * 4);
+  MoveMem(Buf, Gdis^[I].I1 + Start * 4, N * 4);
   SetPaletteEntries := N;
 End;
 
@@ -18932,7 +18984,7 @@ Begin
   If D < 0 Then Exit;
   P := Dcs[D].Pal;
   If (P < 0) Or (P = DefPal) Then Exit;
-  N := Gdis[P].I2;
+  N := Gdis^[P].I2;
   If SysPalUse = 2 Then
   Begin
     Lo := 1; Hi := 254;
@@ -18947,11 +18999,11 @@ Begin
     { palette complete : identite pour les entrees non statiques }
     For I := 0 To 255 Do
     Begin
-      E := Gdis[P].I1 + I * 4;
+      E := Gdis^[P].I1 + I * 4;
       If (I >= Lo) And (I <= Hi) Then
       Begin
         SysPalSet(I, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
-        Mem[0:Gdis[P].I3 + I] := I;
+        Mem[0:Gdis^[P].I3 + I] := I;
         Inc(Changed);
       End;
     End;
@@ -18959,8 +19011,8 @@ Begin
     For I := 0 To 255 Do
       If (I < Lo) Or (I > Hi) Then
       Begin
-        E := Gdis[P].I1 + I * 4;
-        Mem[0:Gdis[P].I3 + I] := NearestIdx(Mem[0:E], Mem[0:E + 1],
+        E := Gdis^[P].I1 + I * 4;
+        Mem[0:Gdis^[P].I3 + I] := NearestIdx(Mem[0:E], Mem[0:E + 1],
                                              Mem[0:E + 2]);
       End;
   End
@@ -18969,16 +19021,16 @@ Begin
     Slot := Lo;
     For I := 0 To N - 1 Do
     Begin
-      E := Gdis[P].I1 + I * 4;
+      E := Gdis^[P].I1 + I * 4;
       If Slot <= Hi Then
       Begin
         SysPalSet(Slot, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
-        Mem[0:Gdis[P].I3 + I] := Slot;
+        Mem[0:Gdis^[P].I3 + I] := Slot;
         Inc(Slot);
         Inc(Changed);
       End
       Else
-        Mem[0:Gdis[P].I3 + I] := NearestIdx(Mem[0:E], Mem[0:E + 1],
+        Mem[0:Gdis^[P].I3 + I] := NearestIdx(Mem[0:E], Mem[0:E + 1],
                                              Mem[0:E + 2]);
     End;
     Inc(PalVer);
@@ -18994,11 +19046,11 @@ Begin
   P := GdiOf(H, goPalette);
   If P < 0 Then Exit;
   For I := 0 To N - 1 Do
-    If Start + I < Gdis[P].I2 Then
+    If Start + I < Gdis^[P].I2 Then
     Begin
       E := Entries + I * 4;
-      MemL[0:Gdis[P].I1 + (Start + I) * 4] := MemL[0:E];
-      S := Mem[0:Gdis[P].I3 + Start + I];
+      MemL[0:Gdis^[P].I1 + (Start + I) * 4] := MemL[0:E];
+      S := Mem[0:Gdis^[P].I3 + Start + I];
       SysPalSet(S, Mem[0:E], Mem[0:E + 1], Mem[0:E + 2]);
       DacSet(S);
     End;
@@ -19048,9 +19100,9 @@ Begin
   P := GdiOf(H, goPalette);
   If P < 0 Then Exit;
   Best := 0; BD := $7FFFFFFF;
-  For I := 0 To Gdis[P].I2 - 1 Do
+  For I := 0 To Gdis^[P].I2 - 1 Do
   Begin
-    E := Gdis[P].I1 + I * 4;
+    E := Gdis^[P].I1 + I * 4;
     D := Sqr(Mem[0:E] - (C And 255)) + Sqr(Mem[0:E + 1] - ((C Shr 8) And
          255)) + Sqr(Mem[0:E + 2] - ((C Shr 16) And 255));
     If D < BD Then
@@ -19098,7 +19150,7 @@ Begin
   D := DcOf(Hdc);
   I := GdiOf(H, 0);
   If (D < 0) Or (I < 0) Then Exit;
-  Case Gdis[I].Kind Of
+  Case Gdis^[I].Kind Of
     goPen : Begin Old := Dcs[D].Pen; Dcs[D].Pen := I End;
     goBrush : Begin Old := Dcs[D].Brush; Dcs[D].Brush := I End;
     goFont : Begin Old := Dcs[D].Font; Dcs[D].Font := I End;
@@ -19106,14 +19158,14 @@ Begin
     Begin
       Old := Dcs[D].Bmp;
       If Old < 0 Then Old := DefBmp;
-      If (Old >= 0) And Gdis[Old].Used Then Gdis[Old].I8 := 0;
+      If (Old >= 0) And Gdis^[Old].Used Then Gdis^[Old].I8 := 0;
       Dcs[D].Bmp := I;
-      Gdis[I].I8 := D + 1;
+      Gdis^[I].I8 := D + 1;
     End;
     goRegion :
     Begin
       Dcs[D].HasClip := True;
-      SetR(Dcs[D].ClipR, Gdis[I].I1, Gdis[I].I2, Gdis[I].I3, Gdis[I].I4);
+      SetR(Dcs[D].ClipR, Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
       SelectObject := 2;
       Exit;
     End;
@@ -19359,8 +19411,8 @@ Begin
   S := Dcs[D].Saved; K := Dcs[D].NSaved;
   MoveMem(S + (N - 1) * SizeOf(TDC), LongInt(@Dcs[D]), SizeOf(TDC));
   Dcs[D].Saved := S; Dcs[D].NSaved := N - 1;
-  If (Dcs[D].Bmp >= 0) And Gdis[Dcs[D].Bmp].Used Then
-    Gdis[Dcs[D].Bmp].I8 := D + 1;
+  If (Dcs[D].Bmp >= 0) And Gdis^[Dcs[D].Bmp].Used Then
+    Gdis^[Dcs[D].Bmp].I8 := D + 1;
   RestoreDC := Ord(K > 0);
 End;
 
@@ -19374,16 +19426,16 @@ Begin
   I := GdiNew(goRegion);
   If I >= 0 Then
   Begin
-    Gdis[I].I1 := Min(L0, R0); Gdis[I].I2 := Min(T0, B0);
-    Gdis[I].I3 := Max(L0, R0); Gdis[I].I4 := Max(T0, B0);
-    Gdis[I].I5 := 2;
+    Gdis^[I].I1 := Min(L0, R0); Gdis^[I].I2 := Min(T0, B0);
+    Gdis^[I].I3 := Max(L0, R0); Gdis^[I].I4 := Max(T0, B0);
+    Gdis^[I].I5 := 2;
   End;
   RgnNew := GdiH(I);
 End;
 
 Function RgnType(I : LongInt) : LongInt;
 Begin
-  If (Gdis[I].I1 >= Gdis[I].I3) Or (Gdis[I].I2 >= Gdis[I].I4) Then
+  If (Gdis^[I].I1 >= Gdis^[I].I3) Or (Gdis^[I].I2 >= Gdis^[I].I4) Then
     RgnType := 1
   Else RgnType := 2;
 End;
@@ -19437,7 +19489,7 @@ Begin
   I := GdiOf(H, goRegion);
   SetRectRgn := 0;
   If I < 0 Then Exit;
-  Gdis[I].I1 := L0; Gdis[I].I2 := T0; Gdis[I].I3 := R0; Gdis[I].I4 := B0;
+  Gdis^[I].I1 := L0; Gdis^[I].I2 := T0; Gdis^[I].I3 := R0; Gdis^[I].I4 := B0;
   SetRectRgn := 1;
 End;
 
@@ -19448,8 +19500,8 @@ Begin
   D := GdiOf(Dst, goRegion); A := GdiOf(S1, goRegion);
   B := GdiOf(S2, goRegion);
   If (D < 0) Or (A < 0) Then Exit;
-  SetR(RA, Gdis[A].I1, Gdis[A].I2, Gdis[A].I3, Gdis[A].I4);
-  If B >= 0 Then SetR(RB, Gdis[B].I1, Gdis[B].I2, Gdis[B].I3, Gdis[B].I4)
+  SetR(RA, Gdis^[A].I1, Gdis^[A].I2, Gdis^[A].I3, Gdis^[A].I4);
+  If B >= 0 Then SetR(RB, Gdis^[B].I1, Gdis^[B].I2, Gdis^[B].I3, Gdis^[B].I4)
   Else RB := RA;
   Case Mode Of
     1 : If Not RInter(RR, RA, RB) Then SetR(RR, 0, 0, 0, 0);
@@ -19461,8 +19513,8 @@ Begin
   Else
     RR := RA;
   End;
-  Gdis[D].I1 := RR.L; Gdis[D].I2 := RR.T; Gdis[D].I3 := RR.R;
-  Gdis[D].I4 := RR.B;
+  Gdis^[D].I1 := RR.L; Gdis^[D].I2 := RR.T; Gdis^[D].I3 := RR.R;
+  Gdis^[D].I4 := RR.B;
   CombineRgn := RgnType(D);
 End;
 
@@ -19472,8 +19524,8 @@ Begin
   OffsetRgn := 0;
   I := GdiOf(H, goRegion);
   If I < 0 Then Exit;
-  Gdis[I].I1 := Gdis[I].I1 + X; Gdis[I].I3 := Gdis[I].I3 + X;
-  Gdis[I].I2 := Gdis[I].I2 + Y; Gdis[I].I4 := Gdis[I].I4 + Y;
+  Gdis^[I].I1 := Gdis^[I].I1 + X; Gdis^[I].I3 := Gdis^[I].I3 + X;
+  Gdis^[I].I2 := Gdis^[I].I2 + Y; Gdis^[I].I4 := Gdis^[I].I4 + Y;
   OffsetRgn := RgnType(I);
 End;
 
@@ -19483,8 +19535,8 @@ Begin
   GetRgnBox := 0;
   I := GdiOf(H, goRegion);
   If I < 0 Then Exit;
-  MemL[0:P] := Gdis[I].I1; MemL[0:P + 4] := Gdis[I].I2;
-  MemL[0:P + 8] := Gdis[I].I3; MemL[0:P + 12] := Gdis[I].I4;
+  MemL[0:P] := Gdis^[I].I1; MemL[0:P + 4] := Gdis^[I].I2;
+  MemL[0:P + 8] := Gdis^[I].I3; MemL[0:P + 12] := Gdis^[I].I4;
   GetRgnBox := RgnType(I);
 End;
 
@@ -19492,17 +19544,17 @@ Function EqualRgn(A, B : LongInt) : LongInt;
 Var I, J : LongInt;
 Begin
   I := GdiOf(A, goRegion); J := GdiOf(B, goRegion);
-  EqualRgn := Ord((I >= 0) And (J >= 0) And (Gdis[I].I1 = Gdis[J].I1) And
-    (Gdis[I].I2 = Gdis[J].I2) And (Gdis[I].I3 = Gdis[J].I3) And
-    (Gdis[I].I4 = Gdis[J].I4));
+  EqualRgn := Ord((I >= 0) And (J >= 0) And (Gdis^[I].I1 = Gdis^[J].I1) And
+    (Gdis^[I].I2 = Gdis^[J].I2) And (Gdis^[I].I3 = Gdis^[J].I3) And
+    (Gdis^[I].I4 = Gdis^[J].I4));
 End;
 
 Function PtInRegion(H, X, Y : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   I := GdiOf(H, goRegion);
-  PtInRegion := Ord((I >= 0) And (X >= Gdis[I].I1) And (X < Gdis[I].I3) And
-                    (Y >= Gdis[I].I2) And (Y < Gdis[I].I4));
+  PtInRegion := Ord((I >= 0) And (X >= Gdis^[I].I1) And (X < Gdis^[I].I3) And
+                    (Y >= Gdis^[I].I2) And (Y < Gdis^[I].I4));
 End;
 
 Function SelectClipRgn(Hdc, H : LongInt) : LongInt;
@@ -19519,7 +19571,7 @@ Begin
     Exit;
   End;
   Dcs[D].HasClip := True;
-  SetR(Dcs[D].ClipR, Gdis[I].I1, Gdis[I].I2, Gdis[I].I3, Gdis[I].I4);
+  SetR(Dcs[D].ClipR, Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
   SelectClipRgn := RgnType(I);
 End;
 
@@ -19565,8 +19617,8 @@ Begin
   D := DcOf(Hdc);
   I := GdiOf(H, goRegion);
   If (D < 0) Or (I < 0) Or Not Dcs[D].HasClip Then Exit;
-  Gdis[I].I1 := Dcs[D].ClipR.L; Gdis[I].I2 := Dcs[D].ClipR.T;
-  Gdis[I].I3 := Dcs[D].ClipR.R; Gdis[I].I4 := Dcs[D].ClipR.B;
+  Gdis^[I].I1 := Dcs[D].ClipR.L; Gdis^[I].I2 := Dcs[D].ClipR.T;
+  Gdis^[I].I3 := Dcs[D].ClipR.R; Gdis^[I].I4 := Dcs[D].ClipR.B;
   GetClipRgn := 1;
 End;
 
@@ -19578,21 +19630,21 @@ End;
 Procedure BrushFill(X1, Y1, X2, Y2, B : LongInt);
 Var C, X, Y, PB, PX, PY : LongInt; PS : TSurf;
 Begin
-  If (B < 0) Or Not Gdis[B].Used Then Exit;
-  Case Gdis[B].I1 Of
+  If (B < 0) Or Not Gdis^[B].Used Then Exit;
+  Case Gdis^[B].I1 Of
     1 : Exit;
     2 :
     Begin
-      C := GColor(Gdis[B].I2);
+      C := GColor(Gdis^[B].I2);
       For Y := Max(Y1, ClipY1) To Min(Y2, ClipY2) Do
         For X := Max(X1, ClipX1) To Min(X2, ClipX2) Do
-          If ((Gdis[B].I3 = 0) And (Y Mod 8 = 0)) Or
-             ((Gdis[B].I3 = 1) And (X Mod 8 = 0)) Or
-             ((Gdis[B].I3 >= 2) And ((X + Y) Mod 8 = 0)) Then Pix(X, Y, C);
+          If ((Gdis^[B].I3 = 0) And (Y Mod 8 = 0)) Or
+             ((Gdis^[B].I3 = 1) And (X Mod 8 = 0)) Or
+             ((Gdis^[B].I3 >= 2) And ((X + Y) Mod 8 = 0)) Then Pix(X, Y, C);
     End;
     3 :
     Begin
-      PB := Gdis[B].I4;
+      PB := Gdis^[B].I4;
       If (PB < 0) Or Not BmpSurf(PB, PS) Then Exit;
       For Y := Max(Y1, ClipY1) To Min(Y2, ClipY2) Do
       Begin
@@ -19603,21 +19655,21 @@ Begin
           PX := X Mod PS.W;
           If PX < 0 Then PX := PX + PS.W;
           C := Mem[0:PS.Bits + PY * PS.Pitch + PX];
-          If (Gdis[PB].I7 And 4) <> 0 Then
+          If (Gdis^[PB].I7 And 4) <> 0 Then
           Begin
             If C = 0 Then C := GColor(Dcs[GDc].TextColor)
             Else C := GColor(Dcs[GDc].BkColor);
           End
-          Else If Gdis[PB].I6 <> 0 Then
-            C := ColorIdx(((MemL[0:Gdis[PB].I6 + C * 4] Shr 16) And 255) Or
-                 (MemL[0:Gdis[PB].I6 + C * 4] And $FF00) Or
-                 ((MemL[0:Gdis[PB].I6 + C * 4] And 255) Shl 16));
+          Else If Gdis^[PB].I6 <> 0 Then
+            C := ColorIdx(((MemL[0:Gdis^[PB].I6 + C * 4] Shr 16) And 255) Or
+                 (MemL[0:Gdis^[PB].I6 + C * 4] And $FF00) Or
+                 ((MemL[0:Gdis^[PB].I6 + C * 4] And 255) Shl 16));
           Pix(X, Y, C);
         End;
       End;
     End;
   Else
-    FBar(X1, Y1, X2, Y2, GColor(Gdis[B].I2));
+    FBar(X1, Y1, X2, Y2, GColor(Gdis^[B].I2));
   End;
 End;
 
@@ -19642,7 +19694,7 @@ Begin
     DSTINVERT, PATINVERT :
     Begin
       C := 255;
-      If Rop = PATINVERT Then C := GColor(Gdis[Dcs[D].Brush].I2);
+      If Rop = PATINVERT Then C := GColor(Gdis^[Dcs[D].Brush].I2);
       For YY := Max(Y, ClipY1) To Min(Y + H - 1, ClipY2) Do
         For XX := Max(X, ClipX1) To Min(X + W - 1, ClipX2) Do
         Begin
@@ -19660,8 +19712,8 @@ End;
 Function PenColor(D : LongInt; Var C : LongInt) : Boolean;
 Begin
   PenColor := False;
-  If (Dcs[D].Pen < 0) Or (Gdis[Dcs[D].Pen].I1 = 5) Then Exit;
-  C := GColor(Gdis[Dcs[D].Pen].I3);
+  If (Dcs[D].Pen < 0) Or (Gdis^[Dcs[D].Pen].I1 = 5) Then Exit;
+  C := GColor(Gdis^[Dcs[D].Pen].I3);
   If Dcs[D].Rop2 = 1 Then C := GColor(0);
   If Dcs[D].Rop2 = 16 Then C := GColor($FFFFFF);
   PenColor := True;
@@ -19671,7 +19723,7 @@ Procedure PenLine(D, X1, Y1, X2, Y2 : LongInt);
 Var C, W, K : LongInt;
 Begin
   If Not PenColor(D, C) Then Exit;
-  W := Gdis[Dcs[D].Pen].I2;
+  W := Gdis^[Dcs[D].Pen].I2;
   DLine(X1, Y1, X2, Y2, C);
   If W > 1 Then
     For K := 1 To W - 1 Do
@@ -19726,7 +19778,7 @@ Procedure FillPoly(D, Pts, N : LongInt);
 Var Y, I, J, X1, Y1, X2, Y2, K, T, MinY, MaxY : LongInt;
     Xs : Array[0..63] Of LongInt;
 Begin
-  If (N < 3) Or (Dcs[D].Brush < 0) Or (Gdis[Dcs[D].Brush].I1 = 1) Then Exit;
+  If (N < 3) Or (Dcs[D].Brush < 0) Or (Gdis^[Dcs[D].Brush].I1 = 1) Then Exit;
   MinY := $7FFFFFF; MaxY := -$7FFFFFF;
   For I := 0 To N - 1 Do
   Begin
@@ -19845,9 +19897,9 @@ Begin
   D := DcOf(Hdc);
   I := GdiOf(H, goRegion);
   If (I < 0) Or Not DcBegin(D) Then Exit;
-  BrushFill(Gdis[I].I1, Gdis[I].I2, Gdis[I].I3 - 1, Gdis[I].I4 - 1,
+  BrushFill(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3 - 1, Gdis^[I].I4 - 1,
             GdiOf(Br, goBrush));
-  DcDirty(Gdis[I].I1, Gdis[I].I2, Gdis[I].I3, Gdis[I].I4);
+  DcDirty(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
 End;
 
 Function PaintRgn(Hdc, H : LongInt) : LongInt;
@@ -19866,11 +19918,11 @@ Begin
   I := GdiOf(H, goRegion);
   B := GdiOf(Br, goBrush);
   If (I < 0) Or Not DcBegin(D) Then Exit;
-  BrushFill(Gdis[I].I1, Gdis[I].I2, Gdis[I].I3 - 1, Gdis[I].I2 + Hh - 1, B);
-  BrushFill(Gdis[I].I1, Gdis[I].I4 - Hh, Gdis[I].I3 - 1, Gdis[I].I4 - 1, B);
-  BrushFill(Gdis[I].I1, Gdis[I].I2, Gdis[I].I1 + W - 1, Gdis[I].I4 - 1, B);
-  BrushFill(Gdis[I].I3 - W, Gdis[I].I2, Gdis[I].I3 - 1, Gdis[I].I4 - 1, B);
-  DcDirty(Gdis[I].I1, Gdis[I].I2, Gdis[I].I3, Gdis[I].I4);
+  BrushFill(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3 - 1, Gdis^[I].I2 + Hh - 1, B);
+  BrushFill(Gdis^[I].I1, Gdis^[I].I4 - Hh, Gdis^[I].I3 - 1, Gdis^[I].I4 - 1, B);
+  BrushFill(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I1 + W - 1, Gdis^[I].I4 - 1, B);
+  BrushFill(Gdis^[I].I3 - W, Gdis^[I].I2, Gdis^[I].I3 - 1, Gdis^[I].I4 - 1, B);
+  DcDirty(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
 End;
 
 Function InvertRgn(Hdc, H : LongInt) : LongInt;
@@ -19880,13 +19932,13 @@ Begin
   D := DcOf(Hdc);
   I := GdiOf(H, goRegion);
   If (I < 0) Or Not DcBegin(D) Then Exit;
-  For Y := Max(Gdis[I].I2, ClipY1) To Min(Gdis[I].I4 - 1, ClipY2) Do
-    For X := Max(Gdis[I].I1, ClipX1) To Min(Gdis[I].I3 - 1, ClipX2) Do
+  For Y := Max(Gdis^[I].I2, ClipY1) To Min(Gdis^[I].I4 - 1, ClipY2) Do
+    For X := Max(Gdis^[I].I1, ClipX1) To Min(Gdis^[I].I3 - 1, ClipX2) Do
     Begin
       A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
       Mem[0:A] := Mem[0:A] Xor 255;
     End;
-  DcDirty(Gdis[I].I1, Gdis[I].I2, Gdis[I].I3, Gdis[I].I4);
+  DcDirty(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
 End;
 
 Function SetPixel(Hdc, X, Y, C : LongInt) : LongInt;
@@ -19996,8 +20048,8 @@ Var D : LongInt; S : String;
 Begin
   D := DcOf(Hdc);
   S := 'System';
-  If (D >= 0) And (Dcs[D].Font >= 0) And (Gdis[Dcs[D].Font].Name <> '') Then
-    S := Gdis[Dcs[D].Font].Name;
+  If (D >= 0) And (Dcs[D].Font >= 0) And (Gdis^[Dcs[D].Font].Name <> '') Then
+    S := Gdis^[Dcs[D].Font].Name;
   PutPStr(Buf, S, N);
   GetTextFaceA := Length(S);
 End;
@@ -20055,8 +20107,8 @@ Begin
     B := Dcs[D].Bmp;
     If B < 0 Then B := DefBmp;
     If Not BmpSurf(B, S) Then Exit;
-    Tab := Gdis[B].I6;
-    Mono := (Gdis[B].I7 And 4) <> 0;
+    Tab := Gdis^[B].I6;
+    Mono := (Gdis^[B].I7 And 4) <> 0;
   End;
   OX := OX + Dcs[D].VpX - Dcs[D].WinX;
   OY := OY + Dcs[D].VpY - Dcs[D].WinY;
@@ -20071,23 +20123,23 @@ Function PalMatch(D, I, Q, C : LongInt) : LongInt;
 Var P, N, E, J, R : LongInt;
 Begin
   P := Dcs[D].Pal;
-  If (P >= 0) And (P <> DefPal) And (Gdis[P].I3 <> 0) Then
+  If (P >= 0) And (P <> DefPal) And (Gdis^[P].I3 <> 0) Then
   Begin
-    N := Gdis[P].I2;
+    N := Gdis^[P].I2;
     R := ((Q Shr 16) And 255) Or (Q And $FF00) Or ((Q And 255) Shl 16);
     If I < N Then
     Begin
-      E := Gdis[P].I1 + I * 4;
+      E := Gdis^[P].I1 + I * 4;
       If (MemL[0:E] And $FFFFFF) = R Then
       Begin
-        PalMatch := Mem[0:Gdis[P].I3 + I];
+        PalMatch := Mem[0:Gdis^[P].I3 + I];
         Exit;
       End;
     End;
     For J := 0 To N - 1 Do
-      If (MemL[0:Gdis[P].I1 + J * 4] And $FFFFFF) = R Then
+      If (MemL[0:Gdis^[P].I1 + J * 4] And $FFFFFF) = R Then
       Begin
-        PalMatch := Mem[0:Gdis[P].I3 + J];
+        PalMatch := Mem[0:Gdis^[P].I3 + J];
         Exit;
       End;
   End;
@@ -20187,9 +20239,9 @@ Begin
   Y0 := Max(DY, ClipY1); Y1 := Min(DY + DH - 1, ClipY2);
   If (X0 > X1) Or (Y0 > Y1) Then Exit;
   Pc := 0;
-  If (Dcs[GDc].Brush >= 0) Then Pc := GColor(Gdis[Dcs[GDc].Brush].I2);
+  If (Dcs[GDc].Brush >= 0) Then Pc := GColor(Gdis^[Dcs[GDc].Brush].I2);
   DMono := 0;
-  If (Dcs[GDc].Bmp >= 0) And ((Gdis[Dcs[GDc].Bmp].I7 And 4) <> 0) And
+  If (Dcs[GDc].Bmp >= 0) And ((Gdis^[Dcs[GDc].Bmp].I7 And 4) <> 0) And
      (Dcs[GDc].Wnd < 0) And Not Dcs[GDc].Screen Then DMono := 1;
   Simple := (Rop = SRCCOPY) And Not Xl And (DW = SW) And (DH = SH) And
             (DMono = 0);
@@ -20287,9 +20339,9 @@ Begin
     Begin
       Q := MemW[0:T + I * 2];
       If (D >= 0) And (Dcs[D].Pal >= 0) Then P := Dcs[D].Pal Else P := DefPal;
-      If Q < Gdis[P].I2 Then
+      If Q < Gdis^[P].I2 Then
       Begin
-        E := Gdis[P].I1 + Q * 4;
+        E := Gdis^[P].I1 + Q * 4;
         MemL[0:Dst + I * 4] := (Mem[0:E] Shl 16) Or (Mem[0:E + 1] Shl 8) Or
                                Mem[0:E + 2];
       End;
@@ -20357,14 +20409,14 @@ Begin
   If Usage = 1 Then
   Begin
     P := Dcs[D].Pal;
-    If (P >= 0) And (Gdis[P].I3 <> 0) Then
+    If (P >= 0) And (Gdis^[P].I3 <> 0) Then
     Begin
       N := Min(DibColors(Bmi), 256);
       T := Bmi + MemL[0:Bmi];
       For V := 0 To N - 1 Do
       Begin
         Q := MemW[0:T + V * 2];
-        If Q < Gdis[P].I2 Then XlatTab[V] := Mem[0:Gdis[P].I3 + Q];
+        If Q < Gdis^[P].I2 Then XlatTab[V] := Mem[0:Gdis^[P].I3 + Q];
       End;
     End;
   End;
@@ -20453,7 +20505,7 @@ Begin
         V := ColorIdx(((V Shr 16) And 255) Or (V And $FF00) Or
                       ((V And 255) Shl 16))
       Else V := XlatTab[V And 255];
-      Mem[0:Gdis[B].I1 + Y * Gdis[B].I5 + X] := V;
+      Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] := V;
     End;
 End;
 
@@ -20478,17 +20530,17 @@ Begin
   B := GdiNew(goBitmap);
   If B < 0 Then Exit;
   Pitch := DibPitch(W, Bpp);
-  Gdis[B].I1 := KAlloc(Pitch * Abs(H) + 16);
-  Gdis[B].I2 := W; Gdis[B].I3 := Abs(H); Gdis[B].I4 := Bpp;
-  Gdis[B].I5 := Pitch;
-  Gdis[B].I7 := 1;
-  If H < 0 Then Gdis[B].I7 := Gdis[B].I7 Or 2;
+  Gdis^[B].I1 := KAlloc(Pitch * Abs(H) + 16);
+  Gdis^[B].I2 := W; Gdis^[B].I3 := Abs(H); Gdis^[B].I4 := Bpp;
+  Gdis^[B].I5 := Pitch;
+  Gdis^[B].I7 := 1;
+  If H < 0 Then Gdis^[B].I7 := Gdis^[B].I7 Or 2;
   If Bpp <= 8 Then
   Begin
-    Gdis[B].I6 := KAlloc(1024);
-    DibTable(Bmi, Usage, DcOf(Hdc), Gdis[B].I6);
+    Gdis^[B].I6 := KAlloc(1024);
+    DibTable(Bmi, Usage, DcOf(Hdc), Gdis^[B].I6);
   End;
-  If PBits <> 0 Then MemL[0:PBits] := Gdis[B].I1;
+  If PBits <> 0 Then MemL[0:PBits] := Gdis^[B].I1;
   CreateDIBSection := GdiH(B);
 End;
 
@@ -20499,9 +20551,9 @@ Begin
   D := DcOf(Hdc);
   If D < 0 Then Exit;
   B := Dcs[D].Bmp;
-  If (B < 0) Or (Gdis[B].I6 = 0) Then Exit;
+  If (B < 0) Or (Gdis^[B].I6 = 0) Then Exit;
   N := Min(N, 256 - Start);
-  MoveMem(Rgbq, Gdis[B].I6 + Start * 4, N * 4);
+  MoveMem(Rgbq, Gdis^[B].I6 + Start * 4, N * 4);
   SetDIBColorTable := N;
 End;
 
@@ -20512,9 +20564,9 @@ Begin
   D := DcOf(Hdc);
   If D < 0 Then Exit;
   B := Dcs[D].Bmp;
-  If (B < 0) Or (Gdis[B].I6 = 0) Then Exit;
+  If (B < 0) Or (Gdis^[B].I6 = 0) Then Exit;
   N := Min(N, 256 - Start);
-  MoveMem(Gdis[B].I6 + Start * 4, Rgbq, N * 4);
+  MoveMem(Gdis^[B].I6 + Start * 4, Rgbq, N * 4);
   GetDIBColorTable := N;
 End;
 
@@ -20547,14 +20599,14 @@ Begin
     WB := ((W + 15) Div 16) * 2;
     For Y := 0 To H - 1 Do
       For X := 0 To W - 1 Do
-        Mem[0:Gdis[B].I1 + Y * Gdis[B].I5 + X] :=
+        Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] :=
           (Mem[0:Bits + Y * WB + X Div 8] Shr (7 - X Mod 8)) And 1;
   End
   Else If Bpp = 8 Then
   Begin
     WB := ((W + 1) Div 2) * 2;
     For Y := 0 To H - 1 Do
-      MoveMem(Bits + Y * WB, Gdis[B].I1 + Y * Gdis[B].I5, W);
+      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5, W);
   End;
 End;
 
@@ -20570,26 +20622,26 @@ Begin
   GetBitmapBits := 0;
   B := GdiOf(H, goBitmap);
   If B < 0 Then Exit;
-  If (Gdis[B].I7 And 4) <> 0 Then
+  If (Gdis^[B].I7 And 4) <> 0 Then
   Begin
-    WB := ((Gdis[B].I2 + 15) Div 16) * 2;
-    FillMem(Bits, Min(N, WB * Gdis[B].I3), 0);
-    For Y := 0 To Gdis[B].I3 - 1 Do
-      For X := 0 To Gdis[B].I2 - 1 Do
+    WB := ((Gdis^[B].I2 + 15) Div 16) * 2;
+    FillMem(Bits, Min(N, WB * Gdis^[B].I3), 0);
+    For Y := 0 To Gdis^[B].I3 - 1 Do
+      For X := 0 To Gdis^[B].I2 - 1 Do
         If (Y * WB + X Div 8 < N) And
-           (Mem[0:Gdis[B].I1 + Y * Gdis[B].I5 + X] <> 0) Then
+           (Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] <> 0) Then
         Begin
           V := Bits + Y * WB + X Div 8;
           Mem[0:V] := Mem[0:V] Or ($80 Shr (X Mod 8));
         End;
-    GetBitmapBits := Min(N, WB * Gdis[B].I3);
+    GetBitmapBits := Min(N, WB * Gdis^[B].I3);
     Exit;
   End;
-  WB := ((Gdis[B].I2 + 1) Div 2) * 2;
-  For Y := 0 To Gdis[B].I3 - 1 Do
+  WB := ((Gdis^[B].I2 + 1) Div 2) * 2;
+  For Y := 0 To Gdis^[B].I3 - 1 Do
     If (Y + 1) * WB <= N Then
-      MoveMem(Gdis[B].I1 + Y * Gdis[B].I5, Bits + Y * WB, Gdis[B].I2);
-  GetBitmapBits := Min(N, WB * Gdis[B].I3);
+      MoveMem(Gdis^[B].I1 + Y * Gdis^[B].I5, Bits + Y * WB, Gdis^[B].I2);
+  GetBitmapBits := Min(N, WB * Gdis^[B].I3);
 End;
 
 Function SetBitmapBits(H, N, Bits : LongInt) : LongInt;
@@ -20598,21 +20650,21 @@ Begin
   SetBitmapBits := 0;
   B := GdiOf(H, goBitmap);
   If B < 0 Then Exit;
-  If (Gdis[B].I7 And 4) <> 0 Then
+  If (Gdis^[B].I7 And 4) <> 0 Then
   Begin
-    WB := ((Gdis[B].I2 + 15) Div 16) * 2;
-    For Y := 0 To Gdis[B].I3 - 1 Do
-      For X := 0 To Gdis[B].I2 - 1 Do
+    WB := ((Gdis^[B].I2 + 15) Div 16) * 2;
+    For Y := 0 To Gdis^[B].I3 - 1 Do
+      For X := 0 To Gdis^[B].I2 - 1 Do
         If Y * WB + X Div 8 < N Then
-          Mem[0:Gdis[B].I1 + Y * Gdis[B].I5 + X] :=
+          Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] :=
             (Mem[0:Bits + Y * WB + X Div 8] Shr (7 - X Mod 8)) And 1;
     SetBitmapBits := N;
     Exit;
   End;
-  WB := ((Gdis[B].I2 + 1) Div 2) * 2;
-  For Y := 0 To Gdis[B].I3 - 1 Do
+  WB := ((Gdis^[B].I2 + 1) Div 2) * 2;
+  For Y := 0 To Gdis^[B].I3 - 1 Do
     If (Y + 1) * WB <= N Then
-      MoveMem(Bits + Y * WB, Gdis[B].I1 + Y * Gdis[B].I5, Gdis[B].I2);
+      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5, Gdis^[B].I2);
   SetBitmapBits := N;
 End;
 
@@ -20624,7 +20676,7 @@ Begin
   GetDIBits := 0;
   B := GdiOf(H, goBitmap);
   If B < 0 Then Exit;
-  W := Gdis[B].I2; Hh := Gdis[B].I3;
+  W := Gdis^[B].I2; Hh := Gdis^[B].I3;
   If MemW[0:Bmi + 14] = 0 Then
   Begin
     MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := Hh;
@@ -20637,7 +20689,7 @@ Begin
   Bpp := MemW[0:Bmi + 14];
   For I := 0 To 255 Do
   Begin
-    If Gdis[B].I6 <> 0 Then V := MemL[0:Gdis[B].I6 + I * 4]
+    If Gdis^[B].I6 <> 0 Then V := MemL[0:Gdis^[B].I6 + I * 4]
     Else V := (SysPal[I * 3] Shl 16) Or (SysPal[I * 3 + 1] Shl 8) Or
               SysPal[I * 3 + 2];
     MemL[0:Bmi + MemL[0:Bmi] + I * 4] := V;
@@ -20650,10 +20702,10 @@ Begin
   Pitch := DibPitch(W, 8);
   For Y := Start To Min(Start + Lines, Hh) - 1 Do
   Begin
-    If (Gdis[B].I7 And 2) <> 0 Then SY := Hh - 1 - Y Else SY := Y;
+    If (Gdis^[B].I7 And 2) <> 0 Then SY := Hh - 1 - Y Else SY := Y;
     For X := 0 To W - 1 Do
       Mem[0:Bits + (Y - Start) * Pitch + X] :=
-        Mem[0:Gdis[B].I1 + SY * Gdis[B].I5 + X];
+        Mem[0:Gdis^[B].I1 + SY * Gdis^[B].I5 + X];
   End;
   GetDIBits := Min(Lines, Hh - Start);
 End;
@@ -20677,17 +20729,17 @@ Begin
                            ((Q And 255) Shl 16));
   End;
   KFree(Tab);
-  For Y := 0 To Min(Hh, Gdis[B].I3) - 1 Do
+  For Y := 0 To Min(Hh, Gdis^[B].I3) - 1 Do
   Begin
-    If (Gdis[B].I7 And 2) <> 0 Then SY := Y Else SY := Gdis[B].I3 - 1 - Y;
-    For X := 0 To Min(W, Gdis[B].I2) - 1 Do
+    If (Gdis^[B].I7 And 2) <> 0 Then SY := Y Else SY := Gdis^[B].I3 - 1 - Y;
+    For X := 0 To Min(W, Gdis^[B].I2) - 1 Do
     Begin
       V := DibPix(Bits, W, Hh, MemW[0:Bmi + 14], X, Y, Top);
       If V < 0 Then
         V := ColorIdx(((V Shr 16) And 255) Or (V And $FF00) Or
                       ((V And 255) Shl 16))
       Else V := XlatTab[V And 255];
-      Mem[0:Gdis[B].I1 + SY * Gdis[B].I5 + X] := V;
+      Mem[0:Gdis^[B].I1 + SY * Gdis^[B].I5 + X] := V;
     End;
   End;
   SetDIBits := Lines;
@@ -21912,7 +21964,7 @@ Begin
   If W < 0 Then Exit;
   I := GdiOf(Rgn, goRegion);
   If I < 0 Then SetR(R, 0, 0, 30000, 30000)
-  Else SetR(R, Gdis[I].I1, Gdis[I].I2, Gdis[I].I3, Gdis[I].I4);
+  Else SetR(R, Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
   InvalW(W, R, Erase <> 0);
 End;
 
@@ -21936,8 +21988,8 @@ Begin
   W := WndOf(H);
   I := GdiOf(Rgn, goRegion);
   If (W < 0) Or (I < 0) Then Exit;
-  Gdis[I].I1 := Wnds[W].Upd.L; Gdis[I].I2 := Wnds[W].Upd.T;
-  Gdis[I].I3 := Wnds[W].Upd.R; Gdis[I].I4 := Wnds[W].Upd.B;
+  Gdis^[I].I1 := Wnds[W].Upd.L; Gdis^[I].I2 := Wnds[W].Upd.T;
+  Gdis^[I].I3 := Wnds[W].Upd.R; Gdis^[I].I4 := Wnds[W].Upd.B;
   GetUpdateRgn := RgnType(I);
 End;
 
@@ -24506,10 +24558,30 @@ Begin
 End;
 
 Procedure IrqSound; Interrupt;
+Var C : LongInt;
 Begin
+  { interruption pendant un programme DOS (mode V86) : le tampon DMA
+    (90000h) n'est visible qu'avec les pages du noyau }
+  C := 0;
+  If KPd <> 0 Then
+  Begin
+    asm
+      mov eax,cr3
+      mov C,eax
+      mov eax,KPd
+      mov cr3,eax
+    end;
+  End;
   SbIsr;
   If SbIrq >= 8 Then Port[$A0] := $20;
   Port[$20] := $20;
+  If (C <> 0) And (C <> KPd) Then
+  Begin
+    asm
+      mov eax,C
+      mov cr3,eax
+    end;
+  End;
 End;
 
 Procedure SndInit;
@@ -26280,6 +26352,12 @@ Begin
       FindModuleFile := S;
       Exit;
     End;
+    S := FullPath(Name + '.COM');
+    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
+    Begin
+      FindModuleFile := S;
+      Exit;
+    End;
   End;
   S := SysDir + UpStr(BaseName(Name));
   If PathInfo(S, Attr, Size, Time, Lba, Ram) Then
@@ -26748,10 +26826,13 @@ End;
 { ------------------------------------------------------------------ }
 
 { Liberer tout ce qui appartient au programme }
+Procedure DosStop; Forward;
+
 Procedure KillApp;
 Var I : LongInt;
 Begin
   KillingApp := True;
+  DosStop;
   NetAppExit;
   For I := 0 To MaxWnd - 1 Do
     If Wnds[I].Used And (Wnds[I].Thread > 0) And
@@ -26772,9 +26853,9 @@ Begin
        (KObjOwner[I] = 1) Then
       KObjs[I].Used := False;
   For I := 0 To MaxDC - 1 Do
-    If Dcs[I].Used And (Gdis[Dcs[I].Gdi].Owner = 1) Then DcFree(I);
+    If Dcs[I].Used And (Gdis^[Dcs[I].Gdi].Owner = 1) Then DcFree(I);
   For I := 0 To MaxGdi - 1 Do
-    If Gdis[I].Used And (Gdis[I].Owner = 1) Then Gdis[I].Used := False;
+    If Gdis^[I].Used And (Gdis^[I].Owner = 1) Then Gdis^[I].Used := False;
   For I := 0 To MaxVBlk - 1 Do VBlks[I].Used := False;
   For I := 0 To MaxMod - 1 Do Mods[I].Used := False;
   For I := 0 To MaxClass - 1 Do
@@ -26822,6 +26903,8 @@ End;
 { Lancer un programme Windows (.EXE du CD-ROM ou du disque virtuel) }
 Function IsNeFile(Path : String) : Boolean; Forward;
 Function RunNe(Path, Args : String; Show : LongInt) : Boolean; Forward;
+Function IsDosFile(Path : String) : Boolean; Forward;
+Function RunDos(Path, Args : String) : Boolean; Forward;
 
 Function RunExe(Path, Args : String) : Boolean;
 Var M, T, Sub : LongInt; S : String;
@@ -26848,6 +26931,12 @@ Begin
   End;
   S := FindModuleFile(Path);
   If S = '' Then Exit;
+  { programme MS-DOS : machine virtuelle 8086 }
+  If IsDosFile(S) Then
+  Begin
+    RunExe := RunDos(S, Args);
+    Exit;
+  End;
   RunExe := True;
   CursorSetShape(1);
   CursorErase; CursorDraw;
@@ -31168,8 +31257,8 @@ Begin
   KillingApp := False;
   Own := ThrOwner[CurT];
   For I := 0 To MaxGdi - 1 Do
-    If Gdis[I].Used And (Gdis[I].Owner = Own) And Not Gdis[I].Stock Then
-      Gdis[I].Used := False;
+    If Gdis^[I].Used And (Gdis^[I].Owner = Own) And Not Gdis^[I].Stock Then
+      Gdis^[I].Used := False;
   For I := 0 To MaxKObj - 1 Do
     If KObjs[I].Used And (KObjOwner[I] = Own) And
        (KObjs[I].Kind In [koFile, koFind]) Then KObjs[I].Used := False;
@@ -33386,13 +33475,13 @@ Begin
   If PHdc = 0 Then Exit;
   B := GdiNew(goBitmap);
   If B < 0 Then Exit;
-  Gdis[B].I1 := MemL[0:T + 24];
-  Gdis[B].I2 := MemL[0:T + 12]; Gdis[B].I3 := MemL[0:T + 16];
-  Gdis[B].I4 := 8; Gdis[B].I5 := MemL[0:T + 20];
-  Gdis[B].I7 := 1 Or 2 Or 8;
-  Gdis[B].I6 := KAlloc(1024);
+  Gdis^[B].I1 := MemL[0:T + 24];
+  Gdis^[B].I2 := MemL[0:T + 12]; Gdis^[B].I3 := MemL[0:T + 16];
+  Gdis^[B].I4 := 8; Gdis^[B].I5 := MemL[0:T + 20];
+  Gdis^[B].I7 := 1 Or 2 Or 8;
+  Gdis^[B].I6 := KAlloc(1024);
   For I := 0 To 255 Do
-    MemL[0:Gdis[B].I6 + I * 4] := (SysPal[I * 3] Shl 16) Or
+    MemL[0:Gdis^[B].I6 + I * 4] := (SysPal[I * 3] Shl 16) Or
       (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
   Hdc := CreateCompatibleDC(0);
   SelectObject(Hdc, GdiH(B));
@@ -33409,9 +33498,9 @@ Begin
   B := MemL[0:T + 60];
   If (B >= 0) And (MemL[0:T + 52] = Hdc) Then
   Begin
-    If Gdis[B].I6 <> 0 Then KFree(Gdis[B].I6);
-    Gdis[B].I6 := 0;
-    Gdis[B].Used := False;
+    If Gdis^[B].I6 <> 0 Then KFree(Gdis^[B].I6);
+    Gdis^[B].I6 := 0;
+    Gdis^[B].Used := False;
   End;
   MemL[0:T + 52] := 0;
   SurfTouched(T);
@@ -38460,6 +38549,3805 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   LockResource, SizeofResource, FreeResource;
 
 { ==================================================================== }
+{ Partie 17 - Machine virtuelle DOS (mode virtuel 8086)                }
+{ ==================================================================== }
+{ Les programmes MS-DOS (.COM, et .EXE sans en-tete PE ni NE) tournent
+  dans une machine virtuelle 8086, comme dans la fenetre MS-DOS de
+  Windows 95. Une tache du noyau execute leur code en mode virtuel 8086
+  (EFLAGS.VM, IOPL 0). Le premier megaoctet de la machine est un bloc de
+  1 Mo du tas place a l'adresse 0 par la pagination : la machine a son
+  propre repertoire de pages, charge seulement pendant l'execution du
+  code 16 bits ; le noyau, ses interruptions et les autres taches voient
+  toujours la memoire en identite (pages de 4 Mo, PSE). La pagination
+  n'est activee qu'au lancement du premier programme DOS.
+
+  Les instructions sensibles (INT, IRET, PUSHF, POPF, CLI, STI, HLT, IN,
+  OUT) provoquent une faute de protection generale (0Dh) que le moniteur
+  emule ; l'indicateur IF de la machine est virtuel. Le BIOS et le DOS
+  sont ecrits ici en Pascal : chaque vecteur de la table des
+  interruptions de la machine pointe sur un octet HLT en F000:0100h + n.
+  Un INT n vers ce vecteur est servi directement ; un programme qui a
+  detourne le vecteur et rappelle l'ancien gestionnaire (PUSHF + CALL
+  FAR) arrive sur le HLT, qui sert l'interruption et revient (IRET).
+  L'horloge (INT 08h et 1Ch, 18,2 Hz) et le clavier (INT 09h, port 60h)
+  sont des interruptions virtuelles, delivrees quand IF le permet.
+
+  Le DOS gere les blocs de memoire (MCB), les PSP, le chargement des
+  .COM et .EXE (relocations ; EXEC 4B00h, 4B01h et 4B03h ; fin avec
+  retour au programme parent par la pile sauvee dans son PSP, comme
+  MS-DOS), les fichiers par une table de fichiers systeme (fichiers du
+  noyau : FAT, NTFS, CD-ROM), la recherche des fichiers (noms courts
+  8.3) et un repertoire courant par lecteur. L'ecran texte de la machine
+  (B800h, 80 x 25) est recopie dans la console par la tache 0, qui y
+  envoie aussi les touches (codes du BIOS et codes de balayage). }
+
+Const
+  { cadre des registres du moniteur (apres PUSHAD) }
+  fEdi = 0; fEsi = 4; fEbp = 8; fEbx = 16; fEdx = 20; fEcx = 24;
+  fEax = 28; fEip = 32; fCs = 36; fFl = 40; fEsp = 44; fSs = 48;
+  fEs = 52; fDs = 56; fFs = 60; fGs = 64;
+  VmBios = $F000;
+  VmStubO = $0100;          { F000:0100h + n : HLT de l'interruption n }
+  VmExitO = $0200;          { fin du programme principal }
+  VmCpmO = $0201;           { CALL 5 (CP/M) }
+  VmMRetO = $0202;          { retour du gestionnaire de la souris }
+  VmCfgO = $0210;           { configuration (INT 15h C0h) }
+  VmFuncO = $0220;          { fonctions video (INT 10h 1Bh) }
+  VmEgaO = $0240;           { palette EGA par defaut }
+  VmFontO = $1000;          { police 8x16 }
+  VmDosSeg = $0060;         { donnees du DOS en 0600h }
+  VmLolO = $0010;           { liste des listes (INT 21h 52h) }
+  VmDbcsO = $0080;          { table DBCS vide }
+  VmUpO = $0090;            { majuscules (128 caracteres) }
+  VmFirstMcb = $0080;
+  VmRootPsp = $0081;        { PSP racine (interpreteur fictif) }
+  VmRootEnv = $0092;
+  VmMaxSft = 64;
+  VmKqMax = 64;
+  VmMaxFind = 16;
+
+Var
+  VmRam, VmRamBlk : LongInt;    { 1 Mo de la machine (aligne a 4 Ko) }
+  VmPd, VmPt, VmPgBlk : LongInt; { repertoire et table de pages }
+  VmF : LongInt;                { cadre des registres en cours }
+  VmVec, VmErrCode : LongInt;   { vecteur et code d'erreur de la faute }
+  VmKEsp, VmE0P : LongInt;      { pile du noyau a l'entree, ESP0 }
+  VmEnterS, VmLeaveS : LongInt; { souches d'entree et de sortie }
+  VmStubsOk : Boolean;
+  VmImg : Array[0..16] Of LongInt; { registres initiaux (cadre) }
+  VmIF : Boolean;               { IF virtuel }
+  VmFlHi : LongInt;             { bits 12-14 (IOPL, NT) virtuels }
+  VmNoIret : Boolean;           { le service a change le flot }
+  VmExitCode, VmRetCode : LongInt;
+  VmProg, VmArgs : String;
+  VmCurPsp, VmDta, VmTopPsp : LongInt;
+  VmDrive : LongInt;
+  VmDir : Array[0..25] Of String[66];
+  VmStrat, VmBreak, VmVerify : LongInt;
+  VmLastErr : LongInt;
+  VmPendScan : LongInt;         { 2e octet d'une touche etendue (AH=07h) }
+  { horloge et controleur d'interruptions virtuels }
+  VmLastMs, VmPitAcc, VmPitDiv, VmTickDue : LongInt;
+  VmPicMask, VmIsr : LongInt;
+  VmPitMode, VmPitLatch, VmPitLo : LongInt;
+  VmIdleN : LongInt;
+  { clavier : file remplie par la tache 0 (bits 0-15 code BIOS, 16-23
+    code de balayage, 24 prefixe E0h, 25 code BIOS present) }
+  VmKq : Array[0..VmKqMax - 1] Of LongInt;
+  VmKqHead, VmKqTail : LongInt;
+  VmCurKey, VmPort60, VmPort61 : LongInt;
+  { ecran }
+  VmBlink : Boolean;
+  VmCrtIdx, VmDacIdx, VmDacRd, VmDacK, VmAttrFF, VmRetr : LongInt;
+  VmDac : Array[0..767] Of Byte;
+  VmGfx : Boolean;
+  { fichiers : table des fichiers systeme }
+  SftH, SftRef, SftDev, SftMode : Array[0..VmMaxSft - 1] Of LongInt;
+  VmFindH, VmFindSeq : Array[0..VmMaxFind - 1] Of LongInt;
+  VmFindNext, VmFindCnt : LongInt;
+  VmTmp : LongInt;              { tampon du noyau (1 Ko) }
+  VmLine : String;              { reste d'une ligne lue sur CON }
+  VmLineOk : Boolean;
+  { souris (INT 33h) }
+  VmMouOn : Boolean;
+  VmMouX, VmMouY, VmMouBtn, VmMouShow : LongInt;
+  VmMouMask, VmMouSeg, VmMouOfs, VmMouEv, VmMouBusy : LongInt;
+  VmMouSave : Array[0..16] Of LongInt;
+  VmMouMinX, VmMouMaxX, VmMouMinY, VmMouMaxY : LongInt;
+  VmMouPress, VmMouRel : Array[0..2] Of LongInt;
+  VmMouPX, VmMouPY, VmMouRX, VmMouRY : Array[0..2] Of LongInt;
+  VmMouMkX, VmMouMkY : LongInt;
+  VmMouCell : LongInt;          { cellule du pointeur affiche (-1) }
+  VmTrace : Boolean;            { journal des appels (variable DOSTRACE) }
+
+{ ------------------------------------------------------------------ }
+{ Registres et memoire de la machine                                 }
+{ ------------------------------------------------------------------ }
+
+Function VR(Ofs : LongInt) : LongInt;
+Begin
+  VR := MemL[0:VmF + Ofs] And $FFFF;
+End;
+
+Procedure VS(Ofs, V : LongInt);
+Begin
+  MemL[0:VmF + Ofs] := (MemL[0:VmF + Ofs] And LongInt($FFFF0000)) Or
+                       (V And $FFFF);
+End;
+
+Function VRL(Ofs : LongInt) : LongInt;
+Begin
+  VRL := MemL[0:VmF + Ofs] And $FF;
+End;
+
+Function VRH(Ofs : LongInt) : LongInt;
+Begin
+  VRH := (MemL[0:VmF + Ofs] Shr 8) And $FF;
+End;
+
+Procedure VSL(Ofs, V : LongInt);
+Begin
+  Mem[0:VmF + Ofs] := V And $FF;
+End;
+
+Procedure VSH(Ofs, V : LongInt);
+Begin
+  Mem[0:VmF + Ofs + 1] := V And $FF;
+End;
+
+Procedure VSeg(Ofs, V : LongInt);
+Begin
+  MemL[0:VmF + Ofs] := V And $FFFF;
+End;
+
+{ adresse lineaire (noyau) de Seg:Ofs dans la machine }
+Function VmLin(Seg, Ofs : LongInt) : LongInt;
+Begin
+  VmLin := VmRam + ((((Seg And $FFFF) Shl 4) + (Ofs And $FFFF)) And
+                    $FFFFF);
+End;
+
+Function VmPtr(SegR, OfsR : LongInt) : LongInt;
+Begin
+  VmPtr := VmLin(VR(SegR), VR(OfsR));
+End;
+
+Function VmGetW(Seg, Ofs : LongInt) : LongInt;
+Begin
+  VmGetW := Mem[0:VmLin(Seg, Ofs)] Or (Mem[0:VmLin(Seg, Ofs + 1)] Shl 8);
+End;
+
+Procedure VmPutW(Seg, Ofs, V : LongInt);
+Begin
+  Mem[0:VmLin(Seg, Ofs)] := V And $FF;
+  Mem[0:VmLin(Seg, Ofs + 1)] := (V Shr 8) And $FF;
+End;
+
+Function VmBda(Ofs : LongInt) : LongInt;
+Begin
+  VmBda := VmRam + $400 + Ofs;
+End;
+
+Procedure VmSetCF(B : Boolean);
+Begin
+  If B Then MemL[0:VmF + fFl] := MemL[0:VmF + fFl] Or 1
+  Else MemL[0:VmF + fFl] := MemL[0:VmF + fFl] And Not 1;
+End;
+
+Procedure VmSetZF(B : Boolean);
+Begin
+  If B Then MemL[0:VmF + fFl] := MemL[0:VmF + fFl] Or $40
+  Else MemL[0:VmF + fFl] := MemL[0:VmF + fFl] And Not $40;
+End;
+
+Procedure VmPush(V : LongInt);
+Var Sp : LongInt;
+Begin
+  Sp := (VR(fEsp) - 2) And $FFFF;
+  VS(fEsp, Sp);
+  VmPutW(VR(fSs), Sp, V);
+End;
+
+Function VmPop : LongInt;
+Var Sp : LongInt;
+Begin
+  Sp := VR(fEsp);
+  VmPop := VmGetW(VR(fSs), Sp);
+  VS(fEsp, Sp + 2);
+End;
+
+Procedure VmGoto(Seg, Ofs : LongInt);
+Begin
+  VSeg(fCs, Seg);
+  MemL[0:VmF + fEip] := Ofs And $FFFF;
+End;
+
+{ FLAGS vus par la machine (IF virtuel) }
+Function VmVFlags : LongInt;
+Begin
+  VmVFlags := (MemL[0:VmF + fFl] And $0DD5) Or 2 Or (Ord(VmIF) * $200) Or
+              VmFlHi;
+End;
+
+{ Charger FLAGS depuis la machine (POPF, IRET) }
+Procedure VmLoadFlags(V : LongInt);
+Begin
+  VmIF := (V And $200) <> 0;
+  VmFlHi := V And $7000;
+  MemL[0:VmF + fFl] := (MemL[0:VmF + fFl] And LongInt($FFFFF000)) Or
+                       (V And $0DD5) Or $202;
+End;
+
+Function VmRegStr : String;
+Begin
+  VmRegStr := 'AX=' + HexStr(VR(fEax), 4) + ' BX=' + HexStr(VR(fEbx), 4) +
+    ' CX=' + HexStr(VR(fEcx), 4) + ' DX=' + HexStr(VR(fEdx), 4) +
+    ' SI=' + HexStr(VR(fEsi), 4) + ' DI=' + HexStr(VR(fEdi), 4) +
+    ' BP=' + HexStr(VR(fEbp), 4) + ' DS=' + HexStr(VR(fDs), 4) +
+    ' ES=' + HexStr(VR(fEs), 4) + ' SS:SP=' + HexStr(VR(fSs), 4) + ':' +
+    HexStr(VR(fEsp), 4) + ' PSP=' + HexStr(VmCurPsp, 4);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pagination et souches d'entree / de sortie / de faute               }
+{ ------------------------------------------------------------------ }
+
+Procedure SetCr3(V : LongInt);
+Begin
+  asm
+    mov eax,V
+    mov cr3,eax
+  end;
+End;
+
+Function GetCr3 : LongInt;
+Var V : LongInt;
+Begin
+  asm
+    mov eax,cr3
+    mov V,eax
+  end;
+  GetCr3 := V;
+End;
+
+Function GetCr2 : LongInt;
+Var V : LongInt;
+Begin
+  asm
+    mov eax,cr2
+    mov V,eax
+  end;
+  GetCr2 := V;
+End;
+
+{ Pagination en identite (pages de 4 Mo) ; False sans PSE }
+Function PagingInit : Boolean;
+Var A, I, D : LongInt;
+Begin
+  PagingInit := True;
+  If KPd <> 0 Then Exit;
+  PagingInit := False;
+  D := 0;
+  asm
+    push ebx
+    mov eax,1
+    db 0Fh,0A2h
+    mov D,edx
+    pop ebx
+  end;
+  If (D And 8) = 0 Then
+  Begin
+    KLog('DOS : processeur sans pages de 4 Mo (PSE)');
+    Exit;
+  End;
+  I := HeapOwner; HeapOwner := 0;
+  A := KAlloc(8192);
+  HeapOwner := I;
+  If A = 0 Then Exit;
+  A := (A + 4095) And Not 4095;
+  For I := 0 To 1023 Do MemL[0:A + I * 4] := (I Shl 22) Or $87;
+  For I := 0 To MaxThread - 1 Do ThrCr3[I] := A;
+  asm
+    mov eax,cr4
+    or eax,10h
+    mov cr4,eax
+    mov eax,A
+    mov cr3,eax
+    mov eax,cr0
+    or eax,80000000h
+    mov cr0,eax
+    jmp @pg
+  @pg:
+  end;
+  KPd := A;
+  PagingInit := True;
+  KLog('DOS : pagination active (repertoire ' + HexStr(A, 8) + ')');
+End;
+
+Procedure V86Trap(F : LongInt); Forward;
+
+Procedure VmJmp(Var A : LongInt; Target : LongInt);
+Begin
+  PutB(A, $E9);
+  PutD(A, Target - (A + 4));
+End;
+
+{ Souches de faute : un evenement du mode V86 va au moniteur, les
+  autres au gestionnaire d'origine }
+Procedure VmBuildStubs;
+Const Vecs : Array[0..7] Of LongInt = (0, 1, 3, 4, 5, 6, 13, 14);
+Var A, Base, Common, ExitL, I, V, Orig : LongInt;
+Begin
+  If VmStubsOk Then Exit;
+  I := HeapOwner; HeapOwner := 0;
+  Base := KAlloc(1024);
+  HeapOwner := I;
+  { partie commune : PUSHAD, segments du noyau, CR3 du noyau }
+  A := Base;
+  Common := A;
+  PutB(A, $60);
+  PutB(A, $66); PutB(A, $B8); PutB(A, $10); PutB(A, 0);
+  PutB(A, $8E); PutB(A, $D8); PutB(A, $8E); PutB(A, $C0);
+  PutB(A, $8E); PutB(A, $E8);
+  PutB(A, $66); PutB(A, $B8); PutB(A, $18); PutB(A, 0);
+  PutB(A, $8E); PutB(A, $E0);
+  PutB(A, $0F); PutB(A, $20); PutB(A, $D8);         { mov eax,cr3 }
+  PutB(A, $50);
+  PutB(A, $A1); PutD(A, LongInt(@KPd));             { mov eax,[KPd] }
+  PutB(A, $0F); PutB(A, $22); PutB(A, $D8);         { mov cr3,eax }
+  PutB(A, $FC);
+  PutB(A, $89); PutB(A, $E0);                       { mov eax,esp }
+  PutB(A, $83); PutB(A, $C0); PutB(A, 4);           { add eax,4 }
+  PutB(A, $50);
+  PutB(A, $B8); PutD(A, LongInt(@V86Trap));
+  PutB(A, $FF); PutB(A, $D0);                       { call eax }
+  PutB(A, $83); PutB(A, $C4); PutB(A, 4);           { add esp,4 }
+  ExitL := A;
+  PutB(A, $58);                                     { pop eax }
+  PutB(A, $0F); PutB(A, $22); PutB(A, $D8);         { mov cr3,eax }
+  PutB(A, $61); PutB(A, $CF);                       { popad ; iretd }
+  { entree : EAX = VmImg (17 registres du cadre) }
+  VmEnterS := A;
+  PutB(A, $55); PutB(A, $53); PutB(A, $56); PutB(A, $57);
+  PutB(A, $89); PutB(A, $25); PutD(A, LongInt(@VmKEsp));
+  PutB(A, $89); PutB(A, $25); PutD(A, TssBase + 4);
+  PutB(A, $8B); PutB(A, $15); PutD(A, LongInt(@VmE0P));
+  PutB(A, $89); PutB(A, $22);                       { mov [edx],esp }
+  PutB(A, $B9); PutD(A, 17);
+  PutB(A, $8D); PutB(A, $70); PutB(A, 64);          { lea esi,[eax+64] }
+  PutB(A, $FF); PutB(A, $36);                       { push [esi] }
+  PutB(A, $83); PutB(A, $EE); PutB(A, 4);           { sub esi,4 }
+  PutB(A, $E2); PutB(A, $F9);                       { loop }
+  PutB(A, $FF); PutB(A, $35); PutD(A, LongInt(@VmPd));
+  VmJmp(A, ExitL);
+  { sortie : retour de l'appel d'entree }
+  VmLeaveS := A;
+  PutB(A, $FA);
+  PutB(A, $8B); PutB(A, $25); PutD(A, LongInt(@VmKEsp));
+  PutB(A, $5F); PutB(A, $5E); PutB(A, $5B); PutB(A, $5D);
+  PutB(A, $C3);
+  { une souche par vecteur }
+  A := Base + 256;
+  For I := 0 To 7 Do
+  Begin
+    V := Vecs[I];
+    Orig := (LongInt(Idt[V].OfsHi) Shl 16) Or Idt[V].OfsLo;
+    SetGate(V, A);
+    PutB(A, $F6); PutB(A, $44); PutB(A, $24);
+    If (V = 13) Or (V = 14) Then PutB(A, 14) Else PutB(A, 10);
+    PutB(A, 2);                                     { test [esp+n],2 }
+    PutB(A, $75); PutB(A, 5);                       { jnz +5 }
+    VmJmp(A, Orig);
+    If (V = 13) Or (V = 14) Then
+    Begin
+      PutB(A, $36); PutB(A, $8F); PutB(A, $05);     { pop ss:[VmErrCode] }
+      PutD(A, LongInt(@VmErrCode));
+    End;
+    PutB(A, $36); PutB(A, $C7); PutB(A, $05);       { mov ss:[VmVec],V }
+    PutD(A, LongInt(@VmVec)); PutD(A, V);
+    VmJmp(A, Common);
+    A := (A + 15) And Not 15;
+  End;
+  VmStubsOk := True;
+End;
+
+{ Executer la machine jusqu'a sa fin (VmQuit) }
+Procedure VmRun;
+Var A, S : LongInt;
+Begin
+  VmE0P := LongInt(@ThrEsp0[CurT]);
+  A := LongInt(@VmImg);
+  S := VmEnterS;
+  asm
+    mov eax,A
+    mov ecx,S
+    call ecx
+    sti
+  end;
+End;
+
+Procedure VmQuit(Code : LongInt);
+Var S : LongInt;
+Begin
+  VmExitCode := Code;
+  S := VmLeaveS;
+  asm
+    mov eax,S
+    jmp eax
+  end;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ecran texte de la machine                                          }
+{ ------------------------------------------------------------------ }
+
+Function VmPage : LongInt;
+Begin
+  VmPage := Mem[0:VmBda($62)] And 7;
+End;
+
+Function VmScrA(Pg : LongInt) : LongInt;
+Begin
+  If Mem[0:VmBda($49)] = 7 Then VmScrA := VmRam + $B0000
+  Else VmScrA := VmRam + $B8000 + Pg * $1000;
+End;
+
+Procedure VmGetCur(Pg : LongInt; Var X, Y : LongInt);
+Begin
+  X := Mem[0:VmBda($50 + Pg * 2)];
+  Y := Mem[0:VmBda($51 + Pg * 2)];
+End;
+
+Procedure VmSetCur(Pg, X, Y : LongInt);
+Begin
+  Mem[0:VmBda($50 + Pg * 2)] := X;
+  Mem[0:VmBda($51 + Pg * 2)] := Y;
+End;
+
+{ Defiler la fenetre (R1,C1)-(R2,C2) de N lignes (0 : effacer) }
+Procedure VmScroll(Pg, N, Attr, R1, C1, R2, C2 : LongInt; Up : Boolean);
+Var A, R, C, H, Src : LongInt;
+Begin
+  If R2 > 24 Then R2 := 24;
+  If C2 > 79 Then C2 := 79;
+  If (R1 > R2) Or (C1 > C2) Then Exit;
+  A := VmScrA(Pg);
+  H := R2 - R1 + 1;
+  If (N = 0) Or (N > H) Then N := H;
+  For R := 0 To H - 1 Do
+  Begin
+    If Up Then
+    Begin
+      Src := R1 + R + N;
+      For C := C1 To C2 Do
+        If Src <= R2 Then
+          MemW[0:A + ((R1 + R) * 80 + C) * 2] :=
+            MemW[0:A + (Src * 80 + C) * 2]
+        Else MemW[0:A + ((R1 + R) * 80 + C) * 2] := (Attr Shl 8) Or 32;
+    End
+    Else
+    Begin
+      Src := R2 - R - N;
+      For C := C1 To C2 Do
+        If Src >= R1 Then
+          MemW[0:A + ((R2 - R) * 80 + C) * 2] :=
+            MemW[0:A + (Src * 80 + C) * 2]
+        Else MemW[0:A + ((R2 - R) * 80 + C) * 2] := (Attr Shl 8) Or 32;
+    End;
+  End;
+End;
+
+{ Ecriture teletype (INT 10h 0Eh) sur la page active }
+Procedure VmTty(Ch : LongInt);
+Var Pg, X, Y, A : LongInt;
+Begin
+  Pg := VmPage;
+  VmGetCur(Pg, X, Y);
+  A := VmScrA(Pg);
+  Case Ch And 255 Of
+    7 : ;
+    8 : If X > 0 Then Dec(X);
+    10 : Inc(Y);
+    13 : X := 0;
+  Else
+    Mem[0:A + (Y * 80 + X) * 2] := Ch;
+    Inc(X);
+    If X >= 80 Then
+    Begin
+      X := 0;
+      Inc(Y);
+    End;
+  End;
+  If Y >= 25 Then
+  Begin
+    VmScroll(Pg, 1, Mem[0:A + (24 * 80 + X) * 2 + 1], 0, 0, 24, 79, True);
+    Y := 24;
+  End;
+  VmSetCur(Pg, X, Y);
+End;
+
+{ Sortie de caractere du DOS (tabulations) }
+Procedure VmConOut(Ch : LongInt);
+Var X, Y : LongInt;
+Begin
+  If (Ch And 255) = 9 Then
+  Begin
+    Repeat
+      VmTty(32);
+      VmGetCur(VmPage, X, Y);
+    Until (X Mod 8) = 0;
+  End
+  Else VmTty(Ch);
+End;
+
+Procedure VmConStr(Const S : String);
+Var I : LongInt;
+Begin
+  For I := 1 To Length(S) Do VmConOut(Ord(S[I]));
+End;
+
+Procedure VmClearScr;
+Var I, A : LongInt;
+Begin
+  A := VmRam + $B8000;
+  For I := 0 To 8 * 2048 - 1 Do MemW[0:A + I * 2] := $0720;
+  For I := 0 To 7 Do VmSetCur(I, 0, 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Interruptions de la machine                                        }
+{ ------------------------------------------------------------------ }
+
+Procedure VmService(N : LongInt); Forward;
+
+Function VmVecDefault(N : LongInt) : Boolean;
+Begin
+  VmVecDefault := MemL[0:VmRam + N * 4] = (LongInt(VmBios) Shl 16) +
+                  VmStubO + N;
+End;
+
+{ INT N : FLAGS, CS et IP empiles, IF et TF effaces, puis le vecteur ;
+  un vecteur du BIOS ou du DOS de Pasdows est servi aussitot }
+Procedure VmInt(N : LongInt);
+Var V : LongInt;
+Begin
+  If VmTrace And Not (N In [8, 9, $16, $21, $28, $33]) Then
+    KLog('INT ' + HexStr(N, 2) + 'h AX=' + HexStr(VR(fEax), 4) + ' de ' +
+         HexStr(VR(fCs), 4) + ':' + HexStr(VR(fEip), 4));
+  VmPush(VmVFlags);
+  VmPush(VR(fCs));
+  VmPush(VR(fEip));
+  VmIF := False;
+  MemL[0:VmF + fFl] := MemL[0:VmF + fFl] And Not $100;
+  V := MemL[0:VmRam + N * 4];
+  VmGoto(V Shr 16, V And $FFFF);
+  If V = (LongInt(VmBios) Shl 16) + VmStubO + N Then VmService(N);
+End;
+
+{ Retour d'un service (IRET) : CF, ZF... du resultat, IF de l'appelant }
+Procedure VmIretRet;
+Var Ip, Cs, Fl, Cur : LongInt;
+Begin
+  Ip := VmPop; Cs := VmPop; Fl := VmPop;
+  Cur := MemL[0:VmF + fFl];
+  VmGoto(Cs, Ip);
+  VmIF := (Fl And $200) <> 0;
+  MemL[0:VmF + fFl] := (Cur And LongInt($FFFFF000) And Not $500) Or
+                       (Cur And $8D5) Or (Fl And $500) Or $202;
+End;
+
+{ Temps ecoule : tops d'horloge (INT 08h) a delivrer }
+Procedure VmTimeUpd;
+Var Ms : LongInt;
+Begin
+  Ms := Ticks - VmLastMs;
+  If Ms <= 0 Then Exit;
+  VmLastMs := Ticks;
+  If Ms > 1000 Then Ms := 1000;
+  VmPitAcc := VmPitAcc + Ms * 1193;
+  While VmPitAcc >= VmPitDiv Do
+  Begin
+    VmPitAcc := VmPitAcc - VmPitDiv;
+    If VmTickDue < 8 Then Inc(VmTickDue);
+  End;
+End;
+
+Function VmIrqPending : Boolean;
+Begin
+  VmTimeUpd;
+  VmIrqPending := ((VmTickDue > 0) And ((VmPicMask And 1) = 0) And
+                   ((VmIsr And 1) = 0)) Or
+                  ((VmKqHead <> VmKqTail) And ((VmPicMask And 2) = 0) And
+                   ((VmIsr And 3) = 0));
+End;
+
+{ Delivrer une interruption materielle virtuelle si IF le permet }
+Procedure VmCheckIrq;
+Begin
+  If Not VmIF Then Exit;
+  VmTimeUpd;
+  If (VmTickDue > 0) And ((VmPicMask And 1) = 0) And
+     ((VmIsr And 1) = 0) Then
+  Begin
+    Dec(VmTickDue);
+    VmIsr := VmIsr Or 1;
+    VmInt(8);
+    Exit;
+  End;
+  If (VmKqHead <> VmKqTail) And ((VmPicMask And 2) = 0) And
+     ((VmIsr And 3) = 0) Then
+  Begin
+    VmCurKey := VmKq[VmKqHead];
+    VmKqHead := (VmKqHead + 1) Mod VmKqMax;
+    VmPort60 := (VmCurKey Shr 16) And $FF;
+    VmIsr := VmIsr Or 2;
+    VmInt(9);
+  End;
+End;
+
+{ Interruption d'horloge du noyau pendant le code 16 bits (cadre B) }
+Procedure VmTick(B : LongInt);
+Begin
+  VmF := B;
+  VmCheckIrq;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Clavier                                                            }
+{ ------------------------------------------------------------------ }
+
+Function VmBufHas : Boolean;
+Begin
+  VmBufHas := MemW[0:VmBda($1A)] <> MemW[0:VmBda($1C)];
+End;
+
+Function VmBufPeek : LongInt;
+Begin
+  VmBufPeek := MemW[0:VmRam + $400 + MemW[0:VmBda($1A)]];
+End;
+
+Function VmBufPop : LongInt;
+Var H : LongInt;
+Begin
+  H := MemW[0:VmBda($1A)];
+  VmBufPop := MemW[0:VmRam + $400 + H];
+  H := H + 2;
+  If H >= MemW[0:VmBda($82)] Then H := MemW[0:VmBda($80)];
+  MemW[0:VmBda($1A)] := H;
+End;
+
+Function VmBufPush(K : LongInt) : Boolean;
+Var T, N : LongInt;
+Begin
+  T := MemW[0:VmBda($1C)];
+  N := T + 2;
+  If N >= MemW[0:VmBda($82)] Then N := MemW[0:VmBda($80)];
+  VmBufPush := N <> MemW[0:VmBda($1A)];
+  If N = MemW[0:VmBda($1A)] Then Exit;
+  MemW[0:VmRam + $400 + T] := K;
+  MemW[0:VmBda($1C)] := N;
+End;
+
+{ Etat des touches de controle (0417h, 0418h) }
+Procedure VmShiftUpd;
+Var B, C : LongInt;
+Begin
+  B := 0; C := 0;
+  If (KeyState[$10] And $80) <> 0 Then B := B Or 2;
+  If (KeyState[$11] And $80) <> 0 Then
+  Begin
+    B := B Or 4; C := C Or 1;
+  End;
+  If (KeyState[$12] And $80) <> 0 Then
+  Begin
+    B := B Or 8; C := C Or 2;
+  End;
+  If (KeyState[$91] And 1) <> 0 Then B := B Or $10;
+  If (KeyState[$90] And 1) <> 0 Then B := B Or $20;
+  If (KeyState[$14] And 1) <> 0 Then B := B Or $40;
+  If (KeyState[$2D] And 1) <> 0 Then B := B Or $80;
+  Mem[0:VmBda($17)] := B;
+  Mem[0:VmBda($18)] := C;
+End;
+
+{ Code du BIOS (balayage * 256 + ASCII) d'une touche ; 0 : aucun }
+Function VmBiosKey(Sc : LongInt; Ext : Boolean; VK, Ch : LongInt)
+  : LongInt;
+Const
+  AltNav : Array[$47..$53] Of Byte = ($97, $98, $99, 0, $9B, 0, $9D, 0,
+    $9F, $A0, $A1, $A2, $A3);
+  CtlNav : Array[$47..$53] Of Byte = ($77, $8D, $84, 0, $73, 0, $74, 0,
+    $75, $91, $76, $92, $93);
+  PadCh : String[13] = '789-456+1230.';
+Var Sh, Ct, Al, Num : Boolean; A : LongInt;
+Begin
+  VmBiosKey := 0;
+  Sh := (KeyState[$10] And $80) <> 0;
+  Ct := (KeyState[$11] And $80) <> 0;
+  Al := (KeyState[$12] And $80) <> 0;
+  Num := (KeyState[$90] And 1) <> 0;
+  Case Sc Of
+    $1D, $2A, $36, $38, $3A, $45, $46, 0 : Exit;
+  End;
+  If Ext And (Sc = $1C) Then
+  Begin
+    If Ct Then VmBiosKey := $E00A Else VmBiosKey := $E00D;
+    Exit;
+  End;
+  If Ext And (Sc = $35) Then
+  Begin
+    VmBiosKey := $E02F;
+    Exit;
+  End;
+  If (Sc >= $3B) And (Sc <= $44) Then
+  Begin
+    If Al Then A := Sc + $2D Else If Ct Then A := Sc + $23
+    Else If Sh Then A := Sc + $19 Else A := Sc;
+    VmBiosKey := A Shl 8;
+    Exit;
+  End;
+  If (Sc = $57) Or (Sc = $58) Then
+  Begin
+    A := Sc + $2E;
+    If Al Then A := A + 6 Else If Ct Then A := A + 4
+    Else If Sh Then A := A + 2;
+    VmBiosKey := A Shl 8;
+    Exit;
+  End;
+  If (Sc >= $47) And (Sc <= $53) Then
+  Begin
+    If (Sc = $4A) Or (Sc = $4E) Then
+    Begin
+      VmBiosKey := (Sc Shl 8) Or Ord(PadCh[Sc - $46]);
+      Exit;
+    End;
+    If Al Then
+    Begin
+      If AltNav[Sc] <> 0 Then VmBiosKey := AltNav[Sc] Shl 8;
+      Exit;
+    End;
+    If Ct Then
+    Begin
+      If CtlNav[Sc] <> 0 Then VmBiosKey := CtlNav[Sc] Shl 8;
+      Exit;
+    End;
+    If Not Ext And (Num <> Sh) Then
+      VmBiosKey := (Sc Shl 8) Or Ord(PadCh[Sc - $46])
+    Else If Ext Then VmBiosKey := (Sc Shl 8) Or $E0
+    Else VmBiosKey := Sc Shl 8;
+    Exit;
+  End;
+  If Al Then
+  Begin
+    Case Sc Of
+      $02..$0D : A := Sc + $76;
+      $0F : A := $A5;
+    Else
+      A := Sc;
+    End;
+    If Sc = $39 Then VmBiosKey := $3920 Else VmBiosKey := A Shl 8;
+    Exit;
+  End;
+  If Ct Then
+  Begin
+    Case Sc Of
+      $01 : A := $011B; $03 : A := $0300; $07 : A := $071E;
+      $0C : A := $0C1F; $0E : A := $0E7F; $0F : A := $9400;
+      $1A : A := $1A1B; $1B : A := $1B1D; $1C : A := $1C0A;
+      $2B : A := $2B1C; $39 : A := $3920; $37 : A := $9600;
+    Else
+      If (VK >= $41) And (VK <= $5A) Then A := (Sc Shl 8) Or (VK - $40)
+      Else A := 0;
+    End;
+    VmBiosKey := A;
+    Exit;
+  End;
+  Case Sc Of
+    $01 : A := $011B;
+    $0E : A := $0E08;
+    $0F : If Sh Then A := $0F00 Else A := $0F09;
+    $1C : A := $1C0D;
+    $39 : A := $3920;
+  Else
+    If Ch = 0 Then A := 0 Else A := (Sc Shl 8) Or (Ch And 255);
+  End;
+  VmBiosKey := A;
+End;
+
+{ Touche frappee dans la console (tache 0) }
+Procedure DosKeyIn(Up : Boolean; VK, Ch : LongInt);
+Var K, N, Sc : LongInt;
+Begin
+  If Not VmOn Then Exit;
+  VmShiftUpd;
+  Sc := KeyScan And $7F;
+  K := (Sc Or (Ord(Up) * $80)) Shl 16;
+  If KeyExt Then K := K Or $1000000;
+  If Not Up Then
+  Begin
+    N := VmBiosKey(Sc, KeyExt, VK, Ch);
+    If N <> 0 Then K := K Or $2000000 Or (N And $FFFF);
+  End;
+  N := (VmKqTail + 1) Mod VmKqMax;
+  If N <> VmKqHead Then
+  Begin
+    VmKq[VmKqTail] := K;
+    VmKqTail := N;
+  End;
+End;
+
+{ Tops et touches servis par le noyau (attente dans un service, sans
+  passer par les gestionnaires de la machine) }
+Procedure VmPumpNative;
+Var K, T : LongInt;
+Begin
+  VmTimeUpd;
+  While VmTickDue > 0 Do
+  Begin
+    Dec(VmTickDue);
+    T := MemL[0:VmBda($6C)] + 1;
+    If T >= $1800B0 Then
+    Begin
+      T := 0;
+      Mem[0:VmBda($70)] := 1;
+    End;
+    MemL[0:VmBda($6C)] := T;
+  End;
+  While VmKqHead <> VmKqTail Do
+  Begin
+    K := VmKq[VmKqHead];
+    VmKqHead := (VmKqHead + 1) Mod VmKqMax;
+    If (K And $2000000) <> 0 Then VmBufPush(K And $FFFF);
+  End;
+End;
+
+{ Le service courant reprendra apres une interruption detournee : rend
+  True si une interruption a ete delivree (le HLT du service sera
+  reexecute a son retour) }
+Function VmIrqRestart : Boolean;
+Var Hook : Boolean;
+Begin
+  VmIrqRestart := False;
+  VmTimeUpd;
+  Hook := ((VmTickDue > 0) And Not (VmVecDefault(8) And
+           VmVecDefault($1C))) Or
+          ((VmKqHead <> VmKqTail) And Not VmVecDefault(9));
+  If Not Hook Then Exit;
+  VmIF := True;
+  VmCheckIrq;
+  VmNoIret := True;
+  VmIrqRestart := True;
+End;
+
+{ Attendre une touche (services du DOS) : code du BIOS }
+Function VmWaitKey : LongInt;
+Begin
+  Repeat
+    If VmBufHas Then
+    Begin
+      VmWaitKey := VmBufPop;
+      Exit;
+    End;
+    VmPumpNative;
+    If Not VmBufHas Then KSleep(2);
+  Until False;
+End;
+
+{ Programme inactif (INT 28h, INT 2Fh 1680h, scrutation du clavier) }
+Procedure VmIdle;
+Begin
+  Inc(VmIdleN);
+  If VmIdleN >= 4 Then
+  Begin
+    VmIdleN := 0;
+    KSleep(1);
+  End;
+End;
+
+Procedure VmInt09;
+Var K : LongInt;
+Begin
+  K := VmCurKey;
+  VmCurKey := 0;
+  If (K And $2000000) <> 0 Then
+  Begin
+    VmBufPush(K And $FFFF);
+    VmIdleN := 0;
+  End;
+  VmIsr := VmIsr And Not 2;
+End;
+
+Procedure VmInt08;
+Var T : LongInt;
+Begin
+  T := MemL[0:VmBda($6C)] + 1;
+  If T >= $1800B0 Then
+  Begin
+    T := 0;
+    Mem[0:VmBda($70)] := 1;
+  End;
+  MemL[0:VmBda($6C)] := T;
+  VmIsr := VmIsr And Not 1;
+  { INT 1Ch detourne : il recoit le cadre d'interruption (son IRET
+    revient au code interrompu) }
+  If Not VmVecDefault($1C) Then
+  Begin
+    T := MemL[0:VmRam + $1C * 4];
+    VmGoto(T Shr 16, T And $FFFF);
+    VmNoIret := True;
+  End;
+End;
+
+Procedure VmInt16;
+Var AH, K : LongInt;
+Begin
+  AH := VRH(fEax);
+  VmShiftUpd;
+  Case AH Of
+    $00, $10 :
+    Begin
+      Repeat
+        If VmBufHas Then
+        Begin
+          K := VmBufPop;
+          If (AH = 0) And ((K And $FF) = $E0) And (K > $FF) Then
+            K := K And $FF00;
+          VS(fEax, K);
+          VmIdleN := 0;
+          Exit;
+        End;
+        If VmIrqRestart Then Exit;
+        VmPumpNative;
+        If Not VmBufHas Then KSleep(2);
+      Until False;
+    End;
+    $01, $11 :
+    Begin
+      If Not VmBufHas Then
+      Begin
+        If VmIrqRestart Then Exit;
+        VmPumpNative;
+      End;
+      If VmBufHas Then
+      Begin
+        K := VmBufPeek;
+        If (AH = 1) And ((K And $FF) = $E0) And (K > $FF) Then
+          K := K And $FF00;
+        VS(fEax, K);
+        VmSetZF(False);
+      End
+      Else
+      Begin
+        VmSetZF(True);
+        VmIdle;
+      End;
+    End;
+    $02 : VSL(fEax, Mem[0:VmBda($17)]);
+    $12 :
+    Begin
+      VSL(fEax, Mem[0:VmBda($17)]);
+      VSH(fEax, Mem[0:VmBda($18)] And $73);
+    End;
+    $05 : VSL(fEax, Ord(Not VmBufPush(VR(fEcx))));
+    $09 : VSL(fEax, $20);
+    $0A : VS(fEbx, $41AB);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ BIOS : video (INT 10h)                                             }
+{ ------------------------------------------------------------------ }
+
+Procedure VmSetMode(M : LongInt);
+Var I : LongInt;
+Begin
+  Mem[0:VmBda($49)] := M And $7F;
+  VmGfx := Not ((M And $7F) In [0..3, 7]);
+  If (M And $7F) In [0, 1] Then MemW[0:VmBda($4A)] := 40
+  Else If (M And $7F) = $13 Then MemW[0:VmBda($4A)] := 40
+  Else MemW[0:VmBda($4A)] := 80;
+  MemW[0:VmBda($4C)] := $1000;
+  MemW[0:VmBda($4E)] := 0;
+  Mem[0:VmBda($62)] := 0;
+  MemW[0:VmBda($60)] := $0607;
+  Mem[0:VmBda($84)] := 24;
+  MemW[0:VmBda($85)] := 16;
+  If (M And $80) = 0 Then
+  Begin
+    If VmGfx Then FillMem(VmRam + $A0000, $10000, 0)
+    Else VmClearScr;
+  End;
+  For I := 0 To 7 Do VmSetCur(I, 0, 0);
+  VmBlink := True;
+End;
+
+Procedure VmWriteStr(Pg, Mode, Attr, N, X, Y, P : LongInt);
+Var I, C, A, Ox, Oy : LongInt;
+Begin
+  VmGetCur(Pg, Ox, Oy);
+  VmSetCur(Pg, X, Y);
+  A := Attr;
+  For I := 0 To N - 1 Do
+  Begin
+    If (Mode And 2) <> 0 Then
+    Begin
+      C := Mem[0:P + I * 2]; A := Mem[0:P + I * 2 + 1];
+    End
+    Else C := Mem[0:P + I];
+    If C In [7, 8, 10, 13] Then VmTty(C)
+    Else
+    Begin
+      VmGetCur(Pg, X, Y);
+      MemW[0:VmScrA(Pg) + (Y * 80 + X) * 2] := (A Shl 8) Or C;
+      VmTty(C);
+    End;
+  End;
+  If (Mode And 1) = 0 Then VmSetCur(Pg, Ox, Oy);
+End;
+
+Procedure VmInt10;
+Var AH, AL, Pg, X, Y, A, I, N, P : LongInt;
+Begin
+  AH := VRH(fEax); AL := VRL(fEax);
+  Case AH Of
+    $00 : VmSetMode(AL);
+    $01 : MemW[0:VmBda($60)] := VR(fEcx);
+    $02 : VmSetCur(VRH(fEbx) And 7, VRL(fEdx), VRH(fEdx));
+    $03 :
+    Begin
+      VmGetCur(VRH(fEbx) And 7, X, Y);
+      VS(fEdx, (Y Shl 8) Or X);
+      VS(fEcx, MemW[0:VmBda($60)]);
+      VS(fEax, 0);
+    End;
+    $05 :
+    Begin
+      Mem[0:VmBda($62)] := AL And 7;
+      MemW[0:VmBda($4E)] := (AL And 7) * $1000;
+    End;
+    $06, $07 :
+      VmScroll(VmPage, AL, VRH(fEbx), VRH(fEcx), VRL(fEcx), VRH(fEdx),
+               VRL(fEdx), AH = 6);
+    $08 :
+    Begin
+      Pg := VRH(fEbx) And 7;
+      VmGetCur(Pg, X, Y);
+      VS(fEax, MemW[0:VmScrA(Pg) + (Y * 80 + X) * 2]);
+    End;
+    $09, $0A :
+    Begin
+      Pg := VRH(fEbx) And 7;
+      VmGetCur(Pg, X, Y);
+      A := VmScrA(Pg) + (Y * 80 + X) * 2;
+      N := VR(fEcx);
+      If N > 2000 - (Y * 80 + X) Then N := 2000 - (Y * 80 + X);
+      For I := 0 To N - 1 Do
+      Begin
+        Mem[0:A + I * 2] := AL;
+        If AH = 9 Then Mem[0:A + I * 2 + 1] := VRL(fEbx);
+      End;
+    End;
+    $0E : VmTty(AL);
+    $0F :
+    Begin
+      VSL(fEax, Mem[0:VmBda($49)]);
+      VSH(fEax, MemW[0:VmBda($4A)]);
+      VSH(fEbx, VmPage);
+    End;
+    $10 :
+      Case AL Of
+        $03 : VmBlink := VRL(fEbx) <> 0;
+        $07 : VSH(fEbx, VRL(fEbx));
+        $08 : VSH(fEbx, 0);
+        $09 :
+        Begin
+          P := VmPtr(fEs, fEdx);
+          For I := 0 To 15 Do Mem[0:P + I] := Mem[0:VmLin(VmBios,
+                                                VmEgaO + I)];
+          Mem[0:P + 16] := 0;
+        End;
+        $10 :
+        Begin
+          I := VRL(fEbx) * 3;
+          VmDac[I] := VRH(fEdx); VmDac[I + 1] := VRH(fEcx);
+          VmDac[I + 2] := VRL(fEcx);
+        End;
+        $12, $17 :
+        Begin
+          P := VmPtr(fEs, fEdx);
+          For I := VR(fEbx) * 3 To Min(767, (VR(fEbx) + VR(fEcx)) * 3 - 1)
+          Do
+            If AL = $12 Then VmDac[I] := Mem[0:P + I - VR(fEbx) * 3]
+            Else Mem[0:P + I - VR(fEbx) * 3] := VmDac[I];
+        End;
+        $15 :
+        Begin
+          I := VRL(fEbx) * 3;
+          VSH(fEdx, VmDac[I]); VSH(fEcx, VmDac[I + 1]);
+          VSL(fEcx, VmDac[I + 2]);
+        End;
+        $1A : VS(fEbx, 0);
+      End;
+    $11 :
+      If AL = $30 Then
+      Begin
+        VSeg(fEs, VmBios);
+        VS(fEbp, VmFontO);
+        VS(fEcx, 16);
+        VSL(fEdx, 24);
+      End;
+    $12 :
+      Case VRL(fEbx) Of
+        $10 :
+        Begin
+          VS(fEbx, $0003);
+          VS(fEcx, $0009);
+        End;
+        $30..$36 : VSL(fEax, $12);
+      End;
+    $13 :
+      VmWriteStr(VRH(fEbx) And 7, AL, VRL(fEbx), VR(fEcx), VRL(fEdx),
+                 VRH(fEdx), VmPtr(fEs, fEbp));
+    $1A :
+      If AL = 0 Then
+      Begin
+        VSL(fEax, $1A);
+        VS(fEbx, $0008);
+      End
+      Else VSL(fEax, $1A);
+    $1B :
+    Begin
+      P := VmPtr(fEs, fEdi);
+      FillMem(P, 64, 0);
+      MemW[0:P] := VmFuncO; MemW[0:P + 2] := VmBios;
+      Mem[0:P + 4] := Mem[0:VmBda($49)];
+      MemW[0:P + 5] := MemW[0:VmBda($4A)];
+      MemW[0:P + 7] := MemW[0:VmBda($4C)];
+      MemW[0:P + 9] := MemW[0:VmBda($4E)];
+      MoveMem(VmBda($50), P + $0B, 16);
+      Mem[0:P + $1B] := Mem[0:VmBda($60)];
+      Mem[0:P + $1C] := Mem[0:VmBda($61)];
+      Mem[0:P + $1D] := VmPage;
+      MemW[0:P + $1E] := $3D4;
+      Mem[0:P + $22] := 25;
+      MemW[0:P + $23] := 16;
+      Mem[0:P + $25] := 8;
+      MemW[0:P + $27] := 16;
+      Mem[0:P + $29] := 8;
+      Mem[0:P + $2A] := 2;
+      Mem[0:P + $2D] := $20 * Ord(Not VmBlink);
+      Mem[0:P + $31] := 3;
+      VSL(fEax, $1B);
+    End;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ BIOS : horloge, systeme, disques, imprimante                       }
+{ ------------------------------------------------------------------ }
+
+Function Bcd(V : LongInt) : LongInt;
+Begin
+  Bcd := ((V Div 10) Shl 4) Or (V Mod 10);
+End;
+
+Procedure VmInt1A;
+Begin
+  VmSetCF(False);
+  Case VRH(fEax) Of
+    $00 :
+    Begin
+      VmPumpNative;
+      VS(fEcx, MemL[0:VmBda($6C)] Shr 16);
+      VS(fEdx, MemL[0:VmBda($6C)]);
+      VSL(fEax, Mem[0:VmBda($70)]);
+      Mem[0:VmBda($70)] := 0;
+    End;
+    $01 : MemL[0:VmBda($6C)] := (VR(fEcx) Shl 16) Or VR(fEdx);
+    $02 :
+    Begin
+      ReadRtc;
+      VS(fEcx, (Bcd(RtcHour) Shl 8) Or Bcd(RtcMin));
+      VS(fEdx, Bcd(RtcSec) Shl 8);
+    End;
+    $04 :
+    Begin
+      ReadRtc;
+      VS(fEcx, (Bcd(RtcYear Div 100) Shl 8) Or Bcd(RtcYear Mod 100));
+      VS(fEdx, (Bcd(RtcMonth) Shl 8) Or Bcd(RtcDay));
+    End;
+    $03, $05, $06, $07 : ;
+  Else
+    VmSetCF(True);
+  End;
+End;
+
+Procedure VmInt15;
+Var AH, Us : LongInt;
+Begin
+  AH := VRH(fEax);
+  VmSetCF(False);
+  Case AH Of
+    $C0 :
+    Begin
+      VSeg(fEs, VmBios);
+      VS(fEbx, VmCfgO);
+      VSH(fEax, 0);
+    End;
+    $88 : VS(fEax, 0);
+    $86 :
+    Begin
+      Us := (VR(fEcx) Shl 16) Or VR(fEdx);
+      If Us >= 1000 Then KSleep(Us Div 1000);
+      VSH(fEax, 0);
+    End;
+    $4F : VmSetCF(True);
+    $90, $91 : VSH(fEax, 0);
+  Else
+    VSH(fEax, $86);
+    VmSetCF(True);
+  End;
+End;
+
+Procedure VmInt13;
+Begin
+  If VRH(fEax) = 0 Then
+  Begin
+    VmSetCF(False);
+    VSH(fEax, 0);
+  End
+  Else If VRH(fEax) = $15 Then
+  Begin
+    VmSetCF(False);
+    VSH(fEax, 0);
+  End
+  Else
+  Begin
+    VmSetCF(True);
+    VSH(fEax, 1);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS : blocs de memoire (MCB)                                       }
+{ ------------------------------------------------------------------ }
+{ MCB : +0 'M' ou 'Z' (dernier), +1 proprietaire (PSP, 0 libre),
+  +3 taille en paragraphes, +8 nom du programme }
+
+Function McbA(Seg : LongInt) : LongInt;
+Begin
+  McbA := VmRam + Seg * 16;
+End;
+
+{ Reunir les blocs libres qui suivent le bloc M }
+Procedure McbMerge(M : LongInt);
+Var N : LongInt;
+Begin
+  While Mem[0:McbA(M)] = Ord('M') Do
+  Begin
+    N := M + 1 + MemW[0:McbA(M) + 3];
+    If (N >= $A000) Or (MemW[0:McbA(N) + 1] <> 0) Then Exit;
+    If Not (Mem[0:McbA(N)] In [Ord('M'), Ord('Z')]) Then Exit;
+    Mem[0:McbA(M)] := Mem[0:McbA(N)];
+    MemW[0:McbA(M) + 3] := MemW[0:McbA(M) + 3] + 1 + MemW[0:McbA(N) + 3];
+  End;
+End;
+
+{ Couper le bloc M a Paras paragraphes (le reste devient libre) }
+Procedure McbSplit(M, Paras : LongInt);
+Var Sz, N : LongInt;
+Begin
+  Sz := MemW[0:McbA(M) + 3];
+  If Sz <= Paras Then Exit;
+  N := M + 1 + Paras;
+  Mem[0:McbA(N)] := Mem[0:McbA(M)];
+  MemW[0:McbA(N) + 1] := 0;
+  MemW[0:McbA(N) + 3] := Sz - Paras - 1;
+  FillMem(McbA(N) + 5, 11, 0);
+  Mem[0:McbA(M)] := Ord('M');
+  MemW[0:McbA(M) + 3] := Paras;
+  McbMerge(N);
+End;
+
+{ Allouer Paras paragraphes ; segment du bloc (0 : echec, Max = plus
+  grand bloc libre) }
+Function McbAlloc(Paras, Owner : LongInt; Var Max : LongInt) : LongInt;
+Var M, Sz, Best, BestSz : LongInt;
+Begin
+  McbAlloc := 0;
+  Max := 0;
+  M := VmFirstMcb;
+  Best := 0; BestSz := 0;
+  Repeat
+    If Not (Mem[0:McbA(M)] In [Ord('M'), Ord('Z')]) Then Exit;
+    If MemW[0:McbA(M) + 1] = 0 Then
+    Begin
+      McbMerge(M);
+      Sz := MemW[0:McbA(M) + 3];
+      If Sz > Max Then Max := Sz;
+      If (Sz >= Paras) And ((Best = 0) Or ((VmStrat And 3) = 2) Or
+         (((VmStrat And 3) = 1) And (Sz < BestSz))) Then
+      Begin
+        Best := M; BestSz := Sz;
+      End;
+    End;
+    If Mem[0:McbA(M)] = Ord('Z') Then Break;
+    M := M + 1 + MemW[0:McbA(M) + 3];
+  Until M >= $A000;
+  If Best = 0 Then Exit;
+  If (VmStrat And 3) = 2 Then
+  Begin
+    { dernier bloc : la fin du bloc libre }
+    If BestSz > Paras Then
+    Begin
+      McbSplit(Best, BestSz - Paras - 1);
+      Best := Best + BestSz - Paras;
+    End;
+  End
+  Else McbSplit(Best, Paras);
+  MemW[0:McbA(Best) + 1] := Owner;
+  McbAlloc := Best + 1;
+End;
+
+Function McbValid(Seg : LongInt) : Boolean;
+Begin
+  McbValid := (Seg > VmFirstMcb) And (Seg < $A000) And
+              (Mem[0:McbA(Seg - 1)] In [Ord('M'), Ord('Z')]);
+End;
+
+Procedure McbFree(Seg : LongInt);
+Begin
+  If McbValid(Seg) Then MemW[0:McbA(Seg - 1) + 1] := 0;
+End;
+
+{ Redimensionner le bloc Seg ; False (Max = taille possible) }
+Function McbResize(Seg, Paras : LongInt; Var Max : LongInt) : Boolean;
+Var M, Own : LongInt;
+Begin
+  McbResize := False;
+  Max := 0;
+  If Not McbValid(Seg) Then Exit;
+  M := Seg - 1;
+  Own := MemW[0:McbA(M) + 1];
+  MemW[0:McbA(M) + 1] := 0;
+  McbMerge(M);
+  MemW[0:McbA(M) + 1] := Own;
+  Max := MemW[0:McbA(M) + 3];
+  If Max < Paras Then Exit;
+  McbSplit(M, Paras);
+  McbResize := True;
+End;
+
+Procedure McbFreeOwner(Owner : LongInt);
+Var M : LongInt;
+Begin
+  M := VmFirstMcb;
+  Repeat
+    If Not (Mem[0:McbA(M)] In [Ord('M'), Ord('Z')]) Then Exit;
+    If MemW[0:McbA(M) + 1] = Owner Then MemW[0:McbA(M) + 1] := 0;
+    If Mem[0:McbA(M)] = Ord('Z') Then Exit;
+    M := M + 1 + MemW[0:McbA(M) + 3];
+  Until M >= $A000;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS : chemins, fichiers et poignees                                }
+{ ------------------------------------------------------------------ }
+
+Function VmDriveOk(D : LongInt) : Boolean;
+Begin
+  VmDriveOk := (D >= 0) And (D < 26) And
+               ((GetLogicalDrives And (1 Shl D)) <> 0);
+End;
+
+{ Chemin complet (X:\...) d'un nom DOS }
+Function VmFullPath(S : String) : String;
+Var D, P : LongInt; R, Part : String;
+Begin
+  S := UpStr(Trim(S));
+  For P := 1 To Length(S) Do If S[P] = '/' Then S[P] := '\';
+  D := VmDrive;
+  If (Length(S) >= 2) And (S[2] = ':') Then
+  Begin
+    D := Ord(S[1]) - 65;
+    S := Copy(S, 3, 255);
+  End;
+  If (D < 0) Or (D > 25) Then D := VmDrive;
+  If (S = '') Or (S[1] <> '\') Then S := VmDir[D] + '\' + S;
+  R := '';
+  While S <> '' Do
+  Begin
+    While (Length(S) > 0) And (S[1] = '\') Do Delete(S, 1, 1);
+    If S = '' Then Break;
+    P := Pos('\', S);
+    If P > 0 Then
+    Begin
+      Part := Copy(S, 1, P - 1);
+      Delete(S, 1, P);
+    End
+    Else
+    Begin
+      Part := S;
+      S := '';
+    End;
+    While (Length(Part) > 0) And (Part[Length(Part)] = ' ') Do
+      Delete(Part, Length(Part), 1);
+    If (Part = '.') Or (Part = '') Then Continue;
+    If Part = '..' Then
+    Begin
+      P := Length(R);
+      While (P > 0) And (R[P] <> '\') Do Dec(P);
+      R := Copy(R, 1, P - 1);
+      If P = 0 Then R := '';
+      Continue;
+    End;
+    R := R + '\' + Part;
+  End;
+  If R = '' Then R := '\';
+  VmFullPath := Chr(65 + D) + ':' + R;
+End;
+
+{ Chaine ASCIIZ de la machine -> chemin complet ; ecrit aussi en
+  ASCIIZ dans VmTmp + K }
+Function VmPathAt(Lin, K : LongInt) : String;
+Var S : String;
+Begin
+  S := VmFullPath(PStr(Lin));
+  PutPStr(VmTmp + K, S, 256);
+  VmPathAt := S;
+End;
+
+{ Nom de peripherique (CON, NUL...) : 0 aucun, 1 CON, 2 NUL et
+  autres, 3 inconnu du systeme (EMMXXXX0...) }
+Function VmDevName(Path : String) : LongInt;
+Var B : String; P : LongInt;
+Begin
+  B := BaseName(Path);
+  P := Pos('.', B);
+  If P > 0 Then B := Copy(B, 1, P - 1);
+  VmDevName := 0;
+  If B = 'CON' Then VmDevName := 1
+  Else If (B = 'NUL') Or (B = 'PRN') Or (B = 'AUX') Or (B = 'LPT1') Or
+     (B = 'LPT2') Or (B = 'LPT3') Or (B = 'COM1') Or (B = 'COM2') Or
+     (B = 'COM3') Or (B = 'COM4') Or (B = 'CLOCK$') Then VmDevName := 2
+  Else If (B = 'EMMXXXX0') Or (B = 'EMMQXXX0') Or (B = '$MMXXXX0') Or
+     (B = 'XMSXXXX0') Then VmDevName := 3;
+End;
+
+Function SftNew(H, Dev, Mode : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  SftNew := -1;
+  For I := 0 To VmMaxSft - 1 Do
+    If SftRef[I] = 0 Then
+    Begin
+      SftH[I] := H; SftDev[I] := Dev; SftMode[I] := Mode;
+      SftRef[I] := 1;
+      SftNew := I;
+      Exit;
+    End;
+  If Dev = 0 Then CloseHandle(H);
+End;
+
+Procedure SftRelease(S : LongInt);
+Begin
+  If (S < 0) Or (S >= VmMaxSft) Or (SftRef[S] <= 0) Then Exit;
+  Dec(SftRef[S]);
+  If (SftRef[S] = 0) And (SftDev[S] = 0) Then CloseHandle(SftH[S]);
+End;
+
+{ Table des fichiers du processus (JFT) : adresse de l'entree H }
+Function VmJft(H : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  VmJft := 0;
+  P := VmLin(VmCurPsp, 0);
+  If (H < 0) Or (H >= MemW[0:P + $32]) Then Exit;
+  VmJft := VmLin(MemW[0:P + $36], MemW[0:P + $34] + H);
+End;
+
+Function VmSftOf(H : LongInt) : LongInt;
+Var J : LongInt;
+Begin
+  VmSftOf := -1;
+  J := VmJft(H And $FFFF);
+  If J = 0 Then Exit;
+  If (Mem[0:J] = $FF) Or (Mem[0:J] >= VmMaxSft) Then Exit;
+  If SftRef[Mem[0:J]] <= 0 Then Exit;
+  VmSftOf := Mem[0:J];
+End;
+
+{ Nouvelle poignee du processus pour l'entree S ; -1 : plus de place }
+Function VmHNew(S : LongInt) : LongInt;
+Var I, P, N : LongInt;
+Begin
+  VmHNew := -1;
+  P := VmLin(VmCurPsp, 0);
+  N := MemW[0:P + $32];
+  For I := 0 To N - 1 Do
+    If Mem[0:VmJft(I)] = $FF Then
+    Begin
+      Mem[0:VmJft(I)] := S;
+      VmHNew := I;
+      Exit;
+    End;
+End;
+
+Procedure VmHClose(H : LongInt);
+Var J : LongInt;
+Begin
+  J := VmJft(H);
+  If J = 0 Then Exit;
+  If Mem[0:J] <> $FF Then SftRelease(Mem[0:J]);
+  Mem[0:J] := $FF;
+End;
+
+{ Erreur Win32 du noyau -> code d'erreur du DOS }
+Function VmErrOf(Def : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  E := Threads[CurT].LastErr;
+  Case E Of
+    2, 3, 4, 5, 6, 8, 15, 16, 17, 18, 32, 80 : ;
+    183 : E := 80;
+    145 : E := 5;
+  Else
+    E := Def;
+  End;
+  VmErrOf := E;
+End;
+
+Procedure VmFail(E : LongInt);
+Begin
+  VmLastErr := E;
+  VS(fEax, E);
+  VmSetCF(True);
+End;
+
+{ Ouvrir un fichier (Disp de CreateFile) ; entree de la table ou -1
+  (VmLastErr) }
+Function VmOpen(Path : String; Mode, Disp : LongInt) : LongInt;
+Var D, H : LongInt; Wr : Boolean;
+Begin
+  VmOpen := -1;
+  D := VmDevName(Path);
+  If D = 3 Then
+  Begin
+    VmLastErr := 2;
+    Exit;
+  End;
+  If D > 0 Then
+  Begin
+    VmOpen := SftNew(0, D, Mode);
+    If VmOpen < 0 Then VmLastErr := 4;
+    Exit;
+  End;
+  Wr := ((Mode And 3) <> 0) Or (Disp <> 3);
+  H := KOpenFile(Path, Wr, Disp);
+  If (H = INVALID_HANDLE) And ((Mode And 3) = 2) And (Disp = 3) Then
+  Begin
+    { lecture et ecriture refusees (CD-ROM...) : lecture seule }
+    H := KOpenFile(Path, False, 3);
+    If H <> INVALID_HANDLE Then Mode := Mode And Not 3;
+  End;
+  If H = INVALID_HANDLE Then
+  Begin
+    VmLastErr := VmErrOf(2);
+    Exit;
+  End;
+  VmOpen := SftNew(H, 0, Mode);
+  If VmOpen < 0 Then VmLastErr := 4;
+End;
+
+Procedure VmOpenH(Path : String; Mode, Disp : LongInt);
+Var S, H : LongInt;
+Begin
+  S := VmOpen(Path, Mode, Disp);
+  If S < 0 Then
+  Begin
+    VmFail(VmLastErr);
+    Exit;
+  End;
+  If (Mode And $80) <> 0 Then SftMode[S] := SftMode[S] Or $80;
+  H := VmHNew(S);
+  If H < 0 Then
+  Begin
+    SftRelease(S);
+    VmFail(4);
+    Exit;
+  End;
+  VS(fEax, H);
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS : console                                                      }
+{ ------------------------------------------------------------------ }
+
+{ Ligne frappee au clavier avec echo (au plus Max caracteres) }
+Function VmReadLine(Max : LongInt) : String;
+Var S : String; K, C : LongInt;
+Begin
+  S := '';
+  Repeat
+    K := VmWaitKey;
+    C := K And $FF;
+    If C = 13 Then Break;
+    If C = 8 Then
+    Begin
+      If Length(S) > 0 Then
+      Begin
+        Delete(S, Length(S), 1);
+        VmTty(8); VmTty(32); VmTty(8);
+      End;
+    End
+    Else If C = 27 Then
+    Begin
+      While Length(S) > 0 Do
+      Begin
+        Delete(S, Length(S), 1);
+        VmTty(8); VmTty(32); VmTty(8);
+      End;
+    End
+    Else If (C <> 0) And (C <> $E0) And (Length(S) < Max) Then
+    Begin
+      S := S + Chr(C);
+      VmConOut(C);
+    End;
+  Until False;
+  VmTty(13);
+  VmReadLine := S;
+End;
+
+{ Lecture de CON (mode ligne) : N octets au plus }
+Function VmConRead(Buf, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  If Not VmLineOk Then
+  Begin
+    VmLine := VmReadLine(126) + #13#10;
+    VmTty(10);
+    VmLineOk := True;
+  End;
+  I := 0;
+  While (I < N) And (VmLine <> '') Do
+  Begin
+    Mem[0:Buf + I] := Ord(VmLine[1]);
+    Delete(VmLine, 1, 1);
+    Inc(I);
+  End;
+  If VmLine = '' Then VmLineOk := False;
+  VmConRead := I;
+End;
+
+{ Lecture d'un caractere (AH=01h, 07h, 08h) }
+Function VmGetCh : LongInt;
+Var K : LongInt;
+Begin
+  If VmPendScan >= 0 Then
+  Begin
+    VmGetCh := VmPendScan;
+    VmPendScan := -1;
+    Exit;
+  End;
+  K := VmWaitKey;
+  If ((K And $FF) = 0) Or (((K And $FF) = $E0) And (K > $FF)) Then
+  Begin
+    VmPendScan := K Shr 8;
+    VmGetCh := 0;
+  End
+  Else VmGetCh := K And $FF;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS : PSP, chargement et fin des programmes                        }
+{ ------------------------------------------------------------------ }
+
+{ FCB non ouvert depuis le debut de la chaine S (nom de fichier) }
+Procedure VmFcbName(F : LongInt; Var S : String);
+Var I, K : LongInt;
+Begin
+  FillMem(F + 1, 11, 32);
+  Mem[0:F] := 0;
+  While (S <> '') And (S[1] In [' ', #9, ',', ';', '=']) Do Delete(S, 1, 1);
+  If (Length(S) >= 2) And (S[2] = ':') Then
+  Begin
+    Mem[0:F] := Ord(UpCase(S[1])) - 64;
+    Delete(S, 1, 2);
+  End;
+  I := 0; K := 0;
+  While (S <> '') And Not (S[1] In [' ', #9, ',', ';', '=', '/', '\',
+        #13]) Do
+  Begin
+    If S[1] = '.' Then K := 8
+    Else If S[1] = '*' Then
+    Begin
+      If K < 8 Then While K < 8 Do
+      Begin
+        Mem[0:F + 1 + K] := Ord('?'); Inc(K);
+      End
+      Else While K < 11 Do
+      Begin
+        Mem[0:F + 1 + K] := Ord('?'); Inc(K);
+      End;
+    End
+    Else If ((K < 8) And (S[1] <> '.')) Or ((K >= 8) And (K < 11)) Then
+    Begin
+      Mem[0:F + 1 + K] := Ord(UpCase(S[1]));
+      Inc(K);
+    End;
+    Delete(S, 1, 1);
+    Inc(I);
+  End;
+End;
+
+{ Construire le PSP de Seg (bloc de Size paragraphes) }
+Procedure VmMakePsp(Seg, Size, Env, Parent : LongInt; Tail : String);
+Var P, PP, I, S, N : LongInt; T : String;
+Begin
+  P := VmLin(Seg, 0);
+  FillMem(P, 256, 0);
+  MemW[0:P] := $20CD;
+  MemW[0:P + 2] := Seg + Size;
+  Mem[0:P + 5] := $9A;
+  MemW[0:P + 6] := VmCpmO; MemW[0:P + 8] := VmBios;
+  MemL[0:P + $0A] := MemL[0:VmRam + $22 * 4];
+  MemL[0:P + $0E] := MemL[0:VmRam + $23 * 4];
+  MemL[0:P + $12] := MemL[0:VmRam + $24 * 4];
+  MemW[0:P + $16] := Parent;
+  FillMem(P + $18, 20, $FF);
+  { fichiers herites du parent }
+  If Parent <> 0 Then
+  Begin
+    PP := VmLin(Parent, 0);
+    N := Min(20, MemW[0:PP + $32]);
+    For I := 0 To N - 1 Do
+    Begin
+      S := Mem[0:VmLin(MemW[0:PP + $36], MemW[0:PP + $34] + I)];
+      If (S < VmMaxSft) And (SftRef[S] > 0) And
+         ((SftMode[S] And $80) = 0) Then
+      Begin
+        Mem[0:P + $18 + I] := S;
+        Inc(SftRef[S]);
+      End;
+    End;
+  End;
+  MemW[0:P + $2C] := Env;
+  MemW[0:P + $32] := 20;
+  MemW[0:P + $34] := $18; MemW[0:P + $36] := Seg;
+  MemL[0:P + $38] := -1;
+  MemW[0:P + $40] := $0007;
+  Mem[0:P + $50] := $CD; Mem[0:P + $51] := $21; Mem[0:P + $52] := $CB;
+  If Length(Tail) > 126 Then Tail := Copy(Tail, 1, 126);
+  T := Tail;
+  VmFcbName(P + $5C, T);
+  VmFcbName(P + $6C, T);
+  Mem[0:P + $80] := Length(Tail);
+  For I := 1 To Length(Tail) Do Mem[0:P + $80 + I] := Ord(Tail[I]);
+  Mem[0:P + $81 + Length(Tail)] := 13;
+End;
+
+{ Taille (octets) des variables d'un environnement }
+Function VmEnvLen(Seg : LongInt) : LongInt;
+Var A, N : LongInt;
+Begin
+  A := VmLin(Seg, 0);
+  N := 0;
+  While (N < 32000) And Not ((Mem[0:A + N] = 0) And
+        ((N = 0) Or (Mem[0:A + N - 1] = 0))) Do Inc(N);
+  If N = 0 Then N := 1 Else N := N + 1;
+  VmEnvLen := N;
+End;
+
+{ Charger le programme Path (EXEC) ; 0 ou code d'erreur du DOS.
+  Mode 3 (recouvrement) : LoadSeg et Reloc ; sinon un PSP est cree. }
+Function VmLoad(Path, Tail : String; EnvSeg, Mode, LoadSeg, Reloc : LongInt;
+                Var Psp, Cs, Ip, Ss, Sp : LongInt) : LongInt;
+Var H, Got, I, N, Hdr, Img, MinA, MaxA, Need, Want, Max, Seg, Env,
+    EnvN, Base, R, A, FSize : LongInt; Exe : Boolean; Nm : String;
+Begin
+  VmLoad := 2;
+  Psp := 0;
+  H := KOpenFile(Path, False, 3);
+  If H = INVALID_HANDLE Then
+  Begin
+    VmLoad := VmErrOf(2);
+    Exit;
+  End;
+  FSize := GetFileSize(H, 0);
+  FillMem(VmTmp, 64, 0);
+  KReadFile(H, VmTmp, 32, Got);
+  Exe := (Got >= 28) And ((MemW[0:VmTmp] = $5A4D) Or
+                          (MemW[0:VmTmp] = $4D5A));
+  If Exe Then
+  Begin
+    Hdr := MemW[0:VmTmp + 8] * 16;
+    Img := MemW[0:VmTmp + 4] * 512;
+    If MemW[0:VmTmp + 2] <> 0 Then Img := Img - 512 + MemW[0:VmTmp + 2];
+    Img := Img - Hdr;
+    If Img > FSize - Hdr Then Img := FSize - Hdr;
+    MinA := MemW[0:VmTmp + 10];
+    MaxA := MemW[0:VmTmp + 12];
+    If (MinA = 0) And (MaxA = 0) Then MaxA := $FFFF;
+  End
+  Else
+  Begin
+    Hdr := 0;
+    Img := FSize;
+    If Img > $FF00 Then
+    Begin
+      CloseHandle(H);
+      VmLoad := 11;
+      Exit;
+    End;
+    MinA := $1000 - ((Img + 15) Shr 4);
+    MaxA := $FFFF;
+  End;
+  If Img < 0 Then
+  Begin
+    CloseHandle(H);
+    VmLoad := 11;
+    Exit;
+  End;
+  { recouvrement : chargement sans PSP }
+  If Mode = 3 Then
+  Begin
+    Base := LoadSeg;
+    R := Reloc;
+  End
+  Else
+  Begin
+    { environnement : variables, mot 1, nom complet du programme }
+    If EnvSeg = 0 Then EnvSeg := MemW[0:VmLin(VmCurPsp, $2C)];
+    EnvN := VmEnvLen(EnvSeg);
+    Env := McbAlloc((EnvN + 3 + Length(Path) + 15) Shr 4, 1, Max);
+    If Env = 0 Then
+    Begin
+      CloseHandle(H);
+      VmLoad := 8;
+      Exit;
+    End;
+    MoveMem(VmLin(EnvSeg, 0), VmLin(Env, 0), EnvN);
+    MemW[0:VmLin(Env, EnvN)] := 1;
+    PutPStr(VmLin(Env, EnvN + 2), Path, 128);
+    { bloc du programme : le plus grand possible, au plus MaxAlloc }
+    Need := ((Img + 15) Shr 4) + $10 + MinA;
+    Want := ((Img + 15) Shr 4) + $10 + MaxA;
+    If Want > $FFFF Then Want := $FFFF;
+    McbAlloc($FFFF, 0, Max);
+    If Max < Need Then
+    Begin
+      McbFree(Env);
+      CloseHandle(H);
+      VmLoad := 8;
+      Exit;
+    End;
+    If Want > Max Then Want := Max;
+    Seg := McbAlloc(Want, 1, Max);
+    If Seg = 0 Then
+    Begin
+      McbFree(Env);
+      CloseHandle(H);
+      VmLoad := 8;
+      Exit;
+    End;
+    MemW[0:McbA(Seg - 1) + 1] := Seg;
+    MemW[0:McbA(Env - 1) + 1] := Seg;
+    Nm := BaseName(Path);
+    If Pos('.', Nm) > 0 Then Nm := Copy(Nm, 1, Pos('.', Nm) - 1);
+    FillMem(McbA(Seg - 1) + 8, 8, 0);
+    For I := 1 To Min(8, Length(Nm)) Do
+      Mem[0:McbA(Seg - 1) + 7 + I] := Ord(Nm[I]);
+    VmMakePsp(Seg, Want, Env, VmCurPsp, Tail);
+    Psp := Seg;
+    If Exe Then Base := Seg + $10 Else Base := Seg;
+    R := Base;
+  End;
+  { image }
+  If Exe Then
+  Begin
+    SetFilePointer(H, Hdr, 0, 0);
+    KReadFile(H, VmLin(Base, 0), Img, Got);
+    N := MemW[0:VmTmp + 6];
+    If N > 0 Then
+    Begin
+      I := HeapOwner; HeapOwner := 0;
+      A := KAlloc(N * 4);
+      HeapOwner := I;
+      If A <> 0 Then
+      Begin
+        SetFilePointer(H, MemW[0:VmTmp + $18], 0, 0);
+        KReadFile(H, A, N * 4, Got);
+        For I := 0 To N - 1 Do
+          VmPutW(Base + MemW[0:A + I * 4 + 2], MemW[0:A + I * 4],
+                 VmGetW(Base + MemW[0:A + I * 4 + 2], MemW[0:A + I * 4]) +
+                 R);
+        KFree(A);
+      End;
+    End;
+    Cs := (Base + MemW[0:VmTmp + $16]) And $FFFF;
+    Ip := MemW[0:VmTmp + $14];
+    Ss := (Base + MemW[0:VmTmp + $0E]) And $FFFF;
+    Sp := MemW[0:VmTmp + $10];
+  End
+  Else
+  Begin
+    SetFilePointer(H, 0, 0, 0);
+    If Mode = 3 Then KReadFile(H, VmLin(Base, 0), Img, Got)
+    Else KReadFile(H, VmLin(Base, $100), Img, Got);
+    Cs := Base; Ip := $100; Ss := Base;
+    If Mode <> 3 Then
+    Begin
+      If MemW[0:VmLin(Psp, 2)] - Psp >= $1000 Then Sp := $FFFE
+      Else Sp := (MemW[0:VmLin(Psp, 2)] - Psp) * 16 - 2;
+      VmPutW(Ss, Sp, 0);
+    End;
+  End;
+  CloseHandle(H);
+  VmLoad := 0;
+End;
+
+{ Registres de l'appelant de l'INT 21h sauves sous sa pile ; le PSP
+  courant garde SS:SP (comme MS-DOS, pour le retour d'un EXEC) }
+Procedure VmDosSave;
+Var Ss, Sp, P : LongInt;
+Begin
+  Ss := VR(fSs); Sp := (VR(fEsp) - 18) And $FFFF;
+  VmPutW(Ss, Sp, VR(fEs));
+  VmPutW(Ss, Sp + 2, VR(fDs));
+  VmPutW(Ss, Sp + 4, VR(fEbp));
+  VmPutW(Ss, Sp + 6, VR(fEdi));
+  VmPutW(Ss, Sp + 8, VR(fEsi));
+  VmPutW(Ss, Sp + 10, VR(fEdx));
+  VmPutW(Ss, Sp + 12, VR(fEcx));
+  VmPutW(Ss, Sp + 14, VR(fEbx));
+  VmPutW(Ss, Sp + 16, VR(fEax));
+  P := VmLin(VmCurPsp, 0);
+  MemW[0:P + $2E] := Sp;
+  MemW[0:P + $30] := Ss;
+End;
+
+{ Fin du programme courant (AH=4Ch, 31h, INT 20h, 27h) }
+Procedure VmTerminate(Code : LongInt; Tsr : Boolean; Keep : LongInt);
+Var Child, Parent, P, I, Ss, Sp, Max : LongInt;
+Begin
+  Child := VmCurPsp;
+  P := VmLin(Child, 0);
+  Parent := MemW[0:P + $16];
+  VmRetCode := Code And $FF;
+  If Tsr Then VmRetCode := VmRetCode Or $300;
+  MemL[0:VmRam + $22 * 4] := MemL[0:P + $0A];
+  MemL[0:VmRam + $23 * 4] := MemL[0:P + $0E];
+  MemL[0:VmRam + $24 * 4] := MemL[0:P + $12];
+  If Tsr Then
+  Begin
+    If Keep < 6 Then Keep := 6;
+    McbResize(Child, Keep, Max);
+  End
+  Else
+  Begin
+    For I := 0 To MemW[0:P + $32] - 1 Do VmHClose(I);
+    McbFreeOwner(Child);
+  End;
+  If (Parent = VmRootPsp) Or (Parent = Child) Or (Parent = 0) Then
+    VmQuit(Code And $FF);
+  VmCurPsp := Parent;
+  VmDta := (Parent Shl 16) Or $80;
+  { pile du parent sauvee a son dernier appel du DOS }
+  P := VmLin(Parent, 0);
+  Ss := MemW[0:P + $30]; Sp := MemW[0:P + $2E];
+  VSeg(fSs, Ss);
+  VSeg(fEs, VmGetW(Ss, Sp));
+  VSeg(fDs, VmGetW(Ss, Sp + 2));
+  VS(fEbp, VmGetW(Ss, Sp + 4));
+  VS(fEdi, VmGetW(Ss, Sp + 6));
+  VS(fEsi, VmGetW(Ss, Sp + 8));
+  VS(fEdx, VmGetW(Ss, Sp + 10));
+  VS(fEcx, VmGetW(Ss, Sp + 12));
+  VS(fEbx, VmGetW(Ss, Sp + 14));
+  VS(fEax, VmGetW(Ss, Sp + 16));
+  VS(fEsp, Sp + 18 + 6);
+  VmLoadFlags(VmGetW(Ss, Sp + 22) Or $200);
+  I := MemL[0:VmLin(Child, $0A)];
+  VmGoto(I Shr 16, I And $FFFF);
+  VmSetCF(False);
+  VmNoIret := True;
+End;
+
+{ AH=4Bh : EXEC }
+Procedure VmExec;
+Var AL, Pb, Err, Psp, Cs, Ip, Ss, Sp, T, I : LongInt; Path, Tail : String;
+Begin
+  AL := VRL(fEax);
+  Path := VmFullPath(PStr(VmPtr(fDs, fEdx)));
+  Pb := VmPtr(fEs, fEbx);
+  If AL = 3 Then
+  Begin
+    Err := VmLoad(Path, '', 0, 3, MemW[0:Pb], MemW[0:Pb + 2], Psp, Cs, Ip,
+                  Ss, Sp);
+    If Err <> 0 Then VmFail(Err) Else VmSetCF(False);
+    Exit;
+  End;
+  If (AL <> 0) And (AL <> 1) Then
+  Begin
+    VmFail(1);
+    Exit;
+  End;
+  T := MemL[0:Pb + 2];
+  T := VmLin(T Shr 16, T And $FFFF);
+  Tail := '';
+  For I := 1 To Mem[0:T] Do
+    If Mem[0:T + I] <> 13 Then Tail := Tail + Chr(Mem[0:T + I]);
+  Err := VmLoad(Path, Tail, MemW[0:Pb], AL, 0, 0, Psp, Cs, Ip, Ss, Sp);
+  If Err <> 0 Then
+  Begin
+    VmFail(Err);
+    Exit;
+  End;
+  { FCB fournis par l'appelant }
+  T := MemL[0:Pb + 6];
+  If (T <> 0) And (T <> -1) Then
+    MoveMem(VmLin(T Shr 16, T And $FFFF), VmLin(Psp, $5C), 16);
+  T := MemL[0:Pb + 10];
+  If (T <> 0) And (T <> -1) Then
+    MoveMem(VmLin(T Shr 16, T And $FFFF), VmLin(Psp, $6C), 16);
+  { retour au parent : l'instruction qui suit son INT 21h }
+  I := (VmGetW(VR(fSs), VR(fEsp) + 2) Shl 16) Or VmGetW(VR(fSs), VR(fEsp));
+  MemL[0:VmLin(Psp, $0A)] := I;
+  MemL[0:VmRam + $22 * 4] := I;
+  VmCurPsp := Psp;
+  VmDta := (Psp Shl 16) Or $80;
+  If AL = 1 Then
+  Begin
+    Sp := (Sp - 2) And $FFFF;
+    VmPutW(Ss, Sp, 0);
+    MemW[0:Pb + $0E] := Sp; MemW[0:Pb + $10] := Ss;
+    MemW[0:Pb + $12] := Ip; MemW[0:Pb + $14] := Cs;
+    VmSetCF(False);
+    Exit;
+  End;
+  VSeg(fSs, Ss); VS(fEsp, Sp);
+  VSeg(fDs, Psp); VSeg(fEs, Psp);
+  VS(fEax, 0); VS(fEbx, 0); VS(fEcx, $FF); VS(fEdx, Psp);
+  VS(fEsi, Ip); VS(fEdi, Sp); VS(fEbp, $091C);
+  VmGoto(Cs, Ip);
+  VmIF := True;
+  VmSetCF(False);
+  VmNoIret := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS : recherche des fichiers (AH=4Eh, 4Fh)                          }
+{ ------------------------------------------------------------------ }
+{ DTA : +0 'P', +1 recherche, +2 numero, +12 attributs demandes ;
+  +15h attributs, +16h heure, +18h date, +1Ah taille, +1Eh nom }
+
+Procedure VmFindStep(Dta : LongInt; First : Boolean);
+Var H, K, Fd, Ok, A, Mask, D, T : LongInt; S : String;
+Begin
+  Fd := VmTmp + 512;
+  If First Then
+  Begin
+    Mask := VR(fEcx) And $FF;
+    If Mask = 8 Then
+    Begin
+      VmFail(18);
+      Exit;
+    End;
+    S := VmPathAt(VmPtr(fDs, fEdx), 0);
+    H := FindFirstFileA(VmTmp, Fd);
+    If H = INVALID_HANDLE Then
+    Begin
+      { aucun fichier : 12h si le repertoire existe, sinon 03h }
+      PutPStr(VmTmp + 256, ParentDir(S), 256);
+      If (Length(ParentDir(S)) = 3) Or
+         ((GetFileAttributesA(VmTmp + 256) <> -1) And
+          ((GetFileAttributesA(VmTmp + 256) And $10) <> 0)) Then
+        VmFail(18)
+      Else VmFail(3);
+      Exit;
+    End;
+    { une recherche par entree de la table ; la plus ancienne est
+      fermee quand la table est pleine }
+    K := VmFindNext;
+    VmFindNext := (VmFindNext + 1) Mod VmMaxFind;
+    If VmFindH[K] <> 0 Then FindClose(VmFindH[K]);
+    Inc(VmFindCnt);
+    VmFindH[K] := H; VmFindSeq[K] := VmFindCnt And $FFFF;
+    Mem[0:Dta] := Ord('P'); Mem[0:Dta + 1] := K;
+    MemW[0:Dta + 2] := VmFindSeq[K];
+    Mem[0:Dta + 12] := Mask;
+    Ok := 1;
+  End
+  Else
+  Begin
+    K := Mem[0:Dta + 1];
+    If (Mem[0:Dta] <> Ord('P')) Or (K >= VmMaxFind) Or
+       (VmFindH[K] = 0) Or (MemW[0:Dta + 2] <> VmFindSeq[K]) Then
+    Begin
+      VmFail(18);
+      Exit;
+    End;
+    H := VmFindH[K];
+    Mask := Mem[0:Dta + 12];
+    Ok := FindNextFileA(H, Fd);
+  End;
+  While Ok <> 0 Do
+  Begin
+    A := MemL[0:Fd] And $3F;
+    S := PStr(Fd + 304);
+    If S = '' Then S := PStr(Fd + 44);
+    S := UpStr(S);
+    If ((A And $16 And Not Mask) = 0) And (Length(S) <= 12) Then
+    Begin
+      Mem[0:Dta + $15] := A;
+      D := 0; T := 0;
+      FileTimeToDosDateTime(Fd + 20, LongInt(@D), LongInt(@T));
+      MemW[0:Dta + $16] := T; MemW[0:Dta + $18] := D;
+      MemL[0:Dta + $1A] := MemL[0:Fd + 32];
+      FillMem(Dta + $1E, 13, 0);
+      PutPStr(Dta + $1E, S, 13);
+      VmSetCF(False);
+      Exit;
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  FindClose(H);
+  VmFindH[K] := 0;
+  VmFail(18);
+End;
+
+{ ------------------------------------------------------------------ }
+{ DOS : INT 21h                                                      }
+{ ------------------------------------------------------------------ }
+
+Procedure VmDiskFree(D : LongInt);
+Var Spc, Bps, Fr, Tot : LongInt;
+Begin
+  If D = 0 Then D := VmDrive Else D := D - 1;
+  If Not VmDriveOk(D) Then
+  Begin
+    VS(fEax, $FFFF);
+    Exit;
+  End;
+  PutPStr(VmTmp + 400, Chr(65 + D) + ':\', 8);
+  If GetDiskFreeSpaceA(VmTmp + 400, VmTmp, VmTmp + 4, VmTmp + 8,
+                       VmTmp + 12) = 0 Then
+  Begin
+    VS(fEax, $FFFF);
+    Exit;
+  End;
+  Spc := MemL[0:VmTmp]; Bps := MemL[0:VmTmp + 4];
+  Fr := MemL[0:VmTmp + 8]; Tot := MemL[0:VmTmp + 12];
+  { au plus FFFFh grappes (comme MS-DOS 7 sur un grand disque) }
+  While ((Tot > $FFFF) Or (Fr > $FFFF)) And (Spc < 128) Do
+  Begin
+    Spc := Spc * 2; Tot := Tot Div 2; Fr := Fr Div 2;
+  End;
+  VS(fEax, Spc); VS(fEbx, Min(Fr, $FFFF));
+  VS(fEcx, Bps); VS(fEdx, Min(Tot, $FFFF));
+End;
+
+Procedure VmIoctl;
+Var AL, S, D : LongInt;
+Begin
+  AL := VRL(fEax);
+  VmSetCF(False);
+  Case AL Of
+    $00, $01, $06, $07, $0A :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If S < 0 Then
+      Begin
+        VmFail(6);
+        Exit;
+      End;
+      Case AL Of
+        $00 :
+          If SftDev[S] = 1 Then VS(fEdx, $80D3)
+          Else If SftDev[S] = 2 Then VS(fEdx, $8084)
+          Else VS(fEdx, $40 Or (VmDrive And $1F));
+        $01 : ;
+        $06 :
+          If SftDev[S] = 1 Then
+          Begin
+            VmPumpNative;
+            VSL(fEax, $FF * Ord(VmBufHas Or VmLineOk));
+          End
+          Else If SftDev[S] = 2 Then VSL(fEax, 0)
+          Else VSL(fEax, $FF * Ord(SetFilePointer(SftH[S], 0, 0, 1) <
+                                   GetFileSize(SftH[S], 0)));
+        $07 : VSL(fEax, $FF);
+        $0A : VS(fEdx, 0);
+      End;
+    End;
+    $08 :
+    Begin
+      D := VRL(fEbx);
+      If D = 0 Then D := VmDrive Else D := D - 1;
+      If Not VmDriveOk(D) Then VmFail(15)
+      Else VS(fEax, Ord(D <> 3));
+    End;
+    $09 :
+    Begin
+      D := VRL(fEbx);
+      If D = 0 Then D := VmDrive Else D := D - 1;
+      If Not VmDriveOk(D) Then VmFail(15)
+      Else If D = 3 Then VS(fEdx, $1000) Else VS(fEdx, 0);
+    End;
+    $0B : ;
+    $0E, $0F : VSL(fEax, 0);
+  Else
+    VmFail(1);
+  End;
+End;
+
+Procedure VmCountry;
+Var P : LongInt;
+Begin
+  P := VmPtr(fDs, fEdx);
+  FillMem(P, 34, 0);
+  If Language = _English Then MemW[0:P] := 0 Else MemW[0:P] := 1;
+  Mem[0:P + 2] := Ord('$');
+  Mem[0:P + 7] := Ord(' '); Mem[0:P + 9] := Ord(',');
+  Mem[0:P + 11] := Ord('/'); Mem[0:P + 13] := Ord(':');
+  Mem[0:P + 16] := 2;
+  If Language = _English Then Mem[0:P + 17] := 0 Else Mem[0:P + 17] := 1;
+  If Language = _English Then
+  Begin
+    Mem[0:P + 7] := Ord(','); Mem[0:P + 9] := Ord('.');
+  End;
+  MemW[0:P + 18] := VmCpmO + 2; MemW[0:P + 20] := VmBios;
+  Mem[0:P + 22] := Ord(',');
+  VS(fEbx, 1);
+  VmSetCF(False);
+End;
+
+Procedure VmCountryX;
+Var AL, P, I, N : LongInt;
+Begin
+  AL := VRL(fEax);
+  VmSetCF(False);
+  Case AL Of
+    $01 :
+    Begin
+      P := VmPtr(fEs, fEdi);
+      Mem[0:P] := 1; MemW[0:P + 1] := 38; MemW[0:P + 3] := 1;
+      MemW[0:P + 5] := 437;
+      MemW[0:VmTmp + 900] := VR(fEdx);
+      VS(fEdx, P);
+      FillMem(P + 7, 34, 0);
+      VS(fEdx, MemW[0:VmTmp + 900]);
+      VS(fEcx, 41);
+    End;
+    $02, $04, $06 :
+    Begin
+      P := VmPtr(fEs, fEdi);
+      Mem[0:P] := AL;
+      MemW[0:P + 1] := VmUpO; MemW[0:P + 3] := VmDosSeg;
+      VS(fEcx, 5);
+    End;
+    $07 :
+    Begin
+      P := VmPtr(fEs, fEdi);
+      Mem[0:P] := 7;
+      MemW[0:P + 1] := VmDbcsO; MemW[0:P + 3] := VmDosSeg;
+      VS(fEcx, 5);
+    End;
+    $20 : VSL(fEdx, UpCh(VRL(fEdx)));
+    $21 :
+    Begin
+      P := VmPtr(fDs, fEdx);
+      For I := 0 To VR(fEcx) - 1 Do Mem[0:P + I] := UpCh(Mem[0:P + I]);
+    End;
+    $22 :
+    Begin
+      P := VmPtr(fDs, fEdx);
+      N := 0;
+      While (N < 65535) And (Mem[0:P + N] <> 0) Do
+      Begin
+        Mem[0:P + N] := UpCh(Mem[0:P + N]);
+        Inc(N);
+      End;
+    End;
+  Else
+    VmFail(1);
+  End;
+End;
+
+{ AH=29h : analyser un nom de fichier vers un FCB }
+Procedure VmParseFcb;
+Var P, F, I, N, AL : LongInt; S : String;
+Begin
+  P := VmPtr(fDs, fEsi);
+  F := VmPtr(fEs, fEdi);
+  AL := VRL(fEax);
+  S := '';
+  For I := 0 To 127 Do
+  Begin
+    If Mem[0:P + I] In [0, 13] Then Break;
+    S := S + Chr(Mem[0:P + I]);
+  End;
+  N := Length(S);
+  If (AL And 1) <> 0 Then
+    While (S <> '') And (S[1] In [' ', #9, ',', ';', '=', ':', '+']) Do
+      Delete(S, 1, 1);
+  VmFcbName(F, S);
+  VS(fEsi, VR(fEsi) + N - Length(S));
+  I := 0;
+  For N := 1 To 11 Do If Mem[0:F + N] = Ord('?') Then I := 1;
+  If (Mem[0:F] <> 0) And Not VmDriveOk(Mem[0:F] - 1) Then I := $FF;
+  VSL(fEax, I);
+End;
+
+Procedure VmInt21;
+Var AH, AL, S, H, N, R, P, D, T, Max : LongInt; Path : String;
+Begin
+  AH := VRH(fEax); AL := VRL(fEax);
+  If VmTrace Then
+    KLog('INT 21h ' + VmRegStr + ' de ' +
+         HexStr(VmGetW(VR(fSs), VR(fEsp) + 2), 4) + ':' +
+         HexStr(VmGetW(VR(fSs), VR(fEsp)), 4));
+  If Not (AH In [$33, $50, $51, $59, $62, $64]) Then VmDosSave;
+  VmSetCF(False);
+  Case AH Of
+    $00 : VmTerminate(0, False, 0);
+    $01 :
+    Begin
+      N := VmGetCh;
+      VSL(fEax, N);
+      If N <> 0 Then VmConOut(N);
+    End;
+    $02 : VmConOut(VRL(fEdx));
+    $03 : VSL(fEax, 0);
+    $04, $05 : ;
+    $06 :
+      If VRL(fEdx) = $FF Then
+      Begin
+        VmPumpNative;
+        If (VmPendScan >= 0) Or VmBufHas Then
+        Begin
+          VSL(fEax, VmGetCh);
+          VmSetZF(False);
+        End
+        Else
+        Begin
+          VSL(fEax, 0);
+          VmSetZF(True);
+          VmIdle;
+        End;
+      End
+      Else VmConOut(VRL(fEdx));
+    $07, $08 : VSL(fEax, VmGetCh);
+    $09 :
+    Begin
+      P := VmPtr(fDs, fEdx);
+      N := 0;
+      While (Mem[0:P + N] <> Ord('$')) And (N < 65535) Do
+      Begin
+        VmConOut(Mem[0:P + N]);
+        Inc(N);
+      End;
+      VSL(fEax, Ord('$'));
+    End;
+    $0A :
+    Begin
+      P := VmPtr(fDs, fEdx);
+      Path := VmReadLine(Max(Mem[0:P] - 1, 0));
+      Mem[0:P + 1] := Length(Path);
+      For N := 1 To Length(Path) Do Mem[0:P + 1 + N] := Ord(Path[N]);
+      Mem[0:P + 2 + Length(Path)] := 13;
+    End;
+    $0B :
+    Begin
+      VmPumpNative;
+      VSL(fEax, $FF * Ord(VmBufHas Or (VmPendScan >= 0)));
+      If Not VmBufHas Then VmIdle;
+    End;
+    $0C :
+    Begin
+      While VmBufHas Do VmBufPop;
+      VmPendScan := -1;
+      If AL In [1, 6, 7, 8, $0A] Then
+      Begin
+        VS(fEax, (AL Shl 8) Or VRL(fEdx));
+        VmInt21;
+        Exit;
+      End;
+    End;
+    $0D : FatFlush;
+    $0E :
+    Begin
+      If VmDriveOk(VRL(fEdx)) Then
+      Begin
+        VmDrive := VRL(fEdx);
+        CurDirS := Chr(65 + VmDrive) + ':' + VmDir[VmDrive];
+        If Length(CurDirS) = 3 Then CurDirS := Copy(CurDirS, 1, 2);
+      End;
+      VSL(fEax, 26);
+    End;
+    $0F..$17, $21..$24, $27, $28 : VSL(fEax, $FF);
+    $18, $1D, $1E, $20 : VSL(fEax, 0);
+    $19 : VSL(fEax, VmDrive);
+    $1A : VmDta := (VR(fDs) Shl 16) Or VR(fEdx);
+    $1B, $1C :
+    Begin
+      D := VRL(fEdx);
+      If AH = $1B Then D := 0;
+      VmDiskFree(D);
+      If VR(fEax) <> $FFFF Then
+      Begin
+        VS(fEdx, VR(fEdx));
+        Mem[0:VmLin(VmDosSeg, $1F0)] := $F8;
+        VSeg(fDs, VmDosSeg); VS(fEbx, $1F0);
+      End
+      Else VSL(fEax, $FF);
+    End;
+    $1F, $32 : VSL(fEax, $FF);
+    $25 : MemL[0:VmRam + AL * 4] := (VR(fDs) Shl 16) Or VR(fEdx);
+    $26 :
+    Begin
+      D := VR(fEdx);
+      MoveMem(VmLin(VmCurPsp, 0), VmLin(D, 0), 256);
+      MemW[0:VmLin(D, 2)] := MemW[0:VmLin(VmCurPsp, 2)];
+    End;
+    $29 : VmParseFcb;
+    $2A :
+    Begin
+      GetLocalTime(VmTmp);
+      VS(fEcx, MemW[0:VmTmp]);
+      VS(fEdx, (MemW[0:VmTmp + 2] Shl 8) Or MemW[0:VmTmp + 6]);
+      VSL(fEax, MemW[0:VmTmp + 4]);
+    End;
+    $2B, $2D : VSL(fEax, 0);
+    $2C :
+    Begin
+      GetLocalTime(VmTmp);
+      VS(fEcx, (MemW[0:VmTmp + 8] Shl 8) Or MemW[0:VmTmp + 10]);
+      VS(fEdx, (MemW[0:VmTmp + 12] Shl 8) Or ((Ticks Div 10) Mod 100));
+    End;
+    $2E : VmVerify := AL And 1;
+    $2F :
+    Begin
+      VSeg(fEs, VmDta Shr 16);
+      VS(fEbx, VmDta);
+    End;
+    $30 :
+    Begin
+      VS(fEax, $0007);
+      If AL = 1 Then VS(fEbx, $0000) Else VS(fEbx, $FF00);
+      VS(fEcx, 0);
+    End;
+    $31 : VmTerminate(AL, True, VR(fEdx));
+    $33 :
+      Case AL Of
+        0 : VSL(fEdx, VmBreak);
+        1 : VmBreak := VRL(fEdx) And 1;
+        2 :
+        Begin
+          N := VmBreak; VmBreak := VRL(fEdx) And 1; VSL(fEdx, N);
+        End;
+        5 : VSL(fEdx, 3);
+        6 :
+        Begin
+          VS(fEbx, $0007); VS(fEdx, $1000);
+        End;
+      Else
+        VSL(fEax, $FF);
+      End;
+    $34 :
+    Begin
+      VSeg(fEs, VmDosSeg);
+      VS(fEbx, 0);
+    End;
+    $35 :
+    Begin
+      N := MemL[0:VmRam + AL * 4];
+      VSeg(fEs, N Shr 16);
+      VS(fEbx, N);
+    End;
+    $36 : VmDiskFree(VRL(fEdx));
+    $37 :
+      If AL = 0 Then
+      Begin
+        VSL(fEdx, Ord('/'));
+        VSL(fEax, 0);
+      End
+      Else VSL(fEax, 0);
+    $38 : If AL = 0 Then VmCountry Else VmSetCF(False);
+    $39, $3A :
+    Begin
+      VmPathAt(VmPtr(fDs, fEdx), 0);
+      If AH = $39 Then N := CreateDirectoryA(VmTmp, 0)
+      Else N := RemoveDirectoryA(VmTmp);
+      If N = 0 Then VmFail(VmErrOf(5));
+    End;
+    $3B :
+    Begin
+      Path := VmPathAt(VmPtr(fDs, fEdx), 0);
+      D := Ord(Path[1]) - 65;
+      If Not VmDriveOk(D) Then VmFail(3)
+      Else If (Length(Path) > 3) And
+         (((GetFileAttributesA(VmTmp) And $10) = 0) Or
+          (GetFileAttributesA(VmTmp) = -1)) Then VmFail(3)
+      Else If Length(Path) > 66 Then VmFail(3)
+      Else
+      Begin
+        VmDir[D] := Copy(Path, 3, 66);
+        If VmDir[D] = '\' Then VmDir[D] := '';
+        If D = VmDrive Then CurDirS := Copy(Path, 1, 2) + VmDir[D];
+      End;
+    End;
+    $3C : VmOpenH(VmPathAt(VmPtr(fDs, fEdx), 0), 2, 2);
+    $5B : VmOpenH(VmPathAt(VmPtr(fDs, fEdx), 0), 2, 1);
+    $3D : VmOpenH(VmPathAt(VmPtr(fDs, fEdx), 0), AL, 3);
+    $5A :
+    Begin
+      P := VmPtr(fDs, fEdx);
+      Path := PStr(P);
+      If (Path <> '') And Not (Path[Length(Path)] In ['\', ':']) Then
+        Path := Path + '\';
+      Repeat
+        Inc(VmFindCnt);
+        S := VmOpen(VmFullPath(Path + 'PD' + HexStr(Ticks + VmFindCnt, 6)),
+                    2, 1);
+      Until (S >= 0) Or (VmLastErr <> 80);
+      If S < 0 Then VmFail(VmLastErr)
+      Else
+      Begin
+        PutPStr(P, Path + 'PD' + HexStr(Ticks + VmFindCnt, 6), 128);
+        H := VmHNew(S);
+        If H < 0 Then
+        Begin
+          SftRelease(S);
+          VmFail(4);
+        End
+        Else VS(fEax, H);
+      End;
+    End;
+    $3E :
+    Begin
+      If VmSftOf(VR(fEbx)) < 0 Then VmFail(6) Else VmHClose(VR(fEbx));
+    End;
+    $3F :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If S < 0 Then VmFail(6)
+      Else If SftDev[S] = 1 Then VS(fEax, VmConRead(VmPtr(fDs, fEdx),
+                                                     VR(fEcx)))
+      Else If SftDev[S] = 2 Then VS(fEax, 0)
+      Else If KReadFile(SftH[S], VmPtr(fDs, fEdx), VR(fEcx), N) Then
+        VS(fEax, N)
+      Else VmFail(5);
+    End;
+    $40 :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      N := VR(fEcx);
+      If S < 0 Then VmFail(6)
+      Else If SftDev[S] = 1 Then
+      Begin
+        P := VmPtr(fDs, fEdx);
+        For R := 0 To N - 1 Do VmConOut(Mem[0:P + R]);
+        VS(fEax, N);
+      End
+      Else If SftDev[S] = 2 Then VS(fEax, N)
+      Else If (SftMode[S] And 3) = 0 Then VmFail(5)
+      Else If N = 0 Then
+      Begin
+        SetEndOfFile(SftH[S]);
+        VS(fEax, 0);
+      End
+      Else
+      Begin
+        R := KWriteFile(SftH[S], VmPtr(fDs, fEdx), N);
+        If R < 0 Then VmFail(5) Else VS(fEax, R);
+      End;
+    End;
+    $41 :
+    Begin
+      VmPathAt(VmPtr(fDs, fEdx), 0);
+      If DeleteFileA(VmTmp) = 0 Then VmFail(VmErrOf(2));
+    End;
+    $42 :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If S < 0 Then VmFail(6)
+      Else If SftDev[S] <> 0 Then VS(fEax, 0)
+      Else If AL > 2 Then VmFail(1)
+      Else
+      Begin
+        R := SetFilePointer(SftH[S], (VR(fEcx) Shl 16) Or VR(fEdx), 0, AL);
+        If R = -1 Then VmFail(25)
+        Else
+        Begin
+          VS(fEax, R);
+          VS(fEdx, R Shr 16);
+        End;
+      End;
+    End;
+    $43 :
+    Begin
+      VmPathAt(VmPtr(fDs, fEdx), 0);
+      If AL = 0 Then
+      Begin
+        R := GetFileAttributesA(VmTmp);
+        If R = -1 Then VmFail(VmErrOf(2))
+        Else
+        Begin
+          If R = $80 Then R := 0;
+          VS(fEcx, R And $3F);
+          VS(fEax, R And $3F);
+        End;
+      End
+      Else If AL = 1 Then
+      Begin
+        If GetFileAttributesA(VmTmp) = -1 Then VmFail(2)
+        Else SetFileAttributesA(VmTmp, VR(fEcx));
+      End
+      Else VmFail(1);
+    End;
+    $44 : VmIoctl;
+    $45 :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If S < 0 Then VmFail(6)
+      Else
+      Begin
+        H := VmHNew(S);
+        If H < 0 Then VmFail(4)
+        Else
+        Begin
+          Inc(SftRef[S]);
+          VS(fEax, H);
+        End;
+      End;
+    End;
+    $46 :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If (S < 0) Or (VmJft(VR(fEcx)) = 0) Then VmFail(6)
+      Else
+      Begin
+        VmHClose(VR(fEcx));
+        Mem[0:VmJft(VR(fEcx))] := S;
+        Inc(SftRef[S]);
+      End;
+    End;
+    $47 :
+    Begin
+      D := VRL(fEdx);
+      If D = 0 Then D := VmDrive Else D := D - 1;
+      If Not VmDriveOk(D) Then VmFail(15)
+      Else
+      Begin
+        PutPStr(VmPtr(fDs, fEsi), Copy(VmDir[D], 2, 66), 64);
+        VS(fEax, $0100);
+      End;
+    End;
+    $48 :
+    Begin
+      N := McbAlloc(VR(fEbx), VmCurPsp, Max);
+      If N = 0 Then
+      Begin
+        VmFail(8);
+        VS(fEbx, Max);
+      End
+      Else VS(fEax, N);
+    End;
+    $49 : If McbValid(VR(fEs)) Then McbFree(VR(fEs)) Else VmFail(9);
+    $4A :
+      If Not McbValid(VR(fEs)) Then VmFail(9)
+      Else If Not McbResize(VR(fEs), VR(fEbx), Max) Then
+      Begin
+        VmFail(8);
+        VS(fEbx, Max);
+      End
+      Else If VR(fEs) = VmCurPsp Then
+        MemW[0:VmLin(VmCurPsp, 2)] := VmCurPsp + VR(fEbx);
+    $4B : VmExec;
+    $4C : VmTerminate(AL, False, 0);
+    $4D :
+    Begin
+      VS(fEax, VmRetCode);
+      VmRetCode := 0;
+    End;
+    $4E : VmFindStep(VmLin(VmDta Shr 16, VmDta), True);
+    $4F : VmFindStep(VmLin(VmDta Shr 16, VmDta), False);
+    $50 : VmCurPsp := VR(fEbx);
+    $51, $62 : VS(fEbx, VmCurPsp);
+    $52 :
+    Begin
+      VSeg(fEs, VmDosSeg);
+      VS(fEbx, VmLolO);
+    End;
+    $54 : VSL(fEax, VmVerify);
+    $55 :
+    Begin
+      D := VR(fEdx);
+      VmMakePsp(D, VR(fEsi) - D, MemW[0:VmLin(VmCurPsp, $2C)], VmCurPsp,
+                '');
+      MoveMem(VmLin(VmCurPsp, $80), VmLin(D, $80), 128);
+      VmCurPsp := D;
+    End;
+    $56 :
+    Begin
+      VmPathAt(VmPtr(fDs, fEdx), 0);
+      VmPathAt(VmPtr(fEs, fEdi), 256);
+      If MoveFileA(VmTmp, VmTmp + 256) = 0 Then VmFail(VmErrOf(5));
+    End;
+    $57 :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If (S < 0) Or (SftDev[S] <> 0) Then
+      Begin
+        If S < 0 Then VmFail(6);
+      End
+      Else If AL = 0 Then
+      Begin
+        D := 0; T := 0;
+        If GetFileTime(SftH[S], 0, 0, VmTmp) <> 0 Then
+          FileTimeToDosDateTime(VmTmp, LongInt(@D), LongInt(@T));
+        VS(fEcx, T); VS(fEdx, D);
+      End
+      Else If AL = 1 Then
+      Begin
+        DosDateTimeToFileTime(VR(fEdx), VR(fEcx), VmTmp);
+        SetFileTime(SftH[S], 0, 0, VmTmp);
+      End
+      Else VmFail(1);
+    End;
+    $58 :
+      Case AL Of
+        0 : VS(fEax, VmStrat);
+        1 : VmStrat := VR(fEbx);
+        2 : VSL(fEax, 0);
+        3 : ;
+      Else
+        VmFail(1);
+      End;
+    $59 :
+    Begin
+      VS(fEax, VmLastErr);
+      VS(fEbx, $0D01);
+      VSH(fEcx, 1);
+    End;
+    $5C : ;
+    $60 :
+    Begin
+      Path := VmFullPath(PStr(VmPtr(fDs, fEsi)));
+      PutPStr(VmPtr(fEs, fEdi), Path, 128);
+    End;
+    $63 :
+    Begin
+      VSeg(fDs, VmDosSeg);
+      VS(fEsi, VmDbcsO);
+      VSL(fEax, 0);
+    End;
+    $65 : VmCountryX;
+    $66 :
+    Begin
+      VS(fEbx, 437);
+      VS(fEdx, 437);
+    End;
+    $67 :
+    Begin
+      N := VR(fEbx);
+      P := VmLin(VmCurPsp, 0);
+      If N <= MemW[0:P + $32] Then
+      Begin
+        If N < 20 Then N := 20;
+      End
+      Else
+      Begin
+        D := McbAlloc((N + 15) Shr 4, VmCurPsp, Max);
+        If D = 0 Then VmFail(8)
+        Else
+        Begin
+          FillMem(VmLin(D, 0), N, $FF);
+          MoveMem(VmLin(MemW[0:P + $36], MemW[0:P + $34]), VmLin(D, 0),
+                  MemW[0:P + $32]);
+          MemW[0:P + $32] := N;
+          MemW[0:P + $34] := 0; MemW[0:P + $36] := D;
+        End;
+      End;
+    End;
+    $68, $6A :
+    Begin
+      S := VmSftOf(VR(fEbx));
+      If S < 0 Then VmFail(6)
+      Else If SftDev[S] = 0 Then FlushFileBuffers(SftH[S]);
+    End;
+    $69 :
+      If AL = 0 Then
+      Begin
+        P := VmPtr(fDs, fEdx);
+        MemW[0:P] := 0; MemL[0:P + 2] := $1995095;
+        PutPStr(VmTmp + 800, 'NO NAME    FAT16   ', 20);
+        MoveMem(VmTmp + 800, P + 6, 19);
+      End;
+    $6C :
+    Begin
+      Path := VmPathAt(VmPtr(fDs, fEsi), 0);
+      D := VR(fEdx);
+      If GetFileAttributesA(VmTmp) <> -1 Then
+      Begin
+        Case D And 3 Of
+          1 :
+          Begin
+            N := 3; R := 1;
+          End;
+          2 :
+          Begin
+            N := 2; R := 3;
+          End;
+        Else
+          N := 0;
+        End;
+      End
+      Else If (D And $10) <> 0 Then
+      Begin
+        N := 1; R := 2;
+      End
+      Else N := -1;
+      If N = 0 Then VmFail(80)
+      Else If N < 0 Then VmFail(2)
+      Else
+      Begin
+        VmOpenH(Path, VRL(fEbx), N);
+        If (MemL[0:VmF + fFl] And 1) = 0 Then VS(fEcx, R);
+      End;
+    End;
+    $71 : VmFail($7100);
+    $73 : VmFail($7300);
+  Else
+    VmFail(1);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Souris (INT 33h) : pointeur texte dans la console                  }
+{ ------------------------------------------------------------------ }
+
+Procedure VmMouReset;
+Var I : LongInt;
+Begin
+  VmMouShow := -1;
+  VmMouX := 320; VmMouY := 96;
+  VmMouMinX := 0; VmMouMaxX := 639; VmMouMinY := 0; VmMouMaxY := 199;
+  VmMouMask := 0; VmMouSeg := 0; VmMouOfs := 0; VmMouEv := 0;
+  VmMouMkX := 0; VmMouMkY := 0;
+  For I := 0 To 2 Do
+  Begin
+    VmMouPress[I] := 0; VmMouRel[I] := 0;
+  End;
+End;
+
+Procedure VmMouClip;
+Begin
+  If VmMouX < VmMouMinX Then VmMouX := VmMouMinX;
+  If VmMouX > VmMouMaxX Then VmMouX := VmMouMaxX;
+  If VmMouY < VmMouMinY Then VmMouY := VmMouMinY;
+  If VmMouY > VmMouMaxY Then VmMouY := VmMouMaxY;
+End;
+
+{ Evenement de la souris dans la console (tache 0) : X, Y relatifs a
+  la zone client }
+Procedure DosMouseIn(Msg, X, Y : LongInt);
+Var NX, NY, B, Ev, I : LongInt;
+Begin
+  If Not VmOn Then Exit;
+  NX := Max(0, Min(79, X Div ConCW)) * 8;
+  NY := Max(0, Min(24, Y Div ConChH)) * 8;
+  Ev := 0;
+  If (NX <> VmMouX) Or (NY <> VmMouY) Then
+  Begin
+    VmMouMkX := VmMouMkX + (NX - VmMouX);
+    VmMouMkY := VmMouMkY + (NY - VmMouY) * 2;
+    VmMouX := NX; VmMouY := NY;
+    VmMouClip;
+    Ev := 1;
+  End;
+  B := VmMouBtn;
+  Case Msg Of
+    WM_LBUTTONDOWN, WM_LBUTTONDBLCLK :
+    Begin
+      B := B Or 1; Ev := Ev Or 2; I := 0;
+    End;
+    WM_LBUTTONUP :
+    Begin
+      B := B And Not 1; Ev := Ev Or 4; I := 0;
+    End;
+    WM_RBUTTONDOWN :
+    Begin
+      B := B Or 2; Ev := Ev Or 8; I := 1;
+    End;
+    WM_RBUTTONUP :
+    Begin
+      B := B And Not 2; Ev := Ev Or $10; I := 1;
+    End;
+  Else
+    I := -1;
+  End;
+  If I >= 0 Then
+  Begin
+    If (Ev And $0A) <> 0 Then
+    Begin
+      Inc(VmMouPress[I]);
+      VmMouPX[I] := VmMouX; VmMouPY[I] := VmMouY;
+    End
+    Else
+    Begin
+      Inc(VmMouRel[I]);
+      VmMouRX[I] := VmMouX; VmMouRY[I] := VmMouY;
+    End;
+  End;
+  VmMouBtn := B;
+  VmMouEv := VmMouEv Or Ev;
+End;
+
+{ Appeler le gestionnaire d'evenements du programme (fonction 0Ch) }
+Function VmMouCall : Boolean;
+Var Ev : LongInt;
+Begin
+  VmMouCall := False;
+  Ev := VmMouEv And VmMouMask;
+  If (Ev = 0) Or (VmMouBusy <> 0) Or ((VmMouSeg = 0) And (VmMouOfs = 0))
+  Then
+  Begin
+    If VmMouBusy = 0 Then VmMouEv := 0;
+    Exit;
+  End;
+  VmMouEv := 0;
+  MoveMem(VmF, LongInt(@VmMouSave), 68);
+  VmMouBusy := 1 + Ord(VmIF);
+  VS(fEax, Ev); VS(fEbx, VmMouBtn); VS(fEcx, VmMouX); VS(fEdx, VmMouY);
+  VS(fEsi, VmMouMkX); VS(fEdi, VmMouMkY);
+  VmPush(VmBios); VmPush(VmMRetO);
+  VmGoto(VmMouSeg, VmMouOfs);
+  VmIF := False;
+  VmMouCall := True;
+End;
+
+Procedure VmInt33;
+Var AX, B : LongInt;
+Begin
+  AX := VR(fEax);
+  Case AX Of
+    $00, $21 :
+    Begin
+      VmMouReset;
+      VS(fEax, $FFFF);
+      VS(fEbx, 2);
+    End;
+    $01 : If VmMouShow < 0 Then Inc(VmMouShow);
+    $02 : Dec(VmMouShow);
+    $03 :
+    Begin
+      VS(fEbx, VmMouBtn); VS(fEcx, VmMouX); VS(fEdx, VmMouY);
+      VmIdle;
+    End;
+    $04 :
+    Begin
+      VmMouX := VR(fEcx) And Not 7; VmMouY := VR(fEdx) And Not 7;
+      VmMouClip;
+    End;
+    $05, $06 :
+    Begin
+      B := VR(fEbx);
+      If B > 2 Then B := 0;
+      VS(fEax, VmMouBtn);
+      If AX = 5 Then
+      Begin
+        VS(fEbx, VmMouPress[B]); VS(fEcx, VmMouPX[B]);
+        VS(fEdx, VmMouPY[B]);
+        VmMouPress[B] := 0;
+      End
+      Else
+      Begin
+        VS(fEbx, VmMouRel[B]); VS(fEcx, VmMouRX[B]);
+        VS(fEdx, VmMouRY[B]);
+        VmMouRel[B] := 0;
+      End;
+    End;
+    $07 :
+    Begin
+      VmMouMinX := Min(VR(fEcx), VR(fEdx));
+      VmMouMaxX := Max(VR(fEcx), VR(fEdx));
+      VmMouClip;
+    End;
+    $08 :
+    Begin
+      VmMouMinY := Min(VR(fEcx), VR(fEdx));
+      VmMouMaxY := Max(VR(fEcx), VR(fEdx));
+      VmMouClip;
+    End;
+    $0B :
+    Begin
+      VS(fEcx, VmMouMkX); VS(fEdx, VmMouMkY);
+      VmMouMkX := 0; VmMouMkY := 0;
+    End;
+    $0C :
+    Begin
+      VmMouMask := VR(fEcx); VmMouSeg := VR(fEs); VmMouOfs := VR(fEdx);
+    End;
+    $14 :
+    Begin
+      B := VmMouMask; VmMouMask := VR(fEcx); VS(fEcx, B);
+      B := VmMouSeg; VmMouSeg := VR(fEs); VSeg(fEs, B);
+      B := VmMouOfs; VmMouOfs := VR(fEdx); VS(fEdx, B);
+    End;
+    $15 : VS(fEbx, 16);
+    $1B :
+    Begin
+      VS(fEbx, 50); VS(fEcx, 50); VS(fEdx, 50);
+    End;
+    $1D, $1E : VS(fEbx, 0);
+    $24 :
+    Begin
+      VS(fEbx, $0626); VS(fEcx, $0400);
+    End;
+    $26 :
+    Begin
+      VS(fEbx, 0); VS(fEcx, 639); VS(fEdx, 199);
+    End;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Multiplexage (INT 2Fh) et ports d'E/S                              }
+{ ------------------------------------------------------------------ }
+
+Procedure VmInt2F;
+Var AX : LongInt;
+Begin
+  AX := VR(fEax);
+  Case AX Of
+    $1600 : VSL(fEax, 0);
+    $1680 :
+    Begin
+      VSL(fEax, 0);
+      KSleep(1);
+    End;
+    $1689 : KSleep(1);
+    $4300 : VSL(fEax, 0);
+    $4A01, $4A02 :
+    Begin
+      VS(fEbx, 0);
+      VSeg(fEs, $FFFF); VS(fEdi, $FFFF);
+    End;
+    $1A00, $B700, $1100, $0800, $AD00, $1000 : VSL(fEax, 0);
+  End;
+End;
+
+Function VmIn(Port : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  V := $FF;
+  Case Port Of
+    $20 : V := 0;
+    $21 : V := VmPicMask;
+    $A0, $A1 : V := 0;
+    $40 :
+    Begin
+      If VmPitMode = 0 Then
+      Begin
+        VmPitLatch := (VmPitDiv - ((Ticks * 1193 + VmPitAcc) Mod VmPitDiv))
+                      And $FFFF;
+        VmPitMode := 1;
+        V := VmPitLatch And $FF;
+      End
+      Else
+      Begin
+        V := (VmPitLatch Shr 8) And $FF;
+        VmPitMode := 0;
+      End;
+    End;
+    $60 : V := VmPort60;
+    $61 :
+    Begin
+      VmPort61 := VmPort61 Xor $10;
+      V := VmPort61;
+    End;
+    $64 : V := $1C;
+    $3C1 : V := 0;
+    $3C9 :
+    Begin
+      V := VmDac[VmDacRd Mod 768];
+      VmDacRd := (VmDacRd + 1) Mod 768;
+    End;
+    $3CC : V := $67;
+    $3D5 :
+      Case VmCrtIdx Of
+        $0A : V := Mem[0:VmBda($61)];
+        $0B : V := Mem[0:VmBda($60)];
+        $0E, $0F :
+        Begin
+          V := Mem[0:VmBda($51)] * 80 + Mem[0:VmBda($50)];
+          If VmCrtIdx = $0E Then V := V Shr 8 Else V := V And $FF;
+        End;
+      Else
+        V := 0;
+      End;
+    $3D4 : V := VmCrtIdx;
+    $3DA, $3BA :
+    Begin
+      VmRetr := VmRetr Xor 9;
+      VmAttrFF := 0;
+      V := VmRetr;
+    End;
+  End;
+  VmIn := V;
+End;
+
+Procedure VmOut(Port, V : LongInt);
+Var P : LongInt;
+Begin
+  V := V And $FF;
+  Case Port Of
+    $20 :
+      If V = $20 Then
+      Begin
+        If (VmIsr And 1) <> 0 Then VmIsr := VmIsr And Not 1
+        Else VmIsr := VmIsr And Not 2;
+      End
+      Else If (V And $F8) = $60 Then VmIsr := VmIsr And Not (1 Shl (V And 7));
+    $21 : VmPicMask := V;
+    $43 :
+      If (V And $C0) = 0 Then
+      Begin
+        If (V And $30) = 0 Then VmPitMode := 0
+        Else VmPitMode := 2;
+      End;
+    $40 :
+      If VmPitMode = 2 Then
+      Begin
+        VmPitLo := V;
+        VmPitMode := 3;
+      End
+      Else If VmPitMode = 3 Then
+      Begin
+        VmPitDiv := VmPitLo Or (V Shl 8);
+        If VmPitDiv = 0 Then VmPitDiv := 65536;
+        If VmPitDiv < 1193 Then VmPitDiv := 1193;
+        VmPitMode := 0;
+      End;
+    $61 : VmPort61 := V;
+    $3D4 : VmCrtIdx := V;
+    $3D5 :
+      Case VmCrtIdx Of
+        $0A : Mem[0:VmBda($61)] := V;
+        $0B : Mem[0:VmBda($60)] := V;
+        $0E, $0F :
+        Begin
+          P := Mem[0:VmBda($51)] * 80 + Mem[0:VmBda($50)];
+          If VmCrtIdx = $0E Then P := (P And $FF) Or (V Shl 8)
+          Else P := (P And $FF00) Or V;
+          If P < 2000 Then VmSetCur(0, P Mod 80, P Div 80);
+        End;
+      End;
+    $3C7 :
+    Begin
+      VmDacRd := V * 3;
+    End;
+    $3C8 :
+    Begin
+      VmDacIdx := V * 3;
+    End;
+    $3C9 :
+    Begin
+      VmDac[VmDacIdx Mod 768] := V And $3F;
+      VmDacIdx := (VmDacIdx + 1) Mod 768;
+    End;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Moniteur : fautes du mode V86                                      }
+{ ------------------------------------------------------------------ }
+
+Procedure VmCrash(Const Why : String);
+Var S, B : String; I : LongInt;
+Begin
+  S := HexStr(VR(fCs), 4) + ':' + HexStr(VR(fEip), 4);
+  KLog('DOS : ' + Why + ' en ' + S);
+  B := '';
+  For I := -8 To 7 Do
+    B := B + HexStr(Mem[0:VmLin(VR(fCs), VR(fEip) + I)], 2) + ' ';
+  KLog('  ' + VmRegStr);
+  KLog('  code ' + B);
+  VmConStr(#13#10 + 'Pasdows : ' + Why + ' en ' + S + #13#10);
+  VmTerminate(255, False, 0);
+End;
+
+Function VmCode(Cs, Ip : LongInt) : LongInt;
+Begin
+  VmCode := Mem[0:VmLin(Cs, Ip)];
+End;
+
+{ Instructions d'E/S : IN, OUT, INS, OUTS }
+Procedure VmPortOp(Op, Cs, Ip, N : LongInt; O32, Rep : Boolean);
+Var Port, Sz, Cnt, I, V, Di, Si, K : LongInt;
+Begin
+  If Op In [$E4..$E7] Then
+  Begin
+    Port := VmCode(Cs, Ip + N);
+    Inc(N);
+  End
+  Else Port := VR(fEdx);
+  If Op In [$E4, $E6, $EC, $EE, $6C, $6E] Then Sz := 1
+  Else If O32 Then Sz := 4 Else Sz := 2;
+  Case Op Of
+    $E4, $E5, $EC, $ED :
+    Begin
+      V := 0;
+      For K := 0 To Sz - 1 Do V := V Or (VmIn(Port + K) Shl (K * 8));
+      If Sz = 1 Then VSL(fEax, V)
+      Else If Sz = 2 Then VS(fEax, V)
+      Else MemL[0:VmF + fEax] := V;
+    End;
+    $E6, $E7, $EE, $EF :
+    Begin
+      V := MemL[0:VmF + fEax];
+      For K := 0 To Sz - 1 Do VmOut(Port + K, V Shr (K * 8));
+    End;
+    $6C, $6D, $6E, $6F :
+    Begin
+      If Rep Then Cnt := VR(fEcx) Else Cnt := 1;
+      For I := 1 To Cnt Do
+      Begin
+        If Op In [$6C, $6D] Then
+        Begin
+          Di := VR(fEdi);
+          For K := 0 To Sz - 1 Do
+            Mem[0:VmLin(VR(fEs), Di + K)] := VmIn(Port + K);
+          If (MemL[0:VmF + fFl] And $400) <> 0 Then VS(fEdi, Di - Sz)
+          Else VS(fEdi, Di + Sz);
+        End
+        Else
+        Begin
+          Si := VR(fEsi);
+          For K := 0 To Sz - 1 Do
+            VmOut(Port + K, Mem[0:VmLin(VR(fDs), Si + K)]);
+          If (MemL[0:VmF + fFl] And $400) <> 0 Then VS(fEsi, Si - Sz)
+          Else VS(fEsi, Si + Sz);
+        End;
+      End;
+      If Rep Then VS(fEcx, 0);
+    End;
+  End;
+  MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+End;
+
+{ Faute de protection generale : instruction sensible a emuler }
+Procedure VmGp;
+Var Cs, Ip, N, Op, V : LongInt; O32, Rep : Boolean;
+Begin
+  Cs := VR(fCs); Ip := VR(fEip);
+  N := 0; O32 := False; Rep := False;
+  Repeat
+    Op := VmCode(Cs, Ip + N);
+    Inc(N);
+    Case Op Of
+      $66 : O32 := True;
+      $F2, $F3 : Rep := True;
+      $26, $2E, $36, $3E, $64, $65, $67, $F0 : ;
+    Else
+      Break;
+    End;
+  Until N > 14;
+  Case Op Of
+    $CD :
+    Begin
+      V := VmCode(Cs, Ip + N);
+      MemL[0:VmF + fEip] := (Ip + N + 1) And $FFFF;
+      VmInt(V);
+    End;
+    $CC :
+    Begin
+      MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+      VmInt(3);
+    End;
+    $CE :
+    Begin
+      MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+      If (MemL[0:VmF + fFl] And $800) <> 0 Then VmInt(4);
+    End;
+    $CF :
+    Begin
+      If O32 Then
+      Begin
+        V := VmPop; VmPop;
+        VmGoto(VmPop, V); VmPop;
+        V := VmPop; VmPop;
+        VmLoadFlags(V);
+      End
+      Else
+      Begin
+        V := VmPop; VmGoto(VmPop, V);
+        VmLoadFlags(VmPop);
+      End;
+    End;
+    $9C :
+    Begin
+      MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+      If O32 Then VmPush(0);
+      VmPush(VmVFlags);
+    End;
+    $9D :
+    Begin
+      MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+      V := VmPop;
+      If O32 Then VmPop;
+      VmLoadFlags(V);
+    End;
+    $FA :
+    Begin
+      MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+      VmIF := False;
+    End;
+    $FB :
+    Begin
+      MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+      VmIF := True;
+    End;
+    $F4 :
+      If (Cs = VmBios) And (Ip >= VmStubO) And (Ip < VmStubO + 256) Then
+        VmService(Ip - VmStubO)
+      Else If (Cs = VmBios) And (Ip = VmExitO) Then VmQuit(VmRetCode)
+      Else If (Cs = VmBios) And (Ip = VmMRetO) Then
+      Begin
+        MoveMem(LongInt(@VmMouSave), VmF, 68);
+        VmIF := VmMouBusy = 2;
+        VmMouBusy := 0;
+      End
+      Else If (Cs = VmBios) And (Ip = VmCpmO) Then
+      Begin
+        { CALL 5 : fonction CL du DOS, puis retour a l'appelant }
+        VmPop;
+        V := VmPop;
+        VmGoto(V, VmPop);
+        VSH(fEax, VRL(fEcx));
+        VmPush(VmVFlags); VmPush(VR(fCs)); VmPush(VR(fEip));
+        VmService($21);
+      End
+      Else
+      Begin
+        MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+        If VmIF Then
+          While Not VmIrqPending And (VmMouEv And VmMouMask = 0) Do
+            KSleep(1);
+      End;
+    $E4..$E7, $EC..$EF, $6C..$6F : VmPortOp(Op, Cs, Ip, N, O32, Rep);
+  Else
+    VmCrash('instruction ' + HexStr(Op, 2) + 'h non geree');
+  End;
+End;
+
+{ Unite Crt de Turbo Pascal 7 (et 6) : l'etalonnage de Delay divise
+  par 55 le nombre de tours de boucle d'un top d'horloge (NOT AX, NOT
+  DX, MOV CX,55, DIV CX) ; sur un processeur rapide le quotient depasse
+  16 bits et le programme s'arretait sur l'erreur 200 (Division by
+  zero). Le quotient est ici limite a FFFFh, comme le font les
+  correctifs de l'unite Crt. }
+Function VmCrtFix : Boolean;
+Var Cs, Ip, I : LongInt;
+Const Pat : Array[0..8] Of Byte = ($F7, $D0, $F7, $D2, $B9, $37, $00,
+                                   $F7, $F1);
+Begin
+  VmCrtFix := False;
+  Cs := VR(fCs); Ip := VR(fEip);
+  For I := 0 To 8 Do
+    If VmCode(Cs, Ip - 7 + I) <> Pat[I] Then Exit;
+  VS(fEax, $FFFF);
+  VS(fEdx, 0);
+  MemL[0:VmF + fEip] := (Ip + 2) And $FFFF;
+  VmCrtFix := True;
+End;
+
+{ Point d'entree des souches : faute ou trappe du mode V86 }
+Procedure V86Trap(F : LongInt);
+Begin
+  VmF := F;
+  asm
+    sti
+  end;
+  Case VmVec Of
+    0 : If Not VmCrtFix Then VmInt(0);
+    13 : VmGp;
+    14 : VmCrash('acces a la memoire hors de la machine (' +
+                 HexStr(GetCr2, 8) + ')');
+    6 : VmCrash('code d''operation invalide');
+  Else
+    VmInt(VmVec);
+  End;
+  If VmIF And (VmMouEv <> 0) Then
+  Begin
+    If Not VmMouCall Then VmCheckIrq;
+  End
+  Else VmCheckIrq;
+  asm
+    cli
+  end;
+End;
+
+{ Services du BIOS et du DOS de la machine (IRET a la fin) }
+Procedure VmService(N : LongInt);
+Var V : LongInt;
+Begin
+  VmNoIret := False;
+  Case N Of
+    $00 :
+    Begin
+      VmConStr(#13#10'Divide overflow'#13#10);
+      VmTerminate(255, False, 0);
+    End;
+    $06 : VmCrash('code d''operation invalide');
+    $08 : VmInt08;
+    $09 : VmInt09;
+    $10 : VmInt10;
+    $11 : VS(fEax, MemW[0:VmBda($10)]);
+    $12 : VS(fEax, MemW[0:VmBda($13)]);
+    $13 : VmInt13;
+    $14 : VSH(fEax, $80);
+    $15 : VmInt15;
+    $16 : VmInt16;
+    $17 : VSH(fEax, $90);
+    $1A : VmInt1A;
+    $20 : VmTerminate(0, False, 0);
+    $21 : VmInt21;
+    $24 : VSL(fEax, 3);
+    $25, $26 :
+    Begin
+      { lecture et ecriture absolues : erreur ; le mot des indicateurs
+        reste sur la pile (RETF) }
+      VS(fEax, $0208);
+      VmSetCF(True);
+      V := VmPop; VmGoto(VmPop, V);
+      VmPush(VmVFlags);
+      VmNoIret := True;
+    End;
+    $27 : VmTerminate(0, True, (VR(fEdx) + 15) Shr 4);
+    $28 : VmIdle;
+    $29 : VmTty(VRL(fEax));
+    $2A : VSH(fEax, 0);
+    $2F : VmInt2F;
+    $33 : VmInt33;
+    $67 : VSH(fEax, $84);
+    $0A..$0F, $70..$77 : ;
+  End;
+  If Not VmNoIret Then VmIretRet;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Creation de la machine, ecran de la console, lancement et fin      }
+{ ------------------------------------------------------------------ }
+
+Function VmSetup : Boolean;
+Var I, A, D, Own, EnvP, S, Z : LongInt; E : String;
+Begin
+  VmSetup := False;
+  If Not PagingInit Then Exit;
+  VmBuildStubs;
+  Own := HeapOwner;
+  HeapOwner := 0;
+  If VmTmp = 0 Then VmTmp := KAlloc(1024);
+  HeapOwner := 1;
+  VmRamBlk := KAlloc($100000 + 4096);
+  VmPgBlk := KAlloc(3 * 4096);
+  HeapOwner := Own;
+  If (VmRamBlk = 0) Or (VmPgBlk = 0) Or (VmTmp = 0) Then Exit;
+  VmRam := (VmRamBlk + 4095) And Not 4095;
+  FillMem(VmRam, $100000, 0);
+  { pages : 0-FFFFFh -> le bloc ; zone haute (HMA) en lecture seule ;
+    le reste du premier 4 Mo au noyau seulement }
+  VmPd := (VmPgBlk + 4095) And Not 4095;
+  VmPt := VmPd + 4096;
+  MoveMem(KPd, VmPd, 4096);
+  MemL[0:VmPd] := VmPt Or 7;
+  For I := 0 To 255 Do MemL[0:VmPt + I * 4] := (VmRam + I * 4096) Or 7;
+  For I := 256 To 271 Do MemL[0:VmPt + I * 4] := (I * 4096) Or 5;
+  For I := 272 To 1023 Do MemL[0:VmPt + I * 4] := (I * 4096) Or 3;
+  { table des interruptions : un HLT par vecteur }
+  For I := 0 To 255 Do
+    MemL[0:VmRam + I * 4] := (LongInt(VmBios) Shl 16) + VmStubO + I;
+  MemL[0:VmRam + $1F * 4] := (LongInt(VmBios) Shl 16) + VmFontO + 1024;
+  MemL[0:VmRam + $43 * 4] := (LongInt(VmBios) Shl 16) + VmFontO;
+  MemL[0:VmRam + $1D * 4] := (LongInt(VmBios) Shl 16) + $0300;
+  MemL[0:VmRam + $1E * 4] := (LongInt(VmBios) Shl 16) + $0300;
+  MemL[0:VmRam + $41 * 4] := (LongInt(VmBios) Shl 16) + $0300;
+  MemL[0:VmRam + $46 * 4] := (LongInt(VmBios) Shl 16) + $0300;
+  { BIOS : souches, tables, police }
+  A := VmRam + $F0000;
+  FillMem(A + VmStubO, 256, $F4);
+  Mem[0:A + VmExitO] := $F4; Mem[0:A + VmCpmO] := $F4;
+  Mem[0:A + VmMRetO] := $F4; Mem[0:A + VmCpmO + 2] := $CB;
+  MemW[0:A + VmCfgO] := 8; Mem[0:A + VmCfgO + 2] := $FC;
+  Mem[0:A + VmCfgO + 3] := 1; Mem[0:A + VmCfgO + 5] := $70;
+  Mem[0:A + VmFuncO] := $FF; Mem[0:A + VmFuncO + 1] := $E0;
+  Mem[0:A + VmFuncO + 2] := $0F; Mem[0:A + VmFuncO + 7] := 7;
+  Mem[0:A + VmFuncO + 8] := 2; Mem[0:A + VmFuncO + 9] := 8;
+  For I := 0 To 7 Do
+  Begin
+    Mem[0:A + VmEgaO + I] := I;
+    Mem[0:A + VmEgaO + 8 + I] := $38 + I;
+  End;
+  Mem[0:A + VmEgaO + 6] := $14;
+  MoveMem(FontAddr, A + VmFontO, 4096);
+  Mem[0:A + $FFF0] := $EA; MemW[0:A + $FFF1] := $E05B;
+  MemW[0:A + $FFF3] := VmBios;
+  PutPStr(A + $FFF5, '11/14/95', 9);
+  Mem[0:A + $FFFE] := $FC;
+  { zone de donnees du BIOS }
+  MemW[0:VmBda($10)] := $0026;
+  MemW[0:VmBda($13)] := 640;
+  MemW[0:VmBda($1A)] := $1E; MemW[0:VmBda($1C)] := $1E;
+  MemW[0:VmBda($80)] := $1E; MemW[0:VmBda($82)] := $3E;
+  VmSetMode($83);
+  MemW[0:VmBda($63)] := $3D4;
+  Mem[0:VmBda($65)] := $29; Mem[0:VmBda($66)] := $30;
+  Mem[0:VmBda($75)] := 1;
+  Mem[0:VmBda($87)] := $60; Mem[0:VmBda($88)] := $09;
+  Mem[0:VmBda($89)] := $11; Mem[0:VmBda($8A)] := $0B;
+  Mem[0:VmBda($96)] := $10;
+  ReadRtc;
+  S := RtcHour * 3600 + RtcMin * 60 + RtcSec;
+  MemL[0:VmBda($6C)] := S * 18 + (S * 2065) Div 10000;
+  { donnees du DOS : liste des listes, peripherique NUL, tables }
+  D := VmLin(VmDosSeg, 0);
+  MemW[0:D + VmLolO - 2] := VmFirstMcb;
+  MemL[0:D + VmLolO] := -1; MemL[0:D + VmLolO + 4] := -1;
+  MemW[0:D + VmLolO + $10] := 512;
+  Mem[0:D + VmLolO + $20] := 2; Mem[0:D + VmLolO + $21] := 26;
+  MemL[0:D + VmLolO + $22] := -1;
+  MemW[0:D + VmLolO + $26] := $8004;
+  PutPStr(D + VmLolO + $2C, 'NUL     ', 9);
+  MemW[0:D + VmUpO] := 128;
+  For I := 0 To 127 Do Mem[0:D + VmUpO + 2 + I] := 128 + I;
+  { premier bloc : PSP racine, puis son environnement }
+  E := 'COMSPEC=C:\COMMAND.COM';
+  EnvP := (EnvLen + Length(E) + 24 + 15) Shr 4;
+  Z := VmRootEnv + EnvP;
+  Mem[0:McbA(VmFirstMcb)] := Ord('M');
+  MemW[0:McbA(VmFirstMcb) + 1] := VmRootPsp;
+  MemW[0:McbA(VmFirstMcb) + 3] := $10;
+  PutPStr(McbA(VmFirstMcb) + 8, 'COMMAND', 8);
+  Mem[0:McbA(VmRootEnv - 1)] := Ord('M');
+  MemW[0:McbA(VmRootEnv - 1) + 1] := VmRootPsp;
+  MemW[0:McbA(VmRootEnv - 1) + 3] := EnvP;
+  Mem[0:McbA(Z)] := Ord('Z');
+  MemW[0:McbA(Z) + 1] := 0;
+  MemW[0:McbA(Z) + 3] := $9FFF - Z;
+  A := VmLin(VmRootEnv, 0);
+  MoveMem(LongInt(@EnvBlk), A, EnvLen);
+  I := EnvLen;
+  If (I > 0) And (Mem[0:A + I - 1] <> 0) Then Inc(I);
+  If Not EnvFind('COMSPEC', S) Then
+  Begin
+    PutPStr(A + I, E, 64);
+    I := I + Length(E) + 1;
+  End;
+  Mem[0:A + I] := 0;
+  MemW[0:A + I + 1] := 1;
+  PutPStr(A + I + 3, 'C:\COMMAND.COM', 16);
+  { fichiers : CON (0-2), AUX et PRN (NUL) }
+  For I := 0 To VmMaxSft - 1 Do SftRef[I] := 0;
+  SftDev[0] := 1; SftRef[0] := 3; SftMode[0] := 2;
+  SftDev[1] := 2; SftRef[1] := 1; SftMode[1] := 2;
+  SftDev[2] := 2; SftRef[2] := 1; SftMode[2] := 2;
+  VmMakePsp(VmRootPsp, $10, VmRootEnv, 0, '');
+  A := VmLin(VmRootPsp, 0);
+  MemW[0:A + $16] := VmRootPsp;
+  Mem[0:A + $18] := 0; Mem[0:A + $19] := 0; Mem[0:A + $1A] := 0;
+  Mem[0:A + $1B] := 1; Mem[0:A + $1C] := 2;
+  MemL[0:A + $0A] := (LongInt(VmBios) Shl 16) + VmExitO;
+  MemL[0:VmRam + $22 * 4] := MemL[0:A + $0A];
+  VmCurPsp := VmRootPsp;
+  VmDta := (VmRootPsp Shl 16) Or $80;
+  For I := 0 To VmMaxFind - 1 Do VmFindH[I] := 0;
+  { lecteurs : repertoire courant du lecteur courant }
+  For I := 0 To 25 Do VmDir[I] := '';
+  VmDrive := Ord(UpCase(CurDirS[1])) - 65;
+  If (VmDrive < 0) Or (VmDrive > 25) Then VmDrive := 2;
+  VmDir[VmDrive] := Copy(CurDirS, 3, 66);
+  { horloge, clavier, souris }
+  VmPitDiv := 65536; VmPitAcc := 0; VmTickDue := 0; VmPitMode := 0;
+  VmLastMs := Ticks;
+  VmPicMask := 0; VmIsr := 0;
+  VmKqHead := 0; VmKqTail := 0; VmCurKey := 0; VmPort60 := 0;
+  VmPort61 := 0; VmRetr := 0;
+  VmMouReset; VmMouBusy := 0; VmMouBtn := 0;
+  VmStrat := 0; VmBreak := 0; VmVerify := 0; VmLastErr := 0;
+  VmPendScan := -1; VmLineOk := False; VmLine := ''; VmRetCode := 0;
+  VmIdleN := 0; VmFlHi := 0;
+  VmTrace := EnvFind('DOSTRACE', I);
+  { ecran : le contenu de la console }
+  For I := 0 To ConCols * ConRows - 1 Do
+    MemW[0:VmRam + $B8000 + I * 2] := (ConAt[I] Shl 8) Or ConCh[I];
+  VmSetCur(0, ConX, ConY);
+  VmSetup := True;
+End;
+
+{ Recopier l'ecran de la machine dans la console (tache 0) }
+Procedure DosPoll;
+Var I, A, C, At, Cell, X, Y, Pg : LongInt; Vis : Boolean;
+Begin
+  If Not VmOn Or (ConW < 0) Or (VmRam = 0) Then Exit;
+  VmShiftUpd;
+  If VmGfx Then Exit;
+  Pg := VmPage;
+  A := VmScrA(Pg);
+  Cell := -1;
+  If VmMouShow >= 0 Then Cell := (VmMouY Div 8) * 80 + VmMouX Div 8;
+  For I := 0 To ConCols * ConRows - 1 Do
+  Begin
+    C := Mem[0:A + I * 2];
+    At := Mem[0:A + I * 2 + 1];
+    If VmBlink Then At := At And $7F;
+    If I = Cell Then At := At Xor $77;
+    If (C <> ConCh[I]) Or (At <> ConAt[I]) Then
+    Begin
+      ConCh[I] := C;
+      ConAt[I] := At;
+      ConDirty(I Div ConCols);
+    End;
+  End;
+  VmGetCur(Pg, X, Y);
+  If X > ConCols - 1 Then X := ConCols - 1;
+  If Y > ConRows - 1 Then Y := ConRows - 1;
+  Vis := (Mem[0:VmBda($61)] And $20) = 0;
+  If (X <> ConX) Or (Y <> ConY) Or (Vis <> ConCurVis) Then
+  Begin
+    ConDirty(ConY);
+    ConX := X; ConY := Y;
+    ConCurVis := Vis;
+    ConDirty(Y);
+  End;
+End;
+
+{ Fin de la machine (KillApp) : fichiers fermes, memoire rendue par
+  KFreeOwner }
+Procedure DosStop;
+Var I : LongInt;
+Begin
+  If Not VmOn Then Exit;
+  DosPoll;
+  VmOn := False;
+  For I := 0 To VmMaxSft - 1 Do
+  Begin
+    If (SftRef[I] > 0) And (SftDev[I] = 0) Then CloseHandle(SftH[I]);
+    SftRef[I] := 0;
+  End;
+  For I := 0 To VmMaxFind - 1 Do
+    If VmFindH[I] <> 0 Then
+    Begin
+      FindClose(VmFindH[I]);
+      VmFindH[I] := 0;
+    End;
+  If VmT > 0 Then ThrCr3[VmT] := KPd;
+  VmRam := 0;
+  ConCurVis := True;
+  ConAttr := 7;
+  KLog('DOS : fin de la machine virtuelle');
+End;
+
+{ Tache de la machine : charger le programme puis l'executer }
+Function DosMain(P : LongInt) : LongInt;
+Var Err, Psp, Cs, Ip, Ss, Sp : LongInt;
+Begin
+  DosMain := 0;
+  Err := VmLoad(VmProg, VmArgs, 0, 0, 0, 0, Psp, Cs, Ip, Ss, Sp);
+  If Err <> 0 Then
+  Begin
+    VmConStr(L('Impossible de lancer ', 'Cannot run ', 'Kann nicht ',
+               'Impossibile eseguire ', 'No se puede ejecutar ') +
+             VmProg + ' (' + IntStr(Err) + ')'#13#10);
+    KLog('DOS : chargement de ' + VmProg + ' impossible (' + IntStr(Err) +
+         ')');
+    ExitProcessK(Err);
+    Exit;
+  End;
+  MemL[0:VmLin(Psp, $0A)] := (LongInt(VmBios) Shl 16) + VmExitO;
+  VmTopPsp := Psp;
+  VmCurPsp := Psp;
+  VmDta := (Psp Shl 16) Or $80;
+  FillMem(LongInt(@VmImg), SizeOf(VmImg), 0);
+  VmImg[fEip Div 4] := Ip; VmImg[fCs Div 4] := Cs;
+  VmImg[fFl Div 4] := $20202;
+  VmImg[fEsp Div 4] := Sp; VmImg[fSs Div 4] := Ss;
+  VmImg[fEs Div 4] := Psp; VmImg[fDs Div 4] := Psp;
+  VmImg[fEcx Div 4] := $FF; VmImg[fEdx Div 4] := Psp;
+  VmImg[fEsi Div 4] := Ip; VmImg[fEdi Div 4] := Sp;
+  VmImg[fEbp Div 4] := $091C;
+  VmIF := True;
+  VmLastMs := Ticks;
+  KLog('DOS : execution de ' + VmProg + ' en ' + HexStr(Cs, 4) + ':' +
+       HexStr(Ip, 4) + ', PSP ' + HexStr(Psp, 4));
+  VmRun;
+  KLog('DOS : ' + VmProg + ' termine (code ' + IntStr(VmExitCode) + ')');
+  ExitProcessK(VmExitCode);
+End;
+
+{ Programme MS-DOS : .COM, ou MZ sans en-tete PE ni NE }
+Function IsDosFile(Path : String) : Boolean;
+Var H, Got, L : LongInt; B : Array[0..63] Of Byte; Ext : String;
+Begin
+  IsDosFile := False;
+  Ext := UpStr(Copy(Path, Length(Path) - 3, 4));
+  If (Ext <> '.EXE') And (Ext <> '.COM') Then Exit;
+  H := KOpenFile(Path, False, 3);
+  If H = INVALID_HANDLE Then Exit;
+  FillMem(LongInt(@B), 64, 0);
+  KReadFile(H, LongInt(@B), 64, Got);
+  If (Got >= 2) And (((B[0] = $4D) And (B[1] = $5A)) Or
+                     ((B[0] = $5A) And (B[1] = $4D))) Then
+  Begin
+    IsDosFile := True;
+    L := MemL[0:LongInt(@B) + $3C];
+    If (Got = 64) And (L >= 64) And (L < GetFileSize(H, 0) - 4) Then
+    Begin
+      SetFilePointer(H, L, 0, 0);
+      KReadFile(H, LongInt(@B), 4, Got);
+      If (Got = 4) And (B[1] = $45) And ((B[0] = $50) Or (B[0] = $4E)) Then
+        IsDosFile := False;
+    End;
+  End
+  Else IsDosFile := Ext = '.COM';
+  CloseHandle(H);
+End;
+
+{ Lancer un programme MS-DOS dans la console }
+Function RunDos(Path, Args : String) : Boolean;
+Var T : LongInt; S : String;
+Begin
+  RunDos := True;
+  KLog('Lancement de ' + Path + ' (MS-DOS)');
+  If ChainDir <> '' Then CurDirS := ChainDir
+  Else CurDirS := ParentDir(Path);
+  If Length(CurDirS) = 3 Then CurDirS := Copy(CurDirS, 1, 2);
+  S := BaseName(Path);
+  If Pos('.', S) > 0 Then S := Copy(S, 1, Pos('.', S) - 1);
+  If ConW < 0 Then ConTitle := S;
+  ConEnsure;
+  If ConW >= 0 Then
+  Begin
+    Wnds[ConW].Text := S;
+    KRepaint(ConW);
+    TaskbarChanged;
+  End;
+  AppRunning := True;
+  AppConsole := True;
+  AppPath := Path;
+  AppBase := 0;
+  If Not VmSetup Then
+  Begin
+    HeapOwner := 0;
+    KFreeOwner(1);
+    AppRunning := False;
+    AppConsole := False;
+    MsgBoxOpen(S, L('Impossible de creer la machine virtuelle MS-DOS.',
+      'Cannot create the MS-DOS virtual machine.',
+      'Die virtuelle MS-DOS-Maschine kann nicht erstellt werden.',
+      'Impossibile creare la macchina virtuale MS-DOS.',
+      'No se puede crear la m'#160'quina virtual de MS-DOS.'), $10);
+    Exit;
+  End;
+  If Args <> '' Then VmArgs := ' ' + Args Else VmArgs := '';
+  VmProg := Path;
+  VmOn := True;
+  HeapOwner := 1;
+  AppProcObj := KObjNew(koProcess);
+  T := ThreadNew(LongInt(@DosMain), 0, $10000, True);
+  HeapOwner := 0;
+  If T < 0 Then
+  Begin
+    KillApp;
+    Exit;
+  End;
+  VmT := T;
+  AppMainT := T;
+End;
+
+{ ==================================================================== }
 { Partie 13 - Demarrage                                                }
 { ==================================================================== }
 
@@ -38745,6 +42633,7 @@ Begin
   Repeat
     ProcessInput;
     ChainPoll;
+    DosPoll;
     NetPoll;
     RunMMTimers;
     RunWave;
@@ -38785,6 +42674,8 @@ BEGIN
   HeapInit(ExeTop, MemTop);
   I := KAlloc(SizeOf(TMItemArr));
   Move(I, MItemsP, 4);
+  I := KAlloc(SizeOf(TGdiArr));
+  Move(I, Gdis, 4);
   Case Mem[0:BootInfo + 3] Mod 5 Of
     1 : Language := _English;
     2 : Language := _Germany;
