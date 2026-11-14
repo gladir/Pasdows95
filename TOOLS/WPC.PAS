@@ -8747,7 +8747,21 @@ Var SPI, TI : Integer;
 Begin
   TI := TypeAdd(TYK_PROCVAR, TName, 4, 4, False, -1);
   MakeProcSigType := TI;
-  If ProcCount >= MAX_PROC Then Exit;
+  If ProcCount >= MAX_PROC - 1 Then Exit;
+  { l index 0 signifie "sans signature" (TypeTab[].Lo) : jamais utilise }
+  If ProcCount = 0 Then
+  Begin
+    ProcTab[0].Name := ''; ProcTab[0].MangledName := '';
+    ProcTab[0].IsFunction := False; ProcTab[0].RetTypeIdx := -1;
+    ProcTab[0].ParamCount := 0; ProcTab[0].LocalCount := 0;
+    ProcTab[0].LocalSize := 0; ProcTab[0].BodyStart := -1;
+    ProcTab[0].BodyEnd := -1; ProcTab[0].IsForward := True;
+    ProcTab[0].IsExternal := True; ProcTab[0].SymIdx := -1;
+    ProcTab[0].ParentIdx := -1; ProcTab[0].VarMask := 0;
+    ProcTab[0].RetOffset := 0;
+    ProcCC[0] := 0; ProcIntr[0] := False;
+    ProcCount := 1;
+  End;
   SPI := ProcCount; Inc(ProcCount);
   ProcTab[SPI].Name := ''; ProcTab[SPI].MangledName := '';
   ProcTab[SPI].IsFunction := IsFunc; ProcTab[SPI].RetTypeIdx := -1;
@@ -9061,7 +9075,8 @@ Var
   End;
 
 Begin
-  ProcCount := 0;
+  { les signatures des types proceduraux deja analyses (MakeProcSigType)
+    sont gardees : leurs index sont dans TypeTab[].Lo }
   I := 0;
   Depth := 0;
 

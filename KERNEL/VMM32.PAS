@@ -16376,6 +16376,40 @@ Begin
   CpuName := S;
 End;
 
+{ Frequence approchee (compteur de cycles pendant 50 ms ; 0 sans TSC) }
+Function CpuMhz : LongInt;
+Var A, D, L0, H0, L1, H1, T, N : LongInt;
+Begin
+  CpuMhz := 0;
+  If Pos('80386', CpuName) > 0 Then Exit;
+  asm
+    push ebx
+    mov eax,1
+    db 0Fh,0A2h
+    mov D,edx
+    pop ebx
+  end;
+  If (D And $10) = 0 Then Exit;
+  T := Ticks; N := 0;
+  While (Ticks = T) And (N < 50000000) Do Inc(N);
+  If Ticks = T Then Exit;
+  asm
+    db 0Fh,31h
+    mov L0,eax
+    mov H0,edx
+  end;
+  T := Ticks;
+  While Ticks - T < 50 Do ;
+  asm
+    db 0Fh,31h
+    mov L1,eax
+    mov H1,edx
+  end;
+  A := (L1 Shr 1) - (L0 Shr 1) + (H1 - H0) * $7FFFFFFF;
+  If A < 0 Then Exit;
+  CpuMhz := A Div 25000;
+End;
+
 Procedure DmBuildRows;
 Var C, D : LongInt; Any : Boolean;
 Begin
@@ -28349,6 +28383,10 @@ Begin
   RegSetStr(S, 'DevicePath', 'C:\WINDOWS\INF');
   RegSetStr(S, 'MediaPath', 'C:\WINDOWS\MEDIA');
   RegWalk(2, S + '\App Paths', True);
+  RegSetStr('Hardware\Description\System\CentralProcessor\0',
+            'ProcessorNameString', CpuName);
+  RegSetStr('Hardware\Description\System\CentralProcessor\0',
+            '~MHz', IntStr(CpuMhz));
   RegSetStr('Software\Microsoft\DirectX', 'Version', '4.08.00.0400');
   RegSetStr('Software\Microsoft\DirectX', 'InstalledVersion',
             '4.08.00.0400');
@@ -43921,7 +43959,11 @@ End;
 Procedure D3DSetMtl(P : LongInt);
 Var I : LongInt;
 Begin
-  If SBRecord(5, 0, SBCopy(P, 68)) Then Exit;
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(5, 0, SBCopy(P, 68));
+    Exit;
+  End;
   For I := 0 To 16 Do D3G^.Mt[I] := FlM(P + I * 4);
 End;
 
@@ -43929,7 +43971,11 @@ Procedure D3DSetLight(I, P : LongInt);
 Var K : LongInt;
 Begin
   If (I < 0) Or (I > 15) Then Exit;
-  If SBRecord(6, I, SBCopy(P, 104)) Then Exit;
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(6, I, SBCopy(P, 104));
+    Exit;
+  End;
   D3G^.Lt[I].Typ := MemL[0:P];
   For K := 0 To 3 Do
   Begin
@@ -43982,7 +44028,11 @@ End;
 
 Procedure D3DSetVP7(P : LongInt);
 Begin
-  If SBRecord(8, 0, SBCopy(P, 24)) Then Exit;
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(8, 0, SBCopy(P, 24));
+    Exit;
+  End;
   D3G^.VX := MemL[0:P]; D3G^.VY := MemL[0:P + 4];
   D3G^.VW := MemL[0:P + 8]; D3G^.VH := MemL[0:P + 12];
   D3G^.VMinZ := FlM(P + 16); D3G^.VMaxZ := FlM(P + 20);
@@ -43996,7 +44046,11 @@ End;
 Procedure D3DSetMatK(K, P : LongInt);
 Var M : TMat;
 Begin
-  If SBRecord(4, K, SBCopy(P, 64)) Then Exit;
+  If D3G^.SBRec <> 0 Then
+  Begin
+    SBRecord(4, K, SBCopy(P, 64));
+    Exit;
+  End;
   MatLoad(M, P);
   D3DMatSet(K, M);
 End;
