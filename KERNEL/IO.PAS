@@ -24,9 +24,9 @@ Program IO;
 
     - ecran de demarrage texte, menu de demarrage (F8) ;
     - demarrage depuis le disque dur quand Pasdows y a ete installe
-      par INSTALL (secteur d'amorce FAT32 qui charge C:\IO.SYS) :
-      lecture de la FAT32 (racine et C:\WINDOWS), VMM32 recoit le
-      drapeau 4 (dossier systeme C:\WINDOWS) ;
+      par INSTALL (secteur d'amorce FAT16, FAT32, NTFS ou HPFS qui
+      charge C:\IO.SYS) : lecture du volume (racine et C:\WINDOWS),
+      VMM32 recoit le drapeau 4 (dossier systeme C:\WINDOWS) ;
     - lecture du CD-ROM ISO 9660 (INT 13h etendue), des options de
       MSDOS.SYS ([Options] BootMenu, BootGUI, Logo, BootDelay) et
       execution des commandes SET de AUTOEXEC.BAT (variables
@@ -50,7 +50,8 @@ Program IO;
     70000h-7FFFFh  texte du Bloc-notes
     80000h-807FFh  tampon d'un secteur du CD-ROM
     80800h-80BFFh  secteur de FAT et secteur de repertoire (disque dur)
-    89000h-8CFFFh  NTFS : enregistrement, bloc d'index, runs, file
+    89000h-8CFFFh  NTFS : enregistrement, bloc d'index, runs, file ;
+                   HPFS : fnode et anodes, dnode, extensions
     81000h-887FFh  lecture des fichiers (30 Ko)                     }
 
 {$S-,R-,I-}
@@ -258,6 +259,11 @@ Var
   Root16Lba, Root16Secs : LongInt;       { racine fixe de la FAT16 }
   { NTFS : partition, cluster, enregistrement, bloc d'index, runs }
   NtfsBoot    : Boolean;
+  HpfsBoot    : Boolean;                 { HPFS (NtPart : partition) }
+  HpFileIdx, HpFileN : Integer;          { extensions du fichier lu }
+  HpSkip      : LongInt;                 { premier secteur du fichier
+                                           couvert par ces extensions }
+  HpTrunc     : Boolean;                 { table pleine (suite omise) }
   NtPart, NtCb, NtRecSz, NtIdxSz, NtVcnSz : LongInt;
   NtSpc, NtMftN, NtQTail, NtFileIdx, NtFileN : Integer;
   NtFileRes   : Boolean;
@@ -1261,6 +1267,233 @@ Begin
   NtFileRead := NtStream(NFileRun, NtFileN, K * 2048, 2048, BSeg);
 End;
 
+{ ================================================================== }
+{ Disque dur HPFS (Pasdows installe par INSTALL sur une partition 07h) }
+{ ================================================================== }
+
+{ Fnodes et anodes lus en NRecSeg (un secteur par niveau de l'arbre
+  d'allocation), dnodes (2 Ko) en NIdxSeg, extensions du fichier lu
+  (secteur du fichier, longueur, secteur du volume) en NFileRun. }
+
+Const
+  HpMaxExt = 290;
+
+Function HpHd(Lba : LongInt; BSeg : Word; N : Integer) : Boolean;
+Begin
+  HpHd := HdRead(NtPart + Lba, BSeg, N);
+End;
+
+{ Dnode racine du repertoire de fnode Fn (0 si erreur) }
+Function HpDirDn(Fn : LongInt) : LongInt;
+Begin
+  HpDirDn := 0;
+  If Not HpHd(Fn, NRecSeg, 1) Then Exit;
+  If (GetD(NRecSeg, 0) <> $F7E40AAE) Or ((Mem[NRecSeg:55] And 1) = 0) Then
+    Exit;
+  HpDirDn := GetD(NRecSeg, 72);
+End;
+
+{ Secondes depuis 1970 -> date et heure de l'entree I de CdFiles }
+Procedure HpDate(I : Integer; T : LongInt);
+Var Days, Secs, Z, Era, Doe, Yoe, Y, Doy, Mp, D, M : LongInt;
+Begin
+  If T < 315532800 Then T := 315532800;
+  Days := T Div 86400;
+  Secs := T Mod 86400;
+  Z := Days + 719468;
+  Era := Z Div 146097;
+  Doe := Z - Era * 146097;
+  Yoe := (Doe - Doe Div 1460 + Doe Div 36524 - Doe Div 146096) Div 365;
+  Y := Yoe + Era * 400;
+  Doy := Doe - (365 * Yoe + Yoe Div 4 - Yoe Div 100);
+  Mp := (5 * Doy + 2) Div 153;
+  D := Doy - (153 * Mp + 2) Div 5 + 1;
+  If Mp < 10 Then M := Mp + 3 Else M := Mp - 9;
+  If M <= 2 Then Inc(Y);
+  CdFiles[I].Yr := Y - 1900; CdFiles[I].Mo := M; CdFiles[I].Dy := D;
+  CdFiles[I].Hr := Secs Div 3600; CdFiles[I].Mi := (Secs Div 60) Mod 60;
+End;
+
+{ Entrees du dnode Dn et de ses fils (arbre B) ajoutees a CdFiles ; le
+  dnode est relu apres chaque fils }
+Procedure HpList(Dn : LongInt; Depth : Integer; Var WinFn : LongInt);
+Var P, L : Word; Fl : Byte; K : Integer; Nm : String;
+Begin
+  If Depth > 8 Then Exit;
+  If Not HpHd(Dn, NIdxSeg, 4) Or (GetD(NIdxSeg, 0) <> $77E40AAE) Then Exit;
+  P := 20;
+  While P < 2048 Do
+  Begin
+    L := MemW[NIdxSeg:P];
+    If (L < 32) Or (P + L > 2048) Then Exit;
+    Fl := Mem[NIdxSeg:P + 2];
+    If (Fl And 4) <> 0 Then
+    Begin
+      HpList(GetD(NIdxSeg, P + L - 4), Depth + 1, WinFn);
+      If Not HpHd(Dn, NIdxSeg, 4) Then Exit;
+    End;
+    If (Fl And 8) <> 0 Then Exit;
+    If ((Fl And 1) = 0) And (CdCount < CdMax) Then
+    Begin
+      Nm := '';
+      For K := 0 To Mem[NIdxSeg:P + 30] - 1 Do
+        Nm := Nm + UpCase(Chr(Mem[NIdxSeg:P + 31 + K]));
+      CdFiles[CdCount].Name := Copy(Nm, 1, 12);
+      CdFiles[CdCount].Lba := GetD(NIdxSeg, P + 4);
+      CdFiles[CdCount].Size := GetD(NIdxSeg, P + 12);
+      CdFiles[CdCount].Dir := (Mem[NIdxSeg:P + 3] And $10) <> 0;
+      HpDate(CdCount, GetD(NIdxSeg, P + 8));
+      If CdFiles[CdCount].Dir And (Nm = 'WINDOWS') Then
+        WinFn := CdFiles[CdCount].Lba;
+      Inc(CdCount);
+    End;
+    P := P + L;
+  End;
+End;
+
+{ Volume HPFS du disque d'amorcage : racine puis C:\WINDOWS }
+Procedure HpScan;
+Var I, Ofs : Integer; Start, W, Dn : LongInt; T : Byte;
+Begin
+  If BootDrive < $80 Then Exit;
+  If Not HdRead(0, CdSeg, 1) Then Exit;
+  If MemW[CdSeg:510] <> $AA55 Then Exit;
+  Start := -1;
+  For I := 0 To 3 Do
+  Begin
+    Ofs := 446 + I * 16;
+    T := Mem[CdSeg:Ofs + 4];
+    If (T = $07) And ((Start < 0) Or (Mem[CdSeg:Ofs] = $80)) Then
+      Start := GetD(CdSeg, Ofs + 8);
+  End;
+  If Start < 0 Then Exit;
+  If Not HdRead(Start, CdSeg, 1) Then Exit;
+  If (GetD(CdSeg, 54) <> $53465048) Or (MemW[CdSeg:11] <> 512) Then Exit;
+  NtPart := Start;
+  VolLabel := '';
+  For I := 0 To 10 Do VolLabel := VolLabel + Chr(Mem[CdSeg:43 + I]);
+  VolLabel := Trim(VolLabel);
+  If Not HpHd(16, NRecSeg, 1) Or (GetD(NRecSeg, 0) <> $F995E849) Then Exit;
+  Dn := HpDirDn(GetD(NRecSeg, 12));
+  If Dn = 0 Then Exit;
+  CdCount := 0; W := -1;
+  HpList(Dn, 0, W);
+  If W >= 0 Then
+  Begin
+    Dn := HpDirDn(W);
+    If Dn <> 0 Then HpList(Dn, 0, W);
+  End;
+  HpFileIdx := -1;
+  HdBoot := True; HpfsBoot := True;
+  RootLba := 0; RootSize := 0;
+End;
+
+{ Arbre B+ d'allocation : en-tete en NRecSeg:Ofs (niveau Lvl) }
+Function HpTree(Ofs : Word; Lvl : Integer) : Boolean;
+Var I, N, W : Integer; A : Word;
+Begin
+  HpTree := False;
+  N := Mem[NRecSeg:Ofs + 5];
+  If (Mem[NRecSeg:Ofs] And $80) <> 0 Then
+  Begin
+    If Lvl >= 6 Then Exit;
+    A := (Lvl + 1) * 512;
+    For I := 0 To N - 1 Do
+    Begin
+      If HpTrunc Then Break;
+      { sous-arbre des secteurs < limite (-1 : le dernier) }
+      If (GetD(NRecSeg, Ofs + 8 + I * 8) = -1) Or
+         (GetD(NRecSeg, Ofs + 8 + I * 8) > HpSkip) Then
+      Begin
+        If Not HpHd(GetD(NRecSeg, Ofs + 12 + I * 8), NRecSeg + A Div 16, 1)
+        Then Exit;
+        If GetD(NRecSeg, A) <> $37E40AAE Then Exit;
+        If Not HpTree(A + 12, Lvl + 1) Then Exit;
+      End;
+    End;
+  End
+  Else
+    For I := 0 To N - 1 Do
+      If GetD(NRecSeg, Ofs + 8 + I * 12) + GetD(NRecSeg, Ofs + 12 + I * 12)
+         > HpSkip Then
+      If HpFileN >= HpMaxExt Then HpTrunc := True
+      Else
+      Begin
+        For W := 0 To 5 Do
+          MemW[NFileRun:HpFileN * 12 + W * 2] :=
+            MemW[NRecSeg:Ofs + 8 + I * 12 + W * 2];
+        Inc(HpFileN);
+      End;
+  HpTree := True;
+End;
+
+{ Extension du fichier Idx contenant son secteur FS (-1 : aucune, -2 :
+  erreur) ; la table est chargee au besoin a partir de FS }
+Function HpFind(Idx : Integer; FS : LongInt) : Integer;
+Var I : Integer; F0 : LongInt;
+Begin
+  HpFind := -2;
+  If HpFileIdx <> Idx Then
+  Begin
+    HpFileIdx := -1; HpFileN := 0; HpSkip := FS; HpTrunc := False;
+    If Not HpHd(CdFiles[Idx].Lba, NRecSeg, 1) Then Exit;
+    If GetD(NRecSeg, 0) <> $F7E40AAE Then Exit;
+    If Not HpTree(56, 0) Then Exit;
+    HpFileIdx := Idx;
+  End;
+  HpFind := -1;
+  For I := 0 To HpFileN - 1 Do
+  Begin
+    F0 := GetD(NFileRun, I * 12);
+    If (FS >= F0) And (FS < F0 + GetD(NFileRun, I * 12 + 4)) Then
+    Begin
+      HpFind := I;
+      Exit;
+    End;
+  End;
+End;
+
+{ Bloc K (2 Ko) du fichier HPFS Idx en Seg:0000 }
+Function HpFileRead(Idx : Integer; K : LongInt; BSeg : Word) : Boolean;
+Var J, I, N : Integer; FS, F0, L : LongInt;
+Begin
+  HpFileRead := False;
+  J := 0;
+  While J < 4 Do
+  Begin
+    FS := K * 4 + J;
+    N := 1;
+    I := HpFind(Idx, FS);
+    If I < 0 Then
+    Begin
+      { table pleine : la recharger a partir de ce secteur }
+      If HpTrunc Then HpFileIdx := -1;
+      I := HpFind(Idx, FS);
+      If I = -2 Then Exit;
+    End;
+    If I >= 0 Then
+    Begin
+      F0 := GetD(NFileRun, I * 12); L := GetD(NFileRun, I * 12 + 4);
+    End
+    Else I := HpFileN;
+    If I >= HpFileN Then
+    Begin
+      For N := 0 To 255 Do MemW[BSeg + J * 32:N * 2] := 0;
+      N := 1;
+    End
+    Else
+    Begin
+      { secteurs contigus de la meme extension }
+      N := 4 - J;
+      If F0 + L - FS < N Then N := F0 + L - FS;
+      If Not HpHd(GetD(NFileRun, I * 12 + 8) + FS - F0, BSeg + J * 32, N)
+      Then Exit;
+    End;
+    J := J + N;
+  End;
+  HpFileRead := True;
+End;
+
 { Lire le bloc K (2 Ko) du fichier Idx en Seg:0000 }
 Function FileRead(Idx : Integer; K : LongInt; BSeg : Word) : Boolean;
 Var J : Integer; S, Ci : LongInt;
@@ -1273,6 +1506,11 @@ Begin
   If NtfsBoot Then
   Begin
     FileRead := NtFileRead(Idx, K, BSeg);
+    Exit;
+  End;
+  If HpfsBoot Then
+  Begin
+    FileRead := HpFileRead(Idx, K, BSeg);
     Exit;
   End;
   FileRead := False;
@@ -7771,6 +8009,7 @@ BEGIN
   CdScan;
   If Not CdOk Then FatScan;
   If Not CdOk And Not HdBoot Then NtScan;
+  If Not CdOk And Not HdBoot Then HpScan;
   If HdBoot Then
   Begin
     SetEnv('PATH', 'C:\WINDOWS;C:\');
