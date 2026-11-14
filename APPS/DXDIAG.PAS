@@ -1462,7 +1462,13 @@ Begin
       12,
       True);
   Group(X - 4, B - 70, R, B, L('Remarques', 'Notes', 'Hinweise', 'Note', 'Notas'));
-  Txt(X + 12, B - 48, Chr(149) + ' DirectSound test: ' + TestDS);
+  Txt(X + 12,
+      B - 48,
+      L('- Test DirectSound : ',
+      '- DirectSound test: ',
+      '- DirectSound-Test: ',
+      '- Prova DirectSound: ',
+      '- Prueba DirectSound: ') + TestDS);
 End;
 
 Procedure PageMusic(X, Y, R, B : LongInt);
