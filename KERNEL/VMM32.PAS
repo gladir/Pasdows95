@@ -9375,6 +9375,19 @@ Begin
   End;
 End;
 
+{ VirtualBox (partie 18) : VMMDev present, souris absolue, pointeur
+  dessine par l'hote }
+Var
+  VbPort  : LongInt;
+  VbIrq, VbMmio : LongInt;
+  VbAbs   : Boolean;
+  VbHwPtr : Boolean;
+  VbGfx   : Boolean;                 { carte VBoxVGA (80EE:BEEF) }
+
+Procedure VbPtrSync; Forward;
+Function VbMousePos(Var X, Y : LongInt) : Boolean; Forward;
+Procedure VbPoll; Forward;
+
 { Forme du pointeur : fleche (0), sablier (1) }
 Procedure CursorSetShape(K : LongInt);
 Var R, I : LongInt; Ch : Char;
@@ -9443,6 +9456,13 @@ End;
 Procedure CursorDraw;
 Var X, Y, PX, PY, V, A : LongInt;
 Begin
+  If VbHwPtr Then
+  Begin
+    { VirtualBox dessine le pointeur (forme donnee a l'hote) }
+    VbPtrSync;
+    CurShownB := False;
+    Exit;
+  End;
   If CurHide < 0 Then Exit;
   If VgaPlanar Then
   Begin
@@ -9472,6 +9492,7 @@ End;
 Procedure CursorErase;
 Var R : TRect;
 Begin
+  If VbHwPtr Then VbPtrSync;
   If Not CurShownB Then Exit;
   CursorRect(R);
   LfbCopy(R);
@@ -11405,8 +11426,11 @@ Begin
 End;
 
 { Traiter les evenements materiels en attente }
+Var
+  VbPosAt : LongInt;
+
 Procedure ProcessInput;
-Var B, Dx, Dy, Bt, NX, NY : LongInt; Moved : Boolean;
+Var B, Dx, Dy, Bt, NX, NY, AX, AY : LongInt; Moved : Boolean;
 Begin
   While KbHead <> KbTail Do
   Begin
@@ -11421,10 +11445,31 @@ Begin
   End;
   Moved := False;
   NX := CurX; NY := CurY;
+  { VirtualBox : evenements de l'hote ; souris integree : position
+    absolue (lue a chaque paquet PS/2 et regulierement) }
+  If VbPort <> 0 Then
+  Begin
+    VbPoll;
+    If VbAbs And ((MouHead <> MouTail) Or (Ticks - VbPosAt >= 0)) Then
+    Begin
+      VbPosAt := Ticks + 15;
+      If VbMousePos(AX, AY) And ((AX <> CurX) Or (AY <> CurY)) Then
+      Begin
+        DIMX := DIMX + AX - CurX; DIMY := DIMY + AY - CurY;
+        NX := AX; NY := AY;
+        CursorMoveTo(NX, NY);
+        Moved := True;
+      End;
+    End;
+  End;
   While MouHead <> MouTail Do
   Begin
     Dx := MouQDx[MouHead]; Dy := MouQDy[MouHead]; Bt := MouQBtn[MouHead];
     MouHead := (MouHead + 1) And 255;
+    If VbAbs Then
+    Begin
+      Dx := 0; Dy := 0;
+    End;
     NX := NX + Dx; NY := NY + Dy;
     DIMX := DIMX + Dx; DIMY := DIMY + Dy; DIMBtn := Bt;
     If NX < 0 Then NX := 0;
@@ -14376,6 +14421,16 @@ Begin
   If DispiOk Then KLog('Ecran : interface VBE DISPI ' + HexStr(V, 4));
 End;
 
+{ Memoire video annoncee par DISPI (registre 0Ah, en 64 Ko) ; 0 si la
+  valeur n'est pas plausible }
+Function DispiVram : LongInt;
+Var V : LongInt;
+Begin
+  V := DispiR($0A);
+  If (V >= 16) And (V <= 16384) Then DispiVram := V * 65536
+  Else DispiVram := 0;
+End;
+
 { Mode W x H en B bits par point, memoire lineaire (DISPI) }
 Function DispiSet(W, H, B : LongInt) : Boolean;
 Begin
@@ -14404,21 +14459,18 @@ End;
 { Passer au mode I de la table, sans redemarrer : nouvel ecran, barre
   des taches et fenetres agrandies a la nouvelle taille, fenetres
   ramenees dans l'ecran, WM_DISPLAYCHANGE aux programmes }
-Function KSetMode(I : LongInt) : Boolean;
+Function KApplyMode(NW, NH, NB, MaskA, NLfb, Num : LongInt) : Boolean;
 Var W, X, Y : LongInt;
 Begin
-  KSetMode := False;
-  If (I < 0) Or (I >= VmN) Or Not DispiOk Then Exit;
-  If Not DispiSet(VmW[I], VmH[I], VmBpp[I]) Then Exit;
   CurShownB := False;
-  ScrW := VmW[I]; ScrH := VmH[I]; ScrBpp := VmBpp[I];
+  ScrW := NW; ScrH := NH; ScrBpp := NB;
   ScrBytes := (ScrBpp + 7) Div 8;
   TaskY := ScrH - TaskH;
-  ScrMode := VmNum[I];
-  VideoMasks(LongInt(@VmMask) + I * 6);
+  ScrMode := Num;
+  VideoMasks(MaskA);
   VgaPlanar := False;
   LfbPitch := ScrW * ScrBytes;
-  If VmLfb[I] <> 0 Then Lfb := VmLfb[I];
+  If NLfb <> 0 Then Lfb := NLfb;
   SurfFree(Back);
   SurfNew(Back, ScrW, ScrH);
   FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
@@ -14449,7 +14501,46 @@ Begin
   MarkAll;
   KLog('Ecran : ' + IntStr(ScrW) + 'x' + IntStr(ScrH) + 'x' +
        IntStr(ScrBpp) + ' (mode ' + HexStr(ScrMode, 3) + ')');
-  KSetMode := True;
+  KApplyMode := True;
+End;
+
+Function KSetMode(I : LongInt) : Boolean;
+Begin
+  KSetMode := False;
+  If (I < 0) Or (I >= VmN) Or Not DispiOk Then Exit;
+  If Not DispiSet(VmW[I], VmH[I], VmBpp[I]) Then Exit;
+  KSetMode := KApplyMode(VmW[I], VmH[I], VmBpp[I],
+                         LongInt(@VmMask) + I * 6, VmLfb[I], VmNum[I]);
+End;
+
+{ Mode quelconque W x H x B par DISPI (taille demandee par VirtualBox) :
+  composantes et memoire lineaire d'un mode VESA de meme profondeur ;
+  largeur ramenee a un multiple de 8 si la carte l'exige }
+Function KSetModeWH(W, H, B : LongInt) : Boolean;
+Var I, K, V : LongInt; Z : Array[0..5] Of Byte;
+Begin
+  KSetModeWH := False;
+  If Not DispiOk Then Exit;
+  V := DispiVram;
+  If (V > 0) And (W * H * ((B + 7) Div 8) > V) Then Exit;
+  If Not DispiSet(W, H, B) Then
+  Begin
+    W := W And Not 7;
+    If Not DispiSet(W, H, B) Then
+    Begin
+      { revenir au mode courant }
+      DispiSet(ScrW, ScrH, ScrBpp);
+      Exit;
+    End;
+  End;
+  K := -1;
+  For I := VmN - 1 DownTo 0 Do If VmBpp[I] = B Then K := I;
+  FillMem(LongInt(@Z), 6, 0);
+  If K >= 0 Then
+    KSetModeWH := KApplyMode(W, H, B, LongInt(@VmMask) + K * 6, VmLfb[K],
+                             $FFFF)
+  Else
+    KSetModeWH := KApplyMode(W, H, B, LongInt(@Z), 0, $FFFF);
 End;
 
 Function DispCurBpp : LongInt;
@@ -15764,6 +15855,16 @@ Begin
 End;
 
 { Nom d'un circuit PCI connu ('' sinon) }
+{ Carte reseau (partie 16) : genre, registres, nom }
+Const
+  NkNe2000 = 1; NkPcnet = 2; NkE1000 = 3;
+
+Var
+  NicKind   : LongInt;
+  NicMmio   : LongInt;             { E1000 : registres en memoire }
+  NicIrq    : LongInt;
+  NicDesc   : String;              { nom pour winipcfg }
+
 Function PciName(Id : LongInt) : String;
 Begin
   Case Id Of
@@ -15797,7 +15898,10 @@ Begin
                              'VGA est'#160'ndar (VBE Bochs/QEMU)');
     $802910EC : PciName := 'Realtek RTL8029 (NE2000 PCI)';
     $813910EC : PciName := 'Realtek RTL8139 Fast Ethernet';
-    $100E8086 : PciName := 'Intel PRO/1000 MT';
+    $100E8086 : PciName := 'Intel PRO/1000 MT Desktop (82540EM)';
+    $10048086 : PciName := 'Intel PRO/1000 T Server (82543GC)';
+    $100F8086 : PciName := 'Intel PRO/1000 MT Server (82545EM)';
+    $20001022 : PciName := 'AMD PCnet (Am79C970A / Am79C973)';
     $50001274 : PciName := 'Ensoniq AudioPCI (ES1370)';
     $24158086 : PciName := 'Intel 82801AA AC''97 Audio';
     $88115333 : PciName := 'S3 Trio32/64';
@@ -15855,6 +15959,8 @@ Begin
       Irq := PciRead(0, D, F, $3C) And 255;
       R := '';
       If (Irq > 0) And (Irq < 16) Then R := RIrq(Irq);
+      { VMMDev de VirtualBox : entree propre (peripheriques systeme) }
+      If (Id = LongInt($CAFE80EE)) And (VbPort <> 0) Then Continue;
       Case Cl Of
         $0300, $0380 : If PciDispName = '' Then PciDispName := N;
         $0200 : If PciNetName = '' Then
@@ -15883,7 +15989,7 @@ Begin
 End;
 
 Procedure DevScan;
-Var I, V : LongInt; N, Std : String;
+Var I, V : LongInt; N, Std, R : String;
 Begin
   DevN := 0;
   Std := '(' + L('P'#130'riph'#130'riques standard', 'Standard devices',
@@ -15897,7 +16003,11 @@ Begin
     N := L('Carte VGA standard', 'Standard VGA display adapter',
            'Standard-VGA-Grafikkarte', 'Scheda VGA standard',
            'Adaptador VGA est'#160'ndar');
-  If VmN > 0 Then
+  If VbGfx Then
+    DevAdd(0, N, 'Oracle Corporation', RIo($3B0, $3BB) + RIo($3C0, $3DF) +
+           RIo($1CE, $1CF) + 'M000A0000-000BFFFF|M' + HexStr(Lfb, 8) +
+           '-' + HexStr(Lfb + Max(DispiVram, $1000000) - 1, 8) + '|')
+  Else If VmN > 0 Then
     DevAdd(0, N, 'VESA ' + IntStr(MemW[0:BootInfo + $40] Shr 8) + '.' +
            IntStr(MemW[0:BootInfo + $40] And 255), RIo($3B0, $3BB) +
            RIo($3C0, $3DF) + 'M000A0000-000BFFFF|M' + HexStr(Lfb, 8) +
@@ -15912,10 +16022,30 @@ Begin
          'Keyboard', 'Standardtastatur (101/102 Tasten)',
          'Tastiera standard a 101/102 tasti', 'Teclado est'#160'ndar 101/102'),
          Std, RIo($60, $60) + RIo($64, $64) + RIrq(1));
-  If MouOk Then
+  If MouOk And (VbPort <> 0) Then
+    DevAdd(11, L('Souris VirtualBox (int'#130'gration)',
+           'VirtualBox Mouse Integration', 'VirtualBox-Mausintegration',
+           'Mouse VirtualBox (integrazione)',
+           'Mouse de VirtualBox (integraci'#162'n)'), 'Oracle Corporation',
+           RIo($60, $60) + RIo($64, $64) + RIrq(12))
+  Else If MouOk Then
     DevAdd(11, L('Souris PS/2 standard', 'Standard PS/2 Port Mouse',
            'PS/2-Standardmaus', 'Mouse PS/2 standard',
            'Mouse PS/2 est'#160'ndar'), Std, RIrq(12));
+  If VbPort <> 0 Then
+  Begin
+    R := RIo(VbPort, VbPort + $1F);
+    If VbMmio <> 0 Then
+      R := R + 'M' + HexStr(VbMmio, 8) + '-' + HexStr(VbMmio + $3FFFFF, 8) +
+           '|';
+    If (VbIrq > 0) And (VbIrq < 16) Then R := R + RIrq(VbIrq);
+    DevAdd(9, L('P'#130'riph'#130'rique VirtualBox (Guest Additions)',
+           'VirtualBox Guest Additions Device',
+           'VirtualBox-Gastger'#132't (Guest Additions)',
+           'Periferica VirtualBox (Guest Additions)',
+           'Dispositivo VirtualBox (Guest Additions)'), 'Oracle Corporation',
+           R);
+  End;
   { disques : controleur IDE, disques ATA, CD-ROM ATAPI }
   If PciIdeName <> '' Then N := PciIdeName
   Else N := L('Contr'#147'leur IDE standard (double FIFO)',
@@ -15954,7 +16084,19 @@ Begin
     DevAdd(6, N, Std, '');
   End;
   { reseau, son }
-  If NicBase <> 0 Then
+  If NicKind = NkPcnet Then
+  Begin
+    R := RIo(NicBase, NicBase + $1F);
+    If (NicIrq > 0) And (NicIrq < 16) Then R := R + RIrq(NicIrq);
+    DevAdd(1, NicDesc, 'Advanced Micro Devices (AMD)', R);
+  End
+  Else If NicKind = NkE1000 Then
+  Begin
+    R := 'M' + HexStr(NicMmio, 8) + '-' + HexStr(NicMmio + $1FFFF, 8) + '|';
+    If (NicIrq > 0) And (NicIrq < 16) Then R := R + RIrq(NicIrq);
+    DevAdd(1, NicDesc, 'Intel', R);
+  End
+  Else If NicBase <> 0 Then
   Begin
     If PciNetName <> '' Then N := PciNetName
     Else N := L('Compatible NE2000', 'NE2000 Compatible', 'NE2000-kompatibel',
@@ -36627,6 +36769,392 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
+{ Pilote AMD PCnet (Am79C970A PCnet-PCI II, Am79C973 PCnet-FAST III : }
+{ cartes par defaut de VirtualBox, "pcnet" de QEMU)                    }
+{ ------------------------------------------------------------------ }
+{ Ports en mode 16 bits (WIO) : RDP +10h, RAP +12h, RESET +14h, BDP
+  +16h ; adresse Ethernet dans l'APROM (+0..+5). Structures 32 bits
+  (BCR20 SWSTYLE = 2) : bloc d'initialisation de 28 octets, anneaux de
+  descripteurs de 16 octets (adresse, OWN/ERR/STP/ENP et longueur en
+  complement a deux, nombre d'octets recus) en memoire du noyau
+  (adresses physiques = lineaires). Scrutation, sans interruption. }
+
+Const
+  PcRxN = 16;                      { descripteurs de reception }
+  PcTxN = 8;                       { descripteurs d'emission }
+  PcBuf = 1536;
+  E1RxN = 32; E1TxN = 8;
+
+Var
+  NicRing, NicBufs, NicRxCur, NicTxCur : LongInt;
+
+Function IoInL(P : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  asm
+    mov edx,P
+    in eax,dx
+    mov V,eax
+  end;
+  IoInL := V;
+End;
+
+Procedure IoOutL(P, V : LongInt);
+Begin
+  asm
+    mov edx,P
+    mov eax,V
+    out dx,eax
+  end;
+End;
+
+Function PcCsr(R : LongInt) : LongInt;
+Begin
+  PortW[NicBase + $12] := R;
+  PcCsr := PortW[NicBase + $10];
+End;
+
+Procedure PcSetCsr(R, V : LongInt);
+Begin
+  PortW[NicBase + $12] := R;
+  PortW[NicBase + $10] := V;
+End;
+
+Procedure PcSetBcr(R, V : LongInt);
+Begin
+  PortW[NicBase + $12] := R;
+  PortW[NicBase + $16] := V;
+End;
+
+{ Descripteurs : anneau de reception (PcRxN), puis d'emission (PcTxN),
+  puis le bloc d'initialisation ; tampons de 1536 octets }
+Function PcRxD(I : LongInt) : LongInt;
+Begin
+  PcRxD := NicRing + I * 16;
+End;
+
+Function PcTxD(I : LongInt) : LongInt;
+Begin
+  PcTxD := NicRing + (PcRxN + I) * 16;
+End;
+
+Function PcInit : Boolean;
+Var I, V, A, Ib, HO : LongInt;
+Begin
+  PcInit := False;
+  { reinitialisation (lecture de RESET en mode 16 bits), structures 32
+    bits }
+  V := PortW[NicBase + $14];
+  KSleep(2);
+  PcSetBcr(20, $0102);
+  For I := 0 To 5 Do NicMac[I] := Port[NicBase + I];
+  If NicRing = 0 Then
+  Begin
+    HO := HeapOwner; HeapOwner := 0;
+    NicRing := KAlloc((PcRxN + PcTxN) * 16 + 64 + 16);
+    NicBufs := KAlloc((PcRxN + PcTxN) * PcBuf + 16);
+    HeapOwner := HO;
+    If (NicRing = 0) Or (NicBufs = 0) Then Exit;
+    NicRing := (NicRing + 15) And Not 15;
+    NicBufs := (NicBufs + 15) And Not 15;
+  End;
+  For I := 0 To PcRxN - 1 Do
+  Begin
+    A := PcRxD(I);
+    MemL[0:A] := NicBufs + I * PcBuf;
+    MemL[0:A + 4] := LongInt($8000F000) Or ((-PcBuf) And $FFF);
+    MemL[0:A + 8] := 0; MemL[0:A + 12] := 0;
+  End;
+  For I := 0 To PcTxN - 1 Do
+  Begin
+    A := PcTxD(I);
+    MemL[0:A] := NicBufs + (PcRxN + I) * PcBuf;
+    MemL[0:A + 4] := 0; MemL[0:A + 8] := 0; MemL[0:A + 12] := 0;
+  End;
+  { bloc d'initialisation : mode, longueurs (log2), adresse, filtre,
+    anneaux }
+  Ib := NicRing + (PcRxN + PcTxN) * 16;
+  FillMem(Ib, 32, 0);
+  MemL[0:Ib] := (4 Shl 20) Or (3 Shl 28);       { 16 / 8 descripteurs }
+  For I := 0 To 5 Do Mem[0:Ib + 4 + I] := NicMac[I];
+  MemL[0:Ib + 20] := PcRxD(0);
+  MemL[0:Ib + 24] := PcTxD(0);
+  PcSetCsr(1, Ib And $FFFF);
+  PcSetCsr(2, (Ib Shr 16) And $FFFF);
+  PcSetCsr(3, $5F00);                           { interruptions masquees }
+  PcSetCsr(4, $0915);                           { remplissage automatique }
+  PcSetCsr(0, $0001);                           { INIT }
+  I := 0;
+  While ((PcCsr(0) And $0100) = 0) And (I < 200) Do
+  Begin
+    KSleep(1);
+    Inc(I);
+  End;
+  If (PcCsr(0) And $0100) = 0 Then Exit;
+  PcSetCsr(0, $0102);                           { IDON acquitte, STRT }
+  NicRxCur := 0; NicTxCur := 0;
+  PcInit := True;
+End;
+
+Procedure PcSend(Src, Len : LongInt);
+Var A, I : LongInt;
+Begin
+  If Len > PcBuf Then Exit;
+  A := PcTxD(NicTxCur);
+  I := 0;
+  While (MemL[0:A + 4] < 0) And (I < 100) Do
+  Begin
+    KSleep(1);
+    Inc(I);
+  End;
+  If MemL[0:A + 4] < 0 Then Exit;               { toujours a la carte }
+  MoveMem(Src, MemL[0:A], Len);
+  MemL[0:A + 8] := 0;
+  MemL[0:A + 4] := LongInt($8300F000) Or ((-Len) And $FFF);
+  PcSetCsr(0, $0008);                           { TDMD : emettre }
+  NicTxCur := (NicTxCur + 1) Mod PcTxN;
+  Inc(NetPktOut);
+End;
+
+Function PcRecv(Dst : LongInt) : LongInt;
+Var A, F, Len : LongInt;
+Begin
+  PcRecv := 0;
+  A := PcRxD(NicRxCur);
+  F := MemL[0:A + 4];
+  If F < 0 Then Exit;                           { OWN : vide }
+  Len := (MemL[0:A + 8] And $FFF) - 4;          { sans le FCS }
+  If ((F And $40000000) <> 0) Or ((F And $03000000) <> $03000000) Or
+     (Len <= 0) Or (Len > PcBuf) Then Len := -1
+  Else MoveMem(MemL[0:A], Dst, Len);
+  MemL[0:A + 8] := 0;
+  MemL[0:A + 4] := LongInt($8000F000) Or ((-PcBuf) And $FFF);
+  NicRxCur := (NicRxCur + 1) Mod PcRxN;
+  { recepteur arrete par manque de tampons : relancer }
+  If (PcCsr(0) And $1000) <> 0 Then PcSetCsr(0, $1000);
+  If Len > 0 Then Inc(NetPktIn);
+  PcRecv := Len;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pilote Intel PRO/1000 (82540EM MT Desktop, 82543GC T Server, 82545EM }
+{ MT Server : cartes de VirtualBox, "e1000" de QEMU)                   }
+{ ------------------------------------------------------------------ }
+{ Registres en memoire (BAR0) ; anneaux de descripteurs de 16 octets
+  (adresse 64 bits, longueur, etat DD/EOP) ; adresse Ethernet dans
+  RAL0/RAH0 (chargee par la carte) ou l'EEPROM (EERD). Scrutation. }
+
+Function E1R(R : LongInt) : LongInt;
+Begin
+  E1R := MemL[0:NicMmio + R];
+End;
+
+Procedure E1W(R, V : LongInt);
+Begin
+  MemL[0:NicMmio + R] := V;
+End;
+
+Function E1Eeprom(A : LongInt) : LongInt;
+Var I, V : LongInt;
+Begin
+  E1W($14, 1 Or (A Shl 8));
+  I := 0;
+  Repeat
+    V := E1R($14);
+    Inc(I);
+  Until ((V And $10) <> 0) Or (I > 100000);
+  E1Eeprom := (V Shr 16) And $FFFF;
+End;
+
+Function E1Init : Boolean;
+Var I, A, Lo, Hi, HO : LongInt;
+Begin
+  E1Init := False;
+  E1W($D8, -1);                                 { IMC : tout masquer }
+  E1W(0, E1R(0) Or $04000000);                  { CTRL.RST }
+  KSleep(5);
+  E1W($D8, -1);
+  E1W(0, (E1R(0) Or $60) And Not $80000008);    { SLU, ASDE }
+  Lo := E1R($5400); Hi := E1R($5404);
+  If (Hi And LongInt($80000000)) <> 0 Then
+  Begin
+    For I := 0 To 3 Do NicMac[I] := (Lo Shr (I * 8)) And $FF;
+    NicMac[4] := Hi And $FF; NicMac[5] := (Hi Shr 8) And $FF;
+  End
+  Else
+    For I := 0 To 2 Do
+    Begin
+      Lo := E1Eeprom(I);
+      NicMac[I * 2] := Lo And $FF; NicMac[I * 2 + 1] := Lo Shr 8;
+    End;
+  E1W($5400, NicMac[0] Or (NicMac[1] Shl 8) Or (NicMac[2] Shl 16) Or
+             (NicMac[3] Shl 24));
+  E1W($5404, NicMac[4] Or (NicMac[5] Shl 8) Or LongInt($80000000));
+  For I := 0 To 127 Do E1W($5200 + I * 4, 0);  { table multidiffusion }
+  If NicRing = 0 Then
+  Begin
+    HO := HeapOwner; HeapOwner := 0;
+    NicRing := KAlloc((E1RxN + E1TxN) * 16 + 128);
+    NicBufs := KAlloc((E1RxN + E1TxN) * 2048 + 16);
+    HeapOwner := HO;
+    If (NicRing = 0) Or (NicBufs = 0) Then Exit;
+    NicRing := (NicRing + 127) And Not 127;
+    NicBufs := (NicBufs + 15) And Not 15;
+  End;
+  For I := 0 To E1RxN + E1TxN - 1 Do
+  Begin
+    A := NicRing + I * 16;
+    MemL[0:A] := NicBufs + I * 2048; MemL[0:A + 4] := 0;
+    MemL[0:A + 8] := 0; MemL[0:A + 12] := 0;
+  End;
+  { reception : 2 Ko, diffusion acceptee, FCS retire }
+  E1W($2800, NicRing); E1W($2804, 0);
+  E1W($2808, E1RxN * 16);
+  E1W($2810, 0); E1W($2818, E1RxN - 1);
+  E1W($100, $04008002);                         { EN, BAM, SECRC }
+  { emission }
+  E1W($3800, NicRing + E1RxN * 16); E1W($3804, 0);
+  E1W($3808, E1TxN * 16);
+  E1W($3810, 0); E1W($3818, 0);
+  E1W($410, $0060200A);                         { TIPG }
+  E1W($400, $0004010A);                         { EN, PSP, CT, COLD }
+  NicRxCur := 0; NicTxCur := 0;
+  E1Init := True;
+End;
+
+Procedure E1Send(Src, Len : LongInt);
+Var A, I : LongInt;
+Begin
+  If Len > 2048 Then Exit;
+  A := NicRing + (E1RxN + NicTxCur) * 16;
+  MoveMem(Src, MemL[0:A], Len);
+  MemL[0:A + 8] := Len Or ($0B Shl 24);         { EOP, IFCS, RS }
+  MemL[0:A + 12] := 0;
+  NicTxCur := (NicTxCur + 1) Mod E1TxN;
+  E1W($3818, NicTxCur);
+  I := 0;
+  While ((Mem[0:A + 12] And 1) = 0) And (I < 100) Do
+  Begin
+    KSleep(1);
+    Inc(I);
+  End;
+  Inc(NetPktOut);
+End;
+
+Function E1Recv(Dst : LongInt) : LongInt;
+Var A, St, Len : LongInt;
+Begin
+  E1Recv := 0;
+  A := NicRing + NicRxCur * 16;
+  St := Mem[0:A + 12];
+  If (St And 1) = 0 Then Exit;                  { DD : vide }
+  Len := MemW[0:A + 8];
+  If ((St And 2) = 0) Or (Mem[0:A + 13] <> 0) Or (Len <= 0) Or
+     (Len > 1536) Then Len := -1
+  Else MoveMem(MemL[0:A], Dst, Len);
+  MemL[0:A + 8] := 0; MemL[0:A + 12] := 0;
+  E1W($2818, NicRxCur);
+  NicRxCur := (NicRxCur + 1) Mod E1RxN;
+  If Len > 0 Then Inc(NetPktIn);
+  E1Recv := Len;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Choix de la carte : PCnet, Intel PRO/1000, puis NE2000               }
+{ ------------------------------------------------------------------ }
+
+Function NicProbe : Boolean;
+Var Bus, Dev, Id, Bar, Cmd, K : LongInt;
+Begin
+  NicProbe := False;
+  NicKind := 0; NicMmio := 0; NicIrq := 0;
+  For K := 1 To 2 Do
+    For Bus := 0 To 3 Do
+      For Dev := 0 To 31 Do
+        If NicKind = 0 Then
+        Begin
+          Id := PciRead(Bus, Dev, 0, 0);
+          If (K = 1) And (Id = $20001022) Then
+          Begin
+            Bar := PciRead(Bus, Dev, 0, $10);
+            If (Bar And 1) <> 0 Then
+            Begin
+              Cmd := PciRead(Bus, Dev, 0, 4);
+              PciWrite(Bus, Dev, 0, 4, (Cmd And $FFFF) Or 5);
+              NicBase := Bar And $FFFC;
+              NicIrq := PciRead(Bus, Dev, 0, $3C) And 255;
+              NicKind := NkPcnet;
+              If ((PciRead(Bus, Dev, 0, 8) And $FF) >= $40) Then
+                NicDesc := 'AMD PCnet-FAST III (Am79C973)'
+              Else NicDesc := 'AMD PCnet-PCI II (Am79C970A)';
+              If Not PcInit Then NicKind := 0;
+            End;
+          End;
+          If (K = 2) And ((Id = $100E8086) Or (Id = $10048086) Or
+             (Id = $100F8086)) Then
+          Begin
+            Bar := PciRead(Bus, Dev, 0, $10);
+            If (Bar And 1) = 0 Then
+            Begin
+              Cmd := PciRead(Bus, Dev, 0, 4);
+              PciWrite(Bus, Dev, 0, 4, (Cmd And $FFFF) Or 6);
+              NicMmio := Bar And LongInt($FFFFFFF0);
+              NicBase := NicMmio;
+              NicIrq := PciRead(Bus, Dev, 0, $3C) And 255;
+              NicKind := NkE1000;
+              Case Id Of
+                $10048086 : NicDesc := 'Intel PRO/1000 T Server (82543GC)';
+                $100F8086 : NicDesc := 'Intel PRO/1000 MT Server (82545EM)';
+              Else
+                NicDesc := 'Intel PRO/1000 MT Desktop (82540EM)';
+              End;
+              If Not E1Init Then NicKind := 0;
+            End;
+          End;
+        End;
+  If NicKind <> 0 Then
+  Begin
+    NicPci := True;
+    NicProbe := True;
+    Exit;
+  End;
+  NicBase := 0;
+  If NeProbe Then
+  Begin
+    NicKind := NkNe2000;
+    If NicPci Then NicDesc := 'NE2000 PCI (Realtek RTL8029)'
+    Else NicDesc := 'NE2000 ISA';
+    NicProbe := True;
+  End;
+End;
+
+Procedure NicSend(Src, Len : LongInt);
+Begin
+  If Len < 60 Then
+  Begin
+    FillMem(Src + Len, 60 - Len, 0);
+    Len := 60;
+  End;
+  Case NicKind Of
+    NkNe2000 : NeSend(Src, Len);
+    NkPcnet : PcSend(Src, Len);
+    NkE1000 : E1Send(Src, Len);
+  End;
+End;
+
+{ Trame recue dans Dst : longueur, 0 si aucune, -1 si rejetee }
+Function NicRecv(Dst : LongInt) : LongInt;
+Begin
+  Case NicKind Of
+    NkNe2000 : NicRecv := NeRecv(Dst);
+    NkPcnet : NicRecv := PcRecv(Dst);
+    NkE1000 : NicRecv := E1Recv(Dst);
+  Else
+    NicRecv := 0;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
 { Ethernet et ARP                                                      }
 { ------------------------------------------------------------------ }
 
@@ -36681,7 +37209,7 @@ Begin
   End;
   MemL[0:F + 28] := NetIP;
   MemL[0:F + 38] := TIP;
-  NeSend(F, 42);
+  NicSend(F, 42);
 End;
 
 Procedure ArpInput(P, Len : LongInt);
@@ -36761,7 +37289,7 @@ Begin
     End;
     EthHeader(NetTx, LongInt(@ArpMac) + I * 6, $0800);
   End;
-  NeSend(NetTx, 34 + Len);
+  NicSend(NetTx, 34 + Len);
   IpSend := True;
 End;
 
@@ -37498,7 +38026,7 @@ Begin
   K := 0;
   While (NicBase <> 0) And (K < 32) Do
   Begin
-    N := NeRecv(NetRx);
+    N := NicRecv(NetRx);
     If N = 0 Then Break;
     If N > 0 Then EthInput(NetRx, N);
     Inc(K);
@@ -37769,17 +38297,13 @@ Begin
   PingId := $0200;
   DnsId := Ticks And $FFFF;
   NetMask := $00FFFFFF;
-  If Not NeProbe Then
+  If Not NicProbe Then
   Begin
-    KLog('Reseau : aucune carte NE2000 (TCP/IP en boucle locale seulement)');
+    KLog('Reseau : aucune carte (TCP/IP en boucle locale seulement)');
     Exit;
   End;
-  If NicPci Then
-    KLog('Reseau : carte NE2000 PCI (RTL8029) en ' + HexStr(NicBase, 4) +
-         'h, adresse ' + MacStr)
-  Else
-    KLog('Reseau : carte NE2000 ISA en ' + HexStr(NicBase, 4) +
-         'h, adresse ' + MacStr);
+  KLog('Reseau : ' + NicDesc + ' en ' + HexStr(NicBase, 8) +
+       'h, adresse ' + MacStr);
   DhcpXid := (NicMac[3] Shl 24) Or (NicMac[4] Shl 16) Or (NicMac[5] Shl 8) Or
              (Ticks And $FF);
   DhcpState := 1;
@@ -40590,18 +41114,20 @@ Begin
   NetPoll;
   If NicBase = 0 Then
   Begin
-    MsgBoxOpen(NetTitle, L('Aucune carte r'#130'seau NE2000 n''a ' +
-      #130't'#130' d'#130'tect'#130'e. TCP/IP fonctionne seulement en boucle ' +
-      'locale ' +
-      '(127.0.0.1).', 'No NE2000 network adapter was detected. TCP/IP ' +
-      'only works on the loopback address (127.0.0.1).',
-      'Keine NE2000-Netzwerkkarte gefunden. TCP/IP nur lokal ' +
-      '(127.0.0.1).', 'Nessuna scheda di rete NE2000 rilevata. TCP/IP ' +
-      'solo in locale (127.0.0.1).', 'No se detect'#162' ning'#163'n ' +
-      'adaptador NE2000. TCP/IP s'#162'lo en local (127.0.0.1).'), $30);
+    MsgBoxOpen(NetTitle, L('Aucune carte r'#130'seau (NE2000, PCnet ou ' +
+      'Intel PRO/1000) n''a '#130't'#130' d'#130'tect'#130'e. TCP/IP ' +
+      'fonctionne seulement en boucle locale (127.0.0.1).',
+      'No network adapter (NE2000, PCnet or Intel PRO/1000) was ' +
+      'detected. TCP/IP only works on the loopback address (127.0.0.1).',
+      'Keine Netzwerkkarte (NE2000, PCnet, Intel PRO/1000) gefunden. ' +
+      'TCP/IP nur lokal (127.0.0.1).', 'Nessuna scheda di rete (NE2000, ' +
+      'PCnet, Intel PRO/1000) rilevata. TCP/IP solo in locale ' +
+      '(127.0.0.1).', 'No se detect'#162' ning'#163'n adaptador de red ' +
+      '(NE2000, PCnet, Intel PRO/1000). TCP/IP s'#162'lo en local ' +
+      '(127.0.0.1).'), $30);
     Exit;
   End;
-  If NicPci Then A := 'NE2000 PCI' Else A := 'NE2000 ISA';
+  A := NicDesc;
   S := L('Carte', 'Adapter', 'Karte', 'Scheda', 'Adaptador') + ' : ' + A +
        '|' + L('Adresse de la carte', 'Adapter address', 'Kartenadresse',
        'Indirizzo scheda', 'Direcci'#162'n') + ' : ' + MacStr + '|' +
@@ -48871,6 +49397,341 @@ Begin
 End;
 
 { ==================================================================== }
+{ Partie 18 - VirtualBox : VMMDev (Guest Additions), souris integree,  }
+{             pointeur dessine par l'hote et taille de l'ecran          }
+{ ==================================================================== }
+
+{ Sous VirtualBox, le peripherique VMMDev (PCI 80EE:CAFE) est l'interface
+  des Guest Additions : le systeme invite ecrit dans son port (BAR0)
+  l'adresse physique d'une requete (en-tete de 24 octets : taille,
+  version 10001h, type, code de retour, puis les donnees), traitee aussitot
+  par l'hote. Pasdows :
+    - se presente (ReportGuestInfo2 et ReportGuestInfo : Windows 95),
+      annonce qu'il sait changer la taille de son ecran (capacite
+      GRAPHICS : menu "Ajuster automatiquement la taille de l'ecran" et
+      "Ecran virtuel, Redimensionner en ...") ;
+    - souris integree : il declare la souris absolue ; quand l'hote la
+      veut aussi, la position (0..FFFFh) est lue par GetMouseStatus a
+      chaque paquet PS/2 (l'hote en envoie un, sans deplacement, a chaque
+      mouvement ; les boutons restent sur le PS/2) et regulierement ;
+    - pointeur : sa forme (masque ET de 1 bit, couleurs de 32 bits) est
+      donnee a l'hote, qui le dessine a la place du pointeur de Pasdows :
+      un seul pointeur a l'ecran, sans retard ; si l'hote ne peut pas
+      (MOUSE_HOST_CANNOT_HWPOINTER) ou si l'integration est coupee (la
+      souris est alors capturee), Pasdows dessine le sien ;
+    - les demandes de changement d'affichage de l'hote (evenement
+      DISPLAY_CHANGE_REQUEST, scrute par AcknowledgeEvents) donnent une
+      largeur, une hauteur et une profondeur quelconques, appliquees
+      aussitot par l'interface VBE DISPI de la carte VBoxVGA (80EE:BEEF).
+  Les requetes se font interruptions masquees (un seul tampon). }
+
+Const
+  VbReqVer = $10001;
+  VbMCanAbs = 1; VbMHostAbs = 2; VbMNoHw = 8;
+  VbEvMouseCaps = 1; VbEvDisplay = 4;
+
+Var
+  VbReq, VbFeat, VbVer : LongInt;
+  VbPtrSum, VbNextPoll, VbNextEv : LongInt;
+
+{ Requete de type T (Size octets) preparee en VbReq + 24 ; code rc }
+Function VbCall(T, Size : LongInt) : LongInt;
+Var R, P, A : LongInt;
+Begin
+  P := VbPort; A := VbReq;
+  MemL[0:A] := Size; MemL[0:A + 4] := VbReqVer; MemL[0:A + 8] := T;
+  MemL[0:A + 12] := -1; MemL[0:A + 16] := 0; MemL[0:A + 20] := 0;
+  asm
+    mov edx,P
+    mov eax,A
+    out dx,eax
+  end;
+  R := MemL[0:A + 12];
+  VbCall := R;
+End;
+
+{ Les requetes et le tampon ne doivent pas etre interrompus }
+Function VbCli : LongInt;
+Var F : LongInt;
+Begin
+  asm
+    pushfd
+    pop eax
+    mov F,eax
+    cli
+  end;
+  VbCli := F;
+End;
+
+Procedure VbSti(F : LongInt);
+Begin
+  If (F And $200) <> 0 Then
+    asm
+      sti
+    end;
+End;
+
+{ Capacites de la souris (hote et invite) et position absolue }
+Function VbMouseStatus(Var X, Y : LongInt) : Boolean;
+Var F : LongInt;
+Begin
+  VbMouseStatus := False;
+  If VbPort = 0 Then Exit;
+  F := VbCli;
+  FillMem(VbReq + 24, 12, 0);
+  If VbCall(1, 36) = 0 Then
+  Begin
+    VbFeat := MemL[0:VbReq + 24];
+    X := MemL[0:VbReq + 28]; Y := MemL[0:VbReq + 32];
+    VbMouseStatus := True;
+  End;
+  VbSti(F);
+End;
+
+{ Etat de l'integration : souris absolue, pointeur de l'hote }
+Procedure VbMouseUpdate;
+Var X, Y : LongInt; Was : Boolean;
+Begin
+  If Not VbMouseStatus(X, Y) Then Exit;
+  Was := VbHwPtr;
+  VbAbs := MouOk And ((VbFeat And VbMHostAbs) <> 0);
+  If VbAbs And ((VbFeat And VbMNoHw) = 0) Then
+  Begin
+    If Not Was Then
+    Begin
+      CursorErase;
+      VbHwPtr := True;
+      VbPtrSum := -1;
+      VbPtrSync;
+    End;
+  End
+  Else If Was Then
+  Begin
+    VbHwPtr := False;
+    VbPtrSum := -1;
+    CursorDraw;
+  End;
+End;
+
+{ Position absolue de l'hote en pixels }
+Function VbMousePos(Var X, Y : LongInt) : Boolean;
+Var PX, PY : LongInt;
+Begin
+  VbMousePos := False;
+  If Not VbAbs Then Exit;
+  If Not VbMouseStatus(PX, PY) Then Exit;
+  If (VbFeat And VbMHostAbs) = 0 Then
+  Begin
+    VbMouseUpdate;
+    Exit;
+  End;
+  PX := PX And $FFFF; PY := PY And $FFFF;
+  X := (PX * ScrW) Shr 16; Y := (PY * ScrH) Shr 16;
+  If X > ScrW - 1 Then X := ScrW - 1;
+  If Y > ScrH - 1 Then Y := ScrH - 1;
+  VbMousePos := True;
+End;
+
+{ Donner a l'hote la forme du pointeur (CurMap : 1 noir, 2 blanc, 3
+  inverse) si elle a change, ou le cacher }
+Procedure VbPtrSync;
+Var Sum, X, Y, V, W, H, Ab, AndSz, Xa, F, Size : LongInt; Vis : Boolean;
+Begin
+  If (VbPort = 0) Or Not VbHwPtr Then Exit;
+  W := CurW; H := CurHh;
+  If W > 32 Then W := 32;
+  If H > 32 Then H := 32;
+  Sum := 0; Vis := False;
+  For Y := 0 To H - 1 Do
+    For X := 0 To W - 1 Do
+    Begin
+      V := CurMap[Y * 32 + X];
+      If V <> 0 Then Vis := True;
+      Sum := (Sum * 31 + V + X * 3 + Y) And $FFFFFF;
+    End;
+  If CurHide < 0 Then Vis := False;
+  Sum := (Sum * 7 + W * 131 + H * 17 + CurHotX * 5 + CurHotY) And $3FFFFFFF;
+  If Not Vis Then Sum := $40000000;
+  If Sum = VbPtrSum Then Exit;
+  VbPtrSum := Sum;
+  F := VbCli;
+  FillMem(VbReq + 24, 24, 0);
+  If Not Vis Then
+  Begin
+    VbCall(3, 48);                               { invisible }
+    VbSti(F);
+    Exit;
+  End;
+  Ab := (W + 7) Div 8;
+  AndSz := (Ab * H + 3) And Not 3;
+  Xa := VbReq + 44 + AndSz;
+  FillMem(VbReq + 44, AndSz + W * H * 4, 0);
+  For Y := 0 To H - 1 Do
+    For X := 0 To W - 1 Do
+    Begin
+      V := CurMap[Y * 32 + X];
+      If (V = 0) Or (V = 3) Then
+        Mem[0:VbReq + 44 + Y * Ab + X Shr 3] :=
+          Mem[0:VbReq + 44 + Y * Ab + X Shr 3] Or ($80 Shr (X And 7));
+      If (V = 2) Or (V = 3) Then MemL[0:Xa + (Y * W + X) * 4] := $FFFFFF;
+    End;
+  MemL[0:VbReq + 24] := 1 Or 4;                  { VISIBLE, SHAPE }
+  MemL[0:VbReq + 28] := CurHotX; MemL[0:VbReq + 32] := CurHotY;
+  MemL[0:VbReq + 36] := W; MemL[0:VbReq + 40] := H;
+  Size := 44 + AndSz + W * H * 4;
+  If Size < 48 Then Size := 48;
+  VbCall(3, Size);
+  VbSti(F);
+End;
+
+{ Demande de changement d'affichage de l'hote : appliquee par DISPI }
+Procedure VbDisplayChange;
+Var F, W, H, B, D, Rc : LongInt;
+Begin
+  F := VbCli;
+  FillMem(VbReq + 24, 20, 0);
+  MemL[0:VbReq + 36] := VbEvDisplay;             { evenement acquitte }
+  Rc := VbCall(54, 44);
+  If Rc <> 0 Then
+  Begin
+    FillMem(VbReq + 24, 16, 0);
+    MemL[0:VbReq + 36] := VbEvDisplay;
+    Rc := VbCall(51, 40);
+    MemL[0:VbReq + 40] := 0;
+  End;
+  W := MemL[0:VbReq + 24]; H := MemL[0:VbReq + 28];
+  B := MemL[0:VbReq + 32]; D := MemL[0:VbReq + 40];
+  VbSti(F);
+  If (Rc <> 0) Or (D <> 0) Or (W <= 0) Or (H <= 0) Then Exit;
+  If (B <> 8) And (B <> 15) And (B <> 16) And (B <> 24) And (B <> 32) Then
+    B := DispCurBpp;
+  If B = 4 Then B := 8;
+  If W < 640 Then W := 640;
+  If H < 480 Then H := 480;
+  KLog('VirtualBox : affichage demande ' + IntStr(W) + 'x' + IntStr(H) +
+       'x' + IntStr(B));
+  If (W = ScrW) And (H = ScrH) And (B = ScrBpp) Then Exit;
+  If Not KSetModeWH(W, H, B) Then
+    KLog('VirtualBox : mode refuse par la carte');
+End;
+
+{ Scrutation (ProcessInput) : evenements de l'hote, position }
+Procedure VbPoll;
+Var F, Ev : LongInt;
+Begin
+  If VbPort = 0 Then Exit;
+  If Ticks - VbNextEv < 0 Then Exit;
+  VbNextEv := Ticks + 200;
+  F := VbCli;
+  MemL[0:VbReq + 24] := 0;
+  If VbCall(41, 28) = 0 Then Ev := MemL[0:VbReq + 24] Else Ev := 0;
+  VbSti(F);
+  If (Ev And VbEvMouseCaps) <> 0 Then VbMouseUpdate;
+  If (Ev And VbEvDisplay) <> 0 Then VbDisplayChange;
+  { l'integration peut aussi changer sans evenement (Hote+I) }
+  If (Ev And VbEvMouseCaps) = 0 Then
+    If Ticks - VbNextPoll >= 0 Then
+    Begin
+      VbNextPoll := Ticks + 1000;
+      VbMouseUpdate;
+    End;
+End;
+
+Procedure VbInit;
+Var Bus, Dev, Id, Bar, Cmd, F, I, HO : LongInt; S : String;
+Begin
+  VbPort := 0; VbAbs := False; VbHwPtr := False; VbGfx := False;
+  VbNextPoll := 0; VbNextEv := 0; VbPtrSum := -1;
+  For Bus := 0 To 3 Do
+    For Dev := 0 To 31 Do
+    Begin
+      Id := PciRead(Bus, Dev, 0, 0);
+      If Id = LongInt($BEEF80EE) Then VbGfx := True;
+      If (Id = LongInt($CAFE80EE)) And (VbPort = 0) Then
+      Begin
+        Bar := PciRead(Bus, Dev, 0, $10);
+        If (Bar And 1) <> 0 Then
+        Begin
+          Cmd := PciRead(Bus, Dev, 0, 4);
+          PciWrite(Bus, Dev, 0, 4, (Cmd And $FFFF) Or 7);
+          VbPort := Bar And $FFFC;
+          VbMmio := PciRead(Bus, Dev, 0, $14) And LongInt($FFFFFFF0);
+          VbIrq := PciRead(Bus, Dev, 0, $3C) And 255;
+        End;
+      End;
+    End;
+  { VBoxVGA : largeurs quelconques (sinon multiples de 8) }
+  If VbGfx And DispiOk Then
+  Begin
+    DispiW(0, $BE02);
+    If DispiR(0) = $BE02 Then
+      KLog('VirtualBox : VBoxVGA, largeurs quelconques');
+  End;
+  If VbPort = 0 Then Exit;
+  HO := HeapOwner; HeapOwner := 0;
+  VbReq := KAlloc(8192 + 16);
+  HeapOwner := HO;
+  If VbReq = 0 Then
+  Begin
+    VbPort := 0;
+    Exit;
+  End;
+  VbReq := (VbReq + 15) And Not 15;
+  F := VbCli;
+  { ReportGuestInfo2 : version et nom des "Additions" }
+  FillMem(VbReq + 24, 144, 0);
+  MemW[0:VbReq + 24] := 6; MemW[0:VbReq + 26] := 1;
+  S := 'Pasdows 95';
+  For I := 1 To Length(S) Do Mem[0:VbReq + 39 + I] := Ord(S[I]);
+  VbCall(58, 168);
+  { ReportGuestInfo : interface 1.4, Windows 95 }
+  MemL[0:VbReq + 24] := $00010004; MemL[0:VbReq + 28] := $21000;
+  I := VbCall(50, 32);
+  If I <> 0 Then
+  Begin
+    VbSti(F);
+    KLog('VirtualBox : VMMDev en ' + HexStr(VbPort, 4) +
+         'h refuse ReportGuestInfo (' + IntStr(I) + ')');
+    VbPort := 0;
+    Exit;
+  End;
+  { pilote actif, capacite GRAPHICS (changement de taille), etat }
+  MemL[0:VbReq + 24] := 20; MemL[0:VbReq + 28] := 50;
+  MemL[0:VbReq + 32] := 0;
+  VbCall(59, 36);
+  MemL[0:VbReq + 24] := 4; MemL[0:VbReq + 28] := 0;
+  If VbCall(56, 32) <> 0 Then
+  Begin
+    MemL[0:VbReq + 24] := 4;
+    VbCall(55, 28);
+  End;
+  MemL[0:VbReq + 24] := 1100; MemL[0:VbReq + 28] := 50;
+  MemL[0:VbReq + 32] := 0;
+  VbCall(59, 36);
+  { evenements : changement d'affichage, capacites de la souris }
+  MemL[0:VbReq + 24] := VbEvDisplay Or VbEvMouseCaps;
+  MemL[0:VbReq + 28] := 0;
+  VbCall(42, 32);
+  { souris absolue }
+  If MouOk Then
+  Begin
+    MemL[0:VbReq + 24] := VbMCanAbs;
+    MemL[0:VbReq + 28] := 0; MemL[0:VbReq + 32] := 0;
+    VbCall(2, 36);
+  End;
+  { version de l'hote }
+  FillMem(VbReq + 24, 16, 0);
+  If VbCall(4, 40) = 0 Then
+    VbVer := (MemW[0:VbReq + 24] Shl 16) Or MemW[0:VbReq + 26]
+  Else VbVer := 0;
+  VbSti(F);
+  KLog('VirtualBox : VMMDev en ' + HexStr(VbPort, 4) + 'h (IRQ ' +
+       IntStr(VbIrq) + '), hote ' + IntStr(VbVer Shr 16) + '.' +
+       IntStr(VbVer And $FFFF) + ', carte VBoxVGA ' + IntStr(Ord(VbGfx)));
+  VbMouseUpdate;
+End;
+
+{ ==================================================================== }
 { Partie 13 - Demarrage                                                }
 { ==================================================================== }
 
@@ -49262,6 +50123,7 @@ BEGIN
   W16Init2;
   BootStep(6);
   NetInit;
+  VbInit;
   BootStep(7);
   AppProcObj := -1;
   ConW := -1; ConTitle := ''; ConRowsDue := False; ConLastCY := -1;
