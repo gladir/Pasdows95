@@ -8099,13 +8099,20 @@ Begin
   FatFormat := VolN > 0;
 End;
 { ==================================================================== }
-{ Partie 4 - Graphisme 8 bits, palette, police, composition, pointeur  }
+{ Partie 4 - Graphisme, palette, police, composition, pointeur          }
 { ==================================================================== }
-{ Chaque fenetre de premier niveau dessine dans sa propre surface 8 bits
-  (indices de la palette systeme, comme un affichage 256 couleurs de
-  Windows 95). L'ecran est compose dans un tampon (bureau puis fenetres
-  dans l'ordre Z) et seule la zone modifiee est recopiee dans la memoire
-  video lineaire ; le pointeur de la souris est dessine par-dessus. }
+{ Chaque fenetre de premier niveau dessine dans sa propre surface. En
+  256 couleurs (et en VGA 16 couleurs), les surfaces contiennent des
+  indices de la palette systeme, comme un affichage 256 couleurs de
+  Windows 95. En High Color et True Color, elles ont le format de la
+  carte (15, 16, 24 ou 32 bits, couleurs vraies) : les images des
+  programmes gardent leurs couleurs exactes. L'ecran est compose dans un
+  tampon (bureau puis fenetres dans l'ordre Z) et seule la zone modifiee
+  est recopiee dans la memoire video lineaire ; le pointeur de la souris
+  est dessine par-dessus.
+  Une couleur passee aux primitives est un indice de la palette systeme
+  (0..255, couleurs de l'interface) ou une couleur directe CDirect Or
+  00RRGGBB, convertie au format de la surface cible. }
 
 Const
   icComputer = 1;  icRecycle  = 2;  icDos      = 3;  icNotepad  = 4;
@@ -8142,6 +8149,7 @@ Const
 Type
   TSurf = Record
     Bits, W, H, Pitch : LongInt;
+    Bpp : LongInt;     { 8 (indices), 15 (5-5-5), 16 (5-6-5), 24 ou 32 }
   End;
 
 Var
@@ -8169,7 +8177,12 @@ Var
   VgaTab    : Array[0..2047] Of LongInt;
   VgaTabOk  : Boolean;
   Back      : TSurf;
+  { format des surfaces composees : 8 (palette systeme) ou celui de la
+    carte en couleurs vraies (15, 16, 24, 32) }
+  ScrFmt    : LongInt;
+  ScrDirect : Boolean;   { ScrFmt est exactement le format de la carte }
   SysPal    : Array[0..767] Of Byte;       { R, G, B (8 bits) }
+  SysX      : Array[0..255] Of LongInt;    { la meme en 00RRGGBB }
   PalVer    : LongInt;
   NcKey     : Array[0..4095] Of LongInt;   { antememoire RGB -> indice }
   NcVal     : Array[0..4095] Of Byte;
@@ -8186,17 +8199,122 @@ Var
   CurCustom  : LongInt;      { curseur Win32 (bits AND/XOR 32x32) }
   CurHotX, CurHotY : LongInt;
 
+{ Octets par point d'un format }
+Function PxBytes(Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    15, 16 : PxBytes := 2;
+    24 : PxBytes := 3;
+    32 : PxBytes := 4;
+  Else
+    PxBytes := 1;
+  End;
+End;
+
+Function SurfNewF(Var S : TSurf; W, H, Bpp : LongInt) : Boolean;
+Begin
+  S.W := W; S.H := H; S.Bpp := Bpp;
+  S.Pitch := (W * PxBytes(Bpp) + 3) And Not 3;
+  S.Bits := KAlloc(S.Pitch * H + 16);
+  SurfNewF := S.Bits <> 0;
+End;
+
+{ Surface au format de l'ecran }
 Function SurfNew(Var S : TSurf; W, H : LongInt) : Boolean;
 Begin
-  S.W := W; S.H := H; S.Pitch := (W + 3) And Not 3;
-  S.Bits := KAlloc(S.Pitch * H + 16);
-  SurfNew := S.Bits <> 0;
+  If ScrFmt = 0 Then ScrFmt := 8;
+  SurfNew := SurfNewF(S, W, H, ScrFmt);
 End;
 
 Procedure SurfFree(Var S : TSurf);
 Begin
   If S.Bits <> 0 Then KFree(S.Bits);
   S.Bits := 0; S.W := 0; S.H := 0;
+End;
+
+{ Remplir N points de 32 ou 16 bits }
+Procedure FillL(A, N, V : LongInt);
+Begin
+  If N <= 0 Then Exit;
+  asm
+    push edi
+    mov edi,A
+    mov ecx,N
+    mov eax,V
+    cld
+    rep stosd
+    pop edi
+  end;
+End;
+
+Procedure FillW(A, N, V : LongInt);
+Begin
+  If N <= 0 Then Exit;
+  asm
+    push edi
+    mov edi,A
+    mov ecx,N
+    mov eax,V
+    cld
+    rep stosw
+    pop edi
+  end;
+End;
+
+{ N points de valeur brute V a l'adresse A, au format Bpp }
+Procedure FillRaw(A, N, V, Bpp : LongInt);
+Var I : LongInt;
+Begin
+  Case Bpp Of
+    32 : FillL(A, N, V);
+    15, 16 : FillW(A, N, V);
+    24 :
+      For I := 0 To N - 1 Do
+      Begin
+        MemW[0:A + I * 3] := V;
+        Mem[0:A + I * 3 + 2] := V Shr 16;
+      End;
+  Else
+    FillMem(A, N, V);
+  End;
+End;
+
+Procedure PutRaw(A, V, Bpp : LongInt);
+Begin
+  Case Bpp Of
+    32 : MemL[0:A] := V;
+    15, 16 : MemW[0:A] := V;
+    24 :
+    Begin
+      MemW[0:A] := V;
+      Mem[0:A + 2] := V Shr 16;
+    End;
+  Else
+    Mem[0:A] := V;
+  End;
+End;
+
+Function GetRaw(A, Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    32 : GetRaw := MemL[0:A] And $FFFFFF;
+    15, 16 : GetRaw := MemW[0:A];
+    24 : GetRaw := MemW[0:A] Or (Mem[0:A + 2] Shl 16);
+  Else
+    GetRaw := Mem[0:A];
+  End;
+End;
+
+{ Masque de tous les bits d'un point (ROP, inversion) }
+Function RawMask(Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    15 : RawMask := $7FFF;
+    16 : RawMask := $FFFF;
+    24, 32 : RawMask := $FFFFFF;
+  Else
+    RawMask := 255;
+  End;
 End;
 
 { ------------------------------------------------------------------ }
@@ -8408,6 +8526,7 @@ End;
 Procedure SysPalSet(I, R, G, B : LongInt);
 Begin
   SysPal[I * 3] := R; SysPal[I * 3 + 1] := G; SysPal[I * 3 + 2] := B;
+  SysX[I] := ((R And 255) Shl 16) Or ((G And 255) Shl 8) Or (B And 255);
 End;
 
 { 20 couleurs statiques, cube 6x6x6 et gris au milieu }
@@ -8479,6 +8598,93 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
+{ Couleurs vraies : conversions entre 00RRGGBB et les formats         }
+{ ------------------------------------------------------------------ }
+
+Const
+  CDirect = $1000000;     { couleur directe 00RRGGBB (sinon un indice) }
+
+{ 00RRGGBB -> point brut du format Bpp (8 : indice systeme proche) }
+Function XToRaw(X, Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    32, 24 : XToRaw := X And $FFFFFF;
+    16 : XToRaw := ((X Shr 8) And $F800) Or ((X Shr 5) And $7E0) Or
+                   ((X Shr 3) And $1F);
+    15 : XToRaw := ((X Shr 9) And $7C00) Or ((X Shr 6) And $3E0) Or
+                   ((X Shr 3) And $1F);
+  Else
+    XToRaw := NearestIdx((X Shr 16) And 255, (X Shr 8) And 255, X And 255);
+  End;
+End;
+
+{ Point brut du format Bpp -> 00RRGGBB (8 : palette systeme) }
+Function RawToX(V, Bpp : LongInt) : LongInt;
+Var R, G, B : LongInt;
+Begin
+  Case Bpp Of
+    32, 24 : RawToX := V And $FFFFFF;
+    16 :
+    Begin
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      RawToX := (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                (((G Shl 2) Or (G Shr 4)) Shl 8) Or ((B Shl 3) Or (B Shr 2));
+    End;
+    15 :
+    Begin
+      R := (V Shr 10) And 31; G := (V Shr 5) And 31; B := V And 31;
+      RawToX := (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                (((G Shl 3) Or (G Shr 2)) Shl 8) Or ((B Shl 3) Or (B Shr 2));
+    End;
+  Else
+    RawToX := SysX[V And 255];
+  End;
+End;
+
+{ Couleur (indice ou CDirect) -> point brut du format Bpp }
+Function RawOf(C, Bpp : LongInt) : LongInt;
+Begin
+  If (C And CDirect) <> 0 Then RawOf := XToRaw(C And $FFFFFF, Bpp)
+  Else If Bpp = 8 Then RawOf := C And 255
+  Else RawOf := XToRaw(SysX[C And 255], Bpp);
+End;
+
+{ COLORREF (00BBGGRR ; 01xxxxxx PALETTEINDEX) -> couleur directe }
+Function DirOf(C : LongInt) : LongInt;
+Begin
+  If (C Shr 24) = 1 Then DirOf := C And 255
+  Else DirOf := CDirect Or ((C And 255) Shl 16) Or (C And $FF00) Or
+                ((C Shr 16) And 255);
+End;
+
+{ 00RRGGBB -> COLORREF }
+Function XToCr(X : LongInt) : LongInt;
+Begin
+  XToCr := ((X Shr 16) And 255) Or (X And $FF00) Or ((X And 255) Shl 16);
+End;
+
+{ Format des surfaces composees d'apres le mode de la carte : celui de la
+  carte si ses composantes sont usuelles, 32 bits sinon (converti a la
+  copie) ; 8 bits en 256 couleurs et en VGA 16 couleurs }
+Procedure ScrFmtSet;
+Begin
+  ScrDirect := True;
+  If VgaPlanar Or (ScrBpp <= 8) Then ScrFmt := 8
+  Else If (ScrBpp = 15) And (RMs = 5) And (RPs = 10) And (GMs = 5) And
+          (GPs = 5) And (BMs = 5) And (BPs = 0) Then ScrFmt := 15
+  Else If (ScrBpp = 16) And (RMs = 5) And (RPs = 11) And (GMs = 6) And
+          (GPs = 5) And (BMs = 5) And (BPs = 0) Then ScrFmt := 16
+  Else If (ScrBpp = 24) And (RMs = 8) And (RPs = 16) And (GMs = 8) And
+          (GPs = 8) And (BMs = 8) And (BPs = 0) Then ScrFmt := 24
+  Else
+  Begin
+    ScrFmt := 32;
+    ScrDirect := (ScrBpp = 32) And (RMs = 8) And (RPs = 16) And
+                 (GMs = 8) And (GPs = 8) And (BMs = 8) And (BPs = 0);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
 { Cible de dessin et primitives (bornes incluses, coord. ecran)      }
 { ------------------------------------------------------------------ }
 
@@ -8509,10 +8715,21 @@ Begin
   If Y2 > ClipY2 Then Y2 := ClipY2;
   If (X1 > X2) Or (Y1 > Y2) Then Exit;
   N := X2 - X1 + 1;
-  A := DS.Bits + (Y1 - DOY) * DS.Pitch + (X1 - DOX);
+  If DS.Bpp = 8 Then
+  Begin
+    A := DS.Bits + (Y1 - DOY) * DS.Pitch + (X1 - DOX);
+    For Y := Y1 To Y2 Do
+    Begin
+      FillMem(A, N, RawOf(C, 8));
+      A := A + DS.Pitch;
+    End;
+    Exit;
+  End;
+  C := RawOf(C, DS.Bpp);
+  A := DS.Bits + (Y1 - DOY) * DS.Pitch + (X1 - DOX) * PxBytes(DS.Bpp);
   For Y := Y1 To Y2 Do
   Begin
-    FillMem(A, N, C);
+    FillRaw(A, N, C, DS.Bpp);
     A := A + DS.Pitch;
   End;
 End;
@@ -8531,15 +8748,28 @@ Procedure Pix(X, Y : LongInt; C : LongInt);
 Begin
   If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then
     Exit;
-  Mem[0:DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX)] := C;
+  PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PxBytes(DS.Bpp),
+         RawOf(C, DS.Bpp), DS.Bpp);
 End;
 
+{ Ou exclusif du point brut (X, Y) de la cible avec M }
+Procedure XorPix(X, Y, M : LongInt);
+Var A : LongInt;
+Begin
+  If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then
+    Exit;
+  A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PxBytes(DS.Bpp);
+  PutRaw(A, GetRaw(A, DS.Bpp) Xor M, DS.Bpp);
+End;
+
+{ Point brut de la cible (indice en 256 couleurs) }
 Function GetPix(X, Y : LongInt) : LongInt;
 Begin
   If (X < DOX) Or (Y < DOY) Or (X >= DOX + DS.W) Or (Y >= DOY + DS.H) Then
     GetPix := 0
   Else
-    GetPix := Mem[0:DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX)];
+    GetPix := GetRaw(DS.Bits + (Y - DOY) * DS.Pitch +
+                     (X - DOX) * PxBytes(DS.Bpp), DS.Bpp);
 End;
 
 Procedure Box(X1, Y1, X2, Y2 : LongInt; C : LongInt);
@@ -8550,16 +8780,17 @@ End;
 
 { Trame : couleur C sur un point sur deux }
 Procedure Dither(X1, Y1, X2, Y2 : LongInt; C : LongInt; Phase : LongInt);
-Var X, Y : LongInt;
+Var X, Y, B : LongInt;
 Begin
+  C := RawOf(C, DS.Bpp); B := PxBytes(DS.Bpp);
   For Y := Max(Y1, ClipY1) To Min(Y2, ClipY2) Do
     For X := Max(X1, ClipX1) To Min(X2, ClipX2) Do
       If Odd(X + Y + Phase) Then
-        Mem[0:DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX)] := C;
+        PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * B, C, DS.Bpp);
 End;
 
 Procedure DrawChar(X, Y : LongInt; Ch : Char; C : LongInt);
-Var R, CX, B, F, A : LongInt;
+Var R, CX, B, F, A, V, PB : LongInt;
 Begin
   If (X > ClipX2) Or (X + 7 < ClipX1) Or (Y > ClipY2) Or
      (Y + 15 < ClipY1) Then Exit;
@@ -8567,13 +8798,18 @@ Begin
   If (X >= ClipX1) And (X + 7 <= ClipX2) And (Y >= ClipY1) And
      (Y + 15 <= ClipY2) Then
   Begin
-    A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
+    V := RawOf(C, DS.Bpp); PB := PxBytes(DS.Bpp);
+    A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PB;
     For R := 0 To 15 Do
     Begin
       B := Mem[0:F + R];
       If B <> 0 Then
         For CX := 0 To 7 Do
-          If (B And ($80 Shr CX)) <> 0 Then Mem[0:A + CX] := C;
+          If (B And ($80 Shr CX)) <> 0 Then
+          Begin
+            If PB = 1 Then Mem[0:A + CX] := V
+            Else PutRaw(A + CX * PB, V, DS.Bpp);
+          End;
       A := A + DS.Pitch;
     End;
     Exit;
@@ -9330,6 +9566,59 @@ Begin
   End;
 End;
 
+{ 00RRGGBB -> valeur de la memoire video (composantes de la carte) }
+Function LfbOfX(X : LongInt) : LongInt;
+Begin
+  LfbOfX := ((((X Shr 16) And 255) Shr (8 - RMs)) Shl RPs) Or
+            ((((X Shr 8) And 255) Shr (8 - GMs)) Shl GPs) Or
+            (((X And 255) Shr (8 - BMs)) Shl BPs);
+End;
+
+{ Ligne de N points du tampon compose en couleurs vraies (S, format
+  ScrFmt) vers la memoire video : copie directe quand le format est
+  celui de la carte, conversion depuis 32 bits sinon }
+Procedure OutRowTC(S, D, N : LongInt);
+Var I, V : LongInt;
+Begin
+  If ScrDirect Then
+  Begin
+    MoveMem(S, D, N * PxBytes(ScrFmt));
+    Exit;
+  End;
+  For I := 0 To N - 1 Do
+  Begin
+    V := LfbOfX(MemL[0:S + I * 4]);
+    Case ScrBytes Of
+      2 : MemW[0:D + I * 2] := V;
+      3 :
+      Begin
+        MemW[0:D + I * 3] := V;
+        Mem[0:D + I * 3 + 2] := V Shr 16;
+      End;
+    Else
+      MemL[0:D + I * 4] := V;
+    End;
+  End;
+End;
+
+{ Valeur brute V (format de la carte) en (X, Y) de la memoire video }
+Procedure OutRaw(X, Y, V : LongInt);
+Var A : LongInt;
+Begin
+  A := Lfb + Y * LfbPitch + X * ScrBytes;
+  Case ScrBytes Of
+    2 : MemW[0:A] := V;
+    3 :
+    Begin
+      MemW[0:A] := V;
+      Mem[0:A + 2] := V Shr 16;
+    End;
+    4 : MemL[0:A] := V;
+  Else
+    Mem[0:A] := V;
+  End;
+End;
+
 { Un pixel d'indice C en (X, Y) de la memoire video }
 Procedure OutPix(X, Y, C : LongInt);
 Var A, V : LongInt;
@@ -9378,11 +9667,11 @@ Begin
     Exit;
   End;
   N := R.R - R.L;
-  S := Back.Bits + R.T * Back.Pitch + R.L;
+  S := Back.Bits + R.T * Back.Pitch + R.L * PxBytes(Back.Bpp);
   D := Lfb + R.T * LfbPitch + R.L * ScrBytes;
   For Y := R.T To R.B - 1 Do
   Begin
-    OutRow(S, D, N);
+    If Back.Bpp = 8 Then OutRow(S, D, N) Else OutRowTC(S, D, N);
     S := S + Back.Pitch;
     D := D + LfbPitch;
   End;
@@ -9503,8 +9792,11 @@ Begin
         Begin
           If V = 1 Then OutPix(PX, PY, cBlack)
           Else If V = 2 Then OutPix(PX, PY, cWhite)
-          Else OutPix(PX, PY,
-                      Mem[0:Back.Bits + PY * Back.Pitch + PX] Xor 255);
+          Else If Back.Bpp = 8 Then
+            OutPix(PX, PY, Mem[0:Back.Bits + PY * Back.Pitch + PX] Xor 255)
+          Else
+            OutRaw(PX, PY, LfbOfX(RawToX(GetRaw(Back.Bits + PY * Back.Pitch +
+                   PX * PxBytes(Back.Bpp), Back.Bpp), Back.Bpp) Xor $FFFFFF));
         End;
       End;
   End;
@@ -9543,6 +9835,9 @@ Var R, C, I : TRect; Y, X0, Y0, Z : LongInt;
 Begin
   { VGA 16 couleurs ou couleurs directes : palette changee, tout l'ecran
     a reconvertir }
+  { (en couleurs vraies, l'ecran compose ne depend pas de la palette) }
+  If (ScrBpp > 8) And OutPalChanged And (Back.Bpp > 8) And Not DDShow Then
+    OutPalChanged := False;
   If (VgaPlanar And VgaMapChanged) Or ((ScrBpp > 8) And OutPalChanged) Then
   Begin
     VgaMapChanged := False;
@@ -10531,7 +10826,7 @@ End;
 
 { Composer une zone de l'ecran : bureau puis fenetres (ordre Z) }
 Procedure ComposeRect(R : TRect);
-Var I, W, Y, S, D, N, X0, Y0 : LongInt; WR, X : TRect;
+Var I, W, Y, S, D, N, X0, Y0, B : LongInt; WR, X : TRect;
 Begin
   DeskDraw(R);
   For I := 0 To ZCnt - 1 Do
@@ -10544,10 +10839,11 @@ Begin
            Wnds^[W].Y + Wnds^[W].H);
       If RInter(X, R, WR) Then
       Begin
-        N := X.R - X.L;
+        B := PxBytes(Back.Bpp);
+        N := (X.R - X.L) * B;
         X0 := X.L - Wnds^[W].X; Y0 := X.T - Wnds^[W].Y;
-        S := Wnds^[W].Surf.Bits + Y0 * Wnds^[W].Surf.Pitch + X0;
-        D := Back.Bits + X.T * Back.Pitch + X.L;
+        S := Wnds^[W].Surf.Bits + Y0 * Wnds^[W].Surf.Pitch + X0 * B;
+        D := Back.Bits + X.T * Back.Pitch + X.L * B;
         For Y := X.T To X.B - 1 Do
         Begin
           MoveMem(S, D, N);
@@ -10845,7 +11141,14 @@ Begin
   If (T >= 0) And (T < MaxThread) Then HeapOwner := ThrOwner[T]
   Else HeapOwner := 0;
   If SurfNew(Wnds^[W].Surf, WW, HH) Then
-    FillMem(Wnds^[W].Surf.Bits, Wnds^[W].Surf.Pitch * HH, cSilver);
+  Begin
+    If Wnds^[W].Surf.Bpp = 8 Then
+      FillMem(Wnds^[W].Surf.Bits, Wnds^[W].Surf.Pitch * HH, cSilver)
+    Else
+      For T := 0 To HH - 1 Do
+        FillRaw(Wnds^[W].Surf.Bits + T * Wnds^[W].Surf.Pitch, WW,
+                RawOf(cSilver, Wnds^[W].Surf.Bpp), Wnds^[W].Surf.Bpp);
+  End;
   HeapOwner := Own;
   Wnds^[W].NeedNc := True;
 End;
@@ -14622,8 +14925,10 @@ End;
 { Passer au mode I de la table, sans redemarrer : nouvel ecran, barre
   des taches et fenetres agrandies a la nouvelle taille, fenetres
   ramenees dans l'ecran, WM_DISPLAYCHANGE aux programmes }
+Procedure BmpReformat(OldF, NewF : LongInt); Forward;
+
 Function KApplyMode(NW, NH, NB, MaskA, NLfb, Num : LongInt) : Boolean;
-Var W, X, Y : LongInt;
+Var W, X, Y, OldF : LongInt;
 Begin
   CurShownB := False;
   ScrW := NW; ScrH := NH; ScrBpp := NB;
@@ -14632,10 +14937,25 @@ Begin
   ScrMode := Num;
   VideoMasks(MaskA);
   VgaPlanar := False;
+  OldF := ScrFmt;
+  ScrFmtSet;
   LfbPitch := ScrW * ScrBytes;
   If NLfb <> 0 Then Lfb := NLfb;
   SurfFree(Back);
   SurfNew(Back, ScrW, ScrH);
+  { autre format de composition : bitmaps compatibles convertis, surfaces
+    des fenetres refaites et redessinees }
+  If OldF <> ScrFmt Then
+  Begin
+    BmpReformat(OldF, ScrFmt);
+    For W := 0 To MaxWnd - 1 Do
+      If Wnds^[W].Used And Not IsChildW(W) And (Wnds^[W].Surf.Bits <> 0) Then
+      Begin
+        SurfFree(Wnds^[W].Surf);
+        WndSurf(W);
+        InvalAll(W, True);
+      End;
+  End;
   FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
   DacAll;
   OutPalChanged := False;
@@ -14644,7 +14964,10 @@ Begin
   For W := 0 To MaxWnd - 1 Do
     If Wnds^[W].Used And Not IsChildW(W) And (W <> TaskbarW) Then
     Begin
-      If Wnds^[W].Max Then
+      If Wnds^[W].Max And ((Wnds^[W].Style And $C00000) <> $C00000) Then
+        MoveW(W, -Wnds^[W].CL, -Wnds^[W].CL, ScrW + 2 * Wnds^[W].CL,
+              ScrH + 2 * Wnds^[W].CL, True)
+      Else If Wnds^[W].Max Then
         MoveW(W, -Wnds^[W].CL, -Wnds^[W].CL, ScrW + 2 * Wnds^[W].CL,
               TaskY + 2 * Wnds^[W].CL, True)
       Else
@@ -17690,6 +18013,21 @@ End;
   assembleur : la version Pascal (112 tests et ecritures par cellule)
   prenait pres de 300 ms pour un ecran sous l'emulateur de DEVENV, et le
   programme console attendait pendant ce temps (DIR, echo du clavier). }
+{ Case de 8x16 points en couleurs vraies (valeurs brutes Fg, Bg) }
+Procedure ConCellX(A, F, Pitch, Fg, Bg, Bpp : LongInt);
+Var R, X, B, PB : LongInt;
+Begin
+  PB := PxBytes(Bpp);
+  For R := 0 To 15 Do
+  Begin
+    B := Mem[0:F + R];
+    For X := 0 To 7 Do
+      If (B And ($80 Shr X)) <> 0 Then PutRaw(A + X * PB, Fg, Bpp)
+      Else PutRaw(A + X * PB, Bg, Bpp);
+    A := A + Pitch;
+  End;
+End;
+
 Procedure ConCell(A, F, Pitch, Fg, Bg : LongInt);
 Begin
   asm
@@ -17796,14 +18134,16 @@ Begin
       Fg := ConPal[ConAt[I] And 15]; Bg := ConPal[(ConAt[I] Shr 4) And 15];
       F := FontAddr + ConCh[I] * 16;
       A := DS.Bits + (Y1 + R * ConChH - DOY) * DS.Pitch +
-           (X1 + C * ConCW - DOX);
-      ConCell(A, F, DS.Pitch, Fg, Bg);
+           (X1 + C * ConCW - DOX) * PxBytes(DS.Bpp);
+      If DS.Bpp = 8 Then ConCell(A, F, DS.Pitch, Fg, Bg)
+      Else ConCellX(A, F, DS.Pitch, RawOf(Fg, DS.Bpp), RawOf(Bg, DS.Bpp),
+                    DS.Bpp);
       { curseur : soulignement, fenetre active seulement }
       If ConCurVis And (R = ConY) And (C = ConX) And (W = ActiveWin) Then
       Begin
         P := A + 13 * DS.Pitch;
-        FillMem(P, ConCW, Fg);
-        FillMem(P + DS.Pitch, ConCW, Fg);
+        FillRaw(P, ConCW, RawOf(Fg, DS.Bpp), DS.Bpp);
+        FillRaw(P + DS.Pitch, ConCW, RawOf(Fg, DS.Bpp), DS.Bpp);
       End;
     End;
 End;
@@ -21091,9 +21431,13 @@ End;
               vers la palette systeme (256 octets)
     region  : I1..I4 rectangle (bornes exclusives), I5 sorte
     contexte: I1 indice dans Dcs
-  Les bitmaps compatibles (DDB) contiennent des indices de la palette
-  systeme, 8 bits par point ; les DIB gardent leur format et leur table
-  de couleurs, traduites lors des transferts. }
+  Les bitmaps compatibles (DDB) ont le format de l'ecran : indices de la
+  palette systeme en 256 couleurs, couleurs vraies (15, 16, 24 ou 32
+  bits) en High Color et True Color ; ils sont convertis quand le mode
+  change. Les bitmaps monochromes gardent un octet 0 (noir) ou 1 (blanc)
+  par point. Les DIB gardent leur format et leur table de couleurs,
+  traduites lors des transferts (I7 : 10h pour une DIB 16 bits en
+  5-6-5). }
 
 Const
   MaxDC = 96;
@@ -21143,6 +21487,10 @@ Var
   SysPalUse : LongInt;
   DefPal    : LongInt;
   XlatTab   : Array[0..255] Of Byte;
+  XlatL     : Array[0..255] Of LongInt;  { indice source -> point cible }
+  GMono     : Boolean;        { cible : bitmap monochrome (0 ou 1) }
+  DibG6     : Boolean;        { DIB 16 bits en 5-6-5 (BI_BITFIELDS) }
+  RopMsk    : LongInt;        { tous les bits d'un point de la cible }
   { cible de dessin d'un contexte }
   GSurf     : TSurf;
   GOX, GOY  : LongInt;
@@ -21204,14 +21552,16 @@ Begin
   If B < 0 Then Exit;
   If W < 1 Then W := 1;
   If H < 1 Then H := 1;
-  Pitch := (W + 3) And Not 3;
+  If Mono Or (Bpp < 8) Then Bpp := 8;
+  Pitch := (W * PxBytes(Bpp) + 3) And Not 3;
   Gdis^[B].I1 := KAlloc(Pitch * H + 16);
   If Gdis^[B].I1 = 0 Then
   Begin
     Gdis^[B].Used := False;
     Exit;
   End;
-  Gdis^[B].I2 := W; Gdis^[B].I3 := H; Gdis^[B].I4 := 8; Gdis^[B].I5 := Pitch;
+  FillMem(Gdis^[B].I1, Pitch * H, 0);
+  Gdis^[B].I2 := W; Gdis^[B].I3 := H; Gdis^[B].I4 := Bpp; Gdis^[B].I5 := Pitch;
   Gdis^[B].I7 := 2;
   If Mono Then
   Begin
@@ -21221,12 +21571,32 @@ Begin
   BmpNew := B;
 End;
 
+{ Format des points d'un bitmap : 8 (indices, ou 0/1 si monochrome),
+  15, 16, 24, 32 ; 1 ou 4 pour une DIB de 1 ou 4 bits }
+Function BmpFmt(B : LongInt) : LongInt;
+Begin
+  If (Gdis^[B].I7 And 4) <> 0 Then BmpFmt := 8
+  Else If (Gdis^[B].I4 = 16) And ((Gdis^[B].I7 And 1) <> 0) And
+          ((Gdis^[B].I7 And $10) = 0) Then BmpFmt := 15
+  Else BmpFmt := Gdis^[B].I4;
+End;
+
+{ Bits par point annonces aux programmes (15 est annonce 16) }
+Function BmpBits(B : LongInt) : LongInt;
+Begin
+  If Gdis^[B].I4 = 15 Then BmpBits := 16 Else BmpBits := Gdis^[B].I4;
+End;
+
 { Surface d'un bitmap 8 bits (les DIB de bas en haut ont un pas negatif)}
 Function BmpSurf(B : LongInt; Var S : TSurf) : Boolean;
+Var F : LongInt;
 Begin
   BmpSurf := False;
-  If (B < 0) Or (Gdis^[B].I4 <> 8) And ((Gdis^[B].I7 And 4) = 0) Then Exit;
-  S.W := Gdis^[B].I2; S.H := Gdis^[B].I3;
+  If B < 0 Then Exit;
+  F := BmpFmt(B);
+  If (F <> 8) And (F <> 15) And (F <> 16) And (F <> 24) And (F <> 32) Then
+    Exit;
+  S.W := Gdis^[B].I2; S.H := Gdis^[B].I3; S.Bpp := F;
   If (Gdis^[B].I7 And 2) <> 0 Then
   Begin
     S.Bits := Gdis^[B].I1; S.Pitch := Gdis^[B].I5;
@@ -21237,6 +21607,37 @@ Begin
     S.Pitch := -Gdis^[B].I5;
   End;
   BmpSurf := True;
+End;
+
+{ Changement de format de l'ecran : les bitmaps compatibles (ni DIB, ni
+  monochromes, ni enveloppes de surfaces DirectDraw) prennent le nouveau
+  format, couleurs conservees }
+Procedure BmpReformat(OldF, NewF : LongInt);
+Var B, Own, P, NB, Y, X, SA, DA, SP, DP : LongInt;
+Begin
+  Own := HeapOwner;
+  SP := PxBytes(OldF); DP := PxBytes(NewF);
+  For B := 0 To MaxGdi - 1 Do
+    If Gdis^[B].Used And (Gdis^[B].Kind = goBitmap) And
+       ((Gdis^[B].I7 And (1 Or 4 Or 8)) = 0) And (Gdis^[B].I4 = OldF) Then
+    Begin
+      HeapOwner := Gdis^[B].Owner;
+      P := (Gdis^[B].I2 * DP + 3) And Not 3;
+      NB := KAlloc(P * Gdis^[B].I3 + 16);
+      If NB <> 0 Then
+      Begin
+        For Y := 0 To Gdis^[B].I3 - 1 Do
+        Begin
+          SA := Gdis^[B].I1 + Y * Gdis^[B].I5; DA := NB + Y * P;
+          For X := 0 To Gdis^[B].I2 - 1 Do
+            PutRaw(DA + X * DP, XToRaw(RawToX(GetRaw(SA + X * SP, OldF),
+                   OldF), NewF), NewF);
+        End;
+        KFree(Gdis^[B].I1);
+        Gdis^[B].I1 := NB; Gdis^[B].I5 := P; Gdis^[B].I4 := NewF;
+      End;
+    End;
+  HeapOwner := Own;
 End;
 
 Procedure BmpFree(B : LongInt);
@@ -21299,7 +21700,7 @@ Var S : TSurf; OX, OY, B : LongInt; Clip, R : TRect;
 Begin
   DcBegin := False;
   If (D < 0) Or Not Dcs[D].Used Then Exit;
-  GTab := 0; GTop := -1;
+  GTab := 0; GTop := -1; GMono := False;
   If Dcs[D].Wnd >= 0 Then
   Begin
     If Not Wnds^[Dcs[D].Wnd].Used Then Exit;
@@ -21319,6 +21720,7 @@ Begin
     OX := 0; OY := 0;
     SetR(Clip, 0, 0, S.W, S.H);
     GTab := Gdis^[B].I6;
+    GMono := (Gdis^[B].I7 And 4) <> 0;
   End;
   If Dcs[D].HasClip Then
   Begin
@@ -21360,12 +21762,37 @@ Begin
 End;
 
 { Couleur (COLORREF) -> indice dans la cible courante }
-Function GColor(C : LongInt) : LongInt;
-Var I, Best, BD, D, R, G, B, T : LongInt;
+{ Entree I de la palette logique du contexte D en 00RRGGBB }
+Function DcPalX(D, I : LongInt) : LongInt;
+Var P, E : LongInt;
 Begin
+  P := -1;
+  If (D >= 0) And Dcs[D].Used Then P := Dcs[D].Pal;
+  If (P >= 0) And (I >= 0) And (I < Gdis^[P].I2) Then
+  Begin
+    E := Gdis^[P].I1 + I * 4;
+    DcPalX := (Mem[0:E] Shl 16) Or (Mem[0:E + 1] Shl 8) Or Mem[0:E + 2];
+  End
+  Else DcPalX := SysX[I And 255];
+End;
+
+{ Couleur (COLORREF) -> couleur pour la cible courante : indice en 256
+  couleurs (ou dans la table d'une DIB), 0 ou 1 pour un bitmap
+  monochrome, couleur directe (CDirect) en couleurs vraies }
+Function GColor(C : LongInt) : LongInt;
+Var I, Best, BD, D, R, G, B, T, X : LongInt;
+Begin
+  If (C Shr 24) = 1 Then X := DcPalX(GDc, C And $FFFF)
+  Else X := ((C And 255) Shl 16) Or (C And $FF00) Or ((C Shr 16) And 255);
+  If GMono Then
+  Begin
+    GColor := Ord(((X Shr 16) And 255) * 30 + ((X Shr 8) And 255) * 59 +
+                  (X And 255) * 11 >= 12800);
+    Exit;
+  End;
   If GTab = 0 Then
   Begin
-    GColor := ColorIdx(C);
+    If DS.Bpp = 8 Then GColor := ColorIdx(C) Else GColor := CDirect Or X;
     Exit;
   End;
   If (C Shr 24) = 1 Then
@@ -21373,7 +21800,7 @@ Begin
     GColor := C And 255;
     Exit;
   End;
-  R := C And 255; G := (C Shr 8) And 255; B := (C Shr 16) And 255;
+  R := (X Shr 16) And 255; G := (X Shr 8) And 255; B := X And 255;
   Best := 0; BD := $7FFFFFFF;
   For I := 0 To 255 Do
   Begin
@@ -21387,6 +21814,40 @@ Begin
     End;
   End;
   GColor := Best;
+End;
+
+{ 00RRGGBB -> point brut de la cible courante }
+Function ToTgt(X : LongInt) : LongInt;
+Begin
+  If GMono Then
+    ToTgt := Ord(((X Shr 16) And 255) * 30 + ((X Shr 8) And 255) * 59 +
+                 (X And 255) * 11 >= 12800)
+  Else If (DS.Bpp = 8) And (GTab <> 0) Then ToTgt := GColor(XToCr(X))
+  Else ToTgt := XToRaw(X, DS.Bpp);
+End;
+
+{ Point brut V d'une source (format Bpp, table Tab pour 8 bits) en
+  00RRGGBB }
+Function SrcX(V, Bpp, Tab : LongInt) : LongInt;
+Begin
+  If (Bpp = 8) And (Tab <> 0) Then SrcX := MemL[0:Tab + (V And 255) * 4] And
+                                          $FFFFFF
+  Else SrcX := RawToX(V, Bpp);
+End;
+
+{ Masque d'inversion de la cible (1 pour un bitmap monochrome) }
+Function TgtMask : LongInt;
+Begin
+  If GMono Then TgtMask := 1 Else TgtMask := RawMask(DS.Bpp);
+End;
+
+{ Point brut V en (X, Y) de la cible, avec decoupage }
+Procedure PixRaw(X, Y, V : LongInt);
+Begin
+  If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then
+    Exit;
+  PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PxBytes(DS.Bpp), V,
+         DS.Bpp);
 End;
 
 { ------------------------------------------------------------------ }
@@ -21619,9 +22080,11 @@ Begin
       MemL[0:Buf + 8] := Gdis^[I].I3;
       If (Gdis^[I].I7 And 4) <> 0 Then
         MemL[0:Buf + 12] := ((Gdis^[I].I2 + 15) Div 16) * 2
-      Else MemL[0:Buf + 12] := Gdis^[I].I5;
+      Else If (Gdis^[I].I7 And 1) <> 0 Then MemL[0:Buf + 12] := Gdis^[I].I5
+      Else MemL[0:Buf + 12] := ((Gdis^[I].I2 * StoreBits(Gdis^[I].I4) + 15)
+                                Div 16) * 2;
       MemW[0:Buf + 16] := 1;
-      MemW[0:Buf + 18] := Gdis^[I].I4;
+      MemW[0:Buf + 18] := BmpBits(I);
       If (Gdis^[I].I7 And 1) <> 0 Then MemL[0:Buf + 20] := Gdis^[I].I1;
       GetObjectA := 24;
       If ((Gdis^[I].I7 And 1) <> 0) And (N >= 84) Then
@@ -21738,6 +22201,17 @@ Begin
   P := Dcs[D].Pal;
   If (P < 0) Or (P = DefPal) Then Exit;
   N := Gdis^[P].I2;
+  If ScrFmt > 8 Then
+  Begin
+    For I := 0 To Min(N, 256) - 1 Do
+    Begin
+      E := Gdis^[P].I1 + I * 4;
+      Mem[0:Gdis^[P].I3 + I] := NearestIdx(Mem[0:E], Mem[0:E + 1],
+                                           Mem[0:E + 2]);
+    End;
+    RealizePalette := N;
+    Exit;
+  End;
   If SysPalUse = 2 Then
   Begin
     Lo := 1; Hi := 254;
@@ -22381,7 +22855,7 @@ End;
 
 { Remplir (X1,Y1)-(X2,Y2) inclus avec le pinceau B (indice GDI) }
 Procedure BrushFill(X1, Y1, X2, Y2, B : LongInt);
-Var C, X, Y, PB, PX, PY : LongInt; PS : TSurf;
+Var C, X, Y, PB, PX, PY, CT, CB : LongInt; PS : TSurf; PM, Same : Boolean;
 Begin
   If (B < 0) Or Not Gdis^[B].Used Then Exit;
   Case Gdis^[B].I1 Of
@@ -22399,6 +22873,11 @@ Begin
     Begin
       PB := Gdis^[B].I4;
       If (PB < 0) Or Not BmpSurf(PB, PS) Then Exit;
+      PM := (Gdis^[PB].I7 And 4) <> 0;
+      CT := RawOf(GColor(Dcs[GDc].TextColor), DS.Bpp);
+      CB := RawOf(GColor(Dcs[GDc].BkColor), DS.Bpp);
+      Same := (PS.Bpp = DS.Bpp) And Not GMono And Not PM And
+              ((PS.Bpp > 8) Or ((Gdis^[PB].I6 = 0) And (GTab = 0)));
       For Y := Max(Y1, ClipY1) To Min(Y2, ClipY2) Do
       Begin
         PY := Y Mod PS.H;
@@ -22407,17 +22886,13 @@ Begin
         Begin
           PX := X Mod PS.W;
           If PX < 0 Then PX := PX + PS.W;
-          C := Mem[0:PS.Bits + PY * PS.Pitch + PX];
-          If (Gdis^[PB].I7 And 4) <> 0 Then
+          C := GetRaw(PS.Bits + PY * PS.Pitch + PX * PxBytes(PS.Bpp), PS.Bpp);
+          If PM Then
           Begin
-            If C = 0 Then C := GColor(Dcs[GDc].TextColor)
-            Else C := GColor(Dcs[GDc].BkColor);
+            If C = 0 Then C := CT Else C := CB;
           End
-          Else If Gdis^[PB].I6 <> 0 Then
-            C := ColorIdx(((MemL[0:Gdis^[PB].I6 + C * 4] Shr 16) And 255) Or
-                 (MemL[0:Gdis^[PB].I6 + C * 4] And $FF00) Or
-                 ((MemL[0:Gdis^[PB].I6 + C * 4] And 255) Shl 16));
-          Pix(X, Y, C);
+          Else If Not Same Then C := ToTgt(SrcX(C, PS.Bpp, Gdis^[PB].I6));
+          PixRaw(X, Y, C);
         End;
       End;
     End;
@@ -22427,7 +22902,7 @@ Begin
 End;
 
 Function PatBlt(Hdc, X, Y, W, H, Rop : LongInt) : LongInt;
-Var D, C, YY, XX, A : LongInt;
+Var D, C, YY, XX : LongInt;
 Begin
   PatBlt := 1;
   D := DcOf(Hdc);
@@ -22446,14 +22921,12 @@ Begin
     WHITENESS : FBar(X, Y, X + W - 1, Y + H - 1, GColor($FFFFFF));
     DSTINVERT, PATINVERT :
     Begin
-      C := 255;
-      If Rop = PATINVERT Then C := GColor(Gdis^[Dcs[D].Brush].I2);
+      C := TgtMask;
+      If Rop = PATINVERT Then
+        C := RawOf(GColor(Gdis^[Dcs[D].Brush].I2), DS.Bpp);
       For YY := Max(Y, ClipY1) To Min(Y + H - 1, ClipY2) Do
         For XX := Max(X, ClipX1) To Min(X + W - 1, ClipX2) Do
-        Begin
-          A := DS.Bits + (YY - DOY) * DS.Pitch + (XX - DOX);
-          Mem[0:A] := Mem[0:A] Xor C;
-        End;
+          XorPix(XX, YY, C);
     End;
   Else
     BrushFill(X, Y, X + W - 1, Y + H - 1, Dcs[D].Brush);
@@ -22687,10 +23160,7 @@ Begin
   If (I < 0) Or Not DcBegin(D) Then Exit;
   For Y := Max(Gdis^[I].I2, ClipY1) To Min(Gdis^[I].I4 - 1, ClipY2) Do
     For X := Max(Gdis^[I].I1, ClipX1) To Min(Gdis^[I].I3 - 1, ClipX2) Do
-    Begin
-      A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
-      Mem[0:A] := Mem[0:A] Xor 255;
-    End;
+      XorPix(X, Y, TgtMask);
   DcDirty(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
 End;
 
@@ -22712,11 +23182,15 @@ Begin
   If Not DcBegin(D) Then Exit;
   If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then Exit;
   I := GetPix(X, Y);
-  If GTab <> 0 Then
+  If GMono Then
+  Begin
+    If I <> 0 Then GetPixel := $FFFFFF Else GetPixel := 0;
+  End
+  Else If GTab <> 0 Then
     GetPixel := ((MemL[0:GTab + I * 4] Shr 16) And 255) Or
                 (MemL[0:GTab + I * 4] And $FF00) Or
                 ((MemL[0:GTab + I * 4] And 255) Shl 16)
-  Else GetPixel := IdxColor(I);
+  Else GetPixel := XToCr(RawToX(I, DS.Bpp));
 End;
 
 { ------------------------------------------------------------------ }
@@ -22906,8 +23380,21 @@ Begin
   BuildXlat := False;
   If SMono Then
   Begin
-    For I := 0 To 255 Do XlatTab[I] := GColor(Dcs[D].BkColor);
-    XlatTab[0] := GColor(Dcs[D].TextColor);
+    C := RawOf(GColor(Dcs[D].BkColor), DS.Bpp);
+    For I := 0 To 255 Do XlatL[I] := C;
+    XlatL[0] := RawOf(GColor(Dcs[D].TextColor), DS.Bpp);
+    BuildXlat := True;
+    Exit;
+  End;
+  If (DS.Bpp > 8) Or GMono Then
+  Begin
+    { couleurs vraies (ou monochrome) : couleur exacte de chaque indice }
+    For I := 0 To 255 Do
+    Begin
+      If STab <> 0 Then Q := MemL[0:STab + I * 4] And $FFFFFF
+      Else Q := SysX[I];
+      XlatL[I] := ToTgt(Q);
+    End;
     BuildXlat := True;
     Exit;
   End;
@@ -22930,10 +23417,10 @@ Begin
       Q := MemL[0:STab + I * 4];
       C := ((Q Shr 16) And 255) Or (Q And $FF00) Or ((Q And 255) Shl 16);
       If GTab = 0 Then
-        XlatTab[I] := PalMatch(D, I, Q And $FFFFFF, C)
-      Else XlatTab[I] := GColor(C);
+        XlatL[I] := PalMatch(D, I, Q And $FFFFFF, C)
+      Else XlatL[I] := GColor(C);
     End
-    Else XlatTab[I] := GColor(IdxColor(I));
+    Else XlatL[I] := GColor(IdxColor(I));
   End;
   BuildXlat := True;
 End;
@@ -22947,16 +23434,16 @@ Begin
     SRCPAINT : Rop3 := S Or D;
     SRCAND : Rop3 := S And D;
     SRCINVERT : Rop3 := S Xor D;
-    NOTSRCCOPY : Rop3 := (Not S) And 255;
-    SRCERASE : Rop3 := S And Not D And 255;
-    MERGEPAINT : Rop3 := (Not S Or D) And 255;
-    NOTSRCERASE : Rop3 := (Not (S Or D)) And 255;
+    NOTSRCCOPY : Rop3 := (Not S) And RopMsk;
+    SRCERASE : Rop3 := S And Not D And RopMsk;
+    MERGEPAINT : Rop3 := (Not S Or D) And RopMsk;
+    NOTSRCERASE : Rop3 := (Not (S Or D)) And RopMsk;
     MERGECOPY : Rop3 := P And S;
-    DSTINVERT : Rop3 := (Not D) And 255;
+    DSTINVERT : Rop3 := (Not D) And RopMsk;
     PATCOPY : Rop3 := P;
     PATINVERT : Rop3 := P Xor D;
     BLACKNESS : Rop3 := 0;
-    WHITENESS : Rop3 := 255;
+    WHITENESS : Rop3 := RopMsk;
   Else
     R := 0;
     I := (Rop Shr 16) And 255;
@@ -22968,16 +23455,17 @@ Begin
     If (I And $20) <> 0 Then R := R Or (P And Not S And D);
     If (I And $40) <> 0 Then R := R Or (P And S And Not D);
     If (I And $80) <> 0 Then R := R Or (P And S And D);
-    Rop3 := R And 255;
+    Rop3 := R And RopMsk;
   End;
 End;
 
 { Transfert (avec mise a l'echelle) de la source S vers le contexte
   courant (DcBegin deja fait). Coordonnees logiques de la cible }
 Procedure BltCore(DX, DY, DW, DH : LongInt; Var S : TSurf; SX, SY, SW,
-                  SH : LongInt; Xl : Boolean; Rop : LongInt);
-Var X, Y, SXX, SYY, A, V, P, X0, X1, Y0, Y1, SRow, Pc, DMono : LongInt;
-    Flip : Boolean; Simple : Boolean;
+                  SH : LongInt; Xl : Boolean; Rop, STab : LongInt;
+                  SMono : Boolean; SBk : LongInt);
+Var X, Y, SXX, SYY, A, V, X0, X1, Y0, Y1, SRow, Pc, PB, SPB, N : LongInt;
+    Simple : Boolean;
 Begin
   If (DW = 0) Or (DH = 0) Or (SW = 0) Or (SH = 0) Then Exit;
   If DW < 0 Then
@@ -22991,19 +23479,19 @@ Begin
   X0 := Max(DX, ClipX1); X1 := Min(DX + DW - 1, ClipX2);
   Y0 := Max(DY, ClipY1); Y1 := Min(DY + DH - 1, ClipY2);
   If (X0 > X1) Or (Y0 > Y1) Then Exit;
+  PB := PxBytes(DS.Bpp); SPB := PxBytes(S.Bpp);
+  RopMsk := TgtMask;
   Pc := 0;
-  If (Dcs[GDc].Brush >= 0) Then Pc := GColor(Gdis^[Dcs[GDc].Brush].I2);
-  DMono := 0;
-  If (Dcs[GDc].Bmp >= 0) And ((Gdis^[Dcs[GDc].Bmp].I7 And 4) <> 0) And
-     (Dcs[GDc].Wnd < 0) And Not Dcs[GDc].Screen Then DMono := 1;
+  If (Dcs[GDc].Brush >= 0) Then
+    Pc := RawOf(GColor(Gdis^[Dcs[GDc].Brush].I2), DS.Bpp);
   Simple := (Rop = SRCCOPY) And Not Xl And (DW = SW) And (DH = SH) And
-            (DMono = 0);
+            Not GMono And (S.Bpp = DS.Bpp);
   For Y := Y0 To Y1 Do
   Begin
     SYY := SY + ((Y - DY) * SH) Div DH;
     If (SYY < 0) Or (SYY >= S.H) Then Continue;
     SRow := S.Bits + SYY * S.Pitch;
-    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX;
+    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX * PB;
     If Simple Then
     Begin
       SXX := SX + (X0 - DX);
@@ -23012,23 +23500,26 @@ Begin
       Begin
         X := X - SXX; SXX := 0;
       End;
-      If X <= X1 Then
-        MoveMem(SRow + SXX, A + X, Min(X1 - X + 1, S.W - SXX));
+      N := Min(X1 - X + 1, S.W - SXX);
+      If (X <= X1) And (N > 0) Then
+        MoveMem(SRow + SXX * SPB, A + X * PB, N * PB);
       Continue;
     End;
     For X := X0 To X1 Do
     Begin
       SXX := SX + ((X - DX) * SW) Div DW;
       If (SXX < 0) Or (SXX >= S.W) Then Continue;
-      V := Mem[0:SRow + SXX];
-      If DMono = 1 Then
+      V := GetRaw(SRow + SXX * SPB, S.Bpp);
+      If GMono Then
       Begin
-        If Xl Then V := XlatTab[V];
-        If V = GColor(Dcs[GDc].BkColor) Then V := 1 Else V := 0;
+        { couleur -> monochrome : blanc pour la couleur de fond de la
+          source, noir sinon }
+        If Not SMono Then V := Ord(SrcX(V, S.Bpp, STab) = SBk);
       End
-      Else If Xl Then V := XlatTab[V];
-      If Rop <> SRCCOPY Then V := Rop3(Rop, Pc, V, Mem[0:A + X]);
-      Mem[0:A + X] := V;
+      Else If Xl Then V := XlatL[V And 255]
+      Else If S.Bpp <> DS.Bpp Then V := ToTgt(RawToX(V, S.Bpp));
+      If Rop <> SRCCOPY Then V := Rop3(Rop, Pc, V, GetRaw(A + X * PB, DS.Bpp));
+      PutRaw(A + X * PB, V, DS.Bpp);
     End;
   End;
   DcDirty(X0, Y0, X1, Y1);
@@ -23036,7 +23527,7 @@ End;
 
 Function StretchBlt(Hdc, X, Y, W, H, Src, SX, SY, SW, SH, Rop : LongInt)
   : LongInt;
-Var D, SD, STab, OX, OY : LongInt; S : TSurf; SMono, Xl : Boolean;
+Var D, SD, STab, OX, OY, SBk, C : LongInt; S : TSurf; SMono, Xl : Boolean;
 Begin
   StretchBlt := 1;
   D := DcOf(Hdc);
@@ -23048,9 +23539,13 @@ Begin
   End;
   SD := DcOf(Src);
   If Not SrcInfo(SD, S, STab, SMono, OX, OY) Then Exit;
+  C := Dcs[SD].BkColor;
+  SBk := ((C And 255) Shl 16) Or (C And $FF00) Or ((C Shr 16) And 255);
   If Not DcBegin(D) Then Exit;
-  Xl := BuildXlat(STab, SMono, D);
-  BltCore(X, Y, W, H, S, SX + OX, SY + OY, SW, SH, Xl, Rop);
+  Xl := False;
+  If S.Bpp = 8 Then Xl := BuildXlat(STab, SMono, D);
+  BltCore(X, Y, W, H, S, SX + OX, SY + OY, SW, SH, Xl, Rop, STab, SMono,
+          SBk);
 End;
 
 Function BitBlt(Hdc, X, Y, W, H, Src, SX, SY, Rop : LongInt) : LongInt;
@@ -23104,72 +23599,123 @@ End;
 
 { Lire le point (X, Y) d'une DIB (Y depuis le haut) comme indice de la
   table (1, 4, 8 bits) ou couleur RGB (16, 24, 32 bits, avec bit 31) }
-Function DibPix(Bits, W, H, Bpp, X, Y : LongInt; TopDown : Boolean)
-  : LongInt;
-Var Row, A, V : LongInt;
+{ DIB 16 bits en 5-6-5 : BI_BITFIELDS avec le masque vert 07E0h (les
+  masques suivent l'en-tete de 40 octets, ou y sont pour V4 et V5) }
+Function DibIs565(Bmi : LongInt) : Boolean;
 Begin
-  If Not TopDown Then Y := H - 1 - Y;
-  Row := Bits + Y * DibPitch(W, Bpp);
+  DibIs565 := (MemW[0:Bmi + 14] = 16) And (MemL[0:Bmi + 16] = 3) And
+              (MemL[0:Bmi + 44] = $7E0);
+End;
+
+{ Point X d'une ligne de DIB : indice de la table (1, 4, 8 bits) ou
+  couleur 00RRGGBB avec le bit 31 (16, 24, 32 bits ; 16 bits en 5-5-5,
+  ou 5-6-5 si DibG6) }
+Function DibPixRow(Row, Bpp, X : LongInt) : LongInt;
+Var A, V : LongInt;
+Begin
   Case Bpp Of
-    8 : DibPix := Mem[0:Row + X];
+    8 : DibPixRow := Mem[0:Row + X];
     4 :
     Begin
       V := Mem[0:Row + X Div 2];
-      If Odd(X) Then DibPix := V And 15 Else DibPix := V Shr 4;
+      If Odd(X) Then DibPixRow := V And 15 Else DibPixRow := V Shr 4;
     End;
-    1 : DibPix := (Mem[0:Row + X Div 8] Shr (7 - X Mod 8)) And 1;
+    1 : DibPixRow := (Mem[0:Row + X Div 8] Shr (7 - X Mod 8)) And 1;
     24 :
     Begin
       A := Row + X * 3;
-      DibPix := LongInt($80000000) Or (Mem[0:A + 2] Shl 16) Or
-                (Mem[0:A + 1] Shl 8) Or Mem[0:A];
+      DibPixRow := LongInt($80000000) Or (Mem[0:A + 2] Shl 16) Or
+                   (Mem[0:A + 1] Shl 8) Or Mem[0:A];
     End;
-    32 : DibPix := LongInt($80000000) Or (MemL[0:Row + X * 4] And $FFFFFF);
+    32 : DibPixRow := LongInt($80000000) Or (MemL[0:Row + X * 4] And $FFFFFF);
     16 :
     Begin
-      V := MemW[0:Row + X * 2];
-      DibPix := LongInt($80000000) Or (((V Shr 10) And 31) Shl 19) Or
-                (((V Shr 5) And 31) Shl 11) Or ((V And 31) Shl 3);
+      If DibG6 Then V := RawToX(MemW[0:Row + X * 2], 16)
+      Else V := RawToX(MemW[0:Row + X * 2], 15);
+      DibPixRow := LongInt($80000000) Or V;
     End;
   Else
-    DibPix := 0;
+    DibPixRow := 0;
   End;
+End;
+
+{ Ecrire le point X (00RRGGBB, ou indice I pour 1, 4, 8 bits) d'une
+  ligne de DIB }
+Procedure DibPutRow(Row, Bpp, X, V : LongInt);
+Var A, M : LongInt;
+Begin
+  Case Bpp Of
+    8 : Mem[0:Row + X] := V;
+    4 :
+    Begin
+      A := Row + X Div 2;
+      If Odd(X) Then Mem[0:A] := (Mem[0:A] And $F0) Or (V And 15)
+      Else Mem[0:A] := (Mem[0:A] And 15) Or ((V And 15) Shl 4);
+    End;
+    1 :
+    Begin
+      A := Row + X Div 8; M := $80 Shr (X Mod 8);
+      If (V And 1) <> 0 Then Mem[0:A] := Mem[0:A] Or M
+      Else Mem[0:A] := Mem[0:A] And Not M;
+    End;
+    16 :
+      If DibG6 Then MemW[0:Row + X * 2] := XToRaw(V, 16)
+      Else MemW[0:Row + X * 2] := XToRaw(V, 15);
+    24 :
+    Begin
+      A := Row + X * 3;
+      MemW[0:A] := V; Mem[0:A + 2] := V Shr 16;
+    End;
+    32 : MemL[0:Row + X * 4] := V And $FFFFFF;
+  End;
+End;
+
+Function DibPix(Bits, W, H, Bpp, X, Y : LongInt; TopDown : Boolean)
+  : LongInt;
+Begin
+  If Not TopDown Then Y := H - 1 - Y;
+  DibPix := DibPixRow(Bits + Y * DibPitch(W, Bpp), Bpp, X);
 End;
 
 { Transferer une DIB (memoire de l'appelant) vers le contexte courant }
 Procedure DibToDc(D, DX, DY, DW, DH, SX, SY, SW, SH, Bits, Bmi, Usage,
                   Rop : LongInt);
 Var W, H, Bpp, X, Y, SXX, SYY, V, A, X0, X1, Y0, Y1, Tab, Q, P, N,
-    T : LongInt;
+    T, PB, DP, Row : LongInt;
     Top : Boolean;
 Begin
   W := MemL[0:Bmi + 4]; H := MemL[0:Bmi + 8]; Bpp := MemW[0:Bmi + 14];
   Top := H < 0;
   If Top Then H := -H;
   If (DW = 0) Or (DH = 0) Or (SW = 0) Or (SH = 0) Then Exit;
-  Tab := KAlloc(1024);
-  DibTable(Bmi, Usage, D, Tab);
-  For V := 0 To 255 Do
+  DibG6 := DibIs565(Bmi);
+  PB := PxBytes(DS.Bpp);
+  RopMsk := TgtMask;
+  If Bpp <= 8 Then
   Begin
-    Q := MemL[0:Tab + V * 4];
-    XlatTab[V] := GColor(((Q Shr 16) And 255) Or (Q And $FF00) Or
-                         ((Q And 255) Shl 16));
-  End;
-  KFree(Tab);
-  { DIB_PAL_COLORS : indices de la palette logique -> indices systeme
-    realises (sans passer par RVB : les fondus de palette restent
-    possibles) }
-  If Usage = 1 Then
-  Begin
-    P := Dcs[D].Pal;
-    If (P >= 0) And (Gdis^[P].I3 <> 0) Then
+    Tab := KAlloc(1024);
+    DibTable(Bmi, Usage, D, Tab);
+    For V := 0 To 255 Do
     Begin
-      N := Min(DibColors(Bmi), 256);
-      T := Bmi + MemL[0:Bmi];
-      For V := 0 To N - 1 Do
+      Q := MemL[0:Tab + V * 4];
+      XlatL[V] := RawOf(GColor(XToCr(Q And $FFFFFF)), DS.Bpp);
+    End;
+    KFree(Tab);
+    { DIB_PAL_COLORS en 256 couleurs : indices de la palette logique ->
+      indices systeme realises (sans passer par RVB : les fondus de
+      palette restent possibles) }
+    If (Usage = 1) And (DS.Bpp = 8) And Not GMono And (GTab = 0) Then
+    Begin
+      P := Dcs[D].Pal;
+      If (P >= 0) And (Gdis^[P].I3 <> 0) Then
       Begin
-        Q := MemW[0:T + V * 2];
-        If Q < Gdis^[P].I2 Then XlatTab[V] := Mem[0:Gdis^[P].I3 + Q];
+        N := Min(DibColors(Bmi), 256);
+        T := Bmi + MemL[0:Bmi];
+        For V := 0 To N - 1 Do
+        Begin
+          Q := MemW[0:T + V * 2];
+          If Q < Gdis^[P].I2 Then XlatL[V] := Mem[0:Gdis^[P].I3 + Q];
+        End;
       End;
     End;
   End;
@@ -23184,22 +23730,26 @@ Begin
   X0 := Max(DX, ClipX1); X1 := Min(DX + DW - 1, ClipX2);
   Y0 := Max(DY, ClipY1); Y1 := Min(DY + DH - 1, ClipY2);
   If (X0 > X1) Or (Y0 > Y1) Then Exit;
+  DP := DibPitch(W, Bpp);
   For Y := Y0 To Y1 Do
   Begin
     SYY := SY + ((Y - DY) * SH) Div DH;
     If (SYY < 0) Or (SYY >= H) Then Continue;
-    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX;
+    If Top Then Row := Bits + SYY * DP Else Row := Bits + (H - 1 - SYY) * DP;
+    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX * PB;
     For X := X0 To X1 Do
     Begin
       SXX := SX + ((X - DX) * SW) Div DW;
       If (SXX < 0) Or (SXX >= W) Then Continue;
-      V := DibPix(Bits, W, H, Bpp, SXX, SYY, Top);
+      V := DibPixRow(Row, Bpp, SXX);
       If V < 0 Then
-        V := GColor(((V Shr 16) And 255) Or (V And $FF00) Or
-                    ((V And 255) Shl 16))
-      Else V := XlatTab[V And 255];
-      If Rop <> SRCCOPY Then V := Rop3(Rop, 0, V, Mem[0:A + X]);
-      Mem[0:A + X] := V;
+      Begin
+        If DS.Bpp > 8 Then V := XToRaw(V And $FFFFFF, DS.Bpp)
+        Else V := RawOf(GColor(XToCr(V And $FFFFFF)), 8);
+      End
+      Else V := XlatL[V And 255];
+      If Rop <> SRCCOPY Then V := Rop3(Rop, 0, V, GetRaw(A + X * PB, DS.Bpp));
+      PutRaw(A + X * PB, V, DS.Bpp);
     End;
   End;
   DcDirty(X0, Y0, X1, Y1);
@@ -23231,35 +23781,88 @@ Begin
 End;
 
 { Creer un bitmap compatible (8 bits) a partir d'une DIB }
-Function CreateDIBitmapK(Bmi, Bits, Usage : LongInt) : LongInt;
-Var B, W, H, Y, X, V, Q, Tab : LongInt; Top : Boolean;
+{ 00RRGGBB -> point brut du bitmap B (format F, monochrome, table) }
+Function BmpRawOf(B, X, F : LongInt) : LongInt;
+Var I, Best, BD, D, T : LongInt;
 Begin
-  W := MemL[0:Bmi + 4]; H := MemL[0:Bmi + 8];
-  Top := H < 0;
-  If Top Then H := -H;
+  If (Gdis^[B].I7 And 4) <> 0 Then
+    BmpRawOf := Ord(((X Shr 16) And 255) * 30 + ((X Shr 8) And 255) * 59 +
+                    (X And 255) * 11 >= 12800)
+  Else If (F = 8) And (Gdis^[B].I6 <> 0) Then
+  Begin
+    Best := 0; BD := $7FFFFFFF;
+    For I := 0 To 255 Do
+    Begin
+      T := MemL[0:Gdis^[B].I6 + I * 4];
+      D := Sqr(((T Shr 16) And 255) - ((X Shr 16) And 255)) +
+           Sqr(((T Shr 8) And 255) - ((X Shr 8) And 255)) +
+           Sqr((T And 255) - (X And 255));
+      If D < BD Then
+      Begin
+        BD := D; Best := I;
+        If D = 0 Then Break;
+      End;
+    End;
+    BmpRawOf := Best;
+  End
+  Else BmpRawOf := XToRaw(X, F);
+End;
+
+{ Lignes Start..Start+Lines-1 d'une DIB (Bits commence a la ligne
+  Start) vers le bitmap B ; rend le nombre de lignes copiees }
+Function SetDIBitsK(B, Start, Lines, Bits, Bmi, Usage, D : LongInt)
+  : LongInt;
+Var DW, DH, L, X, SY, Row, V, I, Tab, DP, SA, Bpp, PB, N : LongInt;
+    S : TSurf; Top : Boolean;
+Begin
+  SetDIBitsK := 0;
+  If (B < 0) Or Not BmpSurf(B, S) Then Exit;
+  DW := MemL[0:Bmi + 4]; DH := MemL[0:Bmi + 8];
+  Top := DH < 0;
+  DH := Abs(DH);
+  Bpp := MemW[0:Bmi + 14];
+  DibG6 := DibIs565(Bmi);
+  DP := DibPitch(DW, Bpp); PB := PxBytes(S.Bpp);
+  If Bpp <= 8 Then
+  Begin
+    Tab := KAlloc(1024);
+    DibTable(Bmi, Usage, D, Tab);
+    For I := 0 To 255 Do
+      XlatL[I] := BmpRawOf(B, MemL[0:Tab + I * 4] And $FFFFFF, S.Bpp);
+    KFree(Tab);
+  End;
+  N := 0;
+  For L := 0 To Lines - 1 Do
+  Begin
+    If Start + L >= DH Then Break;
+    If Top Then SY := Start + L Else SY := S.H - 1 - (Start + L);
+    If (SY >= 0) And (SY < S.H) Then
+    Begin
+      Row := Bits + L * DP;
+      SA := S.Bits + SY * S.Pitch;
+      For X := 0 To Min(DW, S.W) - 1 Do
+      Begin
+        V := DibPixRow(Row, Bpp, X);
+        If V < 0 Then V := BmpRawOf(B, V And $FFFFFF, S.Bpp)
+        Else V := XlatL[V And 255];
+        PutRaw(SA + X * PB, V, S.Bpp);
+      End;
+    End;
+    Inc(N);
+  End;
+  SetDIBitsK := N;
+End;
+
+{ Creer un bitmap compatible (format de l'ecran) a partir d'une DIB }
+Function CreateDIBitmapK(Bmi, Bits, Usage : LongInt) : LongInt;
+Var B, W, H : LongInt;
+Begin
+  W := MemL[0:Bmi + 4]; H := Abs(MemL[0:Bmi + 8]);
   If Bits = 0 Then Bits := Bmi + MemL[0:Bmi] + DibColors(Bmi) * 4;
-  B := BmpNew(W, H, 8, False);
+  B := BmpNew(W, H, ScrFmt, False);
   CreateDIBitmapK := B;
   If B < 0 Then Exit;
-  Tab := KAlloc(1024);
-  DibTable(Bmi, Usage, -1, Tab);
-  For V := 0 To 255 Do
-  Begin
-    Q := MemL[0:Tab + V * 4];
-    XlatTab[V] := ColorIdx(((Q Shr 16) And 255) Or (Q And $FF00) Or
-                           ((Q And 255) Shl 16));
-  End;
-  KFree(Tab);
-  For Y := 0 To H - 1 Do
-    For X := 0 To W - 1 Do
-    Begin
-      V := DibPix(Bits, W, H, MemW[0:Bmi + 14], X, Y, Top);
-      If V < 0 Then
-        V := ColorIdx(((V Shr 16) And 255) Or (V And $FF00) Or
-                      ((V And 255) Shl 16))
-      Else V := XlatTab[V And 255];
-      Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] := V;
-    End;
+  SetDIBitsK(B, 0, H, Bits, Bmi, Usage, -1);
 End;
 
 Function CreateDIBitmap(Hdc, Bih, Init, Bits, Bmi, Usage : LongInt)
@@ -23269,7 +23872,7 @@ Begin
   If ((Init And 4) <> 0) And (Bits <> 0) And (Bmi <> 0) Then
     B := CreateDIBitmapK(Bmi, Bits, Usage)
   Else
-    B := BmpNew(MemL[0:Bih + 4], Abs(MemL[0:Bih + 8]), 8, False);
+    B := BmpNew(MemL[0:Bih + 4], Abs(MemL[0:Bih + 8]), ScrFmt, False);
   CreateDIBitmap := GdiH(B);
 End;
 
@@ -23288,6 +23891,8 @@ Begin
   Gdis^[B].I5 := Pitch;
   Gdis^[B].I7 := 1;
   If H < 0 Then Gdis^[B].I7 := Gdis^[B].I7 Or 2;
+  If DibIs565(Bmi) Then Gdis^[B].I7 := Gdis^[B].I7 Or $10;
+  If Gdis^[B].I1 <> 0 Then FillMem(Gdis^[B].I1, Pitch * Abs(H), 0);
   If Bpp <= 8 Then
   Begin
     Gdis^[B].I6 := KAlloc(1024);
@@ -23331,7 +23936,7 @@ Begin
   D := DcOf(Hdc);
   Mono := (D >= 0) And (Dcs[D].Wnd < 0) And Not Dcs[D].Screen And
           ((Dcs[D].Bmp < 0) Or (Dcs[D].Bmp = DefBmp));
-  B := BmpNew(W, H, 8, Mono);
+  B := BmpNew(W, H, ScrFmt, Mono);
   CreateCompatibleBitmap := GdiH(B);
 End;
 
@@ -23341,13 +23946,26 @@ Begin
 End;
 
 { CreateBitmap : 1 bit (lignes alignees sur 16 bits) ou 8 bits }
-Function CreateBitmap(W, H, Planes, Bpp, Bits : LongInt) : LongInt;
-Var B, X, Y, WB : LongInt;
+{ Bits par point en memoire d'un format (15 occupe 16 bits) }
+Function StoreBits(F : LongInt) : LongInt;
 Begin
-  B := BmpNew(W, H, 8, Bpp = 1);
+  If F = 15 Then StoreBits := 16 Else StoreBits := F;
+End;
+
+{ CreateBitmap : 1 bit (lignes alignees sur 16 bits), 8, 16, 24 ou 32
+  bits (16 bits : format de l'ecran, 5-5-5 ou 5-6-5) }
+Function CreateBitmap(W, H, Planes, Bpp, Bits : LongInt) : LongInt;
+Var B, X, Y, WB, F : LongInt;
+Begin
+  If Planes > 1 Then Bpp := Bpp * Planes;
+  F := Bpp;
+  If (F = 16) And (ScrFmt = 15) Then F := 15;
+  If (F <> 1) And (F <> 8) And (F <> 15) And (F <> 16) And (F <> 24) And
+     (F <> 32) Then F := ScrFmt;
+  B := BmpNew(W, H, F, F = 1);
   CreateBitmap := GdiH(B);
   If (B < 0) Or (Bits = 0) Then Exit;
-  If Bpp = 1 Then
+  If F = 1 Then
   Begin
     WB := ((W + 15) Div 16) * 2;
     For Y := 0 To H - 1 Do
@@ -23355,11 +23973,12 @@ Begin
         Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] :=
           (Mem[0:Bits + Y * WB + X Div 8] Shr (7 - X Mod 8)) And 1;
   End
-  Else If Bpp = 8 Then
+  Else
   Begin
-    WB := ((W + 1) Div 2) * 2;
+    WB := ((W * StoreBits(F) + 15) Div 16) * 2;
     For Y := 0 To H - 1 Do
-      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5, W);
+      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5,
+              W * PxBytes(F));
   End;
 End;
 
@@ -23370,7 +23989,7 @@ Begin
 End;
 
 Function GetBitmapBits(H, N, Bits : LongInt) : LongInt;
-Var B, Y, X, WB, V : LongInt;
+Var B, Y, X, WB, V, F : LongInt;
 Begin
   GetBitmapBits := 0;
   B := GdiOf(H, goBitmap);
@@ -23390,15 +24009,17 @@ Begin
     GetBitmapBits := Min(N, WB * Gdis^[B].I3);
     Exit;
   End;
-  WB := ((Gdis^[B].I2 + 1) Div 2) * 2;
+  F := BmpFmt(B);
+  WB := ((Gdis^[B].I2 * StoreBits(F) + 15) Div 16) * 2;
   For Y := 0 To Gdis^[B].I3 - 1 Do
     If (Y + 1) * WB <= N Then
-      MoveMem(Gdis^[B].I1 + Y * Gdis^[B].I5, Bits + Y * WB, Gdis^[B].I2);
+      MoveMem(Gdis^[B].I1 + Y * Gdis^[B].I5, Bits + Y * WB,
+              Gdis^[B].I2 * PxBytes(F));
   GetBitmapBits := Min(N, WB * Gdis^[B].I3);
 End;
 
 Function SetBitmapBits(H, N, Bits : LongInt) : LongInt;
-Var B, Y, X, WB : LongInt;
+Var B, Y, X, WB, F : LongInt;
 Begin
   SetBitmapBits := 0;
   B := GdiOf(H, goBitmap);
@@ -23414,88 +24035,144 @@ Begin
     SetBitmapBits := N;
     Exit;
   End;
-  WB := ((Gdis^[B].I2 + 1) Div 2) * 2;
+  F := BmpFmt(B);
+  WB := ((Gdis^[B].I2 * StoreBits(F) + 15) Div 16) * 2;
   For Y := 0 To Gdis^[B].I3 - 1 Do
     If (Y + 1) * WB <= N Then
-      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5, Gdis^[B].I2);
+      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5,
+              Gdis^[B].I2 * PxBytes(F));
   SetBitmapBits := N;
 End;
 
 { GetDIBits : bitmap -> DIB (8 bits ; table de couleurs remplie) }
+{ Couleur VGA (16 couleurs) la plus proche de 00RRGGBB }
+Function Nearest16(X : LongInt) : LongInt;
+Var I, D, BD, Best, T : LongInt;
+Begin
+  Best := 0; BD := $7FFFFFFF;
+  For I := 0 To 15 Do
+  Begin
+    T := VgaRGB[I];
+    D := Sqr(((T Shr 16) And 255) - ((X Shr 16) And 255)) +
+         Sqr(((T Shr 8) And 255) - ((X Shr 8) And 255)) +
+         Sqr((T And 255) - (X And 255));
+    If D < BD Then
+    Begin
+      BD := D; Best := I;
+    End;
+  End;
+  Nearest16 := Best;
+End;
+
+{ GetDIBits : bitmap -> DIB de 1, 4, 8, 16 (5-5-5, ou 5-6-5 avec
+  BI_BITFIELDS), 24 ou 32 bits ; sans bits par point (0), decrit le
+  format du bitmap }
 Function GetDIBits(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt)
   : LongInt;
-Var B, W, Hh, Y, X, SY, Pitch, I, V, Bpp : LongInt;
+Var B, W, Hh, L, X, SY, OB, DP, Row, V, XX, I, F, SA, Tab, N, DW, SPB
+    : LongInt;
+    S : TSurf; Mono, Top : Boolean;
 Begin
   GetDIBits := 0;
   B := GdiOf(H, goBitmap);
   If B < 0 Then Exit;
   W := Gdis^[B].I2; Hh := Gdis^[B].I3;
+  F := BmpFmt(B); Mono := (Gdis^[B].I7 And 4) <> 0;
   If MemW[0:Bmi + 14] = 0 Then
   Begin
+    If Mono Then OB := 1 Else OB := BmpBits(B);
     MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := Hh;
-    MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
-    MemL[0:Bmi + 16] := 0; MemL[0:Bmi + 20] := ((W + 3) And Not 3) * Hh;
+    MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := OB;
+    MemL[0:Bmi + 16] := 0;
+    If F = 16 Then MemL[0:Bmi + 16] := 3;
+    MemL[0:Bmi + 20] := DibPitch(W, OB) * Hh;
     MemL[0:Bmi + 32] := 0;
     GetDIBits := Hh;
     Exit;
   End;
-  Bpp := MemW[0:Bmi + 14];
-  For I := 0 To 255 Do
+  OB := MemW[0:Bmi + 14];
+  DibG6 := (OB = 16) And (MemL[0:Bmi + 16] = 3);
+  DW := MemL[0:Bmi + 4];
+  Tab := Bmi + MemL[0:Bmi];
+  If OB <= 8 Then
   Begin
-    If Gdis^[B].I6 <> 0 Then V := MemL[0:Gdis^[B].I6 + I * 4]
-    Else V := (SysPal[I * 3] Shl 16) Or (SysPal[I * 3 + 1] Shl 8) Or
-              SysPal[I * 3 + 2];
-    MemL[0:Bmi + MemL[0:Bmi] + I * 4] := V;
+    For I := 0 To (1 Shl OB) - 1 Do
+    Begin
+      If OB = 1 Then
+      Begin
+        If I = 0 Then V := 0 Else V := $FFFFFF;
+      End
+      Else If OB = 4 Then V := VgaRGB[I]
+      Else If (F = 8) And Not Mono And (Gdis^[B].I6 <> 0) Then
+        V := MemL[0:Gdis^[B].I6 + I * 4] And $FFFFFF
+      Else V := SysX[I];
+      MemL[0:Tab + I * 4] := V;
+    End;
+  End
+  Else If DibG6 Then
+  Begin
+    MemL[0:Tab] := $F800; MemL[0:Tab + 4] := $7E0; MemL[0:Tab + 8] := $1F;
+  End
+  Else If (OB = 32) And (MemL[0:Bmi + 16] = 3) Then
+  Begin
+    MemL[0:Tab] := $FF0000; MemL[0:Tab + 4] := $FF00;
+    MemL[0:Tab + 8] := $FF;
   End;
-  If (Bits = 0) Or (Bpp <> 8) Then
+  MemL[0:Bmi + 20] := DibPitch(DW, OB) * Abs(MemL[0:Bmi + 8]);
+  If Bits = 0 Then
   Begin
     GetDIBits := Hh;
     Exit;
   End;
-  Pitch := DibPitch(W, 8);
-  For Y := Start To Min(Start + Lines, Hh) - 1 Do
+  If Not BmpSurf(B, S) Then Exit;
+  SPB := PxBytes(S.Bpp);
+  DP := DibPitch(DW, OB);
+  Top := MemL[0:Bmi + 8] < 0;
+  N := 0;
+  For L := Start To Min(Start + Lines, Hh) - 1 Do
   Begin
-    If (Gdis^[B].I7 And 2) <> 0 Then SY := Hh - 1 - Y Else SY := Y;
-    For X := 0 To W - 1 Do
-      Mem[0:Bits + (Y - Start) * Pitch + X] :=
-        Mem[0:Gdis^[B].I1 + SY * Gdis^[B].I5 + X];
+    If Top Then SY := L Else SY := Hh - 1 - L;
+    SA := S.Bits + SY * S.Pitch;
+    Row := Bits + (L - Start) * DP;
+    For X := 0 To Min(W, DW) - 1 Do
+    Begin
+      V := GetRaw(SA + X * SPB, S.Bpp);
+      If Mono Then
+      Begin
+        If V <> 0 Then XX := $FFFFFF Else XX := 0;
+      End
+      Else XX := SrcX(V, S.Bpp, Gdis^[B].I6);
+      Case OB Of
+        1 :
+        Begin
+          If Mono Then I := V
+          Else I := Ord(((XX Shr 16) And 255) * 30 + ((XX Shr 8) And 255) *
+                        59 + (XX And 255) * 11 >= 12800);
+          DibPutRow(Row, 1, X, I);
+        End;
+        4 : DibPutRow(Row, 4, X, Nearest16(XX));
+        8 :
+        Begin
+          If (S.Bpp = 8) And Not Mono Then I := V
+          Else If Mono Then I := V * 255
+          Else I := NearestIdx((XX Shr 16) And 255, (XX Shr 8) And 255,
+                               XX And 255);
+          DibPutRow(Row, 8, X, I);
+        End;
+      Else
+        DibPutRow(Row, OB, X, XX);
+      End;
+    End;
+    Inc(N);
   End;
-  GetDIBits := Min(Lines, Hh - Start);
+  GetDIBits := N;
 End;
 
 Function SetDIBits(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt)
   : LongInt;
-Var B, W, Hh, Y, X, V, Q, Tab, SY : LongInt; Top : Boolean;
 Begin
-  SetDIBits := 0;
-  B := GdiOf(H, goBitmap);
-  If B < 0 Then Exit;
-  W := MemL[0:Bmi + 4]; Hh := MemL[0:Bmi + 8];
-  Top := Hh < 0;
-  If Top Then Hh := -Hh;
-  Tab := KAlloc(1024);
-  DibTable(Bmi, Usage, DcOf(Hdc), Tab);
-  For V := 0 To 255 Do
-  Begin
-    Q := MemL[0:Tab + V * 4];
-    XlatTab[V] := ColorIdx(((Q Shr 16) And 255) Or (Q And $FF00) Or
-                           ((Q And 255) Shl 16));
-  End;
-  KFree(Tab);
-  For Y := 0 To Min(Hh, Gdis^[B].I3) - 1 Do
-  Begin
-    If (Gdis^[B].I7 And 2) <> 0 Then SY := Y Else SY := Gdis^[B].I3 - 1 - Y;
-    For X := 0 To Min(W, Gdis^[B].I2) - 1 Do
-    Begin
-      V := DibPix(Bits, W, Hh, MemW[0:Bmi + 14], X, Y, Top);
-      If V < 0 Then
-        V := ColorIdx(((V Shr 16) And 255) Or (V And $FF00) Or
-                      ((V And 255) Shl 16))
-      Else V := XlatTab[V And 255];
-      Mem[0:Gdis^[B].I1 + SY * Gdis^[B].I5 + X] := V;
-    End;
-  End;
-  SetDIBits := Lines;
+  SetDIBits := SetDIBitsK(GdiOf(H, goBitmap), Start, Lines, Bits, Bmi,
+                          Usage, DcOf(Hdc));
 End;
 
 { ------------------------------------------------------------------ }
@@ -24795,7 +25472,7 @@ End;
 { ScrollDC : deplacer une zone d'un contexte }
 Function ScrollDC(Hdc, DX, DY, PScroll, PClip, Rgn, PUpd : LongInt)
   : LongInt;
-Var D, Y, A, S : LongInt; R : TRect; Row : LongInt;
+Var D, Y, A, S, PB : LongInt; R : TRect; Row : LongInt;
 Begin
   ScrollDC := 1;
   D := DcOf(Hdc);
@@ -24805,24 +25482,25 @@ Begin
   R.L := Max(R.L, ClipX1); R.T := Max(R.T, ClipY1);
   R.R := Min(R.R, ClipX2 + 1); R.B := Min(R.B, ClipY2 + 1);
   If (R.L >= R.R) Or (R.T >= R.B) Then Exit;
-  Row := KAlloc(R.R - R.L + 16);
+  PB := PxBytes(DS.Bpp);
+  Row := KAlloc((R.R - R.L) * PB + 16);
   If DY > 0 Then
   Begin
     For Y := R.B - 1 - DY DownTo R.T Do
     Begin
-      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX);
-      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX);
-      MoveMem(S, Row, R.R - R.L);
-      MoveMem(Row, A, R.R - R.L - Abs(DX));
+      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX) * PB;
+      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX) * PB;
+      MoveMem(S, Row, (R.R - R.L) * PB);
+      MoveMem(Row, A, (R.R - R.L - Abs(DX)) * PB);
     End;
   End
   Else
     For Y := R.T - DY To R.B - 1 Do
     Begin
-      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX);
-      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX);
-      MoveMem(S, Row, R.R - R.L);
-      MoveMem(Row, A, R.R - R.L - Abs(DX));
+      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX) * PB;
+      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX) * PB;
+      MoveMem(S, Row, (R.R - R.L) * PB);
+      MoveMem(Row, A, (R.R - R.L - Abs(DX)) * PB);
     End;
   KFree(Row);
   DcDirty(R.L, R.T, R.R, R.B);
@@ -24994,7 +25672,7 @@ Begin
 End;
 
 Function InvertRect(Hdc, P : LongInt) : LongInt;
-Var D, X, Y, A : LongInt; R : TRect;
+Var D, X, Y : LongInt; R : TRect;
 Begin
   InvertRect := 1;
   D := DcOf(Hdc);
@@ -25002,10 +25680,7 @@ Begin
   GetRectAt(P, R);
   For Y := Max(R.T, ClipY1) To Min(R.B - 1, ClipY2) Do
     For X := Max(R.L, ClipX1) To Min(R.R - 1, ClipX2) Do
-    Begin
-      A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
-      Mem[0:A] := Mem[0:A] Xor 255;
-    End;
+      XorPix(X, Y, TgtMask);
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
@@ -38003,7 +38678,7 @@ End;
 Procedure DXWinPush(S, L, T, R, B : LongInt);
 Var H, Hdc, Bmi, Buf, W, Hh, X, Y, Pitch, SA, I, CL, CT, CR, CB
     : LongInt;
-    Pt : Array[0..1] Of LongInt;
+    Pt : Array[0..1] Of LongInt; TC : Boolean;
 Begin
   L := Max(L, 0); T := Max(T, 0);
   R := Min(R, MemL[0:S + 64]); B := Min(B, MemL[0:S + 68]);
@@ -38018,7 +38693,10 @@ Begin
   End;
   If (L >= R) Or (T >= B) Then Exit;
   W := R - L; Hh := B - T;
-  Pitch := (W + 3) And Not 3;
+  { couleurs vraies : DIB 32 bits (couleurs exactes) ; 256 couleurs :
+    DIB 8 bits dans la palette systeme }
+  TC := (ScrFmt > 8) And (MemL[0:S + 88] > 8);
+  If TC Then Pitch := W * 4 Else Pitch := (W + 3) And Not 3;
   Buf := KAlloc(Pitch * Hh + 16);
   Bmi := KAlloc(40 + 1024);
   If (Buf = 0) Or (Bmi = 0) Then Exit;
@@ -38026,6 +38704,10 @@ Begin
   Begin
     SA := MemL[0:S + 76] + (T + Y) * MemL[0:S + 72];
     If MemL[0:S + 88] = 8 Then MoveMem(SA + L, Buf + Y * Pitch, W)
+    Else If TC Then
+      For X := 0 To W - 1 Do
+        MemL[0:Buf + Y * Pitch + X * 4] := SfToRGB(S, SfGet(S, L + X,
+                                                    T + Y)) And $FFFFFF
     Else
       For X := 0 To W - 1 Do
         Mem[0:Buf + Y * Pitch + X] := DXIdxOf(SfToRGB(S, SfGet(S, L + X,
@@ -38035,6 +38717,11 @@ Begin
   MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -Hh;
   MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
   MemL[0:Bmi + 32] := 256;
+  If TC Then
+  Begin
+    MemW[0:Bmi + 14] := 32;
+    MemL[0:Bmi + 32] := 0;
+  End;
   For I := 0 To 255 Do
     MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
       (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
@@ -46805,16 +47492,23 @@ End;
 { Fenetre : tampon arriere affiche dans la zone cliente (agrandi) }
 Procedure D8ToWnd(S, Hw, PSrc, PDst : LongInt);
 Var Hdc, Bmi, Buf, W, H, X, Y, Pitch, I, A, SL, ST, SR, SB : LongInt;
-    R : Array[0..3] Of LongInt;
+    R : Array[0..3] Of LongInt; TC : Boolean;
 Begin
   W := MemL[0:S + 64]; H := MemL[0:S + 68];
-  Pitch := (W + 3) And Not 3;
+  { couleurs vraies : DIB 32 bits, couleurs exactes }
+  TC := ScrFmt > 8;
+  If TC Then Pitch := W * 4 Else Pitch := (W + 3) And Not 3;
   Buf := KAlloc(Pitch * H + 16);
   Bmi := KAlloc(40 + 1024);
   If (Buf = 0) Or (Bmi = 0) Then Exit;
   For Y := 0 To H - 1 Do
   Begin
     A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+    If TC Then
+      For X := 0 To W - 1 Do
+        MemL[0:Buf + Y * Pitch + X * 4] := SfToRGB(S, SfGet(S, X, Y)) And
+                                           $FFFFFF
+    Else
     For X := 0 To W - 1 Do
       Case MemL[0:S + 272] Of
         2 :
@@ -46833,6 +47527,11 @@ Begin
   MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -H;
   MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
   MemL[0:Bmi + 32] := 256;
+  If TC Then
+  Begin
+    MemW[0:Bmi + 14] := 32;
+    MemL[0:Bmi + 32] := 0;
+  End;
   For I := 0 To 255 Do
     MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
       (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
@@ -52385,6 +53084,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXSetupSetCallback, DirectXRegisterApplication,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
+  GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
   RegisterClassExA, GetClassInfoExA, GetWindowPlacement, SetWindowPlacement,
@@ -52397,7 +53097,6 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   mmioDescend, mmioAscend, mmioCreateChunk, OpenPrinterA, ClosePrinter,
   DocumentPropertiesA, EnumPrintersA, GetFileTitleA, InitCommonControls,
   InitCommonControlsEx,
-  GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
   SetHandleCount, DisableThreadLibraryCalls, ExtEscape, ThunkConnect32,
@@ -61456,6 +62155,10 @@ Begin
   FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
   DacAll;
   OutPalChanged := False;
+  { tampon de l'ecran au format de la carte SVGA }
+  ScrFmtSet;
+  SurfFree(Back);
+  SurfNew(Back, ScrW, ScrH);
   SvHwPtr := (SvCaps And SvCapCursor) <> 0;
   SvFull1 := 1; SvFull2 := 2;
   KLog('VMware : carte SVGA II en ' + HexStr(SvPort, 4) + 'h, image ' +
@@ -61846,6 +62549,7 @@ BEGIN
   end;
   InitKeyTables;
   DefaultPalette;
+  ScrFmtSet;
   SurfNew(Back, ScrW, ScrH);
   { VMware SVGA II : la carte remplace le mode VESA (meme taille) }
   SvInit;
