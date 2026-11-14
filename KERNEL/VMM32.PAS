@@ -1535,10 +1535,12 @@ End;
 
 { Correspondance avec un masque DOS (* et ?) }
 { Name correspond-il a Mask ? '*' : toute suite de caracteres (points
-  compris), '?' : un caractere ; '*.*' : tout ; NOM.* accepte aussi NOM
-  sans extension (comme MS-DOS). Comparaison sur le nom entier : un
-  masque HTTPGET.EXE.BAT ne correspond pas a HTTPGET.EXE. }
-Function MatchMask(Name, Mask : String) : Boolean;
+  compris), '?' : un caractere ; '*.*' : tout ; NOM.* accepte aussi
+  NOM sans extension et *. les noms sans extension (comme MS-DOS).
+  Comparaison sur le nom entier : un masque HTTPGET.EXE.BAT ne
+  correspond pas a HTTPGET.EXE. Plusieurs masques separes par ';'
+  (filtres des boites Ouvrir : *.BMP;*.DIB). }
+Function MatchOne(Name, Mask : String) : Boolean;
 
   Function Glob(Const N, M : String) : Boolean;
   Var I, J, SI, SJ : LongInt;
@@ -1571,13 +1573,31 @@ Begin
   Name := UpStr(Name); Mask := UpStr(Mask);
   If (Mask = '*.*') Or (Mask = '*') Then
   Begin
-    MatchMask := True;
+    MatchOne := True;
     Exit;
   End;
-  MatchMask := Glob(Name, Mask);
+  MatchOne := Glob(Name, Mask);
   If (Pos('.', Name) = 0) And (Length(Mask) > 2) And
      (Copy(Mask, Length(Mask) - 1, 2) = '.*') Then
-    If Glob(Name, Copy(Mask, 1, Length(Mask) - 2)) Then MatchMask := True;
+    If Glob(Name, Copy(Mask, 1, Length(Mask) - 2)) Then MatchOne := True;
+  { NOM. et *. : fichiers sans extension }
+  If (Pos('.', Name) = 0) And (Length(Mask) > 1) And
+     (Mask[Length(Mask)] = '.') Then
+    If Glob(Name, Copy(Mask, 1, Length(Mask) - 1)) Then MatchOne := True;
+End;
+
+Function MatchMask(Name, Mask : String) : Boolean;
+Var K : LongInt;
+Begin
+  MatchMask := True;
+  K := Pos(';', Mask);
+  While K > 0 Do
+  Begin
+    If MatchOne(Name, Trim(Copy(Mask, 1, K - 1))) Then Exit;
+    Mask := Copy(Mask, K + 1, 255);
+    K := Pos(';', Mask);
+  End;
+  MatchMask := MatchOne(Name, Trim(Mask));
 End;
 
 { Contenu d'un fichier entier dans un bloc du tas ; adresse ou 0 }
@@ -9267,7 +9287,7 @@ Var
   FdNm : Array[0..199] Of String[63];
   FdIsDir : Array[0..199] Of Boolean;
   FdFiltDesc : Array[0..7] Of String[63];
-  FdFiltPat : Array[0..7] Of String[31];
+  FdFiltPat : Array[0..7] Of String[127];
   FdDone, FdOk : Boolean;
   FdClickR, FdClickT : LongInt;
   FindW : LongInt;
@@ -25275,8 +25295,6 @@ Begin
     A := A + Length(PStr(A)) + 1;
     S := PStr(A);
     A := A + Length(S) + 1;
-    K := Pos(';', S);
-    If K > 0 Then S := Copy(S, 1, K - 1);
     FdFiltPat[FdFiltN] := S;
     Inc(FdFiltN);
   End;
