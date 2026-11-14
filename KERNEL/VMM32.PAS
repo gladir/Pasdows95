@@ -8190,6 +8190,8 @@ Procedure KMouse(W, Msg, X, Y : LongInt); Forward;
 Procedure KKey(W, Msg, VK, Ch : LongInt); Forward;
 Procedure DosKeyIn(Up : Boolean; VK, Ch : LongInt); Forward;
 Procedure DosMouseIn(Msg, X, Y : LongInt); Forward;
+Procedure DosMouseScr(Msg : LongInt); Forward;
+Function DosFullScr : Boolean; Forward;
 Procedure DeskDraw(R : TRect); Forward;
 Procedure TaskbarChanged; Forward;
 Procedure KActivated(W : LongInt); Forward;
@@ -9154,6 +9156,15 @@ Var T, W, B, X1, Y1, X2, Y2, Msg, OX, OY : LongInt; Dbl : Boolean;
 Begin
   If Btn = 1 Then KeyState[1] := Ord(Down) * $80
   Else KeyState[2] := Ord(Down) * $80;
+  { programme DOS graphique en plein ecran : la souris lui revient }
+  If DosFullScr Then
+  Begin
+    If Btn = 1 Then
+      If Down Then DosMouseScr(WM_LBUTTONDOWN) Else DosMouseScr(WM_LBUTTONUP)
+    Else If Down Then DosMouseScr(WM_RBUTTONDOWN)
+    Else DosMouseScr(WM_RBUTTONUP);
+    Exit;
+  End;
   { capture de la souris }
   If (CaptureWin >= 0) And Wnds[CaptureWin].Used Then
   Begin
@@ -9267,6 +9278,11 @@ End;
 Procedure MouseMoved;
 Var T, W, NX, NY : LongInt;
 Begin
+  If DosFullScr Then
+  Begin
+    DosMouseScr(WM_MOUSEMOVE);
+    Exit;
+  End;
   If DragWin >= 0 Then
   Begin
     NX := CurX - DragDX; NY := CurY - DragDY;
@@ -38863,6 +38879,9 @@ Const
   VmFuncO = $0220;          { fonctions video (INT 10h 1Bh) }
   VmEgaO = $0240;           { palette EGA par defaut }
   VmFontO = $1000;          { police 8x16 }
+  VmFont8O = $FA6E;         { police 8x8 (0-127, adresse de la ROM) }
+  VmFont8H = $3000;         { police 8x8 (128-255, INT 1Fh) }
+  VmFont14O = $3400;        { police 8x14 }
   VmDosSeg = $0060;         { donnees du DOS en 0600h }
   VmLolO = $0010;           { liste des listes (INT 21h 52h) }
   VmDbcsO = $0080;          { table DBCS vide }
@@ -39804,6 +39823,590 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
+{ Modes graphiques : carte VGA virtuelle                             }
+{ ------------------------------------------------------------------ }
+{ Comme la fenetre MS-DOS de Windows 95, un programme qui passe en
+  mode graphique occupe l'ecran entier (surface plein ecran de
+  DirectDraw : DDShow, DDBuf ; palette du systeme = DAC de la machine).
+  Mode 13h (320 x 200, 256 couleurs) : memoire lineaire en A0000h,
+  agrandie deux fois. Modes CGA 04h, 05h, 06h : memoire entrelacee en
+  B8000h. Modes EGA / VGA a plans (0Dh, 0Eh, 10h, 12h ; pilote
+  EGAVGA.BGI) : les quatre plans de 64 Ko sont dans le tas ; les pages
+  A0000h-AFFFFh de la machine sont absentes, chaque acces a la memoire
+  video provoque un defaut de page et le moniteur emule l'instruction
+  avec les registres de la carte (masque des plans, modes d'ecriture 0
+  a 3, fonction logique, rotation, masque de bits, verrous, modes de
+  lecture 0 et 1, comparaison de couleur). }
+
+Var
+  VgPlanes : LongInt;            { 4 plans de 64 Ko (tas, 0 : aucun) }
+  VgPlanar : Boolean;            { memoire a plans (pages absentes) }
+  VgMode, VgW, VgH, VgBpl : LongInt;  { mode, taille, octets par ligne }
+  VgLatch : Array[0..3] Of LongInt;
+  VgSeqI, VgGcI, VgAcI : LongInt;
+  VgSeq : Array[0..7] Of LongInt;
+  VgGc : Array[0..8] Of LongInt;
+  VgAc : Array[0..20] Of LongInt;
+  VgStart : LongInt;             { adresse de debut (CRTC 0Ch, 0Dh) }
+  VgCrtLo : LongInt;
+  VgDLo, VgDHi : LongInt;        { lignes de pixels modifiees }
+  VgPalDirty : Boolean;
+  VgCol : Array[0..15] Of LongInt;   { couleur (0-15) -> indice du DAC }
+  VgSpreadLo, VgSpreadHi : Array[0..255] Of LongInt;
+  VgShadow : LongInt;            { copie de l'ecran (13h, CGA) }
+  VgShown : Boolean;             { affichage plein ecran en cours }
+  VgCurX, VgCurY : LongInt;      { pointeur de la souris dessine (-1) }
+
+Procedure VgDirty(Ofs : LongInt);
+Var Y : LongInt;
+Begin
+  If VgBpl <= 0 Then Exit;
+  Y := (Ofs - VgStart) Div VgBpl;
+  If (Y < 0) Or (Y >= VgH) Then Exit;
+  If Y < VgDLo Then VgDLo := Y;
+  If Y > VgDHi Then VgDHi := Y;
+End;
+
+{ Lecture d'un octet de la memoire video a plans (charge les verrous) }
+Function VgRead(Ofs : LongInt) : LongInt;
+Var P, R, M, I : LongInt;
+Begin
+  Ofs := Ofs And $FFFF;
+  For P := 0 To 3 Do VgLatch[P] := Mem[0:VgPlanes + P * 65536 + Ofs];
+  If (VgGc[5] And 8) = 0 Then
+    VgRead := VgLatch[VgGc[4] And 3]
+  Else
+  Begin
+    { mode de lecture 1 : comparaison de couleur }
+    R := $FF;
+    For P := 0 To 3 Do
+      If ((VgGc[7] Shr P) And 1) <> 0 Then
+      Begin
+        If ((VgGc[2] Shr P) And 1) <> 0 Then M := VgLatch[P]
+        Else M := Not VgLatch[P];
+        R := R And M;
+      End;
+    VgRead := R And $FF;
+  End;
+End;
+
+Procedure VgWrite(Ofs, V : LongInt);
+Var P, D, Bm, Rot, Fn, Wm, L : LongInt;
+Begin
+  Ofs := Ofs And $FFFF;
+  Wm := VgGc[5] And 3;
+  Rot := VgGc[3] And 7;
+  Fn := (VgGc[3] Shr 3) And 3;
+  V := V And $FF;
+  If (Wm = 0) Or (Wm = 3) Then
+    V := ((V Shr Rot) Or (V Shl (8 - Rot))) And $FF;
+  Bm := VgGc[8];
+  If Wm = 3 Then
+  Begin
+    Bm := Bm And V;
+  End;
+  For P := 0 To 3 Do
+    If ((VgSeq[2] Shr P) And 1) <> 0 Then
+    Begin
+      L := VgLatch[P];
+      If Wm = 1 Then D := L
+      Else
+      Begin
+        Case Wm Of
+          0 :
+            If ((VgGc[1] Shr P) And 1) <> 0 Then
+              D := $FF * ((VgGc[0] Shr P) And 1)
+            Else D := V;
+          2 : D := $FF * ((V Shr P) And 1);
+        Else
+          D := $FF * ((VgGc[0] Shr P) And 1);
+        End;
+        Case Fn Of
+          1 : D := D And L;
+          2 : D := D Or L;
+          3 : D := D Xor L;
+        End;
+        D := (D And Bm) Or (L And Not Bm);
+      End;
+      Mem[0:VgPlanes + P * 65536 + Ofs] := D;
+    End;
+  VgDirty(Ofs);
+End;
+
+{ Pixel (X, Y) en mode a plans }
+Procedure VgPixel(X, Y, C : LongInt; Xr : Boolean);
+Var Ofs, B, P, V : LongInt;
+Begin
+  If (X < 0) Or (Y < 0) Or (X >= VgW) Or (Y >= VgH) Then Exit;
+  Ofs := (VgStart + Y * VgBpl + X Shr 3) And $FFFF;
+  B := $80 Shr (X And 7);
+  For P := 0 To 3 Do
+  Begin
+    V := Mem[0:VgPlanes + P * 65536 + Ofs];
+    If Xr Then
+    Begin
+      If ((C Shr P) And 1) <> 0 Then V := V Xor B;
+    End
+    Else If ((C Shr P) And 1) <> 0 Then V := V Or B
+    Else V := V And Not B;
+    Mem[0:VgPlanes + P * 65536 + Ofs] := V;
+  End;
+  VgDirty(Ofs);
+End;
+
+Function VgGetPixel(X, Y : LongInt) : LongInt;
+Var Ofs, B, P, R : LongInt;
+Begin
+  R := 0;
+  Ofs := (VgStart + Y * VgBpl + X Shr 3) And $FFFF;
+  B := $80 Shr (X And 7);
+  For P := 0 To 3 Do
+    If (Mem[0:VgPlanes + P * 65536 + Ofs] And B) <> 0 Then
+      R := R Or (1 Shl P);
+  VgGetPixel := R;
+End;
+
+{ Couleurs : DAC de la machine -> palette du systeme }
+Procedure VgPalSync;
+Var I : LongInt;
+Begin
+  VgPalDirty := False;
+  For I := 0 To 15 Do
+    If VgMode In [4, 5, 6] Then VgCol[I] := VgAc[I And 3] And $3F
+    Else VgCol[I] := (VgAc[I] And $3F) Or ((VgAc[$14] And $0C) Shl 4);
+  If Not VgShown Then Exit;
+  For I := 0 To 255 Do
+    SysPalSet(I, VmDac[I * 3] * 255 Div 63, VmDac[I * 3 + 1] * 255 Div 63,
+              VmDac[I * 3 + 2] * 255 Div 63);
+  Inc(PalVer);
+  DacAll;
+  DDDirty := True;
+End;
+
+{ Palette par defaut du DAC (16 couleurs EGA, gris, teintes) }
+Procedure VgDefPal;
+Var I, R, G, B : LongInt;
+Begin
+  For I := 0 To 63 Do
+  Begin
+    VmDac[I * 3] := ((I Shr 2) And 1) * 42 + ((I Shr 5) And 1) * 21;
+    VmDac[I * 3 + 1] := ((I Shr 1) And 1) * 42 + ((I Shr 4) And 1) * 21;
+    VmDac[I * 3 + 2] := (I And 1) * 42 + ((I Shr 3) And 1) * 21;
+  End;
+  If VgMode = $13 Then
+  Begin
+    { 16 couleurs CGA, 16 gris, puis des teintes }
+    For I := 0 To 15 Do
+    Begin
+      R := ((I Shr 2) And 1) * 42 + ((I Shr 3) And 1) * 21;
+      G := ((I Shr 1) And 1) * 42 + ((I Shr 3) And 1) * 21;
+      B := (I And 1) * 42 + ((I Shr 3) And 1) * 21;
+      If I = 6 Then G := 21;
+      VmDac[I * 3] := R; VmDac[I * 3 + 1] := G; VmDac[I * 3 + 2] := B;
+    End;
+    For I := 16 To 31 Do
+    Begin
+      VmDac[I * 3] := (I - 16) * 4 + 3; VmDac[I * 3 + 1] := (I - 16) * 4 + 3;
+      VmDac[I * 3 + 2] := (I - 16) * 4 + 3;
+    End;
+    For I := 32 To 255 Do
+    Begin
+      R := ((I - 32) Mod 24); G := (I - 32) Div 24;
+      VmDac[I * 3] := (R * 63) Div 23;
+      VmDac[I * 3 + 1] := (G * 63) Div 9;
+      VmDac[I * 3 + 2] := 63 - (R * 63) Div 23;
+    End;
+  End;
+  For I := 0 To 15 Do VgAc[I] := I;
+  If VgMode In [$0D, $0E] Then
+    For I := 8 To 15 Do VgAc[I] := I + 8
+  Else If Not (VgMode In [4, 5, 6]) Then
+  Begin
+    VgAc[6] := $14;
+    For I := 8 To 15 Do VgAc[I] := $30 + I;
+  End
+  Else
+  Begin
+    VgAc[0] := 0; VgAc[1] := $3B; VgAc[2] := $3D; VgAc[3] := $3F;
+    If VgMode = 6 Then VgAc[1] := $3F;
+  End;
+  VgAc[$10] := 1; VgAc[$12] := $0F; VgAc[$14] := 0;
+  VgPalDirty := True;
+End;
+
+{ Afficher (ou quitter) l'ecran graphique plein ecran }
+Procedure VgShow(On : Boolean);
+Var I : LongInt;
+Begin
+  If On Then
+  Begin
+    DDW := 640;
+    If VgMode = $10 Then DDH := 350
+    Else If VgMode = $12 Then DDH := 480 Else DDH := 400;
+    If DDBufSz < DDW * DDH Then
+    Begin
+      I := HeapOwner; HeapOwner := 0;
+      If DDBuf <> 0 Then KFree(DDBuf);
+      DDBufSz := DDW * DDH;
+      DDBuf := KAlloc(DDBufSz + 16);
+      HeapOwner := I;
+    End;
+    FillMem(DDBuf, DDW * DDH, 0);
+    VgShown := True;
+    DDShow := True;
+    DDDirty := True;
+    DDCleared := False;
+    CursorErase;
+    VgPalSync;
+    VgDLo := 0; VgDHi := VgH - 1;
+    VgCurX := -1; VgCurY := -1;
+  End
+  Else If VgShown Then
+  Begin
+    VgShown := False;
+    DDShow := False;
+    DefaultPalette;
+    MarkAll;
+    ConFull := True;
+    ConRowsDue := True;
+  End;
+End;
+
+Function DosFullScr : Boolean;
+Begin
+  DosFullScr := VmOn And VgShown;
+End;
+
+{ Pages A0000h-AFFFFh de la machine : absentes (a plans) ou au bloc }
+Procedure VgMapPages(Planar : Boolean);
+Var I : LongInt;
+Begin
+  For I := $A0 To $AF Do
+    If Planar Then MemL[0:VmPt + I * 4] := 0
+    Else MemL[0:VmPt + I * 4] := (VmRam + I * 4096) Or 7;
+  VgPlanar := Planar;
+End;
+
+{ Mode video M (INT 10h AH=00h) : graphique ou retour au texte }
+Procedure VgSetMode(M : LongInt);
+Var I, Own : LongInt;
+Begin
+  M := M And $7F;
+  VgMode := M;
+  VgStart := 0;
+  Case M Of
+    4, 5 :
+    Begin
+      VgW := 320; VgH := 200; VgBpl := 80;
+    End;
+    6 :
+    Begin
+      VgW := 640; VgH := 200; VgBpl := 80;
+    End;
+    $0D :
+    Begin
+      VgW := 320; VgH := 200; VgBpl := 40;
+    End;
+    $0E :
+    Begin
+      VgW := 640; VgH := 200; VgBpl := 80;
+    End;
+    $10 :
+    Begin
+      VgW := 640; VgH := 350; VgBpl := 80;
+    End;
+    $11, $12 :
+    Begin
+      VgW := 640; VgH := 480; VgBpl := 80;
+      If M = $11 Then VgMode := $12;
+    End;
+    $13 :
+    Begin
+      VgW := 320; VgH := 200; VgBpl := 320;
+    End;
+  Else
+    { texte }
+    VgMapPages(False);
+    VgShow(False);
+    Exit;
+  End;
+  If (M In [$0D, $0E, $10, $11, $12]) And (VgPlanes = 0) Then
+  Begin
+    Own := HeapOwner; HeapOwner := 1;
+    VgPlanes := KAlloc(4 * 65536);
+    HeapOwner := Own;
+  End;
+  If (VgShadow = 0) Then
+  Begin
+    Own := HeapOwner; HeapOwner := 1;
+    VgShadow := KAlloc(65536);
+    HeapOwner := Own;
+  End;
+  If ((VgPlanes = 0) And (M In [$0D, $0E, $10, $11, $12])) Or
+     (VgShadow = 0) Then Exit;
+  For I := 0 To 7 Do VgSeq[I] := 0;
+  For I := 0 To 8 Do VgGc[I] := 0;
+  VgSeq[2] := $0F;
+  VgGc[5] := 0; VgGc[7] := $0F; VgGc[8] := $FF;
+  For I := 0 To 3 Do VgLatch[I] := 0;
+  VgMapPages(M In [$0D, $0E, $10, $11, $12]);
+  If VgPlanar Then FillMem(VgPlanes, 4 * 65536, 0);
+  FillMem(VgShadow, 65536, $FF);
+  VgDefPal;
+  VgShow(True);
+End;
+
+{ Tables : un octet de plan -> 8 pixels (un octet chacun, 0 ou 1) }
+Procedure VgTables;
+Var B, K : LongInt;
+Begin
+  For B := 0 To 255 Do
+  Begin
+    VgSpreadLo[B] := 0; VgSpreadHi[B] := 0;
+    For K := 0 To 3 Do
+    Begin
+      If (B And ($80 Shr K)) <> 0 Then
+        VgSpreadLo[B] := VgSpreadLo[B] Or (1 Shl (K * 8));
+      If (B And ($08 Shr K)) <> 0 Then
+        VgSpreadHi[B] := VgSpreadHi[B] Or (1 Shl (K * 8));
+    End;
+  End;
+End;
+
+{ Fleche du pointeur de la souris dans la surface plein ecran }
+Procedure VgArrow(X, Y : LongInt);
+Const
+  Shape : Array[0..18] Of Word = ($800, $C00, $E00, $F00, $F80, $FC0, $FE0,
+    $FF0, $FF8, $FFC, $FFE, $FE0, $EF0, $CF0, $878, $078, $03C, $03C, $018);
+  Fill : Array[0..18] Of Word = (0, 0, $400, $600, $700, $780, $7C0, $7E0,
+    $7F0, $7F8, $7C0, $6C0, $460, $060, $030, $030, $018, $018, 0);
+Var R, K, D : LongInt;
+Begin
+  For R := 0 To 18 Do
+    If Y + R < DDH Then
+      For K := 0 To 11 Do
+        If (X + K < 640) And ((Shape[R] Shr (11 - K)) And 1 <> 0) Then
+        Begin
+          D := DDBuf + (Y + R) * 640 + X + K;
+          If ((Fill[R] Shr (11 - K)) And 1) <> 0 Then Mem[0:D] := VgCol[15]
+          Else Mem[0:D] := VgCol[0];
+        End;
+End;
+
+{ Recopier les lignes modifiees dans la surface plein ecran (tache 0) }
+Procedure VgRender;
+Var Y, X, Ofs, D, Lo, Hi, K, P, C, Dy, Src, V, Sh : LongInt;
+Begin
+  If Not VgShown Or (DDBuf = 0) Then Exit;
+  If VgPalDirty Then VgPalSync;
+  { memoire lineaire (13h, CGA) : lignes changees depuis la copie }
+  If Not VgPlanar Then
+    For Y := 0 To VgH - 1 Do
+    Begin
+      If VgMode = $13 Then Src := VmRam + $A0000 + Y * 320
+      Else Src := VmRam + $B8000 + (Y And 1) * $2000 + (Y Shr 1) * 80;
+      Sh := VgShadow + Y * 320;
+      K := VgBpl;
+      If VgMode <> $13 Then K := 80;
+      For X := 0 To (K Div 4) - 1 Do
+        If MemL[0:Src + X * 4] <> MemL[0:Sh + X * 4] Then
+        Begin
+          MoveMem(Src, Sh, K);
+          If Y < VgDLo Then VgDLo := Y;
+          If Y > VgDHi Then VgDHi := Y;
+          Break;
+        End;
+    End;
+  Dy := 1;
+  If VgH <= 200 Then Dy := 2;
+  { pointeur de la souris (INT 33h) deplace ou cache : lignes de son
+    ancienne place a redessiner }
+  If VmMouShow >= 0 Then
+  Begin
+    X := VmMouX; Y := VmMouY * Dy;
+  End
+  Else
+  Begin
+    X := -1; Y := -1;
+  End;
+  If (X <> VgCurX) Or (Y <> VgCurY) Then
+  Begin
+    If VgCurY >= 0 Then
+    Begin
+      If VgCurY Div Dy < VgDLo Then VgDLo := VgCurY Div Dy;
+      If (VgCurY + 19) Div Dy > VgDHi Then VgDHi := (VgCurY + 19) Div Dy;
+    End;
+    If Y >= 0 Then
+    Begin
+      If Y Div Dy < VgDLo Then VgDLo := Y Div Dy;
+      If (Y + 19) Div Dy > VgDHi Then VgDHi := (Y + 19) Div Dy;
+    End;
+    VgCurX := X; VgCurY := Y;
+  End;
+  If VgDHi < VgDLo Then Exit;
+  Lo := Max(VgDLo, 0); Hi := Min(VgDHi, VgH - 1);
+  VgDLo := VgH; VgDHi := -1;
+  For Y := Lo To Hi Do
+  Begin
+    D := DDBuf + Y * Dy * 640;
+    If VgMode = $13 Then
+    Begin
+      Src := VgShadow + Y * 320;
+      For X := 0 To 319 Do
+      Begin
+        C := Mem[0:Src + X];
+        Mem[0:D + X * 2] := C; Mem[0:D + X * 2 + 1] := C;
+      End;
+    End
+    Else If VgMode In [4, 5] Then
+    Begin
+      Src := VgShadow + Y * 320;
+      For X := 0 To 319 Do
+      Begin
+        C := VgCol[(Mem[0:Src + X Shr 2] Shr (6 - (X And 3) * 2)) And 3];
+        Mem[0:D + X * 2] := C; Mem[0:D + X * 2 + 1] := C;
+      End;
+    End
+    Else If VgMode = 6 Then
+    Begin
+      Src := VgShadow + Y * 320;
+      For X := 0 To 639 Do
+        Mem[0:D + X] := VgCol[(Mem[0:Src + X Shr 3] Shr (7 - (X And 7)))
+                              And 1];
+    End
+    Else
+    Begin
+      { plans : 8 pixels par octet de chaque plan }
+      Ofs := (VgStart + Y * VgBpl) And $FFFF;
+      For X := 0 To VgBpl - 1 Do
+      Begin
+        P := VgPlanes + Ofs + X;
+        Sh := VgSpreadLo[Mem[0:P]] + VgSpreadLo[Mem[0:P + 65536]] * 2 +
+              VgSpreadLo[Mem[0:P + 131072]] * 4 +
+              VgSpreadLo[Mem[0:P + 196608]] * 8;
+        V := VgSpreadHi[Mem[0:P]] + VgSpreadHi[Mem[0:P + 65536]] * 2 +
+             VgSpreadHi[Mem[0:P + 131072]] * 4 +
+             VgSpreadHi[Mem[0:P + 196608]] * 8;
+        If VgW = 320 Then
+        Begin
+          For K := 0 To 3 Do
+          Begin
+            C := VgCol[(Sh Shr (K * 8)) And 15];
+            Mem[0:D + X * 16 + K * 2] := C;
+            Mem[0:D + X * 16 + K * 2 + 1] := C;
+            C := VgCol[(V Shr (K * 8)) And 15];
+            Mem[0:D + X * 16 + 8 + K * 2] := C;
+            Mem[0:D + X * 16 + 9 + K * 2] := C;
+          End;
+        End
+        Else
+          For K := 0 To 3 Do
+          Begin
+            Mem[0:D + X * 8 + K] := VgCol[(Sh Shr (K * 8)) And 15];
+            Mem[0:D + X * 8 + 4 + K] := VgCol[(V Shr (K * 8)) And 15];
+          End;
+      End;
+    End;
+    If Dy = 2 Then MoveMem(D, D + 640, 640);
+  End;
+  If VgCurY >= 0 Then VgArrow(VgCurX, VgCurY);
+  DDDirty := True;
+End;
+
+{ Texte du BIOS en mode graphique (INT 10h 09h, 0Ah, 0Eh) }
+Procedure VgChar(X, Y, Ch, Attr : LongInt);
+Var R, K, B, H, F, C : LongInt;
+Begin
+  If VgH <= 200 Then H := 8 Else If VgH = 350 Then H := 14 Else H := 16;
+  For R := 0 To H - 1 Do
+  Begin
+    If H = 8 Then F := FontAddr + Ch * 16 + R * 2
+    Else If H = 14 Then F := FontAddr + Ch * 16 + R + Ord(R >= 7)
+    Else F := FontAddr + Ch * 16 + R;
+    B := Mem[0:F];
+    For K := 0 To 7 Do
+      If VgPlanar Then
+      Begin
+        If (B And ($80 Shr K)) <> 0 Then
+          VgPixel(X * 8 + K, Y * H + R, Attr And 15, (Attr And $80) <> 0)
+        Else If (Attr And $80) = 0 Then VgPixel(X * 8 + K, Y * H + R, 0,
+                                               False);
+      End
+      Else If VgMode = $13 Then
+      Begin
+        If (B And ($80 Shr K)) <> 0 Then C := Attr Else C := 0;
+        If (X * 8 + K < 320) And (Y * H + R < 200) Then
+          Mem[0:VmRam + $A0000 + (Y * H + R) * 320 + X * 8 + K] := C;
+      End;
+  End;
+End;
+
+{ Pixel du BIOS (INT 10h 0Ch) ; bit 7 de C : OU exclusif }
+Procedure VgPutPix(X, Y, C : LongInt);
+Var A, S, M : LongInt;
+Begin
+  If (X < 0) Or (Y < 0) Or (X >= VgW) Or (Y >= VgH) Or Not VmGfx Then Exit;
+  Case VgMode Of
+    $13 : Mem[0:VmRam + $A0000 + Y * 320 + X] := C;
+    4, 5, 6 :
+    Begin
+      A := VmRam + $B8000 + (Y And 1) * $2000 + (Y Shr 1) * 80;
+      If VgMode = 6 Then
+      Begin
+        A := A + X Shr 3; S := 7 - (X And 7); M := 1;
+      End
+      Else
+      Begin
+        A := A + X Shr 2; S := 6 - (X And 3) * 2; M := 3;
+      End;
+      If (C And $80) <> 0 Then
+        Mem[0:A] := Mem[0:A] Xor ((C And M) Shl S)
+      Else Mem[0:A] := (Mem[0:A] And Not (M Shl S)) Or ((C And M) Shl S);
+    End;
+  Else
+    VgPixel(X, Y, C And 15, (C And $80) <> 0);
+  End;
+End;
+
+Function VgGetPix(X, Y : LongInt) : LongInt;
+Var A : LongInt;
+Begin
+  VgGetPix := 0;
+  If (X < 0) Or (Y < 0) Or (X >= VgW) Or (Y >= VgH) Or Not VmGfx Then Exit;
+  A := VmRam + $B8000 + (Y And 1) * $2000 + (Y Shr 1) * 80;
+  Case VgMode Of
+    $13 : VgGetPix := Mem[0:VmRam + $A0000 + Y * 320 + X];
+    4, 5 : VgGetPix := (Mem[0:A + X Shr 2] Shr (6 - (X And 3) * 2)) And 3;
+    6 : VgGetPix := (Mem[0:A + X Shr 3] Shr (7 - (X And 7))) And 1;
+  Else
+    VgGetPix := VgGetPixel(X, Y);
+  End;
+End;
+
+{ Ecriture teletype en mode graphique (sans defilement) }
+Procedure VgTty(Ch, Col : LongInt);
+Var X, Y : LongInt;
+Begin
+  VmGetCur(0, X, Y);
+  Case Ch Of
+    7 : ;
+    8 : If X > 0 Then Dec(X);
+    10 : Inc(Y);
+    13 : X := 0;
+  Else
+    VgChar(X, Y, Ch, Col);
+    Inc(X);
+    If X >= MemW[0:VmBda($4A)] Then
+    Begin
+      X := 0;
+      Inc(Y);
+    End;
+  End;
+  If Y > Mem[0:VmBda($84)] Then Y := Mem[0:VmBda($84)];
+  VmSetCur(0, X, Y);
+End;
+
+{ ------------------------------------------------------------------ }
 { BIOS : video (INT 10h)                                             }
 { ------------------------------------------------------------------ }
 
@@ -39823,11 +40426,27 @@ Begin
   MemW[0:VmBda($85)] := 16;
   If (M And $80) = 0 Then
   Begin
-    If VmGfx Then FillMem(VmRam + $A0000, $10000, 0)
+    If (M And $7F) In [4..6] Then FillMem(VmRam + $B8000, $8000, 0)
+    Else If VmGfx Then FillMem(VmRam + $A0000, $10000, 0)
     Else VmClearScr;
   End;
   For I := 0 To 7 Do VmSetCur(I, 0, 0);
   VmBlink := True;
+  VgSetMode(M);
+  If VmGfx Then
+  Begin
+    { lignes et hauteur des caracteres du BIOS en mode graphique }
+    If VgH <= 200 Then I := 8 Else If VgH = 350 Then I := 14 Else I := 16;
+    Mem[0:VmBda($84)] := VgH Div I - 1;
+    MemW[0:VmBda($85)] := I;
+    MemW[0:VmBda($4A)] := VgW Div 8;
+    { INT 43h : police de ce mode }
+    If I = 8 Then I := VmFont8O Else If I = 14 Then I := VmFont14O
+    Else I := VmFontO;
+    MemL[0:VmRam + $43 * 4] := (LongInt(VmBios) Shl 16) + I;
+    VmMouMaxY := VgH - 1;
+  End
+  Else MemL[0:VmRam + $43 * 4] := (LongInt(VmBios) Shl 16) + VmFontO;
 End;
 
 Procedure VmWriteStr(Pg, Mode, Attr, N, X, Y, P : LongInt);
@@ -39884,6 +40503,12 @@ Begin
       VS(fEax, MemW[0:VmScrA(Pg) + (Y * 80 + X) * 2]);
     End;
     $09, $0A :
+    If VmGfx Then
+    Begin
+      VmGetCur(0, X, Y);
+      For I := 0 To VR(fEcx) - 1 Do VgChar(X + I, Y, AL, VRL(fEbx));
+    End
+    Else
     Begin
       Pg := VRH(fEbx) And 7;
       VmGetCur(Pg, X, Y);
@@ -39896,7 +40521,9 @@ Begin
         If AH = 9 Then Mem[0:A + I * 2 + 1] := VRL(fEbx);
       End;
     End;
-    $0E : VmTty(AL);
+    $0C : VgPutPix(VR(fEcx), VR(fEdx), AL);
+    $0D : VSL(fEax, VgGetPix(VR(fEcx), VR(fEdx)));
+    $0E : If VmGfx Then VgTty(AL, VRL(fEbx)) Else VmTty(AL);
     $0F :
     Begin
       VSL(fEax, Mem[0:VmBda($49)]);
@@ -39904,22 +40531,34 @@ Begin
       VSH(fEbx, VmPage);
     End;
     $10 :
+    Begin
+      VgPalDirty := True;
       Case AL Of
+        $00 : If VRL(fEbx) < 16 Then VgAc[VRL(fEbx)] := VRH(fEbx);
+        $01 : VgAc[$11] := VRH(fEbx);
+        $02 :
+        Begin
+          P := VmPtr(fEs, fEdx);
+          For I := 0 To 15 Do VgAc[I] := Mem[0:P + I];
+          VgAc[$11] := Mem[0:P + 16];
+        End;
         $03 : VmBlink := VRL(fEbx) <> 0;
-        $07 : VSH(fEbx, VRL(fEbx));
-        $08 : VSH(fEbx, 0);
+        $07 : VSH(fEbx, VgAc[VRL(fEbx) And 31]);
+        $08 : VSH(fEbx, VgAc[$11]);
         $09 :
         Begin
           P := VmPtr(fEs, fEdx);
-          For I := 0 To 15 Do Mem[0:P + I] := Mem[0:VmLin(VmBios,
-                                                VmEgaO + I)];
-          Mem[0:P + 16] := 0;
+          For I := 0 To 15 Do Mem[0:P + I] := VgAc[I];
+          Mem[0:P + 16] := VgAc[$11];
         End;
         $10 :
         Begin
-          I := VRL(fEbx) * 3;
-          VmDac[I] := VRH(fEdx); VmDac[I + 1] := VRH(fEcx);
-          VmDac[I + 2] := VRL(fEcx);
+          I := VR(fEbx) * 3;
+          If I < 768 Then
+          Begin
+            VmDac[I] := VRH(fEdx) And 63; VmDac[I + 1] := VRH(fEcx) And 63;
+            VmDac[I + 2] := VRL(fEcx) And 63;
+          End;
         End;
         $12, $17 :
         Begin
@@ -39937,13 +40576,27 @@ Begin
         End;
         $1A : VS(fEbx, 0);
       End;
+    End;
     $11 :
       If AL = $30 Then
       Begin
+        { polices : 0 INT 1Fh, 1 INT 43h, 2 8x14, 3 et 4 8x8, 6 8x16 }
         VSeg(fEs, VmBios);
-        VS(fEbp, VmFontO);
-        VS(fEcx, 16);
-        VSL(fEdx, 24);
+        Case VRH(fEbx) Of
+          0, 1 :
+          Begin
+            I := MemL[0:VmRam + ($1F + ($43 - $1F) * VRH(fEbx)) * 4];
+            VSeg(fEs, I Shr 16); VS(fEbp, I);
+          End;
+          2 : VS(fEbp, VmFont14O);
+          3 : VS(fEbp, VmFont8O);
+          4 : VS(fEbp, VmFont8H);
+          6 : VS(fEbp, VmFontO);
+        Else
+          VS(fEbp, VmFuncO + 15);
+        End;
+        VS(fEcx, MemW[0:VmBda($85)]);
+        VSL(fEdx, Mem[0:VmBda($84)]);
       End;
     $12 :
       Case VRL(fEbx) Of
@@ -42214,8 +42867,10 @@ Procedure VmMouReset;
 Var I : LongInt;
 Begin
   VmMouShow := -1;
-  VmMouX := 320; VmMouY := 96;
   VmMouMinX := 0; VmMouMaxX := 639; VmMouMinY := 0; VmMouMaxY := 199;
+  { plage verticale du mode video (ecran graphique de 350 ou 480 lignes) }
+  If VmGfx And (VgH > 200) Then VmMouMaxY := VgH - 1;
+  VmMouX := 320; VmMouY := (VmMouMaxY + 1) Div 2;
   VmMouMask := 0; VmMouSeg := 0; VmMouOfs := 0; VmMouEv := 0;
   VmMouMkX := 0; VmMouMkY := 0;
   For I := 0 To 2 Do
@@ -42234,12 +42889,9 @@ End;
 
 { Evenement de la souris dans la console (tache 0) : X, Y relatifs a
   la zone client }
-Procedure DosMouseIn(Msg, X, Y : LongInt);
-Var NX, NY, B, Ev, I : LongInt;
+Procedure DosMouseAt(Msg, NX, NY : LongInt);
+Var B, Ev, I : LongInt;
 Begin
-  If Not VmOn Then Exit;
-  NX := Max(0, Min(79, X Div ConCW)) * 8;
-  NY := Max(0, Min(24, Y Div ConChH)) * 8;
   Ev := 0;
   If (NX <> VmMouX) Or (NY <> VmMouY) Then
   Begin
@@ -42285,6 +42937,24 @@ Begin
   End;
   VmMouBtn := B;
   VmMouEv := VmMouEv Or Ev;
+End;
+
+Procedure DosMouseIn(Msg, X, Y : LongInt);
+Begin
+  If Not VmOn Then Exit;
+  DosMouseAt(Msg, Max(0, Min(79, X Div ConCW)) * 8,
+             Max(0, Min(24, Y Div ConChH)) * 8);
+End;
+
+{ Ecran graphique plein ecran : coordonnees du pointeur de Pasdows dans
+  la surface (640 de large ; 200 lignes doublees) }
+Procedure DosMouseScr(Msg : LongInt);
+Var X, Y : LongInt;
+Begin
+  X := CurX - ((ScrW - Min(DDW, ScrW)) Div 2 And Not 7);
+  Y := CurY - (ScrH - Min(DDH, ScrH)) Div 2;
+  If VgH <= 200 Then Y := Y Div 2;
+  DosMouseAt(Msg, Max(0, Min(639, X)), Max(0, Min(VgH - 1, Y)));
 End;
 
 { Appeler le gestionnaire d'evenements du programme (fonction 0Ch) }
@@ -42451,7 +43121,11 @@ Begin
       V := VmPort61;
     End;
     $64 : V := $1C;
-    $3C1 : V := 0;
+    $3C1 : V := VgAc[VgAcI And 31];
+    $3C4 : V := VgSeqI;
+    $3C5 : V := VgSeq[VgSeqI And 7];
+    $3CE : V := VgGcI;
+    $3CF : If VgGcI <= 8 Then V := VgGc[VgGcI];
     $3C9 :
     Begin
       V := VmDac[VmDacRd Mod 768];
@@ -42526,6 +43200,12 @@ Begin
           Else P := (P And $FF00) Or V;
           If P < 2000 Then VmSetCur(0, P Mod 80, P Div 80);
         End;
+        $0C, $0D :
+        Begin
+          If VmCrtIdx = $0C Then VgStart := (VgStart And $FF) Or (V Shl 8)
+          Else VgStart := (VgStart And $FF00) Or V;
+          VgDLo := 0; VgDHi := VgH - 1;
+        End;
       End;
     $3C7 :
     Begin
@@ -42539,7 +43219,22 @@ Begin
     Begin
       VmDac[VmDacIdx Mod 768] := V And $3F;
       VmDacIdx := (VmDacIdx + 1) Mod 768;
+      VgPalDirty := True;
     End;
+    $3C0 :
+    Begin
+      If VmAttrFF = 0 Then VgAcI := V And $1F
+      Else If VgAcI <= 20 Then
+      Begin
+        VgAc[VgAcI] := V;
+        VgPalDirty := True;
+      End;
+      VmAttrFF := VmAttrFF Xor 1;
+    End;
+    $3C4 : VgSeqI := V;
+    $3C5 : VgSeq[VgSeqI And 7] := V;
+    $3CE : VgGcI := V;
+    $3CF : If VgGcI <= 8 Then VgGc[VgGcI] := V;
   End;
 End;
 
@@ -42564,6 +43259,514 @@ End;
 Function VmCode(Cs, Ip : LongInt) : LongInt;
 Begin
   VmCode := Mem[0:VmLin(Cs, Ip)];
+End;
+
+{ ------------------------------------------------------------------ }
+{ Emulation des instructions qui accedent a la memoire video a plans }
+{ ------------------------------------------------------------------ }
+{ Defaut de page en A0000h-AFFFFh : l'instruction est decodee (prefixes,
+  ModRM 16 et 32 bits) et executee ici, ses acces a la memoire video
+  passant par VgRead et VgWrite : MOV, XCHG, operations arithmetiques
+  et logiques (indicateurs calcules), TEST, NOT, NEG, INC, DEC,
+  decalages et rotations, instructions de chaines (MOVS, STOS, LODS,
+  CMPS, SCAS, avec REP). }
+
+Var
+  XSz : LongInt;                 { taille de l'operande (1, 2, 4) }
+
+Function XRd8(Lin : LongInt) : LongInt;
+Begin
+  Lin := Lin And $FFFFF;
+  If VgPlanar And (Lin >= $A0000) And (Lin < $B0000) Then
+    XRd8 := VgRead(Lin - $A0000)
+  Else XRd8 := Mem[0:VmRam + Lin];
+End;
+
+Procedure XWr8(Lin, V : LongInt);
+Begin
+  Lin := Lin And $FFFFF;
+  If VgPlanar And (Lin >= $A0000) And (Lin < $B0000) Then
+    VgWrite(Lin - $A0000, V)
+  Else Mem[0:VmRam + Lin] := V;
+End;
+
+Function XRd(Lin, Sz : LongInt) : LongInt;
+Var K, R : LongInt;
+Begin
+  R := 0;
+  For K := 0 To Sz - 1 Do R := R Or (XRd8(Lin + K) Shl (K * 8));
+  XRd := R;
+End;
+
+Procedure XWr(Lin, V, Sz : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To Sz - 1 Do XWr8(Lin + K, V Shr (K * 8));
+End;
+
+Function XMask(Sz : LongInt) : LongInt;
+Begin
+  If Sz = 1 Then XMask := $FF
+  Else If Sz = 2 Then XMask := $FFFF
+  Else XMask := -1;
+End;
+
+{ Registre general I (0 AX/AL ... 7 DI/BH) de taille Sz }
+Function XGetR(I, Sz : LongInt) : LongInt;
+Const Ofs : Array[0..7] Of LongInt = (fEax, fEcx, fEdx, fEbx, fEsp, fEbp,
+                                      fEsi, fEdi);
+Begin
+  If Sz = 1 Then
+  Begin
+    If I < 4 Then XGetR := Mem[0:VmF + Ofs[I]]
+    Else XGetR := Mem[0:VmF + Ofs[I - 4] + 1];
+  End
+  Else XGetR := MemL[0:VmF + Ofs[I]] And XMask(Sz);
+End;
+
+Procedure XSetR(I, Sz, V : LongInt);
+Const Ofs : Array[0..7] Of LongInt = (fEax, fEcx, fEdx, fEbx, fEsp, fEbp,
+                                      fEsi, fEdi);
+Begin
+  If Sz = 1 Then
+  Begin
+    If I < 4 Then Mem[0:VmF + Ofs[I]] := V
+    Else Mem[0:VmF + Ofs[I - 4] + 1] := V;
+  End
+  Else If Sz = 2 Then VS(Ofs[I], V)
+  Else MemL[0:VmF + Ofs[I]] := V;
+End;
+
+Function XParity(V : LongInt) : Boolean;
+Var K, N : LongInt;
+Begin
+  N := 0;
+  For K := 0 To 7 Do If ((V Shr K) And 1) <> 0 Then Inc(N);
+  XParity := (N And 1) = 0;
+End;
+
+{ CF, PF, AF, ZF, SF, OF du resultat R }
+Procedure XSetFl(R, Sz : LongInt; Cf, Ovf, Af : Boolean);
+Var F : LongInt;
+Begin
+  R := R And XMask(Sz);
+  F := MemL[0:VmF + fFl] And Not $8D5;
+  If Cf Then F := F Or 1;
+  If XParity(R) Then F := F Or 4;
+  If Af Then F := F Or $10;
+  If R = 0 Then F := F Or $40;
+  If ((R Shr (Sz * 8 - 1)) And 1) <> 0 Then F := F Or $80;
+  If Ovf Then F := F Or $800;
+  MemL[0:VmF + fFl] := F;
+End;
+
+Function XCf : LongInt;
+Begin
+  XCf := MemL[0:VmF + fFl] And 1;
+End;
+
+{ a < b en non signe (32 bits) }
+Function XULess(A, B : LongInt) : Boolean;
+Begin
+  XULess := (A Xor LongInt($80000000)) < (B Xor LongInt($80000000));
+End;
+
+{ ADD OR ADC SBB AND SUB XOR CMP }
+Function XAlu(Op, A, B, Sz : LongInt) : LongInt;
+Var R, M, S, C : LongInt; Cf, Ovf : Boolean;
+Begin
+  M := XMask(Sz);
+  S := 1 Shl (Sz * 8 - 1);
+  A := A And M; B := B And M;
+  C := 0;
+  Case Op Of
+    0, 2 :
+    Begin
+      If Op = 2 Then C := XCf;
+      R := (A + B + C) And M;
+      If Sz = 4 Then Cf := XULess(R, A) Or ((C = 1) And (R = A))
+      Else Cf := A + B + C > M;
+      Ovf := ((A Xor R) And (B Xor R) And S) <> 0;
+      XSetFl(R, Sz, Cf, Ovf, ((A Xor B Xor R) And $10) <> 0);
+    End;
+    3, 5, 7 :
+    Begin
+      If Op = 3 Then C := XCf;
+      R := (A - B - C) And M;
+      If Sz = 4 Then Cf := XULess(A, B) Or ((C = 1) And (A = B))
+      Else Cf := A < B + C;
+      Ovf := ((A Xor B) And (A Xor R) And S) <> 0;
+      XSetFl(R, Sz, Cf, Ovf, ((A Xor B Xor R) And $10) <> 0);
+    End;
+  Else
+    Case Op Of
+      1 : R := A Or B;
+      4 : R := A And B;
+    Else
+      R := A Xor B;
+    End;
+    XSetFl(R, Sz, False, False, False);
+  End;
+  XAlu := R And M;
+End;
+
+{ Decalages et rotations (C0, C1, D0-D3) }
+Function XShift(Op, V, Cnt, Sz : LongInt) : LongInt;
+Var M, Bits, K, B, F : LongInt; Cf : Boolean;
+Begin
+  M := XMask(Sz);
+  Bits := Sz * 8;
+  V := V And M;
+  Cnt := Cnt And 31;
+  If Cnt = 0 Then
+  Begin
+    XShift := V;
+    Exit;
+  End;
+  Cf := XCf <> 0;
+  For K := 1 To Cnt Do
+  Begin
+    B := (V Shr (Bits - 1)) And 1;
+    Case Op Of
+      0 :
+      Begin
+        V := ((V Shl 1) Or B) And M; Cf := B <> 0;
+      End;
+      1 :
+      Begin
+        Cf := (V And 1) <> 0;
+        V := ((V Shr 1) And (M Shr 1)) Or (Ord(Cf) Shl (Bits - 1));
+      End;
+      2 :
+      Begin
+        V := ((V Shl 1) Or Ord(Cf)) And M; Cf := B <> 0;
+      End;
+      3 :
+      Begin
+        F := Ord(Cf);
+        Cf := (V And 1) <> 0;
+        V := ((V Shr 1) And (M Shr 1)) Or (F Shl (Bits - 1));
+      End;
+      4, 6 :
+      Begin
+        Cf := B <> 0; V := (V Shl 1) And M;
+      End;
+      5 :
+      Begin
+        Cf := (V And 1) <> 0; V := (V Shr 1) And (M Shr 1);
+      End;
+    Else
+      Cf := (V And 1) <> 0;
+      V := ((V Shr 1) And (M Shr 1)) Or (B Shl (Bits - 1));
+    End;
+  End;
+  If Op < 4 Then
+  Begin
+    F := MemL[0:VmF + fFl] And Not $801;
+    If Cf Then F := F Or 1;
+    If ((V Shr (Bits - 1)) And 1) <> Ord(Cf) Then F := F Or $800;
+    MemL[0:VmF + fFl] := F;
+  End
+  Else XSetFl(V, Sz, Cf, ((V Shr (Bits - 1)) And 1) <> Ord(Cf), False);
+  XShift := V;
+End;
+
+Function XImm(Cs, Ip : LongInt; Var N : LongInt; Sz : LongInt) : LongInt;
+Var V, K : LongInt;
+Begin
+  V := 0;
+  For K := 0 To Sz - 1 Do V := V Or (VmCode(Cs, Ip + N + K) Shl (K * 8));
+  N := N + Sz;
+  XImm := V;
+End;
+
+{ Operande memoire du ModRM : adresse lineaire de la machine, ou -1 pour
+  un registre (Rm). N avance sur le ModRM et le deplacement. }
+Function XModRM(Cs, Ip : LongInt; Var N, Rg, Rm : LongInt;
+                SegO : LongInt; A32 : Boolean) : LongInt;
+Var B, Md, Ea, D, Sg, Sib, Bs, Ix : LongInt;
+Begin
+  B := VmCode(Cs, Ip + N); Inc(N);
+  Md := B Shr 6; Rg := (B Shr 3) And 7; Rm := B And 7;
+  If Md = 3 Then
+  Begin
+    XModRM := -1;
+    Exit;
+  End;
+  Sg := fDs;
+  If Not A32 Then
+  Begin
+    Case Rm Of
+      0 : Ea := VR(fEbx) + VR(fEsi);
+      1 : Ea := VR(fEbx) + VR(fEdi);
+      2 :
+      Begin
+        Ea := VR(fEbp) + VR(fEsi); Sg := fSs;
+      End;
+      3 :
+      Begin
+        Ea := VR(fEbp) + VR(fEdi); Sg := fSs;
+      End;
+      4 : Ea := VR(fEsi);
+      5 : Ea := VR(fEdi);
+      6 :
+        If Md = 0 Then
+        Begin
+          Ea := VmCode(Cs, Ip + N) Or (VmCode(Cs, Ip + N + 1) Shl 8);
+          N := N + 2;
+        End
+        Else
+        Begin
+          Ea := VR(fEbp); Sg := fSs;
+        End;
+    Else
+      Ea := VR(fEbx);
+    End;
+    If Md = 1 Then
+    Begin
+      D := VmCode(Cs, Ip + N); Inc(N);
+      If D >= $80 Then D := D - 256;
+      Ea := Ea + D;
+    End
+    Else If Md = 2 Then
+    Begin
+      Ea := Ea + (VmCode(Cs, Ip + N) Or (VmCode(Cs, Ip + N + 1) Shl 8));
+      N := N + 2;
+    End;
+    Ea := Ea And $FFFF;
+  End
+  Else
+  Begin
+    { adressage 32 bits (prefixe 67h) }
+    If Rm = 4 Then
+    Begin
+      Sib := VmCode(Cs, Ip + N); Inc(N);
+      Bs := Sib And 7; Ix := (Sib Shr 3) And 7;
+      If (Bs = 5) And (Md = 0) Then
+      Begin
+        Ea := XImm(Cs, Ip, N, 4);
+      End
+      Else
+      Begin
+        Ea := XGetR(Bs, 4);
+        If (Bs = 4) Or (Bs = 5) Then Sg := fSs;
+      End;
+      If Ix <> 4 Then Ea := Ea + (XGetR(Ix, 4) Shl (Sib Shr 6));
+    End
+    Else If (Rm = 5) And (Md = 0) Then
+    Begin
+      Ea := XImm(Cs, Ip, N, 4);
+    End
+    Else
+    Begin
+      Ea := XGetR(Rm, 4);
+      If Rm = 5 Then Sg := fSs;
+    End;
+    If Md = 1 Then
+    Begin
+      D := VmCode(Cs, Ip + N); Inc(N);
+      If D >= $80 Then D := D - 256;
+      Ea := Ea + D;
+    End
+    Else If Md = 2 Then
+    Begin
+      Ea := Ea + XImm(Cs, Ip, N, 4);
+    End;
+  End;
+  If SegO >= 0 Then Sg := SegO;
+  XModRM := ((VR(Sg) Shl 4) + Ea) And $FFFFF;
+End;
+
+{ Instruction de chaine : MOVS, STOS, LODS, CMPS, SCAS }
+Procedure XString(Op, Sz, SegO, Rep : LongInt; A32 : Boolean);
+Var Cnt, Si, Di, SB, D, V, W, M, Cx : LongInt; Go : Boolean;
+Begin
+  If A32 Then M := -1 Else M := $FFFF;
+  If (MemL[0:VmF + fFl] And $400) <> 0 Then D := -Sz Else D := Sz;
+  If SegO < 0 Then SegO := fDs;
+  Cx := fEcx;
+  If Rep <> 0 Then Cnt := MemL[0:VmF + Cx] And M Else Cnt := 1;
+  Si := MemL[0:VmF + fEsi] And M;
+  Di := MemL[0:VmF + fEdi] And M;
+  SB := VR(SegO) Shl 4;
+  Go := True;
+  While Go And (Cnt <> 0) Do
+  Begin
+    Case Op Of
+      $A4, $A5 : XWr((VR(fEs) Shl 4) + Di, XRd(SB + Si, Sz), Sz);
+      $AA, $AB : XWr((VR(fEs) Shl 4) + Di, MemL[0:VmF + fEax], Sz);
+      $AC, $AD : XSetR(0, Sz, XRd(SB + Si, Sz));
+      $A6, $A7 :
+      Begin
+        V := XRd(SB + Si, Sz); W := XRd((VR(fEs) Shl 4) + Di, Sz);
+        XAlu(7, V, W, Sz);
+      End;
+      $AE, $AF :
+      Begin
+        W := XRd((VR(fEs) Shl 4) + Di, Sz);
+        XAlu(7, XGetR(0, Sz), W, Sz);
+      End;
+    End;
+    If Op In [$A4, $A5, $AC, $AD, $A6, $A7] Then Si := (Si + D) And M;
+    If Op In [$A4, $A5, $AA, $AB, $A6, $A7, $AE, $AF] Then
+      Di := (Di + D) And M;
+    Dec(Cnt);
+    If (Rep <> 0) And (Op In [$A6, $A7, $AE, $AF]) Then
+    Begin
+      If (Rep = $F3) And ((MemL[0:VmF + fFl] And $40) = 0) Then Go := False;
+      If (Rep = $F2) And ((MemL[0:VmF + fFl] And $40) <> 0) Then Go := False;
+    End;
+  End;
+  If A32 Then
+  Begin
+    MemL[0:VmF + fEsi] := Si; MemL[0:VmF + fEdi] := Di;
+    If Rep <> 0 Then MemL[0:VmF + Cx] := Cnt;
+  End
+  Else
+  Begin
+    VS(fEsi, Si); VS(fEdi, Di);
+    If Rep <> 0 Then VS(Cx, Cnt);
+  End;
+End;
+
+{ Defaut de page : instruction a emuler ; False si inconnue }
+Function VgFault : Boolean;
+Var Cs, Ip, N, Op, SegO, Rep, Sz, Rg, Rm, A, V, W, R : LongInt;
+    O32, A32 : Boolean;
+Begin
+  VgFault := False;
+  Cs := VR(fCs); Ip := VR(fEip);
+  N := 0; SegO := -1; Rep := 0; O32 := False; A32 := False;
+  Repeat
+    Op := VmCode(Cs, Ip + N);
+    Inc(N);
+    Case Op Of
+      $26 : SegO := fEs; $2E : SegO := fCs; $36 : SegO := fSs;
+      $3E : SegO := fDs; $64 : SegO := fFs; $65 : SegO := fGs;
+      $66 : O32 := True;
+      $67 : A32 := True;
+      $F2, $F3 : Rep := Op;
+      $F0 : ;
+    Else
+      Break;
+    End;
+  Until N > 14;
+  If O32 Then Sz := 4 Else Sz := 2;
+  If (Op < $40) And ((Op And 7) < 4) Then
+  Begin
+    { ALU r/m, r et r, r/m }
+    If (Op And 1) = 0 Then Sz := 1;
+    A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+    If A < 0 Then Exit;
+    If (Op And 2) = 0 Then
+    Begin
+      R := XAlu((Op Shr 3) And 7, XRd(A, Sz), XGetR(Rg, Sz), Sz);
+      If ((Op Shr 3) And 7) <> 7 Then XWr(A, R, Sz);
+    End
+    Else
+    Begin
+      R := XAlu((Op Shr 3) And 7, XGetR(Rg, Sz), XRd(A, Sz), Sz);
+      If ((Op Shr 3) And 7) <> 7 Then XSetR(Rg, Sz, R);
+    End;
+  End
+  Else
+    Case Op Of
+      $88, $89, $8A, $8B, $86, $87, $84, $85 :
+      Begin
+        If (Op And 1) = 0 Then Sz := 1;
+        A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+        If A < 0 Then Exit;
+        Case Op Of
+          $88, $89 : XWr(A, XGetR(Rg, Sz), Sz);
+          $8A, $8B : XSetR(Rg, Sz, XRd(A, Sz));
+          $86, $87 :
+          Begin
+            V := XRd(A, Sz);
+            XWr(A, XGetR(Rg, Sz), Sz);
+            XSetR(Rg, Sz, V);
+          End;
+        Else
+          XAlu(4, XRd(A, Sz), XGetR(Rg, Sz), Sz);
+        End;
+      End;
+      $C6, $C7 :
+      Begin
+        If Op = $C6 Then Sz := 1;
+        A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+        If A < 0 Then Exit;
+        XWr(A, XImm(Cs, Ip, N, Sz), Sz);
+      End;
+      $80, $81, $83 :
+      Begin
+        If Op = $80 Then Sz := 1;
+        A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+        If A < 0 Then Exit;
+        If Op = $83 Then
+        Begin
+          W := VmCode(Cs, Ip + N); Inc(N);
+          If W >= $80 Then W := W - 256;
+        End
+        Else W := XImm(Cs, Ip, N, Sz);
+        R := XAlu(Rg, XRd(A, Sz), W, Sz);
+        If Rg <> 7 Then XWr(A, R, Sz);
+      End;
+      $F6, $F7 :
+      Begin
+        If Op = $F6 Then Sz := 1;
+        A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+        If A < 0 Then Exit;
+        V := XRd(A, Sz);
+        Case Rg Of
+          0, 1 : XAlu(4, V, XImm(Cs, Ip, N, Sz), Sz);
+          2 : XWr(A, Not V, Sz);
+          3 : XWr(A, XAlu(5, 0, V, Sz), Sz);
+        Else
+          Exit;
+        End;
+      End;
+      $FE, $FF :
+      Begin
+        If Op = $FE Then Sz := 1;
+        A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+        If (A < 0) Or (Rg > 1) Then Exit;
+        V := XRd(A, Sz);
+        W := MemL[0:VmF + fFl] And 1;
+        If Rg = 0 Then R := XAlu(0, V, 1, Sz) Else R := XAlu(5, V, 1, Sz);
+        MemL[0:VmF + fFl] := (MemL[0:VmF + fFl] And Not 1) Or W;
+        XWr(A, R, Sz);
+      End;
+      $C0, $C1, $D0, $D1, $D2, $D3 :
+      Begin
+        If Op In [$C0, $D0, $D2] Then Sz := 1;
+        A := XModRM(Cs, Ip, N, Rg, Rm, SegO, A32);
+        If A < 0 Then Exit;
+        If Op In [$C0, $C1] Then
+        Begin
+          W := VmCode(Cs, Ip + N); Inc(N);
+        End
+        Else If Op In [$D2, $D3] Then W := VRL(fEcx)
+        Else W := 1;
+        XWr(A, XShift(Rg, XRd(A, Sz), W, Sz), Sz);
+      End;
+      $A0..$A3 :
+      Begin
+        If Op In [$A0, $A2] Then Sz := 1;
+        If A32 Then W := XImm(Cs, Ip, N, 4) Else W := XImm(Cs, Ip, N, 2);
+        If SegO < 0 Then SegO := fDs;
+        A := ((VR(SegO) Shl 4) + W) And $FFFFF;
+        If Op < $A2 Then XSetR(0, Sz, XRd(A, Sz))
+        Else XWr(A, XGetR(0, Sz), Sz);
+      End;
+      $A4..$A7, $AA..$AF :
+      Begin
+        If (Op And 1) = 0 Then Sz := 1;
+        XString(Op, Sz, SegO, Rep, A32);
+      End;
+    Else
+      Exit;
+    End;
+  MemL[0:VmF + fEip] := (Ip + N) And $FFFF;
+  VgFault := True;
 End;
 
 { Instructions d'E/S : IN, OUT, INS, OUTS }
@@ -42757,8 +43960,11 @@ Begin
   Case VmVec Of
     0 : If Not VmCrtFix Then VmInt(0);
     13 : VmGp;
-    14 : VmCrash('acces a la memoire hors de la machine (' +
-                 HexStr(GetCr2, 8) + ')');
+    14 :
+      If Not (VgPlanar And (GetCr2 >= $A0000) And (GetCr2 < $B0000) And
+              VgFault) Then
+        VmCrash('acces a la memoire hors de la machine (' +
+                HexStr(GetCr2, 8) + ')');
     6 : VmCrash('code d''operation invalide');
   Else
     VmInt(VmVec);
@@ -42853,7 +44059,7 @@ Begin
   { table des interruptions : un HLT par vecteur }
   For I := 0 To 255 Do
     MemL[0:VmRam + I * 4] := (LongInt(VmBios) Shl 16) + VmStubO + I;
-  MemL[0:VmRam + $1F * 4] := (LongInt(VmBios) Shl 16) + VmFontO + 1024;
+  MemL[0:VmRam + $1F * 4] := (LongInt(VmBios) Shl 16) + VmFont8H;
   MemL[0:VmRam + $43 * 4] := (LongInt(VmBios) Shl 16) + VmFontO;
   MemL[0:VmRam + $1D * 4] := (LongInt(VmBios) Shl 16) + $0300;
   MemL[0:VmRam + $1E * 4] := (LongInt(VmBios) Shl 16) + $0300;
@@ -42876,6 +44082,20 @@ Begin
   End;
   Mem[0:A + VmEgaO + 6] := $14;
   MoveMem(FontAddr, A + VmFontO, 4096);
+  { polices 8x8 et 8x14 tirees de la 8x16 (lignes reunies deux a deux,
+    ou sans la premiere et la derniere) }
+  For I := 0 To 255 Do
+  Begin
+    For S := 0 To 7 Do
+    Begin
+      D := Mem[0:FontAddr + I * 16 + S * 2] Or
+           Mem[0:FontAddr + I * 16 + S * 2 + 1];
+      If I < 128 Then Mem[0:A + VmFont8O + I * 8 + S] := D
+      Else Mem[0:A + VmFont8H + (I - 128) * 8 + S] := D;
+    End;
+    For S := 0 To 13 Do
+      Mem[0:A + VmFont14O + I * 14 + S] := Mem[0:FontAddr + I * 16 + S + 1];
+  End;
   Mem[0:A + $FFF0] := $EA; MemW[0:A + $FFF1] := $E05B;
   MemW[0:A + $FFF3] := VmBios;
   PutPStr(A + $FFF5, '11/14/95', 9);
@@ -42885,6 +44105,9 @@ Begin
   MemW[0:VmBda($13)] := 640;
   MemW[0:VmBda($1A)] := $1E; MemW[0:VmBda($1C)] := $1E;
   MemW[0:VmBda($80)] := $1E; MemW[0:VmBda($82)] := $3E;
+  VgPlanes := 0; VgShadow := 0; VgPlanar := False; VgShown := False;
+  VgMode := 3; VgStart := 0;
+  VgTables;
   VmSetMode($83);
   MemW[0:VmBda($63)] := $3D4;
   Mem[0:VmBda($65)] := $29; Mem[0:VmBda($66)] := $30;
@@ -42983,7 +44206,15 @@ Var I, A, C, At, Cell, X, Y, Pg : LongInt; Vis : Boolean;
 Begin
   If Not VmOn Or (ConW < 0) Or (VmRam = 0) Then Exit;
   VmShiftUpd;
-  If VmGfx Then Exit;
+  If VmGfx Then
+  Begin
+    { plein ecran tant que la console est la fenetre active (Alt+Tab
+      ramene au bureau, comme Windows 95) }
+    If (ActiveWin = ConW) And Not VgShown Then VgShow(True)
+    Else If (ActiveWin <> ConW) And VgShown Then VgShow(False);
+    VgRender;
+    Exit;
+  End;
   Pg := VmPage;
   A := VmScrA(Pg);
   Cell := -1;
@@ -43034,7 +44265,17 @@ Begin
       VmFindH[I] := 0;
     End;
   If VmT > 0 Then ThrCr3[VmT] := KPd;
+  VgShow(False);
+  VgPlanes := 0; VgShadow := 0; VgPlanar := False; VgMode := 3;
+  VmGfx := False;
   VmRam := 0;
+  { titre de la console d'avant le programme }
+  If (ConW >= 0) And (ConTitle <> '') Then
+  Begin
+    Wnds[ConW].Text := ConTitle;
+    KRepaint(ConW);
+    TaskbarChanged;
+  End;
   ConCurVis := True;
   ConAttr := 7;
   KLog('DOS : fin de la machine virtuelle');
