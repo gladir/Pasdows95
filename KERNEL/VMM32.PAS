@@ -9373,6 +9373,7 @@ Begin
     S := S + Back.Pitch;
     D := D + LfbPitch;
   End;
+  If SvOn Then SvAdd(R.L, R.T, R.R, R.B);
 End;
 
 { VirtualBox (partie 18) : VMMDev present, souris absolue, pointeur
@@ -9383,8 +9384,16 @@ Var
   VbAbs   : Boolean;
   VbHwPtr : Boolean;
   VbGfx   : Boolean;                 { carte VBoxVGA (80EE:BEEF) }
+  { VMware (partie 19) : backdoor, souris absolue, carte SVGA II }
+  VwOn, VwReal, VmmOn : Boolean;
+  SvOn, SvHwPtr : Boolean;
+  SvPort, SvCaps, SvFb : LongInt;
+  SvFull1, SvFull2 : LongInt;          { mises a jour completes prevues }
 
 Procedure VbPtrSync; Forward;
+Procedure SvPtrSync; Forward;
+Procedure SvAdd(L, T, R, B : LongInt); Forward;
+Procedure SvFlush; Forward;
 Function VbMousePos(Var X, Y : LongInt) : Boolean; Forward;
 Procedure VbPoll; Forward;
 
@@ -9456,10 +9465,10 @@ End;
 Procedure CursorDraw;
 Var X, Y, PX, PY, V, A : LongInt;
 Begin
-  If VbHwPtr Then
+  If VbHwPtr Or SvHwPtr Then
   Begin
-    { VirtualBox dessine le pointeur (forme donnee a l'hote) }
-    VbPtrSync;
+    { VirtualBox ou VMware dessine le pointeur (forme donnee a l'hote) }
+    If VbHwPtr Then VbPtrSync Else SvPtrSync;
     CurShownB := False;
     Exit;
   End;
@@ -9487,16 +9496,24 @@ Begin
       End;
   End;
   CurShownB := True;
+  If SvOn Then
+  Begin
+    SvAdd(CurX - CurHotX, CurY - CurHotY, CurX - CurHotX + CurW,
+          CurY - CurHotY + CurHh);
+    SvFlush;
+  End;
 End;
 
 Procedure CursorErase;
 Var R : TRect;
 Begin
   If VbHwPtr Then VbPtrSync;
+  If SvHwPtr Then SvPtrSync;
   If Not CurShownB Then Exit;
   CursorRect(R);
   LfbCopy(R);
   CurShownB := False;
+  If SvOn Then SvFlush;
 End;
 
 Procedure CursorMoveTo(X, Y : LongInt);
@@ -9508,7 +9525,7 @@ Begin
 End;
 
 { Composer la zone modifiee et l'afficher }
-Procedure FlushScreen;
+Procedure FlushScreen0;
 Var R, C, I : TRect; Y, X0, Y0, Z : LongInt;
 Begin
   { VGA 16 couleurs ou couleurs directes : palette changee, tout l'ecran
@@ -9573,6 +9590,20 @@ Begin
   End
   Else
     LfbCopy(R);
+End;
+
+{ Composer et afficher ; VMware SVGA : zones modifiees envoyees a
+  l'hote (UPDATE) }
+Procedure FlushScreen;
+Var D : Boolean;
+Begin
+  D := DDShow And (DDDirty Or Not DDCleared);
+  FlushScreen0;
+  If SvOn Then
+  Begin
+    If D Then SvAdd(0, 0, ScrW, ScrH);
+    SvFlush;
+  End;
 End;
 
 { ==================================================================== }
@@ -11429,8 +11460,29 @@ End;
 Var
   VbPosAt : LongInt;
 
+Function VmmCount : LongInt; Forward;
+Procedure VmmPacket(Var X, Y, Btn : LongInt); Forward;
+Procedure VwTcloPoll; Forward;
+
+{ Etat des boutons (souris PS/2 ou absolue) }
+Procedure MouseSetBtn(Bt : LongInt; Var Moved : Boolean);
+Begin
+  If (Bt And 1) <> (MouseBtn And 1) Then
+  Begin
+    If Moved Then MouseMoved;
+    Moved := False;
+    MouseBtn := (MouseBtn And Not 1) Or (Bt And 1);
+    MouseButton((Bt And 1) <> 0, 1);
+  End;
+  If (Bt And 2) <> (MouseBtn And 2) Then
+  Begin
+    MouseBtn := (MouseBtn And Not 2) Or (Bt And 2);
+    MouseButton((Bt And 2) <> 0, 2);
+  End;
+End;
+
 Procedure ProcessInput;
-Var B, Dx, Dy, Bt, NX, NY, AX, AY : LongInt; Moved : Boolean;
+Var B, Dx, Dy, Bt, NX, NY, AX, AY, N : LongInt; Moved : Boolean;
 Begin
   While KbHead <> KbTail Do
   Begin
@@ -11462,6 +11514,30 @@ Begin
       End;
     End;
   End;
+  { VMware : souris absolue (vmmouse) ; les paquets PS/2 ne font que
+    signaler les evenements, lus dans la file de la backdoor }
+  If VmmOn And ((MouHead <> MouTail) Or (Ticks - VbPosAt >= 0)) Then
+  Begin
+    VbPosAt := Ticks + 15;
+    MouHead := MouTail;
+    N := VmmCount;
+    While (N >= 4) And VmmOn Do
+    Begin
+      AX := CurX; AY := CurY;
+      VmmPacket(AX, AY, Bt);
+      N := N - 4;
+      If (AX <> CurX) Or (AY <> CurY) Then
+      Begin
+        DIMX := DIMX + AX - CurX; DIMY := DIMY + AY - CurY;
+        NX := AX; NY := AY;
+        CursorMoveTo(NX, NY);
+        Moved := True;
+      End;
+      DIMBtn := Bt;
+      MouseSetBtn(Bt, Moved);
+    End;
+  End;
+  If VwOn Then VwTcloPoll;
   While MouHead <> MouTail Do
   Begin
     Dx := MouQDx[MouHead]; Dy := MouQDy[MouHead]; Bt := MouQBtn[MouHead];
@@ -11481,20 +11557,25 @@ Begin
       CursorMoveTo(NX, NY);
       Moved := True;
     End;
-    If (Bt And 1) <> (MouseBtn And 1) Then
-    Begin
-      If Moved Then MouseMoved;
-      Moved := False;
-      MouseBtn := (MouseBtn And Not 1) Or (Bt And 1);
-      MouseButton((Bt And 1) <> 0, 1);
-    End;
-    If (Bt And 2) <> (MouseBtn And 2) Then
-    Begin
-      MouseBtn := (MouseBtn And Not 2) Or (Bt And 2);
-      MouseButton((Bt And 2) <> 0, 2);
-    End;
+    MouseSetBtn(Bt, Moved);
   End;
   If Moved Then MouseMoved;
+  If SvOn Then
+  Begin
+    { apres un changement de mode, tout l'ecran une ou deux fois de plus
+      (QEMU ignore les zones recues pendant qu'il change de surface) }
+    If (SvFull1 <> 0) And (Ticks - SvFull1 >= 0) Then
+    Begin
+      SvFull1 := 0;
+      SvAdd(0, 0, ScrW, ScrH);
+    End;
+    If (SvFull2 <> 0) And (Ticks - SvFull2 >= 0) Then
+    Begin
+      SvFull2 := 0;
+      SvAdd(0, 0, ScrW, ScrH);
+    End;
+    SvFlush;
+  End;
 End;
 
 { ------------------------------------------------------------------ }
@@ -14504,9 +14585,34 @@ Begin
   KApplyMode := True;
 End;
 
+Function SvSetMode(W, H : LongInt) : Boolean; Forward;
+Procedure SvMasks(A : LongInt); Forward;
+Function SvR(I : LongInt) : LongInt; Forward;
+
+{ VMware SVGA II : mode W x H en 32 bits }
+Function KSetModeSv(W, H : LongInt) : Boolean;
+Var Z : Array[0..5] Of Byte;
+Begin
+  KSetModeSv := False;
+  If Not SvSetMode(W, H) Then
+  Begin
+    SvSetMode(ScrW, ScrH);
+    Exit;
+  End;
+  SvMasks(LongInt(@Z));
+  KSetModeSv := KApplyMode(W, H, 32, LongInt(@Z), SvFb, $FFFF);
+  LfbPitch := SvR(12);
+  SvFull1 := Ticks + 300; SvFull2 := Ticks + 1500;
+End;
+
 Function KSetMode(I : LongInt) : Boolean;
 Begin
   KSetMode := False;
+  If (I >= 0) And (I < VmN) And SvOn Then
+  Begin
+    KSetMode := KSetModeSv(VmW[I], VmH[I]);
+    Exit;
+  End;
   If (I < 0) Or (I >= VmN) Or Not DispiOk Then Exit;
   If Not DispiSet(VmW[I], VmH[I], VmBpp[I]) Then Exit;
   KSetMode := KApplyMode(VmW[I], VmH[I], VmBpp[I],
@@ -14520,6 +14626,11 @@ Function KSetModeWH(W, H, B : LongInt) : Boolean;
 Var I, K, V : LongInt; Z : Array[0..5] Of Byte;
 Begin
   KSetModeWH := False;
+  If SvOn Then
+  Begin
+    KSetModeWH := KSetModeSv(W, H);
+    Exit;
+  End;
   If Not DispiOk Then Exit;
   V := DispiVram;
   If (V > 0) And (W * H * ((B + 7) Div 8) > V) Then Exit;
@@ -14713,7 +14824,8 @@ Begin
   CmosWrite($7D, RH Div 8);
   CmosWrite($7B, $5A);
   I := VmFind(RW, RH, B);
-  If (B <> 4) And KSetMode(I) Then
+  If (B <> 4) And ((SvOn And KSetModeWH(RW, RH, 32)) Or
+     (Not SvOn And KSetMode(I))) Then
   Begin
     { la boite reste centree dans le nouvel ecran }
     MoveW(W, Max(0, (ScrW - Wnds[W].W) Div 2),
@@ -15901,6 +16013,7 @@ Begin
     $100E8086 : PciName := 'Intel PRO/1000 MT Desktop (82540EM)';
     $10048086 : PciName := 'Intel PRO/1000 T Server (82543GC)';
     $100F8086 : PciName := 'Intel PRO/1000 MT Server (82545EM)';
+    $10D38086 : PciName := 'Intel 82574L Gigabit (e1000e)';
     $20001022 : PciName := 'AMD PCnet (Am79C970A / Am79C973)';
     $50001274 : PciName := 'Ensoniq AudioPCI (ES1370)';
     $24158086 : PciName := 'Intel 82801AA AC''97 Audio';
@@ -16003,7 +16116,11 @@ Begin
     N := L('Carte VGA standard', 'Standard VGA display adapter',
            'Standard-VGA-Grafikkarte', 'Scheda VGA standard',
            'Adaptador VGA est'#160'ndar');
-  If VbGfx Then
+  If SvOn Then
+    DevAdd(0, N, 'VMware, Inc.', RIo($3B0, $3BB) + RIo($3C0, $3DF) +
+           RIo(SvPort, SvPort + $F) + 'M000A0000-000BFFFF|M' +
+           HexStr(SvFb, 8) + '-' + HexStr(SvFb + SvR(16) - 1, 8) + '|')
+  Else If VbGfx Then
     DevAdd(0, N, 'Oracle Corporation', RIo($3B0, $3BB) + RIo($3C0, $3DF) +
            RIo($1CE, $1CF) + 'M000A0000-000BFFFF|M' + HexStr(Lfb, 8) +
            '-' + HexStr(Lfb + Max(DispiVram, $1000000) - 1, 8) + '|')
@@ -16022,7 +16139,13 @@ Begin
          'Keyboard', 'Standardtastatur (101/102 Tasten)',
          'Tastiera standard a 101/102 tasti', 'Teclado est'#160'ndar 101/102'),
          Std, RIo($60, $60) + RIo($64, $64) + RIrq(1));
-  If MouOk And (VbPort <> 0) Then
+  If VmmOn Then
+    DevAdd(11, L('Souris VMware (VMware Pointing Device)',
+           'VMware Pointing Device', 'VMware-Zeigeger'#132't',
+           'Mouse VMware (VMware Pointing Device)',
+           'Mouse de VMware (VMware Pointing Device)'), 'VMware, Inc.',
+           RIo($60, $60) + RIo($64, $64) + RIrq(12))
+  Else If MouOk And (VbPort <> 0) Then
     DevAdd(11, L('Souris VirtualBox (int'#130'gration)',
            'VirtualBox Mouse Integration', 'VirtualBox-Mausintegration',
            'Mouse VirtualBox (integrazione)',
@@ -16032,6 +16155,13 @@ Begin
     DevAdd(11, L('Souris PS/2 standard', 'Standard PS/2 Port Mouse',
            'PS/2-Standardmaus', 'Mouse PS/2 standard',
            'Mouse PS/2 est'#160'ndar'), Std, RIrq(12));
+  If VwOn Then
+    DevAdd(9, L('Interface VMware (backdoor des VMware Tools)',
+           'VMware Tools backdoor interface',
+           'VMware-Schnittstelle (VMware Tools)',
+           'Interfaccia VMware (VMware Tools)',
+           'Interfaz de VMware (VMware Tools)'), 'VMware, Inc.',
+           RIo($5658, $5658));
   If VbPort <> 0 Then
   Begin
     R := RIo(VbPort, VbPort + $1F);
@@ -16088,7 +16218,10 @@ Begin
   Begin
     R := RIo(NicBase, NicBase + $1F);
     If (NicIrq > 0) And (NicIrq < 16) Then R := R + RIrq(NicIrq);
-    DevAdd(1, NicDesc, 'Advanced Micro Devices (AMD)', R);
+    If VwReal Then
+      DevAdd(1, NicDesc + ' - VMware vlance', 'Advanced Micro Devices (AMD)',
+             R)
+    Else DevAdd(1, NicDesc, 'Advanced Micro Devices (AMD)', R);
   End
   Else If NicKind = NkE1000 Then
   Begin
@@ -37091,7 +37224,7 @@ Begin
             End;
           End;
           If (K = 2) And ((Id = $100E8086) Or (Id = $10048086) Or
-             (Id = $100F8086)) Then
+             (Id = $100F8086) Or (Id = $10D38086)) Then
           Begin
             Bar := PciRead(Bus, Dev, 0, $10);
             If (Bar And 1) = 0 Then
@@ -37105,6 +37238,7 @@ Begin
               Case Id Of
                 $10048086 : NicDesc := 'Intel PRO/1000 T Server (82543GC)';
                 $100F8086 : NicDesc := 'Intel PRO/1000 MT Server (82545EM)';
+                $10D38086 : NicDesc := 'Intel 82574L Gigabit (e1000e)';
               Else
                 NicDesc := 'Intel PRO/1000 MT Desktop (82540EM)';
               End;
@@ -49732,6 +49866,605 @@ Begin
 End;
 
 { ==================================================================== }
+{ Partie 19 - VMware Workstation : backdoor, souris vmmouse, carte      }
+{             SVGA II et canal RPC des VMware Tools                     }
+{ ==================================================================== }
+
+{ Sous VMware, une instruction IN sur le port 5658h avec EAX = 564D5868h
+  ("VMXh") est une "backdoor" traitee par l'hyperviseur (ECX = commande).
+  Pasdows s'en sert pour :
+    - la souris absolue (vmmouse, commandes 39 a 41) : la souris PS/2
+      ne fait plus que signaler les evenements, lus dans la file de la
+      backdoor par paquets de 4 mots (boutons, X et Y de 0 a FFFFh,
+      molette) ;
+    - le canal RPC des VMware Tools (commande 30) : le canal TCLO recoit
+      les commandes de l'hote ("reset", "ping", "Capabilities_Register",
+      "Resolution_Set largeur hauteur" : ajustement de l'ecran a la
+      fenetre de VMware) et le canal RPCI annonce la version des Tools et
+      leurs capacites (resolution_set, resolution_server toolbox).
+  La carte VMware SVGA II (PCI 15AD:0405) remplace le mode VESA : ports
+  d'index et de valeur (BAR0), memoire d'image (BAR1, en 32 bits par
+  point) et FIFO de commandes (BAR2) : UPDATE pour chaque zone modifiee
+  de l'ecran, DEFINE_CURSOR pour le pointeur, dessine par l'hote (un seul
+  pointeur), modes de taille quelconque sans redemarrer. }
+
+Const
+  BdMagic = $564D5868;
+  BdPort = $5658;
+  SvIdx = 0; SvVal = 1;
+  SvCapCursor = $20;
+
+Var
+  BdA, BdB, BdC, BdD, BdSi, BdDi : LongInt;
+  VwVer, VwType : LongInt;
+  { canal RPC }
+  RpcCh, RpcC1, RpcC2 : LongInt;
+  RpcBuf : LongInt;
+  RpcLen : LongInt;
+  TcCh, TcC1, TcC2 : LongInt;      { canal TCLO ouvert (TcCh >= 0) }
+  TcReply : String;
+  TcNext, TcFails : LongInt;
+  TcCapsDone : Boolean;
+  { SVGA }
+  SvFifo, SvFifoSz, SvMaxW, SvMaxH, SvCurSum : LongInt;
+  SvDL, SvDT, SvDR, SvDB : LongInt;  { zone a mettre a jour }
+  VmmNext : LongInt;
+
+{ Appel de la backdoor avec BdB..BdDi ; resultats dans Bd* }
+Procedure BdCall;
+Var A, B, C, D, S, I : LongInt;
+Begin
+  B := BdB; C := BdC; D := BdD; S := BdSi; I := BdDi;
+  asm
+    push ebx
+    push esi
+    push edi
+    push ebp
+    mov eax,564D5868h
+    mov ebx,B
+    mov ecx,C
+    mov edx,D
+    mov esi,S
+    mov edi,I
+    push ebp
+    in eax,dx
+    pop ebp
+    mov A,eax
+    mov B,ebx
+    mov C,ecx
+    mov D,edx
+    mov S,esi
+    mov I,edi
+    pop ebp
+    pop edi
+    pop esi
+    pop ebx
+  end;
+  BdA := A; BdB := B; BdC := C; BdD := D; BdSi := S; BdDi := I;
+End;
+
+Procedure BdCmd(Cmd, B : LongInt);
+Begin
+  BdB := B; BdC := Cmd; BdD := BdPort; BdSi := 0; BdDi := 0;
+  BdCall;
+End;
+
+{ VMware (ou un hyperviseur qui imite sa backdoor, comme QEMU) }
+Function VwDetect : Boolean;
+Begin
+  BdCmd(10, -1);
+  VwDetect := BdB = BdMagic;
+  VwVer := BdA; VwType := BdC;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Souris vmmouse                                                       }
+{ ------------------------------------------------------------------ }
+
+Function VmmInit : Boolean;
+Begin
+  VmmInit := False;
+  BdCmd(41, $45414552);                          { activer, lire l'ID }
+  BdCmd(40, 0);
+  If ((BdA And LongInt($FFFF0000)) = LongInt($FFFF0000)) Or
+     ((BdA And $FFFF) < 1) Then Exit;
+  BdCmd(39, 1);
+  If BdA <> $3442554A Then Exit;
+  BdCmd(41, $53424152);                          { absolue }
+  VmmInit := True;
+End;
+
+{ Mots en attente dans la file (-1 : souris coupee par l'hote, retour a
+  la souris PS/2) }
+Function VmmCount : LongInt;
+Begin
+  BdCmd(40, 0);
+  If (BdA And LongInt($FFFF0000)) = LongInt($FFFF0000) Then
+  Begin
+    KLog('VMware : souris absolue coupee, retour a la souris PS/2');
+    VmmOn := False;
+    VmmCount := -1;
+    Exit;
+  End;
+  VmmCount := BdA And $FFFF;
+End;
+
+{ Un paquet de 4 mots : boutons, X, Y (absolus de 0 a FFFFh, ou
+  deplacement si le bit 16 des boutons est mis), molette }
+Procedure VmmPacket(Var X, Y, Btn : LongInt);
+Var F : LongInt;
+Begin
+  BdCmd(39, 4);
+  F := BdA;
+  If (F And $10000) <> 0 Then
+  Begin
+    X := X + BdB; Y := Y + BdC;
+  End
+  Else
+  Begin
+    X := ((BdB And $FFFF) * ScrW) Shr 16;
+    Y := ((BdC And $FFFF) * ScrH) Shr 16;
+  End;
+  If X < 0 Then X := 0;
+  If Y < 0 Then Y := 0;
+  If X > ScrW - 1 Then X := ScrW - 1;
+  If Y > ScrH - 1 Then Y := ScrH - 1;
+  Btn := 0;
+  If (F And $20) <> 0 Then Btn := Btn Or 1;
+  If (F And $10) <> 0 Then Btn := Btn Or 2;
+  If (F And $08) <> 0 Then Btn := Btn Or 4;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Canal RPC (GuestRPC) : ouvrir, envoyer, recevoir                     }
+{ ------------------------------------------------------------------ }
+
+Function RpcOpen(Proto : LongInt; Var Ch, C1, C2 : LongInt) : Boolean;
+Begin
+  RpcOpen := False;
+  BdB := Proto Or LongInt($80000000); BdC := 30; BdD := BdPort;
+  BdSi := 0; BdDi := 0;
+  BdCall;
+  If ((BdC Shr 16) And 1) = 0 Then Exit;
+  Ch := (BdD Shr 16) And $FFFF; C1 := BdSi; C2 := BdDi;
+  RpcOpen := True;
+End;
+
+Procedure RpcSet(Ch, C1, C2, Sub, B : LongInt);
+Begin
+  BdB := B; BdC := 30 Or (Sub Shl 16); BdD := BdPort Or (Ch Shl 16);
+  BdSi := C1; BdDi := C2;
+  BdCall;
+End;
+
+Procedure RpcClose(Ch, C1, C2 : LongInt);
+Begin
+  RpcSet(Ch, C1, C2, 6, 0);
+End;
+
+Function RpcSend(Ch, C1, C2 : LongInt; Const S : String) : Boolean;
+Var I, K, V : LongInt;
+Begin
+  RpcSend := False;
+  RpcSet(Ch, C1, C2, 1, Length(S));
+  If ((BdC Shr 16) And 1) = 0 Then Exit;
+  I := 1;
+  While I <= Length(S) Do
+  Begin
+    V := 0;
+    For K := 0 To 3 Do
+      If I + K <= Length(S) Then V := V Or (Ord(S[I + K]) Shl (K * 8));
+    RpcSet(Ch, C1, C2, 2, V);
+    If ((BdC Shr 16) And 1) = 0 Then Exit;
+    I := I + 4;
+  End;
+  RpcSend := True;
+End;
+
+{ Message recu dans RpcBuf (RpcLen octets, 1 Ko au plus garde) ; False
+  si le canal est en erreur }
+Function RpcRecv(Ch, C1, C2 : LongInt) : Boolean;
+Var N, I, K : LongInt;
+Begin
+  RpcRecv := False;
+  RpcLen := 0;
+  RpcSet(Ch, C1, C2, 3, 0);
+  If ((BdC Shr 16) And 1) = 0 Then Exit;
+  RpcRecv := True;
+  If ((BdC Shr 16) And 2) = 0 Then Exit;         { rien a lire }
+  N := BdB;
+  I := 0;
+  While I < N Do
+  Begin
+    RpcSet(Ch, C1, C2, 4, 1);
+    If ((BdC Shr 16) And 1) = 0 Then
+    Begin
+      RpcRecv := False;
+      Exit;
+    End;
+    For K := 0 To 3 Do
+      If (I + K < N) And (I + K < 1024) Then
+        Mem[0:RpcBuf + I + K] := (BdB Shr (K * 8)) And $FF;
+    I := I + 4;
+  End;
+  If N > 1024 Then RpcLen := 1024 Else RpcLen := N;
+  RpcSet(Ch, C1, C2, 5, 1);
+End;
+
+Function RpcStr : String;
+Var S : String; I : LongInt;
+Begin
+  S := '';
+  For I := 0 To Min(RpcLen, 255) - 1 Do S := S + Chr(Mem[0:RpcBuf + I]);
+  RpcStr := S;
+End;
+
+{ Commande RPCI (vers l'hote) ; reponse dans RpcStr ("1 ..." : succes) }
+Function RpciCmd(Const S : String) : Boolean;
+Var Ch, C1, C2 : LongInt;
+Begin
+  RpciCmd := False;
+  If Not RpcOpen($49435052, Ch, C1, C2) Then Exit;
+  If RpcSend(Ch, C1, C2, S) Then
+    If RpcRecv(Ch, C1, C2) Then
+      RpciCmd := (RpcLen > 0) And (Mem[0:RpcBuf] = Ord('1'));
+  RpcClose(Ch, C1, C2);
+End;
+
+{ Capacites des Tools de Pasdows : changement de resolution }
+Procedure VwCaps;
+Begin
+  RpciCmd('tools.set.version 2147483647');
+  RpciCmd('tools.capability.resolution_set 1');
+  RpciCmd('tools.capability.resolution_server toolbox 1');
+  RpciCmd('tools.capability.resolution_min 640 480');
+  TcCapsDone := True;
+End;
+
+{ "Resolution_Set L H" : nouvelle taille de l'ecran }
+Function VwResolution(S : String) : String;
+Var P, W, H, E : LongInt; A : String;
+Begin
+  VwResolution := 'ERROR Invalid arguments';
+  S := Trim(S);
+  P := Pos(' ', S);
+  If P = 0 Then Exit;
+  A := Copy(S, 1, P - 1); Delete(S, 1, P);
+  Val(A, W, E);
+  If E <> 0 Then Exit;
+  Val(Trim(S), H, E);
+  If E <> 0 Then Exit;
+  If W < 640 Then W := 640;
+  If H < 480 Then H := 480;
+  KLog('VMware : resolution demandee ' + IntStr(W) + 'x' + IntStr(H));
+  VwResolution := 'OK ';
+  If (W = ScrW) And (H = ScrH) Then Exit;
+  If Not KSetModeWH(W, H, 32) Then
+  Begin
+    KLog('VMware : resolution refusee');
+    VwResolution := 'ERROR Resolution not supported';
+  End;
+End;
+
+{ Canal TCLO : envoyer la reponse precedente, lire et traiter les
+  commandes de l'hote ; scrute depuis ProcessInput }
+Procedure VwTcloPoll;
+Var Cmd : String; N : LongInt;
+Begin
+  If RpcBuf = 0 Then Exit;
+  If Ticks - TcNext < 0 Then Exit;
+  TcNext := Ticks + 100;
+  If TcCh < 0 Then
+  Begin
+    If TcFails > 5 Then Exit;
+    If Not RpcOpen($4F4C4354, TcCh, TcC1, TcC2) Then
+    Begin
+      TcCh := -1;
+      Inc(TcFails);
+      TcNext := Ticks + 2000;
+      Exit;
+    End;
+    TcReply := '';
+    KLog('VMware : canal TCLO des Tools ouvert');
+  End;
+  N := 0;
+  Repeat
+    If Not RpcSend(TcCh, TcC1, TcC2, TcReply) Or
+       Not RpcRecv(TcCh, TcC1, TcC2) Then
+    Begin
+      RpcClose(TcCh, TcC1, TcC2);
+      TcCh := -1;
+      Exit;
+    End;
+    TcReply := '';
+    If RpcLen = 0 Then Break;
+    Cmd := RpcStr;
+    If Cmd = 'reset' Then TcReply := 'OK ATR toolbox'
+    Else If Cmd = 'ping' Then TcReply := 'OK '
+    Else If Copy(Cmd, 1, 21) = 'Capabilities_Register' Then
+    Begin
+      VwCaps;
+      TcReply := 'OK ';
+    End
+    Else If Copy(Cmd, 1, 15) = 'Resolution_Set ' Then
+      TcReply := VwResolution(Copy(Cmd, 16, 255))
+    Else If (Copy(Cmd, 1, 11) = 'Set_Option ') Or
+            (Copy(Cmd, 1, 16) = 'Time_Synchronize') Or
+            (Copy(Cmd, 1, 21) = 'vmx.capability.unified') Then
+      TcReply := 'OK '
+    Else TcReply := 'ERROR Unknown command';
+    Inc(N);
+  Until N >= 8;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Carte VMware SVGA II                                                 }
+{ ------------------------------------------------------------------ }
+
+Function SvR(I : LongInt) : LongInt;
+Var P, V : LongInt;
+Begin
+  P := SvPort;
+  asm
+    mov edx,P
+    mov eax,I
+    out dx,eax
+    inc edx
+    in eax,dx
+    mov V,eax
+  end;
+  SvR := V;
+End;
+
+Procedure SvW(I, V : LongInt);
+Var P : LongInt;
+Begin
+  P := SvPort;
+  asm
+    mov edx,P
+    mov eax,I
+    out dx,eax
+    inc edx
+    mov eax,V
+    out dx,eax
+  end;
+End;
+
+{ Un mot dans la FIFO (attente de l'hote si elle est pleine) }
+Procedure SvPut(V : LongInt);
+Var Nx, N : LongInt;
+Begin
+  Nx := MemL[0:SvFifo + 8];
+  If (Nx + 4 = MemL[0:SvFifo + 12]) Or
+     ((Nx = MemL[0:SvFifo + 4] - 4) And
+      (MemL[0:SvFifo + 12] = MemL[0:SvFifo])) Then
+  Begin
+    SvW(21, 1);                                  { SYNC }
+    N := 0;
+    While (SvR(22) <> 0) And (N < 1000000) Do Inc(N);
+  End;
+  MemL[0:SvFifo + Nx] := V;
+  If Nx = MemL[0:SvFifo + 4] - 4 Then Nx := MemL[0:SvFifo]
+  Else Nx := Nx + 4;
+  MemL[0:SvFifo + 8] := Nx;
+End;
+
+{ Zone de l'ecran a envoyer a l'hote (UPDATE) }
+Procedure SvAdd(L, T, R, B : LongInt);
+Begin
+  If Not SvOn Then Exit;
+  If L < 0 Then L := 0;
+  If T < 0 Then T := 0;
+  If R > ScrW Then R := ScrW;
+  If B > ScrH Then B := ScrH;
+  If (L >= R) Or (T >= B) Then Exit;
+  If SvDR <= SvDL Then
+  Begin
+    SvDL := L; SvDT := T; SvDR := R; SvDB := B;
+  End
+  Else
+  Begin
+    If L < SvDL Then SvDL := L;
+    If T < SvDT Then SvDT := T;
+    If R > SvDR Then SvDR := R;
+    If B > SvDB Then SvDB := B;
+  End;
+End;
+
+Procedure SvFlush;
+Begin
+  If Not SvOn Or (SvDR <= SvDL) Then Exit;
+  SvPut(1);                                      { UPDATE }
+  SvPut(SvDL); SvPut(SvDT); SvPut(SvDR - SvDL); SvPut(SvDB - SvDT);
+  SvDL := 0; SvDR := 0;
+End;
+
+{ Mode W x H en 32 bits ; memoire d'image, pas et composantes }
+Function SvSetMode(W, H : LongInt) : Boolean;
+Var Rm, Gm, Bm : LongInt;
+Begin
+  SvSetMode := False;
+  If (W > SvMaxW) Or (H > SvMaxH) Then Exit;
+  SvW(2, W); SvW(3, H); SvW(7, 32);
+  SvW(1, 1);                                     { ENABLE }
+  If (SvR(2) <> W) Or (SvR(3) <> H) Then Exit;
+  SvFb := SvR(13) + SvR(14);
+  SvSetMode := True;
+End;
+
+{ Composantes du mode SVGA (masques -> tailles et positions) }
+Procedure SvMasks(A : LongInt);
+Var I, M, S, N : LongInt;
+Begin
+  For I := 0 To 2 Do
+  Begin
+    M := SvR(9 + I);
+    S := 0; N := 0;
+    If M = 0 Then
+      Case I Of
+        0 : M := $FF0000;
+        1 : M := $FF00;
+      Else
+        M := $FF;
+      End;
+    While (S < 32) And ((M And (1 Shl S)) = 0) Do Inc(S);
+    While (S + N < 32) And ((M And (1 Shl (S + N))) <> 0) Do Inc(N);
+    Mem[0:A + I * 2] := N; Mem[0:A + I * 2 + 1] := S;
+  End;
+End;
+
+{ Pointeur : forme (DEFINE_CURSOR, masques de 1 bit) si elle a change,
+  position et visibilite }
+Procedure SvPtrSync;
+Var Sum, X, Y, V, W, H, Wd, A, Xr : LongInt; Vis : Boolean;
+Begin
+  If Not SvHwPtr Then Exit;
+  W := CurW; H := CurHh;
+  If W > 32 Then W := 32;
+  If H > 32 Then H := 32;
+  Sum := 0; Vis := False;
+  For Y := 0 To H - 1 Do
+    For X := 0 To W - 1 Do
+    Begin
+      V := CurMap[Y * 32 + X];
+      If V <> 0 Then Vis := True;
+      Sum := (Sum * 31 + V + X * 3 + Y) And $FFFFFF;
+    End;
+  If CurHide < 0 Then Vis := False;
+  Sum := (Sum * 7 + W * 131 + H * 17 + CurHotX * 5 + CurHotY) And
+         $3FFFFFFF;
+  If Vis And (Sum <> SvCurSum) Then
+  Begin
+    SvCurSum := Sum;
+    SvPut(19);                                   { DEFINE_CURSOR }
+    SvPut(1); SvPut(CurHotX); SvPut(CurHotY); SvPut(W); SvPut(H);
+    SvPut(1); SvPut(1);                          { masques de 1 bit }
+    For Wd := 0 To 1 Do
+      For Y := 0 To H - 1 Do
+      Begin
+        A := 0;
+        For X := 0 To W - 1 Do
+        Begin
+          V := CurMap[Y * 32 + X];
+          If Wd = 0 Then Xr := Ord((V = 0) Or (V = 3))     { ET }
+          Else Xr := Ord((V = 2) Or (V = 3));              { OU exclusif }
+          If Xr <> 0 Then
+            A := A Or (1 Shl ((X And Not 7) + 7 - (X And 7)));
+        End;
+        SvPut(A);
+      End;
+    SvW(21, 1);
+  End;
+  SvW(24, 1);
+  SvW(25, CurX); SvW(26, CurY);
+  SvW(27, Ord(Vis));
+End;
+
+{ Prendre la main sur l'ecran : mode SVGA de meme taille en 32 bits }
+Procedure SvInit;
+Var Bus, Dev, Id, Bar, Cmd, K : LongInt; Z : Array[0..5] Of Byte;
+Begin
+  SvOn := False; SvHwPtr := False; SvPort := 0; SvCurSum := -1;
+  SvDL := 0; SvDR := 0;
+  For Bus := 0 To 3 Do
+    For Dev := 0 To 31 Do
+      If SvPort = 0 Then
+      Begin
+        Id := PciRead(Bus, Dev, 0, 0);
+        If Id = $040515AD Then
+        Begin
+          Bar := PciRead(Bus, Dev, 0, $10);
+          If (Bar And 1) <> 0 Then
+          Begin
+            Cmd := PciRead(Bus, Dev, 0, 4);
+            PciWrite(Bus, Dev, 0, 4, (Cmd And $FFFF) Or 7);
+            SvPort := Bar And $FFFC;
+          End;
+        End;
+      End;
+  If SvPort = 0 Then Exit;
+  SvW(0, LongInt($90000002));                    { SVGA_ID_2 }
+  If SvR(0) <> LongInt($90000002) Then
+  Begin
+    KLog('VMware : carte SVGA sans interface SVGA_ID_2');
+    SvPort := 0;
+    Exit;
+  End;
+  If VgaPlanar Or (ScrBpp < 8) Then
+  Begin
+    KLog('VMware : carte SVGA II laissee en VGA 16 couleurs');
+    Exit;
+  End;
+  SvCaps := SvR(17);
+  SvMaxW := SvR(4); SvMaxH := SvR(5);
+  If SvMaxW <= 0 Then SvMaxW := 1920;
+  If SvMaxH <= 0 Then SvMaxH := 1440;
+  SvFifo := SvR(18); SvFifoSz := SvR(19);
+  If (SvFifo = 0) Or (SvFifoSz < 16384) Then
+  Begin
+    SvPort := 0;
+    Exit;
+  End;
+  If Not SvSetMode(ScrW, ScrH) Then
+  Begin
+    KLog('VMware : mode SVGA ' + IntStr(ScrW) + 'x' + IntStr(ScrH) +
+         ' refuse');
+    SvW(1, 0);
+    SvPort := 0;
+    Exit;
+  End;
+  { FIFO : registres MIN, MAX, NEXT_CMD, STOP }
+  MemL[0:SvFifo] := 16;
+  MemL[0:SvFifo + 4] := SvFifoSz;
+  MemL[0:SvFifo + 8] := 16;
+  MemL[0:SvFifo + 12] := 16;
+  SvW(20, 1);                                    { CONFIG_DONE }
+  SvOn := True;
+  { le reste du noyau ecrit en 32 bits dans la memoire d'image }
+  Lfb := SvFb;
+  ScrBpp := 32; ScrBytes := 4;
+  LfbPitch := SvR(12);
+  SvMasks(LongInt(@Z));
+  VideoMasks(LongInt(@Z));
+  FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
+  DacAll;
+  OutPalChanged := False;
+  SvHwPtr := (SvCaps And SvCapCursor) <> 0;
+  SvFull1 := 1; SvFull2 := 2;
+  KLog('VMware : carte SVGA II en ' + HexStr(SvPort, 4) + 'h, image ' +
+       HexStr(SvFb, 8) + 'h, FIFO ' + HexStr(SvFifo, 8) + 'h (' +
+       IntStr(SvFifoSz Div 1024) + ' Ko), maximum ' + IntStr(SvMaxW) + 'x' +
+       IntStr(SvMaxH) + ', capacites ' + HexStr(SvCaps, 8) +
+       ', pointeur materiel ' + IntStr(Ord(SvHwPtr)));
+End;
+
+{ ------------------------------------------------------------------ }
+{ Initialisation et scrutation                                         }
+{ ------------------------------------------------------------------ }
+
+Procedure VwInit;
+Var HO : LongInt;
+Begin
+  VwOn := False; VwReal := False; VmmOn := False;
+  TcCh := -1; TcFails := 0; TcNext := 0;
+  RpcBuf := 0; TcCapsDone := False;
+  If Not VwDetect Then Exit;
+  VwOn := True;
+  { VMware lui-meme (et non un hyperviseur qui imite la backdoor) :
+    sous-systeme 15ADh du pont hote }
+  VwReal := (PciRead(0, 0, 0, $2C) And $FFFF) = $15AD;
+  HO := HeapOwner; HeapOwner := 0;
+  RpcBuf := KAlloc(1024 + 16);
+  HeapOwner := HO;
+  If MouOk Then VmmOn := VmmInit;
+  KLog('VMware : backdoor version ' + IntStr(VwVer) + ' type ' +
+       IntStr(VwType) + ', VMware ' + IntStr(Ord(VwReal)) +
+       ', souris absolue ' + IntStr(Ord(VmmOn)));
+  { capacites annoncees des le depart (si le canal RPC existe) }
+  If (RpcBuf <> 0) And SvOn Then VwCaps;
+End;
+
+{ ==================================================================== }
 { Partie 13 - Demarrage                                                }
 { ==================================================================== }
 
@@ -50078,6 +50811,8 @@ BEGIN
   InitKeyTables;
   DefaultPalette;
   SurfNew(Back, ScrW, ScrH);
+  { VMware SVGA II : la carte remplace le mode VESA (meme taille) }
+  SvInit;
   BootShow;
   DispiDetect;
   DispW := -1; RebootAskW := -1; DtW := -1;
@@ -50124,6 +50859,7 @@ BEGIN
   BootStep(6);
   NetInit;
   VbInit;
+  VwInit;
   BootStep(7);
   AppProcObj := -1;
   ConW := -1; ConTitle := ''; ConRowsDue := False; ConLastCY := -1;
