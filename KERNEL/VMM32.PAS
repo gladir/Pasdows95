@@ -35746,6 +35746,30 @@ Begin
   DXCall5 := R;
 End;
 
+Function DXCall6(Cb, A, B, C, D, E, F : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,F
+    push eax
+    mov eax,E
+    push eax
+    mov eax,D
+    push eax
+    mov eax,C
+    push eax
+    mov eax,B
+    push eax
+    mov eax,A
+    push eax
+    mov eax,Cb
+    call eax
+    mov R,eax
+  end;
+  DXCall6 := R;
+End;
+
 { Chaine Pascal -> memoire (zero final), ANSI ou UTF-16 }
 Procedure DXPutS(A : LongInt; S : String; Wide : Boolean);
 Var I : LongInt;
@@ -41011,30 +41035,3844 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
-{ Direct3D (provisoire)                                              }
+{ Direct3D : moteur logiciel commun (D3D 1 a 7 et Direct3D 8)        }
+{ ------------------------------------------------------------------ }
+{ Sommets (FVF) transformes par Monde x Vue x Projection, eclaires
+  (lumieres directionnelles, ponctuelles et projecteurs, materiau),
+  brouillard de sommet, decoupes dans le volume de vision (6 plans),
+  projetes dans la fenetre d'affichage puis rasterises : triangles
+  par lignes horizontales (centres des pixels aux coordonnees
+  entieres), couleurs de Gouraud ou unies, textures corrigees en
+  perspective (par segments de 16 pixels), deux etages de melange
+  (COLOROP / ALPHAOP), cle de couleur, test alpha, tampon Z (16, 24
+  ou 32 bits), melange alpha, specularite et brouillard. Cible : toute
+  surface DirectDraw (8, 16, 24 ou 32 bits). }
+
+Type
+  TMat = Array[0..15] Of Double;
+  TLit = Record
+    Typ, On : LongInt;
+    Dif, Spe, Amb : Array[0..3] Of Double;
+    Pos, Dir : Array[0..2] Of Double;
+    Rng, Fall, A0, A1, A2, Th, Ph : Double;
+  End;
+  TVtx = Record
+    X, Y, Z, W : Double;          { coordonnees de decoupage }
+    SX, SY, SZ, RW : Double;      { ecran, Z, 1/w }
+    A, R, G, B, SR, SG, SB, F : Double;
+    U0, V0, U1, V1 : Double;
+    CF : LongInt;
+  End;
+  TVtxArr = Array[0..65535] Of TVtx;
+  PVtxArr = ^TVtxArr;
+  TD3D = Record
+    RT, ZB, Ver, InScene, UseTSS, LegBlend : LongInt;
+    VX, VY, VW, VH : LongInt;
+    VMinZ, VMaxZ, ClX, ClY, ClW, ClH : Double;
+    Wld, Viw, Prj, WV, WVP : TMat;
+    MOk : Boolean;
+    RS : Array[0..255] Of LongInt;
+    TS : Array[0..255] Of LongInt;
+    Tex : Array[0..7] Of LongInt;
+    Mt : Array[0..16] Of Double;
+    Lt : Array[0..15] Of TLit;
+    LS : Array[0..15] Of LongInt;
+    VPCur, D3DObj, Core : LongInt;
+    VPs : Array[0..15] Of LongInt;
+    BFvf, BPt, BN, BBuf, BMax, BIdx, BIn : LongInt;
+    Tris, Verts : LongInt;
+    ClipU, ClipI : LongInt;
+    SBRec : LongInt;
+    D8 : LongInt;
+  End;
+  PD3D = ^TD3D;
+
+Const
+  { etats de rendu utiles }
+  rsTexHandle = 1; rsPersp = 4; rsZEnable = 7; rsFill = 8; rsShade = 9;
+  rsZWrite = 14; rsATest = 15; rsLastPix = 16; rsTexMag = 17;
+  rsTexMin = 18; rsSrcBl = 19; rsDstBl = 20; rsTexBlend = 21; rsCull = 22;
+  rsZFunc = 23; rsARef = 24; rsAFunc = 25; rsDither = 26; rsABlend = 27;
+  rsFog = 28; rsSpecular = 29; rsFogColor = 34; rsFogTable = 35;
+  rsFogStart = 36; rsFogEnd = 37; rsFogDens = 38; rsCKey = 41;
+  rsTFactor = 60; rsWrap0 = 128; rsClipping = 136; rsLighting = 137;
+  rsAmbient = 139; rsFogVtx = 140; rsColorVtx = 141; rsLocalView = 142;
+  rsNormalize = 143; rsDifSrc = 145; rsSpcSrc = 146; rsAmbSrc = 147;
+  rsEmiSrc = 148;
+  { etats d'etage de texture }
+  tsCOp = 1; tsCA1 = 2; tsCA2 = 3; tsAOp = 4; tsAA1 = 5; tsAA2 = 6;
+  tsTCI = 11; tsAddr = 12; tsAddrU = 13; tsAddrV = 14; tsMag = 16;
+  tsMin = 17; tsMip = 18;
+
+Var
+  D3G : PD3D;                       { peripherique courant }
+  DV : PVtxArr;                     { sommets traites }
+  DVCap : LongInt;
+  DVBase : LongInt;                 { premier sommet ecrit par D3DProcess }
+  DC : Array[0..15] Of TVtx;        { polygone en decoupe }
+  DC2 : Array[0..15] Of TVtx;
+  LtV : Array[0..15] Of TLit;      { lumieres dans l'espace de la vue }
+  { format des sommets d'entree }
+  VFStride, VFPos, VFNrm, VFDif, VFSpc, VFTexN, VFRhw : LongInt;
+  VFTex : Array[0..7] Of LongInt;
+  VFTexD : Array[0..7] Of LongInt;
+  { etat de rasterisation (par appel) }
+  RBits, RPitch, RBy, RKind, RW, RH, RTs : LongInt;
+  ZBits, ZPitch, ZBy, ZMax : LongInt;
+  RZOn, RZWr, RZFn, RShade, RABl, RSrc, RDst, RATst, RAFn, RARef : LongInt;
+  RCKey, RFogOn, RFogC, RSpec, RTFac, RCull, RFill : LongInt;
+  TxOn : Array[0..1] Of Boolean;
+  TxBits, TxPitch, TxW, TxH, TxKind, TxBy, TxKey, TxKeyOn, TxAddrU,
+    TxAddrV, TxS, TxMagLin : Array[0..1] Of LongInt;
+  TxPal : Array[0..255] Of LongInt;
+  TxCOp, TxCA1, TxCA2, TxAOp, TxAA1, TxAA2, TxTci : Array[0..1] Of LongInt;
+  NStage : LongInt;
+  ClipL, ClipT, ClipR, ClipB : LongInt;
+  D3DStats : LongInt;
+
+{ Choisir le peripherique du coeur C }
+Function DevSel(C : LongInt) : Boolean;
+Var P : LongInt;
+Begin
+  P := MemL[0:C + 64];
+  Move(P, D3G, 4);
+  DevSel := P <> 0;
+End;
+
+Function FlL(L : LongInt) : Double;
+Var F : Single;
+Begin
+  MemL[0:LongInt(@F)] := L;
+  FlL := F;
+End;
+
+Function LFl(D : Double) : LongInt;
+Var F : Single;
+Begin
+  F := D;
+  LFl := MemL[0:LongInt(@F)];
+End;
+
+Function FlM(A : LongInt) : Double;
+Begin
+  FlM := FlL(MemL[0:A]);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Matrices (lignes, v' = v x M)                                       }
+{ ------------------------------------------------------------------ }
+
+Procedure MatId(Var M : TMat);
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do M[I] := 0;
+  M[0] := 1; M[5] := 1; M[10] := 1; M[15] := 1;
+End;
+
+Procedure MatMul(Var R : TMat; Var A, B : TMat);
+Var I, J : LongInt; T : TMat;
+Begin
+  For I := 0 To 3 Do
+    For J := 0 To 3 Do
+      T[I * 4 + J] := A[I * 4] * B[J] + A[I * 4 + 1] * B[4 + J] +
+                      A[I * 4 + 2] * B[8 + J] + A[I * 4 + 3] * B[12 + J];
+  R := T;
+End;
+
+Procedure MatLoad(Var M : TMat; P : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do M[I] := FlM(P + I * 4);
+End;
+
+Procedure MatStore(Var M : TMat; P : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do MemL[0:P + I * 4] := LFl(M[I]);
+End;
+
+Procedure D3DMats;
+Begin
+  If D3G^.MOk Then Exit;
+  MatMul(D3G^.WV, D3G^.Wld, D3G^.Viw);
+  MatMul(D3G^.WVP, D3G^.WV, D3G^.Prj);
+  D3G^.MOk := True;
+End;
+
+{ Matrice de transformation : 1 monde, 2 vue, 3 projection (D3D7 :
+  1 = D3DTRANSFORMSTATE_WORLD ; D3D8 : 256 = monde, 2 vue, 3 proj.) }
+Function D3DMatOf(K : LongInt; Var M : TMat) : Boolean;
+Begin
+  D3DMatOf := True;
+  Case K Of
+    1, 256 : M := D3G^.Wld;
+    2 : M := D3G^.Viw;
+    3 : M := D3G^.Prj;
+  Else
+    D3DMatOf := False;
+  End;
+End;
+
+Procedure D3DMatSet(K : LongInt; Var M : TMat);
+Begin
+  Case K Of
+    1, 256 : D3G^.Wld := M;
+    2 : D3G^.Viw := M;
+    3 : D3G^.Prj := M;
+  End;
+  D3G^.MOk := False;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Etat initial                                                       }
+{ ------------------------------------------------------------------ }
+
+Procedure D3DDefaults;
+Var I : LongInt;
+Begin
+  FillMem(LongInt(@D3G^.RS), SizeOf(D3G^.RS), 0);
+  FillMem(LongInt(@D3G^.TS), SizeOf(D3G^.TS), 0);
+  MatId(D3G^.Wld); MatId(D3G^.Viw); MatId(D3G^.Prj);
+  D3G^.MOk := False;
+  D3G^.RS[rsPersp] := 1;
+  D3G^.RS[rsZEnable] := Ord(D3G^.ZB <> 0);
+  D3G^.RS[rsFill] := 3; D3G^.RS[rsShade] := 2; D3G^.RS[rsZWrite] := 1;
+  D3G^.RS[rsLastPix] := 1; D3G^.RS[rsTexMag] := 1; D3G^.RS[rsTexMin] := 1;
+  D3G^.RS[rsSrcBl] := 2; D3G^.RS[rsDstBl] := 1; D3G^.RS[rsTexBlend] := 2;
+  D3G^.RS[rsCull] := 3; D3G^.RS[rsZFunc] := 4; D3G^.RS[rsAFunc] := 8;
+  D3G^.RS[rsFogStart] := 0; D3G^.RS[rsFogEnd] := LFl(1.0);
+  D3G^.RS[rsFogDens] := LFl(1.0);
+  D3G^.RS[rsTFactor] := -1;
+  D3G^.RS[rsClipping] := 1; D3G^.RS[rsLighting] := 1;
+  D3G^.RS[rsColorVtx] := 1; D3G^.RS[rsLocalView] := 1;
+  D3G^.RS[rsDifSrc] := 1; D3G^.RS[rsSpcSrc] := 2;
+  D3G^.RS[rsAmbSrc] := 0; D3G^.RS[rsEmiSrc] := 0;
+  If D3G^.Ver < 7 Then D3G^.RS[rsLighting] := 0;
+  For I := 0 To 7 Do
+  Begin
+    D3G^.TS[I * 32 + tsCOp] := 1; D3G^.TS[I * 32 + tsAOp] := 1;
+    D3G^.TS[I * 32 + tsCA1] := 2; D3G^.TS[I * 32 + tsCA2] := 1;
+    D3G^.TS[I * 32 + tsAA1] := 2; D3G^.TS[I * 32 + tsAA2] := 1;
+    D3G^.TS[I * 32 + tsTCI] := I;
+    D3G^.TS[I * 32 + tsAddr] := 1;
+    D3G^.TS[I * 32 + tsAddrU] := 1; D3G^.TS[I * 32 + tsAddrV] := 1;
+    D3G^.TS[I * 32 + tsMag] := 1; D3G^.TS[I * 32 + tsMin] := 1;
+    D3G^.TS[I * 32 + tsMip] := 1;
+    D3G^.Tex[I] := 0;
+  End;
+  D3G^.TS[tsCOp] := 4; D3G^.TS[tsAOp] := 2;
+  For I := 0 To 16 Do D3G^.Mt[I] := 0;
+  For I := 0 To 15 Do
+  Begin
+    FillMem(LongInt(@D3G^.Lt[I]), SizeOf(TLit), 0);
+    D3G^.LS[I] := 0;
+  End;
+  D3G^.LS[3] := 2;
+  D3G^.ClX := -1; D3G^.ClY := 1; D3G^.ClW := 2; D3G^.ClH := 2;
+  D3G^.VMinZ := 0; D3G^.VMaxZ := 1;
+  If D3G^.RT <> 0 Then
+  Begin
+    D3G^.VX := 0; D3G^.VY := 0;
+    D3G^.VW := MemL[0:D3G^.RT + 64]; D3G^.VH := MemL[0:D3G^.RT + 68];
+  End;
+  D3G^.LegBlend := 2;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Format des sommets (FVF)                                           }
+{ ------------------------------------------------------------------ }
+
+Procedure FvfParse(F : LongInt);
+Var O, N, I, K : LongInt;
+Begin
+  O := 0;
+  VFRhw := 0;
+  Case F And $E Of
+    2 : O := 12;
+    4 :
+    Begin
+      O := 16; VFRhw := 1;
+    End;
+    6 : O := 16;
+    8 : O := 20;
+    $A : O := 24;
+    $C : O := 28;
+    $E : O := 32;
+  End;
+  VFPos := 0;
+  VFNrm := -1; VFDif := -1; VFSpc := -1;
+  If (F And $10) <> 0 Then
+  Begin
+    VFNrm := O; O := O + 12;
+  End;
+  If (F And $20) <> 0 Then O := O + 4;
+  If (F And $40) <> 0 Then
+  Begin
+    VFDif := O; O := O + 4;
+  End;
+  If (F And $80) <> 0 Then
+  Begin
+    VFSpc := O; O := O + 4;
+  End;
+  N := (F Shr 8) And 15;
+  If N > 8 Then N := 8;
+  VFTexN := N;
+  For I := 0 To N - 1 Do
+  Begin
+    VFTex[I] := O;
+    K := (F Shr (16 + I * 2)) And 3;
+    Case K Of
+      0 : VFTexD[I] := 2;
+      1 : VFTexD[I] := 3;
+      2 : VFTexD[I] := 4;
+    Else
+      VFTexD[I] := 1;
+    End;
+    O := O + VFTexD[I] * 4;
+  End;
+  VFStride := O;
+End;
+
+{ Types de sommets de D3D 2 : 1 D3DVERTEX, 2 D3DLVERTEX, 3 D3DTLVERTEX }
+Function VtToFvf(T : LongInt) : LongInt;
+Begin
+  Case T Of
+    1 : VtToFvf := $112;
+    2 : VtToFvf := $1E2;
+  Else
+    VtToFvf := $1C4;
+  End;
+End;
+
+Procedure D3DGrow(N : LongInt);
+Var H, P : LongInt;
+Begin
+  If N <= DVCap Then Exit;
+  If DVCap > 0 Then
+  Begin
+    P := 0;
+    Move(DV, P, 4);
+    KFree(P);
+  End;
+  DVCap := Max(N, 1024);
+  H := HeapOwner; HeapOwner := 0;
+  P := KAlloc(DVCap * SizeOf(TVtx) + 16);
+  HeapOwner := H;
+  Move(P, DV, 4);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Eclairage d'un sommet (espace de la vue)                           }
+{ ------------------------------------------------------------------ }
+
+{ Lumieres (espace du monde) ramenees dans l'espace de la vue }
+Procedure D3DLightsView;
+Var I : LongInt; X, Y, Z, D : Double; M : TMat;
+Begin
+  M := D3G^.Viw;
+  For I := 0 To 15 Do
+  Begin
+    LtV[I] := D3G^.Lt[I];
+    If LtV[I].On = 0 Then Continue;
+    If LtV[I].Typ = 4 Then
+    Begin
+      { parallele : direction depuis la position }
+      LtV[I].Typ := 3;
+      LtV[I].Dir[0] := -LtV[I].Pos[0]; LtV[I].Dir[1] := -LtV[I].Pos[1];
+      LtV[I].Dir[2] := -LtV[I].Pos[2];
+    End;
+    X := LtV[I].Pos[0]; Y := LtV[I].Pos[1]; Z := LtV[I].Pos[2];
+    LtV[I].Pos[0] := X * M[0] + Y * M[4] + Z * M[8] + M[12];
+    LtV[I].Pos[1] := X * M[1] + Y * M[5] + Z * M[9] + M[13];
+    LtV[I].Pos[2] := X * M[2] + Y * M[6] + Z * M[10] + M[14];
+    X := LtV[I].Dir[0]; Y := LtV[I].Dir[1]; Z := LtV[I].Dir[2];
+    LtV[I].Dir[0] := X * M[0] + Y * M[4] + Z * M[8];
+    LtV[I].Dir[1] := X * M[1] + Y * M[5] + Z * M[9];
+    LtV[I].Dir[2] := X * M[2] + Y * M[6] + Z * M[10];
+    D := Sqrt(LtV[I].Dir[0] * LtV[I].Dir[0] + LtV[I].Dir[1] *
+              LtV[I].Dir[1] + LtV[I].Dir[2] * LtV[I].Dir[2]);
+    If D > 0.000001 Then
+    Begin
+      LtV[I].Dir[0] := LtV[I].Dir[0] / D; LtV[I].Dir[1] := LtV[I].Dir[1] / D;
+      LtV[I].Dir[2] := LtV[I].Dir[2] / D;
+    End;
+  End;
+End;
+
+Procedure D3DLight(PX, PY, PZ, NX, NY, NZ : Double; DifC, SpcC : LongInt;
+                   Var V : TVtx);
+Var I, Src : LongInt;
+    MdR, MdG, MdB, MdA, MaR, MaG, MaB, MsR, MsG, MsB, MeR, MeG, MeB,
+    DR, DG, DB, AR, AG, AB, SR, SG, SB, LX, LY, LZ, D, At, Sp, NL, HX,
+    HY, HZ, NH, VX, VY, VZ, Rho, Ct, Cp, X, Y, Z : Double;
+Begin
+  D := Sqrt(NX * NX + NY * NY + NZ * NZ);
+  If D > 0.000001 Then
+  Begin
+    NX := NX / D; NY := NY / D; NZ := NZ / D;
+  End;
+  MdR := D3G^.Mt[0]; MdG := D3G^.Mt[1]; MdB := D3G^.Mt[2];
+  MdA := D3G^.Mt[3];
+  MaR := D3G^.Mt[4]; MaG := D3G^.Mt[5]; MaB := D3G^.Mt[6];
+  MsR := D3G^.Mt[8]; MsG := D3G^.Mt[9]; MsB := D3G^.Mt[10];
+  MeR := D3G^.Mt[12]; MeG := D3G^.Mt[13]; MeB := D3G^.Mt[14];
+  If D3G^.RS[rsColorVtx] <> 0 Then
+  Begin
+    Src := D3G^.RS[rsDifSrc];
+    If (Src = 1) And (DifC <> 0) Then
+    Begin
+      MdA := ((DifC Shr 24) And 255) / 255;
+      MdR := ((DifC Shr 16) And 255) / 255;
+      MdG := ((DifC Shr 8) And 255) / 255; MdB := (DifC And 255) / 255;
+    End;
+    If (D3G^.RS[rsAmbSrc] = 1) And (DifC <> 0) Then
+    Begin
+      MaR := ((DifC Shr 16) And 255) / 255;
+      MaG := ((DifC Shr 8) And 255) / 255; MaB := (DifC And 255) / 255;
+    End;
+    If (D3G^.RS[rsSpcSrc] = 2) And (SpcC <> 0) Then
+    Begin
+      MsR := ((SpcC Shr 16) And 255) / 255;
+      MsG := ((SpcC Shr 8) And 255) / 255; MsB := (SpcC And 255) / 255;
+    End;
+  End;
+  I := D3G^.RS[rsAmbient];
+  AR := ((I Shr 16) And 255) / 255; AG := ((I Shr 8) And 255) / 255;
+  AB := (I And 255) / 255;
+  DR := 0; DG := 0; DB := 0; SR := 0; SG := 0; SB := 0;
+  For I := 0 To 15 Do
+  Begin
+    If LtV[I].On = 0 Then Continue;
+    At := 1; Sp := 1;
+    If LtV[I].Typ = 3 Then
+    Begin
+      LX := -LtV[I].Dir[0]; LY := -LtV[I].Dir[1];
+      LZ := -LtV[I].Dir[2];
+    End
+    Else
+    Begin
+      LX := LtV[I].Pos[0] - PX; LY := LtV[I].Pos[1] - PY;
+      LZ := LtV[I].Pos[2] - PZ;
+      D := Sqrt(LX * LX + LY * LY + LZ * LZ);
+      If (LtV[I].Rng > 0) And (D > LtV[I].Rng) Then Continue;
+      If D > 0.000001 Then
+      Begin
+        LX := LX / D; LY := LY / D; LZ := LZ / D;
+      End;
+      X := LtV[I].A0 + LtV[I].A1 * D + LtV[I].A2 * D * D;
+      If X > 0.000001 Then At := 1 / X;
+      If LtV[I].Typ = 2 Then
+      Begin
+        Rho := -(LX * LtV[I].Dir[0] + LY * LtV[I].Dir[1] +
+                 LZ * LtV[I].Dir[2]);
+        Ct := Cos(LtV[I].Th / 2); Cp := Cos(LtV[I].Ph / 2);
+        If Rho <= Cp Then Continue;
+        If (Rho < Ct) And (Ct > Cp) Then Sp := (Rho - Cp) / (Ct - Cp);
+      End;
+    End;
+    At := At * Sp;
+    AR := AR + LtV[I].Amb[0] * At; AG := AG + LtV[I].Amb[1] * At;
+    AB := AB + LtV[I].Amb[2] * At;
+    NL := NX * LX + NY * LY + NZ * LZ;
+    If NL <= 0 Then Continue;
+    DR := DR + LtV[I].Dif[0] * NL * At;
+    DG := DG + LtV[I].Dif[1] * NL * At;
+    DB := DB + LtV[I].Dif[2] * NL * At;
+    If (D3G^.RS[rsSpecular] <> 0) And (D3G^.Mt[16] > 0) Then
+    Begin
+      If D3G^.RS[rsLocalView] <> 0 Then
+      Begin
+        D := Sqrt(PX * PX + PY * PY + PZ * PZ);
+        If D > 0.000001 Then
+        Begin
+          VX := -PX / D; VY := -PY / D; VZ := -PZ / D;
+        End
+        Else
+        Begin
+          VX := 0; VY := 0; VZ := -1;
+        End;
+      End
+      Else
+      Begin
+        VX := 0; VY := 0; VZ := -1;
+      End;
+      HX := LX + VX; HY := LY + VY; HZ := LZ + VZ;
+      D := Sqrt(HX * HX + HY * HY + HZ * HZ);
+      If D > 0.000001 Then
+      Begin
+        NH := (NX * HX + NY * HY + NZ * HZ) / D;
+        If NH > 0 Then
+        Begin
+          NH := Exp(D3G^.Mt[16] * Ln(NH)) * At;
+          SR := SR + LtV[I].Spe[0] * NH;
+          SG := SG + LtV[I].Spe[1] * NH;
+          SB := SB + LtV[I].Spe[2] * NH;
+        End;
+      End;
+    End;
+  End;
+  X := MeR + MaR * AR + MdR * DR;
+  Y := MeG + MaG * AG + MdG * DG;
+  Z := MeB + MaB * AB + MdB * DB;
+  If X > 1 Then X := 1;
+  If Y > 1 Then Y := 1;
+  If Z > 1 Then Z := 1;
+  If X < 0 Then X := 0;
+  If Y < 0 Then Y := 0;
+  If Z < 0 Then Z := 0;
+  If MdA > 1 Then MdA := 1;
+  If MdA < 0 Then MdA := 0;
+  V.R := X * 255; V.G := Y * 255; V.B := Z * 255; V.A := MdA * 255;
+  X := MsR * SR; Y := MsG * SG; Z := MsB * SB;
+  If X > 1 Then X := 1;
+  If Y > 1 Then Y := 1;
+  If Z > 1 Then Z := 1;
+  V.SR := X * 255; V.SG := Y * 255; V.SB := Z * 255;
+End;
+
+{ Facteur de brouillard (1 sans brouillard, 0 tout brouillard) }
+Function D3DFogOf(D : Double) : Double;
+Var Md : LongInt; S, E, De, F : Double;
+Begin
+  Md := D3G^.RS[rsFogVtx];
+  If Md = 0 Then Md := D3G^.RS[rsFogTable];
+  If (D3G^.Ver <= 3) And (D3G^.LS[4] <> 0) Then Md := D3G^.LS[4];
+  If Md = 0 Then Md := 3;
+  S := FlL(D3G^.RS[rsFogStart]); E := FlL(D3G^.RS[rsFogEnd]);
+  De := FlL(D3G^.RS[rsFogDens]);
+  If D3G^.Ver <= 3 Then
+  Begin
+    If D3G^.LS[5] <> 0 Then S := FlL(D3G^.LS[5]);
+    If D3G^.LS[6] <> 0 Then E := FlL(D3G^.LS[6]);
+    If D3G^.LS[7] <> 0 Then De := FlL(D3G^.LS[7]);
+  End;
+  Case Md Of
+    1 : F := Exp(-De * D);
+    2 : F := Exp(-(De * D) * (De * D));
+  Else
+    If E - S > 0.000001 Then F := (E - D) / (E - S) Else F := 1;
+  End;
+  If F < 0 Then F := 0;
+  If F > 1 Then F := 1;
+  D3DFogOf := F;
+End;
+
+{ Traiter N sommets (format courant VF*, pas VFStride) de Src vers DV }
+Procedure D3DProcess(Src, N : LongInt; Light : Boolean);
+Var I, J, A, C, S, K, T : LongInt; X, Y, Z, W, PX, PY, PZ, NX, NY, NZ,
+    NX2, NY2, NZ2 : Double;
+    M : TMat;
+Begin
+  D3DGrow(DVBase + N);
+  D3DMats;
+  M := D3G^.WVP;
+  For I := 0 To N - 1 Do
+  Begin
+    J := DVBase + I;
+    A := Src + I * VFStride;
+    X := FlM(A); Y := FlM(A + 4); Z := FlM(A + 8);
+    If VFDif >= 0 Then C := MemL[0:A + VFDif] Else C := -1;
+    If VFSpc >= 0 Then S := MemL[0:A + VFSpc] Else S := 0;
+    If VFRhw <> 0 Then
+    Begin
+      W := FlM(A + 12);
+      DV^[J].SX := X; DV^[J].SY := Y; DV^[J].SZ := Z;
+      If Abs(W) < 0.0000001 Then W := 1;
+      DV^[J].RW := W;
+      DV^[J].X := X; DV^[J].Y := Y; DV^[J].Z := Z; DV^[J].W := 1 / W;
+      DV^[J].CF := 0;
+    End
+    Else
+    Begin
+      DV^[J].X := X * M[0] + Y * M[4] + Z * M[8] + M[12];
+      DV^[J].Y := X * M[1] + Y * M[5] + Z * M[9] + M[13];
+      DV^[J].Z := X * M[2] + Y * M[6] + Z * M[10] + M[14];
+      DV^[J].W := X * M[3] + Y * M[7] + Z * M[11] + M[15];
+      DV^[J].CF := -1;
+    End;
+    DV^[J].A := (C Shr 24) And 255; DV^[J].R := (C Shr 16) And 255;
+    DV^[J].G := (C Shr 8) And 255; DV^[J].B := C And 255;
+    DV^[J].SR := (S Shr 16) And 255; DV^[J].SG := (S Shr 8) And 255;
+    DV^[J].SB := S And 255;
+    DV^[J].F := 1;
+    If (VFRhw <> 0) And (VFSpc >= 0) Then
+      DV^[J].F := ((S Shr 24) And 255) / 255;
+    If (VFRhw = 0) And (Light Or (D3G^.RS[rsFog] <> 0)) Then
+    Begin
+      PX := X * D3G^.WV[0] + Y * D3G^.WV[4] + Z * D3G^.WV[8] + D3G^.WV[12];
+      PY := X * D3G^.WV[1] + Y * D3G^.WV[5] + Z * D3G^.WV[9] + D3G^.WV[13];
+      PZ := X * D3G^.WV[2] + Y * D3G^.WV[6] + Z * D3G^.WV[10] + D3G^.WV[14];
+      If Light And (VFNrm >= 0) Then
+      Begin
+        NX := FlM(A + VFNrm); NY := FlM(A + VFNrm + 4);
+        NZ := FlM(A + VFNrm + 8);
+        NX2 := NX * D3G^.WV[0] + NY * D3G^.WV[4] + NZ * D3G^.WV[8];
+        NY2 := NX * D3G^.WV[1] + NY * D3G^.WV[5] + NZ * D3G^.WV[9];
+        NZ2 := NX * D3G^.WV[2] + NY * D3G^.WV[6] + NZ * D3G^.WV[10];
+        If VFDif < 0 Then C := 0;
+        D3DLight(PX, PY, PZ, NX2, NY2, NZ2, C, S, DV^[J]);
+      End;
+      If D3G^.RS[rsFog] <> 0 Then DV^[J].F := D3DFogOf(Abs(PZ));
+    End;
+    DV^[J].U0 := 0; DV^[J].V0 := 0; DV^[J].U1 := 0; DV^[J].V1 := 0;
+    For K := 0 To 1 Do
+    Begin
+      T := D3G^.TS[K * 32 + tsTCI] And $FFFF;
+      If (D3G^.Ver <= 2) Then T := 0;
+      If T < VFTexN Then
+      Begin
+        If K = 0 Then
+        Begin
+          DV^[J].U0 := FlM(A + VFTex[T]);
+          If VFTexD[T] > 1 Then DV^[J].V0 := FlM(A + VFTex[T] + 4);
+        End
+        Else
+        Begin
+          DV^[J].U1 := FlM(A + VFTex[T]);
+          If VFTexD[T] > 1 Then DV^[J].V1 := FlM(A + VFTex[T] + 4);
+        End;
+      End;
+    End;
+  End;
+  D3G^.Verts := D3G^.Verts + N;
+End;
+
+{ Projection dans la fenetre d'affichage }
+Procedure D3DProject(Var V : TVtx);
+Var IW : Double;
+Begin
+  If V.CF = 0 Then Exit;
+  If Abs(V.W) < 0.0000001 Then IW := 10000000 Else IW := 1 / V.W;
+  V.SX := D3G^.VX + ((V.X * IW - D3G^.ClX) / D3G^.ClW) * D3G^.VW;
+  V.SY := D3G^.VY + ((D3G^.ClY - V.Y * IW) / D3G^.ClH) * D3G^.VH;
+  V.SZ := D3G^.VMinZ + V.Z * IW * (D3G^.VMaxZ - D3G^.VMinZ);
+  V.RW := IW;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Decoupage (polygone dans DC, N sommets) : 6 plans                  }
+{ ------------------------------------------------------------------ }
+
+Function PlaneD(Var V : TVtx; P : LongInt) : Double;
+Begin
+  Case P Of
+    0 : PlaneD := V.X - D3G^.ClX * V.W;
+    1 : PlaneD := (D3G^.ClX + D3G^.ClW) * V.W - V.X;
+    2 : PlaneD := V.Y - (D3G^.ClY - D3G^.ClH) * V.W;
+    3 : PlaneD := D3G^.ClY * V.W - V.Y;
+    4 : PlaneD := V.Z;
+  Else
+    PlaneD := V.W - V.Z;
+  End;
+End;
+
+Procedure VLerp(Var R : TVtx; Var A, B : TVtx; T : Double);
+Begin
+  R.X := A.X + (B.X - A.X) * T; R.Y := A.Y + (B.Y - A.Y) * T;
+  R.Z := A.Z + (B.Z - A.Z) * T; R.W := A.W + (B.W - A.W) * T;
+  R.A := A.A + (B.A - A.A) * T; R.R := A.R + (B.R - A.R) * T;
+  R.G := A.G + (B.G - A.G) * T; R.B := A.B + (B.B - A.B) * T;
+  R.SR := A.SR + (B.SR - A.SR) * T; R.SG := A.SG + (B.SG - A.SG) * T;
+  R.SB := A.SB + (B.SB - A.SB) * T; R.F := A.F + (B.F - A.F) * T;
+  R.U0 := A.U0 + (B.U0 - A.U0) * T; R.V0 := A.V0 + (B.V0 - A.V0) * T;
+  R.U1 := A.U1 + (B.U1 - A.U1) * T; R.V1 := A.V1 + (B.V1 - A.V1) * T;
+  R.CF := -1;
+End;
+
+Function D3DClipPoly(N : LongInt) : LongInt;
+Var P, I, J, M : LongInt; DA, DB : Double;
+Begin
+  For P := 0 To 5 Do
+  Begin
+    If N < 3 Then
+    Begin
+      D3DClipPoly := 0;
+      Exit;
+    End;
+    M := 0;
+    For I := 0 To N - 1 Do
+    Begin
+      J := (I + 1) Mod N;
+      DA := PlaneD(DC[I], P); DB := PlaneD(DC[J], P);
+      If DA >= 0 Then
+      Begin
+        If M < 15 Then
+        Begin
+          DC2[M] := DC[I]; Inc(M);
+        End;
+      End;
+      If ((DA >= 0) And (DB < 0)) Or ((DA < 0) And (DB >= 0)) Then
+        If M < 15 Then
+        Begin
+          VLerp(DC2[M], DC[I], DC[J], DA / (DA - DB));
+          Inc(M);
+        End;
+    End;
+    For I := 0 To M - 1 Do DC[I] := DC2[I];
+    N := M;
+  End;
+  D3DClipPoly := N;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Rasterisation                                                      }
+{ ------------------------------------------------------------------ }
+
+Function Mul8(A, B : LongInt) : LongInt;
+Begin
+  Mul8 := (A * B + 128) Div 255;
+End;
+
+Function Clamp8(V : LongInt) : LongInt;
+Begin
+  If V < 0 Then V := 0;
+  If V > 255 Then V := 255;
+  Clamp8 := V;
+End;
+
+Function CmpOk(Fn, A, B : LongInt) : Boolean;
+Begin
+  Case Fn Of
+    1 : CmpOk := False;
+    2 : CmpOk := A < B;
+    3 : CmpOk := A = B;
+    4 : CmpOk := A <= B;
+    5 : CmpOk := A > B;
+    6 : CmpOk := A <> B;
+    7 : CmpOk := A >= B;
+  Else
+    CmpOk := True;
+  End;
+End;
+
+{ Texel brut -> ARGB selon la sorte du format }
+Function TxDecode(K, V : LongInt) : LongInt;
+Var R, G, B, A : LongInt;
+Begin
+  Case TxKind[K] Of
+    1 : TxDecode := TxPal[V And 255];
+    2 :
+    Begin
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      TxDecode := LongInt($FF000000) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                  (((G Shl 2) Or (G Shr 4)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+    End;
+    3, 7 :
+    Begin
+      R := (V Shr 10) And 31; G := (V Shr 5) And 31; B := V And 31;
+      A := 255;
+      If (TxKind[K] = 7) And ((V And $8000) = 0) Then A := 0;
+      TxDecode := (A Shl 24) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                  (((G Shl 3) Or (G Shr 2)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+    End;
+    8 :
+    Begin
+      A := (V Shr 12) And 15; R := (V Shr 8) And 15; G := (V Shr 4) And 15;
+      B := V And 15;
+      TxDecode := ((A * 17) Shl 24) Or ((R * 17) Shl 16) Or
+                  ((G * 17) Shl 8) Or (B * 17);
+    End;
+    4, 5 : TxDecode := LongInt($FF000000) Or (V And $FFFFFF);
+    6 : TxDecode := V;
+  Else
+    TxDecode := SfToRGB(TxS[K], V);
+  End;
+End;
+
+{ Coordonnee de texel (16.16) -> indice selon le mode d'adressage }
+Function TxAddr(C, N, Md : LongInt) : LongInt;
+Var X : LongInt;
+Begin
+  If C >= 0 Then X := C Shr 16
+  Else X := -1 - ((-C - 1) Shr 16);
+  Case Md Of
+    3, 4 :
+    Begin
+      If X < 0 Then X := 0;
+      If X >= N Then X := N - 1;
+    End;
+    2 :
+    Begin
+      X := X Mod (2 * N);
+      If X < 0 Then X := X + 2 * N;
+      If X >= N Then X := 2 * N - 1 - X;
+    End;
+  Else
+    If (N And (N - 1)) = 0 Then X := X And (N - 1)
+    Else
+    Begin
+      X := X Mod N;
+      If X < 0 Then X := X + N;
+    End;
+  End;
+  TxAddr := X;
+End;
+
+{ Texel de l'etage K en (U, V) 16.16 ; -1 dans Hit si cle de couleur }
+Function TxFetch(K, U, V : LongInt; Var Keyed : Boolean) : LongInt;
+Var X, Y, A, Raw : LongInt;
+Begin
+  X := TxAddr(U, TxW[K], TxAddrU[K]);
+  Y := TxAddr(V, TxH[K], TxAddrV[K]);
+  A := TxBits[K] + Y * TxPitch[K];
+  Case TxBy[K] Of
+    1 : Raw := Mem[0:A + X];
+    2 : Raw := MemW[0:A + X * 2];
+    3 : Raw := MemW[0:A + X * 3] Or (Mem[0:A + X * 3 + 2] Shl 16);
+  Else
+    Raw := MemL[0:A + X * 4];
+  End;
+  If (TxKeyOn[K] <> 0) And (Raw = TxKey[K]) Then Keyed := True;
+  TxFetch := TxDecode(K, Raw);
+End;
+
+{ Argument d'un etage : 0 diffuse, 1 courant, 2 texture, 3 facteur,
+  4 speculaire ; 10h complement, 20h alpha replique }
+Function TxArg(Ar, Dif, Cur, Tex, Spe : LongInt) : LongInt;
+Var V, A : LongInt;
+Begin
+  Case Ar And 7 Of
+    0 : V := Dif;
+    1 : V := Cur;
+    2 : V := Tex;
+    3 : V := RTFac;
+    4 : V := Spe;
+  Else
+    V := Cur;
+  End;
+  If (Ar And $10) <> 0 Then V := V Xor -1;
+  If (Ar And $20) <> 0 Then
+  Begin
+    A := (V Shr 24) And 255;
+    V := (A Shl 24) Or (A Shl 16) Or (A Shl 8) Or A;
+  End;
+  TxArg := V;
+End;
+
+{ Operation d'etage sur une composante (decalage Sh) }
+Function TxOpC(Op, A1, A2, Sh, Dif, Tex, Cur : LongInt) : LongInt;
+Var X, Y, R, T : LongInt;
+Begin
+  X := (A1 Shr Sh) And 255; Y := (A2 Shr Sh) And 255;
+  Case Op Of
+    2 : R := X;
+    3 : R := Y;
+    4 : R := Mul8(X, Y);
+    5 : R := Clamp8(Mul8(X, Y) * 2);
+    6 : R := Clamp8(Mul8(X, Y) * 4);
+    7 : R := Clamp8(X + Y);
+    8 : R := Clamp8(X + Y - 128);
+    9 : R := Clamp8((X + Y - 128) * 2);
+    10 : R := Clamp8(X - Y);
+    11 : R := Clamp8(X + Y - Mul8(X, Y));
+    12, 13, 14, 16 :
+    Begin
+      Case Op Of
+        12 : T := (Dif Shr 24) And 255;
+        13 : T := (Tex Shr 24) And 255;
+        14 : T := (RTFac Shr 24) And 255;
+      Else
+        T := (Cur Shr 24) And 255;
+      End;
+      R := Clamp8(Mul8(X, T) + Mul8(Y, 255 - T));
+    End;
+    15 : R := Clamp8(X + Mul8(Y, 255 - ((Tex Shr 24) And 255)));
+    18 : R := Clamp8(X + Mul8((A1 Shr 24) And 255, Y));
+    20 : R := Clamp8(X + Mul8(255 - ((A1 Shr 24) And 255), Y));
+  Else
+    R := Mul8(X, Y);
+  End;
+  TxOpC := R;
+End;
+
+{ Melange des etages : couleur finale (avant brouillard) }
+Function D3DShade(Dif, Spe : LongInt; Var T0, T1 : LongInt) : LongInt;
+Var K, Cur, Tex, A1, A2, R, G, B, A, Op : LongInt;
+Begin
+  Cur := Dif;
+  For K := 0 To NStage - 1 Do
+  Begin
+    If K = 0 Then Tex := T0 Else Tex := T1;
+    Op := TxCOp[K];
+    If Op <= 1 Then Break;
+    A1 := TxArg(TxCA1[K], Dif, Cur, Tex, Spe);
+    A2 := TxArg(TxCA2[K], Dif, Cur, Tex, Spe);
+    R := TxOpC(Op, A1, A2, 16, Dif, Tex, Cur);
+    G := TxOpC(Op, A1, A2, 8, Dif, Tex, Cur);
+    B := TxOpC(Op, A1, A2, 0, Dif, Tex, Cur);
+    Op := TxAOp[K];
+    If Op <= 1 Then A := (Cur Shr 24) And 255
+    Else
+    Begin
+      A1 := TxArg(TxAA1[K], Dif, Cur, Tex, Spe);
+      A2 := TxArg(TxAA2[K], Dif, Cur, Tex, Spe);
+      A := TxOpC(Op, A1, A2, 24, Dif, Tex, Cur);
+    End;
+    Cur := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+  End;
+  D3DShade := Cur;
+End;
+
+{ Melange de texture des versions 1 et 2 (D3DRENDERSTATE_TEXTUREMAPBLEND) }
+Function D3DLegacy(Dif, Tex : LongInt; HasA : Boolean) : LongInt;
+Var A, R, G, B, T : LongInt;
+Begin
+  Case D3G^.LegBlend Of
+    1, 5, 7 : D3DLegacy := Tex;
+    3 :
+    Begin
+      T := (Tex Shr 24) And 255;
+      R := Mul8((Tex Shr 16) And 255, T) + Mul8((Dif Shr 16) And 255, 255 - T);
+      G := Mul8((Tex Shr 8) And 255, T) + Mul8((Dif Shr 8) And 255, 255 - T);
+      B := Mul8(Tex And 255, T) + Mul8(Dif And 255, 255 - T);
+      D3DLegacy := (Dif And LongInt($FF000000)) Or (Clamp8(R) Shl 16) Or
+                   (Clamp8(G) Shl 8) Or Clamp8(B);
+    End;
+    8 :
+    Begin
+      R := Clamp8(((Tex Shr 16) And 255) + ((Dif Shr 16) And 255));
+      G := Clamp8(((Tex Shr 8) And 255) + ((Dif Shr 8) And 255));
+      B := Clamp8((Tex And 255) + (Dif And 255));
+      D3DLegacy := (Dif And LongInt($FF000000)) Or (R Shl 16) Or (G Shl 8)
+                   Or B;
+    End;
+  Else
+    Begin
+      R := Mul8((Tex Shr 16) And 255, (Dif Shr 16) And 255);
+      G := Mul8((Tex Shr 8) And 255, (Dif Shr 8) And 255);
+      B := Mul8(Tex And 255, Dif And 255);
+      If D3G^.LegBlend = 4 Then
+        A := Mul8((Tex Shr 24) And 255, (Dif Shr 24) And 255)
+      Else If HasA Then A := (Tex Shr 24) And 255
+      Else A := (Dif Shr 24) And 255;
+      D3DLegacy := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+    End;
+  End;
+End;
+
+{ Facteur de melange (D3DBLEND) pour la source S et la destination D }
+Function BlFac(F, S, D, Sh : LongInt) : LongInt;
+Var SA, DA : LongInt;
+Begin
+  SA := (S Shr 24) And 255; DA := (D Shr 24) And 255;
+  Case F Of
+    1 : BlFac := 0;
+    2 : BlFac := 255;
+    3 : BlFac := (S Shr Sh) And 255;
+    4 : BlFac := 255 - ((S Shr Sh) And 255);
+    5, 12 : BlFac := SA;
+    6, 13 : BlFac := 255 - SA;
+    7 : BlFac := DA;
+    8 : BlFac := 255 - DA;
+    9 : BlFac := (D Shr Sh) And 255;
+    10 : BlFac := 255 - ((D Shr Sh) And 255);
+    11 : BlFac := Min(SA, 255 - DA);
+  Else
+    BlFac := 255;
+  End;
+End;
+
+{ Pixel de la cible -> ARGB et inversement }
+Function RtGet(A : LongInt) : LongInt;
+Var V, R, G, B : LongInt;
+Begin
+  Case RKind Of
+    1 : RtGet := LongInt($FF000000) Or SfPalRGB(RTs, Mem[0:A]);
+    2 :
+    Begin
+      V := MemW[0:A];
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      RtGet := LongInt($FF000000) Or (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+               (((G Shl 2) Or (G Shr 4)) Shl 8) Or (B Shl 3) Or (B Shr 2);
+    End;
+    4 : RtGet := LongInt($FF000000) Or MemW[0:A] Or (Mem[0:A + 2] Shl 16);
+    5, 6 : RtGet := MemL[0:A];
+  Else
+    Begin
+      Case RBy Of
+        1 : V := Mem[0:A];
+        2 : V := MemW[0:A];
+        3 : V := MemW[0:A] Or (Mem[0:A + 2] Shl 16);
+      Else
+        V := MemL[0:A];
+      End;
+      RtGet := SfToRGB(RTs, V);
+    End;
+  End;
+End;
+
+Procedure RtPut(A, C : LongInt);
+Var V : LongInt;
+Begin
+  Case RKind Of
+    1 : Mem[0:A] := DXIdxOf(C);
+    2 : MemW[0:A] := ((C Shr 8) And $F800) Or ((C Shr 5) And $7E0) Or
+                     ((C Shr 3) And $1F);
+    3 : MemW[0:A] := ((C Shr 9) And $7C00) Or ((C Shr 6) And $3E0) Or
+                     ((C Shr 3) And $1F);
+    4 :
+    Begin
+      MemW[0:A] := C; Mem[0:A + 2] := C Shr 16;
+    End;
+    5 : MemL[0:A] := C And $FFFFFF;
+    6 : MemL[0:A] := C;
+  Else
+    Begin
+      V := SfFromRGB(RTs, C);
+      Case RBy Of
+        1 : Mem[0:A] := V;
+        2 : MemW[0:A] := V;
+        3 :
+        Begin
+          MemW[0:A] := V; Mem[0:A + 2] := V Shr 16;
+        End;
+      Else
+        MemL[0:A] := V;
+      End;
+    End;
+  End;
+End;
+
+{ Ecrire un pixel (tests, melange) ; Z en 24 bits (0..FFFFFFh) }
+Procedure D3DPixel(X, Y, Z, Dif, Spe, Fog, U0, V0, U1, V1 : LongInt);
+Var ZA, ZO, CA, C, T0, T1, D, A, R, G, B, FS, FD : LongInt;
+    Keyed : Boolean;
+Begin
+  ZA := 0;
+  If RZOn <> 0 Then
+  Begin
+    ZA := ZBits + Y * ZPitch + X * ZBy;
+    If ZBy = 2 Then
+    Begin
+      ZO := MemW[0:ZA]; Z := Z Shr 8;
+    End
+    Else ZO := MemL[0:ZA] And $FFFFFF;
+    If Not CmpOk(RZFn, Z, ZO) Then Exit;
+  End;
+  Keyed := False;
+  T0 := -1; T1 := -1;
+  If TxOn[0] Then T0 := TxFetch(0, U0, V0, Keyed);
+  If TxOn[1] Then T1 := TxFetch(1, U1, V1, Keyed);
+  If Keyed And (RCKey <> 0) Then Exit;
+  If D3G^.UseTSS <> 0 Then C := D3DShade(Dif, Spe, T0, T1)
+  Else If TxOn[0] Then
+    C := D3DLegacy(Dif, T0, (TxKind[0] = 6) Or (TxKind[0] = 7) Or
+                   (TxKind[0] = 8))
+  Else C := Dif;
+  If RATst <> 0 Then
+    If Not CmpOk(RAFn, (C Shr 24) And 255, RARef) Then Exit;
+  If RSpec <> 0 Then
+  Begin
+    R := Clamp8(((C Shr 16) And 255) + ((Spe Shr 16) And 255));
+    G := Clamp8(((C Shr 8) And 255) + ((Spe Shr 8) And 255));
+    B := Clamp8((C And 255) + (Spe And 255));
+    C := (C And LongInt($FF000000)) Or (R Shl 16) Or (G Shl 8) Or B;
+  End;
+  If (RFogOn <> 0) And (Fog < 255) Then
+  Begin
+    R := Mul8((C Shr 16) And 255, Fog) + Mul8((RFogC Shr 16) And 255,
+                                               255 - Fog);
+    G := Mul8((C Shr 8) And 255, Fog) + Mul8((RFogC Shr 8) And 255, 255 - Fog);
+    B := Mul8(C And 255, Fog) + Mul8(RFogC And 255, 255 - Fog);
+    C := (C And LongInt($FF000000)) Or (Clamp8(R) Shl 16) Or
+         (Clamp8(G) Shl 8) Or Clamp8(B);
+  End;
+  CA := RBits + Y * RPitch + X * RBy;
+  If RABl <> 0 Then
+  Begin
+    D := RtGet(CA);
+    If (RSrc = 12) Or (RSrc = 13) Then
+    Begin
+      If RSrc = 12 Then FS := 5 Else FS := 6;
+      FD := 11 - FS;
+    End
+    Else
+    Begin
+      FS := RSrc; FD := RDst;
+    End;
+    R := Clamp8(Mul8((C Shr 16) And 255, BlFac(FS, C, D, 16)) +
+                Mul8((D Shr 16) And 255, BlFac(FD, C, D, 16)));
+    G := Clamp8(Mul8((C Shr 8) And 255, BlFac(FS, C, D, 8)) +
+                Mul8((D Shr 8) And 255, BlFac(FD, C, D, 8)));
+    B := Clamp8(Mul8(C And 255, BlFac(FS, C, D, 0)) +
+                Mul8(D And 255, BlFac(FD, C, D, 0)));
+    A := Clamp8(Mul8((C Shr 24) And 255, BlFac(FS, C, D, 24)) +
+                Mul8((D Shr 24) And 255, BlFac(FD, C, D, 24)));
+    C := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+  End;
+  RtPut(CA, C);
+  If (RZOn <> 0) And (RZWr <> 0) Then
+  Begin
+    If ZBy = 2 Then MemW[0:ZA] := Z
+    Else MemL[0:ZA] := (MemL[0:ZA] And LongInt($FF000000)) Or Z;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Triangle (sommets ecran)                                           }
+{ ------------------------------------------------------------------ }
+
+Const
+  NAt = 14;  { z, 1/w, a, r, g, b, sr, sg, sb, fog, u0/w, v0/w, u1/w, v1/w }
+
+Type
+  TAt = Array[0..NAt - 1] Of Double;
+
+Procedure VAttr(Var V : TVtx; Var At : TAt);
+Begin
+  At[0] := V.SZ; At[1] := V.RW;
+  At[2] := V.A; At[3] := V.R; At[4] := V.G; At[5] := V.B;
+  At[6] := V.SR; At[7] := V.SG; At[8] := V.SB; At[9] := V.F * 255;
+  At[10] := V.U0 * V.RW; At[11] := V.V0 * V.RW;
+  At[12] := V.U1 * V.RW; At[13] := V.V1 * V.RW;
+End;
+
+Function DRound(D : Double) : LongInt;
+Begin
+  If D > 2000000000 Then D := 2000000000;
+  If D < -2000000000 Then D := -2000000000;
+  DRound := Round(D);
+End;
+
+Procedure D3DLine(Var P, Q : TVtx); Forward;
+Procedure D3DPoint(Var P : TVtx); Forward;
+
+Procedure D3DTri(Var V0, V1, V2 : TVtx);
+Var A0, A1, A2, DX, DY, AT : TAt;
+    X0, Y0, X1, Y1, X2, Y2, Ar, YA, YB, XL, XR, T, W, U, V, U2, VV2,
+    UE, VE, UE2, VE3 : Double;
+    K, Y, YBeg, YEnd, XS, XE, X, Z, DZ, C0, CR, CG, CB, CA, SR, SG, SB, FF,
+    DCA, DCR, DCG, DCB, DSR, DSG, DSB, DFF, Seg, N, IU, IV, IU2, IV2,
+    DU, DV2, DU2, DV3, Dif, Spe : LongInt;
+    Flat : Boolean;
+Begin
+  X0 := V0.SX; Y0 := V0.SY; X1 := V1.SX; Y1 := V1.SY; X2 := V2.SX;
+  Y2 := V2.SY;
+  Ar := (X1 - X0) * (Y2 - Y0) - (X2 - X0) * (Y1 - Y0);
+  If Abs(Ar) < 0.0001 Then Exit;
+  If (RCull = 2) And (Ar > 0) Then Exit;
+  If (RCull = 3) And (Ar < 0) Then Exit;
+  If RFill = 1 Then
+  Begin
+    D3DPoint(V0); D3DPoint(V1); D3DPoint(V2);
+    Exit;
+  End;
+  If RFill = 2 Then
+  Begin
+    D3DLine(V0, V1); D3DLine(V1, V2); D3DLine(V2, V0);
+    Exit;
+  End;
+  Inc(D3G^.Tris);
+  VAttr(V0, A0); VAttr(V1, A1); VAttr(V2, A2);
+  Flat := RShade = 1;
+  If Flat Then
+    For K := 2 To 8 Do
+    Begin
+      A1[K] := A0[K]; A2[K] := A0[K];
+    End;
+  For K := 0 To NAt - 1 Do
+  Begin
+    DX[K] := ((A1[K] - A0[K]) * (Y2 - Y0) - (A2[K] - A0[K]) * (Y1 - Y0)) / Ar;
+    DY[K] := ((A2[K] - A0[K]) * (X1 - X0) - (A1[K] - A0[K]) * (X2 - X0)) / Ar;
+  End;
+  YA := Y0; YB := Y0;
+  If Y1 < YA Then YA := Y1;
+  If Y2 < YA Then YA := Y2;
+  If Y1 > YB Then YB := Y1;
+  If Y2 > YB Then YB := Y2;
+  YBeg := DRound(YA + 0.4999999);
+  If YBeg < YA Then Inc(YBeg);
+  YEnd := DRound(YB + 0.4999999) - 1;
+  If YBeg < ClipT Then YBeg := ClipT;
+  If YEnd > ClipB - 1 Then YEnd := ClipB - 1;
+  For Y := YBeg To YEnd Do
+  Begin
+    { intersections des aretes avec la ligne Y }
+    XL := 1E30; XR := -1E30;
+    For K := 0 To 2 Do
+    Begin
+      Case K Of
+        0 : Begin YA := Y0; T := X0; W := Y1; U := X1; End;
+        1 : Begin YA := Y1; T := X1; W := Y2; U := X2; End;
+      Else
+        Begin YA := Y2; T := X2; W := Y0; U := X0; End;
+      End;
+      If YA = W Then Continue;
+      If YA < W Then
+      Begin
+        If (Y < YA) Or (Y >= W) Then Continue;
+      End
+      Else If (Y < W) Or (Y >= YA) Then Continue;
+      V := T + (Y - YA) * (U - T) / (W - YA);
+      If V < XL Then XL := V;
+      If V > XR Then XR := V;
+    End;
+    If XL > XR Then Continue;
+    XS := DRound(XL + 0.4999999);
+    If XS < XL Then Inc(XS);
+    XE := DRound(XR + 0.4999999) - 1;
+    If XS < ClipL Then XS := ClipL;
+    If XE > ClipR - 1 Then XE := ClipR - 1;
+    If XS > XE Then Continue;
+    For K := 0 To NAt - 1 Do
+      AT[K] := A0[K] + DX[K] * (XS - X0) + DY[K] * (Y - Y0);
+    Z := DRound(AT[0] * 16777215); DZ := DRound(DX[0] * 16777215);
+    CA := DRound(AT[2] * 65536); CR := DRound(AT[3] * 65536);
+    CG := DRound(AT[4] * 65536); CB := DRound(AT[5] * 65536);
+    SR := DRound(AT[6] * 65536); SG := DRound(AT[7] * 65536);
+    SB := DRound(AT[8] * 65536); FF := DRound(AT[9] * 65536);
+    DCA := DRound(DX[2] * 65536); DCR := DRound(DX[3] * 65536);
+    DCG := DRound(DX[4] * 65536); DCB := DRound(DX[5] * 65536);
+    DSR := DRound(DX[6] * 65536); DSG := DRound(DX[7] * 65536);
+    DSB := DRound(DX[8] * 65536); DFF := DRound(DX[9] * 65536);
+    X := XS;
+    While X <= XE Do
+    Begin
+      { segment de 16 pixels : coordonnees de texture exactes aux bouts }
+      N := Min(16, XE - X + 1);
+      IU := 0; IV := 0; IU2 := 0; IV2 := 0; DU := 0; DV2 := 0; DU2 := 0;
+      DV3 := 0;
+      If TxOn[0] Or TxOn[1] Then
+      Begin
+        W := AT[1] + DX[1] * (X - XS);
+        T := AT[1] + DX[1] * (X + N - XS);
+        If Abs(W) < 1E-12 Then W := 1E-12;
+        If Abs(T) < 1E-12 Then T := 1E-12;
+        U := (AT[10] + DX[10] * (X - XS)) / W;
+        V := (AT[11] + DX[11] * (X - XS)) / W;
+        UE := (AT[10] + DX[10] * (X + N - XS)) / T;
+        VE := (AT[11] + DX[11] * (X + N - XS)) / T;
+        IU := DRound(U * TxW[0] * 65536 - 32768);
+        IV := DRound(V * TxH[0] * 65536 - 32768);
+        DU := (DRound(UE * TxW[0] * 65536 - 32768) - IU) Div N;
+        DV2 := (DRound(VE * TxH[0] * 65536 - 32768) - IV) Div N;
+        If TxOn[1] Then
+        Begin
+          U2 := (AT[12] + DX[12] * (X - XS)) / W;
+          VV2 := (AT[13] + DX[13] * (X - XS)) / W;
+          UE2 := (AT[12] + DX[12] * (X + N - XS)) / T;
+          VE3 := (AT[13] + DX[13] * (X + N - XS)) / T;
+          IU2 := DRound(U2 * TxW[1] * 65536 - 32768);
+          IV2 := DRound(VV2 * TxH[1] * 65536 - 32768);
+          DU2 := (DRound(UE2 * TxW[1] * 65536 - 32768) - IU2) Div N;
+          DV3 := (DRound(VE3 * TxH[1] * 65536 - 32768) - IV2) Div N;
+        End;
+      End;
+      For K := 0 To N - 1 Do
+      Begin
+        Dif := (Clamp8(CA Div 65536) Shl 24) Or (Clamp8(CR Div 65536) Shl 16)
+               Or (Clamp8(CG Div 65536) Shl 8) Or Clamp8(CB Div 65536);
+        Spe := (Clamp8(SR Div 65536) Shl 16) Or (Clamp8(SG Div 65536) Shl 8)
+               Or Clamp8(SB Div 65536);
+        C0 := Z;
+        If C0 < 0 Then C0 := 0;
+        If C0 > $FFFFFF Then C0 := $FFFFFF;
+        D3DPixel(X, Y, C0, Dif, Spe, Clamp8(FF Div 65536), IU, IV, IU2, IV2);
+        Z := Z + DZ;
+        CA := CA + DCA; CR := CR + DCR; CG := CG + DCG; CB := CB + DCB;
+        SR := SR + DSR; SG := SG + DSG; SB := SB + DSB; FF := FF + DFF;
+        IU := IU + DU; IV := IV + DV2; IU2 := IU2 + DU2; IV2 := IV2 + DV3;
+        Inc(X);
+      End;
+    End;
+  End;
+End;
+
+{ Couleur diffuse et speculaire d'un sommet }
+Function VDif(Var P : TVtx) : LongInt;
+Begin
+  VDif := (Clamp8(DRound(P.A)) Shl 24) Or (Clamp8(DRound(P.R)) Shl 16) Or
+          (Clamp8(DRound(P.G)) Shl 8) Or Clamp8(DRound(P.B));
+End;
+
+Function VSpe(Var P : TVtx) : LongInt;
+Begin
+  VSpe := (Clamp8(DRound(P.SR)) Shl 16) Or (Clamp8(DRound(P.SG)) Shl 8) Or
+          Clamp8(DRound(P.SB));
+End;
+
+Procedure D3DPoint(Var P : TVtx);
+Var X, Y, Z : LongInt;
+Begin
+  X := DRound(P.SX); Y := DRound(P.SY);
+  If (X < ClipL) Or (Y < ClipT) Or (X >= ClipR) Or (Y >= ClipB) Then Exit;
+  Z := DRound(P.SZ * 16777215);
+  If Z < 0 Then Z := 0;
+  If Z > $FFFFFF Then Z := $FFFFFF;
+  D3DPixel(X, Y, Z, VDif(P), VSpe(P), Clamp8(DRound(P.F * 255)),
+           DRound(P.U0 * TxW[0] * 65536), DRound(P.V0 * TxH[0] * 65536),
+           DRound(P.U1 * TxW[1] * 65536), DRound(P.V1 * TxH[1] * 65536));
+End;
+
+Procedure D3DLine(Var P, Q : TVtx);
+Var N, I, X, Y, Z : LongInt; T, DXX, DYY : Double; M : TVtx;
+Begin
+  DXX := Q.SX - P.SX; DYY := Q.SY - P.SY;
+  N := DRound(Abs(DXX));
+  If DRound(Abs(DYY)) > N Then N := DRound(Abs(DYY));
+  If N > 4096 Then N := 4096;
+  If N < 1 Then N := 1;
+  For I := 0 To N - 1 Do
+  Begin
+    T := I / N;
+    M := P;
+    M.SX := P.SX + DXX * T; M.SY := P.SY + DYY * T;
+    M.SZ := P.SZ + (Q.SZ - P.SZ) * T;
+    If RShade <> 1 Then
+    Begin
+      M.A := P.A + (Q.A - P.A) * T; M.R := P.R + (Q.R - P.R) * T;
+      M.G := P.G + (Q.G - P.G) * T; M.B := P.B + (Q.B - P.B) * T;
+    End;
+    M.U0 := P.U0 + (Q.U0 - P.U0) * T; M.V0 := P.V0 + (Q.V0 - P.V0) * T;
+    X := 0; Y := 0; Z := 0;
+    D3DPoint(M);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Preparation d'un dessin : cible, Z, textures, etats                }
+{ ------------------------------------------------------------------ }
+
+Procedure TxBind(K, S : LongInt);
+Var I, P, L, M : LongInt;
+Begin
+  TxOn[K] := False;
+  If S = 0 Then Exit;
+  { niveau de mipmap : le premier (le choix par triangle est fait par
+    la taille de la cible) }
+  TxS[K] := S;
+  TxBits[K] := MemL[0:S + 76]; TxPitch[K] := MemL[0:S + 72];
+  TxW[K] := MemL[0:S + 64]; TxH[K] := MemL[0:S + 68];
+  TxBy[K] := SfBytes(S);
+  TxKind[K] := MemL[0:S + 272];
+  If (MemL[0:S + 88] = 16) And (MemL[0:S + 96] = $7C00) And
+     (MemL[0:S + 108] = $8000) Then TxKind[K] := 7;
+  If (MemL[0:S + 88] = 16) And (MemL[0:S + 96] = $F00) And
+     (MemL[0:S + 108] = $F000) Then TxKind[K] := 8;
+  TxKeyOn[K] := MemL[0:S + 148] And 1;
+  TxKey[K] := MemL[0:S + 132];
+  If (TxKind[K] = 1) And (K = 0) Then
+  Begin
+    P := MemL[0:S + 124];
+    For I := 0 To 255 Do
+    Begin
+      If P <> 0 Then
+      Begin
+        L := P + 68 + I * 4;
+        M := 255;
+        If (MemL[0:P + 64] And $400) <> 0 Then M := Mem[0:L + 3];
+        TxPal[I] := (M Shl 24) Or (Mem[0:L] Shl 16) Or (Mem[0:L + 1] Shl 8)
+                    Or Mem[0:L + 2];
+      End
+      Else
+        TxPal[I] := LongInt($FF000000) Or (SysPal[I * 3] Shl 16) Or
+                    (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+    End;
+  End;
+  If (TxW[K] <= 0) Or (TxH[K] <= 0) Or (TxBits[K] = 0) Then Exit;
+  TxOn[K] := True;
+End;
+
+Function D3DSetup : Boolean;
+Var Z, K, S, T : LongInt;
+Begin
+  D3DSetup := False;
+  RTs := D3G^.RT;
+  If RTs = 0 Then Exit;
+  RBits := MemL[0:RTs + 76]; RPitch := MemL[0:RTs + 72];
+  RBy := SfBytes(RTs); RKind := MemL[0:RTs + 272];
+  RW := MemL[0:RTs + 64]; RH := MemL[0:RTs + 68];
+  ClipL := Max(0, D3G^.VX); ClipT := Max(0, D3G^.VY);
+  ClipR := Min(RW, D3G^.VX + D3G^.VW); ClipB := Min(RH, D3G^.VY + D3G^.VH);
+  Z := D3G^.ZB;
+  If Z = 0 Then Z := MemL[0:RTs + 120];
+  RZOn := 0;
+  If (D3G^.RS[rsZEnable] <> 0) And (Z <> 0) Then
+  Begin
+    RZOn := 1;
+    ZBits := MemL[0:Z + 76]; ZPitch := MemL[0:Z + 72];
+    ZBy := SfBytes(Z);
+    If ZBy = 3 Then RZOn := 0;
+  End;
+  RZWr := D3G^.RS[rsZWrite];
+  RZFn := D3G^.RS[rsZFunc];
+  If RZFn = 0 Then RZFn := 4;
+  RShade := D3G^.RS[rsShade];
+  RABl := D3G^.RS[rsABlend];
+  RSrc := D3G^.RS[rsSrcBl]; RDst := D3G^.RS[rsDstBl];
+  If RSrc = 0 Then RSrc := 2;
+  If RDst = 0 Then RDst := 1;
+  RATst := D3G^.RS[rsATest]; RAFn := D3G^.RS[rsAFunc];
+  RARef := D3G^.RS[rsARef] And 255;
+  RCKey := D3G^.RS[rsCKey];
+  RFogOn := D3G^.RS[rsFog]; RFogC := D3G^.RS[rsFogColor];
+  RSpec := D3G^.RS[rsSpecular];
+  RTFac := D3G^.RS[rsTFactor];
+  RCull := D3G^.RS[rsCull];
+  RFill := D3G^.RS[rsFill];
+  If RFill = 0 Then RFill := 3;
+  NStage := 0;
+  TxOn[0] := False; TxOn[1] := False;
+  If D3G^.UseTSS <> 0 Then
+  Begin
+    For K := 0 To 1 Do
+    Begin
+      S := D3G^.Tex[K];
+      TxCOp[K] := D3G^.TS[K * 32 + tsCOp];
+      TxCA1[K] := D3G^.TS[K * 32 + tsCA1];
+      TxCA2[K] := D3G^.TS[K * 32 + tsCA2];
+      TxAOp[K] := D3G^.TS[K * 32 + tsAOp];
+      TxAA1[K] := D3G^.TS[K * 32 + tsAA1];
+      TxAA2[K] := D3G^.TS[K * 32 + tsAA2];
+      TxAddrU[K] := D3G^.TS[K * 32 + tsAddrU];
+      TxAddrV[K] := D3G^.TS[K * 32 + tsAddrV];
+      If TxCOp[K] <= 1 Then Break;
+      TxBind(K, S);
+      If Not TxOn[K] Then
+      Begin
+        { etage sans texture : l'argument texture vaut le courant }
+        T := TxCA1[K] And 7;
+        If T = 2 Then TxCA1[K] := (TxCA1[K] And $30) Or 1;
+        T := TxCA2[K] And 7;
+        If T = 2 Then TxCA2[K] := (TxCA2[K] And $30) Or 1;
+        T := TxAA1[K] And 7;
+        If T = 2 Then TxAA1[K] := (TxAA1[K] And $30) Or 1;
+        T := TxAA2[K] And 7;
+        If T = 2 Then TxAA2[K] := (TxAA2[K] And $30) Or 1;
+      End;
+      NStage := K + 1;
+    End;
+  End
+  Else
+  Begin
+    TxBind(0, D3G^.RS[rsTexHandle]);
+    If D3G^.Tex[0] <> 0 Then TxBind(0, D3G^.Tex[0]);
+    TxAddrU[0] := D3G^.RS[3]; TxAddrV[0] := TxAddrU[0];
+    If TxAddrU[0] = 0 Then
+    Begin
+      TxAddrU[0] := 1; TxAddrV[0] := 1;
+    End;
+  End;
+  If Not TxOn[0] Then
+  Begin
+    TxW[0] := 1; TxH[0] := 1;
+  End;
+  If Not TxOn[1] Then
+  Begin
+    TxW[1] := 1; TxH[1] := 1;
+  End;
+  D3DSetup := (ClipL < ClipR) And (ClipT < ClipB);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Primitives                                                         }
+{ ------------------------------------------------------------------ }
+
+Function VInside(Var V : TVtx) : Boolean;
+Var P : LongInt;
+Begin
+  VInside := True;
+  If V.CF = 0 Then Exit;
+  For P := 0 To 5 Do
+    If PlaneD(V, P) < 0 Then
+    Begin
+      VInside := False;
+      Exit;
+    End;
+End;
+
+Procedure D3DTriIdx(I0, I1, I2 : LongInt);
+Var N, K : LongInt;
+Begin
+  If (DV^[I0].CF = 0) And (DV^[I1].CF = 0) And (DV^[I2].CF = 0) Then
+  Begin
+    D3DTri(DV^[I0], DV^[I1], DV^[I2]);
+    Exit;
+  End;
+  If VInside(DV^[I0]) And VInside(DV^[I1]) And VInside(DV^[I2]) Then
+  Begin
+    DC[0] := DV^[I0]; DC[1] := DV^[I1]; DC[2] := DV^[I2];
+    D3DProject(DC[0]); D3DProject(DC[1]); D3DProject(DC[2]);
+    D3DTri(DC[0], DC[1], DC[2]);
+    Exit;
+  End;
+  DC[0] := DV^[I0]; DC[1] := DV^[I1]; DC[2] := DV^[I2];
+  N := D3DClipPoly(3);
+  If N < 3 Then Exit;
+  For K := 0 To N - 1 Do D3DProject(DC[K]);
+  For K := 1 To N - 2 Do D3DTri(DC[0], DC[K], DC[K + 1]);
+End;
+
+Procedure D3DLineIdx(I0, I1 : LongInt);
+Var A, B : TVtx; P : LongInt; DA, DB, T : Double; Ok : Boolean;
+Begin
+  A := DV^[I0]; B := DV^[I1];
+  If (A.CF <> 0) Or (B.CF <> 0) Then
+  Begin
+    Ok := True;
+    For P := 0 To 5 Do
+    Begin
+      DA := PlaneD(A, P); DB := PlaneD(B, P);
+      If (DA < 0) And (DB < 0) Then Ok := False
+      Else If DA < 0 Then
+      Begin
+        T := DA / (DA - DB); VLerp(A, A, B, T);
+      End
+      Else If DB < 0 Then
+      Begin
+        T := DB / (DB - DA); VLerp(B, B, A, T);
+      End;
+    End;
+    If Not Ok Then Exit;
+    D3DProject(A); D3DProject(B);
+  End;
+  D3DLine(A, B);
+End;
+
+Procedure D3DPointIdx(I : LongInt);
+Var A : TVtx;
+Begin
+  A := DV^[I];
+  If Not VInside(A) Then Exit;
+  D3DProject(A);
+  D3DPoint(A);
+End;
+
+{ Indice K de la liste (Idx : adresse, Sz 2 ou 4 octets ; 0 : direct) }
+Function IdxAt(Idx, Sz, K : LongInt) : LongInt;
+Begin
+  If Idx = 0 Then IdxAt := K
+  Else If Sz = 4 Then IdxAt := MemL[0:Idx + K * 4]
+  Else IdxAt := MemW[0:Idx + K * 2];
+End;
+
+{ Dessiner N elements de type Pt (sommets deja traites dans DV) }
+Procedure D3DPrims(Pt, Idx, Sz, N, NV : LongInt);
+Var I, A, B, C : LongInt;
+Begin
+  If Not D3DSetup Then Exit;
+  Case Pt Of
+    1 :
+      For I := 0 To N - 1 Do
+      Begin
+        A := IdxAt(Idx, Sz, I);
+        If A < NV Then D3DPointIdx(A);
+      End;
+    2 :
+      For I := 0 To N Div 2 - 1 Do
+      Begin
+        A := IdxAt(Idx, Sz, I * 2); B := IdxAt(Idx, Sz, I * 2 + 1);
+        If (A < NV) And (B < NV) Then D3DLineIdx(A, B);
+      End;
+    3 :
+      For I := 0 To N - 2 Do
+      Begin
+        A := IdxAt(Idx, Sz, I); B := IdxAt(Idx, Sz, I + 1);
+        If (A < NV) And (B < NV) Then D3DLineIdx(A, B);
+      End;
+    4 :
+      For I := 0 To N Div 3 - 1 Do
+      Begin
+        A := IdxAt(Idx, Sz, I * 3); B := IdxAt(Idx, Sz, I * 3 + 1);
+        C := IdxAt(Idx, Sz, I * 3 + 2);
+        If (A < NV) And (B < NV) And (C < NV) Then D3DTriIdx(A, B, C);
+      End;
+    5 :
+      For I := 0 To N - 3 Do
+      Begin
+        A := IdxAt(Idx, Sz, I); B := IdxAt(Idx, Sz, I + 1);
+        C := IdxAt(Idx, Sz, I + 2);
+        If (A < NV) And (B < NV) And (C < NV) Then
+        Begin
+          If Odd(I) Then D3DTriIdx(A, C, B) Else D3DTriIdx(A, B, C);
+        End;
+      End;
+    6 :
+      For I := 1 To N - 2 Do
+      Begin
+        A := IdxAt(Idx, Sz, 0); B := IdxAt(Idx, Sz, I);
+        C := IdxAt(Idx, Sz, I + 1);
+        If (A < NV) And (B < NV) And (C < NV) Then D3DTriIdx(A, B, C);
+      End;
+  End;
+  If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, False);
+End;
+
+{ Dessin complet : sommets (Src, FVF) puis primitives }
+Procedure D3DDraw(Pt, Fvf, Src, NV, Idx, Sz, NI, Fl : LongInt);
+Var Lit : Boolean;
+Begin
+  If (Src = 0) Or (NV <= 0) Then Exit;
+  FvfParse(Fvf);
+  Lit := (D3G^.RS[rsLighting] <> 0) And (VFNrm >= 0) And (VFRhw = 0);
+  If (D3G^.Ver <= 3) And (VFNrm >= 0) And (VFRhw = 0) Then
+    Lit := (Fl And $10) = 0;
+  If Lit Then D3DLightsView;
+  D3DProcess(Src, NV, Lit);
+  If Idx = 0 Then NI := NV;
+  D3DPrims(Pt, Idx, Sz, NI, NV);
+End;
+
+{ Effacer : cible (couleur), Z (valeur 0..1) dans les rectangles }
+Procedure D3DClear(N, Rects, Fl, Color, ZV : LongInt);
+Var I, L, T, R, B, V, Z, ZS : LongInt;
+Begin
+  If D3G^.RT = 0 Then Exit;
+  Z := D3G^.ZB;
+  If Z = 0 Then Z := MemL[0:D3G^.RT + 120];
+  If N = 0 Then N := 1;
+  For I := 0 To N - 1 Do
+  Begin
+    If Rects <> 0 Then
+    Begin
+      L := MemL[0:Rects + I * 16]; T := MemL[0:Rects + I * 16 + 4];
+      R := MemL[0:Rects + I * 16 + 8]; B := MemL[0:Rects + I * 16 + 12];
+    End
+    Else
+    Begin
+      L := D3G^.VX; T := D3G^.VY;
+      R := D3G^.VX + D3G^.VW; B := D3G^.VY + D3G^.VH;
+    End;
+    If (Fl And 1) <> 0 Then
+    Begin
+      V := SfFromRGB(D3G^.RT, Color);
+      SfFill(D3G^.RT, L, T, R, B, V);
+    End;
+    If ((Fl And 2) <> 0) And (Z <> 0) Then
+    Begin
+      ZS := SfBytes(Z);
+      If ZS = 2 Then V := DRound(FlL(ZV) * 65535)
+      Else V := DRound(FlL(ZV) * 16777215);
+      SfFill(Z, L, T, R, B, V);
+    End;
+  End;
+  If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Direct3D 1 a 7 : objets                                            }
+{ ------------------------------------------------------------------ }
+{ IDirect3D, 2, 3 et 7 sont des vues de l'objet DirectDraw (cases 4 a
+  7) ; IDirect3DTexture et 2 des vues des surfaces (cases 6 et 7).
+  Sortes : 11 peripherique (+64 etat TD3D, +68 version), 12 fenetre
+  d'affichage (viewport), 13 materiau, 14 lumiere, 15 tampon
+  d'execution, 16 tampon de sommets. Les "handles" de D3D 1 a 3
+  (materiaux, textures, matrices) sont les adresses des objets. }
+
+Var
+  VtD3D1, VtD3D2, VtD3D3, VtD3D7, VtDev1, VtDev2, VtDev3, VtDev7,
+    VtVP1, VtVP2, VtVP3, VtMat1, VtMat2, VtMat3, VtLit, VtTx1, VtTx2,
+    VtEB, VtVB, VtVB7 : LongInt;
+  D3DSbList : Array[0..63] Of LongInt;
+
+Procedure D3DInitVt;
+Begin
+  If VtD3D1 <> 0 Then Exit;
+  VtD3D1 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,DXOK2,D3_EnumDevices,D3_CreateLight,');
+  VtAdd('D3_CreateMaterial,D3_CreateViewport,D3_FindDevice');
+  VtD3D2 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,D3_EnumDevices,D3_CreateLight,');
+  VtAdd('D3_CreateMaterial,D3_CreateViewport,D3_FindDevice,D3_CreateDevice2');
+  VtD3D3 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,D3_EnumDevices,D3_CreateLight,');
+  VtAdd('D3_CreateMaterial,D3_CreateViewport,D3_FindDevice,D3_CreateDevice3,');
+  VtAdd('D3_CreateVB3,D3_EnumZFormats,DXOK1');
+  VtD3D7 := VtNew;
+  VtAdd('D3_QI,COMAddRef,COMRelease,D3_EnumDevices7,D3_CreateDevice7,');
+  VtAdd('D3_CreateVB7,D3_EnumZFormats,DXOK1');
+  VtDev1 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DXOK4,DV_GetCaps,DV_SwapTex,');
+  VtAdd('DV_CreateEB,DV_GetStats,DV_Execute,DV_AddViewport,DV_DelViewport,');
+  VtAdd('DV_NextViewport,DV_Pick,DV_GetPickRecords,DV_EnumTexFmt1,');
+  VtAdd('DV_CreateMatrix,DV_SetMatrix,DV_GetMatrix,DV_DeleteMatrix,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D');
+  VtDev2 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DV_GetCaps,DV_SwapTex,DV_GetStats,');
+  VtAdd('DV_AddViewport,DV_DelViewport,DV_NextViewport,DV_EnumTexFmt1,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D,DV_SetCurVP,DV_GetCurVP,');
+  VtAdd('DV_SetRT,DV_GetRT,DV_Begin2,DV_BeginIdx2,DV_Vertex,DV_Index,');
+  VtAdd('DV_End,DV_GetRS,DV_SetRS,DV_GetLS,DV_SetLS,DV_SetTransform,');
+  VtAdd('DV_GetTransform,DV_MulTransform,DV_DrawPrim2,DV_DrawIdxPrim2,');
+  VtAdd('DV_SetClipStatus,DV_GetClipStatus');
+  VtDev3 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DV_GetCaps,DV_GetStats,');
+  VtAdd('DV_AddViewport,DV_DelViewport,DV_NextViewport,DV_EnumTexFmt,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D,DV_SetCurVP,DV_GetCurVP,');
+  VtAdd('DV_SetRT,DV_GetRT,DV_Begin,DV_BeginIdx,DV_Vertex,DV_Index,');
+  VtAdd('DV_End,DV_GetRS,DV_SetRS,DV_GetLS,DV_SetLS,DV_SetTransform,');
+  VtAdd('DV_GetTransform,DV_MulTransform,DV_DrawPrim,DV_DrawIdxPrim,');
+  VtAdd('DV_SetClipStatus,DV_GetClipStatus,DV_DrawPrimStr,DV_DrawIdxPrimStr,');
+  VtAdd('DV_DrawPrimVB,DV_DrawIdxPrimVB3,DV_SphereVis,DV_GetTexture,');
+  VtAdd('DV_SetTexture,DV_GetTSS,DV_SetTSS,DV_Validate');
+  VtDev7 := VtNew;
+  VtAdd('DV_QI,COMAddRef,COMRelease,DV_GetCaps7,DV_EnumTexFmt,');
+  VtAdd('DV_BeginScene,DV_EndScene,DV_GetDirect3D,DV_SetRT,DV_GetRT,');
+  VtAdd('DV_Clear7,DV_SetTransform,DV_GetTransform,DV_SetViewport7,');
+  VtAdd('DV_MulTransform,DV_GetViewport7,DV_SetMaterial7,DV_GetMaterial7,');
+  VtAdd('DV_SetLight7,DV_GetLight7,DV_SetRS,DV_GetRS,DV_BeginSB,DV_EndSB,');
+  VtAdd('DXOK2,DV_DrawPrim,DV_DrawIdxPrim,DV_SetClipStatus,');
+  VtAdd('DV_GetClipStatus,DV_DrawPrimStr,DV_DrawIdxPrimStr,DV_DrawPrimVB,');
+  VtAdd('DV_DrawIdxPrimVB7,DV_SphereVis,DV_GetTexture,DV_SetTexture,');
+  VtAdd('DV_GetTSS,DV_SetTSS,DV_Validate,DV_ApplySB,DV_CaptureSB,');
+  VtAdd('DV_DeleteSB,DV_CreateSB,DV_Load7,DV_LightEnable,DV_GetLightEnable,');
+  VtAdd('DXOK3,DXNI3,DXNI4');
+  VtVP1 := VtNew;
+  VtAdd('VP_QI,COMAddRef,COMRelease,DXOK2,VP_GetViewport,VP_SetViewport,');
+  VtAdd('VP_Transform,DXNI3,VP_SetBack,VP_GetBack,VP_SetBackDepth,');
+  VtAdd('VP_GetBackDepth,VP_Clear,VP_AddLight,VP_DelLight,VP_NextLight');
+  VtVP2 := VtNew;
+  VtAdd('VP_QI,COMAddRef,COMRelease,DXOK2,VP_GetViewport,VP_SetViewport,');
+  VtAdd('VP_Transform,DXNI3,VP_SetBack,VP_GetBack,VP_SetBackDepth,');
+  VtAdd('VP_GetBackDepth,VP_Clear,VP_AddLight,VP_DelLight,VP_NextLight,');
+  VtAdd('VP_GetViewport2,VP_SetViewport2');
+  VtVP3 := VtNew;
+  VtAdd('VP_QI,COMAddRef,COMRelease,DXOK2,VP_GetViewport,VP_SetViewport,');
+  VtAdd('VP_Transform,DXNI3,VP_SetBack,VP_GetBack,VP_SetBackDepth,');
+  VtAdd('VP_GetBackDepth,VP_Clear,VP_AddLight,VP_DelLight,VP_NextLight,');
+  VtAdd('VP_GetViewport2,VP_SetViewport2,VP_SetBackDepth,VP_GetBackDepth,');
+  VtAdd('VP_Clear2');
+  VtMat1 := VtNew;
+  VtAdd('MT_QI,COMAddRef,COMRelease,DXOK2,MT_Set,MT_Get,MT_GetHandle,');
+  VtAdd('DXOK1,DXOK1');
+  VtMat2 := VtNew;
+  VtAdd('MT_QI,COMAddRef,COMRelease,MT_Set,MT_Get,MT_GetHandle');
+  VtMat3 := VtMat2;
+  VtLit := VtNew;
+  VtAdd('LT_QI,COMAddRef,COMRelease,DXOK2,LT_Set,LT_Get');
+  VtTx1 := VtNew;
+  VtAdd('SF_QI,COMAddRef,COMRelease,DXOK3,TX_GetHandle,DXOK3,TX_Load,');
+  VtAdd('DXOK1');
+  VtTx2 := VtNew;
+  VtAdd('SF_QI,COMAddRef,COMRelease,TX_GetHandle,DXOK3,TX_Load');
+  VtEB := VtNew;
+  VtAdd('EB_QI,COMAddRef,COMRelease,DXOK3,EB_Lock,DXOK1,EB_SetData,');
+  VtAdd('EB_GetData,DXNI5,DXOK2');
+  VtVB := VtNew;
+  VtAdd('VB_QI,COMAddRef,COMRelease,VB_Lock,DXOK1,VB_Process,VB_GetDesc,');
+  VtAdd('DXOK3');
+  VtVB7 := VtNew;
+  VtAdd('VB_QI,COMAddRef,COMRelease,VB_Lock,DXOK1,VB_Process,VB_GetDesc,');
+  VtAdd('DXOK3,DXNI6');
+End;
+
+{ ------------------------------------------------------------------ }
+{ Description des peripheriques                                      }
+{ ------------------------------------------------------------------ }
+
+Procedure PrimCaps(P : LongInt);
+Begin
+  FillMem(P, 56, 0);
+  MemL[0:P] := 56;
+  MemL[0:P + 4] := $72;
+  MemL[0:P + 8] := 1 Or $10 Or $20 Or $80 Or $100;
+  MemL[0:P + 12] := $FF;
+  MemL[0:P + 16] := $1FFF;
+  MemL[0:P + 20] := $1FFF;
+  MemL[0:P + 24] := $FF;
+  MemL[0:P + 28] := 2 Or 8 Or $80 Or $200 Or $1000 Or $4000 Or $40000 Or
+                    $80000;
+  MemL[0:P + 32] := 1 Or 4 Or 8 Or $40 Or $80;
+  MemL[0:P + 36] := 1 Or 2 Or 4 Or 8 Or $10 Or $20 Or $100 Or $200 Or
+                    $10000 Or $20000 Or $1000000 Or $2000000;
+  MemL[0:P + 40] := $FF;
+  MemL[0:P + 44] := 7;
+End;
+
+{ D3DDEVICEDESC (versions 1 a 3) ; Hw : peripherique "materiel" }
+Procedure DevDesc(P, Sz : LongInt; Hw : Boolean);
+Begin
+  FillMem(P, Sz, 0);
+  MemL[0:P] := Sz;
+  MemL[0:P + 4] := $FFF;
+  MemL[0:P + 8] := 2;
+  MemL[0:P + 12] := 1 Or $10 Or $40 Or $100 Or $200 Or $400 Or $800 Or
+                    $2000;
+  If Hw Then MemL[0:P + 12] := MemL[0:P + 12] Or $80000;
+  MemL[0:P + 16] := 8; MemL[0:P + 20] := 1;
+  MemL[0:P + 24] := 1;
+  MemL[0:P + 28] := 16; MemL[0:P + 32] := 7; MemL[0:P + 36] := 1;
+  MemL[0:P + 40] := 8;
+  PrimCaps(P + 44); PrimCaps(P + 100);
+  MemL[0:P + 156] := $F00;
+  MemL[0:P + 160] := $500;
+  MemL[0:P + 164] := 0;
+  MemL[0:P + 168] := 65535;
+  If Sz >= 204 Then
+  Begin
+    MemL[0:P + 172] := 1; MemL[0:P + 176] := 1;
+    MemL[0:P + 180] := 2048; MemL[0:P + 184] := 2048;
+  End;
+  If Sz >= 252 Then
+  Begin
+    MemL[0:P + 204] := 8192; MemL[0:P + 208] := 2048;
+    MemL[0:P + 212] := 1;
+    MemL[0:P + 240] := 8;
+    MemL[0:P + 244] := $2BFFF;
+    MemW[0:P + 248] := 2; MemW[0:P + 250] := 2;
+  End;
+End;
+
+{ D3DDEVICEDESC7 }
+Procedure DevDesc7(P, G1 : LongInt; TnL : Boolean);
+Begin
+  FillMem(P, 236, 0);
+  MemL[0:P] := 1 Or $10 Or $40 Or $100 Or $200 Or $400 Or $800 Or $2000 Or
+               $8000 Or $80000;
+  If TnL Then MemL[0:P] := MemL[0:P] Or $10000;
+  PrimCaps(P + 4); PrimCaps(P + 60);
+  MemL[0:P + 116] := $F00; MemL[0:P + 120] := $500;
+  MemL[0:P + 124] := 1; MemL[0:P + 128] := 1;
+  MemL[0:P + 132] := 2048; MemL[0:P + 136] := 2048;
+  MemL[0:P + 140] := 8192; MemL[0:P + 144] := 2048;
+  MemL[0:P + 148] := 1;
+  MemL[0:P + 176] := 8;
+  MemL[0:P + 180] := $2BFFF;
+  MemW[0:P + 184] := 2; MemW[0:P + 186] := 2;
+  MemL[0:P + 188] := 8;
+  MemL[0:P + 192] := LFl(10000000000.0);
+  If G1 <> 0 Then MoveMem(G1, P + 196, 16);
+  MemL[0:P + 216] := $3E;
+End;
+
+Procedure GuidHal(P : LongInt);
+Begin
+  DXGuid(P, LongInt($84E63DE0), $46AA, $11CF, LongInt($00006F81),
+         LongInt($6E1520C0));
+End;
+
+Procedure GuidRGB(P : LongInt);
+Begin
+  DXGuid(P, LongInt($A4665C60), $2673, $11CF, LongInt($AA001AA3),
+         LongInt($5633B900));
+End;
+
+Procedure GuidTnL(P : LongInt);
+Begin
+  DXGuid(P, LongInt($F5049E78), $4861, $11D2, LongInt($A00007A4),
+         LongInt($A82906C9));
+End;
+
+{ ------------------------------------------------------------------ }
+{ IDirect3D (vues de DirectDraw)                                     }
 { ------------------------------------------------------------------ }
 
 Function D3DQueryDD(C, Riid, Ppv : LongInt) : LongInt;
 Begin
   D3DQueryDD := E_NOINTERFACE;
+  If Riid = 0 Then Exit;
+  D3DInitVt;
+  Case MemL[0:Riid] Of
+    LongInt($3BBA0080) : D3DQueryDD := ComGive(C, 4, VtD3D1, Ppv);
+    LongInt($6AAE1EC1) : D3DQueryDD := ComGive(C, 5, VtD3D2, Ppv);
+    LongInt($BB223240) : D3DQueryDD := ComGive(C, 6, VtD3D3, Ppv);
+    LongInt($F5049E77) : D3DQueryDD := ComGive(C, 7, VtD3D7, Ppv);
+  End;
+End;
+
+Function D3_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  If GuidUnk(Riid) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    D3_QI := DD_OK;
+    Exit;
+  End;
+  D3_QI := DD_QI(T, Riid, Ppv);
+End;
+
+Function D3_EnumDevices(T, Cb, Ctx : LongInt) : LongInt;
+Var V, G, Hal, Hel, Sz, D, N, K : LongInt;
+Begin
+  V := IfVer(T);
+  D3_EnumDevices := DD_OK;
+  If Cb = 0 Then Exit;
+  Case V Of
+    4 : Sz := 172;
+    5 : Sz := 204;
+  Else
+    Sz := 252;
+  End;
+  G := KAlloc(16); Hal := KAlloc(256); Hel := KAlloc(256);
+  For K := 0 To 1 Do
+  Begin
+    If K = 0 Then
+    Begin
+      GuidRGB(G);
+      DevDesc(Hal, Sz, False);
+      MemL[0:Hal + 4] := 0;
+      DevDesc(Hel, Sz, False);
+      D := DXStr('Emulation RGB de Pasdows', False);
+      N := DXStr('RGB Emulation', False);
+    End
+    Else
+    Begin
+      GuidHal(G);
+      DevDesc(Hal, Sz, True);
+      DevDesc(Hel, Sz, True);
+      D := DXStr('Pasdows Direct3D HAL (' + DXCardName + ')', False);
+      N := DXStr('Direct3D HAL', False);
+    End;
+    V := DXCall6(Cb, G, D, N, Hal, Hel, Ctx);
+    KFree(D); KFree(N);
+    If V = 0 Then Break;
+  End;
+  KFree(G); KFree(Hal); KFree(Hel);
+End;
+
+Function D3_EnumDevices7(T, Cb, Ctx : LongInt) : LongInt;
+Var G, P, D, N, K, R : LongInt;
+Begin
+  D3_EnumDevices7 := DD_OK;
+  If Cb = 0 Then Exit;
+  G := KAlloc(16); P := KAlloc(256);
+  For K := 0 To 2 Do
+  Begin
+    Case K Of
+      0 :
+      Begin
+        GuidRGB(G); DevDesc7(P, G, False);
+        D := DXStr('Emulation RGB de Pasdows', False);
+        N := DXStr('RGB Emulation', False);
+      End;
+      1 :
+      Begin
+        GuidHal(G); DevDesc7(P, G, False);
+        D := DXStr('Pasdows Direct3D HAL', False);
+        N := DXStr('Direct3D HAL', False);
+      End;
+    Else
+      Begin
+        GuidTnL(G); DevDesc7(P, G, True);
+        D := DXStr('Pasdows Direct3D T&L HAL', False);
+        N := DXStr('Direct3D T&L HAL', False);
+      End;
+    End;
+    R := DXCall4(Cb, D, N, P, Ctx);
+    KFree(D); KFree(N);
+    If R = 0 Then Break;
+  End;
+  KFree(G); KFree(P);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Peripheriques Direct3D 1 a 7                                       }
+{ ------------------------------------------------------------------ }
+
+Function DevVt(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0 : DevVt := VtDev1;
+    1 : DevVt := VtDev2;
+    2 : DevVt := VtDev3;
+  Else
+    DevVt := VtDev7;
+  End;
+End;
+
+{ Nouveau peripherique de version Ver sur la surface S (coeur) }
+Function DevNew(S, Ver, PP : LongInt) : LongInt;
+Var C, R, Sl : LongInt;
+Begin
+  DevNew := DDERR_INVALIDPARAMS;
+  If (S = 0) Or (PP = 0) Then Exit;
+  D3DInitVt;
+  Case Ver Of
+    1 : Sl := 0;
+    2 : Sl := 1;
+    3 : Sl := 2;
+  Else
+    Sl := 3;
+  End;
+  C := ComNew(0, 11, 96);
+  ComView(C, Sl, DevVt(Sl));
+  R := KAlloc(SizeOf(TD3D) + 16);
+  If R = 0 Then
+  Begin
+    KFree(C);
+    DevNew := E_OUTOFMEMORY;
+    Exit;
+  End;
+  FillMem(R, SizeOf(TD3D), 0);
+  MemL[0:C + 64] := R;
+  MemL[0:C + 68] := Ver;
+  DevSel(C);
+  COMAddRef(S);
+  D3G^.RT := S;
+  D3G^.Ver := Ver;
+  D3G^.Core := C;
+  D3G^.D3DObj := DXObj;
+  D3DDefaults;
+  D3G^.UseTSS := Ord(Ver >= 7);
+  MemL[0:PP] := C;
+  KLog('Direct3D : peripherique version ' + IntStr(Ver) + ' sur ' +
+       IntStr(MemL[0:S + 64]) + 'x' + IntStr(MemL[0:S + 68]) + 'x' +
+       IntStr(MemL[0:S + 88]));
+  DevNew := DD_OK;
 End;
 
 Function D3DQuerySurf(C, Riid, Ppv : LongInt) : LongInt;
 Begin
   D3DQuerySurf := E_NOINTERFACE;
+  If Riid = 0 Then Exit;
+  D3DInitVt;
+  Case MemL[0:Riid] Of
+    LongInt($2CDCD9E0) : D3DQuerySurf := ComGive(C, 6, VtTx1, Ppv);
+    LongInt($93281502) : D3DQuerySurf := ComGive(C, 7, VtTx2, Ppv);
+    LongInt($A4665C60), LongInt($84E63DE0), LongInt($F2086B20),
+    LongInt($881949A1), LongInt($50936643) :
+      D3DQuerySurf := DevNew(C, 1, Ppv);
+  End;
 End;
 
 Procedure D3DSurfGone(S : LongInt);
 Begin
 End;
 
-Procedure D3DDestroy(C, K : LongInt);
-Begin
-End;
-
 Function D3DCoCreate(Clsid, PO : LongInt) : LongInt;
 Begin
   D3DCoCreate := REGDB_E_CLASSNOTREG;
+End;
+
+Function D3_CreateDevice2(T, Cls, S, PP : LongInt) : LongInt;
+Begin
+  D3_CreateDevice2 := DevNew(Cor(S), 2, PP);
+End;
+
+Function D3_CreateDevice3(T, Cls, S, PP, Outer : LongInt) : LongInt;
+Begin
+  D3_CreateDevice3 := DevNew(Cor(S), 3, PP);
+End;
+
+Function D3_CreateDevice7(T, Cls, S, PP : LongInt) : LongInt;
+Begin
+  D3_CreateDevice7 := DevNew(Cor(S), 7, PP);
+End;
+
+Function D3_FindDevice(T, PS, PR : LongInt) : LongInt;
+Var Sz : LongInt;
+Begin
+  D3_FindDevice := DDERR_INVALIDPARAMS;
+  If PR = 0 Then Exit;
+  Sz := MemL[0:PR];
+  If Sz < 20 Then Sz := 524;
+  FillMem(PR + 4, Sz - 4, 0);
+  GuidHal(PR + 4);
+  DevDesc(PR + 20, 252, True);
+  DevDesc(PR + 272, 252, True);
+  D3_FindDevice := DD_OK;
+End;
+
+Function DV_QI(T, Riid, Ppv : LongInt) : LongInt;
+Var C, K : LongInt;
+Begin
+  DV_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  C := Cor(T);
+  K := -1;
+  If GuidUnk(Riid) Then K := IfVer(T)
+  Else
+    Case MemL[0:Riid] Of
+      LongInt($64108800) : K := 0;
+      LongInt($93281501) : K := 1;
+      LongInt($B0AB3B60) : K := 2;
+      LongInt($F5049E79) : K := 3;
+    End;
+  If K >= 0 Then DV_QI := ComGive(C, K, DevVt(K), Ppv);
+End;
+
+Function DV_GetDirect3D(T, PP : LongInt) : LongInt;
+Var C, V : LongInt;
+Begin
+  C := Cor(T);
+  DV_GetDirect3D := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(C) Or (D3G^.D3DObj = 0) Then Exit;
+  Case D3G^.Ver Of
+    1 : DV_GetDirect3D := ComGive(D3G^.D3DObj, 4, VtD3D1, PP);
+    2 : DV_GetDirect3D := ComGive(D3G^.D3DObj, 5, VtD3D2, PP);
+    3 : DV_GetDirect3D := ComGive(D3G^.D3DObj, 6, VtD3D3, PP);
+  Else
+    DV_GetDirect3D := ComGive(D3G^.D3DObj, 7, VtD3D7, PP);
+  End;
+  V := 0;
+End;
+
+Function DV_GetCaps(T, PHal, PHel : LongInt) : LongInt;
+Var Sz : LongInt;
+Begin
+  If PHal <> 0 Then
+  Begin
+    Sz := MemL[0:PHal];
+    If (Sz < 172) Or (Sz > 252) Then Sz := 252;
+    DevDesc(PHal, Sz, True);
+  End;
+  If PHel <> 0 Then
+  Begin
+    Sz := MemL[0:PHel];
+    If (Sz < 172) Or (Sz > 252) Then Sz := 252;
+    DevDesc(PHel, Sz, True);
+  End;
+  DV_GetCaps := DD_OK;
+End;
+
+Function DV_GetCaps7(T, P : LongInt) : LongInt;
+Var G : Array[0..3] Of LongInt;
+Begin
+  GuidHal(LongInt(@G));
+  If P <> 0 Then DevDesc7(P, LongInt(@G), False);
+  DV_GetCaps7 := DD_OK;
+End;
+
+Function DV_GetStats(T, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And DevSel(Cor(T)) Then
+  Begin
+    FillMem(P + 4, 20, 0);
+    MemL[0:P + 4] := D3G^.Tris;
+    MemL[0:P + 20] := D3G^.Verts;
+  End;
+  DV_GetStats := DD_OK;
+End;
+
+{ Formats de texture : 565, 1555, 4444, 555, 8888, X888, palette 8 }
+Procedure TexFmt(K, P : LongInt);
+Begin
+  FillMem(P, 32, 0);
+  MemL[0:P] := 32;
+  MemL[0:P + 4] := $40;
+  Case K Of
+    0 :
+    Begin
+      MemL[0:P + 12] := 16; MemL[0:P + 16] := $F800;
+      MemL[0:P + 20] := $7E0; MemL[0:P + 24] := $1F;
+    End;
+    1 :
+    Begin
+      MemL[0:P + 4] := $41; MemL[0:P + 12] := 16; MemL[0:P + 16] := $7C00;
+      MemL[0:P + 20] := $3E0; MemL[0:P + 24] := $1F;
+      MemL[0:P + 28] := $8000;
+    End;
+    2 :
+    Begin
+      MemL[0:P + 4] := $41; MemL[0:P + 12] := 16; MemL[0:P + 16] := $F00;
+      MemL[0:P + 20] := $F0; MemL[0:P + 24] := $F;
+      MemL[0:P + 28] := $F000;
+    End;
+    3 :
+    Begin
+      MemL[0:P + 12] := 16; MemL[0:P + 16] := $7C00;
+      MemL[0:P + 20] := $3E0; MemL[0:P + 24] := $1F;
+    End;
+    4 :
+    Begin
+      MemL[0:P + 4] := $41; MemL[0:P + 12] := 32;
+      MemL[0:P + 16] := $FF0000; MemL[0:P + 20] := $FF00;
+      MemL[0:P + 24] := $FF; MemL[0:P + 28] := LongInt($FF000000);
+    End;
+    5 :
+    Begin
+      MemL[0:P + 12] := 32; MemL[0:P + 16] := $FF0000;
+      MemL[0:P + 20] := $FF00; MemL[0:P + 24] := $FF;
+    End;
+  Else
+    Begin
+      MemL[0:P + 4] := $60; MemL[0:P + 12] := 8;
+    End;
+  End;
+End;
+
+Function DV_EnumTexFmt(T, Cb, Ctx : LongInt) : LongInt;
+Var P, K : LongInt;
+Begin
+  DV_EnumTexFmt := DD_OK;
+  If Cb = 0 Then Exit;
+  P := KAlloc(64);
+  For K := 0 To 6 Do
+  Begin
+    TexFmt(K, P);
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
+End;
+
+Function DV_EnumTexFmt1(T, Cb, Ctx : LongInt) : LongInt;
+Var P, K : LongInt;
+Begin
+  DV_EnumTexFmt1 := DD_OK;
+  If Cb = 0 Then Exit;
+  P := KAlloc(128);
+  For K := 0 To 6 Do
+  Begin
+    FillMem(P, 108, 0);
+    MemL[0:P] := 108;
+    MemL[0:P + 4] := 1 Or $1000;
+    MemL[0:P + 104] := dcTexture;
+    TexFmt(K, P + 72);
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
+End;
+
+Function D3_EnumZFormats(T, Cls, Cb, Ctx : LongInt) : LongInt;
+Var P, K : LongInt;
+Begin
+  D3_EnumZFormats := DD_OK;
+  If Cb = 0 Then Exit;
+  P := KAlloc(64);
+  For K := 0 To 1 Do
+  Begin
+    FillMem(P, 32, 0);
+    MemL[0:P] := 32; MemL[0:P + 4] := $400;
+    If K = 0 Then
+    Begin
+      MemL[0:P + 12] := 16; MemL[0:P + 20] := $FFFF;
+    End
+    Else
+    Begin
+      MemL[0:P + 12] := 32; MemL[0:P + 20] := $FFFFFF;
+    End;
+    If DXCall2(Cb, P, Ctx) = 0 Then Break;
+  End;
+  KFree(P);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fenetres d'affichage : +64 X, +68 Y, +72 L, +76 H, +80..+92 volume  }
+{ de decoupage (flottants), +96/+100 Z min/max, +104 materiau de     }
+{ fond, +108 peripherique, +112 surface de fond Z, +116 lumieres,    }
+{ +120 liste (16)                                                    }
+{ ------------------------------------------------------------------ }
+
+Procedure VPApply(VP : LongInt);
+Begin
+  If VP = 0 Then Exit;
+  D3G^.VX := MemL[0:VP + 64]; D3G^.VY := MemL[0:VP + 68];
+  D3G^.VW := MemL[0:VP + 72]; D3G^.VH := MemL[0:VP + 76];
+  D3G^.ClX := FlL(MemL[0:VP + 80]); D3G^.ClY := FlL(MemL[0:VP + 84]);
+  D3G^.ClW := FlL(MemL[0:VP + 88]); D3G^.ClH := FlL(MemL[0:VP + 92]);
+  If Abs(D3G^.ClW) < 0.000001 Then D3G^.ClW := 2;
+  If Abs(D3G^.ClH) < 0.000001 Then D3G^.ClH := 2;
+  D3G^.VMinZ := FlL(MemL[0:VP + 96]); D3G^.VMaxZ := FlL(MemL[0:VP + 100]);
+  If D3G^.VMaxZ <= D3G^.VMinZ Then
+  Begin
+    D3G^.VMinZ := 0; D3G^.VMaxZ := 1;
+  End;
+End;
+
+{ Lumieres et materiau de D3D 1 a 3 (objets) vers l'etat du moteur }
+Procedure D3DLegacySync;
+Var VP, I, L, M, N : LongInt;
+Begin
+  If D3G^.Ver > 3 Then Exit;
+  For I := 0 To 15 Do D3G^.Lt[I].On := 0;
+  VP := D3G^.VPCur;
+  If VP <> 0 Then
+  Begin
+    N := Min(MemL[0:VP + 116], 16);
+    For I := 0 To N - 1 Do
+    Begin
+      L := MemL[0:VP + 120 + I * 4];
+      If L = 0 Then Continue;
+      If (MemL[0:L + 140] And 1) = 0 Then Continue;
+      D3G^.Lt[I].On := 1;
+      D3G^.Lt[I].Typ := MemL[0:L + 68];
+      D3G^.Lt[I].Dif[0] := FlM(L + 72); D3G^.Lt[I].Dif[1] := FlM(L + 76);
+      D3G^.Lt[I].Dif[2] := FlM(L + 80); D3G^.Lt[I].Dif[3] := 1;
+      If (MemL[0:L + 140] And 2) = 0 Then
+      Begin
+        D3G^.Lt[I].Spe[0] := D3G^.Lt[I].Dif[0];
+        D3G^.Lt[I].Spe[1] := D3G^.Lt[I].Dif[1];
+        D3G^.Lt[I].Spe[2] := D3G^.Lt[I].Dif[2];
+      End
+      Else
+      Begin
+        D3G^.Lt[I].Spe[0] := 0; D3G^.Lt[I].Spe[1] := 0;
+        D3G^.Lt[I].Spe[2] := 0;
+      End;
+      D3G^.Lt[I].Amb[0] := 0; D3G^.Lt[I].Amb[1] := 0;
+      D3G^.Lt[I].Amb[2] := 0;
+      D3G^.Lt[I].Pos[0] := FlM(L + 88); D3G^.Lt[I].Pos[1] := FlM(L + 92);
+      D3G^.Lt[I].Pos[2] := FlM(L + 96);
+      D3G^.Lt[I].Dir[0] := FlM(L + 100); D3G^.Lt[I].Dir[1] := FlM(L + 104);
+      D3G^.Lt[I].Dir[2] := FlM(L + 108);
+      D3G^.Lt[I].Rng := FlM(L + 112); D3G^.Lt[I].Fall := FlM(L + 116);
+      D3G^.Lt[I].A0 := FlM(L + 120); D3G^.Lt[I].A1 := FlM(L + 124);
+      D3G^.Lt[I].A2 := FlM(L + 128);
+      If (D3G^.Lt[I].A0 = 0) And (D3G^.Lt[I].A1 = 0) And
+         (D3G^.Lt[I].A2 = 0) Then D3G^.Lt[I].A0 := 1;
+      D3G^.Lt[I].Th := FlM(L + 132); D3G^.Lt[I].Ph := FlM(L + 136);
+    End;
+  End;
+  M := D3G^.LS[1];
+  If M <> 0 Then
+  Begin
+    For I := 0 To 15 Do D3G^.Mt[I] := FlM(M + 68 + I * 4);
+    D3G^.Mt[16] := FlM(M + 132);
+  End
+  Else
+  Begin
+    For I := 0 To 15 Do D3G^.Mt[I] := 0;
+    D3G^.Mt[0] := 1; D3G^.Mt[1] := 1; D3G^.Mt[2] := 1; D3G^.Mt[3] := 1;
+  End;
+  D3G^.RS[rsAmbient] := D3G^.LS[2];
+  D3G^.RS[rsColorVtx] := 0;
+End;
+
+Function D3_CreateViewport(T, PP, Outer : LongInt) : LongInt;
+Var V, C : LongInt;
+Begin
+  V := IfVer(T);
+  D3DInitVt;
+  D3_CreateViewport := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  C := ComNew(0, 12, 192);
+  Case V Of
+    4 : ComView(C, 0, VtVP1);
+    5 : ComView(C, 1, VtVP2);
+  Else
+    ComView(C, 2, VtVP3);
+  End;
+  MemL[0:C + 80] := LFl(-1); MemL[0:C + 84] := LFl(1);
+  MemL[0:C + 88] := LFl(2); MemL[0:C + 92] := LFl(2);
+  MemL[0:C + 100] := LFl(1);
+  MemL[0:PP] := C;
+  D3_CreateViewport := DD_OK;
+End;
+
+Function VP_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  VP_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, $4417C146) Or
+     GuidIs(Riid, LongInt($93281500)) Or GuidIs(Riid, LongInt($B0AB3B61))
+  Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    VP_QI := DD_OK;
+  End;
+End;
+
+{ Recalculer le peripherique si la fenetre est la sienne }
+Procedure VPChanged(C : LongInt);
+Begin
+  If (MemL[0:C + 108] <> 0) And DevSel(MemL[0:C + 108]) Then
+    If D3G^.VPCur = C Then VPApply(C);
+End;
+
+Function VP_SetViewport(T, P : LongInt) : LongInt;
+Var C : LongInt; MX, MY : Double;
+Begin
+  C := Cor(T);
+  VP_SetViewport := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:C + 64] := MemL[0:P + 4]; MemL[0:C + 68] := MemL[0:P + 8];
+  MemL[0:C + 72] := MemL[0:P + 12]; MemL[0:C + 76] := MemL[0:P + 16];
+  MX := FlM(P + 28); MY := FlM(P + 32);
+  If MX <= 0 Then MX := 1;
+  If MY <= 0 Then MY := 1;
+  MemL[0:C + 80] := LFl(-MX); MemL[0:C + 88] := LFl(2 * MX);
+  MemL[0:C + 84] := LFl(MY); MemL[0:C + 92] := LFl(2 * MY);
+  MemL[0:C + 96] := MemL[0:P + 36]; MemL[0:C + 100] := MemL[0:P + 40];
+  VPChanged(C);
+  VP_SetViewport := DD_OK;
+End;
+
+Function VP_GetViewport(T, P : LongInt) : LongInt;
+Var C : LongInt; MX, MY : Double;
+Begin
+  C := Cor(T);
+  VP_GetViewport := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  FillMem(P, 44, 0);
+  MemL[0:P] := 44;
+  MemL[0:P + 4] := MemL[0:C + 64]; MemL[0:P + 8] := MemL[0:C + 68];
+  MemL[0:P + 12] := MemL[0:C + 72]; MemL[0:P + 16] := MemL[0:C + 76];
+  MX := FlL(MemL[0:C + 88]) / 2; MY := FlL(MemL[0:C + 92]) / 2;
+  If MX <= 0 Then MX := 1;
+  If MY <= 0 Then MY := 1;
+  MemL[0:P + 20] := LFl(MemL[0:C + 72] / (2 * MX));
+  MemL[0:P + 24] := LFl(MemL[0:C + 76] / (2 * MY));
+  MemL[0:P + 28] := LFl(MX); MemL[0:P + 32] := LFl(MY);
+  MemL[0:P + 36] := MemL[0:C + 96]; MemL[0:P + 40] := MemL[0:C + 100];
+  VP_GetViewport := DD_OK;
+End;
+
+Function VP_SetViewport2(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  VP_SetViewport2 := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MoveMem(P + 4, C + 64, 40);
+  VPChanged(C);
+  VP_SetViewport2 := DD_OK;
+End;
+
+Function VP_GetViewport2(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  VP_GetViewport2 := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:P] := 44;
+  MoveMem(C + 64, P + 4, 40);
+  VP_GetViewport2 := DD_OK;
+End;
+
+{ D3DTRANSFORMDATA : positions transformees (D3DTLVERTEX en sortie) }
+Function VP_Transform(T, N, D, Fl, POff : LongInt) : LongInt;
+Var C, I, Src, Dst, SS, DS : LongInt; V : TVtx;
+Begin
+  C := Cor(T);
+  VP_Transform := DDERR_INVALIDPARAMS;
+  If (D = 0) Or (MemL[0:C + 108] = 0) Or Not DevSel(MemL[0:C + 108]) Then
+    Exit;
+  VPApply(C);
+  D3DMats;
+  Src := MemL[0:D + 4]; SS := MemL[0:D + 8];
+  Dst := MemL[0:D + 12]; DS := MemL[0:D + 16];
+  For I := 0 To N - 1 Do
+  Begin
+    FvfParse($2);
+    VFStride := SS;
+    DVBase := 0;
+    D3DProcess(Src + I * SS, 1, False);
+    V := DV^[0];
+    D3DProject(V);
+    If Dst <> 0 Then
+    Begin
+      MemL[0:Dst + I * DS] := LFl(V.SX);
+      MemL[0:Dst + I * DS + 4] := LFl(V.SY);
+      MemL[0:Dst + I * DS + 8] := LFl(V.SZ);
+      MemL[0:Dst + I * DS + 12] := LFl(V.RW);
+    End;
+  End;
+  MemL[0:D + 24] := 0;
+  If POff <> 0 Then MemL[0:POff] := 0;
+  VP_Transform := DD_OK;
+End;
+
+Function VP_SetBack(T, H : LongInt) : LongInt;
+Begin
+  MemL[0:Cor(T) + 104] := H;
+  VP_SetBack := DD_OK;
+End;
+
+Function VP_GetBack(T, PH, PV : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := MemL[0:Cor(T) + 104];
+  If PV <> 0 Then MemL[0:PV] := Ord(MemL[0:Cor(T) + 104] <> 0);
+  VP_GetBack := DD_OK;
+End;
+
+Function VP_SetBackDepth(T, S : LongInt) : LongInt;
+Begin
+  MemL[0:Cor(T) + 112] := Cor(S);
+  VP_SetBackDepth := DD_OK;
+End;
+
+Function VP_GetBackDepth(T, PP, PV : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := MemL[0:Cor(T) + 112];
+  If PV <> 0 Then MemL[0:PV] := Ord(MemL[0:Cor(T) + 112] <> 0);
+  VP_GetBackDepth := DD_OK;
+End;
+
+Function VP_Clear2(T, N, Rects, Fl, Color, Z, St : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  VP_Clear2 := DD_OK;
+  If (MemL[0:C + 108] = 0) Or Not DevSel(MemL[0:C + 108]) Then Exit;
+  VPApply(C);
+  D3DClear(N, Rects, Fl, Color, Z);
+End;
+
+Function VP_Clear(T, N, Rects, Fl : LongInt) : LongInt;
+Var C, M, Col : LongInt;
+Begin
+  C := Cor(T);
+  M := MemL[0:C + 104];
+  Col := 0;
+  If M <> 0 Then
+    Col := (Clamp8(DRound(FlM(M + 80) * 255)) Shl 24) Or
+           (Clamp8(DRound(FlM(M + 68) * 255)) Shl 16) Or
+           (Clamp8(DRound(FlM(M + 72) * 255)) Shl 8) Or
+           Clamp8(DRound(FlM(M + 76) * 255));
+  VP_Clear := VP_Clear2(T, N, Rects, Fl, Col, LFl(1.0), 0);
+End;
+
+Function VP_AddLight(T, L : LongInt) : LongInt;
+Var C, N : LongInt;
+Begin
+  C := Cor(T); L := Cor(L);
+  VP_AddLight := DDERR_INVALIDPARAMS;
+  N := MemL[0:C + 116];
+  If (L = 0) Or (N >= 16) Then Exit;
+  COMAddRef(L);
+  MemL[0:C + 120 + N * 4] := L;
+  MemL[0:C + 116] := N + 1;
+  VP_AddLight := DD_OK;
+End;
+
+Function VP_DelLight(T, L : LongInt) : LongInt;
+Var C, N, I, J : LongInt;
+Begin
+  C := Cor(T); L := Cor(L);
+  VP_DelLight := DDERR_INVALIDPARAMS;
+  N := MemL[0:C + 116];
+  For I := 0 To N - 1 Do
+    If MemL[0:C + 120 + I * 4] = L Then
+    Begin
+      For J := I To N - 2 Do
+        MemL[0:C + 120 + J * 4] := MemL[0:C + 120 + J * 4 + 4];
+      MemL[0:C + 116] := N - 1;
+      COMRelease(L);
+      VP_DelLight := DD_OK;
+      Exit;
+    End;
+End;
+
+Function VP_NextLight(T, Ref, PP, Fl : LongInt) : LongInt;
+Var C, N, I, K : LongInt;
+Begin
+  C := Cor(T); Ref := Cor(Ref);
+  VP_NextLight := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  N := MemL[0:C + 116];
+  If N = 0 Then Exit;
+  K := -1;
+  If (Fl And 2) <> 0 Then K := 0
+  Else If (Fl And 4) <> 0 Then K := N - 1
+  Else
+    For I := 0 To N - 2 Do
+      If MemL[0:C + 120 + I * 4] = Ref Then K := I + 1;
+  If K < 0 Then Exit;
+  MemL[0:PP] := MemL[0:C + 120 + K * 4];
+  COMAddRef(MemL[0:PP]);
+  VP_NextLight := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Materiaux (+64 D3DMATERIAL) et lumieres (+64 D3DLIGHT2)            }
+{ ------------------------------------------------------------------ }
+
+Function D3_CreateMaterial(T, PP, Outer : LongInt) : LongInt;
+Var V, C : LongInt;
+Begin
+  V := IfVer(T);
+  D3DInitVt;
+  D3_CreateMaterial := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  C := ComNew(0, 13, 160);
+  If V = 4 Then ComView(C, 0, VtMat1) Else ComView(C, 1, VtMat2);
+  MemL[0:C + 64] := 80;
+  MemL[0:PP] := C;
+  D3_CreateMaterial := DD_OK;
+End;
+
+Function MT_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  MT_QI := COMQIUnk(T, Riid, Ppv);
+  If (Ppv <> 0) And (Riid <> 0) And ((MemL[0:Riid] = $4417C144) Or
+     (MemL[0:Riid] = LongInt($93281503)) Or
+     (MemL[0:Riid] = LongInt($CA9C46F4))) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    MT_QI := DD_OK;
+  End;
+End;
+
+Function MT_Set(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(P + 4, Cor(T) + 68, 76);
+  MT_Set := DD_OK;
+End;
+
+Function MT_Get(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 80;
+    MoveMem(Cor(T) + 68, P + 4, 76);
+  End;
+  MT_Get := DD_OK;
+End;
+
+Function MT_GetHandle(T, Dev, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := Cor(T);
+  MT_GetHandle := DD_OK;
+End;
+
+Function D3_CreateLight(T, PP, Outer : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  D3DInitVt;
+  D3_CreateLight := DDERR_INVALIDPARAMS;
+  If PP = 0 Then Exit;
+  C := ComNew(0, 14, 160);
+  ComView(C, 0, VtLit);
+  MemL[0:C + 64] := 80;
+  MemL[0:C + 140] := 1;
+  MemL[0:PP] := C;
+  D3_CreateLight := DD_OK;
+End;
+
+Function LT_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  LT_QI := COMQIUnk(T, Riid, Ppv);
+End;
+
+Function LT_Set(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  LT_Set := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MoveMem(P + 4, C + 68, 72);
+  If MemL[0:P] >= 80 Then MemL[0:C + 140] := MemL[0:P + 76]
+  Else MemL[0:C + 140] := 1;
+  LT_Set := DD_OK;
+End;
+
+Function LT_Get(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  LT_Get := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MoveMem(C + 68, P + 4, 72);
+  If MemL[0:P] >= 80 Then MemL[0:P + 76] := MemL[0:C + 140];
+  LT_Get := DD_OK;
+End;
+
+{ Textures (vues des surfaces) : la poignee est le coeur }
+Function TX_GetHandle(T, Dev, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := Cor(T);
+  TX_GetHandle := DD_OK;
+End;
+
+Procedure TxCopy(D, S : LongInt);
+Begin
+  While (D <> 0) And (S <> 0) Do
+  Begin
+    SfXfer(D, 0, 0, MemL[0:D + 64], MemL[0:D + 68], S, 0, 0,
+           MemL[0:S + 64], MemL[0:S + 68], False, False, 0, 0, 0, 0, False,
+           False);
+    If MemL[0:S + 124] <> 0 Then
+    Begin
+      If MemL[0:D + 124] = 0 Then SF_SetPalette(D, MemL[0:S + 124])
+      Else MoveMem(MemL[0:S + 124] + 68, MemL[0:D + 124] + 68, 1024);
+    End;
+    MemL[0:D + 132] := MemL[0:S + 132]; MemL[0:D + 136] := MemL[0:S + 136];
+    MemL[0:D + 148] := MemL[0:S + 148];
+    D := MemL[0:D + 116]; S := MemL[0:S + 116];
+  End;
+End;
+
+Function TX_Load(T, Src : LongInt) : LongInt;
+Begin
+  TxCopy(Cor(T), Cor(Src));
+  TX_Load := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Peripheriques : etats, transformations, dessin                     }
+{ ------------------------------------------------------------------ }
+
+Function DV_AddViewport(T, VP : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DV_AddViewport := DDERR_INVALIDPARAMS;
+  VP := Cor(VP);
+  If (VP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  For I := 0 To 15 Do
+    If D3G^.VPs[I] = 0 Then
+    Begin
+      D3G^.VPs[I] := VP;
+      COMAddRef(VP);
+      MemL[0:VP + 108] := Cor(T);
+      DV_AddViewport := DD_OK;
+      Exit;
+    End;
+End;
+
+Function DV_DelViewport(T, VP : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DV_DelViewport := DDERR_INVALIDPARAMS;
+  VP := Cor(VP);
+  If Not DevSel(Cor(T)) Then Exit;
+  For I := 0 To 15 Do
+    If (VP <> 0) And (D3G^.VPs[I] = VP) Then
+    Begin
+      D3G^.VPs[I] := 0;
+      If D3G^.VPCur = VP Then D3G^.VPCur := 0;
+      COMRelease(VP);
+      DV_DelViewport := DD_OK;
+      Exit;
+    End;
+End;
+
+Function DV_NextViewport(T, Ref, PP, Fl : LongInt) : LongInt;
+Var I, K : LongInt;
+Begin
+  DV_NextViewport := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PP] := 0;
+  Ref := Cor(Ref);
+  K := -1;
+  For I := 15 DownTo 0 Do
+    If D3G^.VPs[I] <> 0 Then
+    Begin
+      If (Fl And 4) <> 0 Then
+      Begin
+        If K < 0 Then K := I;
+      End
+      Else If (Fl And 2) <> 0 Then K := I
+      Else If (I > 0) And (D3G^.VPs[I - 1] = Ref) Then K := I;
+    End;
+  If K < 0 Then Exit;
+  MemL[0:PP] := D3G^.VPs[K];
+  COMAddRef(D3G^.VPs[K]);
+  DV_NextViewport := DD_OK;
+End;
+
+Function DV_SetCurVP(T, VP : LongInt) : LongInt;
+Begin
+  DV_SetCurVP := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Then Exit;
+  D3G^.VPCur := Cor(VP);
+  If D3G^.VPCur <> 0 Then
+  Begin
+    MemL[0:D3G^.VPCur + 108] := Cor(T);
+    VPApply(D3G^.VPCur);
+  End;
+  DV_SetCurVP := DD_OK;
+End;
+
+Function DV_GetCurVP(T, PP : LongInt) : LongInt;
+Begin
+  DV_GetCurVP := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PP] := D3G^.VPCur;
+  If D3G^.VPCur = 0 Then Exit;
+  COMAddRef(D3G^.VPCur);
+  DV_GetCurVP := DD_OK;
+End;
+
+Function DV_BeginScene(T : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3G^.InScene := 1;
+  DV_BeginScene := DD_OK;
+End;
+
+Function DV_EndScene(T : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then
+  Begin
+    D3G^.InScene := 0;
+    If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, True);
+  End;
+  DV_EndScene := DD_OK;
+End;
+
+Function DV_SetRT(T, S, Fl : LongInt) : LongInt;
+Begin
+  DV_SetRT := DDERR_INVALIDPARAMS;
+  S := Cor(S);
+  If (S = 0) Or Not DevSel(Cor(T)) Then Exit;
+  COMAddRef(S);
+  If D3G^.RT <> 0 Then COMRelease(D3G^.RT);
+  D3G^.RT := S;
+  If D3G^.Ver <= 3 Then
+  Begin
+    D3G^.VX := 0; D3G^.VY := 0;
+    D3G^.VW := MemL[0:S + 64]; D3G^.VH := MemL[0:S + 68];
+  End;
+  DV_SetRT := DD_OK;
+End;
+
+Function DV_GetRT(T, PP : LongInt) : LongInt;
+Var K : LongInt;
+Begin
+  DV_GetRT := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If D3G^.Ver >= 7 Then K := 4 Else If D3G^.Ver = 3 Then K := 3 Else K := 0;
+  DV_GetRT := ComGive(D3G^.RT, K, SfVt(K), PP);
+End;
+
+{ ---------------------------- blocs d'etats ------------------------ }
+{ Bloc : +0 nombre, +4 capacite, puis (sorte, indice, valeur) ; les
+  valeurs longues (matrices, materiau, lumiere, viewport) sont des
+  blocs alloues. Sortes : 1 etat de rendu, 2 etat d'etage, 3 texture,
+  4 matrice, 5 materiau, 6 lumiere, 7 lumiere active, 8 viewport }
+
+Function SBNew : LongInt;
+Var B : LongInt;
+Begin
+  B := KAlloc(8 + 64 * 12);
+  MemL[0:B] := 0; MemL[0:B + 4] := 64;
+  SBNew := B;
+End;
+
+Procedure SBAdd(Var B : LongInt; K, I, V : LongInt);
+Var N, J, NB : LongInt;
+Begin
+  N := MemL[0:B];
+  For J := 0 To N - 1 Do
+    If (MemL[0:B + 8 + J * 12] = K) And (MemL[0:B + 12 + J * 12] = I) Then
+    Begin
+      If (K >= 4) And (K <> 7) And (MemL[0:B + 16 + J * 12] <> 0) Then
+        KFree(MemL[0:B + 16 + J * 12]);
+      MemL[0:B + 16 + J * 12] := V;
+      Exit;
+    End;
+  If N >= MemL[0:B + 4] Then
+  Begin
+    NB := KAlloc(8 + MemL[0:B + 4] * 2 * 12);
+    MoveMem(B, NB, 8 + N * 12);
+    MemL[0:NB + 4] := MemL[0:B + 4] * 2;
+    KFree(B);
+    B := NB;
+  End;
+  MemL[0:B + 8 + N * 12] := K; MemL[0:B + 12 + N * 12] := I;
+  MemL[0:B + 16 + N * 12] := V;
+  MemL[0:B] := N + 1;
+End;
+
+Function SBCopy(P, N : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  B := KAlloc(N + 4);
+  MoveMem(P, B, N);
+  SBCopy := B;
+End;
+
+{ Enregistrer si un bloc est en cours ; True : ne pas appliquer }
+Function SBRecord(K, I, V : LongInt) : Boolean;
+Var B : LongInt;
+Begin
+  SBRecord := False;
+  If D3G^.SBRec = 0 Then Exit;
+  B := D3G^.SBRec;
+  SBAdd(B, K, I, V);
+  D3G^.SBRec := B;
+  SBRecord := True;
+End;
+
+Procedure D3DSetRS(S, V : LongInt);
+Begin
+  If (S < 0) Or (S > 255) Then Exit;
+  If SBRecord(1, S, V) Then Exit;
+  D3G^.RS[S] := V;
+  If D3G^.Ver <= 3 Then
+    Case S Of
+      rsTexHandle :
+      Begin
+        D3G^.UseTSS := 0; D3G^.Tex[0] := 0;
+      End;
+      rsTexBlend :
+      Begin
+        D3G^.LegBlend := V; D3G^.UseTSS := 0;
+      End;
+    End;
+End;
+
+Procedure D3DSetTSS(St, K, V : LongInt);
+Begin
+  If (St < 0) Or (St > 7) Or (K < 0) Or (K > 31) Then Exit;
+  If SBRecord(2, St * 32 + K, V) Then Exit;
+  D3G^.TS[St * 32 + K] := V;
+  If K = tsAddr Then
+  Begin
+    D3G^.TS[St * 32 + tsAddrU] := V; D3G^.TS[St * 32 + tsAddrV] := V;
+  End;
+  D3G^.UseTSS := 1;
+End;
+
+Procedure D3DSetTex(St, S : LongInt);
+Begin
+  If (St < 0) Or (St > 7) Then Exit;
+  If SBRecord(3, St, S) Then Exit;
+  If S <> 0 Then COMAddRef(S);
+  If D3G^.Tex[St] <> 0 Then COMRelease(D3G^.Tex[St]);
+  D3G^.Tex[St] := S;
+  D3G^.UseTSS := 1;
+End;
+
+Procedure D3DSetMtl(P : LongInt);
+Var I : LongInt;
+Begin
+  If SBRecord(5, 0, SBCopy(P, 68)) Then Exit;
+  For I := 0 To 16 Do D3G^.Mt[I] := FlM(P + I * 4);
+End;
+
+Procedure D3DSetLight(I, P : LongInt);
+Var K : LongInt;
+Begin
+  If (I < 0) Or (I > 15) Then Exit;
+  If SBRecord(6, I, SBCopy(P, 104)) Then Exit;
+  D3G^.Lt[I].Typ := MemL[0:P];
+  For K := 0 To 3 Do
+  Begin
+    D3G^.Lt[I].Dif[K] := FlM(P + 4 + K * 4);
+    D3G^.Lt[I].Spe[K] := FlM(P + 20 + K * 4);
+    D3G^.Lt[I].Amb[K] := FlM(P + 36 + K * 4);
+  End;
+  For K := 0 To 2 Do
+  Begin
+    D3G^.Lt[I].Pos[K] := FlM(P + 52 + K * 4);
+    D3G^.Lt[I].Dir[K] := FlM(P + 64 + K * 4);
+  End;
+  D3G^.Lt[I].Rng := FlM(P + 76); D3G^.Lt[I].Fall := FlM(P + 80);
+  D3G^.Lt[I].A0 := FlM(P + 84); D3G^.Lt[I].A1 := FlM(P + 88);
+  D3G^.Lt[I].A2 := FlM(P + 92);
+  D3G^.Lt[I].Th := FlM(P + 96); D3G^.Lt[I].Ph := FlM(P + 100);
+  If (D3G^.Lt[I].A0 = 0) And (D3G^.Lt[I].A1 = 0) And (D3G^.Lt[I].A2 = 0)
+  Then D3G^.Lt[I].A0 := 1;
+End;
+
+Procedure D3DGetLight(I, P : LongInt);
+Var K : LongInt;
+Begin
+  FillMem(P, 104, 0);
+  If (I < 0) Or (I > 15) Then Exit;
+  MemL[0:P] := D3G^.Lt[I].Typ;
+  For K := 0 To 3 Do
+  Begin
+    MemL[0:P + 4 + K * 4] := LFl(D3G^.Lt[I].Dif[K]);
+    MemL[0:P + 20 + K * 4] := LFl(D3G^.Lt[I].Spe[K]);
+    MemL[0:P + 36 + K * 4] := LFl(D3G^.Lt[I].Amb[K]);
+  End;
+  For K := 0 To 2 Do
+  Begin
+    MemL[0:P + 52 + K * 4] := LFl(D3G^.Lt[I].Pos[K]);
+    MemL[0:P + 64 + K * 4] := LFl(D3G^.Lt[I].Dir[K]);
+  End;
+  MemL[0:P + 76] := LFl(D3G^.Lt[I].Rng); MemL[0:P + 80] := LFl(D3G^.Lt[I].Fall);
+  MemL[0:P + 84] := LFl(D3G^.Lt[I].A0); MemL[0:P + 88] := LFl(D3G^.Lt[I].A1);
+  MemL[0:P + 92] := LFl(D3G^.Lt[I].A2);
+  MemL[0:P + 96] := LFl(D3G^.Lt[I].Th); MemL[0:P + 100] := LFl(D3G^.Lt[I].Ph);
+End;
+
+Procedure D3DLightOn(I, On : LongInt);
+Begin
+  If (I < 0) Or (I > 15) Then Exit;
+  If SBRecord(7, I, On) Then Exit;
+  D3G^.Lt[I].On := Ord(On <> 0);
+End;
+
+Procedure D3DSetVP7(P : LongInt);
+Begin
+  If SBRecord(8, 0, SBCopy(P, 24)) Then Exit;
+  D3G^.VX := MemL[0:P]; D3G^.VY := MemL[0:P + 4];
+  D3G^.VW := MemL[0:P + 8]; D3G^.VH := MemL[0:P + 12];
+  D3G^.VMinZ := FlM(P + 16); D3G^.VMaxZ := FlM(P + 20);
+  If D3G^.VMaxZ <= D3G^.VMinZ Then
+  Begin
+    D3G^.VMinZ := 0; D3G^.VMaxZ := 1;
+  End;
+  D3G^.ClX := -1; D3G^.ClY := 1; D3G^.ClW := 2; D3G^.ClH := 2;
+End;
+
+Procedure D3DSetMatK(K, P : LongInt);
+Var M : TMat;
+Begin
+  If SBRecord(4, K, SBCopy(P, 64)) Then Exit;
+  MatLoad(M, P);
+  D3DMatSet(K, M);
+End;
+
+{ Appliquer ou relever un bloc }
+Procedure SBApply(B : LongInt; Capture : Boolean);
+Var J, K, I, V, Q : LongInt; M : TMat;
+Begin
+  If B = 0 Then Exit;
+  For J := 0 To MemL[0:B] - 1 Do
+  Begin
+    K := MemL[0:B + 8 + J * 12]; I := MemL[0:B + 12 + J * 12];
+    V := MemL[0:B + 16 + J * 12];
+    If Capture Then
+    Begin
+      Case K Of
+        1 : V := D3G^.RS[I];
+        2 : V := D3G^.TS[I];
+        3 : V := D3G^.Tex[I];
+        4 : If D3DMatOf(I, M) Then MatStore(M, V);
+        5 : For Q := 0 To 16 Do MemL[0:V + Q * 4] := LFl(D3G^.Mt[Q]);
+        6 : D3DGetLight(I, V);
+        7 : V := D3G^.Lt[I].On;
+        8 :
+        Begin
+          MemL[0:V] := D3G^.VX; MemL[0:V + 4] := D3G^.VY;
+          MemL[0:V + 8] := D3G^.VW; MemL[0:V + 12] := D3G^.VH;
+          MemL[0:V + 16] := LFl(D3G^.VMinZ);
+          MemL[0:V + 20] := LFl(D3G^.VMaxZ);
+        End;
+      End;
+      MemL[0:B + 16 + J * 12] := V;
+    End
+    Else
+      Case K Of
+        1 : D3DSetRS(I, V);
+        2 : D3DSetTSS(I Div 32, I Mod 32, V);
+        3 : D3DSetTex(I, V);
+        4 : D3DSetMatK(I, V);
+        5 : D3DSetMtl(V);
+        6 : D3DSetLight(I, V);
+        7 : D3DLightOn(I, V);
+        8 : D3DSetVP7(V);
+      End;
+  End;
+End;
+
+Function DV_BeginSB(T : LongInt) : LongInt;
+Begin
+  DV_BeginSB := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Or (D3G^.SBRec <> 0) Then Exit;
+  D3G^.SBRec := SBNew;
+  DV_BeginSB := DD_OK;
+End;
+
+Function DV_EndSB(T, PH : LongInt) : LongInt;
+Begin
+  DV_EndSB := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Or (D3G^.SBRec = 0) Then Exit;
+  If PH <> 0 Then MemL[0:PH] := D3G^.SBRec;
+  D3G^.SBRec := 0;
+  DV_EndSB := DD_OK;
+End;
+
+Function DV_ApplySB(T, H : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) And (D3G^.SBRec = 0) Then SBApply(H, False);
+  DV_ApplySB := DD_OK;
+End;
+
+Function DV_CaptureSB(T, H : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then SBApply(H, True);
+  DV_CaptureSB := DD_OK;
+End;
+
+Function DV_DeleteSB(T, H : LongInt) : LongInt;
+Var J, K : LongInt;
+Begin
+  If H <> 0 Then
+  Begin
+    For J := 0 To MemL[0:H] - 1 Do
+    Begin
+      K := MemL[0:H + 8 + J * 12];
+      If (K >= 4) And (K <> 7) And (MemL[0:H + 16 + J * 12] <> 0) Then
+        KFree(MemL[0:H + 16 + J * 12]);
+    End;
+    KFree(H);
+  End;
+  DV_DeleteSB := DD_OK;
+End;
+
+{ Bloc de tous les etats (types ALL, PIXEL, VERTEX : tout est pris) }
+Function D3DSBAll : LongInt;
+Var B, I : LongInt;
+Begin
+  B := SBNew;
+  For I := 1 To 255 Do SBAdd(B, 1, I, 0);
+  For I := 0 To 63 Do SBAdd(B, 2, I, 0);
+  For I := 0 To 7 Do SBAdd(B, 3, I, 0);
+  SBAdd(B, 4, 1, KAlloc(64)); SBAdd(B, 4, 2, KAlloc(64));
+  SBAdd(B, 4, 3, KAlloc(64));
+  SBAdd(B, 5, 0, KAlloc(68));
+  For I := 0 To 7 Do
+  Begin
+    SBAdd(B, 6, I, KAlloc(104)); SBAdd(B, 7, I, 0);
+  End;
+  SBAdd(B, 8, 0, KAlloc(24));
+  SBApply(B, True);
+  D3DSBAll := B;
+End;
+
+Function DV_CreateSB(T, Ty, PH : LongInt) : LongInt;
+Begin
+  DV_CreateSB := DDERR_INVALIDPARAMS;
+  If (PH = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PH] := D3DSBAll;
+  DV_CreateSB := DD_OK;
+End;
+
+{ ------------------------------ etats ------------------------------ }
+
+Function DV_SetRS(T, S, V : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DSetRS(S, V);
+  DV_SetRS := DD_OK;
+End;
+
+Function DV_GetRS(T, S, P : LongInt) : LongInt;
+Begin
+  DV_GetRS := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Or (S < 0) Or (S > 255) Then Exit;
+  MemL[0:P] := D3G^.RS[S];
+  DV_GetRS := DD_OK;
+End;
+
+Function DV_SetLS(T, S, V : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) And (S >= 0) And (S <= 15) Then D3G^.LS[S] := V;
+  DV_SetLS := DD_OK;
+End;
+
+Function DV_GetLS(T, S, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And DevSel(Cor(T)) And (S >= 0) And (S <= 15) Then
+    MemL[0:P] := D3G^.LS[S];
+  DV_GetLS := DD_OK;
+End;
+
+Function DV_SetTSS(T, St, K, V : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DSetTSS(St, K, V);
+  DV_SetTSS := DD_OK;
+End;
+
+Function DV_GetTSS(T, St, K, P : LongInt) : LongInt;
+Begin
+  DV_GetTSS := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Or (St < 0) Or (St > 7) Or (K < 0) Or
+     (K > 31) Then Exit;
+  MemL[0:P] := D3G^.TS[St * 32 + K];
+  DV_GetTSS := DD_OK;
+End;
+
+Function DV_SetTexture(T, St, S : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DSetTex(St, Cor(S));
+  DV_SetTexture := DD_OK;
+End;
+
+Function DV_GetTexture(T, St, PP : LongInt) : LongInt;
+Var S, K : LongInt;
+Begin
+  DV_GetTexture := DDERR_INVALIDPARAMS;
+  If (PP = 0) Or Not DevSel(Cor(T)) Or (St < 0) Or (St > 7) Then Exit;
+  S := D3G^.Tex[St];
+  MemL[0:PP] := 0;
+  DV_GetTexture := DD_OK;
+  If S = 0 Then Exit;
+  If D3G^.Ver >= 7 Then K := 4 Else K := 7;
+  If K = 4 Then DV_GetTexture := ComGive(S, 4, VtS7, PP)
+  Else DV_GetTexture := ComGive(S, 7, VtTx2, PP);
+End;
+
+Function DV_Validate(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 1;
+  DV_Validate := DD_OK;
+End;
+
+Function DV_SetClipStatus(T, P : LongInt) : LongInt;
+Begin
+  DV_SetClipStatus := DD_OK;
+End;
+
+Function DV_GetClipStatus(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then FillMem(P, 32, 0);
+  DV_GetClipStatus := DD_OK;
+End;
+
+Function DV_SphereVis(T, C, R, N, Fl, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And (N > 0) Then FillMem(P, N * 4, 0);
+  DV_SphereVis := DD_OK;
+End;
+
+{ --------------------------- transformations ----------------------- }
+
+Function DV_SetTransform(T, K, P : LongInt) : LongInt;
+Begin
+  DV_SetTransform := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetMatK(K, P);
+  DV_SetTransform := DD_OK;
+End;
+
+Function DV_GetTransform(T, K, P : LongInt) : LongInt;
+Var M : TMat;
+Begin
+  DV_GetTransform := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If Not D3DMatOf(K, M) Then MatId(M);
+  MatStore(M, P);
+  DV_GetTransform := DD_OK;
+End;
+
+Function DV_MulTransform(T, K, P : LongInt) : LongInt;
+Var M, A : TMat;
+Begin
+  DV_MulTransform := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If Not D3DMatOf(K, M) Then Exit;
+  MatLoad(A, P);
+  MatMul(M, A, M);
+  D3DMatSet(K, M);
+  DV_MulTransform := DD_OK;
+End;
+
+Function DV_SetViewport7(T, P : LongInt) : LongInt;
+Begin
+  DV_SetViewport7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetVP7(P);
+  DV_SetViewport7 := DD_OK;
+End;
+
+Function DV_GetViewport7(T, P : LongInt) : LongInt;
+Begin
+  DV_GetViewport7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:P] := D3G^.VX; MemL[0:P + 4] := D3G^.VY;
+  MemL[0:P + 8] := D3G^.VW; MemL[0:P + 12] := D3G^.VH;
+  MemL[0:P + 16] := LFl(D3G^.VMinZ); MemL[0:P + 20] := LFl(D3G^.VMaxZ);
+  DV_GetViewport7 := DD_OK;
+End;
+
+Function DV_SetMaterial7(T, P : LongInt) : LongInt;
+Begin
+  DV_SetMaterial7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetMtl(P);
+  DV_SetMaterial7 := DD_OK;
+End;
+
+Function DV_GetMaterial7(T, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DV_GetMaterial7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  For I := 0 To 16 Do MemL[0:P + I * 4] := LFl(D3G^.Mt[I]);
+  DV_GetMaterial7 := DD_OK;
+End;
+
+Function DV_SetLight7(T, I, P : LongInt) : LongInt;
+Begin
+  DV_SetLight7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DSetLight(I, P);
+  DV_SetLight7 := DD_OK;
+End;
+
+Function DV_GetLight7(T, I, P : LongInt) : LongInt;
+Begin
+  DV_GetLight7 := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Then Exit;
+  D3DGetLight(I, P);
+  DV_GetLight7 := DD_OK;
+End;
+
+Function DV_LightEnable(T, I, On : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DLightOn(I, On);
+  DV_LightEnable := DD_OK;
+End;
+
+Function DV_GetLightEnable(T, I, P : LongInt) : LongInt;
+Begin
+  If (P <> 0) And DevSel(Cor(T)) And (I >= 0) And (I <= 15) Then
+    MemL[0:P] := D3G^.Lt[I].On;
+  DV_GetLightEnable := DD_OK;
+End;
+
+{ ------------------------------- dessin ---------------------------- }
+
+Procedure DrawK(T, Pt, Fvf, Src, NV, Idx, Sz, NI, Fl : LongInt);
+Begin
+  If Not DevSel(Cor(T)) Then Exit;
+  If D3G^.Ver <= 3 Then
+  Begin
+    If D3G^.VPCur <> 0 Then VPApply(D3G^.VPCur);
+    D3DLegacySync;
+  End;
+  DVBase := 0;
+  D3DDraw(Pt, Fvf, Src, NV, Idx, Sz, NI, Fl);
+End;
+
+Function DV_DrawPrim(T, Pt, Fvf, Src, N, Fl : LongInt) : LongInt;
+Begin
+  DrawK(T, Pt, Fvf, Src, N, 0, 0, 0, Fl);
+  DV_DrawPrim := DD_OK;
+End;
+
+Function DV_DrawIdxPrim(T, Pt, Fvf, Src, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Begin
+  DrawK(T, Pt, Fvf, Src, NV, Idx, 2, NI, Fl);
+  DV_DrawIdxPrim := DD_OK;
+End;
+
+Function DV_DrawPrim2(T, Pt, Vt, Src, N, Fl : LongInt) : LongInt;
+Begin
+  DrawK(T, Pt, VtToFvf(Vt), Src, N, 0, 0, 0, Fl);
+  DV_DrawPrim2 := DD_OK;
+End;
+
+Function DV_DrawIdxPrim2(T, Pt, Vt, Src, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Begin
+  DrawK(T, Pt, VtToFvf(Vt), Src, NV, Idx, 2, NI, Fl);
+  DV_DrawIdxPrim2 := DD_OK;
+End;
+
+{ Donnees espacees (D3DDRAWPRIMITIVESTRIDEDDATA) -> sommets entrelaces }
+Function StridedPack(Fvf, P, N : LongInt) : LongInt;
+Var B, I, K, O, D : LongInt;
+Begin
+  FvfParse(Fvf);
+  B := KAlloc(N * VFStride + 16);
+  For I := 0 To N - 1 Do
+  Begin
+    D := B + I * VFStride;
+    If VFRhw <> 0 Then O := 16 Else O := 12;
+    MoveMem(MemL[0:P] + I * MemL[0:P + 4], D, O);
+    If VFNrm >= 0 Then
+      MoveMem(MemL[0:P + 8] + I * MemL[0:P + 12], D + VFNrm, 12);
+    If VFDif >= 0 Then
+      MemL[0:D + VFDif] := MemL[0:MemL[0:P + 16] + I * MemL[0:P + 20]];
+    If VFSpc >= 0 Then
+      MemL[0:D + VFSpc] := MemL[0:MemL[0:P + 24] + I * MemL[0:P + 28]];
+    For K := 0 To VFTexN - 1 Do
+      MoveMem(MemL[0:P + 32 + K * 8] + I * MemL[0:P + 36 + K * 8],
+              D + VFTex[K], VFTexD[K] * 4);
+  End;
+  StridedPack := B;
+End;
+
+Function DV_DrawPrimStr(T, Pt, Fvf, P, N, Fl : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  DV_DrawPrimStr := DD_OK;
+  If (P = 0) Or (N <= 0) Then Exit;
+  B := StridedPack(Fvf, P, N);
+  DrawK(T, Pt, Fvf, B, N, 0, 0, 0, Fl);
+  KFree(B);
+End;
+
+Function DV_DrawIdxPrimStr(T, Pt, Fvf, P, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Var B : LongInt;
+Begin
+  DV_DrawIdxPrimStr := DD_OK;
+  If (P = 0) Or (NV <= 0) Then Exit;
+  B := StridedPack(Fvf, P, NV);
+  DrawK(T, Pt, Fvf, B, NV, Idx, 2, NI, Fl);
+  KFree(B);
+End;
+
+{ Tampons de sommets : +64 FVF, +68 nombre, +72 donnees, +76 capacites,
+  +80 pas }
+Function DV_DrawPrimVB(T, Pt, VB, St, N, Fl : LongInt) : LongInt;
+Begin
+  VB := Cor(VB);
+  If VB <> 0 Then
+    DrawK(T, Pt, MemL[0:VB + 64], MemL[0:VB + 72] + St * MemL[0:VB + 80], N,
+          0, 0, 0, Fl);
+  DV_DrawPrimVB := DD_OK;
+End;
+
+Function DV_DrawIdxPrimVB7(T, Pt, VB, St, NV, Idx, NI, Fl : LongInt)
+  : LongInt;
+Begin
+  VB := Cor(VB);
+  If VB <> 0 Then
+    DrawK(T, Pt, MemL[0:VB + 64], MemL[0:VB + 72] + St * MemL[0:VB + 80], NV,
+          Idx, 2, NI, Fl);
+  DV_DrawIdxPrimVB7 := DD_OK;
+End;
+
+Function DV_DrawIdxPrimVB3(T, Pt, VB, Idx, NI, Fl : LongInt) : LongInt;
+Begin
+  VB := Cor(VB);
+  If VB <> 0 Then
+    DrawK(T, Pt, MemL[0:VB + 64], MemL[0:VB + 72], MemL[0:VB + 68], Idx, 2,
+          NI, Fl);
+  DV_DrawIdxPrimVB3 := DD_OK;
+End;
+
+{ Begin / Vertex / Index / End (D3D 2 et 3) }
+Function BeginK(T, Pt, Fvf, Verts, N, Fl : LongInt) : LongInt;
+Begin
+  BeginK := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Then Exit;
+  FvfParse(Fvf);
+  D3G^.BFvf := Fvf; D3G^.BPt := Pt; D3G^.BN := 0; D3G^.BIn := 0;
+  D3G^.BIdx := Verts;
+  If D3G^.BBuf = 0 Then
+  Begin
+    D3G^.BMax := 4096;
+    D3G^.BBuf := KAlloc(D3G^.BMax * 64 + 16);
+  End;
+  If Verts <> 0 Then D3G^.BIn := N;
+  BeginK := DD_OK;
+End;
+
+Function DV_Begin(T, Pt, Fvf, Fl : LongInt) : LongInt;
+Begin
+  DV_Begin := BeginK(T, Pt, Fvf, 0, 0, Fl);
+End;
+
+Function DV_Begin2(T, Pt, Vt, Fl : LongInt) : LongInt;
+Begin
+  DV_Begin2 := BeginK(T, Pt, VtToFvf(Vt), 0, 0, Fl);
+End;
+
+Function DV_BeginIdx(T, Pt, Fvf, Verts, N, Fl : LongInt) : LongInt;
+Begin
+  DV_BeginIdx := BeginK(T, Pt, Fvf, Verts, N, Fl);
+End;
+
+Function DV_BeginIdx2(T, Pt, Vt, Verts, N, Fl : LongInt) : LongInt;
+Begin
+  DV_BeginIdx2 := BeginK(T, Pt, VtToFvf(Vt), Verts, N, Fl);
+End;
+
+Function DV_Vertex(T, P : LongInt) : LongInt;
+Begin
+  DV_Vertex := DDERR_INVALIDPARAMS;
+  If (P = 0) Or Not DevSel(Cor(T)) Or (D3G^.BBuf = 0) Then Exit;
+  FvfParse(D3G^.BFvf);
+  If D3G^.BN >= D3G^.BMax Then Exit;
+  MoveMem(P, D3G^.BBuf + D3G^.BN * VFStride, VFStride);
+  D3G^.BN := D3G^.BN + 1;
+  DV_Vertex := DD_OK;
+End;
+
+Function DV_Index(T, I : LongInt) : LongInt;
+Begin
+  DV_Index := DDERR_INVALIDPARAMS;
+  If Not DevSel(Cor(T)) Or (D3G^.BBuf = 0) Then Exit;
+  If D3G^.BN >= D3G^.BMax Then Exit;
+  MemW[0:D3G^.BBuf + D3G^.BN * 2] := I;
+  D3G^.BN := D3G^.BN + 1;
+  DV_Index := DD_OK;
+End;
+
+Function DV_End(T, Fl : LongInt) : LongInt;
+Begin
+  DV_End := DD_OK;
+  If Not DevSel(Cor(T)) Or (D3G^.BBuf = 0) Then Exit;
+  If D3G^.BIdx <> 0 Then
+    DrawK(T, D3G^.BPt, D3G^.BFvf, D3G^.BIdx, D3G^.BIn, D3G^.BBuf, 2,
+          D3G^.BN, Fl)
+  Else
+    DrawK(T, D3G^.BPt, D3G^.BFvf, D3G^.BBuf, D3G^.BN, 0, 0, 0, Fl);
+  DevSel(Cor(T));
+  D3G^.BN := 0;
+End;
+
+Function DV_Clear7(T, N, Rects, Fl, Color, Z, St : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3DClear(N, Rects, Fl, Color, Z);
+  DV_Clear7 := DD_OK;
+End;
+
+Function DV_SwapTex(T, A, B : LongInt) : LongInt;
+Var Tmp : Array[0..63] Of LongInt;
+Begin
+  A := Cor(A); B := Cor(B);
+  If (A <> 0) And (B <> 0) Then
+  Begin
+    MoveMem(A + 64, LongInt(@Tmp), 52);
+    MoveMem(B + 64, A + 64, 52);
+    MoveMem(LongInt(@Tmp), B + 64, 52);
+    MoveMem(A + 240, LongInt(@Tmp), 36);
+    MoveMem(B + 240, A + 240, 36);
+    MoveMem(LongInt(@Tmp), B + 240, 36);
+  End;
+  DV_SwapTex := DD_OK;
+End;
+
+Function DV_Load7(T, D, PPt, S, PR, Fl : LongInt) : LongInt;
+Var X, Y, L, Tp, R, B : LongInt;
+Begin
+  D := Cor(D); S := Cor(S);
+  DV_Load7 := DDERR_INVALIDPARAMS;
+  If (D = 0) Or (S = 0) Then Exit;
+  If (PR = 0) And (PPt = 0) Then TxCopy(D, S)
+  Else
+  Begin
+    RectOr(PR, MemL[0:S + 64], MemL[0:S + 68], L, Tp, R, B);
+    X := 0; Y := 0;
+    If PPt <> 0 Then
+    Begin
+      X := MemL[0:PPt]; Y := MemL[0:PPt + 4];
+    End;
+    SfXfer(D, X, Y, X + R - L, Y + B - Tp, S, L, Tp, R, B, False, False, 0,
+           0, 0, 0, False, False);
+  End;
+  DV_Load7 := DD_OK;
+End;
+
+{ ------------------- D3D 1 : matrices et tampons d'execution -------- }
+
+Function DV_CreateMatrix(T, PH : LongInt) : LongInt;
+Var M : TMat; B : LongInt;
+Begin
+  DV_CreateMatrix := DDERR_INVALIDPARAMS;
+  If PH = 0 Then Exit;
+  B := KAlloc(64);
+  MatId(M);
+  MatStore(M, B);
+  MemL[0:PH] := B;
+  DV_CreateMatrix := DD_OK;
+End;
+
+Function DV_SetMatrix(T, H, P : LongInt) : LongInt;
+Begin
+  If (H <> 0) And (P <> 0) Then MoveMem(P, H, 64);
+  DV_SetMatrix := DD_OK;
+End;
+
+Function DV_GetMatrix(T, H, P : LongInt) : LongInt;
+Begin
+  If (H <> 0) And (P <> 0) Then MoveMem(H, P, 64);
+  DV_GetMatrix := DD_OK;
+End;
+
+Function DV_DeleteMatrix(T, H : LongInt) : LongInt;
+Begin
+  If H <> 0 Then KFree(H);
+  DV_DeleteMatrix := DD_OK;
+End;
+
+Function DV_Pick(T, EB, VP, Fl, R : LongInt) : LongInt;
+Begin
+  DV_Pick := DD_OK;
+End;
+
+Function DV_GetPickRecords(T, PN, P : LongInt) : LongInt;
+Begin
+  If PN <> 0 Then MemL[0:PN] := 0;
+  DV_GetPickRecords := DD_OK;
+End;
+
+{ Tampon d'execution : +64 taille, +68 donnees, +72 capacites,
+  +76 D3DEXECUTEDATA (48 octets) }
+Function DV_CreateEB(T, PDesc, PP, Outer : LongInt) : LongInt;
+Var C, N : LongInt;
+Begin
+  DV_CreateEB := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PP = 0) Then Exit;
+  N := MemL[0:PDesc + 12];
+  If (N <= 0) Or (N > 16 * 1024 * 1024) Then Exit;
+  C := ComNew(0, 15, 128);
+  ComView(C, 0, VtEB);
+  MemL[0:C + 64] := N;
+  MemL[0:C + 68] := KAlloc(N + 16);
+  FillMem(MemL[0:C + 68], N, 0);
+  MemL[0:C + 72] := MemL[0:PDesc + 8];
+  MemL[0:C + 76] := 48;
+  MemL[0:PP] := C;
+  DV_CreateEB := DD_OK;
+End;
+
+Function EB_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  EB_QI := COMQIUnk(T, Riid, Ppv);
+End;
+
+Function EB_Lock(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  EB_Lock := DDERR_INVALIDPARAMS;
+  If P = 0 Then Exit;
+  MemL[0:P + 4] := 7;
+  MemL[0:P + 8] := MemL[0:C + 72];
+  MemL[0:P + 12] := MemL[0:C + 64];
+  MemL[0:P + 16] := MemL[0:C + 68];
+  EB_Lock := DD_OK;
+End;
+
+Function EB_SetData(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(P, Cor(T) + 76, 48);
+  EB_SetData := DD_OK;
+End;
+
+Function EB_GetData(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MoveMem(Cor(T) + 76, P, 48);
+  EB_GetData := DD_OK;
+End;
+
+{ Interpretation d'un tampon d'execution }
+Function DV_Execute(T, EB, VP, Fl : LongInt) : LongInt;
+Var D, VO, VC, P, E, Op, Sz, N, I, Q, A, B, Ok, PF : LongInt;
+    M, M2, M3 : TMat;
+    Setup : Boolean;
+Begin
+  DV_Execute := DDERR_INVALIDPARAMS;
+  EB := Cor(EB);
+  If (EB = 0) Or Not DevSel(Cor(T)) Then Exit;
+  If Cor(VP) <> 0 Then DV_SetCurVP(T, VP);
+  DevSel(Cor(T));
+  D := MemL[0:EB + 68];
+  VO := MemL[0:EB + 80]; VC := MemL[0:EB + 84];
+  P := D + MemL[0:EB + 88];
+  E := P + MemL[0:EB + 92];
+  D3DGrow(VC + 1);
+  Setup := False;
+  While P < E Do
+  Begin
+    Op := Mem[0:P]; Sz := Mem[0:P + 1]; N := MemW[0:P + 2];
+    Q := P + 4;
+    P := Q + Sz * N;
+    Case Op Of
+      1, 2, 3 :
+      Begin
+        If Not Setup Then
+        Begin
+          Setup := D3DSetup;
+          If Not Setup Then Continue;
+        End;
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          Case Op Of
+            1 :
+              For B := MemW[0:A + 2] To MemW[0:A + 2] + MemW[0:A] - 1 Do
+                If B < VC Then D3DPointIdx(B);
+            2 :
+              If (MemW[0:A] < VC) And (MemW[0:A + 2] < VC) Then
+                D3DLineIdx(MemW[0:A], MemW[0:A + 2]);
+          Else
+            If (MemW[0:A] < VC) And (MemW[0:A + 2] < VC) And
+               (MemW[0:A + 4] < VC) Then
+              D3DTriIdx(MemW[0:A], MemW[0:A + 2], MemW[0:A + 4]);
+          End;
+        End;
+      End;
+      4 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If (MemL[0:A] <> 0) And (MemL[0:A + 4] <> 0) Then
+            MoveMem(MemL[0:A + 4], MemL[0:A], 64);
+        End;
+      5 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If (MemL[0:A] <> 0) And (MemL[0:A + 4] <> 0) And
+             (MemL[0:A + 8] <> 0) Then
+          Begin
+            MatLoad(M2, MemL[0:A + 4]); MatLoad(M3, MemL[0:A + 8]);
+            MatMul(M, M2, M3);
+            MatStore(M, MemL[0:A]);
+          End;
+        End;
+      6 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If MemL[0:A + 4] <> 0 Then
+          Begin
+            MatLoad(M, MemL[0:A + 4]);
+            D3DMatSet(MemL[0:A], M);
+          End;
+        End;
+      7 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          If (MemL[0:A] >= 0) And (MemL[0:A] <= 15) Then
+            D3G^.LS[MemL[0:A]] := MemL[0:A + 4];
+        End;
+      8 :
+      Begin
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          D3DSetRS(MemL[0:A], MemL[0:A + 4]);
+        End;
+        Setup := False;
+      End;
+      9 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          PF := MemL[0:A] And 7;
+          B := MemW[0:A + 6];
+          Ok := MemL[0:A + 8];
+          If B + Ok > VC Then Ok := VC - B;
+          If Ok <= 0 Then Continue;
+          Case PF Of
+            0 : FvfParse($112);
+            1 : FvfParse($1E2);
+          Else
+            FvfParse($1C4);
+          End;
+          VFStride := 32;
+          D3DLegacySync;
+          If PF = 0 Then D3DLightsView;
+          DVBase := B;
+          D3DProcess(D + VO + MemW[0:A + 4] * 32, Ok, PF = 0);
+          DVBase := 0;
+        End;
+      10 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          TxCopy(MemL[0:A], MemL[0:A + 4]);
+        End;
+      11 : P := E;
+      12 :
+        For I := 0 To N - 1 Do
+        Begin
+          A := Q + I * Sz;
+          Ok := Ord((0 And MemL[0:A]) = MemL[0:A + 4]);
+          If MemL[0:A + 8] <> 0 Then Ok := 1 - Ok;
+          If Ok <> 0 Then
+          Begin
+            If MemL[0:A + 12] = 0 Then P := E
+            Else P := Q - 4 + MemL[0:A + 12];
+            Break;
+          End;
+        End;
+    End;
+  End;
+  DV_Execute := DD_OK;
+End;
+
+{ ------------------------- tampons de sommets ---------------------- }
+
+Function VBNew(PDesc, PP, Slot : LongInt) : LongInt;
+Var C, N, F : LongInt;
+Begin
+  VBNew := DDERR_INVALIDPARAMS;
+  If (PDesc = 0) Or (PP = 0) Then Exit;
+  D3DInitVt;
+  F := MemL[0:PDesc + 8]; N := MemL[0:PDesc + 12];
+  If (N <= 0) Or (N > 65536) Then Exit;
+  FvfParse(F);
+  C := ComNew(0, 16, 96);
+  If Slot = 0 Then ComView(C, 0, VtVB) Else ComView(C, 1, VtVB7);
+  MemL[0:C + 64] := F; MemL[0:C + 68] := N;
+  MemL[0:C + 80] := VFStride;
+  MemL[0:C + 72] := KAlloc(N * VFStride + 16);
+  FillMem(MemL[0:C + 72], N * VFStride, 0);
+  MemL[0:C + 76] := MemL[0:PDesc + 4];
+  MemL[0:PP] := C;
+  VBNew := DD_OK;
+End;
+
+Function D3_CreateVB3(T, PDesc, PP, Fl, Outer : LongInt) : LongInt;
+Begin
+  D3_CreateVB3 := VBNew(PDesc, PP, 0);
+End;
+
+Function D3_CreateVB7(T, PDesc, PP, Fl : LongInt) : LongInt;
+Begin
+  D3_CreateVB7 := VBNew(PDesc, PP, 1);
+End;
+
+Function VB_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  VB_QI := COMQIUnk(T, Riid, Ppv);
+End;
+
+Function VB_Lock(T, Fl, PP, PN : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If PP <> 0 Then MemL[0:PP] := MemL[0:C + 72];
+  If PN <> 0 Then MemL[0:PN] := MemL[0:C + 68] * MemL[0:C + 80];
+  VB_Lock := DD_OK;
+End;
+
+Function VB_GetDesc(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 16; MemL[0:P + 4] := MemL[0:C + 76];
+    MemL[0:P + 8] := MemL[0:C + 64]; MemL[0:P + 12] := MemL[0:C + 68];
+  End;
+  VB_GetDesc := DD_OK;
+End;
+
+{ Transformer des sommets d'un tampon source vers ce tampon (ecran) }
+Function VB_Process(T, Op, DI, N, Src, SI, Dev, Fl : LongInt) : LongInt;
+Var C, S, I, A, K : LongInt; V : TVtx; DFvf : LongInt;
+Begin
+  C := Cor(T); S := Cor(Src);
+  VB_Process := DDERR_INVALIDPARAMS;
+  If (S = 0) Or Not DevSel(Cor(Dev)) Then Exit;
+  If (SI + N > MemL[0:S + 68]) Or (DI + N > MemL[0:C + 68]) Then Exit;
+  FvfParse(MemL[0:S + 64]);
+  DVBase := 0;
+  If (Op And $400) <> 0 Then D3DLightsView;
+  D3DProcess(MemL[0:S + 72] + SI * VFStride, N, (Op And $400) <> 0);
+  DFvf := MemL[0:C + 64];
+  FvfParse(DFvf);
+  For I := 0 To N - 1 Do
+  Begin
+    V := DV^[I];
+    D3DProject(V);
+    A := MemL[0:C + 72] + (DI + I) * VFStride;
+    MemL[0:A] := LFl(V.SX); MemL[0:A + 4] := LFl(V.SY);
+    MemL[0:A + 8] := LFl(V.SZ);
+    If VFRhw <> 0 Then MemL[0:A + 12] := LFl(V.RW);
+    If VFDif >= 0 Then MemL[0:A + VFDif] := VDif(V);
+    If VFSpc >= 0 Then
+      MemL[0:A + VFSpc] := VSpe(V) Or (Clamp8(DRound(V.F * 255)) Shl 24);
+    If VFTexN > 0 Then
+    Begin
+      MemL[0:A + VFTex[0]] := LFl(V.U0);
+      MemL[0:A + VFTex[0] + 4] := LFl(V.V0);
+    End;
+    If VFTexN > 1 Then
+    Begin
+      MemL[0:A + VFTex[1]] := LFl(V.U1);
+      MemL[0:A + VFTex[1] + 4] := LFl(V.V1);
+    End;
+    K := 0;
+  End;
+  VB_Process := DD_OK;
+End;
+
+{ Fin d'un objet Direct3D }
+Procedure D3DDestroy(C, K : LongInt);
+Var I : LongInt;
+Begin
+  Case K Of
+    11 :
+      If DevSel(C) Then
+      Begin
+        If D3G^.RT <> 0 Then COMRelease(D3G^.RT);
+        For I := 0 To 7 Do
+          If D3G^.Tex[I] <> 0 Then COMRelease(D3G^.Tex[I]);
+        If D3G^.BBuf <> 0 Then KFree(D3G^.BBuf);
+        KFree(MemL[0:C + 64]);
+        MemL[0:C + 64] := 0;
+      End;
+    12 :
+      For I := 0 To Min(MemL[0:C + 116], 16) - 1 Do
+        If MemL[0:C + 120 + I * 4] <> 0 Then
+          COMRelease(MemL[0:C + 120 + I * 4]);
+    15, 16 :
+      If MemL[0:C + 68 + 4 * Ord(K = 16)] <> 0 Then
+        KFree(MemL[0:C + 68 + 4 * Ord(K = 16)]);
+  End;
 End;
 
 { ==================================================================== }
@@ -45928,13 +49766,35 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DID_SetDataFormat, DID_SetEventNotification, DID_SetCoop, DID_GetObjectInfo,
   DID_GetDeviceInfo, DID_Initialize, DID_EnumEffects, DXNI3, DXNI2,
   DID_EnumCreated, DID_Poll, DP_QI, DPE3, DPE6, DPE7, DPE2, DPE5, DPE4, DPUn3,
-  DPE10, DPL_QI, DPNL4, DPUn7, DPUn5, DPNL6, DPNL2, DD_QI, DD_CreateClipper,
-  DD_CreatePalette, DD_CreateSurface, DD_DuplicateSurface,
-  DD_EnumDisplayModes, DD_EnumSurfaces, DD_FlipToGDISurface, DD_GetCaps,
-  DD_GetDisplayMode, DD_GetFourCCCodes, SF_QI, SF_AddAttached, SF_Blt,
-  SF_BltFast, SF_DeleteAttached, SF_EnumAttached, DXNoOv4, SF_Flip,
-  SF_GetAttached, SF_GetCaps, SF_GetClipper, SF_GetColorKey, SF_GetDC,
-  SF_GetPalette, SF_GetPixelFormat, D3DQueryDD, D3DQuerySurf,
+  DPE10, DPL_QI, DPNL4, DPUn7, DPUn5, DPNL6, DPNL2, D3_QI, D3_EnumDevices,
+  D3_CreateLight, D3_CreateMaterial, D3_CreateViewport, D3_FindDevice,
+  D3_CreateDevice2, D3_CreateDevice3, D3_CreateVB3, D3_EnumZFormats,
+  D3_EnumDevices7, D3_CreateDevice7, D3_CreateVB7, DV_QI, DV_GetCaps,
+  DV_SwapTex, DV_CreateEB, DV_GetStats, DV_Execute, DV_AddViewport,
+  DV_DelViewport, DV_NextViewport, DV_Pick, DV_GetPickRecords, DV_EnumTexFmt1,
+  DV_CreateMatrix, DV_SetMatrix, DV_GetMatrix, DV_DeleteMatrix, DV_BeginScene,
+  DV_EndScene, DV_GetDirect3D, DV_SetCurVP, DV_GetCurVP, DV_SetRT, DV_GetRT,
+  DV_Begin2, DV_BeginIdx2, DV_Vertex, DV_Index, DV_End, DV_GetRS, DV_SetRS,
+  DV_GetLS, DV_SetLS, DV_SetTransform, DV_GetTransform, DV_MulTransform,
+  DV_DrawPrim2, DV_DrawIdxPrim2, DV_SetClipStatus, DV_GetClipStatus,
+  DV_EnumTexFmt, DV_Begin, DV_BeginIdx, DV_DrawPrim, DV_DrawIdxPrim,
+  DV_DrawPrimStr, DV_DrawIdxPrimStr, DV_DrawPrimVB, DV_DrawIdxPrimVB3,
+  DV_SphereVis, DV_GetTexture, DV_SetTexture, DV_GetTSS, DV_SetTSS,
+  DV_Validate, DV_GetCaps7, DV_Clear7, DV_SetViewport7, DV_GetViewport7,
+  DV_SetMaterial7, DV_GetMaterial7, DV_SetLight7, DV_GetLight7, DV_BeginSB,
+  DV_EndSB, DV_DrawIdxPrimVB7, DV_ApplySB, DV_CaptureSB, DV_DeleteSB,
+  DV_CreateSB, DV_Load7, DV_LightEnable, DV_GetLightEnable, VP_QI,
+  VP_GetViewport, VP_SetViewport, VP_Transform, VP_SetBack, VP_GetBack,
+  VP_SetBackDepth, VP_GetBackDepth, VP_Clear, VP_AddLight, VP_DelLight,
+  VP_NextLight, VP_GetViewport2, VP_SetViewport2, VP_Clear2, MT_QI, MT_Set,
+  MT_Get, MT_GetHandle, LT_QI, LT_Set, LT_Get, SF_QI, TX_GetHandle, TX_Load,
+  EB_QI, EB_Lock, EB_SetData, EB_GetData, VB_QI, VB_Lock, VB_Process,
+  VB_GetDesc, DXNI6, DD_QI, DD_CreateClipper, DD_CreatePalette,
+  DD_CreateSurface, DD_DuplicateSurface, DD_EnumDisplayModes, DD_EnumSurfaces,
+  DD_FlipToGDISurface, DD_GetCaps, DD_GetDisplayMode, DD_GetFourCCCodes,
+  SF_AddAttached, SF_Blt, SF_BltFast, SF_DeleteAttached, SF_EnumAttached,
+  DXNoOv4, SF_Flip, SF_GetAttached, SF_GetCaps, SF_GetClipper, SF_GetColorKey,
+  SF_GetDC, SF_GetPalette, SF_GetPixelFormat, D3DQueryDD, D3DQuerySurf,
   DirectDrawCreateClipper, DirectDrawCreate, DirectDrawCreateEx,
   DirectDrawEnumerateA, DirectDrawEnumerateW, DirectDrawEnumerateExA,
   DirectDrawEnumerateExW, DirectSoundCreate, DirectSoundCreate8,
@@ -45947,7 +49807,8 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectPlayLobbyCreateW, DirectXSetup, DirectXSetupA, DirectXSetupW,
   DirectXDeviceDriverSetup, DirectXDeviceDriverSetupA, DirectXSetupGetVersion,
   DirectXSetupSetCallback, DirectXRegisterApplication,
-  DirectXRegisterApplicationA, DirectXUnRegisterApplication,
+  DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
+  D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
