@@ -241,7 +241,7 @@ Var
   Opts : TOptions;
   { -CVMM32 : API Win32 exportees par le noyau (clause exports) }
   KrnExpCount : Integer;
-  KrnExpNames : Array[0..1023] Of String[63];
+  KrnExpNames : Array[0..4095] Of String[63];
   KrnVmm32    : Boolean;
 
   { Compteurs generaux }
@@ -39159,7 +39159,7 @@ Const
   BC_MAX_LABEL  = {$IFDEF FPC}524288{$ELSE}8192{$ENDIF};    { labels de code max }
   BC_MAX_DLABEL = {$IFDEF FPC}131072{$ELSE}8192{$ENDIF};    { labels de donnees max }
   BC_MAX_FIXUP  = {$IFDEF FPC}2097152{$ELSE}32768{$ENDIF};   { fixups max }
-  BC_MAX_IMP    = 1024;    { imports API max (WPC : DLL OS/2) }
+  BC_MAX_IMP    = 4096;    { imports API max (WPC : DLL OS/2) }
 
   { Types de fixup }
   BC_FIX_REL32  = 0;       { CALL/JMP rel32 vers label code    }
@@ -46565,7 +46565,7 @@ End;
 Procedure WritePEFile(FileName: TString);
 Const
   MAX_DLL_PE = 32;
-  MAX_IMP_PER_DLL = 1024;
+  MAX_IMP_PER_DLL = 4096;
 Type
   TDllGroup = Record
     DllName: TString;
@@ -46602,11 +46602,11 @@ Var
   ExpN: Integer;
   { ordinaux : base, nombre d entrees de l EAT, ordinal de chaque exportation }
   OrdBase, NFunc, OrdMax: LongInt;
-  ExpOrd: Array[0..1023] Of LongInt;
+  ExpOrd: Array[0..4095] Of LongInt;
   ExpDll: TString;
   HdrSize, EdataRVA, EdataSize, EdataRawSize, EdataFileBase: LongInt;
-  ExpOrder: Array[0..1023] Of Integer;
-  ExpNameOfs: Array[0..1023] Of LongInt;
+  ExpOrder: Array[0..4095] Of Integer;
+  ExpNameOfs: Array[0..4095] Of LongInt;
   EatOfs, NptOfs, OrdOfs, ExpDllOfs, TmpI, ThunkOfs: LongInt;
 
   Function AlignUp(V, A: LongInt): LongInt;
@@ -60831,7 +60831,7 @@ Begin
         While (J < TokenCount) And Not ((TokenPool[J].Kind = TK_PUNCT) And (TokenPool[J].Val = ';')) Do
         Begin
           If ((TokenPool[J].Kind = TK_IDENT) Or (TokenPool[J].Kind = TK_KEYWORD)) And
-             (KrnExpCount < 1023) Then
+             (KrnExpCount < 4095) Then
           Begin
             KrnExpNames[KrnExpCount] := TokenPool[J].Val;
             Inc(KrnExpCount);

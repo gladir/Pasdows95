@@ -41108,7 +41108,9 @@ Var
   D3G : PD3D;                       { peripherique courant }
   DV : PVtxArr;                     { sommets traites }
   DVCap : LongInt;
-  DVBase : LongInt;                 { premier sommet ecrit par D3DProcess }
+  DVBase : LongInt;
+  D3DStrideOvr : LongInt;          { pas impose (Direct3D 8), 0 sinon }
+  D8Pal : LongInt;                 { palette courante des textures P8 }                 { premier sommet ecrit par D3DProcess }
   DC : Array[0..15] Of TVtx;        { polygone en decoupe }
   DC2 : Array[0..15] Of TVtx;
   LtV : Array[0..15] Of TLit;      { lumieres dans l'espace de la vue }
@@ -42364,6 +42366,12 @@ Begin
         TxPal[I] := (M Shl 24) Or (Mem[0:L] Shl 16) Or (Mem[0:L + 1] Shl 8)
                     Or Mem[0:L + 2];
       End
+      Else If D8Pal <> 0 Then
+      Begin
+        L := D8Pal + I * 4;
+        TxPal[I] := (Mem[0:L + 3] Shl 24) Or (Mem[0:L] Shl 16) Or
+                    (Mem[0:L + 1] Shl 8) Or Mem[0:L + 2];
+      End
       Else
         TxPal[I] := LongInt($FF000000) Or (SysPal[I * 3] Shl 16) Or
                     (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
@@ -42604,6 +42612,7 @@ Var Lit : Boolean;
 Begin
   If (Src = 0) Or (NV <= 0) Then Exit;
   FvfParse(Fvf);
+  If D3DStrideOvr > 0 Then VFStride := D3DStrideOvr;
   Lit := (D3G^.RS[rsLighting] <> 0) And (VFNrm >= 0) And (VFRhw = 0);
   If (D3G^.Ver <= 3) And (VFNrm >= 0) And (VFRhw = 0) Then
     Lit := (Fl And $10) = 0;
@@ -44850,6 +44859,8 @@ Begin
   VB_Process := DD_OK;
 End;
 
+Procedure D8Destroy(C, K : LongInt); Forward;
+
 { Fin d'un objet Direct3D }
 Procedure D3DDestroy(C, K : LongInt);
 Var I : LongInt;
@@ -44872,6 +44883,1506 @@ Begin
     15, 16 :
       If MemL[0:C + 68 + 4 * Ord(K = 16)] <> 0 Then
         KFree(MemL[0:C + 68 + 4 * Ord(K = 16)]);
+    21..27 : D8Destroy(C, K);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Direct3D 8 (D3D8.DLL)                                              }
+{ ------------------------------------------------------------------ }
+{ Le peripherique (sorte 22) utilise le meme moteur (+64 etat TD3D,
+  version 8). Ses ressources enveloppent des surfaces DirectDraw :
+  surface (23, +64 surface, +68 peripherique, +72 conteneur, +76
+  format, +80 usage, +84 reserve), texture (24, +64 niveaux, +68
+  surfaces de niveau (13), +124 peripherique, +128 format, +132
+  usage, +136 reserve, +140 LOD, +144 priorite), tampon de sommets
+  (25) et d'index (26) : +64 donnees, +68 taille, +72 FVF ou format,
+  +76 usage, +80 reserve, +84 peripherique.
+  Peripherique : +68 tampon arriere, +72 tampon Z, +76 primaire (plein
+  ecran), +80 D3DPRESENT_PARAMETERS (52 octets), +132 tampon de
+  sommets du flux 0, +136 pas, +140 tampon d'index, +144 indice de
+  base, +148 nuanceur de sommets (FVF), +152 fenetre, +156 Direct3D8,
+  +160 drapeaux de creation, +164 fenetre de focalisation,
+  +168 enveloppe du tampon arriere, +172 plein ecran.
+  Nuanceurs programmables : non disponibles (version 0 annoncee). }
+
+Const
+  D3DERR_NOTFOUND = LongInt($88760866);
+  D3DERR_NOTAVAILABLE = LongInt($8876086A);
+  D3DERR_INVALIDCALL = LongInt($8876086C);
+
+Var
+  VtD8, VtDev8, VtSf8, VtTx8, VtVB8, VtIB8 : LongInt;
+  D8Pals : Array[0..63] Of LongInt;
+
+Procedure D8InitVt;
+Begin
+  If VtD8 <> 0 Then Exit;
+  D3DInitVt;
+  VtD8 := VtNew;
+  VtAdd('D8_QI,COMAddRef,COMRelease,DXOK2,D8_AdapterCount,D8_AdapterId,');
+  VtAdd('D8_ModeCount,D8_EnumModes,D8_AdapterMode,D8_CheckType,');
+  VtAdd('D8_CheckFormat,D8_CheckMS,DXOK6,D8_GetCaps,D8_Monitor,');
+  VtAdd('D8_CreateDevice');
+  VtDev8 := VtNew;
+  VtAdd('E8_QI,COMAddRef,COMRelease,DXOK1,E8_TexMem,DXOK2,E8_GetD3D,');
+  VtAdd('E8_GetCaps,E8_GetMode,E8_GetParams,DXOK4,DXOK4,E8_ShowCursor,');
+  VtAdd('E8_NoSwap,E8_Reset,E8_Present,E8_GetBack,E8_Raster,E8_SetGamma,');
+  VtAdd('E8_GetGamma,E8_CreateTexture,E8_NA9,E8_NA7,E8_CreateVB,');
+  VtAdd('E8_CreateIB,E8_CreateRT,E8_CreateDS,E8_CreateImage,E8_CopyRects,');
+  VtAdd('E8_UpdateTex,E8_GetFront,E8_SetRT,E8_GetRT,E8_GetDS,');
+  VtAdd('DV_BeginScene,E8_EndScene,DV_Clear7,DV_SetTransform,');
+  VtAdd('DV_GetTransform,DV_MulTransform,DV_SetViewport7,DV_GetViewport7,');
+  VtAdd('DV_SetMaterial7,DV_GetMaterial7,DV_SetLight7,DV_GetLight7,');
+  VtAdd('DV_LightEnable,DV_GetLightEnable,DXOK3,E8_GetClipPlane,DV_SetRS,');
+  VtAdd('DV_GetRS,DV_BeginSB,DV_EndSB,DV_ApplySB,DV_CaptureSB,DV_DeleteSB,');
+  VtAdd('DV_CreateSB,DV_SetClipStatus,DV_GetClipStatus,E8_GetTexture,');
+  VtAdd('E8_SetTexture,DV_GetTSS,DV_SetTSS,DV_Validate,E8_GetInfo,');
+  VtAdd('E8_SetPal,E8_GetPal,E8_SetCurPal,E8_GetCurPal,E8_DrawPrim,');
+  VtAdd('E8_DrawIdxPrim,E8_DrawPrimUP,E8_DrawIdxPrimUP,E8_Process,');
+  VtAdd('E8_CreateVS,E8_SetVS,E8_GetVS,DXOK2,E8_IC4,E8_IC4,E8_IC4,E8_IC4,');
+  VtAdd('E8_SetStream,E8_GetStream,E8_SetIndices,E8_GetIndices,');
+  VtAdd('E8_CreatePS,E8_SetPS,E8_GetPS,DXOK2,E8_IC4,E8_IC4,E8_IC4,');
+  VtAdd('E8_IC4,E8_IC4,DXOK2');
+  VtSf8 := VtNew;
+  VtAdd('S8_QI,COMAddRef,COMRelease,R8_GetDevice,R8_SetPriv,R8_GetPriv,');
+  VtAdd('R8_FreePriv,S8_GetContainer,S8_GetDesc,S8_LockRect,S8_Unlock');
+  VtTx8 := VtNew;
+  VtAdd('T8_QI,COMAddRef,COMRelease,R8_GetDevice,R8_SetPriv,R8_GetPriv,');
+  VtAdd('R8_FreePriv,T8_SetPriority,T8_GetPriority,DXOK1,T8_GetType,');
+  VtAdd('T8_SetLOD,T8_GetLOD,T8_GetLevelCount,T8_GetLevelDesc,');
+  VtAdd('T8_GetSurfaceLevel,T8_LockRect,T8_Unlock,DXOK2');
+  VtVB8 := VtNew;
+  VtAdd('B8_QI,COMAddRef,COMRelease,B8_GetDevice,DXOK5,E8_NF4,DXOK2,');
+  VtAdd('DXNI2,DXOK1,DXOK1,B8_GetType,B8_Lock,DXOK1,B8_GetDesc');
+  VtIB8 := VtVB8;
+End;
+
+Function E8_NF4(T, A, B, C : LongInt) : LongInt;
+Begin
+  E8_NF4 := D3DERR_NOTFOUND;
+End;
+
+Function E8_IC4(T, A, B, C : LongInt) : LongInt;
+Begin
+  E8_IC4 := D3DERR_INVALIDCALL;
+End;
+
+Function E8_NA7(T, A, B, C, D, E, F : LongInt) : LongInt;
+Begin
+  E8_NA7 := D3DERR_NOTAVAILABLE;
+End;
+
+Function E8_NA9(T, A, B, C, D, E, F, G, H : LongInt) : LongInt;
+Begin
+  E8_NA9 := D3DERR_NOTAVAILABLE;
+End;
+
+{ Format D3DFORMAT -> profondeur, masques et drapeaux DDPF }
+Function D8Fmt(F : LongInt; Var Bpp, R, G, B, A, Fl : LongInt) : Boolean;
+Begin
+  D8Fmt := True;
+  R := 0; G := 0; B := 0; A := 0; Fl := $40;
+  Case F Of
+    20 : Begin Bpp := 24; R := $FF0000; G := $FF00; B := $FF; End;
+    21 :
+    Begin
+      Bpp := 32; R := $FF0000; G := $FF00; B := $FF;
+      A := LongInt($FF000000); Fl := $41;
+    End;
+    22 : Begin Bpp := 32; R := $FF0000; G := $FF00; B := $FF; End;
+    23 : Begin Bpp := 16; R := $F800; G := $7E0; B := $1F; End;
+    24 : Begin Bpp := 16; R := $7C00; G := $3E0; B := $1F; End;
+    25 :
+    Begin
+      Bpp := 16; R := $7C00; G := $3E0; B := $1F; A := $8000; Fl := $41;
+    End;
+    26 :
+    Begin
+      Bpp := 16; R := $F00; G := $F0; B := $F; A := $F000; Fl := $41;
+    End;
+    27 : Begin Bpp := 8; R := $E0; G := $1C; B := $3; End;
+    28 : Begin Bpp := 8; A := $FF; Fl := 3; End;
+    30 : Begin Bpp := 16; R := $F00; G := $F0; B := $F; End;
+    41 : Begin Bpp := 8; Fl := $60; End;
+    50 : Begin Bpp := 8; R := $FF; G := $FF; B := $FF; Fl := $20000; End;
+    70, 73, 80 : Begin Bpp := 16; A := $FFFF; Fl := $400; End;
+    71, 75, 77, 79 : Begin Bpp := 32; A := $FFFFFF; Fl := $400; End;
+  Else
+    D8Fmt := False;
+  End;
+End;
+
+{ Format de la surface (inverse) }
+Function D8FmtOf(S : LongInt) : LongInt;
+Var Bp, R, A : LongInt;
+Begin
+  Bp := MemL[0:S + 88]; R := MemL[0:S + 96]; A := MemL[0:S + 108];
+  If MemL[0:S + 220] <> 0 Then
+  Begin
+    D8FmtOf := MemL[0:S + 220];
+    Exit;
+  End;
+  If (MemL[0:S + 92] And $400) <> 0 Then
+  Begin
+    If Bp = 16 Then D8FmtOf := 80 Else D8FmtOf := 77;
+  End
+  Else If (MemL[0:S + 92] And $20) <> 0 Then D8FmtOf := 41
+  Else If Bp = 32 Then
+  Begin
+    If A <> 0 Then D8FmtOf := 21 Else D8FmtOf := 22;
+  End
+  Else If Bp = 24 Then D8FmtOf := 20
+  Else If R = $F800 Then D8FmtOf := 23
+  Else If A = $8000 Then D8FmtOf := 25
+  Else D8FmtOf := 24;
+End;
+
+{ Nouvelle surface DirectDraw au format F (coeur) ; 0 si impossible }
+Function D8Surf(W, H, F, Caps : LongInt) : LongInt;
+Var Bpp, R, G, B, A, Fl, S : LongInt;
+Begin
+  D8Surf := 0;
+  If Not D8Fmt(F, Bpp, R, G, B, A, Fl) Then Exit;
+  DDInitVt;
+  S := SfNew(W, H, Bpp, Fl, R, G, B, A, Caps, 4);
+  If S = 0 Then Exit;
+  MemL[0:S + 220] := F;
+  D8Surf := S;
+End;
+
+Function D8Vt(K : LongInt) : LongInt;
+Begin
+  D8Vt := VtD8;
+End;
+
+Function Direct3DCreate8(Sdk : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  D8InitVt;
+  O := ComNew(0, 21, 64);
+  ComView(O, 0, VtD8);
+  KLog('Direct3D 8 : objet cree (SDK ' + IntStr(Sdk) + ')');
+  Direct3DCreate8 := O;
+End;
+
+Function D8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  D8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, $1DD9E8DA) Then
+    D8_QI := ComGive(Cor(T), 0, VtD8, Ppv);
+End;
+
+Function D8_AdapterCount(T : LongInt) : LongInt;
+Begin
+  D8_AdapterCount := 1;
+End;
+
+Function D8_Monitor(T, A : LongInt) : LongInt;
+Begin
+  D8_Monitor := 1;
+End;
+
+Function D8_AdapterId(T, Ad, Fl, P : LongInt) : LongInt;
+Var Id : LongInt;
+Begin
+  D8_AdapterId := D3DERR_INVALIDCALL;
+  If (P = 0) Or (Ad <> 0) Then Exit;
+  FillMem(P, 1068, 0);
+  DXPutS(P, 'vmm32.vxd', False);
+  DXPutS(P + 512, DXCardName, False);
+  MemL[0:P + 1024] := $00000400; MemL[0:P + 1028] := $00040008;
+  Id := DXCardId;
+  MemL[0:P + 1032] := Id And $FFFF;
+  MemL[0:P + 1036] := (Id Shr 16) And $FFFF;
+  DXGuid(P + 1048, LongInt($D7B71F83), $6340, $11CF, LongInt($A000534E),
+         $35C9AE00);
+  MemL[0:P + 1048] := MemL[0:P + 1048] Xor Id;
+  MemL[0:P + 1064] := 1;
+  D8_AdapterId := DD_OK;
+End;
+
+{ Modes : tailles de DirectDraw en 16 bits (565) puis 32 bits (X888) }
+Function D8ModeAt(K : LongInt; P : LongInt) : Boolean;
+Var I, B, N : LongInt;
+Begin
+  D8ModeAt := False;
+  N := 0;
+  For B := 0 To 1 Do
+    For I := 0 To DXModeN - 1 Do
+      If DXModeOk(DXModeW[I], DXModeH[I], 16 + B * 16) Then
+      Begin
+        If N = K Then
+        Begin
+          If P <> 0 Then
+          Begin
+            MemL[0:P] := DXModeW[I]; MemL[0:P + 4] := DXModeH[I];
+            MemL[0:P + 8] := 60;
+            If B = 0 Then MemL[0:P + 12] := 23 Else MemL[0:P + 12] := 22;
+          End;
+          D8ModeAt := True;
+          Exit;
+        End;
+        Inc(N);
+      End;
+End;
+
+Function D8_ModeCount(T, Ad : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  N := 0;
+  While D8ModeAt(N, 0) Do Inc(N);
+  D8_ModeCount := N;
+End;
+
+Function D8_EnumModes(T, Ad, K, P : LongInt) : LongInt;
+Begin
+  If D8ModeAt(K, P) Then D8_EnumModes := DD_OK
+  Else D8_EnumModes := D3DERR_INVALIDCALL;
+End;
+
+Function D8DispFmt : LongInt;
+Begin
+  Case ScrBpp Of
+    15 : D8DispFmt := 24;
+    16 : D8DispFmt := 23;
+    24 : D8DispFmt := 20;
+    32 : D8DispFmt := 22;
+  Else
+    D8DispFmt := 41;
+  End;
+End;
+
+Function D8_AdapterMode(T, Ad, P : LongInt) : LongInt;
+Begin
+  D8_AdapterMode := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  MemL[0:P] := ScrW; MemL[0:P + 4] := ScrH; MemL[0:P + 8] := 60;
+  MemL[0:P + 12] := D8DispFmt;
+  D8_AdapterMode := DD_OK;
+End;
+
+Function D8RTOk(F : LongInt) : Boolean;
+Begin
+  D8RTOk := (F = 20) Or (F = 21) Or (F = 22) Or (F = 23) Or (F = 24) Or
+            (F = 25);
+End;
+
+Function D8_CheckType(T, Ad, Dt, DF, BF, Win : LongInt) : LongInt;
+Begin
+  If (Ad = 0) And D8RTOk(BF) And ((Win <> 0) Or D8RTOk(DF)) Then
+    D8_CheckType := DD_OK
+  Else D8_CheckType := D3DERR_NOTAVAILABLE;
+End;
+
+Function D8_CheckFormat(T, Ad, Dt, AF, Usage, RT, F : LongInt) : LongInt;
+Var B, R, G, Bl, A, Fl : LongInt; Ok : Boolean;
+Begin
+  Ok := D8Fmt(F, B, R, G, Bl, A, Fl);
+  If (Usage And 2) <> 0 Then Ok := Ok And ((Fl And $400) <> 0);
+  If (Usage And 1) <> 0 Then Ok := Ok And D8RTOk(F);
+  If (RT = 4) Or (RT = 5) Then Ok := False;
+  If Ok Then D8_CheckFormat := DD_OK
+  Else D8_CheckFormat := D3DERR_NOTAVAILABLE;
+End;
+
+Function D8_CheckMS(T, Ad, Dt, F, Win, Ms : LongInt) : LongInt;
+Begin
+  If Ms = 0 Then D8_CheckMS := DD_OK
+  Else D8_CheckMS := D3DERR_NOTAVAILABLE;
+End;
+
+{ D3DCAPS8 (212 octets) }
+Procedure D8Caps(P : LongInt);
+Begin
+  FillMem(P, 212, 0);
+  MemL[0:P] := 1;
+  MemL[0:P + 12] := $20000 Or $80000;
+  MemL[0:P + 20] := 1 Or LongInt($80000000);
+  MemL[0:P + 28] := 1 Or $10 Or $40 Or $100 Or $200 Or $400 Or $800 Or
+                    $2000 Or $8000 Or $10000 Or $80000;
+  MemL[0:P + 32] := $72;
+  MemL[0:P + 36] := 1 Or $10 Or $20 Or $80 Or $100;
+  MemL[0:P + 40] := $FF;
+  MemL[0:P + 44] := $1FFF; MemL[0:P + 48] := $1FFF;
+  MemL[0:P + 52] := $FF;
+  MemL[0:P + 56] := 2 Or 8 Or $80 Or $200 Or $1000 Or $4000 Or $40000 Or
+                    $80000;
+  MemL[0:P + 60] := 1 Or 4 Or 8 Or $80 Or $4000;
+  MemL[0:P + 64] := $100 Or $200 Or $10000 Or $20000 Or $1000000 Or
+                    $2000000;
+  MemL[0:P + 76] := 7;
+  MemL[0:P + 84] := $1F;
+  MemL[0:P + 88] := 2048; MemL[0:P + 92] := 2048;
+  MemL[0:P + 100] := 8192; MemL[0:P + 104] := 2048;
+  MemL[0:P + 108] := 1;
+  MemL[0:P + 112] := LFl(10000000000.0);
+  MemL[0:P + 140] := 8;
+  MemL[0:P + 144] := $2BFFF;
+  MemL[0:P + 148] := 2; MemL[0:P + 152] := 2;
+  MemL[0:P + 156] := $3B;
+  MemL[0:P + 160] := 8;
+  MemL[0:P + 176] := LFl(1.0);
+  MemL[0:P + 180] := $FFFFF; MemL[0:P + 184] := $FFFF;
+  MemL[0:P + 188] := 1; MemL[0:P + 192] := 256;
+  MemL[0:P + 196] := LongInt($FFFE0000);
+  MemL[0:P + 204] := LongInt($FFFF0000);
+End;
+
+Function D8_GetCaps(T, Ad, Dt, P : LongInt) : LongInt;
+Begin
+  D8_GetCaps := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  D8Caps(P);
+  D8_GetCaps := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Ressources                                                         }
+{ ------------------------------------------------------------------ }
+
+{ Enveloppe Surface8 d'une surface (une seule par surface, +212) }
+Function S8Wrap(S, Dev : LongInt) : LongInt;
+Var W : LongInt;
+Begin
+  W := MemL[0:S + 212];
+  If W = 0 Then
+  Begin
+    W := ComNew(0, 23, 96);
+    ComView(W, 0, VtSf8);
+    MemL[0:W + 64] := S;
+    COMAddRef(S);
+    MemL[0:W + 68] := Dev;
+    MemL[0:W + 76] := D8FmtOf(S);
+    MemL[0:S + 212] := W;
+    MemL[0:W + 4] := 0;
+  End;
+  COMAddRef(W);
+  S8Wrap := W;
+End;
+
+Function S8Core(W : LongInt) : LongInt;
+Begin
+  S8Core := 0;
+  W := Cor(W);
+  If W = 0 Then Exit;
+  If MemL[0:W + 8] = 23 Then S8Core := MemL[0:W + 64]
+  Else If MemL[0:W + 8] = 3 Then S8Core := W;
+End;
+
+Function S8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  S8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($B96EEBCA)) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    S8_QI := DD_OK;
+  End;
+End;
+
+Function R8_GetDevice(T, PP : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  T := Cor(T);
+  Case MemL[0:T + 8] Of
+    24 : D := MemL[0:T + 124];
+    25, 26 : D := MemL[0:T + 84];
+  Else
+    D := MemL[0:T + 68];
+  End;
+  R8_GetDevice := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (D = 0) Then Exit;
+  MemL[0:PP] := D;
+  COMAddRef(D);
+  R8_GetDevice := DD_OK;
+End;
+
+Function R8Surf(T : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  If MemL[0:T + 8] = 24 Then R8Surf := MemL[0:MemL[0:T + 68]]
+  Else R8Surf := MemL[0:T + 64];
+End;
+
+Function R8_SetPriv(T, G, D, N, Fl : LongInt) : LongInt;
+Begin
+  R8_SetPriv := SF_SetPrivateData(R8Surf(T), G, D, N, Fl);
+End;
+
+Function R8_GetPriv(T, G, D, PN : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := SF_GetPrivateData(R8Surf(T), G, D, PN);
+  If R = DDERR_NOTFOUND Then R := D3DERR_NOTFOUND;
+  R8_GetPriv := R;
+End;
+
+Function R8_FreePriv(T, G : LongInt) : LongInt;
+Begin
+  R8_FreePriv := SF_FreePrivateData(R8Surf(T), G);
+End;
+
+Function S8_GetContainer(T, Riid, PP : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  T := Cor(T);
+  S8_GetContainer := D3DERR_INVALIDCALL;
+  If PP = 0 Then Exit;
+  C := MemL[0:T + 72];
+  If C = 0 Then C := MemL[0:T + 68];
+  If C = 0 Then Exit;
+  MemL[0:PP] := C;
+  COMAddRef(C);
+  S8_GetContainer := DD_OK;
+End;
+
+{ D3DSURFACE_DESC }
+Procedure S8Desc(S, Fmt, Usage, Pool, P : LongInt);
+Begin
+  MemL[0:P] := Fmt; MemL[0:P + 4] := 1;
+  MemL[0:P + 8] := Usage; MemL[0:P + 12] := Pool;
+  MemL[0:P + 16] := MemL[0:S + 72] * MemL[0:S + 68];
+  MemL[0:P + 20] := 0;
+  MemL[0:P + 24] := MemL[0:S + 64]; MemL[0:P + 28] := MemL[0:S + 68];
+End;
+
+Function S8_GetDesc(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  S8_GetDesc := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  S8Desc(MemL[0:T + 64], MemL[0:T + 76], MemL[0:T + 80], MemL[0:T + 84],
+         P);
+  S8_GetDesc := DD_OK;
+End;
+
+Procedure LockK(S, PL, PR : LongInt);
+Var A : LongInt;
+Begin
+  A := MemL[0:S + 76];
+  If PR <> 0 Then
+    A := A + MemL[0:PR + 4] * MemL[0:S + 72] + MemL[0:PR] * SfBytes(S);
+  MemL[0:PL] := MemL[0:S + 72];
+  MemL[0:PL + 4] := A;
+End;
+
+Function S8_LockRect(T, PL, PR, Fl : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  S8_LockRect := D3DERR_INVALIDCALL;
+  If PL = 0 Then Exit;
+  LockK(MemL[0:T + 64], PL, PR);
+  S8_LockRect := DD_OK;
+End;
+
+Function S8_Unlock(T : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  S := MemL[0:Cor(T) + 64];
+  If (S = DXPrim) And DXOn Then DXTouch(0, DXH, True);
+  S8_Unlock := DD_OK;
+End;
+
+{ Textures }
+Function T8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  T8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($E4CDD575)) Or
+     GuidIs(Riid, LongInt($B4211CFA)) Or GuidIs(Riid, $1B36BB7B) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    T8_QI := DD_OK;
+  End;
+End;
+
+Function T8_SetPriority(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  T8_SetPriority := MemL[0:T + 144];
+  MemL[0:T + 144] := P;
+End;
+
+Function T8_GetPriority(T : LongInt) : LongInt;
+Begin
+  T8_GetPriority := MemL[0:Cor(T) + 144];
+End;
+
+Function T8_GetType(T : LongInt) : LongInt;
+Begin
+  T8_GetType := 3;
+End;
+
+Function T8_SetLOD(T, L : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  T8_SetLOD := MemL[0:T + 140];
+  MemL[0:T + 140] := L;
+End;
+
+Function T8_GetLOD(T : LongInt) : LongInt;
+Begin
+  T8_GetLOD := MemL[0:Cor(T) + 140];
+End;
+
+Function T8_GetLevelCount(T : LongInt) : LongInt;
+Begin
+  T8_GetLevelCount := MemL[0:Cor(T) + 64];
+End;
+
+Function T8Lv(T, L : LongInt) : LongInt;
+Begin
+  T8Lv := 0;
+  If (L < 0) Or (L >= MemL[0:T + 64]) Then Exit;
+  T8Lv := MemL[0:MemL[0:T + 68] + L * 4];
+End;
+
+Function T8_GetLevelDesc(T, L, P : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  T := Cor(T);
+  S := T8Lv(T, L);
+  T8_GetLevelDesc := D3DERR_INVALIDCALL;
+  If (S = 0) Or (P = 0) Then Exit;
+  S8Desc(S, MemL[0:T + 128], MemL[0:T + 132], MemL[0:T + 136], P);
+  MemL[0:P + 4] := 1;
+  T8_GetLevelDesc := DD_OK;
+End;
+
+Function T8_GetSurfaceLevel(T, L, PP : LongInt) : LongInt;
+Var S, W : LongInt;
+Begin
+  T := Cor(T);
+  S := T8Lv(T, L);
+  T8_GetSurfaceLevel := D3DERR_INVALIDCALL;
+  If (S = 0) Or (PP = 0) Then Exit;
+  W := S8Wrap(S, MemL[0:T + 124]);
+  MemL[0:W + 72] := T;
+  MemL[0:W + 80] := MemL[0:T + 132]; MemL[0:W + 84] := MemL[0:T + 136];
+  MemL[0:PP] := W;
+  T8_GetSurfaceLevel := DD_OK;
+End;
+
+Function T8_LockRect(T, L, PL, PR, Fl : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  T := Cor(T);
+  S := T8Lv(T, L);
+  T8_LockRect := D3DERR_INVALIDCALL;
+  If (S = 0) Or (PL = 0) Then Exit;
+  LockK(S, PL, PR);
+  T8_LockRect := DD_OK;
+End;
+
+Function T8_Unlock(T, L : LongInt) : LongInt;
+Begin
+  T8_Unlock := DD_OK;
+End;
+
+{ Tampons de sommets et d'index }
+Function B8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  B8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, LongInt($8AEEEAC7)) Or
+     GuidIs(Riid, $0E689C9A) Or GuidIs(Riid, $1B36BB7B) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    B8_QI := DD_OK;
+  End;
+End;
+
+Function B8_GetDevice(T, PP : LongInt) : LongInt;
+Begin
+  B8_GetDevice := R8_GetDevice(T, PP);
+End;
+
+Function B8_GetType(T : LongInt) : LongInt;
+Begin
+  If MemL[0:Cor(T) + 8] = 25 Then B8_GetType := 6 Else B8_GetType := 7;
+End;
+
+Function B8_Lock(T, Ofs, N, PP, Fl : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  B8_Lock := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (Ofs < 0) Or (Ofs > MemL[0:T + 68]) Then Exit;
+  MemL[0:PP] := MemL[0:T + 64] + Ofs;
+  B8_Lock := DD_OK;
+End;
+
+Function B8_GetDesc(T, P : LongInt) : LongInt;
+Begin
+  T := Cor(T);
+  B8_GetDesc := D3DERR_INVALIDCALL;
+  If P = 0 Then Exit;
+  If MemL[0:T + 8] = 25 Then
+  Begin
+    MemL[0:P] := 100; MemL[0:P + 4] := 6;
+    MemL[0:P + 20] := MemL[0:T + 72];
+  End
+  Else
+  Begin
+    MemL[0:P] := MemL[0:T + 72]; MemL[0:P + 4] := 7;
+  End;
+  MemL[0:P + 8] := MemL[0:T + 76]; MemL[0:P + 12] := MemL[0:T + 80];
+  MemL[0:P + 16] := MemL[0:T + 68];
+  B8_GetDesc := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IDirect3DDevice8                                                   }
+{ ------------------------------------------------------------------ }
+
+{ Format 16 / 32 bits d'un D3DFORMAT d'ecran }
+Function D8Bpp(F : LongInt) : LongInt;
+Begin
+  Case F Of
+    23, 24, 25 : D8Bpp := 16;
+    20 : D8Bpp := 24;
+  Else
+    D8Bpp := 32;
+  End;
+End;
+
+{ Tampons du peripherique C selon D3DPRESENT_PARAMETERS (en +80) }
+Function D8Buffers(C : LongInt) : LongInt;
+Var P, W, H, F, Hw, Q, D, S, ZF, Z : LongInt;
+    R : Array[0..3] Of LongInt;
+Begin
+  D8Buffers := D3DERR_INVALIDCALL;
+  P := C + 80;
+  W := MemL[0:P]; H := MemL[0:P + 4]; F := MemL[0:P + 8];
+  Hw := MemL[0:P + 24];
+  If Hw = 0 Then Hw := MemL[0:C + 164];
+  MemL[0:C + 152] := Hw;
+  If MemL[0:P + 28] <> 0 Then
+  Begin
+    { fenetre : tampon arriere hors ecran }
+    MemL[0:C + 172] := 0;
+    If (W = 0) Or (H = 0) Then
+    Begin
+      R[2] := 640; R[3] := 480;
+      If Hw <> 0 Then GetClientRect(Hw, LongInt(@R));
+      W := Max(1, R[2]); H := Max(1, R[3]);
+    End;
+    If (F = 0) Or Not D8RTOk(F) Then
+    Begin
+      If ScrBpp = 16 Then F := 23 Else F := 22;
+    End;
+    S := D8Surf(W, H, F, dcOffscreen Or dc3D);
+    If S = 0 Then Exit;
+    MemL[0:C + 76] := 0;
+  End
+  Else
+  Begin
+    { plein ecran : mode de la carte, primaire et tampon arriere }
+    MemL[0:C + 172] := 1;
+    If DXObj = 0 Then DDNewObj(3);
+    DXCoopWnd := Hw; DXCoopFl := $11;
+    If DXSetMode(W, H, D8Bpp(F)) <> DD_OK Then Exit;
+    If DXPrim <> 0 Then
+    Begin
+      COMRelease(DXPrim);
+      DXPrim := 0;
+    End;
+    Q := KAlloc(128);
+    FillMem(Q, 124, 0);
+    MemL[0:Q] := 124; MemL[0:Q + 4] := 1 Or $20; MemL[0:Q + 20] := 1;
+    MemL[0:Q + 104] := dcPrimary Or dcFlip Or dcComplex Or dc3D;
+    D := 0;
+    If DD_CreateSurface(DXObj, Q, LongInt(@D), 0) <> DD_OK Then
+    Begin
+      KFree(Q);
+      Exit;
+    End;
+    KFree(Q);
+    MemL[0:C + 76] := D;
+    S := MemL[0:D + 116];
+    COMAddRef(S);
+    F := D8FmtOf(S);
+  End;
+  MemL[0:P] := MemL[0:S + 64]; MemL[0:P + 4] := MemL[0:S + 68];
+  MemL[0:P + 8] := F;
+  MemL[0:C + 68] := S;
+  MemL[0:C + 72] := 0;
+  If MemL[0:P + 32] <> 0 Then
+  Begin
+    ZF := MemL[0:P + 36];
+    If ZF = 0 Then ZF := 80;
+    Z := D8Surf(MemL[0:S + 64], MemL[0:S + 68], ZF, dcZBuf);
+    If Z = 0 Then Z := D8Surf(MemL[0:S + 64], MemL[0:S + 68], 80, dcZBuf);
+    MemL[0:C + 72] := Z;
+  End;
+  If DevSel(C) Then
+  Begin
+    D3G^.RT := S; COMAddRef(S);
+    D3G^.ZB := MemL[0:C + 72];
+    D3DDefaults;
+    D3G^.UseTSS := 1;
+  End;
+  KLog('Direct3D 8 : tampons ' + IntStr(MemL[0:S + 64]) + 'x' +
+       IntStr(MemL[0:S + 68]) + ' format ' + IntStr(F) + ', Z ' +
+       IntStr(Ord(MemL[0:C + 72] <> 0)));
+  D8Buffers := DD_OK;
+End;
+
+Procedure D8FreeBuffers(C : LongInt);
+Begin
+  If DevSel(C) And (D3G^.RT <> 0) Then
+  Begin
+    COMRelease(D3G^.RT);
+    D3G^.RT := 0;
+  End;
+  If MemL[0:C + 68] <> 0 Then COMRelease(MemL[0:C + 68]);
+  If MemL[0:C + 72] <> 0 Then COMRelease(MemL[0:C + 72]);
+  If MemL[0:C + 76] <> 0 Then COMRelease(MemL[0:C + 76]);
+  MemL[0:C + 68] := 0; MemL[0:C + 72] := 0; MemL[0:C + 76] := 0;
+End;
+
+Function D8_CreateDevice(T, Ad, Dt, Hw, Beh, PP, PDev : LongInt)
+  : LongInt;
+Var C, R, E : LongInt;
+Begin
+  D8_CreateDevice := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (PDev = 0) Then Exit;
+  MemL[0:PDev] := 0;
+  D8InitVt;
+  C := ComNew(0, 22, 192);
+  ComView(C, 0, VtDev8);
+  R := KAlloc(SizeOf(TD3D) + 16);
+  FillMem(R, SizeOf(TD3D), 0);
+  MemL[0:C + 64] := R;
+  DevSel(C);
+  D3G^.Ver := 8; D3G^.Core := C; D3G^.D8 := 1;
+  MoveMem(PP, C + 80, 52);
+  MemL[0:C + 156] := Cor(T); COMAddRef(Cor(T));
+  MemL[0:C + 160] := Beh; MemL[0:C + 164] := Hw;
+  MemL[0:C + 148] := $002;
+  E := D8Buffers(C);
+  If E <> DD_OK Then
+  Begin
+    KLog('Direct3D 8 : echec de creation du peripherique');
+    D8_CreateDevice := E;
+    Exit;
+  End;
+  MoveMem(C + 80, PP, 52);
+  MemL[0:PDev] := C;
+  D8_CreateDevice := DD_OK;
+End;
+
+Function E8_QI(T, Riid, Ppv : LongInt) : LongInt;
+Begin
+  E8_QI := E_NOINTERFACE;
+  If Ppv = 0 Then Exit;
+  MemL[0:Ppv] := 0;
+  If GuidUnk(Riid) Or GuidIs(Riid, $7385E5DF) Then
+  Begin
+    MemL[0:Ppv] := T;
+    COMAddRef(T);
+    E8_QI := DD_OK;
+  End;
+End;
+
+Function E8_TexMem(T : LongInt) : LongInt;
+Begin
+  E8_TexMem := 16 * 1024 * 1024;
+End;
+
+Function E8_GetD3D(T, PP : LongInt) : LongInt;
+Begin
+  E8_GetD3D := D3DERR_INVALIDCALL;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := MemL[0:Cor(T) + 156];
+  COMAddRef(MemL[0:PP]);
+  E8_GetD3D := DD_OK;
+End;
+
+Function E8_GetCaps(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then D8Caps(P);
+  E8_GetCaps := DD_OK;
+End;
+
+Function E8_GetMode(T, P : LongInt) : LongInt;
+Begin
+  E8_GetMode := D8_AdapterMode(0, 0, P);
+End;
+
+Function E8_GetParams(T, P : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 0; MemL[0:P + 4] := 1;
+    MemL[0:P + 8] := MemL[0:C + 164]; MemL[0:P + 12] := MemL[0:C + 160];
+  End;
+  E8_GetParams := DD_OK;
+End;
+
+Function E8_ShowCursor(T, Sh : LongInt) : LongInt;
+Begin
+  E8_ShowCursor := 0;
+End;
+
+Function E8_NoSwap(T, P, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  E8_NoSwap := D3DERR_NOTAVAILABLE;
+End;
+
+Function E8_Reset(T, PP : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_Reset := D3DERR_INVALIDCALL;
+  If PP = 0 Then Exit;
+  D8FreeBuffers(C);
+  MoveMem(PP, C + 80, 52);
+  E8_Reset := D8Buffers(C);
+  MoveMem(C + 80, PP, 52);
+End;
+
+{ Fenetre : tampon arriere affiche dans la zone cliente (agrandi) }
+Procedure D8ToWnd(S, Hw, PSrc, PDst : LongInt);
+Var Hdc, Bmi, Buf, W, H, X, Y, Pitch, I, A, SL, ST, SR, SB : LongInt;
+    R : Array[0..3] Of LongInt;
+Begin
+  W := MemL[0:S + 64]; H := MemL[0:S + 68];
+  Pitch := (W + 3) And Not 3;
+  Buf := KAlloc(Pitch * H + 16);
+  Bmi := KAlloc(40 + 1024);
+  If (Buf = 0) Or (Bmi = 0) Then Exit;
+  For Y := 0 To H - 1 Do
+  Begin
+    A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+    For X := 0 To W - 1 Do
+      Case MemL[0:S + 272] Of
+        2 :
+        Begin
+          I := MemW[0:A + X * 2];
+          Mem[0:Buf + Y * Pitch + X] := DXIdxOf(((I Shr 8) And $F8) Shl 16 Or
+            ((I Shr 3) And $FC) Shl 8 Or ((I Shl 3) And $F8));
+        End;
+        5, 6 : Mem[0:Buf + Y * Pitch + X] :=
+                 DXIdxOf(MemL[0:A + X * 4] And $FFFFFF);
+      Else
+        Mem[0:Buf + Y * Pitch + X] := DXIdxOf(SfToRGB(S, SfGet(S, X, Y)));
+      End;
+  End;
+  FillMem(Bmi, 40, 0);
+  MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -H;
+  MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
+  MemL[0:Bmi + 32] := 256;
+  For I := 0 To 255 Do
+    MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
+      (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
+  RectOr(PSrc, W, H, SL, ST, SR, SB);
+  R[0] := 0; R[1] := 0; R[2] := W; R[3] := H;
+  If Hw <> 0 Then GetClientRect(Hw, LongInt(@R));
+  If PDst <> 0 Then MoveMem(PDst, LongInt(@R), 16);
+  Hdc := GetDC(Hw);
+  StretchDIBits(Hdc, R[0], R[1], R[2] - R[0], R[3] - R[1], SL, ST,
+                SR - SL, SB - ST, Buf, Bmi, 0, SRCCOPY);
+  ReleaseDC(Hw, Hdc);
+  KFree(Buf); KFree(Bmi);
+End;
+
+Function E8_Present(T, PSrc, PDst, Hw, Dirty : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_Present := DD_OK;
+  If MemL[0:C + 172] <> 0 Then
+  Begin
+    If MemL[0:C + 76] <> 0 Then
+    Begin
+      If MemL[0:C + 80 + 48] = LongInt($80000000) Then
+        SF_Flip(MemL[0:C + 76], 0, 8)
+      Else SF_Flip(MemL[0:C + 76], 0, 0);
+    End;
+  End
+  Else
+  Begin
+    If Hw = 0 Then Hw := MemL[0:C + 152];
+    D8ToWnd(MemL[0:C + 68], Hw, PSrc, PDst);
+    KYield;
+  End;
+End;
+
+Function E8_GetBack(T, I, Ty, PP : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_GetBack := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (MemL[0:C + 68] = 0) Then Exit;
+  MemL[0:PP] := S8Wrap(MemL[0:C + 68], C);
+  MemL[0:MemL[0:PP] + 80] := 1;
+  E8_GetBack := DD_OK;
+End;
+
+Function E8_Raster(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := Ord(Ticks Mod 17 < 2);
+    MemL[0:P + 4] := ((Ticks Mod 17) * 480) Div 17;
+  End;
+  E8_Raster := DD_OK;
+End;
+
+Function E8_SetGamma(T, Fl, P : LongInt) : LongInt;
+Begin
+  GM_SetGammaRamp(0, Fl, P);
+  E8_SetGamma := DD_OK;
+End;
+
+Function E8_GetGamma(T, P : LongInt) : LongInt;
+Begin
+  GM_GetGammaRamp(0, 0, P);
+  E8_GetGamma := DD_OK;
+End;
+
+Function E8_CreateTexture(T, W, H, Lv, Us, F, Pool, PP : LongInt)
+  : LongInt;
+Var C, X, N, K, S, L, Prev : LongInt;
+Begin
+  E8_CreateTexture := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (W <= 0) Or (H <= 0) Then Exit;
+  MemL[0:PP] := 0;
+  N := Lv;
+  If N <= 0 Then
+  Begin
+    N := 1; K := Max(W, H);
+    While K > 1 Do
+    Begin
+      Inc(N); K := K Div 2;
+    End;
+  End;
+  If N > 13 Then N := 13;
+  X := ComNew(0, 24, 160);
+  ComView(X, 0, VtTx8);
+  L := KAlloc(13 * 4 + 4);
+  MemL[0:X + 64] := N; MemL[0:X + 68] := L;
+  MemL[0:X + 124] := Cor(T);
+  MemL[0:X + 128] := F; MemL[0:X + 132] := Us; MemL[0:X + 136] := Pool;
+  Prev := 0;
+  For K := 0 To N - 1 Do
+  Begin
+    S := D8Surf(W, H, F, dcTexture);
+    If S = 0 Then
+    Begin
+      MemL[0:X + 64] := K;
+      COMRelease(X);
+      E8_CreateTexture := D3DERR_INVALIDCALL;
+      If K = 0 Then Exit;
+      Exit;
+    End;
+    MemL[0:S + 216] := X;
+    MemL[0:S + 204] := K;
+    MemL[0:L + K * 4] := S;
+    If Prev <> 0 Then MemL[0:Prev + 116] := S;
+    Prev := S;
+    W := Max(1, W Div 2); H := Max(1, H Div 2);
+  End;
+  C := 0;
+  MemL[0:PP] := X;
+  E8_CreateTexture := DD_OK;
+End;
+
+Function BufNew(K, Len, Us, F, Pool, Dev, PP : LongInt) : LongInt;
+Var X : LongInt;
+Begin
+  BufNew := D3DERR_INVALIDCALL;
+  If (PP = 0) Or (Len <= 0) Or (Len > 64 * 1024 * 1024) Then Exit;
+  D8InitVt;
+  X := ComNew(0, K, 96);
+  If K = 25 Then ComView(X, 0, VtVB8) Else ComView(X, 0, VtIB8);
+  MemL[0:X + 64] := KAlloc(Len + 16);
+  If MemL[0:X + 64] = 0 Then
+  Begin
+    KFree(X);
+    BufNew := E_OUTOFMEMORY;
+    Exit;
+  End;
+  FillMem(MemL[0:X + 64], Len, 0);
+  MemL[0:X + 68] := Len; MemL[0:X + 72] := F; MemL[0:X + 76] := Us;
+  MemL[0:X + 80] := Pool; MemL[0:X + 84] := Dev;
+  MemL[0:PP] := X;
+  BufNew := DD_OK;
+End;
+
+Function E8_CreateVB(T, Len, Us, Fvf, Pool, PP : LongInt) : LongInt;
+Begin
+  E8_CreateVB := BufNew(25, Len, Us, Fvf, Pool, Cor(T), PP);
+End;
+
+Function E8_CreateIB(T, Len, Us, F, Pool, PP : LongInt) : LongInt;
+Begin
+  If (F <> 101) And (F <> 102) Then F := 101;
+  E8_CreateIB := BufNew(26, Len, Us, F, Pool, Cor(T), PP);
+End;
+
+Function SurfOut(S, Dev, Us, PP : LongInt) : LongInt;
+Begin
+  SurfOut := D3DERR_INVALIDCALL;
+  If (S = 0) Or (PP = 0) Then Exit;
+  MemL[0:PP] := S8Wrap(S, Dev);
+  MemL[0:MemL[0:PP] + 80] := Us;
+  COMRelease(S);
+  SurfOut := DD_OK;
+End;
+
+Function E8_CreateRT(T, W, H, F, Ms, Lk, PP : LongInt) : LongInt;
+Begin
+  E8_CreateRT := SurfOut(D8Surf(W, H, F, dcOffscreen Or dc3D), Cor(T), 1,
+                         PP);
+End;
+
+Function E8_CreateDS(T, W, H, F, Ms, PP : LongInt) : LongInt;
+Begin
+  E8_CreateDS := SurfOut(D8Surf(W, H, F, dcZBuf), Cor(T), 2, PP);
+End;
+
+Function E8_CreateImage(T, W, H, F, PP : LongInt) : LongInt;
+Begin
+  E8_CreateImage := SurfOut(D8Surf(W, H, F, dcOffscreen Or dcSysMem),
+                            Cor(T), 0, PP);
+End;
+
+Function E8_CopyRects(T, Src, Rects, N, Dst, Pts : LongInt) : LongInt;
+Var S, D, I, L, Tp, R, B, X, Y : LongInt;
+Begin
+  S := S8Core(Src); D := S8Core(Dst);
+  E8_CopyRects := D3DERR_INVALIDCALL;
+  If (S = 0) Or (D = 0) Then Exit;
+  If (Rects = 0) Or (N = 0) Then
+  Begin
+    X := 0; Y := 0;
+    If Pts <> 0 Then
+    Begin
+      X := MemL[0:Pts]; Y := MemL[0:Pts + 4];
+    End;
+    SfXfer(D, X, Y, X + MemL[0:S + 64], Y + MemL[0:S + 68], S, 0, 0,
+           MemL[0:S + 64], MemL[0:S + 68], False, False, 0, 0, 0, 0, False,
+           False);
+  End
+  Else
+    For I := 0 To N - 1 Do
+    Begin
+      L := MemL[0:Rects + I * 16]; Tp := MemL[0:Rects + I * 16 + 4];
+      R := MemL[0:Rects + I * 16 + 8]; B := MemL[0:Rects + I * 16 + 12];
+      X := L; Y := Tp;
+      If Pts <> 0 Then
+      Begin
+        X := MemL[0:Pts + I * 8]; Y := MemL[0:Pts + I * 8 + 4];
+      End;
+      SfXfer(D, X, Y, X + R - L, Y + B - Tp, S, L, Tp, R, B, False, False,
+             0, 0, 0, 0, False, False);
+    End;
+  If (D = DXPrim) And DXOn Then DXTouch(0, DXH, True);
+  E8_CopyRects := DD_OK;
+End;
+
+Function E8_UpdateTex(T, Src, Dst : LongInt) : LongInt;
+Begin
+  Src := Cor(Src); Dst := Cor(Dst);
+  E8_UpdateTex := D3DERR_INVALIDCALL;
+  If (Src = 0) Or (Dst = 0) Or (MemL[0:Src + 8] <> 24) Or
+     (MemL[0:Dst + 8] <> 24) Then Exit;
+  TxCopy(MemL[0:MemL[0:Dst + 68]], MemL[0:MemL[0:Src + 68]]);
+  E8_UpdateTex := DD_OK;
+End;
+
+Function E8_GetFront(T, Dst : LongInt) : LongInt;
+Var C, S, D : LongInt;
+Begin
+  C := Cor(T);
+  D := S8Core(Dst);
+  E8_GetFront := D3DERR_INVALIDCALL;
+  If D = 0 Then Exit;
+  S := MemL[0:C + 76];
+  If S = 0 Then S := MemL[0:C + 68];
+  SfXfer(D, 0, 0, MemL[0:S + 64], MemL[0:S + 68], S, 0, 0, MemL[0:S + 64],
+         MemL[0:S + 68], False, False, 0, 0, 0, 0, False, False);
+  E8_GetFront := DD_OK;
+End;
+
+Function E8_SetRT(T, RT, ZS : LongInt) : LongInt;
+Var C, S, Z : LongInt;
+Begin
+  C := Cor(T);
+  E8_SetRT := D3DERR_INVALIDCALL;
+  If Not DevSel(C) Then Exit;
+  S := S8Core(RT);
+  If S <> 0 Then
+  Begin
+    COMAddRef(S);
+    If D3G^.RT <> 0 Then COMRelease(D3G^.RT);
+    D3G^.RT := S;
+    D3G^.VX := 0; D3G^.VY := 0;
+    D3G^.VW := MemL[0:S + 64]; D3G^.VH := MemL[0:S + 68];
+  End;
+  Z := S8Core(ZS);
+  D3G^.ZB := Z;
+  E8_SetRT := DD_OK;
+End;
+
+Function E8_GetRT(T, PP : LongInt) : LongInt;
+Begin
+  E8_GetRT := D3DERR_INVALIDCALL;
+  If (PP = 0) Or Not DevSel(Cor(T)) Or (D3G^.RT = 0) Then Exit;
+  MemL[0:PP] := S8Wrap(D3G^.RT, Cor(T));
+  E8_GetRT := DD_OK;
+End;
+
+Function E8_GetDS(T, PP : LongInt) : LongInt;
+Begin
+  E8_GetDS := D3DERR_NOTFOUND;
+  If (PP = 0) Or Not DevSel(Cor(T)) Then Exit;
+  MemL[0:PP] := 0;
+  If D3G^.ZB = 0 Then Exit;
+  MemL[0:PP] := S8Wrap(D3G^.ZB, Cor(T));
+  E8_GetDS := DD_OK;
+End;
+
+Function E8_EndScene(T : LongInt) : LongInt;
+Begin
+  If DevSel(Cor(T)) Then D3G^.InScene := 0;
+  E8_EndScene := DD_OK;
+End;
+
+Function E8_GetClipPlane(T, I, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then FillMem(P, 16, 0);
+  E8_GetClipPlane := DD_OK;
+End;
+
+Function E8_SetTexture(T, St, X : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  X := Cor(X);
+  S := 0;
+  If X <> 0 Then
+  Begin
+    If MemL[0:X + 8] = 24 Then S := MemL[0:MemL[0:X + 68]]
+    Else If MemL[0:X + 8] = 3 Then S := X;
+  End;
+  If DevSel(Cor(T)) Then D3DSetTex(St, S);
+  E8_SetTexture := DD_OK;
+End;
+
+Function E8_GetTexture(T, St, PP : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  E8_GetTexture := D3DERR_INVALIDCALL;
+  If (PP = 0) Or Not DevSel(Cor(T)) Or (St < 0) Or (St > 7) Then Exit;
+  MemL[0:PP] := 0;
+  S := D3G^.Tex[St];
+  E8_GetTexture := DD_OK;
+  If (S = 0) Or (MemL[0:S + 216] = 0) Then Exit;
+  MemL[0:PP] := MemL[0:S + 216];
+  COMAddRef(MemL[0:PP]);
+End;
+
+Function E8_GetInfo(T, Id, P, N : LongInt) : LongInt;
+Begin
+  E8_GetInfo := S_FALSE;
+End;
+
+Function E8_SetPal(T, N, P : LongInt) : LongInt;
+Begin
+  E8_SetPal := D3DERR_INVALIDCALL;
+  If (N < 0) Or (N > 63) Or (P = 0) Then Exit;
+  If D8Pals[N] = 0 Then D8Pals[N] := KAlloc(1024);
+  MoveMem(P, D8Pals[N], 1024);
+  E8_SetPal := DD_OK;
+End;
+
+Function E8_GetPal(T, N, P : LongInt) : LongInt;
+Begin
+  E8_GetPal := D3DERR_INVALIDCALL;
+  If (N < 0) Or (N > 63) Or (P = 0) Or (D8Pals[N] = 0) Then Exit;
+  MoveMem(D8Pals[N], P, 1024);
+  E8_GetPal := DD_OK;
+End;
+
+Var
+  D8CurPal : LongInt;
+
+Function E8_SetCurPal(T, N : LongInt) : LongInt;
+Begin
+  D8CurPal := N;
+  If (N >= 0) And (N <= 63) Then D8Pal := D8Pals[N];
+  E8_SetCurPal := DD_OK;
+End;
+
+Function E8_GetCurPal(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := D8CurPal;
+  E8_GetCurPal := DD_OK;
+End;
+
+{ Nuanceurs : declaration (D3DVSD) -> FVF ; fonction non disponible }
+Function D8DeclFvf(D : LongInt) : LongInt;
+Var Tk, F, R, Ty, N, Tex : LongInt;
+Begin
+  F := 0; Tex := 0;
+  N := 0;
+  While N < 64 Do
+  Begin
+    Tk := MemL[0:D + N * 4];
+    Inc(N);
+    If Tk = -1 Then Break;
+    If (Tk Shr 29) = 2 Then
+    Begin
+      R := Tk And $1F; Ty := (Tk Shr 16) And 15;
+      Case R Of
+        0 : If Ty = 3 Then F := F Or 4 Else F := F Or 2;
+        3 : F := F Or $10;
+        4 : F := F Or $20;
+        5 : F := F Or $40;
+        6 : F := F Or $80;
+        7..14 : Tex := Max(Tex, R - 6);
+      End;
+    End;
+  End;
+  D8DeclFvf := F Or (Tex Shl 8);
+End;
+
+Function E8_CreateVS(T, Decl, Func, PH, Us : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  E8_CreateVS := D3DERR_INVALIDCALL;
+  If (PH = 0) Or (Decl = 0) Or (Func <> 0) Then Exit;
+  B := KAlloc(16);
+  MemL[0:B] := D8DeclFvf(Decl);
+  MemL[0:PH] := B Or 1;
+  E8_CreateVS := DD_OK;
+End;
+
+Function E8_SetVS(T, H : LongInt) : LongInt;
+Begin
+  If (H And 1) <> 0 Then H := MemL[0:H And Not 1];
+  MemL[0:Cor(T) + 148] := H;
+  E8_SetVS := DD_OK;
+End;
+
+Function E8_GetVS(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := MemL[0:Cor(T) + 148];
+  E8_GetVS := DD_OK;
+End;
+
+Function E8_CreatePS(T, Func, PH : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  E8_CreatePS := D3DERR_INVALIDCALL;
+End;
+
+Function E8_SetPS(T, H : LongInt) : LongInt;
+Begin
+  If H = 0 Then E8_SetPS := DD_OK Else E8_SetPS := D3DERR_INVALIDCALL;
+End;
+
+Function E8_GetPS(T, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  E8_GetPS := DD_OK;
+End;
+
+Function E8_SetStream(T, N, VB, Stride : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  E8_SetStream := D3DERR_INVALIDCALL;
+  If N <> 0 Then Exit;
+  VB := Cor(VB);
+  If VB <> 0 Then COMAddRef(VB);
+  If MemL[0:C + 132] <> 0 Then COMRelease(MemL[0:C + 132]);
+  MemL[0:C + 132] := VB; MemL[0:C + 136] := Stride;
+  E8_SetStream := DD_OK;
+End;
+
+Function E8_GetStream(T, N, PP, PS : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If PP <> 0 Then
+  Begin
+    MemL[0:PP] := MemL[0:C + 132];
+    If MemL[0:PP] <> 0 Then COMAddRef(MemL[0:PP]);
+  End;
+  If PS <> 0 Then MemL[0:PS] := MemL[0:C + 136];
+  E8_GetStream := DD_OK;
+End;
+
+Function E8_SetIndices(T, IB, Base : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  IB := Cor(IB);
+  If IB <> 0 Then COMAddRef(IB);
+  If MemL[0:C + 140] <> 0 Then COMRelease(MemL[0:C + 140]);
+  MemL[0:C + 140] := IB; MemL[0:C + 144] := Base;
+  E8_SetIndices := DD_OK;
+End;
+
+Function E8_GetIndices(T, PP, PB : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := Cor(T);
+  If PP <> 0 Then
+  Begin
+    MemL[0:PP] := MemL[0:C + 140];
+    If MemL[0:PP] <> 0 Then COMAddRef(MemL[0:PP]);
+  End;
+  If PB <> 0 Then MemL[0:PB] := MemL[0:C + 144];
+  E8_GetIndices := DD_OK;
+End;
+
+{ Nombre de sommets (ou d'indices) d'un dessin de N primitives }
+Function D8Count(Pt, N : LongInt) : LongInt;
+Begin
+  Case Pt Of
+    1 : D8Count := N;
+    2 : D8Count := N * 2;
+    3 : D8Count := N + 1;
+    4 : D8Count := N * 3;
+  Else
+    D8Count := N + 2;
+  End;
+End;
+
+Procedure D8Draw(C, Pt, Src, Stride, NV, Idx, Sz, NI : LongInt);
+Begin
+  If Not DevSel(C) Then Exit;
+  DVBase := 0;
+  D3DStrideOvr := Stride;
+  D3DDraw(Pt, MemL[0:C + 148], Src, NV, Idx, Sz, NI, 0);
+  D3DStrideOvr := 0;
+End;
+
+Function E8_DrawPrim(T, Pt, St, N : LongInt) : LongInt;
+Var C, VB : LongInt;
+Begin
+  C := Cor(T);
+  VB := MemL[0:C + 132];
+  E8_DrawPrim := D3DERR_INVALIDCALL;
+  If VB = 0 Then Exit;
+  D8Draw(C, Pt, MemL[0:VB + 64] + St * MemL[0:C + 136], MemL[0:C + 136],
+         D8Count(Pt, N), 0, 0, 0);
+  E8_DrawPrim := DD_OK;
+End;
+
+Function E8_DrawIdxPrim(T, Pt, MinI, NV, SI, N : LongInt) : LongInt;
+Var C, VB, IB, Sz : LongInt;
+Begin
+  C := Cor(T);
+  VB := MemL[0:C + 132]; IB := MemL[0:C + 140];
+  E8_DrawIdxPrim := D3DERR_INVALIDCALL;
+  If (VB = 0) Or (IB = 0) Then Exit;
+  If MemL[0:IB + 72] = 102 Then Sz := 4 Else Sz := 2;
+  D8Draw(C, Pt, MemL[0:VB + 64] + MemL[0:C + 144] * MemL[0:C + 136],
+         MemL[0:C + 136], MinI + NV, MemL[0:IB + 64] + SI * Sz, Sz,
+         D8Count(Pt, N));
+  E8_DrawIdxPrim := DD_OK;
+End;
+
+Function E8_DrawPrimUP(T, Pt, N, D, Stride : LongInt) : LongInt;
+Begin
+  D8Draw(Cor(T), Pt, D, Stride, D8Count(Pt, N), 0, 0, 0);
+  E8_DrawPrimUP := DD_OK;
+End;
+
+Function E8_DrawIdxPrimUP(T, Pt, MinI, NV, N, Idx, F, D, Stride : LongInt)
+  : LongInt;
+Var Sz : LongInt;
+Begin
+  If F = 102 Then Sz := 4 Else Sz := 2;
+  D8Draw(Cor(T), Pt, D, Stride, MinI + NV, Idx, Sz, D8Count(Pt, N));
+  E8_DrawIdxPrimUP := DD_OK;
+End;
+
+Function E8_Process(T, SS, DI, N, Dst, Fl : LongInt) : LongInt;
+Var C, VB, D, I, A, F : LongInt; V : TVtx;
+Begin
+  C := Cor(T); D := Cor(Dst);
+  VB := MemL[0:C + 132];
+  E8_Process := D3DERR_INVALIDCALL;
+  If (VB = 0) Or (D = 0) Or Not DevSel(C) Then Exit;
+  FvfParse(MemL[0:C + 148]);
+  VFStride := MemL[0:C + 136];
+  DVBase := 0;
+  D3DLightsView;
+  D3DProcess(MemL[0:VB + 64] + SS * VFStride, N,
+             (D3G^.RS[rsLighting] <> 0) And (VFNrm >= 0));
+  F := MemL[0:D + 72];
+  FvfParse(F);
+  For I := 0 To N - 1 Do
+  Begin
+    V := DV^[I];
+    D3DProject(V);
+    A := MemL[0:D + 64] + (DI + I) * VFStride;
+    If (DI + I + 1) * VFStride > MemL[0:D + 68] Then Break;
+    MemL[0:A] := LFl(V.SX); MemL[0:A + 4] := LFl(V.SY);
+    MemL[0:A + 8] := LFl(V.SZ);
+    If VFRhw <> 0 Then MemL[0:A + 12] := LFl(V.RW);
+    If VFDif >= 0 Then MemL[0:A + VFDif] := VDif(V);
+    If VFSpc >= 0 Then MemL[0:A + VFSpc] := VSpe(V);
+    If VFTexN > 0 Then
+    Begin
+      MemL[0:A + VFTex[0]] := LFl(V.U0);
+      MemL[0:A + VFTex[0] + 4] := LFl(V.V0);
+    End;
+  End;
+  E8_Process := DD_OK;
+End;
+
+{ Fin des objets Direct3D 8 }
+Procedure D8Destroy(C, K : LongInt);
+Var I : LongInt;
+Begin
+  Case K Of
+    22 :
+    Begin
+      D8FreeBuffers(C);
+      If MemL[0:C + 132] <> 0 Then COMRelease(MemL[0:C + 132]);
+      If MemL[0:C + 140] <> 0 Then COMRelease(MemL[0:C + 140]);
+      If MemL[0:C + 156] <> 0 Then COMRelease(MemL[0:C + 156]);
+      D3DDestroy(C, 11);
+      If DXOn Then DXLeave;
+    End;
+    23 :
+    Begin
+      If MemL[0:C + 64] <> 0 Then
+      Begin
+        MemL[0:MemL[0:C + 64] + 212] := 0;
+        COMRelease(MemL[0:C + 64]);
+      End;
+    End;
+    24 :
+    Begin
+      For I := 0 To MemL[0:C + 64] - 1 Do
+        If MemL[0:MemL[0:C + 68] + I * 4] <> 0 Then
+        Begin
+          MemL[0:MemL[0:MemL[0:C + 68] + I * 4] + 116] := 0;
+          COMRelease(MemL[0:MemL[0:C + 68] + I * 4]);
+        End;
+      KFree(MemL[0:C + 68]);
+    End;
+    25, 26 :
+      If MemL[0:C + 64] <> 0 Then KFree(MemL[0:C + 64]);
   End;
 End;
 
@@ -49789,7 +51300,23 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   VP_NextLight, VP_GetViewport2, VP_SetViewport2, VP_Clear2, MT_QI, MT_Set,
   MT_Get, MT_GetHandle, LT_QI, LT_Set, LT_Get, SF_QI, TX_GetHandle, TX_Load,
   EB_QI, EB_Lock, EB_SetData, EB_GetData, VB_QI, VB_Lock, VB_Process,
-  VB_GetDesc, DXNI6, DD_QI, DD_CreateClipper, DD_CreatePalette,
+  VB_GetDesc, DXNI6, D8_QI, D8_AdapterCount, D8_AdapterId, D8_ModeCount,
+  D8_EnumModes, D8_AdapterMode, D8_CheckType, D8_CheckFormat, D8_CheckMS,
+  DXOK6, D8_GetCaps, D8_Monitor, D8_CreateDevice, E8_QI, E8_TexMem, E8_GetD3D,
+  E8_GetCaps, E8_GetMode, E8_GetParams, E8_ShowCursor, E8_NoSwap, E8_Reset,
+  E8_Present, E8_GetBack, E8_Raster, E8_SetGamma, E8_GetGamma,
+  E8_CreateTexture, E8_NA9, E8_NA7, E8_CreateVB, E8_CreateIB, E8_CreateRT,
+  E8_CreateDS, E8_CreateImage, E8_CopyRects, E8_UpdateTex, E8_GetFront,
+  E8_SetRT, E8_GetRT, E8_GetDS, E8_EndScene, E8_GetClipPlane, E8_GetTexture,
+  E8_SetTexture, E8_GetInfo, E8_SetPal, E8_GetPal, E8_SetCurPal, E8_GetCurPal,
+  E8_DrawPrim, E8_DrawIdxPrim, E8_DrawPrimUP, E8_DrawIdxPrimUP, E8_Process,
+  E8_CreateVS, E8_SetVS, E8_GetVS, E8_IC4, E8_SetStream, E8_GetStream,
+  E8_SetIndices, E8_GetIndices, E8_CreatePS, E8_SetPS, E8_GetPS, S8_QI,
+  R8_GetDevice, R8_SetPriv, R8_GetPriv, R8_FreePriv, S8_GetContainer,
+  S8_GetDesc, S8_LockRect, S8_Unlock, T8_QI, T8_SetPriority, T8_GetPriority,
+  T8_GetType, T8_SetLOD, T8_GetLOD, T8_GetLevelCount, T8_GetLevelDesc,
+  T8_GetSurfaceLevel, T8_LockRect, T8_Unlock, B8_QI, B8_GetDevice, E8_NF4,
+  B8_GetType, B8_Lock, B8_GetDesc, DD_QI, DD_CreateClipper, DD_CreatePalette,
   DD_CreateSurface, DD_DuplicateSurface, DD_EnumDisplayModes, DD_EnumSurfaces,
   DD_FlipToGDISurface, DD_GetCaps, DD_GetDisplayMode, DD_GetFourCCCodes,
   SF_AddAttached, SF_Blt, SF_BltFast, SF_DeleteAttached, SF_EnumAttached,
@@ -49808,7 +51335,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXDeviceDriverSetup, DirectXDeviceDriverSetupA, DirectXSetupGetVersion,
   DirectXSetupSetCallback, DirectXRegisterApplication,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
-  D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy,
+  D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
