@@ -294,7 +294,9 @@ Var
   NProc, NThr, NHnd : LongInt;
   { reseau }
   NetName : String[60];
-  NetSpeed, NetUse, NetOldB, NetN : LongInt;
+  NetSpeed, NetUse, NetOldB, NetN, NetOldT, NetScale : LongInt;
+  { NetUse, NetHist : centiemes de pour cent ; NetScale : haut du
+    graphique (10000 = 100 %, 1000 = 10 %, 100 = 1 %) }
   NetHave : Boolean;
   UserName : String[40];
   { zones cliquables }
@@ -684,7 +686,7 @@ Begin
 End;
 
 Procedure SampleNet;
-Var Buf : Array[0..1300] Of LongInt; N, I, R, B, D : LongInt;
+Var Buf : Array[0..1300] Of LongInt; N, I, R, B, D, T, Mx : LongInt;
 Begin
   N := SizeOf(Buf);
   NetHave := False;
@@ -699,19 +701,43 @@ Begin
       NetSpeed := Pk(R + 524);
       B := Pk(R + 552) + Pk(R + 576);
       D := B - NetOldB;
-      If NetN = 0 Then D := 0;
-      NetOldB := B;
+      T := GetTickCount - NetOldT;
+      If (NetN = 0) Or (T <= 0) Then D := 0;
+      If T <= 0 Then T := 1;
+      NetOldB := B; NetOldT := GetTickCount;
       Inc(NetN);
-      If NetSpeed > 0 Then
-        NetUse := (D Div 1000) * 8000 Div (NetSpeed Div 1000 + 1) *
-                  1000 Div Interval
+      { octets par seconde, puis centiemes de pour cent du debit }
+      D := D Div T * 1000 + (D Mod T) * 1000 Div T;
+      If NetSpeed >= 10000 Then
+        NetUse := D * 8 Div (NetSpeed Div 10000)
       Else NetUse := 0;
-      If NetUse > 100 Then NetUse := 100;
+      If NetUse > 10000 Then NetUse := 10000;
       If NetUse < 0 Then NetUse := 0;
     End;
   End;
   For I := 0 To NHist - 2 Do NetHist[I] := NetHist[I + 1];
   NetHist[NHist - 1] := NetUse;
+  { echelle automatique du graphique, comme Windows XP }
+  Mx := 0;
+  For I := 0 To NHist - 1 Do
+    If NetHist[I] > Mx Then Mx := NetHist[I];
+  If Mx > 1000 Then NetScale := 10000
+  Else If Mx > 100 Then NetScale := 1000
+  Else NetScale := 100;
+End;
+
+{ Centiemes de pour cent en texte : 0,12 % }
+Function Pct100(V : LongInt) : String;
+Var S : String;
+Begin
+  If V >= 1000 Then S := IStr(V Div 100)
+  Else
+  Begin
+    S := IStr(V Mod 100);
+    If Length(S) < 2 Then S := '0' + S;
+    S := IStr(V Div 100) + L(',', '.', ',', ',', ',') + S;
+  End;
+  Pct100 := S + ' %';
 End;
 
 Procedure Sample;
@@ -912,11 +938,11 @@ Begin
   ListFrame(X1 + 8, Y1 + 8, X2 - 26, BY - 28);
   { colonnes : nom, utilisateur, UC, memoire puis les optionnelles }
   NW := 0;
-  CK[NW] := -1; CN[NW] := 19; Inc(NW);
+  CK[NW] := -1; CN[NW] := 17; Inc(NW);
   CK[NW] := -5; CN[NW] := 4; Inc(NW);           { PID si choisi }
   CK[NW] := -2; CN[NW] := 11; Inc(NW);
   CK[NW] := -3; CN[NW] := 4; Inc(NW);
-  CK[NW] := -4; CN[NW] := 10; Inc(NW);
+  CK[NW] := -4; CN[NW] := 9; Inc(NW);
   For K := 1 To NCol - 1 Do
     If ColOn[K] Then
     Begin
@@ -1043,6 +1069,7 @@ Begin
   If N > NHist Then N := NHist;
   Mx := 100;
   If Kind = 1 Then Mx := PerfBuf[2] * 4;     { limite (Ko) }
+  If Kind = 2 Then Mx := NetScale;
   If Mx <= 0 Then Mx := 1;
   If (Kind = 0) And ShowKrn Then
   Begin
@@ -1071,7 +1098,9 @@ Begin
       V := NetHist[NHist - N + I];
     End;
     X := X2 - 2 - (N - 1 - I) * 2;
-    Y := Y2 - 2 - (V Div 16) * H Div (Mx Div 16 + 1);
+    If V > Mx Then V := Mx;
+    If V < 0 Then V := 0;
+    Y := Y2 - 2 - V * H Div Mx;
     If PX >= 0 Then
     Begin
       If Kind = 1 Then SelectObject(DC, PenYellow)
@@ -1200,7 +1229,7 @@ Begin
   Group(X1 + 8, Y, X2 - 8, Y + 190, Copy(NetName, 1, (X2 - X1 - 40) Div 8));
   Graph(X1 + 16, Y + 22, X2 - 16, Y + 182, 2);
   SetTextColor(DC, cGreen);
-  Txt(X1 + 20, Y + 24, '100 %');
+  Txt(X1 + 20, Y + 24, IStr(NetScale Div 100) + ' %');
   Txt(X1 + 20, Y + 164, '0 %');
   SetTextColor(DC, cBlack);
   Y := Y + 198;
@@ -1216,7 +1245,7 @@ Begin
          'Estado'), 0, False);
   SetTextColor(DC, cBlack);
   Txt(X1 + 12, Y + 20, Copy(NetName, 1, 25));
-  S := IStr(NetUse) + ' %';
+  S := Pct100(NetUse);
   TxtR(CX + 12 * 8 - 6, Y + 20, S);
   TxtR(CX + 24 * 8 - 6, Y + 20, SpeedStr(NetSpeed));
   Txt(CX + 24 * 8 + 4, Y + 20, L('Connect'#130, 'Connected', 'Verbunden',
@@ -1861,6 +1890,8 @@ Begin
       If (Id >= 1000) And (Id < 1000 + MaxA) Then ASel := Id - 1000;
       If (Id >= 2000) And (Id < 2000 + MaxP) Then PSel := Id - 2000;
       Redraw;
+      { la selection est visible avant le menu (TrackPopupMenu attend) }
+      UpdateWindow(H);
       If ((Tab = 0) And (Id >= 1000) And (Id < 1000 + MaxA)) Or
          ((Tab = 1) And (Id >= 2000) And (Id < 2000 + MaxP)) Then
         ContextMenu(X, Y);
@@ -1937,7 +1968,7 @@ Begin
   PenRed := CreatePen(0, 1, cRed);
   PenYellow := CreatePen(0, 1, cYellow);
   OnTop := True; MinUse := True; HideMin := False; ShowKrn := False;
-  Interval := 1000;
+  Interval := 1000; NetScale := 100;
   For I := 0 To NCol - 1 Do ColOn[I] := False;
   ASel := -1; PSel := -1; PSort := 0;
   I := 40;
@@ -1948,8 +1979,8 @@ Begin
   C.Brush := 0; C.MenuName := Nil; C.ClassName := @Cls[1];
   RegisterClassA(C);
   Ttl := Z(Title);
-  Wnd := CreateWindowExA(8, @Cls[1], @Ttl[1], $00CF0000 Or $10000000, 36, 4,
-                         568, 448, 0, 0, Inst, 0);
+  Wnd := CreateWindowExA(8, @Cls[1], @Ttl[1], $00CF0000 Or $10000000, 20, 4,
+                         600, 448, 0, 0, Inst, 0);
   BuildMenus;
   { premiers echantillons (l'utilisation demande deux mesures) }
   SampleCpu;
