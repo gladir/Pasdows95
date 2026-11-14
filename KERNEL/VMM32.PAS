@@ -9657,6 +9657,7 @@ Type
     KObj     : LongInt;
     IsApp    : Boolean;
     PaintReq : Boolean;
+    Susp     : LongInt;                 { compteur de SuspendThread }
   End;
 
   TMsgRec = Record
@@ -9765,6 +9766,7 @@ Function ThreadRunnable(T : LongInt) : Boolean;
 Begin
   ThreadRunnable := False;
   If Not Threads[T].Used Then Exit;
+  If Threads[T].Susp > 0 Then Exit;
   Case Threads[T].State Of
     tsReady : ThreadRunnable := True;
     tsSleep : ThreadRunnable := Ticks >= Threads[T].WakeAt;
@@ -9952,6 +9954,7 @@ Begin
   Threads[T].Start := Start;
   Threads[T].Param := Param;
   Threads[T].ExitCode := 259;
+  Threads[T].Susp := 0;
   Threads[T].IsApp := IsApp;
   ThrOwner[T] := Ord(IsApp);
   ThrW16[T] := False;
@@ -10282,6 +10285,7 @@ Var
   Wnds     : PWndArr;         { alloue dans le tas }
   ZList    : Array[0..MaxWnd - 1] Of LongInt;
   ZCnt     : LongInt;
+  ZTaskW   : LongInt;                 { barre des taches (-1 : aucune) }
   Props    : Array[0..MaxProp - 1] Of TProp;
   WTimers  : Array[0..MaxTimer - 1] Of TTimerW;
   ActiveWin, FocusWin, CaptureWin : LongInt;
@@ -10463,6 +10467,44 @@ Begin
   ZCnt := J;
 End;
 
+{ Fenetre de premier niveau qui couvre tout l'ecran (jeu, diaporama) }
+Function ZCovers(W : LongInt) : Boolean;
+Begin
+  ZCovers := Wnds^[W].Visible And Not IsChildW(W) And
+             (Wnds^[W].X <= 0) And (Wnds^[W].Y <= 0) And
+             (Wnds^[W].X + Wnds^[W].W >= ScrW) And
+             (Wnds^[W].Y + Wnds^[W].H >= ScrH);
+End;
+
+{ Comme le shell de Windows : la fenetre mise au premier plan qui
+  couvre tout l'ecran passe au-dessus de la barre des taches (toujours
+  visible) ; une autre fenetre mise au premier plan la fait revenir }
+Procedure ZFullScr(W : LongInt);
+Var I, T : LongInt; Low : Boolean;
+Begin
+  If (ZTaskW < 0) Or (W = ZTaskW) Then Exit;
+  If (Wnds^[W].ExStyle And WS_EX_TOPMOST) <> 0 Then Exit;
+  If ZCovers(W) Then
+  Begin
+    ZRemove(W);
+    ZList[ZCnt] := W;
+    Inc(ZCnt);
+    Exit;
+  End;
+  { la barre est-elle sous une fenetre ordinaire ? }
+  T := -1; Low := False;
+  For I := 0 To ZCnt - 1 Do
+    If ZList[I] = ZTaskW Then T := I
+    Else If (T >= 0) And
+            ((Wnds^[ZList[I]].ExStyle And WS_EX_TOPMOST) = 0) Then
+      Low := True;
+  If Not Low Then Exit;
+  ZRemove(ZTaskW);
+  ZList[ZCnt] := ZTaskW;
+  Inc(ZCnt);
+  DirtyWnd(ZTaskW);
+End;
+
 { Placer W au sommet (sous les fenetres toujours visibles) }
 Procedure ZTop(W : LongInt);
 Var I, P : LongInt;
@@ -10475,6 +10517,7 @@ Begin
   For I := ZCnt DownTo P + 1 Do ZList[I] := ZList[I - 1];
   ZList[P] := W;
   Inc(ZCnt);
+  ZFullScr(W);
 End;
 
 Procedure ZBottom(W : LongInt);
@@ -11210,18 +11253,26 @@ Begin
     Wnds^[W].Max := False;
     MoveW(W, Wnds^[W].NX, Wnds^[W].NY, Wnds^[W].NW, Wnds^[W].NH, True);
     NcPaint(W);
+    ZFullScr(W);
   End;
 End;
 
+{ Agrandir : la zone de travail (au-dessus de la barre des taches) ;
+  une fenetre sans barre de titre (WS_POPUP d'un jeu) prend tout
+  l'ecran, comme sous Windows }
 Procedure MaximizeW(W : LongInt);
+Var B, HH : LongInt;
 Begin
-  If Wnds^[W].Max Or ((Wnds^[W].Style And WS_THICKFRAME) = 0) Then Exit;
+  If Wnds^[W].Max Then Exit;
   Wnds^[W].NX := Wnds^[W].X; Wnds^[W].NY := Wnds^[W].Y;
   Wnds^[W].NW := Wnds^[W].W; Wnds^[W].NH := Wnds^[W].H;
   Wnds^[W].Max := True;
-  MoveW(W, -Wnds^[W].CL, -Wnds^[W].CL, ScrW + 2 * Wnds^[W].CL,
-        TaskY + 2 * Wnds^[W].CL, True);
+  B := Wnds^[W].CL;
+  If (Wnds^[W].Style And $C00000) = $C00000 Then HH := TaskY
+  Else HH := ScrH;
+  MoveW(W, -B, -B, ScrW + 2 * B, HH + 2 * B, True);
   NcPaint(W);
+  ZFullScr(W);
 End;
 
 { Commande systeme (bouton ou menu systeme) }
@@ -20738,6 +20789,8 @@ Begin
     Exit;
   End;
   KLog('CreateThread ' + IntStr(T) + ' -> ' + HexStr(Start, 8));
+  { CREATE_SUSPENDED : la tache attend ResumeThread }
+  If (Flags And 4) <> 0 Then Threads[T].Susp := 1;
   If PTid <> 0 Then MemL[0:PTid] := ThreadId(T);
   CreateThread := KHandle(Threads[T].KObj);
 End;
@@ -20757,9 +20810,53 @@ Begin
   GetThreadPriority := 0;
 End;
 
-Function ResumeThread(H : LongInt) : LongInt;
+{ Tache designee par une poignee (-2 : la tache courante), -1 sinon }
+Function ThreadOfH(H : LongInt) : LongInt;
+Var I, T : LongInt;
 Begin
-  ResumeThread := 1;
+  T := -1;
+  If H = -2 Then T := CurT
+  Else
+  Begin
+    I := KObjOf(H, koThread);
+    If I >= 0 Then T := KObjs^[I].F1;
+  End;
+  If (T >= 0) And (T < MaxThread) Then
+    If Not Threads[T].Used Or (Threads[T].State = tsDead) Then T := -1;
+  If T >= MaxThread Then T := -1;
+  ThreadOfH := T;
+End;
+
+{ ResumeThread : decremente le compteur de suspension, la tache repart
+  quand il revient a 0 ; rend l'ancien compteur }
+Function ResumeThread(H : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  ResumeThread := -1;
+  T := ThreadOfH(H);
+  If T < 0 Then Exit;
+  ResumeThread := Threads[T].Susp;
+  If Threads[T].Susp > 0 Then Dec(Threads[T].Susp);
+End;
+
+{ SuspendThread : la tache ne recoit plus le processeur tant que son
+  compteur n'est pas revenu a 0 (une tache qui se suspend elle-meme
+  attend ici son ResumeThread) }
+Function SuspendThread(H : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  SuspendThread := -1;
+  T := ThreadOfH(H);
+  If T < 0 Then Exit;
+  { la tache 0 (bureau) ne peut pas etre arretee }
+  If T = 0 Then
+  Begin
+    SuspendThread := 0;
+    Exit;
+  End;
+  SuspendThread := Threads[T].Susp;
+  If Threads[T].Susp < 127 Then Inc(Threads[T].Susp);
+  If T = CurT Then KBlock;
 End;
 
 Function GetExitCodeThread(H, P : LongInt) : LongInt;
@@ -23405,6 +23502,18 @@ End;
 { Informations sur le peripherique, impression                       }
 { ------------------------------------------------------------------ }
 
+{ Profondeur annoncee aux programmes : celle de la carte (16, 24 ou 32
+  bits ; 15 bits est annonce 16 comme sous Windows), 8 bits sinon. Les
+  programmes qui exigent la couleur 16 bits fonctionnent donc en
+  High Color ou True Color et refusent le mode 256 couleurs, comme sous
+  Windows 95 (l'ecran reste compose en 256 couleurs par Pasdows) }
+Function HiBits : LongInt;
+Begin
+  If ScrBpp >= 24 Then HiBits := ScrBpp
+  Else If ScrBpp >= 15 Then HiBits := 16
+  Else HiBits := 8;
+End;
+
 Function GetDeviceCaps(Hdc, I : LongInt) : LongInt;
 Begin
   Case I Of
@@ -23414,24 +23523,29 @@ Begin
     6 : GetDeviceCaps := 127;
     8 : GetDeviceCaps := ScrW;      { HORZRES }
     10 : GetDeviceCaps := ScrH;     { VERTRES }
-    12 : GetDeviceCaps := 8;        { BITSPIXEL }
+    12 : GetDeviceCaps := HiBits;   { BITSPIXEL }
     14 : GetDeviceCaps := 1;        { PLANES }
     16 : GetDeviceCaps := -1;
     18 : GetDeviceCaps := 0;
     20 : GetDeviceCaps := 0;
     22 : GetDeviceCaps := 0;
-    24 : GetDeviceCaps := 20;       { NUMCOLORS }
+    24 : If HiBits > 8 Then GetDeviceCaps := -1
+         Else GetDeviceCaps := 20;  { NUMCOLORS }
     26 : GetDeviceCaps := 0;
     28 : GetDeviceCaps := 1;
-    38 : GetDeviceCaps := $7F99;    { RASTERCAPS (avec RC_PALETTE) }
+    38 : If HiBits > 8 Then GetDeviceCaps := $7E99
+         Else GetDeviceCaps := $7F99; { RASTERCAPS, RC_PALETTE en 8 bits }
     40 : GetDeviceCaps := 36;
     42 : GetDeviceCaps := 36;
     44 : GetDeviceCaps := 51;
     88 : GetDeviceCaps := 96;       { LOGPIXELSX }
     90 : GetDeviceCaps := 96;
-    104 : GetDeviceCaps := 256;     { SIZEPALETTE }
-    106 : GetDeviceCaps := 20;      { NUMRESERVED }
-    108 : GetDeviceCaps := 18;      { COLORRES }
+    104 : If HiBits > 8 Then GetDeviceCaps := 0
+          Else GetDeviceCaps := 256; { SIZEPALETTE }
+    106 : If HiBits > 8 Then GetDeviceCaps := 0
+          Else GetDeviceCaps := 20; { NUMRESERVED }
+    108 : If HiBits > 8 Then GetDeviceCaps := HiBits
+          Else GetDeviceCaps := 18; { COLORRES }
     116 : GetDeviceCaps := 60;      { VREFRESH }
   Else
     GetDeviceCaps := 0;
@@ -26894,6 +27008,9 @@ Type
     Used : Boolean;
     Paused : Boolean;
     Rate, Cb, Inst, CbType, QN, LastEnd, PauseAt : LongInt;
+    { position de lecture : octets ecrits, base (octets, instant) et
+      alignement des blocs (waveOutGetPosition) }
+    Wr, PB, PT, Blk : LongInt;
   End;
 
 Var
@@ -27630,6 +27747,10 @@ Begin
   WaveDevs[I].CbType := Flags And $70000;
   WaveDevs[I].QN := 0;
   WaveDevs[I].LastEnd := Ticks;
+  WaveDevs[I].Wr := 0; WaveDevs[I].PB := 0; WaveDevs[I].PT := Ticks;
+  WaveDevs[I].Blk := 1;
+  If Fmt <> 0 Then
+    If MemW[0:Fmt + 12] > 0 Then WaveDevs[I].Blk := MemW[0:Fmt + 12];
   If PH <> 0 Then MemL[0:PH] := HWaveBase + I;
   WaveNotify(I, WOM_OPEN, 0);
 End;
@@ -27677,6 +27798,20 @@ Begin
   waveOutUnprepareHeader := 0;
 End;
 
+{ Octets deja joues par le peripherique I (estimes d'apres l'horloge,
+  sans depasser ce qui a ete ecrit) }
+Function WavePosB(I : LongInt) : LongInt;
+Var E, P, R : LongInt;
+Begin
+  If WaveDevs[I].Paused Then E := WaveDevs[I].PauseAt Else E := Ticks;
+  E := E - WaveDevs[I].PT;
+  If E < 0 Then E := 0;
+  R := WaveDevs[I].Rate;
+  P := WaveDevs[I].PB + (E Div 1000) * R + ((E Mod 1000) * R) Div 1000;
+  If (P < 0) Or (P > WaveDevs[I].Wr) Then P := WaveDevs[I].Wr;
+  WavePosB := P;
+End;
+
 Function waveOutWrite(H, Hdr, N : LongInt) : LongInt;
 Var I, Len, R, St, Q, F : LongInt;
 Begin
@@ -27696,6 +27831,14 @@ Begin
   End;
   MemL[0:Hdr + 16] := (MemL[0:Hdr + 16] Or 16) And Not 1;
   Len := MemL[0:Hdr + 4]; R := WaveDevs[I].Rate;
+  { file vide : la lecture (re)part maintenant }
+  If Q = 0 Then
+  Begin
+    WaveDevs[I].PB := WavePosB(I);
+    WaveDevs[I].PT := Ticks;
+    If WaveDevs[I].Paused Then WaveDevs[I].PT := WaveDevs[I].PauseAt;
+  End;
+  WaveDevs[I].Wr := WaveDevs[I].Wr + Len;
   St := Max(Ticks, WaveDevs[I].LastEnd);
   WaveDevs[I].LastEnd := St + (Len Div R) * 1000 + ((Len Mod R) * 1000) Div R;
   F := IntOff;
@@ -27718,6 +27861,7 @@ Begin
   While WaveDevs[I].QN > 0 Do WaveDone(I, 0);
   WaveDevs[I].LastEnd := Ticks;
   WaveDevs[I].Paused := False;
+  WaveDevs[I].Wr := 0; WaveDevs[I].PB := 0; WaveDevs[I].PT := Ticks;
   waveOutReset := 0;
 End;
 
@@ -27752,6 +27896,7 @@ Begin
     For K := 0 To WaveDevs[I].QN - 1 Do
       WaveQEnd[I * MaxWaveQ + K] := WaveQEnd[I * MaxWaveQ + K] + D;
     WaveDevs[I].LastEnd := WaveDevs[I].LastEnd + D;
+    WaveDevs[I].PT := WaveDevs[I].PT + D;
     WaveDevs[I].Paused := False;
     If (I = SbDev) And SbPlaying And SbPaused Then
     Begin
@@ -28990,6 +29135,8 @@ Begin
   If (Name = '') Then Name := DXOrdName(Dll, Ordinal);
   If (Name = '') And (UpStr(BaseName(Dll)) = 'MSVFW32.DLL') And
      (Ordinal = 2) Then Name := 'VideoForWindowsVersion';
+  If (Name = '') And (UpStr(BaseName(Dll)) = 'COMCTL32.DLL') And
+     (Ordinal = 17) Then Name := 'InitCommonControls';
   If (A = 0) And Not IsSysDll(Dll) Then
   Begin
     M := FindModule(Dll);
@@ -29109,7 +29256,10 @@ Begin
     VSize := MemL[0:S + 8]; VAddr := MemL[0:S + 12];
     RawSize := MemL[0:S + 16]; RawPtr := MemL[0:S + 20];
     If (VSize = 0) Or (RawSize < VSize) Then VSize := RawSize;
-    If (RawSize > 0) And (RawPtr + VSize <= FSize) Then
+    { sans donnees dans le fichier (PointerToRawData = 0, comme la
+      section .bss de certains editeurs de liens) : la section reste a
+      zero, comme sous Windows }
+    If (RawSize > 0) And (RawPtr > 0) And (RawPtr + VSize <= FSize) Then
       MoveMem(F + RawPtr, Load + VAddr, Min(VSize, RawSize));
     S := S + 40;
   End;
@@ -30547,6 +30697,851 @@ End;
 Function SetMapMode(Hdc, M : LongInt) : LongInt;
 Begin
   SetMapMode := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ GDI : origines et etendues (mode MM_TEXT), visibilite               }
+{ ------------------------------------------------------------------ }
+
+Function OffsetViewportOrgEx(Hdc, X, Y, P : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  D := DcOf(Hdc);
+  OffsetViewportOrgEx := 0;
+  If D < 0 Then Exit;
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := Dcs[D].VpX; MemL[0:P + 4] := Dcs[D].VpY;
+  End;
+  Dcs[D].VpX := Dcs[D].VpX + X; Dcs[D].VpY := Dcs[D].VpY + Y;
+  OffsetViewportOrgEx := 1;
+End;
+
+{ En MM_TEXT, les etendues valent toujours 1 x 1 et ne changent pas }
+Function ExtOne(Hdc, P : LongInt) : LongInt;
+Begin
+  ExtOne := 0;
+  If DcOf(Hdc) < 0 Then Exit;
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 1; MemL[0:P + 4] := 1;
+  End;
+  ExtOne := 1;
+End;
+
+Function SetViewportExtEx(Hdc, X, Y, P : LongInt) : LongInt;
+Begin
+  SetViewportExtEx := ExtOne(Hdc, P);
+End;
+
+Function SetWindowExtEx(Hdc, X, Y, P : LongInt) : LongInt;
+Begin
+  SetWindowExtEx := ExtOne(Hdc, P);
+End;
+
+Function ScaleViewportExtEx(Hdc, XN, XD, YN, YD, P : LongInt) : LongInt;
+Begin
+  ScaleViewportExtEx := ExtOne(Hdc, P);
+End;
+
+Function ScaleWindowExtEx(Hdc, XN, XD, YN, YD, P : LongInt) : LongInt;
+Begin
+  ScaleWindowExtEx := ExtOne(Hdc, P);
+End;
+
+Function GetViewportExtEx(Hdc, P : LongInt) : LongInt;
+Begin
+  GetViewportExtEx := ExtOne(Hdc, P);
+End;
+
+Function GetWindowExtEx(Hdc, P : LongInt) : LongInt;
+Begin
+  GetWindowExtEx := ExtOne(Hdc, P);
+End;
+
+{ Le dessin est toujours decoupe a la surface du DC : tout est dit
+  visible (comme un DC sans region de decoupage) }
+Function PtVisible(Hdc, X, Y : LongInt) : LongInt;
+Begin
+  PtVisible := Ord(DcOf(Hdc) >= 0);
+End;
+
+Function RectVisible(Hdc, P : LongInt) : LongInt;
+Begin
+  RectVisible := Ord(DcOf(Hdc) >= 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ USER : classes etendues, placement, texte avec tabulations         }
+{ ------------------------------------------------------------------ }
+
+{ WNDCLASSEX = cbSize + WNDCLASS + hIconSm }
+Function RegisterClassExA(P : LongInt) : LongInt;
+Begin
+  RegisterClassExA := 0;
+  If P = 0 Then Exit;
+  RegisterClassExA := RegisterClassA(P + 4);
+End;
+
+Function GetClassInfoExA(Inst, Name, P : LongInt) : LongInt;
+Begin
+  GetClassInfoExA := 0;
+  If P = 0 Then Exit;
+  GetClassInfoExA := GetClassInfoA(Inst, Name, P + 4);
+  MemL[0:P] := 48; MemL[0:P + 44] := 0;
+End;
+
+{ WINDOWPLACEMENT : length, flags, showCmd, ptMin, ptMax, rcNormal }
+Function GetWindowPlacement(H, P : LongInt) : LongInt;
+Var W, C : LongInt;
+Begin
+  GetWindowPlacement := 0;
+  W := WndOf(H);
+  If (W < 0) Or (P = 0) Then Exit;
+  FillMem(P + 4, 40, 0);
+  MemL[0:P] := 44;
+  C := 1;
+  If Wnds^[W].Min Then C := 2
+  Else If Wnds^[W].Max Then C := 3;
+  MemL[0:P + 8] := C;
+  MemL[0:P + 12] := -1; MemL[0:P + 16] := -1;
+  MemL[0:P + 20] := -1; MemL[0:P + 24] := -1;
+  GetWindowRect(H, P + 28);
+  GetWindowPlacement := 1;
+End;
+
+Function SetWindowPlacement(H, P : LongInt) : LongInt;
+Var X, Y : LongInt;
+Begin
+  SetWindowPlacement := 0;
+  If (WndOf(H) < 0) Or (P = 0) Then Exit;
+  X := MemL[0:P + 28]; Y := MemL[0:P + 32];
+  If MemL[0:P + 8] <> 3 Then
+    MoveWindow(H, X, Y, MemL[0:P + 36] - X, MemL[0:P + 40] - Y, 1);
+  ShowWindow(H, MemL[0:P + 8]);
+  SetWindowPlacement := 1;
+End;
+
+Function SetMenuItemBitmaps(Mn, Pos0, Flags, BUn, BCh : LongInt) : LongInt;
+Begin
+  SetMenuItemBitmaps := 1;
+End;
+
+{ Position de la tabulation qui suit X (taquets en Tabs, decalage Org) }
+Function NextTab(X, NT, Tabs, Org : LongInt) : LongInt;
+Var I, T, St, R : LongInt;
+Begin
+  R := -1;
+  If (NT <= 0) Or (Tabs = 0) Then
+  Begin
+    St := 64;
+    If (NT = 1) And (Tabs <> 0) And (MemL[0:Tabs] > 0) Then
+      St := MemL[0:Tabs];
+    R := Org + ((X - Org) Div St + 1) * St;
+  End
+  Else
+  Begin
+    For I := 0 To NT - 1 Do
+    Begin
+      T := Org + MemL[0:Tabs + I * 4];
+      If (R < 0) And (T > X) Then R := T;
+    End;
+    If R < 0 Then R := X + 8;
+  End;
+  NextTab := R;
+End;
+
+Function TabbedTextDo(Hdc, X, Y, Str, N, NT, Tabs, Org : LongInt;
+                      Draw : Boolean) : LongInt;
+Var I, A, CX, H : LongInt; Sz : Array[0..1] Of LongInt;
+Begin
+  CX := X; A := 0; H := 16;
+  For I := 0 To N Do
+    If (I = N) Or (Mem[0:Str + I] = 9) Then
+    Begin
+      If I > A Then
+      Begin
+        GetTextExtentPoint32A(Hdc, Str + A, I - A, LongInt(@Sz));
+        If Draw Then TextOutA(Hdc, CX, Y, Str + A, I - A);
+        CX := CX + Sz[0]; H := Sz[1];
+      End;
+      If I < N Then CX := NextTab(CX, NT, Tabs, Org);
+      A := I + 1;
+    End;
+  TabbedTextDo := (H Shl 16) Or ((CX - X) And $FFFF);
+End;
+
+Function TabbedTextOutA(Hdc, X, Y, Str, N, NT, Tabs, Org : LongInt)
+  : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Str);
+  TabbedTextOutA := TabbedTextDo(Hdc, X, Y, Str, N, NT, Tabs, Org, True);
+End;
+
+Function GetTabbedTextExtentA(Hdc, Str, N, NT, Tabs : LongInt) : LongInt;
+Begin
+  If N < 0 Then N := StrLenZ(Str);
+  GetTabbedTextExtentA := TabbedTextDo(Hdc, 0, 0, Str, N, NT, Tabs, 0,
+                                       False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ KERNEL32 : messages d'erreur, poignees, fichiers, divers           }
+{ ------------------------------------------------------------------ }
+
+Function SysErrText(Id : LongInt) : String;
+Var S : String;
+Begin
+  Case Id Of
+    0 : S := L('L''operation a reussi.', 'The operation completed ' +
+              'successfully.', 'Der Vorgang wurde erfolgreich beendet.',
+              'Operazione completata.', 'La operacion se completo.');
+    2 : S := L('Le fichier specifie est introuvable.', 'The system ' +
+              'cannot find the file specified.', 'Die Datei wurde ' +
+              'nicht gefunden.', 'File non trovato.', 'No se encuentra ' +
+              'el archivo.');
+    3 : S := L('Le chemin d''acces specifie est introuvable.', 'The ' +
+              'system cannot find the path specified.', 'Der Pfad ' +
+              'wurde nicht gefunden.', 'Percorso non trovato.',
+              'No se encuentra la ruta.');
+    5 : S := L('Acces refuse.', 'Access is denied.', 'Zugriff ' +
+              'verweigert.', 'Accesso negato.', 'Acceso denegado.');
+    6 : S := L('Handle non valide.', 'The handle is invalid.',
+              'Ungultiges Handle.', 'Handle non valido.',
+              'Identificador no valido.');
+    8 : S := L('Memoire insuffisante pour traiter cette commande.',
+              'Not enough storage is available to process this ' +
+              'command.', 'Nicht genug Speicher.', 'Memoria ' +
+              'insufficiente.', 'Memoria insuficiente.');
+    87 : S := L('Parametre incorrect.', 'The parameter is incorrect.',
+               'Falscher Parameter.', 'Parametro non corretto.',
+               'Parametro incorrecto.');
+    112 : S := L('Espace insuffisant sur le disque.', 'There is not ' +
+                'enough space on the disk.', 'Nicht genug Speicherplatz ' +
+                'auf dem Datentrager.', 'Spazio su disco insufficiente.',
+                'Espacio en disco insuficiente.');
+    120 : S := L('Cette fonction n''est pas prise en charge.', 'This ' +
+                'function is not supported on this system.', 'Funktion ' +
+                'nicht unterstutzt.', 'Funzione non supportata.',
+                'Funcion no admitida.');
+  Else
+    S := L('Erreur ', 'Error ', 'Fehler ', 'Errore ', 'Error ') +
+         IntStr(Id) + '.';
+  End;
+  SysErrText := S + #13#10;
+End;
+
+Var
+  FmT, FmN : LongInt;                 { tampon de FormatMessageA }
+
+Procedure FmPut(Ch : LongInt);
+Begin
+  If FmN < 4095 Then
+  Begin
+    Mem[0:FmT + FmN] := Ch;
+    Inc(FmN);
+  End;
+End;
+
+Procedure FmPutS(Const S : String);
+Var J : LongInt;
+Begin
+  For J := 1 To Length(S) Do FmPut(Ord(S[J]));
+End;
+
+{ FormatMessageA : FROM_STRING, FROM_SYSTEM (FROM_HMODULE : comme
+  FROM_SYSTEM), insertions %1..%99 (avec !d! !s! !u! !x! !c!), %0 %n
+  %% %. %t ; ALLOCATE_BUFFER (LocalAlloc) }
+Function FormatMessageA(Flags, Src, Id, Lang, Buf, Size, Args : LongInt)
+  : LongInt;
+Var T, Fm, N, I, K, V, C, Mx : LongInt; Spec, Ins : String;
+    Own : Boolean;
+Begin
+  FormatMessageA := 0;
+  T := KAlloc(4096);
+  If T = 0 Then Exit;
+  Own := False;
+  If (Flags And $400) <> 0 Then Fm := Src
+  Else
+  Begin
+    Ins := SysErrText(Id);
+    Fm := KAlloc(Length(Ins) + 1);
+    PutPStr(Fm, Ins, Length(Ins) + 1);
+    Own := True;
+  End;
+  Mx := Flags And $FF;
+  FmT := T; FmN := 0; I := 0;
+  While (Fm <> 0) And (Mem[0:Fm + I] <> 0) Do
+  Begin
+    C := Mem[0:Fm + I];
+    Inc(I);
+    If (C = Ord('%')) And ((Flags And $200) = 0) Then
+    Begin
+      C := Mem[0:Fm + I];
+      If C <> 0 Then Inc(I);
+      If (C >= Ord('1')) And (C <= Ord('9')) Then
+      Begin
+        K := C - Ord('0');
+        If (Mem[0:Fm + I] >= Ord('0')) And (Mem[0:Fm + I] <= Ord('9')) Then
+        Begin
+          K := K * 10 + Mem[0:Fm + I] - Ord('0');
+          Inc(I);
+        End;
+        Spec := 's';
+        If Mem[0:Fm + I] = Ord('!') Then
+        Begin
+          Spec := '';
+          Inc(I);
+          While (Mem[0:Fm + I] <> 0) And (Mem[0:Fm + I] <> Ord('!')) Do
+          Begin
+            Spec := Spec + Chr(Mem[0:Fm + I]);
+            Inc(I);
+          End;
+          If Mem[0:Fm + I] = Ord('!') Then Inc(I);
+        End;
+        V := 0;
+        If Args <> 0 Then V := MemL[0:Args + (K - 1) * 4];
+        If Spec <> '' Then C := Ord(Spec[Length(Spec)]) Else C := Ord('s');
+        Case Chr(C) Of
+          'd', 'i' : FmPutS(IntStr(V));
+          'u' : If V >= 0 Then FmPutS(IntStr(V))
+                Else FmPutS(IntStr(V Shr 1 Div 5) + IntStr(V Mod 10));
+          'x' :
+          Begin
+            Ins := HexStr(V, 1);
+            For K := 1 To Length(Ins) Do
+              If Ins[K] In ['A'..'F'] Then Ins[K] := Chr(Ord(Ins[K]) + 32);
+            FmPutS(Ins);
+          End;
+          'X' : FmPutS(HexStr(V, 1));
+          'c' : FmPut(V And $FF);
+        Else
+          Begin
+            K := 0;
+            If V <> 0 Then
+              While Mem[0:V + K] <> 0 Do
+              Begin
+                FmPut(Mem[0:V + K]);
+                Inc(K);
+              End;
+          End;
+        End;
+      End
+      Else If C = Ord('0') Then Break
+      Else If C = Ord('n') Then
+      Begin
+        FmPut(13); FmPut(10);
+      End
+      Else If C = Ord('t') Then FmPut(9)
+      Else If C <> 0 Then FmPut(C);
+    End
+    Else If (Mx <> 0) And ((C = 13) Or (C = 10)) Then
+    Begin
+      If (C = 13) And (Mem[0:Fm + I] = 10) Then Inc(I);
+      FmPut(32);
+    End
+    Else FmPut(C);
+  End;
+  N := FmN;
+  Mem[0:T + N] := 0;
+  If Own Then KFree(Fm);
+  If (Flags And $100) <> 0 Then
+  Begin
+    If Buf <> 0 Then
+    Begin
+      V := LocalAlloc(0, Max(N + 1, Size));
+      MoveMem(T, V, N + 1);
+      MemL[0:Buf] := V;
+    End;
+  End
+  Else
+  Begin
+    If N >= Size Then
+    Begin
+      KFree(T);
+      SetErr(122);
+      Exit;
+    End;
+    MoveMem(T, Buf, N + 1);
+  End;
+  KFree(T);
+  FormatMessageA := N;
+End;
+
+Function HeapValidate(Heap, Flags, P : LongInt) : LongInt;
+Begin
+  HeapValidate := 1;
+End;
+
+Procedure DebugBreak;
+Begin
+  KLog('DebugBreak');
+End;
+
+{ Copie d'une poignee : les pseudo-poignees de la tache courante
+  deviennent une vraie poignee, les autres sont partagees }
+Function DuplicateHandle(SP, H, TP, PH, Acc, Inh, Opt : LongInt)
+  : LongInt;
+Var R : LongInt;
+Begin
+  R := H;
+  If H = -2 Then R := KHandle(Threads[CurT].KObj);
+  If PH <> 0 Then MemL[0:PH] := R;
+  DuplicateHandle := 1;
+End;
+
+Procedure FatalAppExitA(Act, Msg : LongInt);
+Begin
+  KLog('FatalAppExit : ' + PStr(Msg));
+  MessageBoxA(0, Msg, 0, $10);
+  ExitProcess(255);
+End;
+
+Function GetProcessVersion(Pid : LongInt) : LongInt;
+Begin
+  GetProcessVersion := $00040000;
+End;
+
+{ Verrous de fichiers : un seul programme a la fois, toujours accordes }
+Function LockFile(H, OL, OH, NL, NH : LongInt) : LongInt;
+Begin
+  LockFile := 1;
+End;
+
+Function UnlockFile(H, OL, OH, NL, NH : LongInt) : LongInt;
+Begin
+  UnlockFile := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ WINMM : manette de jeu (aucune) et fichiers RIFF (mmio)            }
+{ ------------------------------------------------------------------ }
+
+Function joyGetNumDevs : LongInt;
+Begin
+  joyGetNumDevs := 0;
+End;
+
+Function joyGetDevCapsA(Id, P, N : LongInt) : LongInt;
+Begin
+  joyGetDevCapsA := 167;
+End;
+
+Function joyGetPos(Id, P : LongInt) : LongInt;
+Begin
+  joyGetPos := 167;
+End;
+
+Function joyGetPosEx(Id, P : LongInt) : LongInt;
+Begin
+  joyGetPosEx := 167;
+End;
+
+Function joyGetThreshold(Id, P : LongInt) : LongInt;
+Begin
+  joyGetThreshold := 167;
+End;
+
+Function joySetThreshold(Id, V : LongInt) : LongInt;
+Begin
+  joySetThreshold := 167;
+End;
+
+Function joySetCapture(H, Id, Per, Chg : LongInt) : LongInt;
+Begin
+  joySetCapture := 167;
+End;
+
+Function joyReleaseCapture(Id : LongInt) : LongInt;
+Begin
+  joyReleaseCapture := 0;
+End;
+
+Function waveOutGetPosition(H, P, N : LongInt) : LongInt;
+Var I, B, R : LongInt;
+Begin
+  waveOutGetPosition := 5;
+  I := WaveOf(H);
+  If I < 0 Then Exit;
+  waveOutGetPosition := 11;
+  If (P = 0) Or (N < 8) Then Exit;
+  B := WavePosB(I); R := Max(WaveDevs[I].Rate, 1);
+  Case MemL[0:P] Of
+    1 : MemL[0:P + 4] := (B Div R) * 1000 + ((B Mod R) * 1000) Div R;
+    2 : MemL[0:P + 4] := B Div Max(WaveDevs[I].Blk, 1);
+  Else
+    MemL[0:P] := 4;
+    MemL[0:P + 4] := B;
+  End;
+  waveOutGetPosition := 0;
+End;
+
+Const
+  MaxMmio = 16;
+  HMmioBase = $6D10000;
+
+Type
+  TMmio = Record
+    Used : Boolean;
+    FH : LongInt;                     { fichier, ou 0 pour la memoire }
+    MP, MN, MPos : LongInt;           { fichier en memoire }
+    Dirty : Boolean;
+  End;
+
+Var
+  Mmios : Array[0..MaxMmio - 1] Of TMmio;
+
+Function MmioOf(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := H - HMmioBase;
+  If (I < 0) Or (I >= MaxMmio) Then I := -1
+  Else If Not Mmios[I].Used Then I := -1;
+  MmioOf := I;
+End;
+
+Function MmioSeekK(I, Off, Org : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  If Mmios[I].FH <> 0 Then
+    R := SetFilePointer(Mmios[I].FH, Off, 0, Org)
+  Else
+  Begin
+    R := Off;
+    If Org = 1 Then R := Mmios[I].MPos + Off
+    Else If Org = 2 Then R := Mmios[I].MN + Off;
+    If (R < 0) Or (R > Mmios[I].MN) Then R := -1
+    Else Mmios[I].MPos := R;
+  End;
+  MmioSeekK := R;
+End;
+
+Function MmioReadK(I, Buf, N : LongInt) : LongInt;
+Var Got : LongInt;
+Begin
+  Got := -1;
+  If N < 0 Then N := 0;
+  If Mmios[I].FH <> 0 Then
+  Begin
+    If ReadFile(Mmios[I].FH, Buf, N, LongInt(@Got), 0) = 0 Then Got := -1;
+  End
+  Else
+  Begin
+    Got := Min(N, Mmios[I].MN - Mmios[I].MPos);
+    If Got < 0 Then Got := 0;
+    MoveMem(Mmios[I].MP + Mmios[I].MPos, Buf, Got);
+    Mmios[I].MPos := Mmios[I].MPos + Got;
+  End;
+  MmioReadK := Got;
+End;
+
+Function MmioWriteK(I, Buf, N : LongInt) : LongInt;
+Var Got : LongInt;
+Begin
+  Got := -1;
+  If N < 0 Then N := 0;
+  If Mmios[I].FH <> 0 Then
+  Begin
+    If WriteFile(Mmios[I].FH, Buf, N, LongInt(@Got), 0) = 0 Then Got := -1;
+  End
+  Else
+  Begin
+    Got := Min(N, Mmios[I].MN - Mmios[I].MPos);
+    If Got < 0 Then Got := 0;
+    MoveMem(Buf, Mmios[I].MP + Mmios[I].MPos, Got);
+    Mmios[I].MPos := Mmios[I].MPos + Got;
+  End;
+  MmioWriteK := Got;
+End;
+
+{ MMIOINFO : dwFlags +0, fccIOProc +4, pIOProc +8, wErrorRet +12,
+  htask +16, cchBuffer +20, pchBuffer +24, ..., adwInfo +48,
+  hmmio +68 ; lecture et ecriture de fichiers (DOS) et de memoire (MEM) }
+Function mmioOpenA(Name, Info, Flags : LongInt) : LongInt;
+Var I, K, H, Acc, Disp : LongInt;
+Begin
+  mmioOpenA := 0;
+  If Info <> 0 Then MemW[0:Info + 12] := 0;
+  { MMIO_PARSE : nom complet ; MMIO_EXIST : le fichier existe-t-il ? }
+  If (Flags And $100) <> 0 Then
+  Begin
+    If Name <> 0 Then
+      PutPStr(Name, FullPath(PStr(Name)), 128);
+    mmioOpenA := 1;
+    Exit;
+  End;
+  If (Flags And $200) <> 0 Then
+  Begin
+    mmioOpenA := DeleteFileA(Name);
+    Exit;
+  End;
+  I := -1;
+  For K := MaxMmio - 1 DownTo 0 Do
+    If Not Mmios[K].Used Then I := K;
+  If I < 0 Then
+  Begin
+    If Info <> 0 Then MemW[0:Info + 12] := 260;
+    Exit;
+  End;
+  Mmios[I].FH := 0; Mmios[I].MP := 0; Mmios[I].MN := 0;
+  Mmios[I].MPos := 0; Mmios[I].Dirty := False;
+  If (Info <> 0) And (MemL[0:Info + 4] = $204D454D) Then
+  Begin
+    { 'MEM ' : fichier en memoire (pchBuffer, cchBuffer) }
+    Mmios[I].MP := MemL[0:Info + 24];
+    Mmios[I].MN := MemL[0:Info + 20];
+    If Mmios[I].MP = 0 Then
+    Begin
+      Mmios[I].MP := KAlloc(Max(Mmios[I].MN, 1));
+      FillMem(Mmios[I].MP, Max(Mmios[I].MN, 1), 0);
+    End;
+  End
+  Else
+  Begin
+    Acc := LongInt($80000000); Disp := 3;
+    Case Flags And 3 Of
+      1 : Acc := $40000000;
+      2 : Acc := LongInt($C0000000);
+    End;
+    If (Flags And $1000) <> 0 Then Disp := 2;
+    H := CreateFileA(Name, Acc, 1, 0, Disp, $80, 0);
+    If (H = 0) Or (H = -1) Then
+    Begin
+      If Info <> 0 Then MemW[0:Info + 12] := 257;
+      Exit;
+    End;
+    Mmios[I].FH := H;
+  End;
+  Mmios[I].Used := True;
+  If Info <> 0 Then
+  Begin
+    MemL[0:Info] := Flags;
+    MemL[0:Info + 68] := HMmioBase + I;
+  End;
+  mmioOpenA := HMmioBase + I;
+End;
+
+Function mmioClose(H, Flags : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioClose := 5;
+  I := MmioOf(H);
+  If I < 0 Then Exit;
+  If Mmios[I].FH <> 0 Then CloseHandle(Mmios[I].FH);
+  Mmios[I].Used := False;
+  mmioClose := 0;
+End;
+
+Function mmioRead(H, Buf, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioRead := -1;
+  I := MmioOf(H);
+  If I >= 0 Then mmioRead := MmioReadK(I, Buf, N);
+End;
+
+Function mmioWrite(H, Buf, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioWrite := -1;
+  I := MmioOf(H);
+  If I >= 0 Then mmioWrite := MmioWriteK(I, Buf, N);
+End;
+
+Function mmioSeek(H, Off, Org : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  mmioSeek := -1;
+  I := MmioOf(H);
+  If I >= 0 Then mmioSeek := MmioSeekK(I, Off, Org);
+End;
+
+Function mmioFlush(H, Flags : LongInt) : LongInt;
+Begin
+  mmioFlush := 0;
+End;
+
+Function mmioFOURCC(A, B, C, D : LongInt) : LongInt;
+Begin
+  mmioFOURCC := (A And $FF) Or ((B And $FF) Shl 8) Or ((C And $FF) Shl 16)
+                Or ((D And $FF) Shl 24);
+End;
+
+Function mmioStringToFOURCCA(P, Flags : LongInt) : LongInt;
+Var I, R, C : LongInt;
+Begin
+  R := 0;
+  For I := 0 To 3 Do
+  Begin
+    C := 32;
+    If (P <> 0) And (StrLenZ(P) > I) Then C := Mem[0:P + I];
+    If ((Flags And $10) <> 0) And (C >= 97) And (C <= 122) Then C := C - 32;
+    R := R Or (C Shl (I * 8));
+  End;
+  mmioStringToFOURCCA := R;
+End;
+
+{ MMCKINFO : ckid +0, cksize +4, fccType +8, dwDataOffset +12,
+  dwFlags +16 }
+Function mmioDescend(H, Ck, Par, Flags : LongInt) : LongInt;
+Var I, Pos0, Fin, Id, Sz, Ty, Want, WantT : LongInt;
+    Hd : Array[0..2] Of LongInt; Ok : Boolean;
+Begin
+  mmioDescend := 5;
+  I := MmioOf(H);
+  If (I < 0) Or (Ck = 0) Then Exit;
+  Fin := MaxLongInt;
+  If Par <> 0 Then Fin := MemL[0:Par + 12] + MemL[0:Par + 4];
+  Want := 0; WantT := 0;
+  If (Flags And $10) <> 0 Then Want := MemL[0:Ck];
+  If (Flags And $20) <> 0 Then
+  Begin
+    Want := $46464952; WantT := MemL[0:Ck + 8];
+  End;
+  If (Flags And $40) <> 0 Then
+  Begin
+    Want := $5453494C; WantT := MemL[0:Ck + 8];
+  End;
+  mmioDescend := 265;
+  Repeat
+    Pos0 := MmioSeekK(I, 0, 1);
+    If (Pos0 < 0) Or (Pos0 + 8 > Fin) Then Exit;
+    If MmioReadK(I, LongInt(@Hd), 8) <> 8 Then Exit;
+    Id := Hd[0]; Sz := Hd[1]; Ty := 0;
+    If (Id = $46464952) Or (Id = $5453494C) Then
+    Begin
+      If MmioReadK(I, LongInt(@Hd[2]), 4) <> 4 Then Exit;
+      Ty := Hd[2];
+    End;
+    Ok := (Want = 0) Or ((Id = Want) And ((WantT = 0) Or (Ty = WantT)));
+    If Not Ok Then
+      If MmioSeekK(I, Pos0 + 8 + Sz + (Sz And 1), 0) < 0 Then Exit;
+  Until Ok;
+  MemL[0:Ck] := Id; MemL[0:Ck + 4] := Sz; MemL[0:Ck + 8] := Ty;
+  MemL[0:Ck + 12] := Pos0 + 8; MemL[0:Ck + 16] := 0;
+  mmioDescend := 0;
+End;
+
+Function mmioAscend(H, Ck, Flags : LongInt) : LongInt;
+Var I, Sz, P, E : LongInt;
+Begin
+  mmioAscend := 5;
+  I := MmioOf(H);
+  If (I < 0) Or (Ck = 0) Then Exit;
+  Sz := MemL[0:Ck + 4];
+  { MMIO_DIRTY : le morceau ecrit prend la taille atteinte }
+  If (MemL[0:Ck + 16] And $10000000) <> 0 Then
+  Begin
+    P := MmioSeekK(I, 0, 1);
+    Sz := P - MemL[0:Ck + 12];
+    MemL[0:Ck + 4] := Sz;
+    MmioSeekK(I, MemL[0:Ck + 12] - 4, 0);
+    MmioWriteK(I, LongInt(@Sz), 4);
+    MemL[0:Ck + 16] := MemL[0:Ck + 16] And Not $10000000;
+  End;
+  E := MemL[0:Ck + 12] + Sz;
+  If (Sz And 1) <> 0 Then
+  Begin
+    MmioSeekK(I, E, 0);
+    If (MemL[0:Ck + 16] And $20000000) <> 0 Then
+    Begin
+      P := 0;
+      MmioWriteK(I, LongInt(@P), 1);
+    End;
+    Inc(E);
+  End;
+  If MmioSeekK(I, E, 0) < 0 Then
+  Begin
+    mmioAscend := 264;
+    Exit;
+  End;
+  mmioAscend := 0;
+End;
+
+{ MMIO_CREATERIFF $20, MMIO_CREATELIST $40 }
+Function mmioCreateChunk(H, Ck, Flags : LongInt) : LongInt;
+Var I, P, N : LongInt; Hd : Array[0..2] Of LongInt;
+Begin
+  mmioCreateChunk := 5;
+  I := MmioOf(H);
+  If (I < 0) Or (Ck = 0) Then Exit;
+  If (Flags And $20) <> 0 Then MemL[0:Ck] := $46464952;
+  If (Flags And $40) <> 0 Then MemL[0:Ck] := $5453494C;
+  P := MmioSeekK(I, 0, 1);
+  Hd[0] := MemL[0:Ck]; Hd[1] := MemL[0:Ck + 4]; Hd[2] := MemL[0:Ck + 8];
+  N := 8;
+  If (Hd[0] = $46464952) Or (Hd[0] = $5453494C) Then N := 12;
+  If MmioWriteK(I, LongInt(@Hd), N) <> N Then
+  Begin
+    mmioCreateChunk := 259;
+    Exit;
+  End;
+  MemL[0:Ck + 12] := P + 8;
+  MemL[0:Ck + 16] := $10000000;
+  mmioCreateChunk := 0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ WINSPOOL, COMDLG32, COMCTL32                                       }
+{ ------------------------------------------------------------------ }
+
+{ Aucune imprimante n'est installee }
+Function OpenPrinterA(Name, PH, Def : LongInt) : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  SetErr(1801);
+  OpenPrinterA := 0;
+End;
+
+Function ClosePrinter(H : LongInt) : LongInt;
+Begin
+  ClosePrinter := 1;
+End;
+
+Function DocumentPropertiesA(Wnd, Prn, Name, POut, PIn, Mode : LongInt)
+  : LongInt;
+Begin
+  DocumentPropertiesA := -1;
+End;
+
+Function EnumPrintersA(Fl, Name, Lvl, Buf, Cb, PNeed, PRet : LongInt)
+  : LongInt;
+Begin
+  If PNeed <> 0 Then MemL[0:PNeed] := 0;
+  If PRet <> 0 Then MemL[0:PRet] := 0;
+  EnumPrintersA := 1;
+End;
+
+{ Titre d'un fichier : son nom sans le chemin }
+Function GetFileTitleA(Path, Buf, N : LongInt) : LongInt;
+Var S : String; K : LongInt;
+Begin
+  S := PStr(Path);
+  K := Length(S);
+  While (K > 0) And (S[K] <> '\') And (S[K] <> '/') And (S[K] <> ':') Do
+    Dec(K);
+  S := Copy(S, K + 1, 255);
+  If (S = '') Then
+  Begin
+    GetFileTitleA := -1;
+    Exit;
+  End;
+  If (Buf = 0) Or (N <= Length(S)) Then
+  Begin
+    GetFileTitleA := Length(S) + 1;
+    Exit;
+  End;
+  PutPStr(Buf, S, N);
+  GetFileTitleA := 0;
+End;
+
+Procedure InitCommonControls;
+Begin
+End;
+
+Function InitCommonControlsEx(P : LongInt) : LongInt;
+Begin
+  InitCommonControlsEx := 1;
 End;
 
 Function MessageBoxIndirectA(P : LongInt) : LongInt;
@@ -41148,7 +42143,7 @@ Var
   DVCap : LongInt;
   DVBase : LongInt;
   D3DStrideOvr : LongInt;          { pas impose (Direct3D 8), 0 sinon }
-  D8Pal : LongInt;                 { palette courante des textures P8 }                 { premier sommet ecrit par D3DProcess }
+  D8Pal : LongInt;                 { palette courante des textures P8 }
   DC : Array[0..15] Of TVtx;        { polygone en decoupe }
   DC2 : Array[0..15] Of TVtx;
   LtV : Array[0..15] Of TLit;      { lumieres dans l'espace de la vue }
@@ -51390,6 +52385,18 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXSetupSetCallback, DirectXRegisterApplication,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
+  OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
+  ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
+  RegisterClassExA, GetClassInfoExA, GetWindowPlacement, SetWindowPlacement,
+  SetMenuItemBitmaps, TabbedTextOutA, GetTabbedTextExtentA, FormatMessageA,
+  HeapValidate, DebugBreak, DuplicateHandle, FatalAppExitA, GetProcessVersion,
+  LockFile, UnlockFile, SuspendThread, joyGetNumDevs, joyGetDevCapsA,
+  joyGetPos, joyGetPosEx, joyGetThreshold, joySetThreshold, joySetCapture,
+  joyReleaseCapture, waveOutGetPosition, mmioOpenA, mmioClose, mmioRead,
+  mmioWrite, mmioSeek, mmioFlush, mmioFOURCC, mmioStringToFOURCCA,
+  mmioDescend, mmioAscend, mmioCreateChunk, OpenPrinterA, ClosePrinter,
+  DocumentPropertiesA, EnumPrintersA, GetFileTitleA, InitCommonControls,
+  InitCommonControlsEx,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
@@ -60873,7 +61880,7 @@ BEGIN
   InitInput;
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
-  MenuDepth := 0; DeskSel := -1; TaskbarW := -1;
+  MenuDepth := 0; DeskSel := -1; TaskbarW := -1; ZTaskW := -1;
   DeskColor := cTeal;
   InitClasses;
   InitGdi;
@@ -60902,6 +61909,7 @@ BEGIN
   BootStep(BootN);
   TaskbarW := KCreate(ikTaskbar, '', 0, 0, TaskY, ScrW, TaskH, WS_POPUP,
                       WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
+  ZTaskW := TaskbarW;
   ShowW(TaskbarW, True, False);
   LastMinute := -1;
   PreemptOn := True;
