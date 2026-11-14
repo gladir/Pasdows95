@@ -1,0 +1,9 @@
+# Exemple de fichier HOSTS pour Pasdows 95 (comme HOSTS.SAM de
+# Windows 95). Copiez-le sous le nom HOSTS dans le dossier systeme
+# (C:\WINDOWS une fois Pasdows installe) : chaque ligne donne une
+# adresse IP puis un ou plusieurs noms, consultes avant le DNS.
+#
+#      102.54.94.97     rhino.acme.com          # serveur source
+#       38.25.63.10     x.acme.com              # client x
+
+127.0.0.1       localhost

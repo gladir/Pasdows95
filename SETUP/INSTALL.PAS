@@ -2480,7 +2480,9 @@ Begin
   E := Copy(N, Length(N) - 3, 4);
   If (N = 'PASDOWS.WAV') And Not CompSnd Then Exit;
   If (N = 'LISEZMOI.TXT') And Not CompDoc Then Exit;
-  If (E = '.EXE') And (N <> 'COMMAND.EXE') And Not CompEx Then Exit;
+  { COMMAND.EXE et Paint (accessoire) sont toujours installes }
+  If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
+     Not CompEx Then Exit;
   WantFile := True;
 End;
 

@@ -8,7 +8,8 @@
 #        WPC -CVMM32 VMM32.PAS VMM32.VXD   (noyau 32 bits et Win32)
 #  3. compile les programmes systeme (SYSTEM/*.PAS, dont COMMAND.EXE,
 #     l'interpreteur de commandes) et les exemples Win32 (EXAMPLES/*.PAS),
-#     avec WPC -CW32 ;
+#     avec WPC -CW32, puis les applications (APPS/*.PAS, dont PAINT.EXE,
+#     le Paint de CloneDRAW) ;
 #  4. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec tous
 #     les fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
 #     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) ;
@@ -44,6 +45,13 @@ echo "== VMM32.VXD (WPC -CVMM32)"
 
 echo "== Programmes systeme et exemples Win32 (WPC -CW32)"
 for P in "$ROOT"/SYSTEM/*.PAS "$ROOT"/EXAMPLES/*.PAS; do
+  N=$(basename "$P" .PAS)
+  "$W/wpc" -CW32 "$P" "$W/cd/$N.EXE"
+  cp "$W/cd/$N.EXE" "$ROOT/IMAGE/CDROM/$N.EXE"
+done
+
+echo "== Applications (APPS, WPC -CW32)"
+for P in "$ROOT"/APPS/*.PAS; do
   N=$(basename "$P" .PAS)
   "$W/wpc" -CW32 "$P" "$W/cd/$N.EXE"
   cp "$W/cd/$N.EXE" "$ROOT/IMAGE/CDROM/$N.EXE"
