@@ -24,7 +24,8 @@ Program VMM32;
     Partie 1  - Constantes, types, variables et utilitaires
     Partie 2  - Processeur (GDT, IDT, exceptions), PIC, minuterie,
                 horloge, clavier et souris PS/2
-    Partie 3  - CD-ROM ATAPI, ISO 9660, fichiers et disque virtuel
+    Partie 3  - CD-ROM ATAPI, ISO 9660, fichiers et disque virtuel ;
+                3b disques ATA, FAT12/16/32 ; 3c NTFS ; 3d HPFS
     Partie 4  - Graphisme 8 bits : palette systeme, surfaces, police,
                 composition de l'ecran et pointeur
     Partie 5  - Taches (threads cooperatifs) et objets de synchronisation
@@ -5338,6 +5339,1943 @@ Begin
   KFree(R);
 End;
 
+{ ==================================================================== }
+{ Partie 3d - HPFS (lecture et ecriture)                                }
+{ ==================================================================== }
+
+{ Volumes HPFS (OS/2 1.2 et suivants, meme format que HPFS.IFS d'OS/2-0)
+  des partitions de type 07h dont le secteur d'amorce porte "HPFS    "
+  en +36h :
+    secteur 16  superbloc (F995E849h) : fnode de la racine, nombre de
+                secteurs, liste des bitmaps, bande des repertoires
+    secteur 17  bloc de reserve (F9911849h) : bit 0 de +8 = volume sale
+    bitmaps     2 Ko (4 secteurs) par bande de 8 Mo, bit a 1 = libre
+    fnode       un secteur par fichier ou repertoire (F7E40AAEh) : nom
+                (15 premiers caracteres), parent, taille, arbre B+
+                d'allocation (8 extensions ou 12 anodes)
+    anode       noeud de l'arbre B+ (37E40AAEh) : 40 extensions ou 60
+                pointeurs
+    dnode       2 Ko (77E40AAEh) : entrees de repertoire triees sans
+                tenir compte de la casse (page de codes 850), arbre B ;
+                la racine commence par l'entree ^A^A (le repertoire)
+  Les noms (254 caracteres) sont convertis entre la page 850 du disque et
+  le Latin-1 du noyau ; les dates sont en secondes depuis 1970 (heure
+  locale). En ecriture, la bitmap du volume est gardee en memoire et ses
+  secteurs modifies sont reecrits aussitot ; un repertoire modifie est
+  reconstruit en arbre B equilibre de dnodes (en reutilisant les siens).
+  Le bit "sale" du bloc de reserve couvre chaque modification. Les
+  attributs etendus (EA) ne sont pas lus ; ceux d'un fichier supprime
+  sont liberes. }
+
+Const
+  HpfsT = 9;                       { VolType d'un volume HPFS }
+  HpBand = 16384;                  { secteurs par bande (8 Mo) }
+  HpFnMagic = $F7E40AAE;
+  HpAnMagic = $37E40AAE;
+  HpDnMagic = $77E40AAE;
+  HpDnHdr = 20;                    { en-tete d'un dnode }
+  HpDnCap = 1992;                  { 2048 - en-tete - entree finale }
+  HpMaxExtW = 480;                 { extensions ecrites (12 anodes) }
+  { Latin-1 A0h-FFh -> page de codes 850 }
+  HpL2C : Array[0..95] Of Byte = (
+    $FF, $AD, $BD, $9C, $CF, $BE, $DD, $F5, $F9, $B8, $A6, $AE, $AA, $F0,
+    $A9, $EE, $F8, $F1, $FD, $FC, $EF, $E6, $F4, $FA, $F7, $FB, $A7, $AF,
+    $AC, $AB, $F3, $A8, $B7, $B5, $B6, $C7, $8E, $8F, $92, $80, $D4, $90,
+    $D2, $D3, $DE, $D6, $D7, $D8, $D1, $A5, $E3, $E0, $E2, $E5, $99, $9E,
+    $9D, $EB, $E9, $EA, $9A, $ED, $E8, $E1, $85, $A0, $83, $C6, $84, $86,
+    $91, $87, $8A, $82, $88, $89, $8D, $A1, $8C, $8B, $D0, $A4, $95, $A2,
+    $93, $E4, $94, $F6, $9B, $97, $A3, $96, $81, $EC, $E7, $98);
+
+Var
+  HvRoot, HvDirS, HvDirE, HvDirBmp, HvBmp, HvNB, HvBands, HvDbm, HvRO,
+  HvDirty
+    : Array[0..MaxVol - 1] Of LongInt;
+  HpUp, HpC2L : Array[0..255] Of Byte;
+  HpTabOk : Boolean;
+  { entrees d'un repertoire (HpGather) et ses dnodes }
+  HgN, HgBuf, HgCap, HgUsed, HgOff, HgOffCap : LongInt;
+  HgDn, HgDnN, HgDnCap : LongInt;
+  HgVol, HgDir : LongInt;          { repertoire rassemble (cache) }
+  { dernier repertoire liste par chemin (HpDirEntry) }
+  HdPath : String;
+  HdPathVol, HdPathFn : LongInt;
+  HpTmp : LongInt;                 { tampon de travail : 4 Ko }
+  HpDnB : LongInt;                 { dnode en construction : 2 Ko }
+  HpEnt : LongInt;                 { entree trouvee (HpLookup) : 320 }
+  HpNew : LongInt;                 { entree en construction : 320 }
+  HpAnL : Array[0..63] Of LongInt; { anodes de l'arbre lu }
+  HpAnN : LongInt;
+  HpExt : LongInt;                 { extensions de travail }
+  { plan de reconstruction d'un repertoire (HpStore) }
+  HbE, HbC, HbLo, HbHi, HbEnd, HbUp, HbSec : LongInt;
+  HbCap : LongInt;
+
+{ ------------------------------------------------------------------ }
+{ Utilitaires : page de codes, dates, entrees/sorties                  }
+{ ------------------------------------------------------------------ }
+
+Procedure HpInitTab;
+Var I : LongInt;
+Begin
+  If HpTabOk Then Exit;
+  For I := 0 To 255 Do HpUp[I] := I;
+  For I := 97 To 122 Do HpUp[I] := I - 32;
+  HpUp[129] := 154; HpUp[130] := 144; HpUp[131] := 182; HpUp[132] := 142;
+  HpUp[133] := 183; HpUp[134] := 143; HpUp[135] := 128; HpUp[136] := 210;
+  HpUp[137] := 211; HpUp[138] := 212; HpUp[139] := 216; HpUp[140] := 215;
+  HpUp[141] := 222; HpUp[145] := 146; HpUp[147] := 226; HpUp[148] := 153;
+  HpUp[149] := 227; HpUp[150] := 234; HpUp[151] := 235; HpUp[155] := 157;
+  HpUp[160] := 181; HpUp[161] := 214; HpUp[162] := 224; HpUp[163] := 233;
+  HpUp[164] := 165; HpUp[198] := 199; HpUp[208] := 209; HpUp[213] := 73;
+  HpUp[228] := 229; HpUp[231] := 232; HpUp[236] := 237;
+  For I := 0 To 255 Do HpC2L[I] := I;
+  For I := 128 To 255 Do HpC2L[I] := Ord('_');
+  For I := 0 To 95 Do HpC2L[HpL2C[I]] := 160 + I;
+  HpTabOk := True;
+End;
+
+{ Nom du noyau (Latin-1) -> page 850 }
+Function HpToDisk(Const S : String) : String;
+Var R : String; I, C : LongInt;
+Begin
+  R := S;
+  For I := 1 To Length(R) Do
+  Begin
+    C := Ord(R[I]);
+    If C >= 160 Then R[I] := Chr(HpL2C[C - 160])
+    Else If C >= 128 Then R[I] := '_';
+  End;
+  HpToDisk := R;
+End;
+
+{ N octets en page 850 a l'adresse A -> Latin-1 }
+Function HpFromDisk(A, N : LongInt) : String;
+Var R : String; I : LongInt;
+Begin
+  R := '';
+  For I := 0 To N - 1 Do R := R + Chr(HpC2L[Mem[0:A + I]]);
+  HpFromDisk := R;
+End;
+
+{ Comparaison de noms sans tenir compte de la casse : -1, 0 ou 1 }
+Function HpCmp(A1, L1, A2, L2 : LongInt) : LongInt;
+Var I, N, C1, C2 : LongInt;
+Begin
+  N := L1;
+  If L2 < N Then N := L2;
+  For I := 0 To N - 1 Do
+  Begin
+    C1 := HpUp[Mem[0:A1 + I]]; C2 := HpUp[Mem[0:A2 + I]];
+    If C1 <> C2 Then
+    Begin
+      If C1 < C2 Then HpCmp := -1 Else HpCmp := 1;
+      Exit;
+    End;
+  End;
+  If L1 < L2 Then HpCmp := -1
+  Else If L1 > L2 Then HpCmp := 1
+  Else HpCmp := 0;
+End;
+
+{ Nom valide pour HPFS (1 a 254 caracteres, sans caractere interdit) }
+Function HpNameOk(Const S : String) : Boolean;
+Var I, C : LongInt;
+Begin
+  HpNameOk := False;
+  If (Length(S) = 0) Or (Length(S) > 254) Or (S = '.') Or (S = '..') Then
+    Exit;
+  For I := 1 To Length(S) Do
+  Begin
+    C := Ord(S[I]);
+    If (C < 32) Or (C = 34) Or (C = 42) Or (C = 47) Or (C = 58) Or
+       (C = 60) Or (C = 62) Or (C = 63) Or (C = 92) Or (C = 124) Then Exit;
+  End;
+  HpNameOk := True;
+End;
+
+{ Le nom a-t-il la forme 8.3 de FAT ? (sinon attribut 40h) }
+Function HpIs83(Const S : String) : Boolean;
+Var I, P, C : LongInt;
+Begin
+  HpIs83 := False;
+  P := 0;
+  For I := 1 To Length(S) Do
+  Begin
+    C := Ord(S[I]);
+    If S[I] = '.' Then
+    Begin
+      If P > 0 Then Exit;
+      P := I;
+    End
+    Else If (C = 32) Or (C = 43) Or (C = 44) Or (C = 59) Or (C = 61) Or
+            (C = 91) Or (C = 93) Then Exit;
+  End;
+  If P = 0 Then
+  Begin
+    If Length(S) > 8 Then Exit;
+  End
+  Else If (P = 1) Or (P > 9) Or (Length(S) - P > 3) Or (P = Length(S)) Then
+    Exit;
+  HpIs83 := True;
+End;
+
+{ Jours depuis le 1er janvier 1970 (calendrier gregorien) }
+Function HpDays(Y, M, D : LongInt) : LongInt;
+Var A, Era, Yoe, Doy, Doe : LongInt;
+Begin
+  If M <= 2 Then Y := Y - 1;
+  Era := Y Div 400;
+  Yoe := Y - Era * 400;
+  If M > 2 Then A := M - 3 Else A := M + 9;
+  Doy := (153 * A + 2) Div 5 + D - 1;
+  Doe := Yoe * 365 + Yoe Div 4 - Yoe Div 100 + Doy;
+  HpDays := Era * 146097 + Doe - 719468;
+End;
+
+{ Secondes depuis 1970 -> date et heure DOS (date shl 16 or heure) }
+Function HpToDos(T : LongInt) : LongInt;
+Var Days, Secs, Z, Era, Doe, Yoe, Y, Doy, Mp, D, M : LongInt;
+Begin
+  If (T < 315532800) Or (T < 0) Then T := 315532800;
+  Days := T Div 86400;
+  Secs := T Mod 86400;
+  Z := Days + 719468;
+  Era := Z Div 146097;
+  Doe := Z - Era * 146097;
+  Yoe := (Doe - Doe Div 1460 + Doe Div 36524 - Doe Div 146096) Div 365;
+  Y := Yoe + Era * 400;
+  Doy := Doe - (365 * Yoe + Yoe Div 4 - Yoe Div 100);
+  Mp := (5 * Doy + 2) Div 153;
+  D := Doy - (153 * Mp + 2) Div 5 + 1;
+  If Mp < 10 Then M := Mp + 3 Else M := Mp - 9;
+  If M <= 2 Then Inc(Y);
+  If Y > 2107 Then Y := 2107;
+  HpToDos := ((((Y - 1980) Shl 9) Or (M Shl 5) Or D) Shl 16) Or
+             (((Secs Div 3600) Shl 11) Or (((Secs Div 60) Mod 60) Shl 5) Or
+              ((Secs Mod 60) Div 2));
+End;
+
+Function HpFromDos(T : LongInt) : LongInt;
+Var Dt, Tm, Y, M, D : LongInt;
+Begin
+  Dt := (T Shr 16) And $FFFF;
+  Tm := T And $FFFF;
+  Y := 1980 + (Dt Shr 9);
+  M := (Dt Shr 5) And 15;
+  D := Dt And 31;
+  If (M < 1) Or (M > 12) Then M := 1;
+  If D < 1 Then D := 1;
+  HpFromDos := HpDays(Y, M, D) * 86400 + (Tm Shr 11) * 3600 +
+               ((Tm Shr 5) And 63) * 60 + (Tm And 31) * 2;
+End;
+
+Function HpNow : LongInt;
+Begin
+  HpNow := HpFromDos(DosNow);
+End;
+
+Function HpRd(V, S, N, Buf : LongInt) : Boolean;
+Begin
+  HpRd := NtIo(V, S, N, Buf, False);
+End;
+
+Function HpWr(V, S, N, Buf : LongInt) : Boolean;
+Begin
+  HpWr := NtIo(V, S, N, Buf, True);
+End;
+
+{ Fnode du secteur S en Buf (signature verifiee) }
+Function HpFnode(V, S, Buf : LongInt) : Boolean;
+Begin
+  HpFnode := False;
+  If (S <= 0) Or (S >= VolSecs[V]) Then Exit;
+  If Not HpRd(V, S, 1, Buf) Then Exit;
+  HpFnode := MemL[0:Buf] = HpFnMagic;
+End;
+
+Function HpDnode(V, S, Buf : LongInt) : Boolean;
+Begin
+  HpDnode := False;
+  If (S <= 0) Or (S + 4 > VolSecs[V]) Then Exit;
+  If Not HpRd(V, S, 4, Buf) Then Exit;
+  HpDnode := (MemL[0:Buf] = HpDnMagic) And (MemL[0:Buf + 4] <= 2048) And
+             (MemL[0:Buf + 4] >= HpDnHdr + 32);
+End;
+
+{ Volume sale (bloc de reserve) pendant une modification }
+Procedure HpDirtyOn(V : LongInt);
+Begin
+  If HvDirty[V] <> 0 Then Exit;
+  If Not HpRd(V, 17, 1, HpTmp) Then Exit;
+  If MemL[0:HpTmp] <> $F9911849 Then Exit;
+  Mem[0:HpTmp + 8] := Mem[0:HpTmp + 8] Or 1;
+  If HpWr(V, 17, 1, HpTmp) Then HvDirty[V] := 1;
+End;
+
+Procedure HpDirtyOff(V : LongInt);
+Begin
+  If HvDirty[V] = 0 Then Exit;
+  HvDirty[V] := 0;
+  If Not HpRd(V, 17, 1, HpTmp) Then Exit;
+  If MemL[0:HpTmp] <> $F9911849 Then Exit;
+  Mem[0:HpTmp + 8] := Mem[0:HpTmp + 8] And $FE;
+  HpWr(V, 17, 1, HpTmp);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Bitmaps et allocation                                                }
+{ ------------------------------------------------------------------ }
+
+Function HpIsFree(V, S : LongInt) : Boolean;
+Begin
+  HpIsFree := False;
+  If (S < 0) Or (S >= VolSecs[V]) Then Exit;
+  HpIsFree := (Mem[0:HvBmp[V] + S Shr 3] And (1 Shl (S And 7))) <> 0;
+End;
+
+{ Marquer N secteurs libres (Free) ou occupes ; reecrire les secteurs de
+  bitmap modifies }
+Procedure HpMark(V, S, N : LongInt; Free : Boolean);
+Var I, B, M, A, B0, B1, C : LongInt;
+Begin
+  If N <= 0 Then Exit;
+  B0 := -1; B1 := -1;
+  For I := S To S + N - 1 Do
+  Begin
+    If (I < 0) Or (I >= VolSecs[V]) Then Continue;
+    A := HvBmp[V] + I Shr 3;
+    M := 1 Shl (I And 7);
+    B := Mem[0:A];
+    If Free And ((B And M) = 0) Then
+    Begin
+      Mem[0:A] := B Or M;
+      Inc(VolFree[V]);
+    End
+    Else If Not Free And ((B And M) <> 0) Then
+    Begin
+      Mem[0:A] := B And Not M;
+      Dec(VolFree[V]);
+    End
+    Else Continue;
+    If B0 < 0 Then B0 := I Shr 3;
+    B1 := I Shr 3;
+  End;
+  If B0 < 0 Then Exit;
+  HpDirtyOn(V);
+  { secteurs de bitmap touches : 512 octets = 4096 secteurs du volume }
+  For C := B0 Shr 9 To B1 Shr 9 Do
+    HpWr(V, MemL[0:HvBands[V] + (C Shr 2) * 4] + (C And 3), 1,
+         HvBmp[V] + C * 512);
+End;
+
+{ Suite de secteurs libres : la premiere de longueur Want depuis Near
+  (puis depuis le debut), sinon la plus longue ; Align : 1 ou 4 }
+Function HpFindRun(V, Near, Want, Align : LongInt; Var Start : LongInt)
+  : LongInt;
+Var Pass, S, Stop, L, BestS, BestL, Tot : LongInt;
+Begin
+  Tot := VolSecs[V];
+  BestS := 0; BestL := 0;
+  If (Near < 0) Or (Near >= Tot) Then Near := 0;
+  For Pass := 0 To 1 Do
+  Begin
+    If Pass = 0 Then
+    Begin
+      S := Near; Stop := Tot;
+    End
+    Else
+    Begin
+      S := 0; Stop := Near;
+    End;
+    If Align > 1 Then S := ((S + Align - 1) Div Align) * Align;
+    While S < Stop Do
+    Begin
+      If ((S And 7) = 0) And (Mem[0:HvBmp[V] + S Shr 3] = 0) Then
+      Begin
+        S := S + 8;
+        Continue;
+      End;
+      If Not HpIsFree(V, S) Then
+      Begin
+        S := S + Align;
+        Continue;
+      End;
+      L := 0;
+      While (L < Want) And HpIsFree(V, S + L) Do Inc(L);
+      If Align > 1 Then L := (L Div Align) * Align;
+      If L > BestL Then
+      Begin
+        BestL := L; BestS := S;
+      End;
+      If L >= Want Then
+      Begin
+        Start := BestS;
+        HpFindRun := Want;
+        Exit;
+      End;
+      S := S + L + 1;
+      If Align > 1 Then S := ((S + Align - 1) Div Align) * Align;
+    End;
+  End;
+  Start := BestS;
+  HpFindRun := BestL;
+End;
+
+{ Allouer jusqu'a Want secteurs contigus pres de Near ; nombre obtenu }
+Function HpAlloc(V, Near, Want : LongInt; Var Start : LongInt) : LongInt;
+Var Got : LongInt;
+Begin
+  Got := HpFindRun(V, Near, Want, 1, Start);
+  If Got > 0 Then HpMark(V, Start, Got, False);
+  HpAlloc := Got;
+End;
+
+Function HpAlloc1(V, Near : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  HpAlloc1 := 0;
+  If HpAlloc(V, Near, 1, S) = 1 Then HpAlloc1 := S;
+End;
+
+{ Dnode (4 secteurs) : bande des repertoires, sinon ailleurs }
+Function HpDnAlloc(V, Near : LongInt) : LongInt;
+Var I, N, S : LongInt;
+Begin
+  HpDnAlloc := 0;
+  N := (HvDirE[V] - HvDirS[V] + 1) Div 4;
+  If N > 16384 Then N := 16384;
+  For I := 0 To N - 1 Do
+    If (Mem[0:HvDbm[V] + I Shr 3] And (1 Shl (I And 7))) <> 0 Then
+    Begin
+      Mem[0:HvDbm[V] + I Shr 3] := Mem[0:HvDbm[V] + I Shr 3] And
+                                    Not (1 Shl (I And 7));
+      HpDirtyOn(V);
+      HpWr(V, HvDirBmp[V] + I Shr 12, 1, HvDbm[V] + (I Shr 12) * 512);
+      HpDnAlloc := HvDirS[V] + I * 4;
+      Exit;
+    End;
+  If HpFindRun(V, Near, 4, 4, S) >= 4 Then
+  Begin
+    HpMark(V, S, 4, False);
+    HpDnAlloc := S;
+  End;
+End;
+
+Procedure HpDnFree(V, S : LongInt);
+Var I : LongInt;
+Begin
+  If (S >= HvDirS[V]) And (S <= HvDirE[V]) Then
+  Begin
+    I := (S - HvDirS[V]) Div 4;
+    Mem[0:HvDbm[V] + I Shr 3] := Mem[0:HvDbm[V] + I Shr 3] Or
+                                  (1 Shl (I And 7));
+    HpDirtyOn(V);
+    HpWr(V, HvDirBmp[V] + I Shr 12, 1, HvDbm[V] + (I Shr 12) * 512);
+  End
+  Else HpMark(V, S, 4, True);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Arbre B+ d'allocation (fnode, anodes) : extensions de 12 octets       }
+{ (secteur du fichier, longueur, secteur du disque)                    }
+{ ------------------------------------------------------------------ }
+
+{ Parcourir l'arbre d'en-tete Hdr : extensions ajoutees en RA (Cap au
+  plus), anodes notees dans HpAnL }
+Function HpTree(V, Hdr, RA, Cap : LongInt; Var RN : LongInt;
+                Depth : LongInt) : Boolean;
+Var I, N, A, Dn : LongInt; Ok : Boolean;
+Begin
+  HpTree := False;
+  N := Mem[0:Hdr + 5];
+  If (Mem[0:Hdr] And $80) <> 0 Then
+  Begin
+    If (Depth > 6) Or (N > 60) Then Exit;
+    A := KAlloc(512);
+    If A = 0 Then Exit;
+    Ok := True;
+    For I := 0 To N - 1 Do
+    Begin
+      Dn := MemL[0:Hdr + 8 + I * 8 + 4];
+      If Not HpRd(V, Dn, 1, A) Or (MemL[0:A] <> HpAnMagic) Then
+      Begin
+        Ok := False;
+        Break;
+      End;
+      If HpAnN < 64 Then
+      Begin
+        HpAnL[HpAnN] := Dn;
+        Inc(HpAnN);
+      End;
+      If Not HpTree(V, A + 12, RA, Cap, RN, Depth + 1) Then
+      Begin
+        Ok := False;
+        Break;
+      End;
+    End;
+    KFree(A);
+    HpTree := Ok;
+    Exit;
+  End;
+  If N > 40 Then Exit;
+  For I := 0 To N - 1 Do
+    If RN < Cap Then
+    Begin
+      MemL[0:RA + RN * 12] := MemL[0:Hdr + 8 + I * 12];
+      MemL[0:RA + RN * 12 + 4] := MemL[0:Hdr + 8 + I * 12 + 4];
+      MemL[0:RA + RN * 12 + 8] := MemL[0:Hdr + 8 + I * 12 + 8];
+      Inc(RN);
+    End;
+  HpTree := True;
+End;
+
+{ Extensions du fnode Fn (en memoire) -> RA, RN }
+Function HpLoadExt(V, Fn, RA, Cap : LongInt; Var RN : LongInt) : Boolean;
+Begin
+  RN := 0; HpAnN := 0;
+  HpLoadExt := HpTree(V, Fn + 56, RA, Cap, RN, 0);
+End;
+
+Function HpExtSecs(RA, RN : LongInt) : LongInt;
+Var I, T : LongInt;
+Begin
+  T := 0;
+  For I := 0 To RN - 1 Do T := T + MemL[0:RA + I * 12 + 4];
+  HpExtSecs := T;
+End;
+
+{ Secteur du disque du secteur FS du fichier ; Run : secteurs contigus }
+Function HpMap(RA, RN, FS : LongInt; Var Run : LongInt) : LongInt;
+Var I, F0, L : LongInt;
+Begin
+  HpMap := 0; Run := 0;
+  For I := 0 To RN - 1 Do
+  Begin
+    F0 := MemL[0:RA + I * 12]; L := MemL[0:RA + I * 12 + 4];
+    If (FS >= F0) And (FS < F0 + L) Then
+    Begin
+      HpMap := MemL[0:RA + I * 12 + 8] + FS - F0;
+      Run := F0 + L - FS;
+      Exit;
+    End;
+  End;
+End;
+
+{ Reecrire l'arbre d'allocation du fnode FnS (Fn en memoire, ecrit ici)
+  d'apres RA, RN ; les anodes de l'ancien arbre sont liberees }
+Function HpStoreExt(V, FnS, Fn, RA : LongInt; Var RN : LongInt) : Boolean;
+Var I, K, J, N, S, A, Hdr, Dummy, X : LongInt;
+    Secs : Array[0..11] Of LongInt;
+Begin
+  HpStoreExt := False;
+  { fusionner les extensions contigues }
+  K := 0;
+  For I := 0 To RN - 1 Do
+    If MemL[0:RA + I * 12 + 4] > 0 Then
+    Begin
+      If (K > 0) And
+         (MemL[0:RA + (K - 1) * 12 + 8] + MemL[0:RA + (K - 1) * 12 + 4] =
+          MemL[0:RA + I * 12 + 8]) And
+         (MemL[0:RA + (K - 1) * 12] + MemL[0:RA + (K - 1) * 12 + 4] =
+          MemL[0:RA + I * 12]) Then
+        MemL[0:RA + (K - 1) * 12 + 4] := MemL[0:RA + (K - 1) * 12 + 4] +
+                                          MemL[0:RA + I * 12 + 4]
+      Else
+      Begin
+        If K <> I Then MoveMem(RA + I * 12, RA + K * 12, 12);
+        Inc(K);
+      End;
+    End;
+  RN := K;
+  If RN > HpMaxExtW Then Exit;
+  { anodes de l'ancien arbre }
+  X := KAlloc(4096);
+  If X = 0 Then Exit;
+  Dummy := 0; HpAnN := 0;
+  HpTree(V, Fn + 56, X, 0, Dummy, 0);
+  For I := 0 To HpAnN - 1 Do HpMark(V, HpAnL[I], 1, True);
+  HpAnN := 0;
+  Hdr := Fn + 56;
+  FillMem(Hdr, 104, 0);
+  If RN <= 8 Then
+  Begin
+    Mem[0:Hdr + 4] := 8 - RN;
+    Mem[0:Hdr + 5] := RN;
+    MemW[0:Hdr + 6] := 8 + 12 * RN;
+    MoveMem(RA, Hdr + 8, RN * 12);
+  End
+  Else
+  Begin
+    K := (RN + 39) Div 40;
+    For J := 0 To K - 1 Do
+    Begin
+      S := HpAlloc1(V, FnS);
+      If S = 0 Then
+      Begin
+        For I := 0 To J - 1 Do HpMark(V, Secs[I], 1, True);
+        KFree(X);
+        Exit;
+      End;
+      Secs[J] := S;
+      A := X;
+      FillMem(A, 512, 0);
+      MemL[0:A] := HpAnMagic;
+      MemL[0:A + 4] := S;
+      MemL[0:A + 8] := FnS;
+      N := Min(RN - J * 40, 40);
+      Mem[0:A + 12] := $20;              { parent : le fnode }
+      Mem[0:A + 16] := 40 - N;
+      Mem[0:A + 17] := N;
+      MemW[0:A + 18] := 8 + 12 * N;
+      MoveMem(RA + J * 40 * 12, A + 20, N * 12);
+      HpWr(V, S, 1, A);
+    End;
+    Mem[0:Hdr] := $80;
+    Mem[0:Hdr + 4] := 12 - K;
+    Mem[0:Hdr + 5] := K;
+    MemW[0:Hdr + 6] := 8 + 8 * K;
+    For J := 0 To K - 1 Do
+    Begin
+      If J < K - 1 Then MemL[0:Hdr + 8 + J * 8] := MemL[0:RA + (J + 1) * 480]
+      Else MemL[0:Hdr + 8 + J * 8] := -1;
+      MemL[0:Hdr + 8 + J * 8 + 4] := Secs[J];
+    End;
+  End;
+  KFree(X);
+  HpStoreExt := HpWr(V, FnS, 1, Fn);
+End;
+
+{ Porter l'allocation (RA, RN) du fnode FnS a NSec secteurs }
+Function HpGrow(V, FnS, Fn, RA, Cap : LongInt; Var RN : LongInt;
+                NSec : LongInt) : Boolean;
+Var Cur, Near, Got, S, L : LongInt;
+Begin
+  HpGrow := False;
+  Cur := HpExtSecs(RA, RN);
+  If Cur >= NSec Then
+  Begin
+    HpGrow := True;
+    Exit;
+  End;
+  While Cur < NSec Do
+  Begin
+    If RN > 0 Then
+      Near := MemL[0:RA + (RN - 1) * 12 + 8] + MemL[0:RA + (RN - 1) * 12 + 4]
+    Else Near := FnS + 1;
+    Got := HpAlloc(V, Near, NSec - Cur, S);
+    If Got = 0 Then Break;
+    If (RN > 0) And (S = Near) Then
+    Begin
+      L := MemL[0:RA + (RN - 1) * 12 + 4];
+      MemL[0:RA + (RN - 1) * 12 + 4] := L + Got;
+    End
+    Else If RN >= Min(Cap, HpMaxExtW) Then
+    Begin
+      HpMark(V, S, Got, True);
+      Break;
+    End
+    Else
+    Begin
+      MemL[0:RA + RN * 12] := Cur;
+      MemL[0:RA + RN * 12 + 4] := Got;
+      MemL[0:RA + RN * 12 + 8] := S;
+      Inc(RN);
+    End;
+    Cur := Cur + Got;
+  End;
+  If Not HpStoreExt(V, FnS, Fn, RA, RN) Then Exit;
+  HpGrow := Cur >= NSec;
+End;
+
+{ Reduire l'allocation a NSec secteurs }
+Function HpShrink(V, FnS, Fn, RA : LongInt; Var RN : LongInt;
+                  NSec : LongInt) : Boolean;
+Var I, K, F0, L, D, Keep : LongInt;
+Begin
+  K := 0;
+  For I := 0 To RN - 1 Do
+  Begin
+    F0 := MemL[0:RA + I * 12]; L := MemL[0:RA + I * 12 + 4];
+    D := MemL[0:RA + I * 12 + 8];
+    If F0 >= NSec Then HpMark(V, D, L, True)
+    Else
+    Begin
+      Keep := L;
+      If F0 + Keep > NSec Then
+      Begin
+        Keep := NSec - F0;
+        HpMark(V, D + Keep, L - Keep, True);
+      End;
+      MemL[0:RA + K * 12] := F0; MemL[0:RA + K * 12 + 4] := Keep;
+      MemL[0:RA + K * 12 + 8] := D;
+      Inc(K);
+    End;
+  End;
+  RN := K;
+  HpShrink := HpStoreExt(V, FnS, Fn, RA, RN);
+End;
+
+{ Liberer un fichier : donnees, anodes, EA externes et le fnode }
+Procedure HpFreeFile(V, FnS : LongInt; IsDir : Boolean);
+Var Fn, RA, RN, I, L : LongInt;
+Begin
+  Fn := KAlloc(512 + 4096);
+  If Fn = 0 Then Exit;
+  RA := Fn + 512;
+  If HpFnode(V, FnS, Fn) Then
+  Begin
+    { repertoire : ses dnodes sont liberes par l'appelant }
+    If Not IsDir And HpLoadExt(V, Fn, RA, 341, RN) Then
+    Begin
+      For I := 0 To RN - 1 Do
+        HpMark(V, MemL[0:RA + I * 12 + 8], MemL[0:RA + I * 12 + 4], True);
+      For I := 0 To HpAnN - 1 Do HpMark(V, HpAnL[I], 1, True);
+    End;
+    L := MemL[0:Fn + 44];
+    If (L > 0) And ((MemW[0:Fn + 54] And 2) = 0) Then
+      HpMark(V, MemL[0:Fn + 48], (L + 511) Div 512, True);
+  End;
+  HpMark(V, FnS, 1, True);
+  KFree(Fn);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Repertoires : arbre B de dnodes                                      }
+{ ------------------------------------------------------------------ }
+{ Entree (dirent) : +0 longueur, +2 indicateurs (01 ^A^A, 04 pointeur
+  vers un dnode fils dans les 4 derniers octets, 08 entree finale),
+  +3 attributs, +4 fnode, +8 date d'ecriture, +12 taille, +16 date de
+  lecture, +20 date de creation, +24 taille des EA, +30 longueur du nom,
+  +31 nom. Un fils contient les noms qui precedent l'entree ; celui de
+  l'entree finale, ceux qui suivent toutes les entrees du dnode. }
+
+Procedure HpInval;
+Begin
+  HgVol := -1; HdPathVol := -1;
+End;
+
+Function HgEnt(I : LongInt) : LongInt;
+Begin
+  HgEnt := HgBuf + MemL[0:HgOff + I * 4];
+End;
+
+{ Agrandir un tableau du tas (garde son contenu) }
+Function HpGrowBuf(Var A, Cap : LongInt; Need : LongInt) : Boolean;
+Var N, B, Own : LongInt;
+Begin
+  HpGrowBuf := True;
+  If Need <= Cap Then Exit;
+  N := Cap * 2;
+  If N < Need Then N := Need + 4096;
+  Own := HeapOwner; HeapOwner := 0;
+  B := KAlloc(N);
+  HeapOwner := Own;
+  If B = 0 Then
+  Begin
+    HpGrowBuf := False;
+    Exit;
+  End;
+  If (A <> 0) And (Cap > 0) Then
+  Begin
+    MoveMem(A, B, Cap);
+    KFree(A);
+  End;
+  A := B; Cap := N;
+End;
+
+{ Ajouter une copie de l'entree E (sans pointeur vers un fils) }
+Function HgAdd(E : LongInt) : Boolean;
+Var L : LongInt;
+Begin
+  HgAdd := False;
+  L := MemW[0:E];
+  If (Mem[0:E + 2] And 4) <> 0 Then L := L - 4;
+  If (L < 32) Or (L > 300) Then Exit;
+  If Not HpGrowBuf(HgBuf, HgCap, HgUsed + L) Then Exit;
+  If Not HpGrowBuf(HgOff, HgOffCap, (HgN + 2) * 4) Then Exit;
+  MoveMem(E, HgBuf + HgUsed, L);
+  MemW[0:HgBuf + HgUsed] := L;
+  Mem[0:HgBuf + HgUsed + 2] := Mem[0:E + 2] And Not $0C;
+  MemL[0:HgOff + HgN * 4] := HgUsed;
+  HgUsed := HgUsed + L;
+  Inc(HgN);
+  HgAdd := True;
+End;
+
+{ Parcours dans l'ordre du dnode Dn (et de ses fils) }
+Function HpWalk(V, Dn, Depth : LongInt) : Boolean;
+Var B, P, E, L : LongInt; Ok : Boolean;
+Begin
+  HpWalk := False;
+  If Depth > 20 Then Exit;
+  If Not HpGrowBuf(HgDn, HgDnCap, (HgDnN + 1) * 4) Then Exit;
+  MemL[0:HgDn + HgDnN * 4] := Dn;
+  Inc(HgDnN);
+  B := KAlloc(2048);
+  If B = 0 Then Exit;
+  Ok := HpDnode(V, Dn, B);
+  P := HpDnHdr;
+  While Ok Do
+  Begin
+    E := B + P;
+    L := MemW[0:E];
+    If (L < 32) Or (P + L > 2048) Then
+    Begin
+      Ok := False;
+      Break;
+    End;
+    If (Mem[0:E + 2] And 4) <> 0 Then
+      If Not HpWalk(V, MemL[0:E + L - 4], Depth + 1) Then
+      Begin
+        Ok := False;
+        Break;
+      End;
+    If (Mem[0:E + 2] And 8) <> 0 Then Break;
+    If Not HgAdd(E) Then
+    Begin
+      Ok := False;
+      Break;
+    End;
+    P := P + L;
+  End;
+  KFree(B);
+  HpWalk := Ok;
+End;
+
+{ Racine (dnode) du repertoire de fnode Dir ; 0 si ce n'en est pas un }
+Function HpDirRoot(V, Dir : LongInt) : LongInt;
+Var Fn : LongInt;
+Begin
+  HpDirRoot := 0;
+  Fn := KAlloc(512);
+  If Fn = 0 Then Exit;
+  If HpFnode(V, Dir, Fn) Then
+    If (MemW[0:Fn + 54] And $100) <> 0 Then HpDirRoot := MemL[0:Fn + 72];
+  KFree(Fn);
+End;
+
+{ Toutes les entrees du repertoire Dir, triees, dans HgBuf (cache) }
+Function HpGather(V, Dir : LongInt) : Boolean;
+Var Dn : LongInt;
+Begin
+  HpGather := True;
+  If (HgVol = V) And (HgDir = Dir) Then Exit;
+  HpGather := False;
+  HgVol := -1;
+  Dn := HpDirRoot(V, Dir);
+  If Dn = 0 Then Exit;
+  HgN := 0; HgUsed := 0; HgDnN := 0;
+  If Not HpWalk(V, Dn, 0) Then Exit;
+  HgVol := V; HgDir := Dir;
+  HpGather := True;
+End;
+
+{ Taille d'un element du plan : entree (+4 avec un fils) }
+Function HbSize(K : LongInt) : LongInt;
+Var L : LongInt;
+Begin
+  L := MemW[0:HgEnt(MemL[0:HbE + K * 4])];
+  If MemL[0:HbC + K * 4] >= 0 Then L := L + 4;
+  HbSize := L;
+End;
+
+{ Reconstruire l'arbre du repertoire Dir d'apres HgBuf : arbre B
+  equilibre, construit par niveaux depuis les feuilles ; la racine garde
+  son dnode, les autres reutilisent ceux de l'ancien arbre }
+Function HpStore(V, Dir : LongInt) : Boolean;
+Var NIt, NNd, Lo, Hi, Fin, K, K0, Sz, J, NS, Root, I, P, E, L, B,
+    Old, S, Up, C, Lv0 : LongInt; Ok : Boolean;
+Begin
+  HpStore := False;
+  If (HgVol <> V) Or (HgDir <> Dir) Or (HgDnN = 0) Then Exit;
+  { plan : elements (entree, fils) et noeuds (elements Lo..Hi-1, fils
+    de l'entree finale) }
+  If Not HpGrowBuf(HbE, HbCap, (HgN * 2 + 8) * 4) Then Exit;
+  If KSize(HbC) < (HgN * 2 + 8) * 4 Then
+  Begin
+    If HbC <> 0 Then KFree(HbC);
+    If HbLo <> 0 Then KFree(HbLo);
+    If HbHi <> 0 Then KFree(HbHi);
+    If HbEnd <> 0 Then KFree(HbEnd);
+    If HbUp <> 0 Then KFree(HbUp);
+    If HbSec <> 0 Then KFree(HbSec);
+    I := HeapOwner; HeapOwner := 0;
+    HbC := KAlloc(HbCap); HbLo := KAlloc(HbCap); HbHi := KAlloc(HbCap);
+    HbEnd := KAlloc(HbCap); HbUp := KAlloc(HbCap); HbSec := KAlloc(HbCap);
+    HeapOwner := I;
+    If (HbC = 0) Or (HbLo = 0) Or (HbHi = 0) Or (HbEnd = 0) Or
+       (HbUp = 0) Or (HbSec = 0) Then Exit;
+  End;
+  For I := 0 To HgN - 1 Do
+  Begin
+    MemL[0:HbE + I * 4] := I; MemL[0:HbC + I * 4] := -1;
+  End;
+  NIt := HgN; NNd := 0;
+  Lo := 0; Hi := HgN; Fin := -1;
+  Root := -1;
+  Repeat
+    Lv0 := NNd;
+    K := Lo;
+    While True Do
+    Begin
+      K0 := K; Sz := 0;
+      While (K < Hi) And (Sz + HbSize(K) <= HpDnCap) Do
+      Begin
+        Sz := Sz + HbSize(K);
+        Inc(K);
+      End;
+      If K = K0 Then Inc(K);
+      If Hi - K = 0 Then
+      Begin
+        MemL[0:HbLo + NNd * 4] := K0; MemL[0:HbHi + NNd * 4] := K;
+        MemL[0:HbEnd + NNd * 4] := Fin;
+        Inc(NNd);
+        Break;
+      End;
+      If (Hi - K = 1) And (K - K0 >= 2) Then Dec(K);
+      { l'element K monte au niveau superieur avec ce noeud pour fils }
+      MemL[0:HbLo + NNd * 4] := K0; MemL[0:HbHi + NNd * 4] := K;
+      MemL[0:HbEnd + NNd * 4] := MemL[0:HbC + K * 4];
+      MemL[0:HbE + NIt * 4] := MemL[0:HbE + K * 4];
+      MemL[0:HbC + NIt * 4] := NNd;
+      Inc(NIt); Inc(NNd);
+      Inc(K);
+      If K >= Hi Then Break;
+    End;
+    If NNd - Lv0 = 1 Then Root := NNd - 1
+    Else
+    Begin
+      Lo := Hi; Hi := NIt; Fin := NNd - 1;
+    End;
+  Until (Root >= 0) Or (NNd > HgN + 4);
+  If Root < 0 Then Exit;
+  { parents }
+  For J := 0 To NNd - 1 Do MemL[0:HbUp + J * 4] := -1;
+  For J := 0 To NNd - 1 Do
+  Begin
+    For K := MemL[0:HbLo + J * 4] To MemL[0:HbHi + J * 4] - 1 Do
+      If MemL[0:HbC + K * 4] >= 0 Then
+        MemL[0:HbUp + MemL[0:HbC + K * 4] * 4] := J;
+    If MemL[0:HbEnd + J * 4] >= 0 Then
+      MemL[0:HbUp + MemL[0:HbEnd + J * 4] * 4] := J;
+  End;
+  { secteurs : la racine garde le sien, puis les anciens, puis neufs }
+  Old := 1;
+  For J := 0 To NNd - 1 Do
+    If J = Root Then MemL[0:HbSec + J * 4] := MemL[0:HgDn]
+    Else If Old < HgDnN Then
+    Begin
+      MemL[0:HbSec + J * 4] := MemL[0:HgDn + Old * 4];
+      Inc(Old);
+    End
+    Else
+    Begin
+      S := HpDnAlloc(V, MemL[0:HgDn]);
+      If S = 0 Then
+      Begin
+        { disque plein : rendre les dnodes neufs }
+        For I := 0 To J - 1 Do
+          If (I <> Root) And (MemL[0:HbSec + I * 4] <> 0) Then
+          Begin
+            Ok := False;
+            For K := 0 To HgDnN - 1 Do
+              If MemL[0:HgDn + K * 4] = MemL[0:HbSec + I * 4] Then Ok := True;
+            If Not Ok Then HpDnFree(V, MemL[0:HbSec + I * 4]);
+          End;
+        HgVol := -1;
+        Exit;
+      End;
+      MemL[0:HbSec + J * 4] := S;
+    End;
+  HpDirtyOn(V);
+  { ecrire les dnodes }
+  Ok := True;
+  B := HpDnB;
+  For J := 0 To NNd - 1 Do
+  Begin
+    FillMem(B, 2048, 0);
+    MemL[0:B] := HpDnMagic;
+    If J = Root Then
+    Begin
+      Mem[0:B + 8] := 1;
+      MemL[0:B + 12] := Dir;
+    End
+    Else MemL[0:B + 12] := MemL[0:HbSec + MemL[0:HbUp + J * 4] * 4];
+    MemL[0:B + 16] := MemL[0:HbSec + J * 4];
+    P := HpDnHdr;
+    For K := MemL[0:HbLo + J * 4] To MemL[0:HbHi + J * 4] - 1 Do
+    Begin
+      E := HgEnt(MemL[0:HbE + K * 4]);
+      L := MemW[0:E];
+      MoveMem(E, B + P, L);
+      C := MemL[0:HbC + K * 4];
+      If C >= 0 Then
+      Begin
+        Mem[0:B + P + 2] := Mem[0:B + P + 2] Or 4;
+        MemL[0:B + P + L] := MemL[0:HbSec + C * 4];
+        L := L + 4;
+        MemW[0:B + P] := L;
+      End;
+      P := P + L;
+    End;
+    { entree finale }
+    C := MemL[0:HbEnd + J * 4];
+    Mem[0:B + P + 2] := 8;
+    Mem[0:B + P + 30] := 1;
+    Mem[0:B + P + 31] := $FF;
+    If C >= 0 Then
+    Begin
+      Mem[0:B + P + 2] := 8 Or 4;
+      MemL[0:B + P + 32] := MemL[0:HbSec + C * 4];
+      MemW[0:B + P] := 36;
+      P := P + 36;
+    End
+    Else
+    Begin
+      MemW[0:B + P] := 32;
+      P := P + 32;
+    End;
+    MemL[0:B + 4] := P;
+    If Not HpWr(V, MemL[0:HbSec + J * 4], 4, B) Then Ok := False;
+  End;
+  { dnodes de l'ancien arbre qui ne servent plus }
+  For K := Old To HgDnN - 1 Do HpDnFree(V, MemL[0:HgDn + K * 4]);
+  { le nouvel arbre : liste des dnodes a jour }
+  HgDnN := 0;
+  For J := 0 To NNd - 1 Do
+  Begin
+    If Not HpGrowBuf(HgDn, HgDnCap, (HgDnN + 1) * 4) Then
+    Begin
+      HgVol := -1;
+      Break;
+    End;
+    MemL[0:HgDn + HgDnN * 4] := MemL[0:HbSec + Root * 4];
+    If J <> Root Then MemL[0:HgDn + HgDnN * 4] := MemL[0:HbSec + J * 4];
+    Inc(HgDnN);
+  End;
+  { la racine en premier }
+  If Root <> 0 Then
+  Begin
+    S := MemL[0:HgDn];
+    For J := 1 To HgDnN - 1 Do
+      If MemL[0:HgDn + J * 4] = MemL[0:HbSec + Root * 4] Then
+        MemL[0:HgDn + J * 4] := S;
+    MemL[0:HgDn] := MemL[0:HbSec + Root * 4];
+  End;
+  HdPathVol := -1;
+  HpStore := Ok;
+End;
+
+{ Construire une entree en A ; longueur }
+Function HpBuildDe(A : LongInt; Const Nm : String; Attr, Fn, Size, T
+                   : LongInt) : LongInt;
+Var L, I : LongInt;
+Begin
+  L := (31 + Length(Nm) + 3) And Not 3;
+  FillMem(A, L, 0);
+  MemW[0:A] := L;
+  Mem[0:A + 3] := Attr;
+  MemL[0:A + 4] := Fn;
+  MemL[0:A + 8] := T; MemL[0:A + 12] := Size;
+  MemL[0:A + 16] := T; MemL[0:A + 20] := T;
+  Mem[0:A + 30] := Length(Nm);
+  For I := 1 To Length(Nm) Do Mem[0:A + 30 + I] := Ord(Nm[I]);
+  HpBuildDe := L;
+End;
+
+{ Inserer l'entree A (rassemblee) a sa place ; False si le nom existe }
+Function HgInsert(A : LongInt) : Boolean;
+Var I, J, R : LongInt;
+Begin
+  HgInsert := False;
+  I := 0;
+  While I < HgN Do
+  Begin
+    R := HpCmp(A + 31, Mem[0:A + 30], HgEnt(I) + 31, Mem[0:HgEnt(I) + 30]);
+    If (R = 0) And ((Mem[0:HgEnt(I) + 2] And 1) = 0) Then Exit;
+    If R < 0 Then Break;
+    Inc(I);
+  End;
+  { ^A^A reste en tete }
+  If (I = 0) And (HgN > 0) Then
+    If (Mem[0:HgEnt(0) + 2] And 1) <> 0 Then I := 1;
+  J := HgN;
+  If Not HgAdd(A) Then Exit;
+  { HgAdd a ajoute en fin : deplacer le decalage a la place I }
+  R := MemL[0:HgOff + J * 4];
+  While J > I Do
+  Begin
+    MemL[0:HgOff + J * 4] := MemL[0:HgOff + (J - 1) * 4];
+    Dec(J);
+  End;
+  MemL[0:HgOff + I * 4] := R;
+  HgInsert := True;
+End;
+
+Procedure HgDelete(I : LongInt);
+Begin
+  If (I < 0) Or (I >= HgN) Then Exit;
+  MoveMem(HgOff + (I + 1) * 4, HgOff + I * 4, (HgN - I - 1) * 4);
+  Dec(HgN);
+End;
+
+{ Indice de l'entree du fnode Fn (-1) }
+Function HgFind(Fn : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  HgFind := -1;
+  For I := 0 To HgN - 1 Do
+    If (MemL[0:HgEnt(I) + 4] = Fn) And ((Mem[0:HgEnt(I) + 2] And 1) = 0)
+    Then
+    Begin
+      HgFind := I;
+      Exit;
+    End;
+End;
+
+{ Chercher Key (page 850) dans le repertoire Dir par l'arbre B ; copie
+  de l'entree en HpEnt }
+Function HpLookup(V, Dir : LongInt; Const Key : String) : Boolean;
+Var Dn, B, P, E, L, R, Guard : LongInt; Down : Boolean;
+Begin
+  HpLookup := False;
+  If Length(Key) = 0 Then Exit;
+  Dn := HpDirRoot(V, Dir);
+  If Dn = 0 Then Exit;
+  B := KAlloc(2048);
+  If B = 0 Then Exit;
+  Guard := 0;
+  While (Dn <> 0) And (Guard < 20) Do
+  Begin
+    Inc(Guard);
+    If Not HpDnode(V, Dn, B) Then Break;
+    P := HpDnHdr; Down := False;
+    While P < 2048 Do
+    Begin
+      E := B + P;
+      L := MemW[0:E];
+      If (L < 32) Or (P + L > 2048) Then Break;
+      If (Mem[0:E + 2] And 8) <> 0 Then R := -1
+      Else If (Mem[0:E + 2] And 1) <> 0 Then R := 1
+      Else R := HpCmp(LongInt(@Key[1]), Length(Key), E + 31, Mem[0:E + 30]);
+      If R = 0 Then
+      Begin
+        MoveMem(E, HpEnt, Min(L, 320));
+        KFree(B);
+        HpLookup := True;
+        Exit;
+      End;
+      If R < 0 Then
+      Begin
+        If (Mem[0:E + 2] And 4) <> 0 Then
+        Begin
+          Dn := MemL[0:E + L - 4];
+          Down := True;
+        End;
+        Break;
+      End;
+      P := P + L;
+    End;
+    If Not Down Then Break;
+  End;
+  KFree(B);
+End;
+
+{ Mettre a jour sur place l'entree du fnode Fn du repertoire Dir }
+Function HpPatch(V, Dn, Fn, Size, T, Depth : LongInt) : Boolean;
+Var B, P, E, L : LongInt;
+Begin
+  HpPatch := False;
+  If Depth > 20 Then Exit;
+  B := KAlloc(2048);
+  If B = 0 Then Exit;
+  If HpDnode(V, Dn, B) Then
+  Begin
+    P := HpDnHdr;
+    While P < 2048 Do
+    Begin
+      E := B + P;
+      L := MemW[0:E];
+      If (L < 32) Or (P + L > 2048) Then Break;
+      If (Mem[0:E + 2] And 4) <> 0 Then
+        If HpPatch(V, MemL[0:E + L - 4], Fn, Size, T, Depth + 1) Then
+        Begin
+          HpPatch := True;
+          Break;
+        End;
+      If (Mem[0:E + 2] And 8) <> 0 Then Break;
+      If (MemL[0:E + 4] = Fn) And ((Mem[0:E + 2] And 1) = 0) Then
+      Begin
+        MemL[0:E + 12] := Size;
+        MemL[0:E + 8] := T; MemL[0:E + 16] := T;
+        Mem[0:E + 3] := Mem[0:E + 3] Or $20;
+        HpWr(V, Dn, 4, B);
+        HpPatch := True;
+        Break;
+      End;
+      P := P + L;
+    End;
+  End;
+  KFree(B);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Montage                                                              }
+{ ------------------------------------------------------------------ }
+
+Function HpMount(D, Start, Secs : LongInt) : Boolean;
+Var V, A, B, S, I, N, Own : LongInt; Lab : String;
+Begin
+  HpMount := False;
+  If VolN >= MaxVol Then Exit;
+  V := VolN;
+  A := SecGet(D, Start);
+  If FatIoErr Then
+  Begin
+    FatIoErr := False;
+    Exit;
+  End;
+  If (MemL[0:A + 54] <> $53465048) Or (MemL[0:A + 58] <> $20202020) Or
+     (MemW[0:A + 510] <> $AA55) Then Exit;
+  Lab := '';
+  For I := 0 To 10 Do Lab := Lab + Chr(Mem[0:A + 43 + I]);
+  While (Length(Lab) > 0) And ((Lab[Length(Lab)] = ' ') Or
+        (Lab[Length(Lab)] = #0)) Do Delete(Lab, Length(Lab), 1);
+  S := MemL[0:A + 39];
+  HpInitTab;
+  Own := HeapOwner; HeapOwner := 0;
+  If HpTmp = 0 Then
+  Begin
+    HpTmp := KAlloc(4096); HpDnB := KAlloc(2048);
+    HpEnt := KAlloc(320); HpNew := KAlloc(320);
+    HgVol := -1; HdPathVol := -1;
+  End;
+  HeapOwner := Own;
+  If (HpTmp = 0) Or (HpDnB = 0) Or (HpEnt = 0) Or (HpNew = 0) Then Exit;
+  VolDisk[V] := D; VolStart[V] := Start; VolType[V] := HpfsT;
+  VolSecs[V] := Secs; VolSerial[V] := S; VolSpc[V] := 1;
+  HvDirty[V] := 0;
+  { superbloc et bloc de reserve }
+  If Not HpRd(V, 16, 1, HpTmp) Or (MemL[0:HpTmp] <> $F995E849) Then Exit;
+  N := MemL[0:HpTmp + 16];
+  If (N <= 64) Or (N > Secs) Then Exit;
+  VolSecs[V] := N;
+  HvRoot[V] := MemL[0:HpTmp + 12];
+  HvDirS[V] := MemL[0:HpTmp + 52];
+  HvDirE[V] := MemL[0:HpTmp + 56];
+  HvDirBmp[V] := MemL[0:HpTmp + 60];
+  B := MemL[0:HpTmp + 24];
+  HvNB[V] := (N + HpBand - 1) Div HpBand;
+  HvRO[V] := Ord(Mem[0:HpTmp + 9] > 3);
+  If (HvDirE[V] < HvDirS[V]) Or (HvDirE[V] >= N) Or (HvNB[V] > 8192) Then
+    Exit;
+  Own := HeapOwner; HeapOwner := 0;
+  HvBands[V] := KAlloc(((HvNB[V] * 4 + 2047) Div 2048) * 2048);
+  HvBmp[V] := KAlloc(HvNB[V] * 2048);
+  HvDbm[V] := KAlloc(2048);
+  HeapOwner := Own;
+  If (HvBands[V] = 0) Or (HvBmp[V] = 0) Or (HvDbm[V] = 0) Then Exit;
+  { liste des secteurs de bitmap (blocs de 4 secteurs) puis bitmaps }
+  If Not HpRd(V, B, ((HvNB[V] * 4 + 2047) Div 2048) * 4, HvBands[V]) Then
+    Exit;
+  For I := 0 To HvNB[V] - 1 Do
+    If Not HpRd(V, MemL[0:HvBands[V] + I * 4], 4, HvBmp[V] + I * 2048) Then
+      Exit;
+  FillMem(HvDbm[V], 2048, 0);
+  HpRd(V, HvDirBmp[V], 4, HvDbm[V]);
+  If Not HpRd(V, 17, 1, HpTmp) Or (MemL[0:HpTmp] <> $F9911849) Then Exit;
+  If (Mem[0:HpTmp + 8] And 1) <> 0 Then
+    KLog('HPFS : volume marque sale (mal ferme)');
+  If HpDirRoot(V, HvRoot[V]) = 0 Then Exit;
+  { secteurs libres }
+  N := 0;
+  For I := 0 To HvNB[V] * 2048 - 1 Do
+  Begin
+    B := Mem[0:HvBmp[V] + I];
+    While B <> 0 Do
+    Begin
+      N := N + (B And 1);
+      B := B Shr 1;
+    End;
+  End;
+  VolFree[V] := N;
+  VolClus[V] := VolSecs[V];
+  VolLab[V] := Copy(Lab, 1, 11);
+  If VolN = 0 Then VolLetter[V] := Ord('C')
+  Else VolLetter[V] := Ord('D') + VolN;
+  VolFsDirty[V] := False;
+  Inc(VolN);
+  HpInval;
+  KLog('HPFS : ' + Chr(VolLetter[V]) + ': disque ' + IntStr(D) +
+       ' secteur ' + IntStr(Start) + ', ' + IntStr(VolSecs[V]) +
+       ' secteurs, ' + IntStr(HvNB[V]) + ' bandes, ' + IntStr(VolFree[V]) +
+       ' libres, etiquette ' + VolLab[V]);
+  HpMount := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Chemins et repertoires                                               }
+{ ------------------------------------------------------------------ }
+
+{ Remplir Ff* avec l'entree E du repertoire Dir }
+Procedure HpSetFf(E, Dir, Idx : LongInt);
+Begin
+  FfName := HpFromDisk(E + 31, Mem[0:E + 30]);
+  FfShort := NtShort(FfName);
+  FfAttr := Mem[0:E + 3] And $37;
+  FfSize := MemL[0:E + 12];
+  If (FfAttr And $10) <> 0 Then FfSize := 0;
+  FfTime := HpToDos(MemL[0:E + 8]);
+  FfClus := MemL[0:E + 4];
+  FfDirClus := Dir;
+  FfIdx := Idx;
+  FfNEnt := 1;
+End;
+
+{ Chemin complet (X:\A\B) -> Ff* }
+Function HpResolve(V : LongInt; Path : String) : Boolean;
+Var P, I, Dir : LongInt; Part : String; Found : Boolean;
+Begin
+  HpResolve := False;
+  Delete(Path, 1, 2);
+  While (Length(Path) > 0) And (Path[1] = '\') Do Delete(Path, 1, 1);
+  While (Length(Path) > 0) And (Path[Length(Path)] = '\') Do
+    Delete(Path, Length(Path), 1);
+  Dir := HvRoot[V];
+  If Path = '' Then
+  Begin
+    FfName := ''; FfShort := ''; FfAttr := $10; FfSize := 0;
+    FfTime := DosNow; FfClus := Dir; FfDirClus := Dir; FfIdx := -1;
+    HpResolve := True;
+    Exit;
+  End;
+  While Path <> '' Do
+  Begin
+    P := Pos('\', Path);
+    If P > 0 Then
+    Begin
+      Part := Copy(Path, 1, P - 1);
+      Delete(Path, 1, P);
+    End
+    Else
+    Begin
+      Part := Path;
+      Path := '';
+    End;
+    If HpLookup(V, Dir, HpToDisk(Part)) Then
+    Begin
+      HpSetFf(HpEnt, Dir, 0);
+      Found := True;
+    End
+    Else
+    Begin
+      { nom court (NOM~1.EXT) d'un nom long }
+      Found := False;
+      If Pos('~', Part) > 0 Then
+        If HpGather(V, Dir) Then
+          For I := 0 To HgN - 1 Do
+            If (Mem[0:HgEnt(I) + 2] And 1) = 0 Then
+              If NtShort(HpFromDisk(HgEnt(I) + 31, Mem[0:HgEnt(I) + 30])) =
+                 UpStr(Part) Then
+              Begin
+                HpSetFf(HgEnt(I), Dir, 0);
+                Found := True;
+                Break;
+              End;
+    End;
+    If Not Found Then Exit;
+    If (Path <> '') And ((FfAttr And $10) = 0) Then Exit;
+    Dir := FfClus;
+  End;
+  HpResolve := True;
+End;
+
+{ Entree Idx du repertoire Dir (chemin) ; Idx avance }
+Function HpDirEntry(Const Dir : String; Var Idx : LongInt) : Boolean;
+Var V, D : LongInt;
+Begin
+  HpDirEntry := False;
+  V := FatVolOf(Dir);
+  If V < 0 Then Exit;
+  If (HdPathVol = V) And (HdPath = UpStr(Dir)) Then D := HdPathFn
+  Else
+  Begin
+    If Not HpResolve(V, Dir) Or ((FfAttr And $10) = 0) Then Exit;
+    D := FfClus;
+    HdPathVol := V; HdPath := UpStr(Dir); HdPathFn := D;
+  End;
+  If Not HpGather(V, D) Then Exit;
+  If Idx < 0 Then Exit;
+  While (Idx < HgN) And ((Mem[0:HgEnt(Idx) + 2] And 1) <> 0) Do Inc(Idx);
+  If Idx >= HgN Then Exit;
+  HpSetFf(HgEnt(Idx), D, Idx);
+  Inc(Idx);
+  HpDirEntry := True;
+End;
+
+{ Le repertoire Anc contient-il (ou est-il) le fnode Dir ? }
+Function HpInside(V, Dir, Anc : LongInt) : Boolean;
+Var Fn, N : LongInt;
+Begin
+  HpInside := False;
+  Fn := KAlloc(512);
+  If Fn = 0 Then Exit;
+  N := 0;
+  While N < 64 Do
+  Begin
+    If Dir = Anc Then
+    Begin
+      HpInside := True;
+      Break;
+    End;
+    If (Dir = HvRoot[V]) Or Not HpFnode(V, Dir, Fn) Then Break;
+    Dir := MemL[0:Fn + 28];
+    Inc(N);
+  End;
+  KFree(Fn);
+End;
+
+{ Creer un fichier ou un repertoire Name (Latin-1) dans Dir ; code
+  d'erreur Win32, fnode dans Fn }
+Function HpCreate(V, Dir : LongInt; Const Name : String; IsDir : Boolean;
+                  Var Fn : LongInt) : LongInt;
+Var A, Dn, T, I, Attr, L : LongInt; Nm : String;
+Begin
+  HpCreate := 123;                                 { nom incorrect }
+  Fn := 0;
+  If Not HpNameOk(Name) Then Exit;
+  HpCreate := 19;
+  If HvRO[V] <> 0 Then Exit;
+  HpCreate := 3;
+  If Not HpGather(V, Dir) Then Exit;
+  Nm := HpToDisk(Name);
+  T := HpNow;
+  If IsDir Then Attr := $10 Else Attr := $20;
+  If Not HpIs83(Name) Then Attr := Attr Or $40;
+  HpBuildDe(HpNew, Nm, Attr, 0, 0, T);
+  For I := 0 To HgN - 1 Do
+    If (Mem[0:HgEnt(I) + 2] And 1) = 0 Then
+      If HpCmp(HpNew + 31, Length(Nm), HgEnt(I) + 31,
+               Mem[0:HgEnt(I) + 30]) = 0 Then
+      Begin
+        HpCreate := 183;                           { existe deja }
+        Exit;
+      End;
+  HpCreate := 112;                                 { disque plein }
+  HpDirtyOn(V);
+  Fn := HpAlloc1(V, Dir);
+  If Fn = 0 Then Exit;
+  A := HpTmp;
+  FillMem(A, 512, 0);
+  MemL[0:A] := HpFnMagic;
+  Mem[0:A + 12] := Length(Nm);
+  L := Min(Length(Nm), 15);
+  For I := 1 To L Do Mem[0:A + 12 + I] := Ord(Nm[I]);
+  MemL[0:A + 28] := Dir;
+  Mem[0:A + 60] := 8;                              { 8 extensions libres }
+  MemW[0:A + 62] := 8;
+  MemW[0:A + 184] := 196;                          { zone des EA }
+  Dn := 0;
+  If IsDir Then
+  Begin
+    Dn := HpDnAlloc(V, Fn);
+    If Dn = 0 Then
+    Begin
+      HpMark(V, Fn, 1, True);
+      Fn := 0;
+      Exit;
+    End;
+    MemW[0:A + 54] := $100;
+    Mem[0:A + 60] := 7; Mem[0:A + 61] := 1; MemW[0:A + 62] := 20;
+    MemL[0:A + 64] := 0; MemL[0:A + 68] := 4; MemL[0:A + 72] := Dn;
+    { dnode racine : ^A^A puis l'entree finale }
+    FillMem(HpDnB, 2048, 0);
+    MemL[0:HpDnB] := HpDnMagic;
+    Mem[0:HpDnB + 8] := 1;
+    MemL[0:HpDnB + 12] := Fn; MemL[0:HpDnB + 16] := Dn;
+    L := HpBuildDe(HpDnB + HpDnHdr, #1#1, $10, Fn, 0, T);
+    Mem[0:HpDnB + HpDnHdr + 2] := 1;
+    I := HpDnHdr + L;
+    MemW[0:HpDnB + I] := 32; Mem[0:HpDnB + I + 2] := 8;
+    Mem[0:HpDnB + I + 30] := 1; Mem[0:HpDnB + I + 31] := $FF;
+    MemL[0:HpDnB + 4] := I + 32;
+    HpWr(V, Dn, 4, HpDnB);
+  End;
+  If Not HpWr(V, Fn, 1, A) Then
+  Begin
+    If Dn <> 0 Then HpDnFree(V, Dn);
+    HpMark(V, Fn, 1, True);
+    Fn := 0;
+    Exit;
+  End;
+  MemL[0:HpNew + 4] := Fn;
+  If Not HpGather(V, Dir) Or Not HgInsert(HpNew) Or Not HpStore(V, Dir) Then
+  Begin
+    HpInval;
+    If Dn <> 0 Then HpDnFree(V, Dn);
+    HpMark(V, Fn, 1, True);
+    Fn := 0;
+    HpDirtyOff(V);
+    Exit;
+  End;
+  HpDirtyOff(V);
+  HpCreate := 0;
+End;
+
+{ Nom affiche (casse d'origine si elle correspond) }
+Function HpDisp(Const Path, Orig : String) : String;
+Var B, R : String;
+Begin
+  B := BaseName(Path);
+  R := B;
+  If (Orig <> '') And (UpStr(Orig) = UpStr(B)) Then R := Orig;
+  HpDisp := R;
+End;
+
+Function HpRemove(V : LongInt; Const Path : String; IsDir : Boolean)
+  : LongInt;
+Var N, D, I, K, Cnt : LongInt;
+Begin
+  HpRemove := 2;
+  If IsDir Then HpRemove := 3;
+  If Not HpResolve(V, Path) Or (FfIdx < 0) Then Exit;
+  If ((FfAttr And $10) <> 0) <> IsDir Then
+  Begin
+    HpRemove := 5;
+    Exit;
+  End;
+  If HvRO[V] <> 0 Then
+  Begin
+    HpRemove := 19;
+    Exit;
+  End;
+  N := FfClus; D := FfDirClus;
+  For I := 0 To MaxFo - 1 Do
+    If FoUsed[I] And (FoVol[I] = V) And (FoClus[I] = N) Then
+    Begin
+      HpRemove := 32;
+      Exit;
+    End;
+  HpDirtyOn(V);
+  If IsDir Then
+  Begin
+    { vide ? puis liberer ses dnodes }
+    If Not HpGather(V, N) Then
+    Begin
+      HpRemove := 5;
+      Exit;
+    End;
+    Cnt := 0;
+    For I := 0 To HgN - 1 Do
+      If (Mem[0:HgEnt(I) + 2] And 1) = 0 Then Inc(Cnt);
+    If Cnt > 0 Then
+    Begin
+      HpRemove := 145;
+      Exit;
+    End;
+    For K := 0 To HgDnN - 1 Do HpDnFree(V, MemL[0:HgDn + K * 4]);
+    HpInval;
+  End;
+  If Not HpGather(V, D) Then
+  Begin
+    HpRemove := 5;
+    Exit;
+  End;
+  I := HgFind(N);
+  If I >= 0 Then HgDelete(I);
+  If Not HpStore(V, D) Then
+  Begin
+    HpInval;
+    HpRemove := 5;
+    Exit;
+  End;
+  HpFreeFile(V, N, IsDir);
+  HpInval;
+  HpDirtyOff(V);
+  HpRemove := 0;
+End;
+
+{ Renommer / deplacer sur le meme volume }
+Function HpRename(V : LongInt; Const Src, Dst, Orig : String) : LongInt;
+Var N, D1, D2, I, Fn, L : LongInt; Nm : String;
+Begin
+  HpRename := 2;
+  If Not HpResolve(V, Src) Or (FfIdx < 0) Then Exit;
+  N := FfClus; D1 := FfDirClus;
+  If HvRO[V] <> 0 Then
+  Begin
+    HpRename := 19;
+    Exit;
+  End;
+  For I := 0 To MaxFo - 1 Do
+    If FoUsed[I] And (FoVol[I] = V) And (FoClus[I] = N) Then
+    Begin
+      HpRename := 32;
+      Exit;
+    End;
+  If HpResolve(V, Dst) Then
+    If FfClus <> N Then
+    Begin
+      HpRename := 183;
+      Exit;
+    End;
+  If Not HpResolve(V, ParentDir(Dst)) Or ((FfAttr And $10) = 0) Then
+  Begin
+    HpRename := 3;
+    Exit;
+  End;
+  D2 := FfClus;
+  If HpInside(V, D2, N) Then
+  Begin
+    HpRename := 5;
+    Exit;
+  End;
+  Nm := HpDisp(Dst, Orig);
+  If Not HpNameOk(Nm) Then
+  Begin
+    HpRename := 123;
+    Exit;
+  End;
+  HpRename := 5;
+  HpDirtyOn(V);
+  { entree d'origine, retiree de son repertoire }
+  If Not HpGather(V, D1) Then Exit;
+  I := HgFind(N);
+  If I < 0 Then Exit;
+  MoveMem(HgEnt(I), HpEnt, 32);
+  HgDelete(I);
+  If Not HpStore(V, D1) Then
+  Begin
+    HpInval;
+    Exit;
+  End;
+  { nouvelle entree (memes donnees, nouveau nom) }
+  Nm := HpToDisk(Nm);
+  L := (31 + Length(Nm) + 3) And Not 3;
+  MoveMem(HpEnt, HpNew, 31);
+  FillMem(HpNew + 31, L - 31, 0);
+  MemW[0:HpNew] := L;
+  Mem[0:HpNew + 2] := 0;
+  Mem[0:HpNew + 30] := Length(Nm);
+  For I := 1 To Length(Nm) Do Mem[0:HpNew + 30 + I] := Ord(Nm[I]);
+  Mem[0:HpNew + 3] := Mem[0:HpNew + 3] And Not $40;
+  If Not HpIs83(HpDisp(Dst, Orig)) Then
+    Mem[0:HpNew + 3] := Mem[0:HpNew + 3] Or $40;
+  If Not HpGather(V, D2) Or Not HgInsert(HpNew) Or Not HpStore(V, D2) Then
+  Begin
+    HpInval;
+    Exit;
+  End;
+  { fnode : nom et parent }
+  Fn := KAlloc(512);
+  If Fn <> 0 Then
+  Begin
+    If HpFnode(V, N, Fn) Then
+    Begin
+      FillMem(Fn + 13, 15, 0);
+      Mem[0:Fn + 12] := Length(Nm);
+      For I := 1 To Min(Length(Nm), 15) Do Mem[0:Fn + 12 + I] := Ord(Nm[I]);
+      MemL[0:Fn + 28] := D2;
+      HpWr(V, N, 1, Fn);
+    End;
+    KFree(Fn);
+  End;
+  HpInval;
+  HpDirtyOff(V);
+  HpRename := 0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fichiers ouverts (Fo* communs : FoClus = fnode, FoRA/FoRN =          }
+{ extensions de 12 octets)                                             }
+{ ------------------------------------------------------------------ }
+
+Function HpFoLoad(F : LongInt) : Boolean;
+Var Fn, RN : LongInt;
+Begin
+  HpFoLoad := False;
+  Fn := KAlloc(512);
+  If Fn = 0 Then Exit;
+  If HpFnode(FoVol[F], FoClus[F], Fn) Then
+    If HpLoadExt(FoVol[F], Fn, FoRA[F], NtMaxRuns, RN) Then
+    Begin
+      FoRN[F] := RN;
+      FoSize[F] := MemL[0:Fn + 160];
+      FoRes[F] := False;
+      HpFoLoad := True;
+    End;
+  KFree(Fn);
+End;
+
+Function HpOpenR(V, F : LongInt) : Boolean;
+Var Own : LongInt;
+Begin
+  HpOpenR := False;
+  If FoRA[F] = 0 Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    FoRA[F] := KAlloc(NtMaxRuns * 12);
+    HeapOwner := Own;
+    If FoRA[F] = 0 Then Exit;
+  End;
+  FoVol[F] := V; FoClus[F] := FfClus; FoDir[F] := FfDirClus;
+  FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoCIdx[F] := -1;
+  FoDirty[F] := False;
+  HpOpenR := HpFoLoad(F);
+End;
+
+Function HpRead(F, Pos0, N, Dst : LongInt) : LongInt;
+Var V, Done, FS, Off, DS, Run, Cnt, L : LongInt;
+Begin
+  HpRead := 0;
+  V := FoVol[F];
+  If Pos0 + N > FoSize[F] Then N := FoSize[F] - Pos0;
+  If N <= 0 Then Exit;
+  FatIoErr := False;
+  Done := 0;
+  While Done < N Do
+  Begin
+    FS := (Pos0 + Done) Shr 9;
+    Off := (Pos0 + Done) And 511;
+    DS := HpMap(FoRA[F], FoRN[F], FS, Run);
+    If DS = 0 Then
+    Begin
+      { hors allocation : zeros }
+      L := Min(512 - Off, N - Done);
+      FillMem(Dst + Done, L, 0);
+      Done := Done + L;
+      Continue;
+    End;
+    If (Off = 0) And (N - Done >= 512) Then
+    Begin
+      Cnt := Min(Run, (N - Done) Shr 9);
+      Cnt := Min(Cnt, 128);
+      If Not HpRd(V, DS, Cnt, Dst + Done) Then Break;
+      Done := Done + Cnt * 512;
+    End
+    Else
+    Begin
+      If Not HpRd(V, DS, 1, HpTmp) Then Break;
+      L := Min(512 - Off, N - Done);
+      MoveMem(HpTmp + Off, Dst + Done, L);
+      Done := Done + L;
+    End;
+  End;
+  HpRead := Done;
+End;
+
+{ Ecrire N octets de Src en Pos0 (allocation deja suffisante) }
+Function HpPut(F, Pos0, N, Src : LongInt) : LongInt;
+Var V, Done, FS, Off, DS, Run, Cnt, L : LongInt;
+Begin
+  V := FoVol[F];
+  Done := 0;
+  While Done < N Do
+  Begin
+    FS := (Pos0 + Done) Shr 9;
+    Off := (Pos0 + Done) And 511;
+    DS := HpMap(FoRA[F], FoRN[F], FS, Run);
+    If DS = 0 Then Break;
+    If (Off = 0) And (N - Done >= 512) Then
+    Begin
+      Cnt := Min(Run, (N - Done) Shr 9);
+      Cnt := Min(Cnt, 128);
+      If Not HpWr(V, DS, Cnt, Src + Done) Then Break;
+      Done := Done + Cnt * 512;
+    End
+    Else
+    Begin
+      L := Min(512 - Off, N - Done);
+      If (Off > 0) Or (Pos0 + Done + L < FoSize[F]) Then
+      Begin
+        If Not HpRd(V, DS, 1, HpTmp) Then Break;
+      End
+      Else FillMem(HpTmp, 512, 0);
+      MoveMem(Src + Done, HpTmp + Off, L);
+      If Not HpWr(V, DS, 1, HpTmp) Then Break;
+      Done := Done + L;
+    End;
+  End;
+  HpPut := Done;
+End;
+
+{ Allocation du fichier F portee (ou reduite) a NSec secteurs }
+Function HpAllocTo(F, NSec : LongInt; Shrink : Boolean) : Boolean;
+Var V, Fn, RN : LongInt;
+Begin
+  HpAllocTo := False;
+  V := FoVol[F];
+  Fn := KAlloc(512);
+  If Fn = 0 Then Exit;
+  If HpFnode(V, FoClus[F], Fn) Then
+  Begin
+    RN := FoRN[F];
+    MemL[0:Fn + 160] := FoSize[F];
+    If Shrink Then
+      HpAllocTo := HpShrink(V, FoClus[F], Fn, FoRA[F], RN, NSec)
+    Else
+      HpAllocTo := HpGrow(V, FoClus[F], Fn, FoRA[F], NtMaxRuns, RN, NSec);
+    FoRN[F] := RN;
+  End;
+  KFree(Fn);
+End;
+
+Function HpWrite(F, Pos0, N, Src : LongInt) : LongInt;
+Var V, Need, Z, Done : LongInt;
+Begin
+  HpWrite := -1;
+  V := FoVol[F];
+  If HvRO[V] <> 0 Then Exit;
+  If N < 0 Then Exit;
+  { ecriture au-dela de la fin : l'intervalle est rempli de zeros }
+  While FoSize[F] < Pos0 Do
+  Begin
+    Z := Min(Pos0 - FoSize[F], 32768);
+    If HpWrite(F, FoSize[F], Z, FatZero) < Z Then Exit;
+  End;
+  If N = 0 Then
+  Begin
+    HpWrite := 0;
+    Exit;
+  End;
+  HpDirtyOn(V);
+  Need := (Pos0 + N + 511) Shr 9;
+  If Need > HpExtSecs(FoRA[F], FoRN[F]) Then
+    If Not HpAllocTo(F, Need, False) Then
+    Begin
+      { disque plein : ecrire ce qui tient }
+      Need := HpExtSecs(FoRA[F], FoRN[F]) * 512 - Pos0;
+      If Need <= 0 Then Exit;
+      N := Need;
+    End;
+  Done := HpPut(F, Pos0, N, Src);
+  If Pos0 + Done > FoSize[F] Then FoSize[F] := Pos0 + Done;
+  FoDirty[F] := True;
+  HpWrite := Done;
+End;
+
+Function HpSetSize(F, NewSize : LongInt) : Boolean;
+Var Old : LongInt;
+Begin
+  HpSetSize := True;
+  Old := FoSize[F];
+  If NewSize = Old Then Exit;
+  If NewSize > Old Then
+  Begin
+    HpSetSize := HpWrite(F, NewSize, 0, FatZero) >= 0;
+    Exit;
+  End;
+  FoSize[F] := NewSize;
+  FoDirty[F] := True;
+  HpDirtyOn(FoVol[F]);
+  HpSetSize := HpAllocTo(F, (NewSize + 511) Shr 9, True);
+End;
+
+{ Taille dans le fnode et l'entree du repertoire, dates }
+Procedure HpClose(F : LongInt);
+Var V, Fn, T, Dn : LongInt;
+Begin
+  V := FoVol[F];
+  T := HpNow;
+  Fn := KAlloc(512);
+  If Fn = 0 Then Exit;
+  If HpFnode(V, FoClus[F], Fn) Then
+  Begin
+    MemL[0:Fn + 160] := FoSize[F];
+    HpWr(V, FoClus[F], 1, Fn);
+  End;
+  KFree(Fn);
+  Dn := HpDirRoot(V, FoDir[F]);
+  If Dn <> 0 Then HpPatch(V, Dn, FoClus[F], FoSize[F], T, 0);
+  HpInval;
+  HpDirtyOff(V);
+End;
+
+{ Ouvrir (et creer) un fichier ; meme logique que FatOpen }
+Function HpOpen(V : LongInt; Const Path, Orig : String; Wr : Boolean;
+                Disp : LongInt; Var Err : LongInt) : LongInt;
+Var F, I, N : LongInt; Ex : Boolean;
+Begin
+  HpOpen := -1;
+  Err := 3;
+  Ex := HpResolve(V, Path);
+  If Ex And ((FfAttr And $10) <> 0) Then
+  Begin
+    Err := 5;
+    Exit;
+  End;
+  If Ex And (Disp = 1) Then
+  Begin
+    Err := 80;
+    Exit;
+  End;
+  If Not Ex And ((Disp = 3) Or (Disp = 5)) Then
+  Begin
+    Err := 2;
+    If Not HpResolve(V, ParentDir(Path)) Then Err := 3;
+    Exit;
+  End;
+  If (Wr Or Not Ex) And (HvRO[V] <> 0) Then
+  Begin
+    Err := 19;
+    Exit;
+  End;
+  If Ex And Wr And ((FfAttr And 1) <> 0) Then
+  Begin
+    Err := 5;
+    Exit;
+  End;
+  F := -1;
+  For I := MaxFo - 1 DownTo 0 Do If Not FoUsed[I] Then F := I;
+  If F < 0 Then
+  Begin
+    Err := 4;
+    Exit;
+  End;
+  If Not Ex Then
+  Begin
+    If Not HpResolve(V, ParentDir(Path)) Or ((FfAttr And $10) = 0) Then
+      Exit;
+    Err := HpCreate(V, FfClus, HpDisp(Path, Orig), False, N);
+    If Err <> 0 Then Exit;
+    If Not HpResolve(V, Path) Then
+    Begin
+      Err := 3;
+      Exit;
+    End;
+  End;
+  FoUsed[F] := True;
+  If Not HpOpenR(V, F) Then
+  Begin
+    FoUsed[F] := False;
+    Err := 5;
+    Exit;
+  End;
+  FoDirty[F] := Not Ex;
+  If Ex And ((Disp = 2) Or (Disp = 5)) And (FoSize[F] > 0) Then
+    HpSetSize(F, 0);
+  Err := 0;
+  HpOpen := F;
+End;
+
+Function HpMkDir(V : LongInt; Const Path, Orig : String) : LongInt;
+Var N : LongInt;
+Begin
+  HpMkDir := 3;
+  If Length(Path) <= 3 Then Exit;
+  If HpResolve(V, Path) Then
+  Begin
+    HpMkDir := 183;
+    Exit;
+  End;
+  If Not HpResolve(V, ParentDir(Path)) Or ((FfAttr And $10) = 0) Then Exit;
+  HpMkDir := HpCreate(V, FfClus, HpDisp(Path, Orig), True, N);
+End;
+
+{ ==================================================================== }
+{ Partitions et operations communes (FAT, NTFS, HPFS)                    }
+{ ==================================================================== }
+
 Function IsFatPart(T : LongInt) : Boolean;
 Begin
   IsFatPart := (T = $01) Or (T = $04) Or (T = $06) Or (T = $0B) Or
@@ -5376,6 +7314,11 @@ Begin
     NtMount(D, 0, DiskSecs[D]);
     Exit;
   End;
+  If (MemL[0:A + 54] = $53465048) And ((PT[0] < 0) Or (PS[0] = 0)) Then
+  Begin
+    HpMount(D, 0, DiskSecs[D]);
+    Exit;
+  End;
   Ext := 0;
   For I := 0 To 3 Do
   Begin
@@ -5383,7 +7326,8 @@ Begin
     If IsFatPart(T) And (PS[I] > 0) Then
       If VolMount(D, PS[I], PZ[I]) Then Found := True;
     If (T = $07) And (PS[I] > 0) Then
-      If NtMount(D, PS[I], PZ[I]) Then Found := True;
+      If NtMount(D, PS[I], PZ[I]) Or HpMount(D, PS[I], PZ[I]) Then
+        Found := True;
     If (T = $05) Or (T = $0F) Or (T = $85) Then Ext := PS[I];
   End;
   { partitions logiques de la partition etendue }
@@ -5398,7 +7342,8 @@ Begin
     I := MemL[0:A + 446 + 16 + 8];
     If (Mem[0:A + 446 + 16 + 4] = 0) Or (I = 0) Then I := -1;
     If IsFatPart(T) And (St > 0) Then VolMount(D, Ebr + St, Sz);
-    If (T = $07) And (St > 0) Then NtMount(D, Ebr + St, Sz);
+    If (T = $07) And (St > 0) Then
+      If Not NtMount(D, Ebr + St, Sz) Then HpMount(D, Ebr + St, Sz);
     If I < 0 Then Ebr := 0 Else Ebr := Ext + I;
     Inc(N);
   End;
@@ -5435,6 +7380,14 @@ Procedure FatWinDirs;
 Var R, W : LongInt;
 Begin
   If (VolN = 0) Or (VolLetter[0] <> Ord('C')) Then Exit;
+  If VolType[0] = HpfsT Then
+  Begin
+    HpMkDir(0, 'C:\WINDOWS', 'WINDOWS');
+    HpMkDir(0, 'C:\WINDOWS\SYSTEM', 'SYSTEM');
+    HpMkDir(0, 'C:\WINDOWS\TEMP', 'TEMP');
+    HpMkDir(0, 'C:\TEMP', 'TEMP');
+    Exit;
+  End;
   If VolType[0] = NtfsT Then
   Begin
     NtMkDir(0, 'C:\WINDOWS', 'WINDOWS');
@@ -5483,6 +7436,12 @@ Begin
   NdBuf := 0; NdCap := 0; NdVol := -1; NdPathVol := -1;
   For I := 0 To MaxFo - 1 Do FoRA[I] := 0;
   HeapOwner := HO;
+  { HPFS : tampons alloues au premier montage }
+  HpTmp := 0; HpDnB := 0; HpEnt := 0; HpNew := 0; HpTabOk := False;
+  HgBuf := 0; HgCap := 0; HgOff := 0; HgOffCap := 0; HgDn := 0;
+  HgDnCap := 0; HgVol := -1; HdPathVol := -1;
+  HbE := 0; HbC := 0; HbLo := 0; HbHi := 0; HbEnd := 0; HbUp := 0;
+  HbSec := 0; HbCap := 0;
   DcVol := -1;
   DiskN := 0; VolN := 0;
   HdIdentify($1F0, $3F6, False);
@@ -5529,6 +7488,10 @@ Begin
   If VolType[V] = NtfsT Then
   Begin
     If Not NtResolve(V, Path) Then Exit;
+  End
+  Else If VolType[V] = HpfsT Then
+  Begin
+    If Not HpResolve(V, Path) Then Exit;
   End
   Else If Not FatResolve(V, Path) Then Exit;
   Attr := FfAttr And $37;
@@ -5590,6 +7553,11 @@ Begin
     FatMkDir := NtMkDir(V, Path, Orig);
     Exit;
   End;
+  If VolType[V] = HpfsT Then
+  Begin
+    FatMkDir := HpMkDir(V, Path, Orig);
+    Exit;
+  End;
   If FatResolve(V, Path) Then
   Begin
     FatMkDir := 183;                               { existe deja }
@@ -5610,6 +7578,11 @@ Begin
   If (V >= 0) And (VolType[V] = NtfsT) Then
   Begin
     FatRmDir := NtRemove(V, Path, True);
+    Exit;
+  End;
+  If (V >= 0) And (VolType[V] = HpfsT) Then
+  Begin
+    FatRmDir := HpRemove(V, Path, True);
     Exit;
   End;
   If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
@@ -5636,6 +7609,11 @@ Begin
   If (V >= 0) And (VolType[V] = NtfsT) Then
   Begin
     FatDelete := NtRemove(V, Path, False);
+    Exit;
+  End;
+  If (V >= 0) And (VolType[V] = HpfsT) Then
+  Begin
+    FatDelete := HpRemove(V, Path, False);
     Exit;
   End;
   If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
@@ -5671,6 +7649,11 @@ Begin
   If VolType[V] = NtfsT Then
   Begin
     FatRename := NtRename(V, Src, Dst, Orig);
+    Exit;
+  End;
+  If VolType[V] = HpfsT Then
+  Begin
+    FatRename := HpRename(V, Src, Dst, Orig);
     Exit;
   End;
   If Not FatResolve(V, Src) Or (FfIdx < 0) Then Exit;
@@ -5726,6 +7709,11 @@ Begin
   If VolType[V] = NtfsT Then
   Begin
     FatOpen := NtOpen(V, Path, Orig, Wr, Disp, Err);
+    Exit;
+  End;
+  If VolType[V] = HpfsT Then
+  Begin
+    FatOpen := HpOpen(V, Path, Orig, Wr, Disp, Err);
     Exit;
   End;
   Ex := FatResolve(V, Path);
@@ -5829,6 +7817,11 @@ Begin
     FatRead := NtRead(F, Pos0, N, Dst);
     Exit;
   End;
+  If VolType[FoVol[F]] = HpfsT Then
+  Begin
+    FatRead := HpRead(F, Pos0, N, Dst);
+    Exit;
+  End;
   If Pos0 + N > FoSize[F] Then N := FoSize[F] - Pos0;
   If N < 0 Then N := 0;
   CB := ClusBytes(FoVol[F]);
@@ -5853,6 +7846,11 @@ Begin
   If VolType[FoVol[F]] = NtfsT Then
   Begin
     FatWrite := NtWrite(F, Pos0, N, Src);
+    Exit;
+  End;
+  If VolType[FoVol[F]] = HpfsT Then
+  Begin
+    FatWrite := HpWrite(F, Pos0, N, Src);
     Exit;
   End;
   { ecriture au-dela de la fin : remplir l'intervalle de zeros }
@@ -5887,6 +7885,11 @@ Begin
   If VolType[FoVol[F]] = NtfsT Then
   Begin
     FatSetSize := NtSetSize(F, NewSize);
+    Exit;
+  End;
+  If VolType[FoVol[F]] = HpfsT Then
+  Begin
+    FatSetSize := HpSetSize(F, NewSize);
     Exit;
   End;
   If NewSize = FoSize[F] Then Exit;
@@ -5928,6 +7931,11 @@ Begin
     If FoDirty[F] Then NtClose(F);
     Exit;
   End;
+  If VolType[FoVol[F]] = HpfsT Then
+  Begin
+    If FoDirty[F] Then HpClose(F);
+    Exit;
+  End;
   If FoDirty[F] Then FatFlush;
 End;
 
@@ -5964,6 +7972,11 @@ Begin
     FatDirEntry := NtDirEntry(Dir, Idx);
     Exit;
   End;
+  If VolType[V] = HpfsT Then
+  Begin
+    FatDirEntry := HpDirEntry(Dir, Idx);
+    Exit;
+  End;
   C := FatDirClus(V, Dir);
   If C < 0 Then Exit;
   K := 0;
@@ -5978,7 +7991,7 @@ End;
 { Espace libre et total d'un volume (en clusters) }
 Procedure FatSpace(V : LongInt; Var Free0, Total, Spc : LongInt);
 Begin
-  If VolType[V] = NtfsT Then
+  If (VolType[V] = NtfsT) Or (VolType[V] = HpfsT) Then
   Begin
     Free0 := VolFree[V]; Total := VolClus[V]; Spc := VolSpc[V];
     Exit;
@@ -17535,8 +19548,11 @@ Begin
     If PFs <> 0 Then
       If VolType[V] = 32 Then PutPStr(PFs, 'FAT32', FsSize)
       Else If VolType[V] = NtfsT Then PutPStr(PFs, 'NTFS', FsSize)
+      Else If VolType[V] = HpfsT Then PutPStr(PFs, 'HPFS', FsSize)
       Else PutPStr(PFs, 'FAT', FsSize);
     If (PFlags <> 0) And (VolType[V] = NtfsT) Then MemL[0:PFlags] := $1F;
+    If (PFlags <> 0) And (VolType[V] = HpfsT) Then MemL[0:PFlags] := 3;
+    If (PMaxComp <> 0) And (VolType[V] = HpfsT) Then MemL[0:PMaxComp] := 254;
   End
   Else If (D <> '') And (D[1] = 'C') Then
   Begin

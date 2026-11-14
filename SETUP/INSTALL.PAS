@@ -27,7 +27,7 @@ Program INSTALL;
       AUTOEXEC.BAT recoit SET LANGUAGE= ;
     - le disque dur et sa partition : nouvelle partition principale
       (taille en Mo, le disque est efface) ou formatage de la partition
-      existante, en FAT16, FAT32 (par defaut) ou NTFS ;
+      existante, en FAT16, FAT32 (par defaut), NTFS ou HPFS ;
     - le fuseau horaire et l'heure d'ete (CMOS 79h, lu par VMM32) ;
     - le mode d'affichage (CMOS 7Ah-7Dh, lu par IO.SYS) ;
     - les composants (programmes d'exemple, son de demarrage, Lisez-moi).
@@ -35,22 +35,25 @@ Program INSTALL;
   Puis il ecrit la table des partitions et le MBR (SETUP/MBR.ASM),
   formate la partition (FAT16 : SETUP/BOOT16.ASM ; FAT32 : SETUP/
   BOOT32.ASM, FSInfo ; NTFS 3.1 : chargeur SETUP/NTFSBOOT.ASM, MFT,
-  $LogFile, $Bitmap, $UpCase, $Secure, $Extend...) et copie les
-  fichiers du CD-ROM :
+  $LogFile, $Bitmap, $UpCase, $Secure, $Extend... ; HPFS : chargeur
+  SETUP/HPFSBOOT.ASM, superbloc, bloc de reserve, bitmaps par bandes,
+  bande des repertoires, fnodes et dnodes) et copie les fichiers du
+  CD-ROM :
 
     C:\IO.SYS, C:\MSDOS.SYS (caches, systeme), C:\CONFIG.SYS,
     C:\AUTOEXEC.BAT, C:\COMMAND.EXE et C:\WINDOWS (VMM32.VXD, ...).
 
   Le secteur d'amorce charge C:\IO.SYS, qui lit alors ses fichiers sur
-  le disque dur (FAT32) et demarre VMM32 avec C:\WINDOWS comme dossier
-  systeme.
+  le disque dur (FAT16, FAT32, NTFS ou HPFS) et demarre VMM32 avec
+  C:\WINDOWS comme dossier systeme.
 
   Carte memoire (mode reel) :
     00000h-07BFFh  vecteurs, BIOS, pile (0000:7C00 vers le bas)
     07C00h-....    INSTALL.SYS (code, puis donnees et BSS)
     50000h-5FFFFh  NTFS : les 64 enregistrements de la MFT
     60000h-67FFFh  tampon de copie (32 Ko)
-    70000h-77FFFh  secteurs de FAT et de repertoires (32 Ko)
+    70000h-77FFFh  secteurs de FAT et de repertoires, dnodes et
+                   bitmaps HPFS (32 Ko)
     80000h-807FFh  tampon d'un secteur du CD-ROM
     81000h-811FFh  secteur du disque dur (MBR, secteur d'amorce)
     81400h-81BFFh  NTFS : valeur d'attribut en construction          }
@@ -71,9 +74,9 @@ Const
   MinMb     = 40;                    { FAT32 : au moins 65525 grappes }
   { systemes de fichiers : FAT16, FAT32 (defaut), NTFS ; taille
     minimale et maximale (Mo) }
-  FsCount   = 3;
-  FsMinMb : Array[0..2] Of LongInt = (16, 40, 32);
-  FsMaxMb : Array[0..2] Of LongInt = (2047, 1000000, 1000000);
+  FsCount   = 4;
+  FsMinMb : Array[0..3] Of LongInt = (16, 40, 32, 16);
+  FsMaxMb : Array[0..3] Of LongInt = (2047, 1000000, 1000000, 64000);
 
   { Palette de Windows 95 (16 couleurs) }
   cBlack   = 0;  cMaroon  = 1;  cGreen   = 2;  cOlive   = 3;
@@ -240,6 +243,81 @@ Const
     $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
     $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
     $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00);
+  { chargeur HPFS (SETUP/HPFSBOOT.ASM, octets 62 a 1078) }
+  HpBootCode : Array[0..1016] Of Byte = (
+    $FA, $31, $C0, $8E, $D0, $BC, $00, $7C, $8E, $D8, $FB, $FC, $B8, $00,
+    $90, $8E, $C0, $BE, $00, $7C, $31, $FF, $B9, $00, $01, $F3, $A5, $8E,
+    $D8, $88, $16, $24, $00, $66, $A1, $1C, $00, $66, $40, $66, $A3, $B7,
+    $00, $C7, $06, $B1, $00, $0F, $00, $C7, $06, $B3, $00, $00, $02, $C7,
+    $06, $B5, $00, $00, $90, $BE, $AF, $00, $B4, $42, $8A, $16, $24, $00,
+    $CD, $13, $72, $05, $EA, $00, $02, $00, $90, $BE, $A1, $00, $AC, $08,
+    $C0, $74, $09, $B4, $0E, $BB, $07, $00, $CD, $10, $EB, $F2, $F4, $EB,
+    $FD, $45, $72, $72, $65, $75, $72, $20, $64, $69, $73, $71, $75, $65,
+    $00, $10, $00, $01, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $55, $AA, $B8, $00, $90, $8E, $D8, $8E, $C0, $8E, $D0, $BC, $F0, $FF,
+    $66, $B8, $10, $00, $00, $00, $B9, $01, $00, $BF, $00, $20, $E8, $A2,
+    $01, $66, $81, $3E, $00, $20, $49, $E8, $95, $F9, $0F, $85, $A6, $00,
+    $66, $A1, $0C, $20, $E8, $77, $01, $F6, $06, $37, $20, $01, $0F, $84,
+    $96, $00, $66, $A1, $48, $20, $C6, $06, $3C, $04, $00, $FE, $06, $3C,
+    $04, $80, $3E, $3C, $04, $20, $0F, $87, $80, $00, $B9, $04, $00, $BF,
+    $00, $28, $E8, $66, $01, $66, $81, $3E, $00, $28, $AE, $0A, $E4, $77,
+    $75, $6C, $BE, $14, $28, $8B, $04, $83, $F8, $20, $72, $62, $8A, $5C,
+    $02, $F6, $C3, $08, $75, $12, $F6, $C3, $01, $75, $09, $E8, $6C, $01,
+    $08, $C0, $74, $16, $78, $04, $03, $34, $EB, $DF, $F6, $44, $02, $04,
+    $74, $42, $89, $F3, $03, $1C, $66, $8B, $47, $FC, $EB, $AB, $66, $8B,
+    $44, $04, $E8, $09, $01, $66, $A1, $A0, $20, $66, $05, $FF, $01, $00,
+    $00, $66, $C1, $E8, $09, $66, $A3, $38, $04, $BB, $38, $20, $31, $ED,
+    $E8, $1D, $00, $31, $C0, $8E, $C0, $26, $66, $C7, $06, $10, $7C, $00,
+    $00, $00, $00, $8A, $16, $24, $00, $EA, $00, $00, $C0, $07, $BE, $2A,
+    $04, $E9, $BC, $FD, $0F, $B6, $4F, $05, $F6, $07, $80, $75, $12, $8D,
+    $77, $08, $E3, $49, $51, $56, $E8, $45, $00, $5E, $59, $83, $C6, $0C,
+    $49, $EB, $F1, $83, $FD, $06, $73, $DA, $8D, $77, $08, $E3, $32, $51,
+    $56, $53, $66, $8B, $44, $04, $89, $EF, $C1, $E7, $09, $81, $C7, $00,
+    $30, $57, $B9, $01, $00, $E8, $AD, $00, $5F, $66, $81, $3D, $AE, $0A,
+    $E4, $37, $75, $B4, $8D, $5D, $0C, $45, $E8, $B3, $FF, $4D, $5B, $5E,
+    $59, $83, $C6, $08, $49, $EB, $CC, $C3, $66, $8B, $04, $66, $8B, $4C,
+    $04, $66, $8B, $54, $08, $66, $09, $C9, $74, $69, $66, $3B, $06, $38,
+    $04, $73, $62, $66, $8B, $1E, $38, $04, $66, $29, $C3, $66, $39, $CB,
+    $76, $03, $66, $89, $CB, $66, $83, $FB, $40, $76, $06, $66, $BB, $40,
+    $00, $00, $00, $66, $50, $66, $51, $66, $52, $66, $53, $66, $89, $C7,
+    $66, $C1, $E7, $05, $66, $81, $C7, $C0, $07, $00, $00, $89, $3E, $B5,
+    $00, $C7, $06, $B3, $00, $00, $00, $89, $1E, $B1, $00, $66, $89, $D0,
+    $66, $03, $06, $1C, $00, $66, $A3, $B7, $00, $E8, $42, $00, $66, $5B,
+    $66, $5A, $66, $59, $66, $58, $66, $01, $D8, $66, $01, $DA, $66, $29,
+    $D9, $EB, $92, $C3, $B9, $01, $00, $BF, $00, $20, $E8, $0E, $00, $66,
+    $81, $3E, $00, $20, $AE, $0A, $E4, $F7, $0F, $85, $12, $FF, $C3, $66,
+    $03, $06, $1C, $00, $66, $A3, $B7, $00, $89, $0E, $B1, $00, $89, $3E,
+    $B3, $00, $C7, $06, $B5, $00, $00, $90, $66, $60, $BE, $AF, $00, $B4,
+    $42, $8A, $16, $24, $00, $CD, $13, $66, $61, $0F, $82, $A6, $FC, $C3,
+    $56, $53, $0F, $B6, $4C, $1E, $8D, $7C, $1F, $BB, $24, $04, $BA, $06,
+    $00, $09, $D2, $74, $1A, $E3, $1E, $8A, $05, $3C, $61, $72, $06, $3C,
+    $7A, $77, $02, $2C, $20, $38, $07, $72, $0A, $77, $0C, $47, $43, $49,
+    $4A, $EB, $E2, $E3, $08, $B0, $FF, $EB, $06, $B0, $01, $EB, $02, $30,
+    $C0, $5B, $5E, $C3, $49, $4F, $2E, $53, $59, $53, $49, $4F, $2E, $53,
+    $59, $53, $20, $61, $62, $73, $65, $6E, $74);
   { chargeur NTFS (SETUP/NTFSBOOT.ASM, octets 84 a 1555) }
   NtBootCode : Array[0..1471] Of Byte = (
     $FA, $31, $C0, $8E, $D0, $BC, $00, $7C, $8E, $D8, $FB, $FC, $B8, $00,
@@ -2086,6 +2164,7 @@ Begin
   Case I Of
     0 : FsName := 'FAT16';
     1 : FsName := 'FAT32';
+    3 : FsName := 'HPFS';
   Else
     FsName := 'NTFS';
   End;
@@ -2116,7 +2195,7 @@ Begin
     $04, $06, $0E : PartTypeName := 'FAT16';
     $05, $0F : PartTypeName := L('Etendue', 'Extended', 'Erweitert',
                                  'Estesa', 'Extendida');
-    $07 : PartTypeName := 'NTFS';
+    $07 : PartTypeName := 'HPFS/NTFS';
     $0B, $0C : PartTypeName := 'FAT32';
     $82 : PartTypeName := 'Linux swap';
     $83 : PartTypeName := 'Linux';
@@ -2496,25 +2575,34 @@ Begin
   NeedMb := T Div 1048576 + 1;
 End;
 
+{ Texte d'accueil (page de la langue) }
+Function WelcomeText : String;
+Begin
+  WelcomeText := L('Bienvenue dans l''installation de ' +
+    'Pasdows 95. Ce programme installe Pasdows 95 sur le disque dur de ' +
+    'votre ordinateur : il peut cr'#130'er une partition, la formater ' +
+    '(FAT16, FAT32, NTFS ou HPFS) et copier les fichiers du ' +
+    'syst'#138'me.',
+    'Welcome to Pasdows 95 Setup. This program installs Pasdows 95 on ' +
+    'the hard disk of your computer: it can create a partition, format ' +
+    'it (FAT16, FAT32, NTFS or HPFS) and copy the system files.',
+    'Willkommen bei Pasdows 95 Setup. Dieses Programm installiert ' +
+    'Pasdows 95 auf der Festplatte: es kann eine Partition erstellen, ' +
+    'sie formatieren (FAT16, FAT32, NTFS oder HPFS) und die ' +
+    'Systemdateien kopieren.',
+    'Benvenuti nell''installazione di Pasdows 95. Questo programma ' +
+    'installa Pasdows 95 sul disco rigido: pu'#149' creare una partizione, ' +
+    'formattarla (FAT16, FAT32, NTFS o HPFS) e copiare i file di sistema.',
+    'Bienvenido a la instalaci'#162'n de Pasdows 95. Este programa ' +
+    'instala Pasdows 95 en el disco duro: puede crear una partici'#162'n, ' +
+    'formatearla (FAT16, FAT32, NTFS o HPFS) y copiar los archivos del ' +
+    'sistema.');
+End;
+
 Procedure DrawPageLang;
 Var I, N : Integer;
 Begin
-  N := WrapText(CX1, CY1, CX2 - CX1, L('Bienvenue dans l''installation de ' +
-    'Pasdows 95. Ce programme installe Pasdows 95 sur le disque dur de ' +
-    'votre ordinateur : il peut cr'#130'er une partition, la formater ' +
-    '(FAT16, FAT32 ou NTFS) et copier les fichiers du syst'#138'me.',
-    'Welcome to Pasdows 95 Setup. This program installs Pasdows 95 on ' +
-    'the hard disk of your computer: it can create a partition, format ' +
-    'it with FAT32 and copy the system files.',
-    'Willkommen bei Pasdows 95 Setup. Dieses Programm installiert ' +
-    'Pasdows 95 auf der Festplatte: es kann eine Partition erstellen, ' +
-    'sie mit FAT32 formatieren und die Systemdateien kopieren.',
-    'Benvenuti nell''installazione di Pasdows 95. Questo programma ' +
-    'installa Pasdows 95 sul disco rigido: pu'#149' creare una partizione, ' +
-    'formattarla in FAT32 e copiare i file di sistema.',
-    'Bienvenido a la instalaci'#162'n de Pasdows 95. Este programa ' +
-    'instala Pasdows 95 en el disco duro: puede crear una partici'#162'n, ' +
-    'formatearla en FAT32 y copiar los archivos del sistema.'),
+  N := WrapText(CX1, CY1, CX2 - CX1, WelcomeText,
     cBlack, True);
   GroupBox(CX1, CY1 + N * 16 + 20, CX2, CY1 + N * 16 + 30 + 5 * 24,
            L('Langue', 'Language', 'Sprache', 'Lingua', 'Idioma'));
@@ -2526,22 +2614,7 @@ End;
 Function LangRadioY(I : Integer) : Integer;
 Var N : Integer;
 Begin
-  N := WrapText(CX1, CY1, CX2 - CX1, L('Bienvenue dans l''installation de ' +
-    'Pasdows 95. Ce programme installe Pasdows 95 sur le disque dur de ' +
-    'votre ordinateur : il peut cr'#130'er une partition, la formater ' +
-    '(FAT16, FAT32 ou NTFS) et copier les fichiers du syst'#138'me.',
-    'Welcome to Pasdows 95 Setup. This program installs Pasdows 95 on ' +
-    'the hard disk of your computer: it can create a partition, format ' +
-    'it with FAT32 and copy the system files.',
-    'Willkommen bei Pasdows 95 Setup. Dieses Programm installiert ' +
-    'Pasdows 95 auf der Festplatte: es kann eine Partition erstellen, ' +
-    'sie mit FAT32 formatieren und die Systemdateien kopieren.',
-    'Benvenuti nell''installazione di Pasdows 95. Questo programma ' +
-    'installa Pasdows 95 sul disco rigido: pu'#149' creare una partizione, ' +
-    'formattarla in FAT32 e copiare i file di sistema.',
-    'Bienvenido a la instalaci'#162'n de Pasdows 95. Este programa ' +
-    'instala Pasdows 95 en el disco duro: puede crear una partici'#162'n, ' +
-    'formatearla en FAT32 y copiar los archivos del sistema.'),
+  N := WrapText(CX1, CY1, CX2 - CX1, WelcomeText,
     cBlack, False);
   LangRadioY := CY1 + N * 16 + 34 + I * 24;
 End;
@@ -2618,7 +2691,7 @@ Begin
   OutText(CX1, Y + 86, L('Syst'#138'me de fichiers :', 'File system:',
           'Dateisystem:', 'File system:', 'Sistema de archivos:'), cBlack);
   For I := 0 To FsCount - 1 Do
-    RadioButton(CX1 + 18 + I * 90, Y + 106, FsName(I), I = FsKind);
+    RadioButton(CX1 + 18 + I * 80, Y + 106, FsName(I), I = FsKind);
   If MaxMb < FsMinMb[FsKind] Then
     OutText(CX1, Y + 126, L('Disque trop petit pour ', 'Disk too small for ',
             'Festplatte zu klein: ', 'Disco troppo piccolo: ',
@@ -3058,7 +3131,7 @@ Begin
     0 : PartType := $0E;                         { FAT16 (LBA) }
     1 : PartType := $0C;                         { FAT32 (LBA) }
   Else
-    PartType := $07;                             { NTFS }
+    PartType := $07;                             { NTFS, HPFS }
   End;
 End;
 
@@ -4336,6 +4409,607 @@ Begin
               'Instalaci'#162'n completada.'));
 End;
 
+{ ================================================================== }
+{ Formatage HPFS et copie des fichiers                               }
+{ ================================================================== }
+
+{ Disposition (comme HPFS.IFS d'OS/2-0) : 0-15 amorce (SETUP/
+  HPFSBOOT.ASM), 16 superbloc, 17 bloc de reserve, 18-21 bitmap de la
+  bande 0, 22-25 liste des bitmaps, 26-29 secteurs defectueux, 30-33
+  table de remplacement, 34-35 pages de codes, 36-43 identificateurs,
+  44 fnode de la racine, 45-48 bitmap de la bande des repertoires, 52..
+  bande des repertoires (dnodes de 4 secteurs, la racine en premier) ;
+  les bandes suivantes de 8 Mo ont leur bitmap au debut (paire) ou a la
+  fin (impaire). Chaque fichier est copie d'un seul tenant (fnode puis
+  donnees) a la suite, en sautant les bitmaps ; les repertoires (racine
+  et C:\WINDOWS) sont ecrits a la fin en arbres B de dnodes. }
+
+Const
+  HpBand = 16384;
+  HfMax  = 64;
+
+Var
+  HpTot, HpNB, HpDirS, HpDirE, HpNDir, HpNext, HpDnNext, HpNow : LongInt;
+  HpWinFn, HpList, HpListN, HpSerial : LongInt;
+  HpGapS, HpGapE : Array[0..63] Of LongInt;
+  HpGapCnt : Integer;
+  HpUp : Array[128..255] Of Byte;
+  { fichiers et repertoires crees }
+  HfN : Integer;
+  HfName : Array[0..HfMax - 1] Of String[12];
+  HfRoot : Array[0..HfMax - 1] Of Boolean;
+  HfFn, HfSize : Array[0..HfMax - 1] Of LongInt;
+  HfAttr : Array[0..HfMax - 1] Of Byte;
+  { arbre B d'un repertoire : elements (entree, fils) et noeuds }
+  HbE, HbC : Array[0..135] Of Integer;
+  HbLo, HbHi, HbEnd, HbUp : Array[0..67] Of Integer;
+  HbSec : Array[0..67] Of LongInt;
+
+{ Secondes depuis 1970 (heure locale) de la date et de l'heure DOS }
+Function HpUnix(D, T : Word) : LongInt;
+Var Y, M, Dd, A, Era, Yoe, Doy, Doe : LongInt;
+Begin
+  Y := 1980 + (D Shr 9); M := (D Shr 5) And 15; Dd := D And 31;
+  If (M < 1) Or (M > 12) Then M := 1;
+  If Dd < 1 Then Dd := 1;
+  If M <= 2 Then Y := Y - 1;
+  Era := Y Div 400;
+  Yoe := Y - Era * 400;
+  If M > 2 Then A := M - 3 Else A := M + 9;
+  Doy := (153 * A + 2) Div 5 + Dd - 1;
+  Doe := Yoe * 365 + Yoe Div 4 - Yoe Div 100 + Doy;
+  HpUnix := (Era * 146097 + Doe - 719468) * 86400 +
+            LongInt(T Shr 11) * 3600 + LongInt((T Shr 5) And 63) * 60 +
+            LongInt(T And 31) * 2;
+End;
+
+{ Secteur de la bitmap de la bande B }
+Function HpBmpSec(B : LongInt) : LongInt;
+Var S : LongInt;
+Begin
+  If B = 0 Then S := 18
+  Else If Odd(B) Then
+  Begin
+    S := B * HpBand + HpBand - 4;
+    If S + 4 > HpTot Then S := HpTot - 4;
+  End
+  Else S := B * HpBand;
+  HpBmpSec := S;
+End;
+
+{ N secteurs contigus a la suite, sans chevaucher une bitmap ; l'espace
+  saute est note (libre) ; -1 si la partition est pleine }
+Function HpTake(N : LongInt) : LongInt;
+Var S, B, Bs : LongInt; Moved : Boolean;
+Begin
+  HpTake := -1;
+  S := HpNext;
+  Repeat
+    Moved := False;
+    For B := S Div HpBand To (S + N) Div HpBand + 1 Do
+      If (B >= 1) And (B < HpNB) Then
+      Begin
+        Bs := HpBmpSec(B);
+        If (S < Bs + 4) And (S + N > Bs) Then
+        Begin
+          S := Bs + 4;
+          Moved := True;
+        End;
+      End;
+  Until Not Moved;
+  If S + N > HpTot Then Exit;
+  If (S > HpNext) And (HpGapCnt < 64) Then
+  Begin
+    HpGapS[HpGapCnt] := HpNext; HpGapE[HpGapCnt] := S;
+    Inc(HpGapCnt);
+  End;
+  HpNext := S + N;
+  HpTake := S;
+End;
+
+Procedure HpInitUp;
+Var I : Integer;
+Begin
+  For I := 128 To 255 Do HpUp[I] := I;
+  HpUp[129] := 154; HpUp[130] := 144; HpUp[131] := 182; HpUp[132] := 142;
+  HpUp[133] := 183; HpUp[134] := 143; HpUp[135] := 128; HpUp[136] := 210;
+  HpUp[137] := 211; HpUp[138] := 212; HpUp[139] := 216; HpUp[140] := 215;
+  HpUp[141] := 222; HpUp[145] := 146; HpUp[147] := 226; HpUp[148] := 153;
+  HpUp[149] := 227; HpUp[150] := 234; HpUp[151] := 235; HpUp[155] := 157;
+  HpUp[160] := 181; HpUp[161] := 214; HpUp[162] := 224; HpUp[163] := 233;
+  HpUp[164] := 165; HpUp[198] := 199; HpUp[208] := 209; HpUp[213] := 73;
+  HpUp[228] := 229; HpUp[231] := 232; HpUp[236] := 237;
+End;
+
+Function HpErrFull : String;
+Begin
+  HpErrFull := L('Partition trop petite.', 'Partition too small.',
+                 'Partition zu klein.', 'Partizione troppo piccola.',
+                 'Partici'#162'n demasiado peque'#164'a.');
+End;
+
+{ Fnode en SecSeg : nom, parent, extension unique (Data, Secs) }
+Procedure HpFnode(Const Nm : String; Up, Data, Secs, Size : LongInt;
+                  IsDir : Boolean);
+Var I : Integer;
+Begin
+  ZeroSeg(SecSeg, 512);
+  PutL(SecSeg, 0, $F7E40AAE);
+  Mem[SecSeg:12] := Length(Nm);
+  For I := 1 To Length(Nm) Do
+    If I <= 15 Then Mem[SecSeg:12 + I] := Ord(Nm[I]);
+  PutL(SecSeg, 28, Up);
+  If IsDir Then PutW(SecSeg, 54, $100);
+  If Secs > 0 Then
+  Begin
+    Mem[SecSeg:60] := 7; Mem[SecSeg:61] := 1; PutW(SecSeg, 62, 20);
+    PutL(SecSeg, 64, 0); PutL(SecSeg, 68, Secs); PutL(SecSeg, 72, Data);
+  End
+  Else
+  Begin
+    Mem[SecSeg:60] := 8; PutW(SecSeg, 62, 8);
+  End;
+  PutL(SecSeg, 160, Size);
+  PutW(SecSeg, 184, 196);
+End;
+
+Procedure HfAdd(Const Nm : String; InRoot : Boolean; Fn, Size : LongInt;
+                A : Byte);
+Begin
+  If HfN >= HfMax Then Exit;
+  HfName[HfN] := Nm; HfRoot[HfN] := InRoot; HfFn[HfN] := Fn;
+  HfSize[HfN] := Size; HfAttr[HfN] := A;
+  Inc(HfN);
+End;
+
+{ Copier le fichier Idx du CD-ROM (-1 : texte produit dans CopySeg) }
+Function HpCopy(Idx : Integer; Const Nm : String; InRoot : Boolean;
+                A : Byte) : Boolean;
+Var Fn, Data, Secs, Size, Rem, K, Bytes, Up : LongInt; N : Integer;
+Begin
+  HpCopy := False;
+  If HfN >= HfMax Then Exit;
+  If Idx >= 0 Then Size := CdFiles[Idx].Size Else Size := GenLen;
+  Secs := (Size + 511) Div 512;
+  Fn := HpTake(1);
+  Data := 0;
+  If (Fn >= 0) And (Secs > 0) Then Data := HpTake(Secs);
+  If (Fn < 0) Or (Data < 0) Then
+  Begin
+    InstErr := HpErrFull;
+    Exit;
+  End;
+  If Idx < 0 Then
+  Begin
+    SetStatus(L('Cr'#130'ation de ', 'Creating ', 'Erstellen: ',
+                'Creazione di ', 'Creando ') + Nm + '...');
+    If Size > 0 Then
+      If Not WriteBuf(PartLba + Data, Size) Then Exit;
+  End
+  Else
+  Begin
+    SetStatus(L('Copie de ', 'Copying ', 'Kopieren: ', 'Copia di ',
+                'Copiando ') + Nm + '...');
+    Rem := Size; K := 0;
+    While Rem > 0 Do
+    Begin
+      N := 16;
+      If Rem < 32768 Then N := (Rem + 2047) Div 2048;
+      If Not CdReadN(CdFiles[Idx].Lba + K, CopySeg, N) Then
+      Begin
+        InstErr := L('Erreur de lecture du CD-ROM : ', 'CD-ROM read error: ',
+                     'CD-ROM-Lesefehler: ', 'Errore di lettura del CD-ROM: ',
+                     'Error de lectura del CD-ROM: ') + Nm;
+        Exit;
+      End;
+      Bytes := LongInt(N) * 2048;
+      If Bytes > Rem Then Bytes := Rem;
+      If Not WriteBuf(PartLba + Data + K * 4, Bytes) Then Exit;
+      K := K + N; Rem := Rem - Bytes;
+      DoneBytes := DoneBytes + Bytes;
+      DrawStatus;
+    End;
+  End;
+  If InRoot Then Up := 44 Else Up := HpWinFn;
+  HpFnode(Nm, Up, Data, Secs, Size, False);
+  If Not HdIo(Drv, True, PartLba + Fn, SecSeg, 1) Then Exit;
+  HfAdd(Nm, InRoot, Fn, Size, A);
+  HpCopy := True;
+End;
+
+{ Mise en page du volume et structures fixes (avant la copie) }
+Function HpFormat : Boolean;
+Var I : Integer; A : Word;
+Begin
+  HpFormat := False;
+  HpTot := PartSecs;
+  HpNB := (HpTot + HpBand - 1) Div HpBand;
+  { une derniere bande trop petite pour sa bitmap est abandonnee }
+  If (HpNB > 1) And (HpTot - (HpNB - 1) * HpBand < 64) Then
+  Begin
+    Dec(HpNB);
+    HpTot := HpNB * HpBand;
+  End;
+  If HpTot < 8192 Then
+  Begin
+    InstErr := HpErrFull;
+    Exit;
+  End;
+  HpNDir := HpTot Div 512;
+  If HpNDir < 16 Then HpNDir := 16;
+  If HpNDir > 2000 Then HpNDir := 2000;
+  HpDirS := 52;
+  HpDirE := HpDirS + HpNDir * 4 - 1;
+  HpNext := HpDirE + 1;
+  HpGapCnt := 0; HfN := 0; HpDnNext := 1;
+  HpNow := HpUnix(DosDate, DosTime);
+  HpSerial := HpNow Xor (HpTot * 40503);
+  HpInitUp;
+  SetStatus(L('Formatage de C: (HPFS)...', 'Formatting C: (HPFS)...',
+              'C: wird formatiert (HPFS)...', 'Formattazione di C: ' +
+              '(HPFS)...', 'Formateando C: (HPFS)...'));
+  { liste des bitmaps : secteurs 22-25, ou plus loin pour plus de 512
+    bandes (4 Go) }
+  HpListN := ((HpNB * 4 + 2047) Div 2048) * 4;
+  If HpListN <= 4 Then HpList := 22
+  Else
+  Begin
+    HpList := HpTake(HpListN);
+    If HpList < 0 Then Exit;
+  End;
+  { zone systeme a zero (le chargeur est ecrit a la fin) }
+  ZeroSeg(CopySeg, 32768);
+  If Not HdIo(Drv, True, PartLba, CopySeg, HpDirS) Then Exit;
+  { pages de codes (850) }
+  ZeroSeg(SecSeg, 512);
+  PutL(SecSeg, 0, $494521F7); PutL(SecSeg, 4, 1);
+  PutW(SecSeg, 18, 850); PutL(SecSeg, 24, 35);
+  If Not HdIo(Drv, True, PartLba + 34, SecSeg, 1) Then Exit;
+  ZeroSeg(SecSeg, 512);
+  PutL(SecSeg, 0, $894521F7); PutL(SecSeg, 4, 1);
+  PutW(SecSeg, 20, 26); PutW(SecSeg, 28, 850);
+  For A := 128 To 255 Do Mem[SecSeg:32 + A - 128] := HpUp[A];
+  If Not HdIo(Drv, True, PartLba + 35, SecSeg, 1) Then Exit;
+  { superbloc }
+  ZeroSeg(SecSeg, 512);
+  PutL(SecSeg, 0, $F995E849); PutL(SecSeg, 4, $FA53E9C5);
+  Mem[SecSeg:8] := 2;
+  If HpTot > 8388608 Then Mem[SecSeg:9] := 3 Else Mem[SecSeg:9] := 2;
+  PutL(SecSeg, 12, 44); PutL(SecSeg, 16, HpTot);
+  PutL(SecSeg, 24, HpList); PutL(SecSeg, 32, 26);
+  PutL(SecSeg, 48, HpNDir * 4); PutL(SecSeg, 52, HpDirS);
+  PutL(SecSeg, 56, HpDirE); PutL(SecSeg, 60, 45);
+  PutL(SecSeg, 96, 36);
+  If Not HdIo(Drv, True, PartLba + 16, SecSeg, 1) Then Exit;
+  { bloc de reserve }
+  ZeroSeg(SecSeg, 512);
+  PutL(SecSeg, 0, $F9911849); PutL(SecSeg, 4, $FA5229C5);
+  PutL(SecSeg, 12, 30); PutL(SecSeg, 32, 34); PutL(SecSeg, 36, 1);
+  If Not HdIo(Drv, True, PartLba + 17, SecSeg, 1) Then Exit;
+  { fnode de C:\WINDOWS (son dnode est ecrit a la fin) }
+  HpWinFn := HpTake(1);
+  If HpWinFn < 0 Then Exit;
+  HpFormat := True;
+End;
+
+{ Longueur de l'entree K (Hf, ou -1 pour ^A^A) }
+Function HpEntLen(K : Integer) : Integer;
+Begin
+  If K < 0 Then HpEntLen := 36
+  Else HpEntLen := (31 + Length(HfName[K]) + 3) And Not 3;
+End;
+
+{ Ecrire l'entree K du repertoire de fnode Dir en FatBufSeg:P }
+Function HpPutEnt(P : Word; K : Integer; Dir : LongInt) : Word;
+Var L, I : Integer; Nm : String;
+Begin
+  L := HpEntLen(K);
+  For I := 0 To L - 1 Do Mem[FatBufSeg:P + I] := 0;
+  PutW(FatBufSeg, P, L);
+  If K < 0 Then
+  Begin
+    Nm := #1#1;
+    Mem[FatBufSeg:P + 2] := 1;
+    Mem[FatBufSeg:P + 3] := $10;
+    PutL(FatBufSeg, P + 4, Dir);
+  End
+  Else
+  Begin
+    Nm := HfName[K];
+    Mem[FatBufSeg:P + 3] := HfAttr[K];
+    PutL(FatBufSeg, P + 4, HfFn[K]);
+    PutL(FatBufSeg, P + 12, HfSize[K]);
+  End;
+  PutL(FatBufSeg, P + 8, HpNow); PutL(FatBufSeg, P + 16, HpNow);
+  PutL(FatBufSeg, P + 20, HpNow);
+  Mem[FatBufSeg:P + 30] := Length(Nm);
+  For I := 1 To Length(Nm) Do Mem[FatBufSeg:P + 30 + I] := Ord(Nm[I]);
+  HpPutEnt := L;
+End;
+
+Function HbSize(K : Integer) : Integer;
+Begin
+  If HbC[K] >= 0 Then HbSize := HpEntLen(HbE[K]) + 4
+  Else HbSize := HpEntLen(HbE[K]);
+End;
+
+{ Arbre B du repertoire Dir (fnode) aux entrees InRoot, racine Root
+  (dnode) ; meme construction par niveaux que VMM32 }
+Function HpWriteDir(Dir, Root : LongInt; InRoot : Boolean) : Boolean;
+Var I, J, K, K0, NIt, NNd, Lo, Hi, Fin, Lv0, RootNd, Sz, C : Integer;
+    P : Word;
+Begin
+  HpWriteDir := False;
+  { entrees : ^A^A puis les noms tries }
+  NIt := 0;
+  HbE[NIt] := -1; HbC[NIt] := -1; Inc(NIt);
+  For I := 0 To HfN - 1 Do
+    If HfRoot[I] = InRoot Then
+    Begin
+      J := NIt;
+      While (J > 1) And (HfName[HbE[J - 1]] > HfName[I]) Do
+      Begin
+        HbE[J] := HbE[J - 1];
+        Dec(J);
+      End;
+      HbE[J] := I; HbC[NIt] := -1;
+      Inc(NIt);
+    End;
+  NNd := 0; Lo := 0; Hi := NIt; Fin := -1; RootNd := -1;
+  Repeat
+    Lv0 := NNd;
+    K := Lo;
+    While True Do
+    Begin
+      K0 := K; Sz := 0;
+      While (K < Hi) And (Sz + HbSize(K) <= 1992) Do
+      Begin
+        Sz := Sz + HbSize(K);
+        Inc(K);
+      End;
+      If K = K0 Then Inc(K);
+      If Hi - K = 0 Then
+      Begin
+        HbLo[NNd] := K0; HbHi[NNd] := K; HbEnd[NNd] := Fin;
+        Inc(NNd);
+        Break;
+      End;
+      If (Hi - K = 1) And (K - K0 >= 2) Then Dec(K);
+      HbLo[NNd] := K0; HbHi[NNd] := K; HbEnd[NNd] := HbC[K];
+      HbE[NIt] := HbE[K]; HbC[NIt] := NNd;
+      Inc(NIt); Inc(NNd);
+      Inc(K);
+      If K >= Hi Then Break;
+    End;
+    If NNd - Lv0 = 1 Then RootNd := NNd - 1
+    Else
+    Begin
+      Lo := Hi; Hi := NIt; Fin := NNd - 1;
+    End;
+  Until (RootNd >= 0) Or (NNd > 60) Or (NIt > 130);
+  If RootNd < 0 Then Exit;
+  For J := 0 To NNd - 1 Do HbUp[J] := -1;
+  For J := 0 To NNd - 1 Do
+  Begin
+    For K := HbLo[J] To HbHi[J] - 1 Do
+      If HbC[K] >= 0 Then HbUp[HbC[K]] := J;
+    If HbEnd[J] >= 0 Then HbUp[HbEnd[J]] := J;
+  End;
+  For J := 0 To NNd - 1 Do
+    If J = RootNd Then HbSec[J] := Root
+    Else
+    Begin
+      If HpDnNext >= HpNDir Then Exit;
+      HbSec[J] := HpDirS + HpDnNext * 4;
+      Inc(HpDnNext);
+    End;
+  For J := 0 To NNd - 1 Do
+  Begin
+    ZeroSeg(FatBufSeg, 2048);
+    PutL(FatBufSeg, 0, $77E40AAE);
+    If J = RootNd Then
+    Begin
+      Mem[FatBufSeg:8] := 1;
+      PutL(FatBufSeg, 12, Dir);
+    End
+    Else PutL(FatBufSeg, 12, HbSec[HbUp[J]]);
+    PutL(FatBufSeg, 16, HbSec[J]);
+    P := 20;
+    For K := HbLo[J] To HbHi[J] - 1 Do
+    Begin
+      I := HpPutEnt(P, HbE[K], Dir);
+      C := HbC[K];
+      If C >= 0 Then
+      Begin
+        Mem[FatBufSeg:P + 2] := Mem[FatBufSeg:P + 2] Or 4;
+        PutL(FatBufSeg, P + I, HbSec[C]);
+        I := I + 4;
+        PutW(FatBufSeg, P, I);
+      End;
+      P := P + I;
+    End;
+    { entree finale }
+    C := HbEnd[J];
+    Mem[FatBufSeg:P + 30] := 1; Mem[FatBufSeg:P + 31] := $FF;
+    If C >= 0 Then
+    Begin
+      PutW(FatBufSeg, P, 36); Mem[FatBufSeg:P + 2] := 12;
+      PutL(FatBufSeg, P + 32, HbSec[C]);
+      P := P + 36;
+    End
+    Else
+    Begin
+      PutW(FatBufSeg, P, 32); Mem[FatBufSeg:P + 2] := 8;
+      P := P + 32;
+    End;
+    PutL(FatBufSeg, 4, P);
+    If Not HdIo(Drv, True, PartLba + HbSec[J], FatBufSeg, 4) Then Exit;
+  End;
+  HpWriteDir := True;
+End;
+
+{ Marquer les secteurs S0..S1-1 de la bande B (en FatBufSeg) }
+Procedure HpBits(B, S0, S1 : LongInt; Free : Boolean);
+Var S, I : LongInt; V : Byte;
+Begin
+  If S0 < B * HpBand Then S0 := B * HpBand;
+  If S1 > (B + 1) * HpBand Then S1 := (B + 1) * HpBand;
+  S := S0;
+  If Free Then V := $FF Else V := 0;
+  While S < S1 Do
+  Begin
+    I := S - B * HpBand;
+    If ((I And 7) = 0) And (S + 8 <= S1) Then
+    Begin
+      Mem[FatBufSeg:Word(I Shr 3)] := V;
+      S := S + 8;
+    End
+    Else
+    Begin
+      If Free Then
+        Mem[FatBufSeg:Word(I Shr 3)] := Mem[FatBufSeg:Word(I Shr 3)] Or
+                                         (1 Shl (I And 7))
+      Else
+        Mem[FatBufSeg:Word(I Shr 3)] := Mem[FatBufSeg:Word(I Shr 3)] And
+                                         Not (1 Shl (I And 7));
+      Inc(S);
+    End;
+  End;
+End;
+
+{ Repertoires, bitmaps, fnodes des repertoires et amorce }
+Function HpFinish : Boolean;
+Var B, Bs, I, N : LongInt; J : Integer; Tx : String;
+Begin
+  HpFinish := False;
+  SetStatus(L(''#144'criture des r'#130'pertoires et des bitmaps...',
+              'Writing directories and bitmaps...',
+              'Verzeichnisse und Bitmaps werden geschrieben...',
+              'Scrittura di directory e bitmap...',
+              'Escribiendo directorios y mapas de bits...'));
+  HfAdd('WINDOWS', True, HpWinFn, 0, $10);
+  If Not HpWriteDir(44, HpDirS, True) Then Exit;
+  N := HpDirS + HpDnNext * 4;                    { dnode de C:\WINDOWS }
+  If HpDnNext >= HpNDir Then Exit;
+  Inc(HpDnNext);
+  If Not HpWriteDir(HpWinFn, N, False) Then Exit;
+  HpFnode('', 44, HpDirS, 4, 0, True);
+  If Not HdIo(Drv, True, PartLba + 44, SecSeg, 1) Then Exit;
+  HpFnode('WINDOWS', 44, N, 4, 0, True);
+  If Not HdIo(Drv, True, PartLba + HpWinFn, SecSeg, 1) Then Exit;
+  { bitmaps des bandes (bit a 1 = secteur libre) et leur liste }
+  ZeroSeg(CopySeg, 32768);
+  For B := 0 To HpNB - 1 Do
+  Begin
+    PutL(CopySeg, Word(B * 4 Mod 32768), HpBmpSec(B));
+    ZeroSeg(FatBufSeg, 2048);
+    HpBits(B, 49, HpDirS, True);
+    HpBits(B, HpNext, HpTot, True);
+    For J := 0 To HpGapCnt - 1 Do HpBits(B, HpGapS[J], HpGapE[J], True);
+    For I := 1 To HpNB - 1 Do
+    Begin
+      Bs := HpBmpSec(I);
+      HpBits(B, Bs, Bs + 4, False);
+    End;
+    If Not HdIo(Drv, True, PartLba + HpBmpSec(B), FatBufSeg, 4) Then Exit;
+    { liste : par blocs de 32 Ko }
+    If (B Mod 8192 = 8191) Or (B = HpNB - 1) Then
+    Begin
+      I := (B Div 8192) * 64;
+      If Not HdIo(Drv, True, PartLba + HpList + I, CopySeg,
+                  Min(64, HpListN - I)) Then Exit;
+      ZeroSeg(CopySeg, 32768);
+    End;
+  End;
+  { bitmap de la bande des repertoires : bit a 1 = dnode libre }
+  ZeroSeg(FatBufSeg, 2048);
+  For I := HpDnNext To HpNDir - 1 Do
+    Mem[FatBufSeg:Word(I Shr 3)] := Mem[FatBufSeg:Word(I Shr 3)] Or
+                                     (1 Shl (I And 7));
+  If Not HdIo(Drv, True, PartLba + 45, FatBufSeg, 4) Then Exit;
+  { secteur d'amorce (BPB) et chargeur (secteurs 0 a 15) }
+  ZeroSeg(CopySeg, 8192);
+  Mem[CopySeg:0] := $EB; Mem[CopySeg:1] := $3C; Mem[CopySeg:2] := $90;
+  Tx := 'PASDOWS ';
+  For J := 1 To 8 Do Mem[CopySeg:2 + J] := Ord(Tx[J]);
+  PutW(CopySeg, 11, 512); Mem[CopySeg:13] := 1;
+  If HpTot < 65536 Then PutW(CopySeg, 19, HpTot)
+  Else PutL(CopySeg, 32, HpTot);
+  Mem[CopySeg:21] := $F8;
+  PutW(CopySeg, 24, DiskSpt[DiskSel]); PutW(CopySeg, 26, DiskHeads[DiskSel]);
+  PutL(CopySeg, 28, PartLba);
+  Mem[CopySeg:36] := $80; Mem[CopySeg:38] := $28;
+  PutL(CopySeg, 39, HpSerial);
+  Tx := 'PASDOWS    HPFS    ';
+  For J := 1 To 19 Do Mem[CopySeg:42 + J] := Ord(Tx[J]);
+  For J := 0 To 1016 Do Mem[CopySeg:62 + J] := HpBootCode[J];
+  MemW[CopySeg:510] := $AA55;
+  If Not HdIo(Drv, True, PartLba, CopySeg, 16) Then Exit;
+  HpFinish := True;
+End;
+
+{ Installation sur HPFS : formatage, fichiers, puis repertoires }
+Procedure DoInstallHpfs;
+Var I, Ix : Integer; N : String;
+Begin
+  If Not HpFormat Then
+  Begin
+    If InstErr = '' Then InstErr := DiskErr;
+    Exit;
+  End;
+  If Not HpCopy(CdFind('IO.SYS'), 'IO.SYS', True, $07) Then
+  Begin
+    If InstErr = '' Then InstErr := DiskErr;
+    Exit;
+  End;
+  GenMsdosSys;
+  If Not HpCopy(-1, 'MSDOS.SYS', True, $07) Then
+  Begin
+    If InstErr = '' Then InstErr := DiskErr;
+    Exit;
+  End;
+  GenConfigSys;
+  If Not HpCopy(-1, 'CONFIG.SYS', True, $20) Then
+  Begin
+    If InstErr = '' Then InstErr := DiskErr;
+    Exit;
+  End;
+  GenAutoexec;
+  If Not HpCopy(-1, 'AUTOEXEC.BAT', True, $20) Then
+  Begin
+    If InstErr = '' Then InstErr := DiskErr;
+    Exit;
+  End;
+  Ix := CdFind('COMMAND.EXE');
+  If Ix >= 0 Then
+    If Not HpCopy(Ix, 'COMMAND.EXE', True, $20) Then
+    Begin
+      If InstErr = '' Then InstErr := DiskErr;
+      Exit;
+    End;
+  For I := 0 To CdCount - 1 Do
+  Begin
+    N := CdFiles[I].Name;
+    If Not CdFiles[I].Dir And WantFile(N) And (N <> 'IO.SYS') And
+       (N <> 'COMMAND.EXE') Then
+      If Not HpCopy(I, N, False, $20) Then
+      Begin
+        If InstErr = '' Then InstErr := DiskErr;
+        Exit;
+      End;
+  End;
+  If Not HpFinish Then
+  Begin
+    InstErr := DiskErr;
+    Exit;
+  End;
+  SaveCmos;
+  DoneBytes := TotalBytes;
+  SetStatus(L('Installation termin'#130'e.', 'Setup is complete.',
+              'Installation abgeschlossen.', 'Installazione completata.',
+              'Instalaci'#162'n completada.'));
+End;
+
 Procedure DoInstall;
 Var I, Ix : Integer; RootC, WinC, RootK, WinK, Free0 : LongInt;
     H, M, S, Y, Mo, D : Integer; N : String;
@@ -4368,6 +5042,11 @@ Begin
   If FsKind = 2 Then
   Begin
     DoInstallNtfs;
+    Exit;
+  End;
+  If FsKind = 3 Then
+  Begin
+    DoInstallHpfs;
     Exit;
   End;
   Fat16 := FsKind = 0;
@@ -4630,7 +5309,7 @@ Begin
       End
       Else
         For I := 0 To FsCount - 1 Do
-          If InRect(X, Y, CX1 + 18 + I * 90, Yo + 106, CX1 + 100 + I * 90,
+          If InRect(X, Y, CX1 + 18 + I * 80, Yo + 106, CX1 + 94 + I * 80,
                     Yo + 122) Then
           Begin
             FsKind := I;
