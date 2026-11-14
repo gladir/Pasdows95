@@ -110,7 +110,7 @@ Const
   { Sortes d'objets du noyau }
   koFile      = 1;  koFind = 2;   koThread = 3; koEvent = 4;
   koSemaphore = 5;  koMutex = 6;  koProcess = 7; koConsole = 8;
-  koMapping   = 9;
+  koMapping   = 9;  koSnapshot = 10;
 
   { Sortes d'objets GDI }
   goPen = 1; goBrush = 2; goFont = 3; goBitmap = 4; goPalette = 5;
@@ -152,6 +152,11 @@ Var
   SliceStart : LongInt;          { debut de la tranche de temps }
   KImgLo, KImgHi : LongInt;      { image du noyau (jamais preemptee) }
   Ticks      : LongInt;          { millisecondes depuis le demarrage }
+  { temps processeur, compte a chaque milliseconde par l'horloge }
+  InIdle     : Boolean;          { processeur arrete (HLT) en attente }
+  IdleMs, BusyMs : LongInt;
+  { carte reseau : octets et trames envoyes et recus }
+  NicTxB, NicTxP, NicRxB, NicRxP : LongInt;
   { ecran : mode VESA choisi par IO.SYS ou par le Panneau de
     configuration (Affichage) ; ScrBpp : 4 (VGA 16 couleurs, plans),
     8 (256 couleurs) ou 15, 16, 24, 32 (couleurs directes) }
@@ -540,6 +545,21 @@ Begin
   HeapRover := HeapStart;
 End;
 
+Function HeapOwnerBytes(Owner : LongInt) : LongInt;
+Var P, BS, T : LongInt;
+Begin
+  T := 0;
+  P := HeapStart;
+  While P < HeapEnd Do
+  Begin
+    BS := MemL[0:P + 4];
+    If BS <= 0 Then Break;
+    If (MemL[0:P] = HeapUsed) And (MemL[0:P + 8] = Owner) Then T := T + BS;
+    P := P + BS;
+  End;
+  HeapOwnerBytes := T;
+End;
+
 Function HeapFreeBytes : LongInt;
 Var P, BS, T : LongInt;
 Begin
@@ -676,10 +696,12 @@ Begin
 End;
 
 Procedure TimerTail; Forward;
+Procedure CpuTick; Forward;
 
 Procedure IrqTimer; Interrupt;
 Begin
   Inc(Ticks);
+  CpuTick;
   Port[$20] := $20;
   If PreemptOn Then TimerTail;
 End;
@@ -794,10 +816,12 @@ End;
 
 Procedure Idle;
 Begin
+  InIdle := True;
   asm
     sti
     hlt
   end;
+  InIdle := False;
 End;
 
 Procedure KDelay(Ms : LongInt);
@@ -10110,6 +10134,29 @@ Var
   AppMainT  : LongInt;
   AppConsole : Boolean;                  { programme du sous-systeme console }
 
+Var
+  ThrCpu   : Array[0..MaxThread - 1] Of LongInt;   { ms de la tache }
+  ProcsOk  : Boolean;
+  PeakCommit : LongInt;
+
+{ Une milliseconde de l'horloge : au repos, ou a la tache courante et a
+  son processus (le processus 0 compte le noyau et le bureau) }
+Procedure CpuTick;
+Var P : LongInt;
+Begin
+  If InIdle Then
+  Begin
+    Inc(IdleMs);
+    Exit;
+  End;
+  Inc(BusyMs);
+  If (CurT < 0) Or (CurT >= MaxThread) Then Exit;
+  Inc(ThrCpu[CurT]);
+  P := ThrProc[CurT];
+  If ProcsOk And (P >= 0) And (P < MaxProc) Then
+    Procs^[P].CpuMs := Procs^[P].CpuMs + 1;
+End;
+
 Procedure ProcCtxSave(P : LongInt);
 Begin
   If (P < 0) Or (P >= MaxProc) Then Exit;
@@ -10476,6 +10523,7 @@ Begin
   Threads[T].IsApp := IsApp;
   ThrOwner[T] := Ord(IsApp);
   ThrProc[T] := 0; ThrCurP[T] := 0; ThrPxD[T] := 0;
+  ThrCpu[T] := 0;
   If IsApp And (CurProc > 0) Then
   Begin
     { tache d'un programme : celle de son processus }
@@ -11025,6 +11073,121 @@ Begin
   TopOf := W;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Menus Win32 : elements, barre de menus des fenetres                }
+{ ------------------------------------------------------------------ }
+
+Const
+  MF_POPUP = $10; MF_SEPARATOR = $800; MF_BYPOSITION = $400;
+  MF_CHECKED = 8; MF_GRAYED = 1; MF_DISABLED = 2;
+  mnW32 = 1000;                  { menus du noyau : mnW32 + menu Win32 }
+  cmW32Base = 100000;            { commande : cmW32Base + element }
+
+Type
+  TMenuItemR = Record
+    Used  : Boolean;
+    Menu  : LongInt;
+    Flags : LongInt;
+    Id    : LongInt;
+    Seq   : LongInt;
+    Text  : String[63];
+  End;
+  TMItemArr = Array[0..MaxMenuItem - 1] Of TMenuItemR;
+  PMItemArr = ^TMItemArr;
+
+Var
+  MenuUsed  : Array[0..MaxMenu - 1] Of Boolean;
+  { elements de menu : dans le tas (l'image du noyau doit finir sous
+    00400000h, adresse de chargement des programmes Win32) }
+  MItemsP   : PMItemArr;
+  MSeq      : LongInt;
+  MenuOwnerW : LongInt;          { fenetre qui recoit WM_COMMAND }
+  MBarW, MBarOpen : LongInt;     { barre de menus deroulee (element) }
+  MBarTogW, MBarTog : LongInt;   { menu ferme par le clic courant }
+  TrackOn : Boolean;             { TrackPopupMenu en attente }
+  TrackRes : LongInt;            { commande choisie }
+
+Function MenuIdx(H : LongInt) : LongInt;
+Begin
+  If (H >= HMenuBase) And (H < HMenuBase + MaxMenu * 4) And
+     MenuUsed[(H - HMenuBase) Div 4] Then MenuIdx := (H - HMenuBase) Div 4
+  Else MenuIdx := -1;
+End;
+
+{ N-ieme element d'un menu (par position) ; -1 si absent }
+Function MItemAt(M, Pos0 : LongInt) : LongInt;
+Var I, J, Best, BS, Last : LongInt;
+Begin
+  MItemAt := -1;
+  Last := -1;
+  For J := 0 To Pos0 Do
+  Begin
+    Best := -1; BS := $7FFFFFFF;
+    For I := 0 To MaxMenuItem - 1 Do
+      If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+         (MItemsP^[I].Seq > Last)
+         And (MItemsP^[I].Seq < BS) Then
+      Begin
+        Best := I; BS := MItemsP^[I].Seq;
+      End;
+    If Best < 0 Then Exit;
+    Last := BS;
+    MItemAt := Best;
+  End;
+End;
+
+{ Elements d'un menu, dans l'ordre (rend leur nombre) }
+Function MItemList(M : LongInt; Var L : Array Of LongInt) : LongInt;
+Var I, J, K, N, T : LongInt;
+Begin
+  N := 0;
+  For I := 0 To MaxMenuItem - 1 Do
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And (N <= High(L)) Then
+    Begin
+      L[N] := I;
+      Inc(N);
+    End;
+  For I := 1 To N - 1 Do
+  Begin
+    T := L[I]; J := I;
+    While (J > 0) And (MItemsP^[L[J - 1]].Seq > MItemsP^[T].Seq) Do
+    Begin
+      L[J] := L[J - 1];
+      Dec(J);
+    End;
+    L[J] := T;
+  End;
+  MItemList := N;
+  K := 0;
+End;
+
+{ Texte affiche d'un element : sans les '&' (un '&&' donne '&') }
+Function MText(I : LongInt) : String;
+Var S, R : String; K : LongInt;
+Begin
+  S := MItemsP^[I].Text;
+  R := '';
+  K := 1;
+  While K <= Length(S) Do
+  Begin
+    If S[K] = '&' Then Inc(K);
+    If K <= Length(S) Then R := R + S[K];
+    Inc(K);
+  End;
+  MText := R;
+End;
+
+{ La fenetre d'un programme a une barre de menus (menu non vide) }
+Function HasMenuBar(W : LongInt) : Boolean;
+Var M : LongInt;
+Begin
+  HasMenuBar := False;
+  If (W < 0) Or IsChildW(W) Or (Wnds^[W].IKind <> ikNone) Then Exit;
+  M := MenuIdx(Wnds^[W].Menu);
+  If M < 0 Then Exit;
+  HasMenuBar := MItemAt(M, 0) >= 0;
+End;
+
 { Metriques du cadre selon le style }
 Procedure CalcNc(W : LongInt);
 Var B, T : LongInt;
@@ -11037,6 +11200,7 @@ Begin
   If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then B := B + 2;
   T := B;
   If (Wnds^[W].Style And WS_CAPTION) = WS_CAPTION Then T := T + 19;
+  If HasMenuBar(W) Then T := T + 20;
   Wnds^[W].CL := B; Wnds^[W].CT := T;
   Wnds^[W].CR := Max(B, Wnds^[W].W - B);
   Wnds^[W].CB := Max(T, Wnds^[W].H - B);
@@ -11267,6 +11431,68 @@ Begin
   X1 := X2 - 15;
 End;
 
+{ Ligne superieure de la barre de menus (dans la fenetre) }
+Function MBarY(W : LongInt) : LongInt;
+Begin
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then
+    MBarY := Wnds^[W].CT - 22
+  Else MBarY := Wnds^[W].CT - 20;
+End;
+
+{ Element de la barre de menus sous (OX, OY) (coord. dans la fenetre) ;
+  IX : bord gauche de l'element }
+Function MBarHit(W, OX, OY : LongInt; Var IX : LongInt) : LongInt;
+Var L : Array[0..31] Of LongInt; N, I, X, Y, TW, Bd : LongInt;
+Begin
+  MBarHit := -1;
+  Y := MBarY(W);
+  If (OY < Y) Or (OY >= Y + 19) Then Exit;
+  Bd := Wnds^[W].CL;
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then Bd := Bd - 2;
+  N := MItemList(MenuIdx(Wnds^[W].Menu), L);
+  X := Bd + 1;
+  For I := 0 To N - 1 Do
+  Begin
+    TW := TextW(MText(L[I])) + 16;
+    If X + TW > Wnds^[W].W - Bd Then
+    Begin
+      X := Bd + 1;
+    End;
+    If (OX >= X) And (OX < X + TW) Then
+    Begin
+      MBarHit := L[I];
+      IX := X;
+      Exit;
+    End;
+    X := X + TW;
+  End;
+End;
+
+Procedure NcMenuBar(W, X0, Y0, Bd : LongInt);
+Var L : Array[0..31] Of LongInt; N, I, X, Y, TW, C : LongInt; T : String;
+Begin
+  Y := Y0 + MBarY(W);
+  FBar(X0 + Bd, Y, X0 + Wnds^[W].W - Bd - 1, Y + 19, cSilver);
+  N := MItemList(MenuIdx(Wnds^[W].Menu), L);
+  X := X0 + Bd + 1;
+  For I := 0 To N - 1 Do
+  Begin
+    T := MText(L[I]);
+    TW := TextW(T) + 16;
+    If X + TW > X0 + Wnds^[W].W - Bd Then Break;
+    If (MBarW = W) And (MBarOpen = L[I]) Then
+      Edge(X, Y + 1, X + TW - 1, Y + 18, cGray, cWhite);
+    If (MItemsP^[L[I]].Flags And 3) <> 0 Then
+    Begin
+      OutTxt(X + 9, Y + 3, T, cWhite);
+      C := cGray;
+    End
+    Else C := cBlack;
+    OutTxt(X + 8, Y + 2, T, C);
+    X := X + TW;
+  End;
+End;
+
 Procedure NcPaint(W : LongInt);
 Var Bd, X0, Y0, WW, HH, B, I, X1, Y1, X2, Y2, D : LongInt;
     Active : Boolean; Fg, C : LongInt; T : String;
@@ -11292,6 +11518,7 @@ Begin
       Box(X0 + I, Y0 + I, X0 + WW - 1 - I, Y0 + HH - 1 - I, cSilver);
   End
   Else If Bd = 1 Then Box(X0, Y0, X0 + WW - 1, Y0 + HH - 1, cBlack);
+  If HasMenuBar(W) Then NcMenuBar(W, X0, Y0, Bd);
   If (Wnds^[W].Style And WS_CAPTION) = WS_CAPTION Then
   Begin
     Active := (W = ActiveWin);
@@ -12032,6 +12259,10 @@ End;
 
 Function ModalBlocked(T : LongInt) : Boolean; Forward;
 
+Procedure CloseMenus(Lv : LongInt); Forward;
+Procedure MBarClick(W, It, IX : LongInt); Forward;
+Procedure W32MenuPick(K : LongInt); Forward;
+
 Procedure MouseButton(Down : Boolean; Btn : LongInt);
 Var T, W, B, X1, Y1, X2, Y2, Msg, OX, OY : LongInt; Dbl : Boolean;
 Begin
@@ -12086,6 +12317,13 @@ Begin
     Else KMouse(-1, WM_LBUTTONUP + 3 * (Btn - 1), CurX, CurY);
     Exit;
   End;
+  { un clic dans la fenetre d'un programme ferme les menus ouverts }
+  MBarTog := -1;
+  If Down And (MenuDepth > 0) And (Wnds^[T].IKind = ikNone) Then
+  Begin
+    MBarTog := MBarOpen; MBarTogW := MBarW;
+    CloseMenus(0);
+  End;
   If Down And ModalBlocked(T) Then
   Begin
     KBeep;
@@ -12098,6 +12336,15 @@ Begin
      Not InRect(OX, OY, Wnds^[T].CL, Wnds^[T].CT, Wnds^[T].CR - 1,
                 Wnds^[T].CB - 1) Then
   Begin
+    If HasMenuBar(T) Then
+    Begin
+      B := MBarHit(T, OX, OY, X1);
+      If B >= 0 Then
+      Begin
+        MBarClick(T, B, X1);
+        Exit;
+      End;
+    End;
     For B := 0 To CapButtonCount(T) - 1 Do
     Begin
       CapBtnRect(T, B, X1, Y1, X2, Y2);
@@ -12204,6 +12451,8 @@ End;
 { Clavier (tache 0)                                                  }
 { ------------------------------------------------------------------ }
 
+Function RunExe(Path, Args : String) : Boolean; Forward;
+
 Procedure KeyEvent(Sc : LongInt; Up, Ext : Boolean);
 Var Vk, Lp, Msg, W, Ch : LongInt; Alt : Boolean;
 Begin
@@ -12223,7 +12472,15 @@ Begin
   Ch := 0;
   If Not Up Then Ch := ScanToChar(Sc);
   KeyScan := Sc; KeyExt := Ext;
-  { raccourcis du systeme }
+  { raccourcis du systeme : Ctrl+Alt+Suppr et Ctrl+Maj+Echap ouvrent le
+    Gestionnaire des taches (comme Windows XP) }
+  If Not Up And ((KeyState[$11] And $80) <> 0) And
+     (((Vk = $2E) And Alt) Or ((Vk = $1B) And
+      ((KeyState[$10] And $80) <> 0))) Then
+  Begin
+    RunExe('TASKMGR.EXE', '');
+    Exit;
+  End;
   If Not Up Then
   Begin
     KKey(-1, WM_KEYDOWN, Vk, Ch);
@@ -12467,7 +12724,7 @@ Const
   cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
   cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
-  cmSysProps = 22; cmPaint = 23;
+  cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -12485,7 +12742,7 @@ Const
   mnDesk = 5; mnArrange = 6; mnColors = 7; mnIcon = 8;
   mnMonths = 9; mnTz = 10; mnVolCtx = 11;
   mnNFile = 12; mnNEdit = 13; mnNSearch = 14; mnNHelp = 15;
-  mnFdDrives = 16; mnFdTypes = 17;
+  mnFdDrives = 16; mnFdTypes = 17; mnTaskCtx = 18;
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -12579,7 +12836,6 @@ Var
   ExeCnt    : LongInt;
   NoteBuf   : LongInt;
 
-Function RunExe(Path, Args : String) : Boolean; Forward;
 Procedure KCommand(Cmd : LongInt); Forward;
 Procedure NetConfigBox; Forward;
 Function NetRunCmd(S : String) : Boolean; Forward;
@@ -12921,7 +13177,6 @@ Begin
 End;
 
 Procedure OpenStartMenu; Forward;
-Procedure CloseMenus(Lv : LongInt); Forward;
 
 Procedure VolPopOpen; Forward;
 
@@ -12952,6 +13207,14 @@ Begin
         VolPopOpen;
       End;
     End;
+    Exit;
+  End;
+  { clic droit sur la barre : Reduire toutes les fenetres, Gestionnaire
+    des taches }
+  If Msg = WM_RBUTTONDOWN Then
+  Begin
+    CloseMenus(0);
+    OpenMenu(0, mnTaskCtx, X, TaskY, True);
     Exit;
   End;
   If Msg <> WM_LBUTTONDOWN Then Exit;
@@ -13189,14 +13452,20 @@ Begin
 End;
 
 Function MenuCount(M : LongInt) : LongInt;
-Var N : LongInt; S : String;
+Var N : LongInt; S : String; L : Array[0..63] Of LongInt;
 Begin
+  If M >= mnW32 Then
+  Begin
+    MenuCount := MItemList(M - mnW32, L);
+    Exit;
+  End;
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 5 + ExeCnt;
     mnSettings : MenuCount := 7;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
+    mnTaskCtx : MenuCount := 2;
     mnNFile : MenuCount := 9;
     mnNEdit : MenuCount := 10;
     mnNSearch : MenuCount := 2;
@@ -13222,8 +13491,25 @@ End;
 
 Procedure MenuItem(M, I : LongInt; Var T : String;
                    Var Cmd, Sub, Icon : LongInt);
+Var K, F : LongInt;
 Begin
   T := '-'; Cmd := cmNone; Sub := 0; Icon := 0;
+  If M >= mnW32 Then
+  Begin
+    K := MItemAt(M - mnW32, I);
+    If K < 0 Then Exit;
+    F := MItemsP^[K].Flags;
+    If (F And MF_SEPARATOR) <> 0 Then Exit;
+    T := MText(K);
+    If (T = '') Or (T = '-') Then T := ' ';
+    If (F And 3) <> 0 Then Cmd := cmGray Else Cmd := cmW32Base + K;
+    If (F And MF_POPUP) <> 0 Then
+    Begin
+      Sub := MenuIdx(MItemsP^[K].Id);
+      If Sub >= 0 Then Sub := mnW32 + Sub Else Sub := 0;
+    End;
+    Exit;
+  End;
   Case M Of
     mnStart :
       Case I Of
@@ -13500,6 +13786,20 @@ Begin
                'Regola propriet'#133' audio', 'Ajustar propiedades de audio');
         Cmd := cmAudioProps;
       End;
+    mnTaskCtx :
+      If I = 0 Then
+      Begin
+        T := L('R'#130'duire toutes les fen'#136'tres', 'Minimize All Windows',
+               'Alle Fenster minimieren', 'Riduci a icona tutte le finestre',
+               'Minimizar todas las ventanas');
+        Cmd := cmMinAll;
+      End
+      Else
+      Begin
+        T := L('Gestionnaire des t'#131'ches', 'Task Manager', 'Task-Manager',
+               'Task Manager', 'Administrador de tareas');
+        Cmd := cmTaskMgr;
+      End;
     mnMonths :
       Begin
         T := MonthName(I + 1);
@@ -13585,6 +13885,13 @@ Begin
   For I := MenuDepth - 1 DownTo Lv Do
     If (MenuW[I] >= 0) And Wnds^[MenuW[I]].Used Then DestroyW(MenuW[I]);
   If MenuDepth > Lv Then MenuDepth := Lv;
+  If Lv = 0 Then
+  Begin
+    { barre de menus d'un programme : plus d'element enfonce }
+    If (MBarW >= 0) And Wnds^[MBarW].Used Then Wnds^[MBarW].NeedNc := True;
+    MBarW := -1; MBarOpen := -1;
+    TrackOn := False;
+  End;
   TaskbarChanged;
 End;
 
@@ -13615,7 +13922,7 @@ Begin
 End;
 
 Procedure PaintMenu(W : LongInt);
-Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH, K : LongInt;
+Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH, K, J : LongInt;
     T, A : String;
 Begin
   X := Wnds^[W].X; Y := Wnds^[W].Y; WW := Wnds^[W].W; HH := Wnds^[W].H;
@@ -13654,6 +13961,18 @@ Begin
       Begin
         If M = mnStart Then PaintIcon(Ic, TX, YY + 4, 24)
         Else PaintIcon(Ic, TX, YY + 2, 16);
+      End;
+      { coche d'un element de menu d'un programme }
+      If M >= mnW32 Then
+      Begin
+        K := MItemAt(M - mnW32, I);
+        If (K >= 0) And ((MItemsP^[K].Flags And MF_CHECKED) <> 0) Then
+          For J := 0 To 2 Do
+          Begin
+            VLine(TX + 4 + J, YY + 8 + J, YY + 10 + J, Fg);
+            VLine(TX + 7 + J, YY + 10 - J, YY + 12 - J, Fg);
+            VLine(TX + 10 + J, YY + 7 - J, YY + 9 - J, Fg);
+          End;
       End;
       K := Pos(#9, T);
       If K > 0 Then
@@ -13722,12 +14041,45 @@ Begin
     End;
     Exit;
   End;
-  If Msg = WM_LBUTTONUP Then
+  If (Msg = WM_LBUTTONUP) Or (Msg = WM_RBUTTONUP) Then
   Begin
     If (Sub <> 0) Or (Cmd = cmGray) Then Exit;
+    If Cmd >= cmW32Base Then
+    Begin
+      W32MenuPick(Cmd - cmW32Base);
+      CloseMenus(0);
+      Exit;
+    End;
+    If Msg = WM_RBUTTONUP Then Exit;
     CloseMenus(0);
     If Cmd <> cmNone Then KCommand(Cmd);
   End;
+End;
+
+{ Clic sur l'element It de la barre de menus de W (IX : son bord) }
+Procedure MBarClick(W, It, IX : LongInt);
+Var S : LongInt;
+Begin
+  If (MBarTogW = W) And (MBarTog = It) Then
+  Begin
+    { second clic sur le menu deroule : il reste ferme }
+    MBarTog := -1;
+    Exit;
+  End;
+  CloseMenus(0);
+  If (MItemsP^[It].Flags And 3) <> 0 Then Exit;
+  MenuOwnerW := W;
+  If (MItemsP^[It].Flags And MF_POPUP) = 0 Then
+  Begin
+    W32MenuPick(It);
+    Exit;
+  End;
+  S := MenuIdx(MItemsP^[It].Id);
+  If S < 0 Then Exit;
+  OpenMenu(0, mnW32 + S, Wnds^[W].X + IX, Wnds^[W].Y + MBarY(W) + 19,
+           False);
+  MBarW := W; MBarOpen := It;
+  Wnds^[W].NeedNc := True;
 End;
 
 { ------------------------------------------------------------------ }
@@ -13810,7 +14162,8 @@ Begin
   WW := 420;
   W := KCreate(ikMsgBox, Title, icLogo, (ScrW - WW) Div 2,
                (TaskY - (110 + N * 16)) Div 2, WW, 110 + N * 16,
-               WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+               WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+               WS_EX_DLGMODALFRAME Or WS_EX_TOPMOST);
   If W >= 0 Then
   Begin
     Wnds^[W].KS := Text;
@@ -18035,7 +18388,7 @@ Begin
 End;
 
 Procedure KCommand(Cmd : LongInt);
-Var W : LongInt; Nm : String;
+Var W, I : LongInt; Nm : String;
 Begin
   If (Cmd >= cmColorBase) And (Cmd < cmColorBase + 64) Then
   Begin
@@ -18079,6 +18432,12 @@ Begin
     cmDisplay : DispOpen;
     cmDateTime : DtOpen;
     cmMixer : MixerOpen;
+    cmTaskMgr : RunExe('TASKMGR.EXE', '');
+    cmMinAll :
+      For I := 0 To MaxWnd - 1 Do
+        If Wnds^[I].Used And Wnds^[I].Visible And Not IsChildW(I) And
+           (Wnds^[I].IKind <> ikTaskbar) And (Wnds^[I].IKind <> ikMenu) And
+           ((Wnds^[I].Style And WS_CAPTION) = WS_CAPTION) Then MinimizeW(I);
     cmSysProps : SysOpen;
     cmAudioProps : AudioOpen;
     cmAlign : MarkAll;
@@ -18586,8 +18945,25 @@ Begin
   Dec(ConQLen);
 End;
 
-Procedure KKey(W, Msg, VK, Ch : LongInt);
+{ Bouton par defaut (BS_DEFPUSHBUTTON) ou d'annulation (IDCANCEL)
+  d'une fenetre de premier niveau ; -1 si aucun }
+Function DefBtnOf(T : LongInt; Cancel : Boolean) : LongInt;
 Var I : LongInt;
+Begin
+  DefBtnOf := -1;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And (Wnds^[I].IKind = ikButton) And IsChildW(I) And
+       Wnds^[I].Visible And Wnds^[I].Enabled And (TopOf(I) = T) Then
+      If (Cancel And (Wnds^[I].Id = IDCANCEL)) Or
+         (Not Cancel And ((Wnds^[I].Style And $F) = 1)) Then
+      Begin
+        DefBtnOf := I;
+        Exit;
+      End;
+End;
+
+Procedure KKey(W, Msg, VK, Ch : LongInt);
+Var I, K : LongInt;
 Begin
   If W = -1 Then
   Begin
@@ -18650,6 +19026,16 @@ Begin
       PostMsgW(I, WM_COMMAND, IDOK, 0)
     Else If (VK = $1B) And (Wnds^[I].IKind = ikDialog) Then
       PostMsgW(I, WM_COMMAND, IDCANCEL, 0)
+    Else If ((VK = $0D) Or (VK = $1B)) And (Wnds^[I].IKind = ikNone) And
+            ((Wnds^[W].IKind <> ikEdit) Or
+             ((Wnds^[W].Style And $1004) = 0)) And
+            (DefBtnOf(I, VK = $1B) >= 0) Then
+    Begin
+      { fenetre d'un programme : Entree = bouton par defaut,
+        Echap = bouton Annuler (comme le gestionnaire de dialogues) }
+      K := DefBtnOf(I, VK = $1B);
+      PostMsgW(Wnds^[K].Parent, WM_COMMAND, Wnds^[K].Id And $FFFF, 0);
+    End
     Else If (Ch <> 0) And (Wnds^[W].IKind = ikEdit) Then
       KWndProc(W, WM_CHAR, Ch, 0);
     Exit;
@@ -20161,6 +20547,8 @@ Begin
   End;
   { objet processus : garde (autres poignees, code de sortie) }
   If KObjs^[I].Kind = koProcess Then Exit;
+  If (KObjs^[I].Kind = koSnapshot) And (KObjs^[I].F4 <> 0) Then
+    KFree(KObjs^[I].F4);
   { synchronisation et mappages : une reference de moins }
   If KObjs^[I].Kind In [koEvent, koSemaphore, koMutex, koMapping] Then
   Begin
@@ -24881,21 +25269,8 @@ End;
 Const
   HDesktop = HWndBase - 4;
   KProcToken = $7FFF0000;
-  MF_POPUP = $10; MF_SEPARATOR = $800; MF_BYPOSITION = $400;
-  MF_CHECKED = 8; MF_GRAYED = 1; MF_DISABLED = 2;
 
 Type
-  TMenuItemR = Record
-    Used  : Boolean;
-    Menu  : LongInt;
-    Flags : LongInt;
-    Id    : LongInt;
-    Seq   : LongInt;
-    Text  : String[63];
-  End;
-  TMItemArr = Array[0..MaxMenuItem - 1] Of TMenuItemR;
-  PMItemArr = ^TMItemArr;
-
   TCursorR = Record
     Used : Boolean;
     HX, HY : LongInt;
@@ -24903,11 +25278,6 @@ Type
   End;
 
 Var
-  MenuUsed  : Array[0..MaxMenu - 1] Of Boolean;
-  { elements de menu : dans le tas (l'image du noyau doit finir sous
-    00400000h, adresse de chargement des programmes Win32) }
-  MItemsP   : PMItemArr;
-  MSeq      : LongInt;
   Cursors   : Array[0..31] Of TCursorR;
   AppCursor : LongInt;
 
@@ -25093,6 +25463,10 @@ Begin
   End;
   If (Name > 0) And (Name < $10000) Then Nm := ''
   Else Nm := PStr(Name);
+  { menu de la classe (lpszMenuName) }
+  If ((Style And WS_CHILD) = 0) And (Menu = 0) And
+     (Classes^[C].MenuName <> 0) Then
+    Menu := LoadMenuA(Inst, Classes^[C].MenuName);
   R := CreateW(Ex, C, Nm, Style, X, Y, W, H, P, Menu, Inst, Param);
   If (R >= 0) And Not IsChildW(R) Then
     KLog('Fenetre ' + HexStr(HwndOf(R), 8) + ' ' + Classes^[C].Name + ' "' +
@@ -25446,6 +25820,7 @@ Begin
   If (Ex And WS_EX_CLIENTEDGE) <> 0 Then B := B + 2;
   T := B;
   If (Style And WS_CAPTION) = WS_CAPTION Then T := T + 19;
+  If Menu Then T := T + 20;
 End;
 
 Function AdjustWindowRectEx(P, Style, Menu, Ex : LongInt) : LongInt;
@@ -27481,13 +27856,6 @@ Begin
     End;
 End;
 
-Function MenuIdx(H : LongInt) : LongInt;
-Begin
-  If (H >= HMenuBase) And (H < HMenuBase + MaxMenu * 4) And
-     MenuUsed[(H - HMenuBase) Div 4] Then MenuIdx := (H - HMenuBase) Div 4
-  Else MenuIdx := -1;
-End;
-
 Function CreateMenu : LongInt;
 Begin
   CreateMenu := MenuNew;
@@ -27498,26 +27866,34 @@ Begin
   CreatePopupMenu := MenuNew;
 End;
 
-{ N-ieme element d'un menu (par position) ; -1 si absent }
-Function MItemAt(M, Pos0 : LongInt) : LongInt;
-Var I, J, Best, BS, Last : LongInt;
+{ Element de commande Id dans le menu M ou ses sous-menus }
+Function MItemFindR(M, Id, Depth : LongInt) : LongInt;
+Var I, R, S : LongInt;
 Begin
-  MItemAt := -1;
-  Last := -1;
-  For J := 0 To Pos0 Do
-  Begin
-    Best := -1; BS := $7FFFFFFF;
-    For I := 0 To MaxMenuItem - 1 Do
-      If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
-         (MItemsP^[I].Seq > Last)
-         And (MItemsP^[I].Seq < BS) Then
+  MItemFindR := -1;
+  For I := 0 To MaxMenuItem - 1 Do
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+       (MItemsP^[I].Id = Id) Then
+    Begin
+      MItemFindR := I;
+      Exit;
+    End;
+  If Depth >= 6 Then Exit;
+  For I := 0 To MaxMenuItem - 1 Do
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+       ((MItemsP^[I].Flags And MF_POPUP) <> 0) Then
+    Begin
+      S := MenuIdx(MItemsP^[I].Id);
+      If (S >= 0) And (S <> M) Then
       Begin
-        Best := I; BS := MItemsP^[I].Seq;
+        R := MItemFindR(S, Id, Depth + 1);
+        If R >= 0 Then
+        Begin
+          MItemFindR := R;
+          Exit;
+        End;
       End;
-    If Best < 0 Then Exit;
-    Last := BS;
-    MItemAt := Best;
-  End;
+    End;
 End;
 
 Function MItemFind(M, Id, Flags : LongInt) : LongInt;
@@ -27528,20 +27904,14 @@ Begin
     MItemFind := MItemAt(M, Id);
     Exit;
   End;
-  MItemFind := -1;
-  For I := 0 To MaxMenuItem - 1 Do
-    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
-       (MItemsP^[I].Id = Id) Then
-    Begin
-      MItemFind := I;
-      Exit;
-    End;
+  MItemFind := MItemFindR(M, Id, 0);
 End;
 
-Function AppendMenuA(H, Flags, Id, Item : LongInt) : LongInt;
+{ Ajouter un element (texte deja lu) au menu H }
+Function MAdd(H, Flags, Id : LongInt; Const T : String) : LongInt;
 Var M, I : LongInt;
 Begin
-  AppendMenuA := 0;
+  MAdd := 0;
   M := MenuIdx(H);
   If M < 0 Then Exit;
   For I := 0 To MaxMenuItem - 1 Do
@@ -27550,12 +27920,19 @@ Begin
       MItemsP^[I].Used := True; MItemsP^[I].Menu := M;
       MItemsP^[I].Flags := Flags; MItemsP^[I].Id := Id;
       Inc(MSeq); MItemsP^[I].Seq := MSeq;
-      If ((Flags And (MF_SEPARATOR Or 4 Or $100)) = 0) And (Item <> 0) Then
-        MItemsP^[I].Text := Copy(PStr(Item), 1, 63)
+      If (Flags And (MF_SEPARATOR Or 4 Or $100)) = 0 Then
+        MItemsP^[I].Text := Copy(T, 1, 63)
       Else MItemsP^[I].Text := '';
-      AppendMenuA := 1;
+      MAdd := 1;
       Exit;
     End;
+End;
+
+Function AppendMenuA(H, Flags, Id, Item : LongInt) : LongInt;
+Begin
+  If ((Flags And (MF_SEPARATOR Or 4 Or $100)) = 0) And (Item <> 0) Then
+    AppendMenuA := MAdd(H, Flags, Id, PStr(Item))
+  Else AppendMenuA := MAdd(H, Flags, Id, '');
 End;
 
 Function InsertMenuA(H, Pos0, Flags, Id, Item : LongInt) : LongInt;
@@ -27595,15 +27972,23 @@ Begin
 End;
 
 Function DestroyMenu(H : LongInt) : LongInt;
-Var M, I : LongInt;
+Var M, I, S : LongInt;
 Begin
   DestroyMenu := 0;
   M := MenuIdx(H);
   If M < 0 Then Exit;
+  MenuUsed[M] := False;
   For I := 0 To MaxMenuItem - 1 Do
     If MItemsP^[I].Used And (MItemsP^[I].Menu = M) Then
+    Begin
       MItemsP^[I].Used := False;
-  MenuUsed[M] := False;
+      { les sous-menus sont detruits avec le menu }
+      If (MItemsP^[I].Flags And MF_POPUP) <> 0 Then
+      Begin
+        S := MItemsP^[I].Id;
+        If MenuIdx(S) >= 0 Then DestroyMenu(S);
+      End;
+    End;
   DestroyMenu := 1;
 End;
 
@@ -27676,6 +28061,20 @@ Begin
                      (Flags And MF_CHECKED);
 End;
 
+{ CheckMenuRadioItem : coche Id parmi First..Last (par commande, ou par
+  position avec MF_BYPOSITION) }
+Function CheckMenuRadioItem(H, First, Last, Id, Flags : LongInt)
+  : LongInt;
+Var K : LongInt;
+Begin
+  CheckMenuRadioItem := 0;
+  If First > Last Then Exit;
+  For K := First To Last Do
+    If K = Id Then CheckMenuItem(H, K, (Flags And $400) Or MF_CHECKED)
+    Else CheckMenuItem(H, K, Flags And $400);
+  CheckMenuRadioItem := 1;
+End;
+
 Function EnableMenuItem(H, Id, Flags : LongInt) : LongInt;
 Var M, I : LongInt;
 Begin
@@ -27705,19 +28104,41 @@ Begin
   If W < 0 Then GetMenu := 0 Else GetMenu := Wnds^[W].Menu;
 End;
 
+{ La barre de menus a pu apparaitre ou disparaitre : cadre, WM_SIZE }
+Procedure MenuBarRecalc(W : LongInt);
+Var T0 : LongInt;
+Begin
+  T0 := Wnds^[W].CT;
+  CalcNc(W);
+  Wnds^[W].NeedNc := True;
+  If Wnds^[W].CT <> T0 Then
+  Begin
+    InvalAll(W, True);
+    SendMsgW(W, WM_SIZE, 0, ((Wnds^[W].CB - Wnds^[W].CT) Shl 16) Or
+             ((Wnds^[W].CR - Wnds^[W].CL) And $FFFF));
+    DirtyWnd(W);
+  End;
+End;
+
 Function SetMenu(H, M : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
   SetMenu := 0;
-  If W < 0 Then Exit;
+  If (W < 0) Or IsChildW(W) Then Exit;
+  If MBarW = W Then CloseMenus(0);
   Wnds^[W].Menu := M;
-  { la barre de menus n'est pas affichee : pas de changement du cadre }
+  MenuBarRecalc(W);
   SetMenu := 1;
 End;
 
 Function DrawMenuBar(H : LongInt) : LongInt;
+Var W : LongInt;
 Begin
+  W := WndOf(H);
+  DrawMenuBar := 0;
+  If W < 0 Then Exit;
+  MenuBarRecalc(W);
   DrawMenuBar := 1;
 End;
 
@@ -27731,14 +28152,184 @@ Begin
   GetSystemMenu := Wnds^[W].K1;
 End;
 
-Function TrackPopupMenu(H, Flags, X, Y, Res, Hw, P : LongInt) : LongInt;
+{ Choix de l'element K d'un menu de programme : commande de
+  TrackPopupMenu, ou WM_COMMAND a la fenetre proprietaire }
+Procedure W32MenuPick(K : LongInt);
+Var Id : LongInt;
 Begin
-  TrackPopupMenu := 0;
+  If (K < 0) Or (K >= MaxMenuItem) Or Not MItemsP^[K].Used Then Exit;
+  Id := MItemsP^[K].Id And $FFFF;
+  If TrackOn Then
+  Begin
+    TrackRes := Id;
+    Exit;
+  End;
+  If (MenuOwnerW >= 0) And Wnds^[MenuOwnerW].Used Then
+    PostMsgW(MenuOwnerW, WM_COMMAND, Id, 0);
 End;
 
-Function LoadMenuA(Inst, Name : LongInt) : LongInt;
+{ Menu contextuel : affiche le menu H en (X, Y) et attend le choix.
+  TPM_RETURNCMD (100h) : rend la commande ; sinon WM_COMMAND a Hw.
+  TPM_BOTTOMALIGN (20h) : le menu finit en Y ; TPM_RIGHTALIGN (8) et
+  TPM_CENTERALIGN (4) : alignement horizontal. }
+Function TrackPopupMenu(H, Flags, X, Y, Res, Hw, P : LongInt) : LongInt;
+Var M, W, MW : LongInt;
 Begin
-  LoadMenuA := MenuNew;
+  TrackPopupMenu := 0;
+  M := MenuIdx(H);
+  If (M < 0) Or (MItemAt(M, 0) < 0) Then Exit;
+  W := WndOf(Hw);
+  CloseMenus(0);
+  MenuOwnerW := W;
+  OpenMenu(0, mnW32 + M, X, Y, (Flags And $20) <> 0);
+  If MenuDepth = 0 Then Exit;
+  MW := MenuW[0];
+  If (Flags And 8) <> 0 Then
+    MoveW(MW, Max(0, X - Wnds^[MW].W), Wnds^[MW].Y, Wnds^[MW].W,
+          Wnds^[MW].H, True)
+  Else If (Flags And 4) <> 0 Then
+    MoveW(MW, Max(0, X - Wnds^[MW].W Div 2), Wnds^[MW].Y, Wnds^[MW].W,
+          Wnds^[MW].H, True);
+  TrackRes := 0;
+  If CurT = 0 Then
+  Begin
+    { appel depuis le noyau : pas d'attente }
+    TrackPopupMenu := 1;
+    Exit;
+  End;
+  TrackOn := True;
+  While TrackOn And (MenuDepth > 0) Do KYield;
+  TrackOn := False;
+  If (Flags And $100) <> 0 Then TrackPopupMenu := TrackRes
+  Else
+  Begin
+    If (TrackRes <> 0) And (W >= 0) And ((Flags And $80) = 0) Then
+      PostMsgW(W, WM_COMMAND, TrackRes, 0);
+    TrackPopupMenu := 1;
+  End;
+End;
+
+Function TrackPopupMenuEx(H, Flags, X, Y, Hw, Tpm : LongInt) : LongInt;
+Begin
+  TrackPopupMenuEx := TrackPopupMenu(H, Flags, X, Y, 0, Hw, 0);
+End;
+
+{ Chaine UTF-16 d'un modele de menu (avance P apres le zero) }
+Function MTplStr(Var P : LongInt) : String;
+Var S : String; C : LongInt;
+Begin
+  S := '';
+  Repeat
+    C := MemW[0:P];
+    P := P + 2;
+    If C = 0 Then Break;
+    If Length(S) < 63 Then
+      If C < 256 Then S := S + Chr(C) Else S := S + '?';
+  Until False;
+  MTplStr := S;
+End;
+
+{ Elements d'un modele de menu (MENUITEMTEMPLATE ou MENUEX) }
+Procedure MTplItems(H : LongInt; Var P : LongInt; Ex : Boolean;
+                    Depth : LongInt);
+Var F, Id, Sub, Typ, St, Fl, N : LongInt; T : String; Last : Boolean;
+Begin
+  N := 0;
+  Repeat
+    Inc(N);
+    If Ex Then
+    Begin
+      Typ := MemL[0:P]; St := MemL[0:P + 4]; Id := MemL[0:P + 8];
+      F := MemW[0:P + 12];
+      P := P + 14;
+      T := MTplStr(P);
+      P := (P + 3) And Not 3;
+      Last := (F And $80) <> 0;
+      Fl := 0;
+      If (Typ And $800) <> 0 Then Fl := MF_SEPARATOR;
+      If (St And 3) <> 0 Then Fl := Fl Or MF_GRAYED;
+      If (St And 8) <> 0 Then Fl := Fl Or MF_CHECKED;
+      If (F And 1) <> 0 Then
+      Begin
+        P := P + 4;                     { dwHelpId }
+        Sub := MenuNew;
+        If Depth < 6 Then MTplItems(Sub, P, True, Depth + 1);
+        MAdd(H, Fl Or MF_POPUP, Sub, T);
+      End
+      Else MAdd(H, Fl, Id, T);
+    End
+    Else
+    Begin
+      F := MemW[0:P];
+      P := P + 2;
+      Id := 0;
+      If (F And MF_POPUP) = 0 Then
+      Begin
+        Id := MemW[0:P];
+        P := P + 2;
+      End;
+      T := MTplStr(P);
+      Last := (F And $80) <> 0;
+      F := F And $FF7F;
+      If (F And MF_POPUP) <> 0 Then
+      Begin
+        Sub := MenuNew;
+        If Depth < 6 Then MTplItems(Sub, P, False, Depth + 1);
+        MAdd(H, F, Sub, T);
+      End
+      Else If (F = 0) And (Id = 0) And (T = '') Then
+        MAdd(H, MF_SEPARATOR, 0, '')
+      Else MAdd(H, F, Id, T);
+    End;
+  Until Last Or (N > 200);
+End;
+
+Function LoadMenuIndirectA(P : LongInt) : LongInt;
+Var H, Ofs : LongInt;
+Begin
+  H := MenuNew;
+  LoadMenuIndirectA := H;
+  If (H = 0) Or (P = 0) Then Exit;
+  Ofs := MemW[0:P + 2];
+  If MemW[0:P] = 1 Then
+  Begin
+    P := P + 4 + Ofs;
+    MTplItems(H, P, True, 0);
+  End
+  Else
+  Begin
+    P := P + 4 + Ofs;
+    MTplItems(H, P, False, 0);
+  End;
+End;
+
+Function LoadMenuIndirectW(P : LongInt) : LongInt;
+Begin
+  LoadMenuIndirectW := LoadMenuIndirectA(P);
+End;
+
+{ Menu des ressources (RT_MENU) d'un module PE ; vide sinon }
+Function LoadMenuA(Inst, Name : LongInt) : LongInt;
+Var M, R, Sz : LongInt;
+Begin
+  M := AppModule(Inst);
+  R := 0;
+  If (M >= $10000) And (MemW[0:M] = $5A4D) And
+     ((M = AppBase) Or (ModOfBase(M) >= 0)) Then R := ResFind(M, Name, 4);
+  If R = 0 Then LoadMenuA := MenuNew
+  Else LoadMenuA := LoadMenuIndirectA(ResData(M, R, Sz));
+End;
+
+Function LoadMenuW(Inst, Name : LongInt) : LongInt;
+Var S : String; Q : LongInt;
+Begin
+  If (Name >= 0) And (Name < $10000) Then LoadMenuW := LoadMenuA(Inst, Name)
+  Else
+  Begin
+    Q := Name;
+    S := MTplStr(Q) + #0;
+    LoadMenuW := LoadMenuA(Inst, LongInt(@S[1]));
+  End;
 End;
 
 { ------------------------------------------------------------------ }
@@ -28201,11 +28792,17 @@ End;
 
 { Boite de message d'un programme (modale) }
 Function MessageBoxA(H, Text, Cap, Typ : LongInt) : LongInt;
-Var T : String;
+Var T, X, Y : String; I : LongInt;
 Begin
   If Cap = 0 Then T := 'Erreur' Else T := PStr(Cap);
-  KLog('MessageBoxA "' + T + '" : ' + PStr(Text));
-  MessageBoxA := MsgBoxModal(T, PStr(Text), Typ);
+  X := PStr(Text);
+  { fins de ligne du programme : '|' pour WrapText }
+  Y := '';
+  For I := 1 To Length(X) Do
+    If X[I] = #10 Then Y := Y + '|'
+    Else If X[I] <> #13 Then Y := Y + X[I];
+  KLog('MessageBoxA "' + T + '" : ' + Y);
+  MessageBoxA := MsgBoxModal(T, Y, Typ);
 End;
 
 Function MessageBoxExA(H, Text, Cap, Typ, Lang : LongInt) : LongInt;
@@ -33145,6 +33742,691 @@ End;
 Function InitCommonControlsEx(P : LongInt) : LongInt;
 Begin
   InitCommonControlsEx := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Supervision : processus, temps, memoire (Gestionnaire des taches)   }
+{ ------------------------------------------------------------------ }
+
+{ Processus designe par une poignee (-1 : le processus courant) ;
+  -1 si la poignee n'est pas celle d'un processus en cours }
+Function ProcOfH(H : LongInt) : LongInt;
+Var I, P : LongInt;
+Begin
+  ProcOfH := -1;
+  If H = -1 Then
+  Begin
+    ProcOfH := CurProc;
+    Exit;
+  End;
+  I := KObjOf(H, koProcess);
+  If (I < 0) Or (KObjs^[I].F2 <> 0) Then Exit;
+  P := KObjs^[I].F1;
+  If (P > 0) And (P < MaxProc) And Procs^[P].Used Then ProcOfH := P;
+End;
+
+{ Nom de l'image d'un processus }
+Function ProcName(P : LongInt) : String;
+Var S : String;
+Begin
+  If P = 0 Then S := 'System'
+  Else If P = CurProc Then S := BaseName(AppPath)
+  Else S := BaseName(Procs^[P].Path);
+  If S = '' Then S := '?';
+  ProcName := S;
+End;
+
+Function ProcPath(P : LongInt) : String;
+Begin
+  If P = CurProc Then ProcPath := AppPath Else ProcPath := Procs^[P].Path;
+End;
+
+Function ProcThreads(P : LongInt) : LongInt;
+Var I, N : LongInt;
+Begin
+  N := 0;
+  For I := 0 To MaxThread - 1 Do
+    If Threads[I].Used And (Threads[I].State <> tsDead) And
+       (ThrProc[I] = P) Then Inc(N);
+  ProcThreads := N;
+End;
+
+{ Memoire utilisee par un processus : image privee (ou noyau) et blocs
+  du tas qui lui appartiennent }
+Function ProcMem(P : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  If P = 0 Then N := KImgHi - KImgLo + HeapOwnerBytes(0)
+  Else
+  Begin
+    N := HeapOwnerBytes(Procs^[P].Owner);
+    If WinProc = P Then
+    Begin
+      If P = CurProc Then N := N + AppSize Else N := N + Procs^[P].Size;
+    End;
+  End;
+  ProcMem := N;
+End;
+
+{ Poignees ouvertes par un processus (objets du noyau et GDI) }
+Function ProcHandles(P : LongInt) : LongInt;
+Var I, N, O : LongInt;
+Begin
+  N := 0;
+  O := Procs^[P].Owner;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used Then
+      If (KObjPr^[I * 32 + P] > 0) Or ((P > 0) And (KObjOwner[I] = O)) Then
+        Inc(N);
+  For I := 0 To MaxThread - 1 Do
+    If Threads[I].Used And (ThrProc[I] = P) Then Inc(N);
+  ProcHandles := N;
+End;
+
+Function ProcGdi(P : LongInt) : LongInt;
+Var I, N, O : LongInt;
+Begin
+  N := 0;
+  If P = 0 Then O := 0 Else O := Procs^[P].Owner;
+  For I := 0 To MaxGdi - 1 Do
+    If Gdis^[I].Used And (Gdis^[I].Owner = O) Then Inc(N);
+  ProcGdi := N;
+End;
+
+Function ProcUser(P : LongInt) : LongInt;
+Var I, N, T : LongInt;
+Begin
+  N := 0;
+  For I := 0 To MaxWnd - 1 Do
+  Begin
+    T := Wnds^[I].Thread;
+    If Wnds^[I].Used And (T >= 0) And (T < MaxThread) Then
+      If ThrProc[T] = P Then Inc(N);
+  End;
+  ProcUser := N;
+End;
+
+{ FILETIME (unites de 100 ns) d'une duree en millisecondes }
+{ Ms * 10000 sur 64 bits (Ms >= 0) : moitie basse L, haute H }
+Procedure Mul10k(Ms : LongInt; Var L, H : LongInt);
+Var A, B, L1 : LongInt;
+Begin
+  A := (Ms And $FFFF) * 10000;
+  B := ((Ms Shr 16) And $7FFF) * 10000;
+  L1 := (A Shr 16) + (B And $FFFF);
+  L := (A And $FFFF) Or ((L1 And $FFFF) Shl 16);
+  H := (L1 Shr 16) + (B Shr 16);
+End;
+
+{ FILETIME (unites de 100 ns) d'une duree en millisecondes }
+Procedure PutMsFt(A, Ms : LongInt);
+Var L, H : LongInt;
+Begin
+  If A = 0 Then Exit;
+  If Ms < 0 Then Ms := 0;
+  Mul10k(Ms, L, H);
+  MemL[0:A] := L; MemL[0:A + 4] := H;
+End;
+
+Procedure GetSystemTimeAsFileTime(P : LongInt);
+Var St : Array[0..3] Of LongInt;
+Begin
+  GetSystemTime(LongInt(@St));
+  SystemTimeToFileTime(LongInt(@St), P);
+End;
+
+{ Instant (FILETIME) d'un moment exprime en Ticks }
+{ Instant (FILETIME) d'un moment exprime en Ticks }
+Procedure TicksFt(A, T : LongInt);
+Var D, L, H, NL : LongInt;
+Begin
+  If A = 0 Then Exit;
+  GetSystemTimeAsFileTime(A);
+  D := Ticks - T;
+  If D < 0 Then D := 0;
+  Mul10k(D, L, H);
+  NL := MemL[0:A];
+  MemL[0:A] := NL - L;
+  { retenue : NL < L en non signe }
+  If (NL Xor LongInt($80000000)) < (L Xor LongInt($80000000)) Then
+    H := H + 1;
+  MemL[0:A + 4] := MemL[0:A + 4] - H;
+End;
+
+{ GetSystemTimes : repos, noyau (repos compris), utilisateur }
+Function GetSystemTimes(PIdle, PKern, PUser : LongInt) : LongInt;
+Var U, K : LongInt;
+Begin
+  K := Procs^[0].CpuMs;
+  U := BusyMs - K;
+  If U < 0 Then U := 0;
+  PutMsFt(PIdle, IdleMs);
+  PutMsFt(PKern, IdleMs + K);
+  PutMsFt(PUser, U);
+  GetSystemTimes := 1;
+End;
+
+Function GetProcessTimes(H, PCre, PExit, PKern, PUser : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  GetProcessTimes := 0;
+  P := ProcOfH(H);
+  If P < 0 Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  TicksFt(PCre, Procs^[P].StartT);
+  If PExit <> 0 Then
+  Begin
+    MemL[0:PExit] := 0; MemL[0:PExit + 4] := 0;
+  End;
+  If P = 0 Then
+  Begin
+    PutMsFt(PKern, Procs^[0].CpuMs);
+    PutMsFt(PUser, 0);
+  End
+  Else
+  Begin
+    PutMsFt(PKern, 0);
+    PutMsFt(PUser, Procs^[P].CpuMs);
+  End;
+  GetProcessTimes := 1;
+End;
+
+Function GetThreadTimes(H, PCre, PExit, PKern, PUser : LongInt) : LongInt;
+Var T, I : LongInt;
+Begin
+  GetThreadTimes := 0;
+  If H = -2 Then T := CurT
+  Else
+  Begin
+    I := KObjOf(H, koThread);
+    If I < 0 Then Exit;
+    T := KObjs^[I].F1;
+  End;
+  If (T < 0) Or (T >= MaxThread) Then Exit;
+  TicksFt(PCre, 0);
+  If PExit <> 0 Then
+  Begin
+    MemL[0:PExit] := 0; MemL[0:PExit + 4] := 0;
+  End;
+  PutMsFt(PKern, 0);
+  PutMsFt(PUser, ThrCpu[T]);
+  GetThreadTimes := 1;
+End;
+
+{ MEMORYSTATUSEX (64 octets, valeurs 64 bits) }
+Function GlobalMemoryStatusEx(P : LongInt) : LongInt;
+Var F : LongInt;
+Begin
+  F := HeapFreeBytes;
+  FillMem(P + 4, 60, 0);
+  MemL[0:P] := 64;
+  MemL[0:P + 4] := 100 - Trunc(F / (MemTop / 100.0));
+  MemL[0:P + 8] := MemTop;                      { ullTotalPhys }
+  MemL[0:P + 16] := F;                          { ullAvailPhys }
+  MemL[0:P + 24] := MemTop;                     { ullTotalPageFile }
+  MemL[0:P + 32] := F;
+  MemL[0:P + 40] := $7FFE0000;                  { ullTotalVirtual }
+  MemL[0:P + 48] := F;
+  GlobalMemoryStatusEx := 1;
+End;
+
+{ PERFORMANCE_INFORMATION (PSAPI, en pages de 4 Ko) }
+Function GetPerformanceInfo(P, Cb : LongInt) : LongInt;
+Var F, I, N, T, Used : LongInt;
+Begin
+  GetPerformanceInfo := 0;
+  If (P = 0) Or (Cb < 56) Then Exit;
+  F := HeapFreeBytes;
+  Used := MemTop - F;
+  MemL[0:P] := 56;
+  MemL[0:P + 4] := Used Div 4096;                         { CommitTotal }
+  MemL[0:P + 8] := MemTop Div 4096;                       { CommitLimit }
+  If Used > PeakCommit Then PeakCommit := Used;
+  MemL[0:P + 12] := PeakCommit Div 4096;                  { CommitPeak }
+  MemL[0:P + 16] := MemTop Div 4096;                      { PhysicalTotal }
+  MemL[0:P + 20] := F Div 4096;                           { PhysicalAvailable }
+  MemL[0:P + 24] := CacheSlots * 2048 Div 4096;           { SystemCache }
+  MemL[0:P + 28] := (KImgHi - KImgLo + HeapOwnerBytes(0)) Div 4096;
+  MemL[0:P + 32] := HeapOwnerBytes(0) Div 4096;           { KernelPaged }
+  MemL[0:P + 36] := (KImgHi - KImgLo) Div 4096;           { KernelNonpaged }
+  MemL[0:P + 40] := 4096;
+  N := 0; T := 0;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used Then Inc(N);
+  MemL[0:P + 44] := N + MaxThread;                        { HandleCount }
+  N := 2;
+  For I := 1 To MaxProc - 1 Do
+    If Procs^[I].Used Then Inc(N);
+  MemL[0:P + 48] := N;                                    { ProcessCount }
+  For I := 0 To MaxThread - 1 Do
+    If Threads[I].Used And (Threads[I].State <> tsDead) Then Inc(T);
+  MemL[0:P + 52] := T;                                    { ThreadCount }
+  GetPerformanceInfo := 1;
+End;
+
+{ Identifiants des processus (le premier, 0, est le processus inactif) }
+Function EnumProcesses(PIds, Cb, PNeed : LongInt) : LongInt;
+Var I, N : LongInt;
+Begin
+  N := 0;
+  If Cb >= 4 Then MemL[0:PIds] := 0;
+  N := 1;
+  For I := 0 To MaxProc - 1 Do
+    If Procs^[I].Used And ((N + 1) * 4 <= Cb) Then
+    Begin
+      MemL[0:PIds + N * 4] := Procs^[I].Pid;
+      Inc(N);
+    End;
+  If PNeed <> 0 Then MemL[0:PNeed] := N * 4;
+  EnumProcesses := 1;
+End;
+
+{ PROCESS_MEMORY_COUNTERS (40 octets) }
+Function GetProcessMemoryInfo(H, PMC, Cb : LongInt) : LongInt;
+Var P, M : LongInt;
+Begin
+  GetProcessMemoryInfo := 0;
+  P := ProcOfH(H);
+  If (P < 0) Or (PMC = 0) Or (Cb < 40) Then Exit;
+  M := ProcMem(P);
+  If M > Procs^[P].KrnMs Then Procs^[P].KrnMs := M;     { pic }
+  FillMem(PMC, 40, 0);
+  MemL[0:PMC] := 40;
+  MemL[0:PMC + 4] := M Div 4096;                  { PageFaultCount }
+  MemL[0:PMC + 8] := Procs^[P].KrnMs;             { PeakWorkingSetSize }
+  MemL[0:PMC + 12] := M;                          { WorkingSetSize }
+  MemL[0:PMC + 20] := M Div 8;
+  MemL[0:PMC + 28] := M Div 32;
+  MemL[0:PMC + 32] := M;                          { PagefileUsage }
+  MemL[0:PMC + 36] := Procs^[P].KrnMs;
+  GetProcessMemoryInfo := 1;
+End;
+
+Function EnumProcessModules(H, PMods, Cb, PNeed : LongInt) : LongInt;
+Var P, I, N : LongInt;
+Begin
+  EnumProcessModules := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  N := 0;
+  If P > 0 Then
+  Begin
+    { le programme d'abord, puis ses DLL }
+    For I := 0 To MaxMod - 1 Do
+      If Mods^[I].Used And (Mods^[I].PrcId = P) And Not Mods^[I].IsDll Then
+      Begin
+        If (N + 1) * 4 <= Cb Then MemL[0:PMods + N * 4] := Mods^[I].Base;
+        Inc(N);
+      End;
+    For I := 0 To MaxMod - 1 Do
+      If Mods^[I].Used And (Mods^[I].PrcId = P) And Mods^[I].IsDll Then
+      Begin
+        If (N + 1) * 4 <= Cb Then MemL[0:PMods + N * 4] := Mods^[I].Base;
+        Inc(N);
+      End;
+  End;
+  If PNeed <> 0 Then MemL[0:PNeed] := N * 4;
+  EnumProcessModules := 1;
+End;
+
+{ Nom (ou chemin) d'un module d'un processus ; HMod 0 : le programme }
+Function ProcModName(H, HMod, Buf, N : LongInt; Full : Boolean) : LongInt;
+Var P, I : LongInt; S : String;
+Begin
+  ProcModName := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  S := ProcPath(P);
+  If P = 0 Then S := 'C:\WINDOWS\SYSTEM\VMM32.VXD';
+  If HMod <> 0 Then
+    For I := 0 To MaxMod - 1 Do
+      If Mods^[I].Used And (Mods^[I].PrcId = P) And (Mods^[I].Base = HMod)
+      Then S := Mods^[I].Path;
+  If Not Full Then S := BaseName(S);
+  If P = 0 Then
+  Begin
+    If Full Then S := 'C:\WINDOWS\SYSTEM\VMM32.VXD' Else S := 'System';
+  End;
+  PutPStr(Buf, S, N);
+  ProcModName := Min(Length(S), N - 1);
+End;
+
+Function GetModuleBaseNameA(H, HMod, Buf, N : LongInt) : LongInt;
+Begin
+  GetModuleBaseNameA := ProcModName(H, HMod, Buf, N, False);
+End;
+
+Function GetModuleFileNameExA(H, HMod, Buf, N : LongInt) : LongInt;
+Begin
+  GetModuleFileNameExA := ProcModName(H, HMod, Buf, N, True);
+End;
+
+Function GetProcessImageFileNameA(H, Buf, N : LongInt) : LongInt;
+Begin
+  GetProcessImageFileNameA := ProcModName(H, 0, Buf, N, True);
+End;
+
+Function EmptyWorkingSet(H : LongInt) : LongInt;
+Begin
+  EmptyWorkingSet := 1;
+End;
+
+Function GetProcessHandleCount(H, P : LongInt) : LongInt;
+Var Q : LongInt;
+Begin
+  GetProcessHandleCount := 0;
+  Q := ProcOfH(H);
+  If (Q < 0) Or (P = 0) Then Exit;
+  MemL[0:P] := ProcHandles(Q);
+  GetProcessHandleCount := 1;
+End;
+
+{ Objets GDI (0) ou USER (1) d'un processus }
+Function GetGuiResources(H, Fl : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  GetGuiResources := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  If Fl = 0 Then GetGuiResources := ProcGdi(P)
+  Else GetGuiResources := ProcUser(P);
+End;
+
+Function GetPriorityClass(H : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := ProcOfH(H);
+  If P < 0 Then GetPriorityClass := 0
+  Else GetPriorityClass := Procs^[P].PrioCls;
+End;
+
+Function SetPriorityClass(H, C : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  SetPriorityClass := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  Procs^[P].PrioCls := C;
+  SetPriorityClass := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Toolhelp32 : instantanes des processus, taches et modules            }
+{ ------------------------------------------------------------------ }
+{ Bloc de l'instantane : +0 processus, +4 taches, +8 modules (nombres),
+  +12, +16, +20 positions de lecture, puis PROCESSENTRY32 (296
+  octets), THREADENTRY32 (28) et MODULEENTRY32 (548) }
+
+Function CreateToolhelp32Snapshot(Flags, Pid : LongInt) : LongInt;
+Var I, B, NP, NT, NM, A, P, Q, K, Own : LongInt; S : String;
+Begin
+  CreateToolhelp32Snapshot := -1;
+  Own := HeapOwner;
+  B := KAlloc(64 + (MaxProc + 1) * 296 + MaxThread * 28 + MaxMod * 548);
+  If B = 0 Then Exit;
+  NP := 0; NT := 0; NM := 0;
+  A := B + 64;
+  If (Flags And 2) <> 0 Then
+  Begin
+    { processus inactif, systeme, programmes }
+    For K := -1 To MaxProc - 1 Do
+      If (K < 0) Or Procs^[K].Used Then
+      Begin
+        FillMem(A, 296, 0);
+        MemL[0:A] := 296;
+        If K < 0 Then
+        Begin
+          MemL[0:A + 8] := 0; MemL[0:A + 20] := 1;
+          S := '[System Process]';
+        End
+        Else
+        Begin
+          MemL[0:A + 8] := Procs^[K].Pid;
+          MemL[0:A + 20] := ProcThreads(K);
+          MemL[0:A + 24] := Procs^[K].Parent;
+          S := ProcName(K);
+        End;
+        MemL[0:A + 4] := 1;
+        MemL[0:A + 28] := 8;
+        PutPStr(A + 36, S, 260);
+        A := A + 296;
+        Inc(NP);
+      End;
+  End;
+  MemL[0:B + 0] := NP;
+  If (Flags And 4) <> 0 Then
+    For I := 0 To MaxThread - 1 Do
+      If Threads[I].Used And (Threads[I].State <> tsDead) Then
+      Begin
+        FillMem(A, 28, 0);
+        MemL[0:A] := 28; MemL[0:A + 4] := 1;
+        MemL[0:A + 8] := ThreadId(I);
+        MemL[0:A + 12] := Procs^[ThrProc[I]].Pid;
+        MemL[0:A + 16] := 8;
+        A := A + 28;
+        Inc(NT);
+      End;
+  MemL[0:B + 4] := NT;
+  If (Flags And 8) <> 0 Then
+  Begin
+    If Pid = 0 Then P := CurProc Else P := ProcByPid(Pid);
+    If P > 0 Then
+      For Q := 0 To 1 Do
+        For I := 0 To MaxMod - 1 Do
+          If Mods^[I].Used And (Mods^[I].PrcId = P) And
+             (Mods^[I].IsDll = (Q = 1)) Then
+          Begin
+            FillMem(A, 548, 0);
+            MemL[0:A] := 548; MemL[0:A + 4] := 1;
+            MemL[0:A + 8] := Procs^[P].Pid;
+            MemL[0:A + 12] := 1; MemL[0:A + 16] := 1;
+            MemL[0:A + 20] := Mods^[I].Base; MemL[0:A + 24] := Mods^[I].Size;
+            MemL[0:A + 28] := Mods^[I].Base;
+            PutPStr(A + 32, BaseName(Mods^[I].Path), 256);
+            PutPStr(A + 288, Mods^[I].Path, 260);
+            A := A + 548;
+            Inc(NM);
+          End;
+  End;
+  MemL[0:B + 8] := NM;
+  I := KObjNew(koSnapshot);
+  If I < 0 Then
+  Begin
+    KFree(B);
+    Exit;
+  End;
+  KObjs^[I].F4 := B;
+  HeapOwner := Own;
+  CreateToolhelp32Snapshot := KHandle(I);
+End;
+
+{ Entree suivante de la liste L (0 processus, 1 taches, 2 modules) }
+Function SnapNext(H, P, L : LongInt; First : Boolean) : LongInt;
+Var I, B, N, C, A, Sz : LongInt;
+Begin
+  SnapNext := 0;
+  I := KObjOf(H, koSnapshot);
+  If (I < 0) Or (P = 0) Then Exit;
+  B := KObjs^[I].F4;
+  If First Then MemL[0:B + 12 + L * 4] := 0;
+  C := MemL[0:B + 12 + L * 4];
+  N := MemL[0:B + L * 4];
+  If C >= N Then
+  Begin
+    SetErr(18);                          { ERROR_NO_MORE_FILES }
+    Exit;
+  End;
+  A := B + 64;
+  If L >= 1 Then A := A + MemL[0:B] * 296;
+  If L >= 2 Then A := A + MemL[0:B + 4] * 28;
+  Case L Of
+    0 : Sz := 296;
+    1 : Sz := 28;
+  Else
+    Sz := 548;
+  End;
+  MoveMem(A + C * Sz, P, Min(Sz, Max(MemL[0:P], 28)));
+  MemL[0:B + 12 + L * 4] := C + 1;
+  SnapNext := 1;
+End;
+
+Function Process32First(H, P : LongInt) : LongInt;
+Begin
+  Process32First := SnapNext(H, P, 0, True);
+End;
+
+Function Process32Next(H, P : LongInt) : LongInt;
+Begin
+  Process32Next := SnapNext(H, P, 0, False);
+End;
+
+Function Thread32First(H, P : LongInt) : LongInt;
+Begin
+  Thread32First := SnapNext(H, P, 1, True);
+End;
+
+Function Thread32Next(H, P : LongInt) : LongInt;
+Begin
+  Thread32Next := SnapNext(H, P, 1, False);
+End;
+
+Function Module32First(H, P : LongInt) : LongInt;
+Begin
+  Module32First := SnapNext(H, P, 2, True);
+End;
+
+Function Module32Next(H, P : LongInt) : LongInt;
+Begin
+  Module32Next := SnapNext(H, P, 2, False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fenetres de premier niveau, utilisateur, ordinateur                  }
+{ ------------------------------------------------------------------ }
+
+Function CallEnum(Proc, H, LP : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,LP
+    push eax
+    mov eax,H
+    push eax
+    mov eax,Proc
+    call eax
+    mov R,eax
+  end;
+  CallEnum := R;
+End;
+
+{ Fenetres de premier niveau, de la plus haute a la plus basse }
+Function EnumWindows(Proc, LP : LongInt) : LongInt;
+Var I, N, W : LongInt; L : Array[0..MaxWnd - 1] Of LongInt;
+Begin
+  EnumWindows := 1;
+  N := 0;
+  For I := ZCnt - 1 DownTo 0 Do
+  Begin
+    L[N] := ZList[I];
+    Inc(N);
+  End;
+  For I := 0 To N - 1 Do
+  Begin
+    W := L[I];
+    If Wnds^[W].Used And Not IsChildW(W) Then
+      If CallEnum(Proc, HwndOf(W), LP) = 0 Then Exit;
+  End;
+End;
+
+Function EnumThreadWindows(Tid, Proc, LP : LongInt) : LongInt;
+Var I, T : LongInt;
+Begin
+  EnumThreadWindows := 1;
+  T := ThreadOfId(Tid);
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And Not IsChildW(I) And (Wnds^[I].Thread = T) Then
+      If CallEnum(Proc, HwndOf(I), LP) = 0 Then Exit;
+End;
+
+{ Une fenetre ne repond plus quand sa file contient des messages non lus
+  depuis plus de 5 secondes }
+Function IsHungAppWindow(H : LongInt) : LongInt;
+Var W, T : LongInt;
+Begin
+  IsHungAppWindow := 0;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  T := Wnds^[W].Thread;
+  If (T <= 0) Or (T >= MaxThread) Then Exit;
+  If (Threads[T].QHead <> Threads[T].QTail) And
+     (Ticks - MsgQ^[T * MaxQueue + Threads[T].QHead].Time > 5000) Then
+    IsHungAppWindow := 1;
+End;
+
+Procedure SwitchToThisWindow(H, AltTab : LongInt);
+Var W : LongInt;
+Begin
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  If Wnds^[W].Min Then RestoreW(W);
+  ActivateW(W);
+End;
+
+{ Fin d'une tache (Gestionnaire des taches) : WM_CLOSE, ou arret du
+  processus si Force }
+Function EndTask(H, Shut, Force : LongInt) : LongInt;
+Var W, T, P : LongInt;
+Begin
+  EndTask := 0;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  T := Wnds^[W].Thread;
+  P := 0;
+  If (T > 0) And (T < MaxThread) Then P := ThrProc[T];
+  If (Force <> 0) And (P > 0) Then
+  Begin
+    If P = ThrProc[CurT] Then ExitProcessK(1) Else KillProc(P, 1);
+  End
+  Else PostMsgW(W, WM_CLOSE, 0, 0);
+  EndTask := 1;
+End;
+
+Function GetUserNameA(Buf, PN : LongInt) : LongInt;
+Var S : String;
+Begin
+  GetUserNameA := 0;
+  If PN = 0 Then Exit;
+  S := L('Utilisateur', 'User', 'Benutzer', 'Utente', 'Usuario');
+  If MemL[0:PN] <= Length(S) Then
+  Begin
+    MemL[0:PN] := Length(S) + 1;
+    SetErr(122);
+    Exit;
+  End;
+  PutPStr(Buf, S, MemL[0:PN]);
+  MemL[0:PN] := Length(S) + 1;
+  GetUserNameA := 1;
+End;
+
+Function GetComputerNameA(Buf, PN : LongInt) : LongInt;
+Var S : String;
+Begin
+  GetComputerNameA := 0;
+  If PN = 0 Then Exit;
+  S := 'PASDOWS';
+  If MemL[0:PN] <= Length(S) Then
+  Begin
+    MemL[0:PN] := Length(S) + 1;
+    SetErr(111);
+    Exit;
+  End;
+  PutPStr(Buf, S, MemL[0:PN]);
+  MemL[0:PN] := Length(S);
+  GetComputerNameA := 1;
 End;
 
 Function MessageBoxIndirectA(P : LongInt) : LongInt;
@@ -49850,18 +51132,116 @@ Begin
     NkPcnet : PcSend(Src, Len);
     NkE1000 : E1Send(Src, Len);
   End;
+  NicTxB := NicTxB + Len; Inc(NicTxP);
 End;
 
 { Trame recue dans Dst : longueur, 0 si aucune, -1 si rejetee }
 Function NicRecv(Dst : LongInt) : LongInt;
+Var N : LongInt;
 Begin
   Case NicKind Of
-    NkNe2000 : NicRecv := NeRecv(Dst);
-    NkPcnet : NicRecv := PcRecv(Dst);
-    NkE1000 : NicRecv := E1Recv(Dst);
+    NkNe2000 : N := NeRecv(Dst);
+    NkPcnet : N := PcRecv(Dst);
+    NkE1000 : N := E1Recv(Dst);
   Else
-    NicRecv := 0;
+    N := 0;
   End;
+  If N > 0 Then
+  Begin
+    NicRxB := NicRxB + N; Inc(NicRxP);
+  End;
+  NicRecv := N;
+End;
+
+{ Debit nominal de la carte (bits par seconde) }
+Function NicSpeed : LongInt;
+Begin
+  Case NicKind Of
+    NkNe2000 : NicSpeed := 10000000;
+    NkE1000 : NicSpeed := 1000000000;
+  Else
+    If Pos('FAST', NicDesc) > 0 Then NicSpeed := 100000000
+    Else NicSpeed := 10000000;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IPHLPAPI : interfaces (bouclage et carte), compteurs                }
+{ ------------------------------------------------------------------ }
+
+{ MIB_IFROW (860 octets) de l'interface I (1 bouclage, 2 carte) }
+Procedure IfRow(R, I : LongInt);
+Var S : String; K : LongInt;
+Begin
+  FillMem(R, 860, 0);
+  If I = 1 Then S := 'Loopback Interface'
+  Else S := NicDesc;
+  For K := 1 To Length(S) Do MemW[0:R + (K - 1) * 2] := Ord(S[K]);
+  MemL[0:R + 512] := I;
+  If I = 1 Then
+  Begin
+    MemL[0:R + 516] := 24; MemL[0:R + 520] := 1520;
+    MemL[0:R + 524] := 10000000;
+  End
+  Else
+  Begin
+    MemL[0:R + 516] := 6; MemL[0:R + 520] := 1500;
+    MemL[0:R + 524] := NicSpeed;
+    MemL[0:R + 528] := 6;
+    For K := 0 To 5 Do Mem[0:R + 532 + K] := NicMac[K];
+    MemL[0:R + 552] := NicRxB;                { dwInOctets }
+    MemL[0:R + 556] := NicRxP;                { dwInUcastPkts }
+    MemL[0:R + 576] := NicTxB;                { dwOutOctets }
+    MemL[0:R + 580] := NicTxP;                { dwOutUcastPkts }
+  End;
+  MemL[0:R + 540] := 1;                      { dwAdminStatus : actif }
+  MemL[0:R + 544] := 5;                      { dwOperStatus : operationnel }
+  MemL[0:R + 600] := Length(S);              { dwDescrLen, bDescr }
+  For K := 1 To Length(S) Do Mem[0:R + 603 + K] := Ord(S[K]);
+End;
+
+Function IfCount : LongInt;
+Begin
+  If NicBase <> 0 Then IfCount := 2 Else IfCount := 1;
+End;
+
+Function GetNumberOfInterfaces(P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := IfCount;
+  GetNumberOfInterfaces := 0;
+End;
+
+Function GetIfTable(T, PSize, Order : LongInt) : LongInt;
+Var N, I : LongInt;
+Begin
+  N := IfCount;
+  If (PSize = 0) Then
+  Begin
+    GetIfTable := 87;
+    Exit;
+  End;
+  If (T = 0) Or (MemL[0:PSize] < 4 + N * 860) Then
+  Begin
+    MemL[0:PSize] := 4 + N * 860;
+    GetIfTable := 122;                    { ERROR_INSUFFICIENT_BUFFER }
+    Exit;
+  End;
+  MemL[0:T] := N;
+  For I := 1 To N Do IfRow(T + 4 + (I - 1) * 860, I);
+  GetIfTable := 0;
+End;
+
+Function GetIfEntry(R : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := MemL[0:R + 512];
+  If (I < 1) Or (I > IfCount) Then
+  Begin
+    GetIfEntry := 87;
+    Exit;
+  End;
+  IfRow(R, I);
+  GetIfEntry := 0;
 End;
 
 { ------------------------------------------------------------------ }
@@ -54032,6 +55412,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  TrackPopupMenuEx, LoadMenuW, LoadMenuIndirectA, LoadMenuIndirectW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
   RegisterClassExA, GetClassInfoExA, GetWindowPlacement, SetWindowPlacement,
@@ -54044,6 +55425,17 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   mmioDescend, mmioAscend, mmioCreateChunk, OpenPrinterA, ClosePrinter,
   DocumentPropertiesA, EnumPrintersA, GetFileTitleA, InitCommonControls,
   InitCommonControlsEx,
+  GetSystemTimeAsFileTime, GetSystemTimes, GetProcessTimes, GetThreadTimes,
+  GlobalMemoryStatusEx, GetPerformanceInfo, EnumProcesses,
+  GetProcessMemoryInfo, EnumProcessModules, GetModuleBaseNameA,
+  GetModuleFileNameExA, GetProcessImageFileNameA, EmptyWorkingSet,
+  GetProcessHandleCount, GetGuiResources, GetPriorityClass,
+  SetPriorityClass, CreateToolhelp32Snapshot, Process32First, Process32Next,
+  Thread32First, Thread32Next, Module32First, Module32Next, EnumWindows,
+  EnumThreadWindows, IsHungAppWindow, SwitchToThisWindow, EndTask,
+  GetUserNameA, GetComputerNameA, GetNumberOfInterfaces, GetIfTable,
+  GetIfEntry,
+  CheckMenuRadioItem,
   OpenEventA, OpenSemaphoreA, WaitForSingleObjectEx, WaitForMultipleObjects,
   WaitForMultipleObjectsEx, MsgWaitForMultipleObjects,
   MsgWaitForMultipleObjectsEx, SignalObjectAndWait, OpenFileMappingA,
@@ -63500,6 +64892,7 @@ BEGIN
   Procs^[0].Used := True; Procs^[0].Kind := pkSystem; Procs^[0].Pid := 4;
   Procs^[0].Obj := -1; Procs^[0].MainT := 0; Procs^[0].PrioCls := $20;
   Procs^[0].Path := 'VMM32.VXD';
+  ProcsOk := True;
   CurProc := 0; ProcCnt := 0; WinProc := -1; VmProc := -1; DXProc := -1;
   NextPid := 1132;
   I := KAlloc(SizeOf(TMItemArr));
@@ -63576,6 +64969,8 @@ BEGIN
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
   MenuDepth := 0; DeskSel := -1; TaskbarW := -1; ZTaskW := -1;
+  MenuOwnerW := -1; MBarW := -1; MBarOpen := -1; MBarTogW := -1;
+  MBarTog := -1; TrackOn := False;
   DeskColor := cTeal;
   InitClasses;
   InitGdi;
