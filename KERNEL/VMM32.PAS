@@ -110,6 +110,7 @@ Const
   { Sortes d'objets du noyau }
   koFile      = 1;  koFind = 2;   koThread = 3; koEvent = 4;
   koSemaphore = 5;  koMutex = 6;  koProcess = 7; koConsole = 8;
+  koMapping   = 9;
 
   { Sortes d'objets GDI }
   goPen = 1; goBrush = 2; goFont = 3; goBitmap = 4; goPalette = 5;
@@ -1003,6 +1004,8 @@ Type
 Type
   TKObjArr = Array[0..MaxKObj - 1] Of TKObj;
   PKObjArr = ^TKObjArr;
+  TKObjPrArr = Array[0..MaxKObj * 32 - 1] Of Byte;
+  PKObjPrArr = ^TKObjPrArr;
 
 Var
   AtaBase, AtaCtrl : LongInt;
@@ -1014,6 +1017,10 @@ Var
   VolLabel  : String[32];
   KObjs     : PKObjArr;       { alloue dans le tas (place sous 4 Mo) }
   KObjOwner : Array[0..MaxKObj - 1] Of LongInt;
+  { references des objets de synchronisation et des mappages : total et
+    par processus (KObjPr^[objet * 32 + processus]) }
+  KObjRef   : Array[0..MaxKObj - 1] Of LongInt;
+  KObjPr    : PKObjPrArr;
   RamFiles  : Array[0..MaxRam - 1] Of TRamFile;
   CurDirS   : String[127];
   LastErr0  : LongInt;
@@ -1331,6 +1338,8 @@ Begin
       KObjs^[I].F4 := 0; KObjs^[I].F5 := 0; KObjs^[I].F6 := 0;
       KObjs^[I].Name := ''; KObjs^[I].Mask := '';
       KObjOwner[I] := HeapOwner;
+      KObjRef[I] := 0;
+      If KObjPr <> Nil Then FillMem(LongInt(@KObjPr^[I * 32]), 32, 0);
       KObjNew := I;
       Exit;
     End;
@@ -1342,6 +1351,31 @@ Begin
 End;
 
 { Index de l'objet de la poignee H (de la sorte Kind, 0 = toute) }
+{ Objet nomme (evenement, semaphore, mutex, mappage : un seul espace de
+  noms, comme sous Windows) ; prefixes Global\ et Local\ ignores }
+Function KNameNorm(Name : LongInt) : String;
+Var S : String;
+Begin
+  S := UpStr(PStr(Name));
+  If Copy(S, 1, 7) = 'GLOBAL\' Then S := Copy(S, 8, 255);
+  If Copy(S, 1, 6) = 'LOCAL\' Then S := Copy(S, 7, 255);
+  KNameNorm := S;
+End;
+
+Function KNamed(Const S : String) : LongInt;
+Var I : LongInt;
+Begin
+  KNamed := -1;
+  If S = '' Then Exit;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used And (KObjs^[I].Kind In [koEvent, koSemaphore, koMutex,
+       koMapping]) And (KObjs^[I].Name = S) Then
+    Begin
+      KNamed := I;
+      Exit;
+    End;
+End;
+
 Function KObjOf(H, Kind : LongInt) : LongInt;
 Var I : LongInt;
 Begin
@@ -9953,6 +9987,11 @@ Type
     IsApp    : Boolean;
     PaintReq : Boolean;
     Susp     : LongInt;                 { compteur de SuspendThread }
+    WaitN    : LongInt;                 { attente de WaitN objets (0 : un) }
+    WaitAll  : Boolean;
+    WaitMsg  : Boolean;                 { ... ou d'un message }
+    PulseH   : LongInt;                 { evenement pulse pendant l'attente }
+    Abandon  : Boolean;                 { mutex abandonne obtenu }
   End;
 
   TMsgRec = Record
@@ -9968,10 +10007,13 @@ Type
 Type
   TMsgQArr = Array[0..MaxThread * MaxQueue - 1] Of TMsgRec;
   PMsgQArr = ^TMsgQArr;
+  TWaitArr = Array[0..MaxThread * 64 - 1] Of LongInt;
+  PWaitArr = ^TWaitArr;
 
 Var
   Threads  : Array[0..MaxThread - 1] Of TThread;
   MsgQ     : PMsgQArr;        { alloue dans le tas }
+  WaitHs   : PWaitArr;        { objets attendus (64 par tache) }
   CurT     : LongInt;
   FpuArea  : Array[0..MaxThread * 112 - 1] Of Byte;
   { par tache : pile de l'anneau 0 pour le code 16 bits (TSS.ESP0),
@@ -10233,6 +10275,7 @@ Begin
 End;
 
 Function ObjSignaled(H : LongInt; Consume : Boolean) : Boolean; Forward;
+Function WaitReady(T : LongInt; Consume : Boolean) : LongInt; Forward;
 Function MsgPending(T : LongInt) : Boolean; Forward;
 Procedure RunMMTimers; Forward;
 
@@ -10245,7 +10288,7 @@ Begin
     tsReady : ThreadRunnable := True;
     tsSleep : ThreadRunnable := Ticks >= Threads[T].WakeAt;
     tsWait :
-      ThreadRunnable := ObjSignaled(Threads[T].WaitH, False) Or
+      ThreadRunnable := (WaitReady(T, False) >= 0) Or
                         ((Threads[T].WakeAt >= 0) And
                          (Ticks >= Threads[T].WakeAt));
     tsMsg :
@@ -10457,12 +10500,14 @@ Begin
 End;
 
 Procedure KillProc(P, Code : LongInt); Forward;
+Procedure MutexAbandon(T : LongInt); Forward;
 
 Procedure ExitThreadK(Code : LongInt);
 Var P, I, N : LongInt;
 Begin
   Threads[CurT].ExitCode := Code;
   Threads[CurT].State := tsDead;
+  MutexAbandon(CurT);
   If CurT = 0 Then Exit;
   { derniere tache d'un processus : fin du processus }
   P := ThrProc[CurT];
@@ -10508,79 +10553,213 @@ End;
 { Objets de synchronisation                                          }
 { ------------------------------------------------------------------ }
 
-Function ObjSignaled(H : LongInt; Consume : Boolean) : Boolean;
+{ L'objet H est-il signale pour la tache T ? Consume : l'obtenir
+  (mutex, semaphore, evenement automatique) }
+Function ObjSignaledT(H, T : LongInt; Consume : Boolean) : Boolean;
 Var I : LongInt;
 Begin
-  ObjSignaled := False;
+  ObjSignaledT := False;
   I := KObjOf(H, 0);
   If I < 0 Then
   Begin
-    ObjSignaled := True;
+    ObjSignaledT := True;
     Exit;
   End;
   Case KObjs^[I].Kind Of
     koEvent :
-      If KObjs^[I].F1 <> 0 Then
+      If (KObjs^[I].F1 <> 0) Or (Threads[T].PulseH = H) Then
       Begin
-        ObjSignaled := True;
-        If Consume And (KObjs^[I].F2 = 0) Then KObjs^[I].F1 := 0;
+        ObjSignaledT := True;
+        If Consume Then
+        Begin
+          If Threads[T].PulseH = H Then Threads[T].PulseH := 0
+          Else If KObjs^[I].F2 = 0 Then KObjs^[I].F1 := 0;
+        End;
       End;
     koSemaphore :
       If KObjs^[I].F1 > 0 Then
       Begin
-        ObjSignaled := True;
+        ObjSignaledT := True;
         If Consume Then Dec(KObjs^[I].F1);
       End;
     koMutex :
-      If (KObjs^[I].F1 = 0) Or (KObjs^[I].F1 = ThreadId(CurT)) Then
+      If (KObjs^[I].F1 = 0) Or (KObjs^[I].F1 = ThreadId(T)) Then
       Begin
-        ObjSignaled := True;
+        ObjSignaledT := True;
         If Consume Then
         Begin
-          KObjs^[I].F1 := ThreadId(CurT);
+          KObjs^[I].F1 := ThreadId(T);
           Inc(KObjs^[I].F2);
+          { mutex abandonne par une tache terminee : WAIT_ABANDONED }
+          If KObjs^[I].F3 <> 0 Then
+          Begin
+            KObjs^[I].F3 := 0;
+            Threads[T].Abandon := True;
+          End;
         End;
       End;
     koThread :
-      ObjSignaled := (KObjs^[I].F2 <> 0) Or
-                     Not Threads[KObjs^[I].F1].Used Or
-                     (Threads[KObjs^[I].F1].State = tsDead);
+      ObjSignaledT := (KObjs^[I].F2 <> 0) Or
+                      Not Threads[KObjs^[I].F1].Used Or
+                      (Threads[KObjs^[I].F1].State = tsDead);
     koProcess :
-      ObjSignaled := KObjs^[I].F2 <> 0;
+      ObjSignaledT := KObjs^[I].F2 <> 0;
   Else
-    ObjSignaled := True;
+    ObjSignaledT := True;
   End;
 End;
 
+Function ObjSignaled(H : LongInt; Consume : Boolean) : Boolean;
+Begin
+  ObjSignaled := ObjSignaledT(H, CurT, Consume);
+End;
+
+{ Attente de la tache T prete ? Rend -1, ou le resultat : indice de
+  l'objet (+80h si mutex abandonne), WaitN pour un message }
+Function WaitReady(T : LongInt; Consume : Boolean) : LongInt;
+Var I, N, B, R : LongInt; Ok : Boolean;
+Begin
+  WaitReady := -1;
+  N := Threads[T].WaitN;
+  B := T * 64;
+  Threads[T].Abandon := False;
+  R := -1;
+  If N = 0 Then
+  Begin
+    If ObjSignaledT(Threads[T].WaitH, T, Consume) Then R := 0;
+  End
+  Else If Threads[T].WaitAll Then
+  Begin
+    Ok := True;
+    For I := 0 To N - 1 Do
+      If Not ObjSignaledT(WaitHs^[B + I], T, False) Then Ok := False;
+    If Ok Then
+    Begin
+      If Consume Then
+        For I := 0 To N - 1 Do ObjSignaledT(WaitHs^[B + I], T, True);
+      R := 0;
+    End;
+  End
+  Else
+    For I := 0 To N - 1 Do
+      If (R < 0) And (WaitHs^[B + I] <> -1) Then
+        If ObjSignaledT(WaitHs^[B + I], T, Consume) Then R := I;
+  If (R >= 0) And Threads[T].Abandon Then R := R + $80;
+  If (R < 0) And Threads[T].WaitMsg And MsgPending(T) Then R := N;
+  WaitReady := R;
+End;
+
 { Attente d'un objet : 0 signale, 102h delai ecoule }
+{ Attendre : la tache courante a prepare WaitH (un objet) ou WaitN objets
+  dans WaitHs ; resultat de WaitReady, 102h delai ecoule }
+Function KWaitPrep(Ms : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := WaitReady(CurT, True);
+  If (R < 0) And (Ms <> 0) Then
+  Begin
+    Threads[CurT].State := tsWait;
+    If Ms = -1 Then Threads[CurT].WakeAt := -1
+    Else Threads[CurT].WakeAt := Ticks + Ms;
+    Repeat
+      If CurT = 0 Then KDelay(1) Else KSchedule;
+      R := WaitReady(CurT, True);
+      If (R < 0) And (Ms <> -1) And (Ticks >= Threads[CurT].WakeAt) Then
+        Break;
+      Threads[CurT].State := tsWait;
+    Until R >= 0;
+    Threads[CurT].State := tsReady;
+  End;
+  Threads[CurT].WaitN := 0; Threads[CurT].WaitMsg := False;
+  Threads[CurT].PulseH := 0;
+  If R < 0 Then R := $102;
+  KWaitPrep := R;
+End;
+
+{ Attente d'un objet : 0 signale (80h mutex abandonne), 102h delai }
 Function KWait(H, Ms : LongInt) : LongInt;
 Begin
-  If ObjSignaled(H, True) Then
+  Threads[CurT].WaitH := H;
+  Threads[CurT].WaitN := 0;
+  Threads[CurT].WaitMsg := False;
+  KWait := KWaitPrep(Ms);
+End;
+
+{ Attente de N objets (copies dans WaitHs : la liste de l'appelant est
+  dans la memoire de son processus) }
+Function KWaitMulti(N, Arr, All, Ms : LongInt; Msg : Boolean) : LongInt;
+Var I : LongInt;
+Begin
+  If (N <= 0) Or (N > 64) Then
   Begin
-    KWait := 0;
+    KWaitMulti := -1;
     Exit;
   End;
-  KWait := $102;
-  If Ms = 0 Then Exit;
-  Threads[CurT].State := tsWait;
-  Threads[CurT].WaitH := H;
-  If Ms = -1 Then Threads[CurT].WakeAt := -1
-  Else Threads[CurT].WakeAt := Ticks + Ms;
-  Repeat
-    If CurT = 0 Then KDelay(1) Else KSchedule;
-    If ObjSignaled(H, True) Then
+  For I := 0 To N - 1 Do WaitHs^[CurT * 64 + I] := MemL[0:Arr + I * 4];
+  Threads[CurT].WaitN := N;
+  Threads[CurT].WaitAll := All <> 0;
+  Threads[CurT].WaitMsg := Msg;
+  KWaitMulti := KWaitPrep(Ms);
+End;
+
+{ References des objets de synchronisation : une par ouverture, par
+  processus ; l'objet est detruit quand il n'en reste plus }
+Procedure KRefAdd(I : LongInt);
+Var K : LongInt;
+Begin
+  Inc(KObjRef[I]);
+  K := I * 32 + CurProc;
+  If KObjPr^[K] < 255 Then KObjPr^[K] := KObjPr^[K] + 1;
+End;
+
+Procedure KObjDrop(I : LongInt);
+Begin
+  If (KObjs^[I].Kind = koMapping) And (KObjs^[I].F4 <> 0) Then
+  Begin
+    KFree(KObjs^[I].F4);
+    KObjs^[I].F4 := 0;
+  End;
+  KObjs^[I].Used := False;
+  KObjRef[I] := 0;
+End;
+
+{ Fermer une reference de l'objet I pour le processus P }
+Procedure KRefClose(I, P : LongInt);
+Var K : LongInt;
+Begin
+  K := I * 32 + P;
+  If KObjPr^[K] > 0 Then KObjPr^[K] := KObjPr^[K] - 1;
+  Dec(KObjRef[I]);
+  If KObjRef[I] <= 0 Then KObjDrop(I);
+End;
+
+{ Fin du processus P : ses references sont rendues }
+Procedure KRefProcExit(P : LongInt);
+Var I, K : LongInt;
+Begin
+  For I := 0 To MaxKObj - 1 Do
+  Begin
+    K := I * 32 + P;
+    If KObjs^[I].Used And (KObjPr^[K] > 0) Then
     Begin
-      Threads[CurT].State := tsReady;
-      KWait := 0;
-      Exit;
+      KObjRef[I] := KObjRef[I] - KObjPr^[K];
+      KObjPr^[K] := 0;
+      If KObjRef[I] <= 0 Then KObjDrop(I);
     End;
-    If (Ms <> -1) And (Ticks >= Threads[CurT].WakeAt) Then
+  End;
+End;
+
+{ Fin de la tache T : ses mutex sont abandonnes (le prochain qui les
+  obtient recoit WAIT_ABANDONED) }
+Procedure MutexAbandon(T : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
+       (KObjs^[I].F1 = ThreadId(T)) Then
     Begin
-      Threads[CurT].State := tsReady;
-      Exit;
+      KObjs^[I].F1 := 0; KObjs^[I].F2 := 0; KObjs^[I].F3 := 1;
     End;
-    Threads[CurT].State := tsWait;
-  Until False;
 End;
 
 { ------------------------------------------------------------------ }
@@ -19982,6 +20161,12 @@ Begin
   End;
   { objet processus : garde (autres poignees, code de sortie) }
   If KObjs^[I].Kind = koProcess Then Exit;
+  { synchronisation et mappages : une reference de moins }
+  If KObjs^[I].Kind In [koEvent, koSemaphore, koMutex, koMapping] Then
+  Begin
+    KRefClose(I, CurProc);
+    Exit;
+  End;
   If (KObjs^[I].Kind = koFile) And (KObjs^[I].F4 <= -1000) Then
     FatClose(-1000 - KObjs^[I].F4);
   KObjs^[I].Used := False;
@@ -21460,15 +21645,36 @@ Begin
 End;
 
 Function CreateSemaphoreA(Sec, Init, Mx, Name : LongInt) : LongInt;
-Var I : LongInt;
+Var I : LongInt; S : String;
 Begin
-  I := KObjNew(koSemaphore);
-  If I < 0 Then
+  CreateSemaphoreA := 0;
+  If (Mx <= 0) Or (Init < 0) Or (Init > Mx) Then
   Begin
-    CreateSemaphoreA := 0;
+    SetErr(87);
     Exit;
   End;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
+  I := KNamed(S);
+  If I >= 0 Then
+  Begin
+    If KObjs^[I].Kind <> koSemaphore Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateSemaphoreA := KHandle(I);
+    Exit;
+  End;
+  I := KObjNew(koSemaphore);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
   KObjs^[I].F1 := Init; KObjs^[I].F2 := Mx;
+  KObjs^[I].Name := S;
+  KRefAdd(I);
+  SetErr(0);
   CreateSemaphoreA := KHandle(I);
 End;
 
@@ -21477,23 +21683,83 @@ Var I : LongInt;
 Begin
   ReleaseSemaphore := 0;
   I := KObjOf(H, koSemaphore);
-  If I < 0 Then Exit;
+  If I < 0 Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  If (N <= 0) Or (KObjs^[I].F1 + N > KObjs^[I].F2) Then
+  Begin
+    SetErr(298);                 { ERROR_TOO_MANY_POSTS }
+    Exit;
+  End;
   If Prev <> 0 Then MemL[0:Prev] := KObjs^[I].F1;
-  KObjs^[I].F1 := Min(KObjs^[I].F1 + N, KObjs^[I].F2);
+  KObjs^[I].F1 := KObjs^[I].F1 + N;
   ReleaseSemaphore := 1;
 End;
 
 Function CreateEventA(Sec, Manual, Init, Name : LongInt) : LongInt;
-Var I : LongInt;
+Var I : LongInt; S : String;
 Begin
-  I := KObjNew(koEvent);
-  If I < 0 Then
+  CreateEventA := 0;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
+  I := KNamed(S);
+  If I >= 0 Then
   Begin
-    CreateEventA := 0;
+    If KObjs^[I].Kind <> koEvent Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateEventA := KHandle(I);
     Exit;
   End;
+  I := KObjNew(koEvent);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
   KObjs^[I].F1 := Ord(Init <> 0); KObjs^[I].F2 := Ord(Manual <> 0);
+  KObjs^[I].Name := S;
+  KRefAdd(I);
+  SetErr(0);
   CreateEventA := KHandle(I);
+End;
+
+{ Ouvrir un objet nomme de la sorte K }
+Function KOpenNamed(Name, K : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  KOpenNamed := 0;
+  If Name = 0 Then
+  Begin
+    SetErr(87);
+    Exit;
+  End;
+  I := KNamed(KNameNorm(Name));
+  If I < 0 Then
+  Begin
+    SetErr(ErrFileNotFound);
+    Exit;
+  End;
+  If KObjs^[I].Kind <> K Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  KRefAdd(I);
+  KOpenNamed := KHandle(I);
+End;
+
+Function OpenEventA(Acc, Inh, Name : LongInt) : LongInt;
+Begin
+  OpenEventA := KOpenNamed(Name, koEvent);
+End;
+
+Function OpenSemaphoreA(Acc, Inh, Name : LongInt) : LongInt;
+Begin
+  OpenSemaphoreA := KOpenNamed(Name, koSemaphore);
 End;
 
 Function SetEvent(H : LongInt) : LongInt;
@@ -21512,53 +21778,86 @@ Begin
   ResetEvent := Ord(I >= 0);
 End;
 
+{ PulseEvent : libere les taches qui attendent (toutes pour un evenement
+  manuel, une seule sinon) puis laisse l'evenement non signale }
 Function PulseEvent(H : LongInt) : LongInt;
+Var I, T, K : LongInt; W : Boolean;
 Begin
-  SetEvent(H);
-  KYield;
-  PulseEvent := ResetEvent(H);
+  PulseEvent := 0;
+  I := KObjOf(H, koEvent);
+  If I < 0 Then Exit;
+  For T := 1 To MaxThread - 1 Do
+    If Threads[T].Used And (Threads[T].State = tsWait) Then
+    Begin
+      W := (Threads[T].WaitN = 0) And (Threads[T].WaitH = H);
+      For K := 0 To Threads[T].WaitN - 1 Do
+        If WaitHs^[T * 64 + K] = H Then W := True;
+      If W Then
+      Begin
+        Threads[T].PulseH := H;
+        If KObjs^[I].F2 = 0 Then Break;
+      End;
+    End;
+  KObjs^[I].F1 := 0;
+  PulseEvent := 1;
 End;
 
 Function CreateMutexA(Sec, Own, Name : LongInt) : LongInt;
-Var I : LongInt;
+Var I : LongInt; S : String;
 Begin
+  CreateMutexA := 0;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
   { mutex nomme deja cree : meme objet, ERROR_ALREADY_EXISTS }
-  If Name <> 0 Then
-    For I := 0 To MaxKObj - 1 Do
-      If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
-         (KObjs^[I].Name = UpStr(PStr(Name))) Then
-      Begin
-        SetErr(183);
-        CreateMutexA := KHandle(I);
-        Exit;
-      End;
-  I := KObjNew(koMutex);
-  If I < 0 Then
+  I := KNamed(S);
+  If I >= 0 Then
   Begin
-    CreateMutexA := 0;
+    If KObjs^[I].Kind <> koMutex Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateMutexA := KHandle(I);
     Exit;
   End;
-  If Name <> 0 Then KObjs^[I].Name := UpStr(PStr(Name));
+  I := KObjNew(koMutex);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
+  KObjs^[I].Name := S;
   If Own <> 0 Then
   Begin
     KObjs^[I].F1 := ThreadId(CurT); KObjs^[I].F2 := 1;
   End;
+  KRefAdd(I);
+  SetErr(0);
   CreateMutexA := KHandle(I);
 End;
 
+{ ReleaseMutex : seulement par la tache proprietaire ; libere quand le
+  compte des acquisitions revient a 0 }
 Function ReleaseMutex(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  ReleaseMutex := 0;
   I := KObjOf(H, koMutex);
-  If I >= 0 Then
+  If I < 0 Then
   Begin
-    Dec(KObjs^[I].F2);
-    If KObjs^[I].F2 <= 0 Then
-    Begin
-      KObjs^[I].F1 := 0; KObjs^[I].F2 := 0;
-    End;
+    SetErr(6);
+    Exit;
   End;
-  ReleaseMutex := Ord(I >= 0);
+  If KObjs^[I].F1 <> ThreadId(CurT) Then
+  Begin
+    SetErr(288);                 { ERROR_NOT_OWNER }
+    Exit;
+  End;
+  Dec(KObjs^[I].F2);
+  If KObjs^[I].F2 <= 0 Then
+  Begin
+    KObjs^[I].F1 := 0; KObjs^[I].F2 := 0;
+  End;
+  ReleaseMutex := 1;
 End;
 
 Procedure ChainStart; Forward;
@@ -21566,6 +21865,62 @@ Procedure ChainStart; Forward;
 Function WaitForSingleObject(H, Ms : LongInt) : LongInt;
 Begin
   WaitForSingleObject := KWait(H, Ms);
+End;
+
+Function WaitForSingleObjectEx(H, Ms, Alert : LongInt) : LongInt;
+Begin
+  WaitForSingleObjectEx := KWait(H, Ms);
+End;
+
+{ WAIT_OBJECT_0 + i, WAIT_ABANDONED_0 + i (80h), WAIT_TIMEOUT (102h),
+  WAIT_FAILED (-1) }
+Function WaitForMultipleObjects(N, Arr, All, Ms : LongInt) : LongInt;
+Begin
+  WaitForMultipleObjects := KWaitMulti(N, Arr, All, Ms, False);
+End;
+
+Function WaitForMultipleObjectsEx(N, Arr, All, Ms, Alert : LongInt)
+  : LongInt;
+Begin
+  WaitForMultipleObjectsEx := KWaitMulti(N, Arr, All, Ms, False);
+End;
+
+{ ... ou un message dans la file (resultat N) }
+Function MsgWaitForMultipleObjects(N, Arr, All, Ms, Mask : LongInt)
+  : LongInt;
+Begin
+  If N = 0 Then
+  Begin
+    { seulement les messages : attente d'un objet toujours non signale }
+    Threads[CurT].WaitN := 1;
+    WaitHs^[CurT * 64] := -1;
+    Threads[CurT].WaitAll := False;
+    Threads[CurT].WaitMsg := True;
+    MsgWaitForMultipleObjects := KWaitPrep(Ms);
+    Exit;
+  End;
+  MsgWaitForMultipleObjects := KWaitMulti(N, Arr, All, Ms, True);
+End;
+
+Function MsgWaitForMultipleObjectsEx(N, Arr, Ms, Mask, Flags : LongInt)
+  : LongInt;
+Begin
+  MsgWaitForMultipleObjectsEx := MsgWaitForMultipleObjects(N, Arr,
+    Ord((Flags And 1) <> 0), Ms, Mask);
+End;
+
+{ Signaler un objet puis en attendre un autre }
+Function SignalObjectAndWait(HS, HW, Ms, Alert : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := KObjOf(HS, 0);
+  If I >= 0 Then
+    Case KObjs^[I].Kind Of
+      koEvent : SetEvent(HS);
+      koMutex : ReleaseMutex(HS);
+      koSemaphore : ReleaseSemaphore(HS, 1, 0);
+    End;
+  SignalObjectAndWait := KWait(HW, Ms);
 End;
 
 { CRITICAL_SECTION : +4 LockCount, +8 RecursionCount, +12 OwningThread }
@@ -30758,8 +31113,12 @@ Begin
       End;
   End;
   For I := 1 To MaxThread - 1 Do
-    If Threads[I].Used And (ThrProc[I] = P) And (I <> CurT) Then
-      Threads[I].State := tsDead;
+    If Threads[I].Used And (ThrProc[I] = P) Then
+    Begin
+      MutexAbandon(I);
+      If I <> CurT Then Threads[I].State := tsDead;
+    End;
+  KRefProcExit(P);
   For I := 0 To MaxTimer - 1 Do
   Begin
     T := WTimers[I].Thread;
@@ -31183,7 +31542,6 @@ End;
 { ==================================================================== }
 
 Const
-  koMapping = 9;
   MaxView = 32;
 
 Var
@@ -31209,19 +31567,8 @@ Begin
 End;
 
 Function OpenMutexA(Acc, Inh, Name : LongInt) : LongInt;
-Var I : LongInt; S : String;
 Begin
-  OpenMutexA := 0;
-  If Name = 0 Then Exit;
-  S := UpStr(PStr(Name));
-  For I := 0 To MaxKObj - 1 Do
-    If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
-       (KObjs^[I].Name = S) Then
-    Begin
-      OpenMutexA := KHandle(I);
-      Exit;
-    End;
-  SetErr(ErrFileNotFound);
+  OpenMutexA := KOpenNamed(Name, koMutex);
 End;
 
 Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
@@ -31376,19 +31723,48 @@ End;
 
 { Projection de fichiers : la vue est une copie du fichier, recrite a
   UnmapViewOfFile / FlushViewOfFile si elle est modifiable }
+{ Mappage : F1 fichier (-1 : memoire), F2 taille, F3 protection, F4
+  bloc partage (alloue au premier MapViewOfFile, rendu avec l'objet) ;
+  toutes les vues d'un mappage (memes processus ou non) partagent ce
+  bloc, comme la memoire partagee de Windows 95 }
 Function CreateFileMappingA(HFile, Sec, Prot, SzHi, SzLo, Name : LongInt)
   : LongInt;
-Var I, Sz : LongInt;
+Var I, Sz : LongInt; S : String;
 Begin
   CreateFileMappingA := 0;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
+  I := KNamed(S);
+  If I >= 0 Then
+  Begin
+    If KObjs^[I].Kind <> koMapping Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateFileMappingA := KHandle(I);
+    Exit;
+  End;
   I := KObjNew(koMapping);
   If I < 0 Then Exit;
+  KObjOwner[I] := 0;
   Sz := SzLo;
   If (Sz = 0) And (HFile <> -1) Then Sz := GetFileSize(HFile, 0);
   KObjs^[I].F1 := HFile;
   KObjs^[I].F2 := Sz;
   KObjs^[I].F3 := Prot;
+  KObjs^[I].F4 := 0;
+  KObjs^[I].Name := S;
+  KRefAdd(I);
+  SetErr(0);
   CreateFileMappingA := KHandle(I);
+End;
+
+Function OpenFileMappingA(Acc, Inh, Name : LongInt) : LongInt;
+Begin
+  OpenFileMappingA := KOpenNamed(Name, koMapping);
 End;
 
 Function ViewFlush(V : LongInt) : LongInt;
@@ -31404,7 +31780,7 @@ Begin
 End;
 
 Function MapViewOfFile(HMap, Acc, OfsHi, OfsLo, N : LongInt) : LongInt;
-Var I, V, A, Got, K : LongInt;
+Var I, V, A, Got, K, Own : LongInt;
 Begin
   MapViewOfFile := 0;
   I := KObjOf(HMap, koMapping);
@@ -31413,19 +31789,27 @@ Begin
   For K := MaxView - 1 DownTo 0 Do
     If ViewAddr[K] = 0 Then V := K;
   If V < 0 Then Exit;
+  If KObjs^[I].F4 = 0 Then
+  Begin
+    { bloc partage : au noyau, rendu avec le mappage }
+    Own := HeapOwner; HeapOwner := 0;
+    A := KAlloc(Max(KObjs^[I].F2, 1) + 16);
+    HeapOwner := Own;
+    If A = 0 Then Exit;
+    FillMem(A, Max(KObjs^[I].F2, 1), 0);
+    If KObjs^[I].F1 <> -1 Then
+    Begin
+      SetFilePointer(KObjs^[I].F1, 0, 0, 0);
+      KReadFile(KObjs^[I].F1, A, KObjs^[I].F2, Got);
+    End;
+    KObjs^[I].F4 := A;
+  End;
+  If OfsLo >= KObjs^[I].F2 Then OfsLo := 0;
   If (N = 0) Or (OfsLo + N > KObjs^[I].F2) Then N := KObjs^[I].F2 - OfsLo;
   If N <= 0 Then N := 1;
-  A := KAlloc(N + 4096);
-  If A = 0 Then Exit;
-  FillMem(A, N, 0);
-  If KObjs^[I].F1 <> -1 Then
-  Begin
-    SetFilePointer(KObjs^[I].F1, OfsLo, 0, 0);
-    KReadFile(KObjs^[I].F1, A, N, Got);
-  End;
-  ViewAddr[V] := A; ViewMap[V] := HMap; ViewOfs[V] := OfsLo;
-  ViewSize[V] := N;
-  MapViewOfFile := A;
+  ViewAddr[V] := KObjs^[I].F4 + OfsLo; ViewMap[V] := HMap;
+  ViewOfs[V] := OfsLo; ViewSize[V] := N;
+  MapViewOfFile := ViewAddr[V];
 End;
 
 Function FlushViewOfFile(A, N : LongInt) : LongInt;
@@ -31445,7 +31829,6 @@ Begin
     If ViewAddr[V] = A Then
     Begin
       ViewFlush(V);
-      KFree(A);
       ViewAddr[V] := 0;
       UnmapViewOfFile := 1;
     End;
@@ -32299,10 +32682,13 @@ End;
   deviennent une vraie poignee, les autres sont partagees }
 Function DuplicateHandle(SP, H, TP, PH, Acc, Inh, Opt : LongInt)
   : LongInt;
-Var R : LongInt;
+Var R, I : LongInt;
 Begin
   R := H;
   If H = -2 Then R := KHandle(Threads[CurT].KObj);
+  I := KObjOf(R, 0);
+  If (I >= 0) And (KObjs^[I].Kind In [koEvent, koSemaphore, koMutex,
+     koMapping]) Then KRefAdd(I);
   If PH <> 0 Then MemL[0:PH] := R;
   DuplicateHandle := 1;
 End;
@@ -53658,6 +54044,9 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   mmioDescend, mmioAscend, mmioCreateChunk, OpenPrinterA, ClosePrinter,
   DocumentPropertiesA, EnumPrintersA, GetFileTitleA, InitCommonControls,
   InitCommonControlsEx,
+  OpenEventA, OpenSemaphoreA, WaitForSingleObjectEx, WaitForMultipleObjects,
+  WaitForMultipleObjectsEx, MsgWaitForMultipleObjects,
+  MsgWaitForMultipleObjectsEx, SignalObjectAndWait, OpenFileMappingA,
   OpenProcess, GetWindowThreadProcessId,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
@@ -63126,6 +63515,12 @@ BEGIN
   I := KAlloc(SizeOf(TMsgQArr));
   FillMem(I, SizeOf(TMsgQArr), 0);
   Move(I, MsgQ, 4);
+  I := KAlloc(SizeOf(TWaitArr));
+  FillMem(I, SizeOf(TWaitArr), 0);
+  Move(I, WaitHs, 4);
+  I := KAlloc(SizeOf(TKObjPrArr));
+  FillMem(I, SizeOf(TKObjPrArr), 0);
+  Move(I, KObjPr, 4);
   Case Mem[0:BootInfo + 3] Mod 5 Of
     1 : Language := _English;
     2 : Language := _Germany;
