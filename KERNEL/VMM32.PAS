@@ -12778,6 +12778,9 @@ Const
     -866, -809, -743, -669, -588, -500, -407, -309, -208, -105);
   MaxDesk = 12;
 
+Type
+  TFdNmArr = Array[0..199] Of String[63];
+
 Var
   { Propriete de Affichage : boite ouverte, profondeurs proposees,
     resolutions de la profondeur choisie, question de redemarrage }
@@ -12809,7 +12812,7 @@ Var
   { boite Ouvrir / Enregistrer sous }
   FdW, FdMode, FdOwner, FdN, FdSel, FdTop, FdFiltN, FdFiltI : LongInt;
   FdDir, FdName, FdMask, FdResult, FdDefExt, FdTitle : String;
-  FdNm : Array[0..199] Of String[63];
+  FdNm : ^TFdNmArr;                 { dans le tas (image sous 4 Mo) }
   FdIsDir : Array[0..199] Of Boolean;
   FdFiltDesc : Array[0..7] Of String[63];
   FdFiltPat : Array[0..7] Of String[127];
@@ -17039,12 +17042,15 @@ Const
   DevCats = 13;
   MaxRow = 96;
 
+Type
+  TDevResArr = Array[0..MaxDev - 1] Of String[160];
+
 Var
   DevN : LongInt;
   DevCat, DevIco : Array[0..MaxDev - 1] Of LongInt;
   DevName : Array[0..MaxDev - 1] Of String[63];
   DevMfg : Array[0..MaxDev - 1] Of String[31];
-  DevRes : Array[0..MaxDev - 1] Of String[160];
+  DevRes : ^TDevResArr;             { dans le tas (image sous 4 Mo) }
   CatOpen : Array[0..DevCats - 1] Of Boolean;
   RowN : LongInt;
   RowKind, RowIdx : Array[0..MaxRow - 1] Of LongInt;
@@ -17114,7 +17120,7 @@ Procedure DevAdd(C : LongInt; Const N, M, R : String);
 Begin
   If DevN >= MaxDev Then Exit;
   DevCat[DevN] := C; DevName[DevN] := N; DevMfg[DevN] := M;
-  DevRes[DevN] := R; DevIco[DevN] := CatIcon(C);
+  DevRes^[DevN] := R; DevIco[DevN] := CatIcon(C);
   Inc(DevN);
 End;
 
@@ -17819,7 +17825,7 @@ Begin
   GroupBox(X1 + 12, Y1 + 166, X2 - 12, Y2 - 40, L('Ressources',
            'Resources', 'Ressourcen', 'Risorse', 'Recursos'));
   Sunken(X1 + 22, Y1 + 182, X2 - 22, Y2 - 50, cWhite);
-  R := DevRes[D]; Y := Y1 + 186;
+  R := DevRes^[D]; Y := Y1 + 186;
   If R = '' Then
     OutTxt(X1 + 28, Y, L('Aucune ressource requise.', 'No resources ' +
            'required.', 'Keine Ressourcen.', 'Nessuna risorsa.',
@@ -18054,12 +18060,12 @@ Begin
       { insertion triee : dossiers d'abord, puis par nom }
       J := FdN;
       While (J > 0) And ((Dir And Not FdIsDir[J - 1]) Or
-            ((Dir = FdIsDir[J - 1]) And (UpStr(Nm) < UpStr(FdNm[J - 1])))) Do
+            ((Dir = FdIsDir[J - 1]) And (UpStr(Nm) < UpStr(FdNm^[J - 1])))) Do
       Begin
-        FdNm[J] := FdNm[J - 1]; FdIsDir[J] := FdIsDir[J - 1];
+        FdNm^[J] := FdNm^[J - 1]; FdIsDir[J] := FdIsDir[J - 1];
         Dec(J);
       End;
-      FdNm[J] := Nm; FdIsDir[J] := Dir;
+      FdNm^[J] := Nm; FdIsDir[J] := Dir;
       Inc(FdN);
     End;
   Until FindNextFileA(H, LongInt(@Fd)) = 0;
@@ -18151,10 +18157,10 @@ Begin
     Fg := cBlack;
     If I = FdSel Then
     Begin
-      FBar(LX1 + 23, Y, LX1 + 26 + TextW(FdNm[I]), Y + 16, cNavy);
+      FBar(LX1 + 23, Y, LX1 + 26 + TextW(FdNm^[I]), Y + 16, cNavy);
       Fg := cWhite;
     End;
-    OutTxt(LX1 + 25, Y, Fit(FdNm[I], LX2 - LX1 - 50), Fg);
+    OutTxt(LX1 + 25, Y, Fit(FdNm^[I], LX2 - LX1 - 50), Fg);
   End;
   If FdN > Vis Then
   Begin
@@ -18214,7 +18220,7 @@ Procedure FdAccept;
 Var N, F : String; Attr, Size, Time, Lba, Ram : LongInt;
 Begin
   N := Trim(FdName);
-  If (N = '') And (FdSel >= 0) Then N := FdNm[FdSel];
+  If (N = '') And (FdSel >= 0) Then N := FdNm^[FdSel];
   If N = '' Then Exit;
   If (Pos('*', N) > 0) Or (Pos('?', N) > 0) Then
   Begin
@@ -18298,13 +18304,13 @@ Begin
            (Ticks - FdClickT < 700))) Then
         Begin
           FdClickR := -1;
-          FdName := FdNm[R];
+          FdName := FdNm^[R];
           FdAccept;
           If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
           Exit;
         End;
         FdSel := R; FdClickR := R; FdClickT := Ticks;
-        If Not FdIsDir[R] Then FdName := FdNm[R];
+        If Not FdIsDir[R] Then FdName := FdNm^[R];
         KRepaint(W);
       End;
       Exit;
@@ -18351,7 +18357,7 @@ Begin
     Begin
       If VK = $26 Then FdSel := Max(0, FdSel - 1)
       Else FdSel := Min(FdN - 1, FdSel + 1);
-      If (FdSel >= 0) And Not FdIsDir[FdSel] Then FdName := FdNm[FdSel];
+      If (FdSel >= 0) And Not FdIsDir[FdSel] Then FdName := FdNm^[FdSel];
       If FdSel < FdTop Then FdTop := FdSel;
       If FdSel >= FdTop + Vis Then FdTop := FdSel - Vis + 1;
     End;
@@ -55920,7 +55926,22 @@ Begin
 End;
 
 Function VmRegStr : String;
+Var K : LongInt;
 Begin
+  If VmPM And Vm32 Then
+  Begin
+    { client DPMI 32 bits : registres complets }
+    VmRegStr := 'EAX=' + HexStr(MemL[0:VmF + fEax], 8) + ' EBX=' +
+      HexStr(MemL[0:VmF + fEbx], 8) + ' ECX=' +
+      HexStr(MemL[0:VmF + fEcx], 8) + ' EDX=' +
+      HexStr(MemL[0:VmF + fEdx], 8) + ' ESI=' +
+      HexStr(MemL[0:VmF + fEsi], 8) + ' EDI=' +
+      HexStr(MemL[0:VmF + fEdi], 8) + ' DS=' + HexStr(VR(fDs), 4) +
+      ' ES=' + HexStr(VR(fEs), 4) + ' SS:ESP=' + HexStr(VR(fSs), 4) +
+      ':' + HexStr(MemL[0:VmF + fEsp], 8);
+    Exit;
+  End;
+  K := 0;
   VmRegStr := 'AX=' + HexStr(VR(fEax), 4) + ' BX=' + HexStr(VR(fEbx), 4) +
     ' CX=' + HexStr(VR(fEcx), 4) + ' DX=' + HexStr(VR(fEdx), 4) +
     ' SI=' + HexStr(VR(fEsi), 4) + ' DI=' + HexStr(VR(fEdi), 4) +
@@ -56787,6 +56808,9 @@ End;
 Var
   VgPlanes : LongInt;            { 4 plans de 64 Ko (tas, 0 : aucun) }
   VgPlanar : Boolean;            { memoire a plans (pages absentes) }
+  { VESA (INT 10h AX=4Fxxh) : memoire de 384 Ko (alignee), fenetre de
+    64 Ko en A0000h projetee par la table des pages }
+  VgVbeBlk, VgVbe, VgBank : LongInt;
   VgMode, VgW, VgH, VgBpl : LongInt;  { mode, taille, octets par ligne }
   VgLatch : Array[0..3] Of LongInt;
   VgSeqI, VgGcI, VgAcI : LongInt;
@@ -56988,7 +57012,8 @@ Begin
   Begin
     DDW := 640;
     If VgMode = $10 Then DDH := 350
-    Else If VgMode = $12 Then DDH := 480 Else DDH := 400;
+    Else If (VgMode = $12) Or (VgMode = $101) Then DDH := 480
+    Else DDH := 400;
     If DDBufSz < DDW * DDH Then
     Begin
       I := HeapOwner; HeapOwner := 0;
@@ -57145,6 +57170,23 @@ Var Y, X, Ofs, D, Lo, Hi, K, P, C, Dy, Src, V, Sh : LongInt;
 Begin
   If Not VgShown Or (DDBuf = 0) Then Exit;
   If VgPalDirty Then VgPalSync;
+  { mode VESA : memoire lineaire de 640 points par ligne }
+  If VgMode >= $100 Then
+  Begin
+    For Y := 0 To VgH - 1 Do
+    Begin
+      Src := VgVbe + (VgStart + Y * 640) Mod (6 * 65536);
+      D := DDBuf + Y * 640;
+      For X := 0 To 159 Do
+        If MemL[0:Src + X * 4] <> MemL[0:D + X * 4] Then
+        Begin
+          MoveMem(Src, D, 640);
+          Break;
+        End;
+    End;
+    DDDirty := True;
+    Exit;
+  End;
   { memoire lineaire (13h, CGA) : lignes changees depuis la copie }
   If Not VgPlanar Then
     For Y := 0 To VgH - 1 Do
@@ -57419,12 +57461,144 @@ Begin
   If (Mode And 1) = 0 Then VmSetCur(Pg, Ox, Oy);
 End;
 
+{ ------------------------------------------------------------------ }
+{ VESA BIOS Extensions 1.2 (INT 10h AX=4Fxxh)                         }
+{ ------------------------------------------------------------------ }
+{ Modes 100h (640x400) et 101h (640x480) en 256 couleurs ; fenetre A de
+  64 Ko en A000h (AX=4F05h ou fonction de fenetre en F000:VbeO+48) }
+
+Const
+  VbeO = $4800;             { F000:4800h : nom, liste des modes, fenetre }
+
+Procedure VgMapBank;
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do
+    MemL[0:VmPt + ($A0 + I) * 4] := (VgVbe + VgBank * 65536 + I * 4096) Or 7;
+  SetCr3(GetCr3);
+End;
+
+Function VgSetVbe(M : LongInt; Clear : Boolean) : Boolean;
+Var Own : LongInt;
+Begin
+  VgSetVbe := False;
+  If (M <> $100) And (M <> $101) Then Exit;
+  If VgVbeBlk = 0 Then
+  Begin
+    Own := HeapOwner; HeapOwner := VmOwner;
+    VgVbeBlk := KAlloc(6 * 65536 + 4096);
+    HeapOwner := Own;
+    If VgVbeBlk = 0 Then Exit;
+    VgVbe := (VgVbeBlk + 4095) And Not 4095;
+    Clear := True;
+  End;
+  If Clear Then FillMem(VgVbe, 6 * 65536, 0);
+  VmGfx := True;
+  VgMode := M; VgW := 640; VgBpl := 640; VgStart := 0;
+  If M = $100 Then VgH := 400 Else VgH := 480;
+  VgPlanar := False;
+  VgBank := 0;
+  VgMapBank;
+  VgDefPal;
+  VgShow(True);
+  Mem[0:VmBda($84)] := VgH Div 16 - 1;
+  MemW[0:VmBda($85)] := 16;
+  MemW[0:VmBda($4A)] := 80;
+  VgSetVbe := True;
+End;
+
+Procedure VmVbe;
+Const
+  Win : Array[0..7] Of Byte = ($50, $B8, $05, $4F, $CD, $10, $58, $CB);
+Var AL, P, M, I : LongInt; Ok : Boolean; S : String;
+Begin
+  AL := VRL(fEax);
+  Ok := True;
+  { nom, liste des modes et fonction de fenetre dans le BIOS }
+  P := VmRam + VmBios * 16 + VbeO;
+  S := 'Pasdows 95 VBE'#0;
+  For I := 1 To Length(S) Do Mem[0:P + I - 1] := Ord(S[I]);
+  MemW[0:P + 32] := $100; MemW[0:P + 34] := $101; MemW[0:P + 36] := $FFFF;
+  For I := 0 To 7 Do Mem[0:P + 48 + I] := Win[I];
+  Case AL Of
+    0 :
+    Begin
+      P := VmPtr(fEs, fEdi);
+      FillMem(P, 256, 0);
+      Mem[0:P] := Ord('V'); Mem[0:P + 1] := Ord('E');
+      Mem[0:P + 2] := Ord('S'); Mem[0:P + 3] := Ord('A');
+      MemW[0:P + 4] := $0102;
+      MemL[0:P + 6] := (LongInt(VmBios) Shl 16) + VbeO;
+      MemL[0:P + 14] := (LongInt(VmBios) Shl 16) + VbeO + 32;
+      MemW[0:P + 18] := 6;
+    End;
+    1 :
+    Begin
+      M := VR(fEcx) And $1FF;
+      If (M <> $100) And (M <> $101) Then Ok := False
+      Else
+      Begin
+        P := VmPtr(fEs, fEdi);
+        FillMem(P, 256, 0);
+        MemW[0:P] := $1B;
+        Mem[0:P + 2] := 7;
+        MemW[0:P + 4] := 64; MemW[0:P + 6] := 64;
+        MemW[0:P + 8] := $A000;
+        MemL[0:P + 12] := (LongInt(VmBios) Shl 16) + VbeO + 48;
+        MemW[0:P + 16] := 640;
+        MemW[0:P + 18] := 640;
+        If M = $100 Then MemW[0:P + 20] := 400 Else MemW[0:P + 20] := 480;
+        Mem[0:P + 22] := 8; Mem[0:P + 23] := 16;
+        Mem[0:P + 24] := 1; Mem[0:P + 25] := 8; Mem[0:P + 26] := 1;
+        Mem[0:P + 27] := 4; Mem[0:P + 30] := 1;
+      End;
+    End;
+    2 :
+    Begin
+      M := VR(fEbx);
+      If (M And $3FFF) < $100 Then
+        VmSetMode((M And $7F) Or ((M Shr 8) And $80))
+      Else If ((M And $4000) <> 0) Or
+              Not VgSetVbe(M And $1FF, (M And $8000) = 0) Then Ok := False;
+    End;
+    3 :
+      If VgMode >= $100 Then VS(fEbx, VgMode)
+      Else VS(fEbx, Mem[0:VmBda($49)]);
+    5 :
+      If VRH(fEbx) = 1 Then VS(fEdx, VgBank)
+      Else If (VRL(fEbx) <> 0) Or (VR(fEdx) > 5) Then Ok := False
+      Else
+      Begin
+        VgBank := VR(fEdx);
+        If VgMode >= $100 Then VgMapBank;
+      End;
+    6 :
+    Begin
+      VS(fEbx, 640); VS(fEcx, 640); VS(fEdx, 6 * 65536 Div 640);
+    End;
+    7 :
+      If VRL(fEbx) = 1 Then
+      Begin
+        VSH(fEbx, 0);
+        VS(fEcx, VgStart Mod 640); VS(fEdx, VgStart Div 640);
+      End
+      Else VgStart := VR(fEdx) * 640 + VR(fEcx);
+    8 : VSH(fEbx, 6);
+  Else
+    Ok := False;
+  End;
+  If Ok Then VS(fEax, $004F) Else VS(fEax, $014F);
+End;
+
 Procedure VmInt10;
 Var AH, AL, Pg, X, Y, A, I, N, P : LongInt;
 Begin
   AH := VRH(fEax); AL := VRL(fEax);
+  If VmTrace And Not (AH In [2, 3, 8, 9, $0E]) Then
+    KLog('INT 10h ' + VmRegStr);
   Case AH Of
     $00 : VmSetMode(AL);
+    $4F : VmVbe;
     $01 : MemW[0:VmBda($60)] := VR(fEcx);
     $02 : VmSetCur(VRH(fEbx) And 7, VRL(fEdx), VRH(fEdx));
     $03 :
@@ -60645,6 +60819,11 @@ Procedure VmOut(Port, V : LongInt);
 Var P : LongInt;
 Begin
   V := V And $FF;
+  If VmTrace And ((Port = $3C5) Or (Port = $3D5) Or (Port = $3CF) Or
+     (Port = $3C2) Or (Port = $20) Or (Port = $43) Or (Port = $40)) Then
+    KLog('OUT ' + HexStr(Port, 3) + ' [' + HexStr(VgSeqI * Ord(Port = $3C5) +
+         VmCrtIdx * Ord(Port = $3D5) + VgGcI * Ord(Port = $3CF), 2) +
+         '] = ' + HexStr(V, 2));
   Case Port Of
     $20 :
       If V = $20 Then
@@ -62355,7 +62534,7 @@ Const
   VmVendorO = $0506;        { API du fournisseur 'MS-DOS' (CALL FAR) }
   DpOwner = $DD;            { proprietaire des selecteurs du client }
   VmSvMax = 16;
-  VmSvW = 22;               { mots par contexte sauve }
+  VmSvW = 23;               { mots par contexte sauve }
 
 Var
   VmDpmi : Boolean;
@@ -62372,7 +62551,13 @@ Var
   VmSgSeg, VmSgSel : Array[0..63] Of LongInt;
   VmSgN : LongInt;
   VmIrqSv : Array[0..47] Of LongInt;
+  VmIrqVec : Array[0..15] Of LongInt;  { vecteur de chaque niveau }
+  { gestionnaires en cours par IRQ (0-15) : une IRQ n'est pas redonnee
+    tant que son gestionnaire n'est pas termine (les tics en retard de
+    l'horloge emulee arriveraient sinon en rafale, imbriques) }
+  VmIrqAct : Array[0..15] Of LongInt;
   VmIrqN : LongInt;
+  VmHwRefl : Boolean;           { reflexion d'une interruption materielle }
   VmLdtSel : LongInt;           { alias de la LDT (API 'MS-DOS' 0100h) }
 
 { ------------------------- descripteurs ---------------------------- }
@@ -62533,10 +62718,28 @@ End;
 
 { Interruption N reflechie en mode reel ; PopFr : un cadre IRET du
   client est a retirer au retour (gestionnaire par defaut atteint) }
-Procedure VmReflect(N : LongInt; PopFr : Boolean);
-Var V : LongInt;
+{ IRQ (0-15) d'un vecteur d'interruption materielle ; -1 sinon }
+Function VmIrqIdx(N : LongInt) : LongInt;
 Begin
-  VmSave(1, Ord(PopFr));
+  If (N >= 8) And (N <= $0F) Then VmIrqIdx := N - 8
+  Else If (N >= $70) And (N <= $77) Then VmIrqIdx := N - $70 + 8
+  Else VmIrqIdx := -1;
+End;
+
+Procedure VmReflect(N : LongInt; PopFr : Boolean);
+Var V, A, K : LongInt;
+Begin
+  { interruption materielle (IRQ, horloge 1Ch) arrivee en mode protege :
+    le code interrompu retrouve tous ses registres ; une interruption
+    logicielle rend les registres du mode reel }
+  A := Ord(PopFr);
+  If VmHwRefl Or ((VmIrqN > 0) And (((N >= 8) And (N <= $0F)) Or
+     (N = $1C) Or ((N >= $70) And (N <= $77)))) Then A := A Or 2;
+  VmHwRefl := False;
+  VmSave(1, A);
+  K := VmIrqIdx(N);
+  VmSv[(VmSvN - 1) * VmSvW + 22] := K;
+  If ((A And 2) <> 0) And (K >= 0) Then Inc(VmIrqAct[K]);
   VmToRm;
   VmPush(VmVFlags); VmPush(VmBios); VmPush(VmRmRetO);
   VmIF := False;
@@ -62560,11 +62763,17 @@ Begin
   Fl := R[10];
   If K = 1 Then
   Begin
-    { interruption : registres generaux et indicateurs du resultat }
-    For I := 0 To 7 Do
-      If I <> 3 Then VmCtx[I] := R[I];
-    VmCtx[10] := (VmCtx[10] And Not $8D5) Or (Fl And $8D5);
-    If VmSv[B + 19] <> 0 Then
+    { interruption logicielle : registres generaux et indicateurs du
+      resultat ; materielle (bit 1) : registres du code interrompu }
+    If (VmSv[B + 19] And 2) = 0 Then
+    Begin
+      For I := 0 To 7 Do
+        If I <> 3 Then VmCtx[I] := R[I];
+      VmCtx[10] := (VmCtx[10] And Not $8D5) Or (Fl And $8D5);
+    End
+    Else If (VmSv[B + 22] >= 0) And (VmIrqAct[VmSv[B + 22]] > 0) Then
+      Dec(VmIrqAct[VmSv[B + 22]]);
+    If (VmSv[B + 19] And 1) <> 0 Then
     Begin
       { IRET du cadre empile par le client }
       L := VmPmPop(VmPmSz);
@@ -62625,6 +62834,7 @@ Begin
   End;
   Vm32 := (VR(fEax) And 1) <> 0;
   VmSgN := 0; VmSvN := 0; VmIrqN := 0;
+  FillMem(LongInt(@VmIrqAct), SizeOf(VmIrqAct), 0);
   For I := 0 To 63 Do VmMbBlk[I] := 0;
   For I := 0 To 15 Do VmCbUsed[I] := False;
   { pile reelle du serveur : les 4 Ko (SI = 100h paragraphes) donnes
@@ -62795,10 +63005,14 @@ Begin
     End;
   If (H < 0) Or (Size <= 0) Or (Size > HeapFreeBytes - 8 * 1048576) Then
     Exit;
+  { pages entieres, comme les serveurs DPMI : les extenseurs (DOS/4GW)
+    se servent de la fin de la derniere page }
+  Size := (Size + 4095) And Not 4095;
   Own := HeapOwner; HeapOwner := VmOwner;
   A := KAlloc(Size + 4096);
   HeapOwner := Own;
   If A = 0 Then Exit;
+  FillMem(A, Size + 4096, 0);
   VmMbBlk[H] := A;
   VmMbLin[H] := (A + 4095) And Not 4095;
   VmMbSize[H] := Size;
@@ -63129,7 +63343,9 @@ Var Sz : LongInt;
 Begin
   If VmPmDef(N) Then
   Begin
+    VmHwRefl := Hw;
     VmPmDefault(N, False);
+    VmHwRefl := False;
     Exit;
   End;
   Sz := VmPmSz;
@@ -63139,7 +63355,9 @@ Begin
     VmIrqSv[VmIrqN * 3] := VR(fCs);
     VmIrqSv[VmIrqN * 3 + 1] := MemL[0:VmF + fEip];
     VmIrqSv[VmIrqN * 3 + 2] := MemL[0:VmF + fFl];
+    VmIrqVec[VmIrqN] := N;
     Inc(VmIrqN);
+    If VmIrqIdx(N) >= 0 Then Inc(VmIrqAct[VmIrqIdx(N)]);
     VmPmPush(VmPmFlags, Sz); VmPmPush(VmHostCs, Sz); VmPmPush(VmIrqRetO, Sz);
     VmIF := False;
   End
@@ -63464,7 +63682,7 @@ End;
 
 { HLT d'une souche du serveur en mode protege }
 Procedure VmHostPm(Ip : LongInt);
-Var Sz, P, B, L : LongInt;
+Var Sz, P, B, L, I : LongInt;
 Begin
   If VmTrace And (Ip <> VmPmDefO + $21) And (Ip <> VmPmDefO + $31) Then
     KLog('PM souche ' + HexStr(Ip, 4) + ' ' + VmRegStr);
@@ -63487,6 +63705,8 @@ Begin
     If VmIrqN > 0 Then
     Begin
       Dec(VmIrqN);
+      I := VmIrqIdx(VmIrqVec[VmIrqN]);
+      If (I >= 0) And (VmIrqAct[I] > 0) Then Dec(VmIrqAct[I]);
       VSeg(fCs, VmIrqSv[VmIrqN * 3]);
       MemL[0:VmF + fEip] := VmIrqSv[VmIrqN * 3 + 1];
       MemL[0:VmF + fFl] := VmIrqSv[VmIrqN * 3 + 2];
@@ -63640,7 +63860,7 @@ Begin
   If Not VmIF Then Exit;
   VmTimeUpd;
   If (VmTickDue > 0) And ((VmPicMask And 1) = 0) And
-     ((VmIsr And 1) = 0) Then
+     ((VmIsr And 1) = 0) And (VmIrqAct[0] = 0) Then
   Begin
     Dec(VmTickDue);
     VmIsr := VmIsr Or 1;
@@ -63648,7 +63868,7 @@ Begin
     Exit;
   End;
   If (VmKqHead <> VmKqTail) And ((VmPicMask And 2) = 0) And
-     ((VmIsr And 3) = 0) Then
+     ((VmIsr And 3) = 0) And (VmIrqAct[1] = 0) Then
   Begin
     VmCurKey := VmKq[VmKqHead];
     VmKqHead := (VmKqHead + 1) Mod VmKqMax;
@@ -63667,7 +63887,7 @@ Begin
   If Not VmIF Then Exit;
   VmTimeUpd;
   If (VmTickDue > 0) And ((VmPicMask And 1) = 0) And
-     ((VmIsr And 1) = 0) Then
+     ((VmIsr And 1) = 0) And (VmIrqAct[0] = 0) Then
   Begin
     If Not VmPmDef(8) Then
     Begin
@@ -63686,12 +63906,22 @@ Begin
         Mem[0:VmBda($70)] := 1;
       End;
       MemL[0:VmBda($6C)] := T;
+    End
+    Else
+    Begin
+      { gestionnaire du mode reel (pilote, extenseur) : l'horloge lui
+        est reflechie meme si le client tourne dans une boucle sans
+        appel au systeme }
+      Dec(VmTickDue);
+      VmIsr := VmIsr Or 1;
+      VmPmDeliver(8, True);
+      Exit;
     End;
   End;
   If (VmKqHead <> VmKqTail) And ((VmPicMask And 2) = 0) And
-     ((VmIsr And 3) = 0) Then
+     ((VmIsr And 3) = 0) And (VmIrqAct[1] = 0) Then
   Begin
-    If Not VmPmDef(9) Then
+    If Not VmPmDef(9) Or Not VmVecDefault(9) Then
     Begin
       VmCurKey := VmKq[VmKqHead];
       VmKqHead := (VmKqHead + 1) Mod VmKqMax;
@@ -64036,6 +64266,7 @@ Begin
   DpEnd;
   VgShow(False);
   VgPlanes := 0; VgShadow := 0; VgPlanar := False; VgMode := 3;
+  VgVbeBlk := 0;
   VmGfx := False;
   VmRam := 0;
   VmT := -1;
@@ -65471,6 +65702,10 @@ BEGIN
   NextPid := 1132;
   I := KAlloc(SizeOf(TMItemArr));
   Move(I, MItemsP, 4);
+  I := KAlloc(SizeOf(TFdNmArr));
+  Move(I, FdNm, 4);
+  I := KAlloc(SizeOf(TDevResArr));
+  Move(I, DevRes, 4);
   I := KAlloc(SizeOf(TGdiArr));
   Move(I, Gdis, 4);
   I := KAlloc(SizeOf(TWndArr));

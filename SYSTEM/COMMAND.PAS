@@ -17,13 +17,18 @@ Program CMD;
 Uses Crt,DOS;
 
 Const
- CommandList:Array[0..37]of String[8]=(
+ CommandList:Array[0..38]of String[8]=(
   'BREAK','CALL','CD','CHCP','CHDIR','CLS','COPY','CTTY','DEL','DELETE',
   'DIR','ECHO','ERA','ERASE','EXIT','FOR','IF','LOADHIGH','MD','MKDIR',
   'PATH','PAUSE','PROMPT','RD','REM','REN','RENAME','RMDIR','SET',
   'SHIFT','TIME','TRUENAME','TYPE','VER','VERIFY','VOL','DATE',
-  'TIMEOUT'
+  'TIMEOUT','GOTO'
  );
+ { fichiers de traitement par lots : lignes en memoire, niveaux de CALL }
+ MaxBatLevel=8;
+ MaxBatLines=600;
+ MaxBatArgs=20;
+ BatBufSz=16384;                  { texte d'un fichier (octets) }
 
  MaxHistory=100;
 
@@ -44,8 +49,20 @@ Var
  CmdStr:String;
  CurrCommand,ParamList,PipeCommand:String;
  I,J:Byte;
+ { traitement par lots : niveau courant (0 : invite), lignes, ligne
+   suivante, parametres (%0 a %9 apres SHIFT), ECHO a l'invite }
+ BatLevel:Byte;
+ BatN,BatPc,BatShift,BatArgN:Array[1..MaxBatLevel]of Integer;
+ { lignes : chaines (longueur puis caracteres) dans BatBuf, tableaux a
+   une dimension indexes par niveau }
+ BatBuf:Array[0..MaxBatLevel*BatBufSz-1]of Char;
+ BatOfs:Array[0..MaxBatLevel*MaxBatLines-1]of LongInt;
+ BatArg:Array[0..MaxBatLevel*MaxBatArgs-1]of String[127];
+ TopEcho:Boolean;
+ ErrLevel:Integer;
 
 Procedure RunCommand;Forward;
+Procedure RunBatch(Name,Args:String);Forward;
 
 Procedure PCopy(Source,Target:Byte);Begin
  {$IFNDEF FPC}
@@ -157,61 +174,67 @@ Begin
  GetDiskLabel:=''
 End;
 
-Procedure SetEnv(EnvVar,Value:String);
-Var
- Link,
- PrevLink,
- EnvirP:Word;
- Size,Scan,Where,Dif:Integer;
- NewVar,OldVar,Test:String;
+{ Environnement du processus (API Win32) : SET le modifie, les
+  programmes lances en heritent }
+Function SetEnvironmentVariableA(N,V:Pointer):LongInt;stdcall;
+ external 'kernel32.dll' name 'SetEnvironmentVariableA';
+Function GetEnvironmentVariableA(N,B:Pointer;Sz:LongInt):LongInt;stdcall;
+ external 'kernel32.dll' name 'GetEnvironmentVariableA';
+Function GetEnvironmentStringsA:LongInt;stdcall;
+ external 'kernel32.dll' name 'GetEnvironmentStringsA';
 
- Function CheckSpace(Wanted:Integer):Boolean;Begin
-  If Wanted+Scan>Size Then InOutRes:=8;
-  CheckSpace := inoutres = 0;
+Procedure SetEnv(EnvVar,Value:String);Begin
+ EnvVar:=StrToUpper(EnvVar)+#0;
+ If Value=''Then SetEnvironmentVariableA(@EnvVar[1],Nil)
+  Else
+ Begin
+  Value:=Value+#0;
+  SetEnvironmentVariableA(@EnvVar[1],@Value[1]);
  End;
+End;
 
+Function EnvGet(Name:String):String;
+Var
+ B:Array[0..259]of Char;
+ N,K:LongInt;
+ R:String;
 Begin
- {$IFNDEF FPC}
-  If InOutRes>0 Then Exit;
-  For Scan:=1 TO Length(EnvVar)do EnvVar[Scan]:=UpCase(EnvVar[Scan]);
-  EnvVar:=EnvVar+'=';
-  NewVar:=EnvVar+Value+#0;
-  link:=PrefixSeg;
-  Repeat
-   PrevLink:=Link;
-   Link:=MemW[link:$16];
-  Until Link=prevlink;
-  EnvirP:=MemW[Link:$2C];
-  Size:=MemW[Envirp-1:$03]*16;
-  Scan:=0;
-  Where:=-1;
-  While mem[EnvirP:Scan]<>0 do Begin
-   Move(mem[EnvirP:Scan],Test[1],255);
-   Test[0]:=#255;
-   Test[0]:=Chr(pos(#0,Test));
-   If Pos(EnvVar,Test)=1 Then Begin
-    Where:=Scan;
-    OldVar:=Test;
+ Name:=StrToUpper(Name)+#0;
+ N:=GetEnvironmentVariableA(@Name[1],@B,256);
+ R:='';
+ If(N>0)and(N<256)Then For K:=0 to N-1 do R:=R+B[K];
+ EnvGet:=R;
+End;
+
+{ Afficher les variables (pause : une page a la fois) }
+Procedure EnvList(Pause:Boolean);
+Type
+ PB=^Byte;
+Var
+ A,P:LongInt;
+ S:String;
+Begin
+ A:=GetEnvironmentStringsA;
+ If A=0Then Exit;
+ P:=0;
+ While PB(A)^<>0 do Begin
+  S:='';
+  While PB(A)^<>0 do Begin
+   If Length(S)<255Then S:=S+Chr(PB(A)^);
+   Inc(A);
+  End;
+  Inc(A);
+  WriteLn(S);
+  If(Pause)Then Begin
+   Inc(P);
+   If P=Hi(WindMax)Then Begin
+    Write('Presse une touche pour continuer...');
+    ReadKey;
+    WriteLn;
+    P:=0;
    End;
-   Scan:=Scan+Length(Test);
   End;
-  If Where=-1 Then Begin
-   Where:=Scan;
-   NewVar:=NewVar+#0#0#0;
-   If Not CheckSpace(Length(NewVar)) Then Exit;
-  End
-   Else
-  Begin
-   Dif:=Length(NewVar)-Length(OldVar);
-   If Dif>0 Then Begin
-    If Not CheckSpace(Dif)Then Exit;
-    Move(mem[EnvirP:Where], mem[EnvirP:Where+Dif],Scan-Where+3);
-   End
-    Else
-   If Dif<0 Then Move(mem[EnvirP:Where-Dif],Mem[EnvirP:Where],Size-Where+Dif);
-  End;
-  Move(NewVar[1],Mem[EnvirP:Where],Length(NewVar));
- {$ENDIF}
+ End;
 End;
 
 Procedure Box(X1,Y1,X2,Y2,Couleur:Byte);Begin
@@ -499,7 +522,7 @@ Var
 Begin
  If Not(Echo)Then Exit;
  GetDir(0,CurrentDir);
- SP:=GetEnv('PROMPT');
+ SP:=EnvGet('PROMPT');
  If SP=''Then SP:='$P$G';
  I:=1;
  While I<=Length(SP)do Begin
@@ -594,8 +617,63 @@ Begin
  End;
 End;
 
-Procedure CallCommand;Begin
- WriteLn('Cette commande n''est pas mise en oeuvre');
+{ Ligne K (1..BatN) du fichier de niveau L }
+Function BatGetLine(L,K:Integer):String;
+Var
+ O,N,X:LongInt;
+ S:String;
+Begin
+ O:=BatOfs[(L-1)*MaxBatLines+K-1];
+ N:=Ord(BatBuf[O]);
+ S:='';
+ For X:=1 to N do S:=S+BatBuf[O+X];
+ BatGetLine:=S;
+End;
+
+{ Parametre N du fichier de niveau L }
+Function BatGetArg(L,N:Integer):String;Begin
+ BatGetArg:=BatArg[(L-1)*MaxBatArgs+N];
+End;
+
+{ Premier mot de S (retire de S, espaces de tete enleves) }
+Function NextWord(Var S:String):String;
+Var
+ P:Integer;
+Begin
+ S:=TrimL(S);
+ P:=1;
+ While(P<=Length(S))and Not(S[P]in[' ',#9])do Inc(P);
+ NextWord:=Copy(S,1,P-1);
+ S:=TrimL(Copy(S,P,255));
+End;
+
+{ Nom du fichier de traitement par lots d'une commande ('' sinon) }
+Function BatchOf(Cmd:String):String;
+Begin
+ BatchOf:='';
+ Cmd:=StrToUpper(Cmd);
+ If Cmd=''Then Exit;
+ If Copy(Cmd,Length(Cmd)-3,4)='.BAT'Then Begin
+  If FileExist(Cmd)Then BatchOf:=Cmd;
+ End
+  Else
+ If FileExist(Cmd+'.BAT')Then BatchOf:=Cmd+'.BAT';
+End;
+
+{ CALL : un fichier de traitement par lots revient ensuite a l'appelant }
+Procedure CallCommand;
+Var
+ S,W,B:String;
+Begin
+ S:=ParamList;
+ W:=NextWord(S);
+ B:=BatchOf(W);
+ If B<>''Then RunBatch(B,S)
+  Else
+ If W<>''Then Begin
+  CmdStr:=ParamList;
+  RunCommand;
+ End;
 End;
 
 Procedure ChDirCommand;
@@ -1404,8 +1482,81 @@ Begin
  End;
 End;
 
-Procedure IfCommand;Begin
- WriteLn('Cette commande n''est pas mise en oeuvre');
+{ IF [NOT] ERRORLEVEL n | EXIST fichier | chaine1==chaine2 commande }
+Procedure IfCommand;
+Var
+ S,W,A,B:String;
+ Neg,Cond:Boolean;
+ N,E,P:Integer;
+ Sr:SearchRec;
+Begin
+ S:=ParamList;
+ Neg:=False;
+ W:=StrToUpper(NextWord(S));
+ If W='NOT'Then Begin
+  Neg:=True;
+  W:=StrToUpper(NextWord(S));
+ End;
+ If W='ERRORLEVEL'Then Begin
+  Val(NextWord(S),N,E);
+  Cond:=(E=0)and(ErrLevel>=N);
+ End
+  Else
+ If W='EXIST'Then Begin
+  A:=NextWord(S);
+  FindFirst(A,AnyFile-Directory-VolumeID,Sr);
+  Cond:=DosError=0;
+ End
+  Else
+ Begin
+  { chaine1==chaine2 : W peut contenir les deux, ou une partie }
+  S:=ParamList;
+  If Neg Then W:=NextWord(S);
+  P:=Pos('==',S);
+  If P=0Then Begin
+   WriteLn('Erreur de syntaxe');
+   Exit;
+  End;
+  A:=Copy(S,1,P-1);
+  While(Length(A)>0)and(A[Length(A)]=' ')do Delete(A,Length(A),1);
+  A:=TrimL(A);
+  S:=TrimL(Copy(S,P+2,255));
+  B:=NextWord(S);
+  Cond:=A=B;
+ End;
+ If Neg Then Cond:=Not Cond;
+ If Cond and(S<>'')Then Begin
+  CmdStr:=S;
+  RunCommand;
+ End;
+End;
+
+{ GOTO etiquette (GOTO :EOF termine le fichier) }
+Procedure GotoCommand;
+Var
+ S,L,T:String;
+ K:Integer;
+Begin
+ If BatLevel=0Then Exit;
+ S:=ParamList;
+ L:=StrToUpper(NextWord(S));
+ If(L<>'')and(L[1]=':')Then Delete(L,1,1);
+ If L='EOF'Then Begin
+  BatPc[BatLevel]:=BatN[BatLevel]+1;
+  Exit;
+ End;
+ For K:=1 to BatN[BatLevel]do Begin
+  T:=TrimL(BatGetLine(BatLevel,K));
+  If(T<>'')and(T[1]=':')Then Begin
+   T:=Copy(T,2,255);
+   If StrToUpper(NextWord(T))=L Then Begin
+    BatPc[BatLevel]:=K+1;
+    Exit;
+   End;
+  End;
+ End;
+ WriteLn('Etiquette introuvable');
+ BatPc[BatLevel]:=BatN[BatLevel]+1;
 End;
 
 Procedure LoadHighCommand;Begin
@@ -1463,7 +1614,7 @@ Begin
 End;
 
 Procedure PathCommand;Begin
- WriteLn(GetEnv('PATH'));
+ WriteLn(EnvGet('PATH'));
 End;
 
 Procedure PauseCommand;
@@ -1715,24 +1866,12 @@ Begin
   Else
  Begin
   If(FirstParam='/P')or(FirstParam='/p')Then Pause:=True;
-  P:=0;
-  For I:=0to EnvCount do Begin
-   WriteLn(EnvStr(I));
-   If(Pause)Then Begin
-    Inc(P);
-    If P=Hi(WindMax)Then Begin
-     Write('Presse une touche pour continuer...');
-     ReadKey;
-     WriteLn;
-     P:=0;
-    End;
-   End;
-  End;
+  EnvList(Pause);
  End;
 End;
 
 Procedure ShiftCommand;Begin
- WriteLn('Cette commande n''est pas mise en oeuvre');
+ If BatLevel>0Then Inc(BatShift[BatLevel]);
 End;
 
 Procedure TimeCommand;
@@ -2117,25 +2256,131 @@ Var
 Begin
  Exec(CurrCommand,ParamList);
  Err:=DosError;
+ If Err=0Then ErrLevel:=DosExitCode;
  Case Err of
   0:;
   2:WriteLn('Commande ou nom de fichier non reconnu');
   Else Write(GetErrorMessage(Err));
  End;
- WriteLn;
+ If BatLevel=0Then WriteLn;
+End;
+
+{ Parametres %0 a %9, variables %NOM% et %% d'une ligne }
+Function BatExpand(S:String;L:Byte):String;
+Var
+ R,V:String;
+ K,P,N:Integer;
+Begin
+ R:='';
+ K:=1;
+ While K<=Length(S)do Begin
+  If(S[K]='%')and(K<Length(S))Then Begin
+   If S[K+1]='%'Then Begin
+    R:=R+'%';
+    Inc(K,2);
+   End
+    Else
+   If S[K+1]in['0'..'9']Then Begin
+    N:=Ord(S[K+1])-48;
+    If N>0Then N:=N+BatShift[L];
+    If N<BatArgN[L]Then R:=R+BatGetArg(L,N);
+    Inc(K,2);
+   End
+    Else
+   Begin
+    P:=K+1;
+    While(P<=Length(S))and(S[P]<>'%')do Inc(P);
+    If P<=Length(S)Then Begin
+     V:=Copy(S,K+1,P-K-1);
+     R:=R+EnvGet(V);
+     K:=P+1;
+    End
+     Else
+    Begin
+     R:=R+'%';
+     Inc(K);
+    End;
+   End;
+  End
+   Else
+  Begin
+   R:=R+S[K];
+   Inc(K);
+  End;
+ End;
+ BatExpand:=R;
+End;
+
+{ Executer le fichier de traitement par lots Name avec ses parametres }
+Procedure RunBatch(Name,Args:String);
+Var
+ F:Text;
+ L:Byte;
+ K:Integer;
+ O:LongInt;
+ S:String;
+ Silent:Boolean;
+Begin
+ If BatLevel>=MaxBatLevel Then Begin
+  WriteLn('Limite de ',MaxBatLevel,
+          ' fichiers de traitement par lots imbriques');
+  Exit;
+ End;
+ Assign(F,Name);
+ {$I-}Reset(F);{$I+}
+ If IOResult<>0Then Begin
+  WriteLn('Probleme de lecture du fichier de traitement par lot');
+  Exit;
+ End;
+ If BatLevel=0Then TopEcho:=Echo;
+ Inc(BatLevel);
+ L:=BatLevel;
+ BatN[L]:=0;
+ O:=(L-1)*BatBufSz;
+ While Not EOF(F)and(BatN[L]<MaxBatLines)do Begin
+  ReadLn(F,S);
+  If O+Length(S)+1>L*BatBufSz Then Break;
+  BatOfs[(L-1)*MaxBatLines+BatN[L]]:=O;
+  Inc(BatN[L]);
+  BatBuf[O]:=Chr(Length(S));
+  For K:=1 to Length(S)do BatBuf[O+K]:=S[K];
+  O:=O+Length(S)+1;
+ End;
+ Close(F);
+ BatArg[(L-1)*MaxBatArgs]:=Name;
+ BatArgN[L]:=1;
+ While(Args<>'')and(BatArgN[L]<MaxBatArgs)do Begin
+  BatArg[(L-1)*MaxBatArgs+BatArgN[L]]:=NextWord(Args);
+  Inc(BatArgN[L]);
+ End;
+ BatShift[L]:=0;
+ BatPc[L]:=1;
+ While(BatPc[L]<=BatN[L])and Not(Terminated)do Begin
+  S:=TrimL(BatGetLine(L,BatPc[L]));
+  Inc(BatPc[L]);
+  If(S='')or(S[1]=':')Then Continue;
+  Silent:=S[1]='@';
+  If Silent Then S:=TrimL(Copy(S,2,255));
+  S:=BatExpand(S,L);
+  If S=''Then Continue;
+  If Echo and Not(Silent)Then WriteLn(S);
+  CmdStr:=S;
+  RunCommand;
+ End;
+ Dec(BatLevel);
+ If BatLevel=0Then Echo:=TopEcho;
 End;
 
 Procedure RunCommand;
 Label
  Restart;
 Var
- LastEcho:Boolean;
- FileBat:Text;
  OY:Byte;
  Error:Word;
  PipeS,BatchName:String;
 Begin
- AddHistory(CmdStr);
+ If(CmdStr<>'')and(CmdStr[1]='@')Then CmdStr:=TrimL(Copy(CmdStr,2,255));
+ If BatLevel=0Then AddHistory(CmdStr);
   { Change d'unit‚ de disque A:, B:, C:, D:,... }
  If(Length(CmdStr)=2)and(CmdStr[2]=':')and(CmdStr[1]in['A'..'Z',
    'a'..'z'])Then Begin
@@ -2214,10 +2459,11 @@ Restart:
     35:VolCommand;
     36:DateCommand;
     37:TimeOutCommand;
+    38:GotoCommand;
    End;
    If J<=High(CommandList)Then Begin
     CommandFound:=True;
-    WriteLn;
+    If BatLevel=0Then WriteLn;
     Break;
    End;
   End;
@@ -2242,14 +2488,7 @@ Restart:
  If Not(CommandFound)Then Begin
   { fichier de traitement par lots : NOM ou NOM.BAT (sans les
     parametres de la ligne) }
-  BatchName:='';
-  If Pos('.',CurrCommand)=0Then Begin
-   If(CurrCommand<>'')and FileExist(CurrCommand+'.BAT')Then
-    BatchName:=CurrCommand+'.BAT';
-  End
-   Else
-  If(Copy(CurrCommand,Length(CurrCommand)-3,4)='.BAT')and
-    FileExist(CurrCommand)Then BatchName:=CurrCommand;
+  BatchName:=BatchOf(CurrCommand);
   If CmdStr='?'Then Begin
    For I:=Low(CommandList) to High(CommandList)
      do Write(PadRight(CommandList[I],10));
@@ -2258,26 +2497,9 @@ Restart:
   End
    Else
   If BatchName<>''Then Begin
-   Inc(InCmd);
-   If InCmd>20Then Begin
-    WriteLn('Limite de 20 fichiers de traitements par lots maximum.');
-    Exit;
-   End;
-   LastEcho:=Echo;
-   Assign(FileBat,BatchName);
-   {$I-}Reset(FileBat);{$I+}
-   If IOResult=0Then Begin
-    While Not EOF(FileBat)do Begin
-     ReadLn(FileBat,CmdStr);
-     If(Echo)Then WriteLn(CmdStr);
-     RunCommand;
-    End;
-    Close(FileBat);
-   End
-    Else
-   WriteLn('Probleme de lecture du fichier de traitement par lot');
-   Echo:=LastEcho;
-   Dec(InCmd);
+   { sans CALL, le fichier appelant ne reprend pas }
+   If BatLevel>0Then BatPc[BatLevel]:=BatN[BatLevel]+1;
+   RunBatch(BatchName,ParamList);
   End
    Else
   UnknownCommand;
@@ -2433,7 +2655,7 @@ BEGIN
   {$ENDIF}
  {$ENDIF}
  Language:=_French;
- TmpLanguage:=GetEnv('LANGUAGE');
+ TmpLanguage:=EnvGet('LANGUAGE');
  If TmpLanguage<>''Then Begin
   If TmpLanguage[1]='"'Then TmpLanguage:=Copy(TmpLanguage,2,255);
   If StrToUpper(Copy(TmpLanguage,1,2))='EN'Then Language:=_English Else
@@ -2452,6 +2674,7 @@ BEGIN
  NumberHistory:=0;
  Echo:=True;Pipe:=False;PipeToCommand:=False;
  InCmd:=0;
+ BatLevel:=0;ErrLevel:=0;TopEcho:=True;
  If(ParamStr(1)='/?')or(ParamStr(1)='--help')or(ParamStr(1)='-h')Then Begin
   Case Language of
    _Germany:Begin
