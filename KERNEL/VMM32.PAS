@@ -12778,6 +12778,9 @@ Const
     -866, -809, -743, -669, -588, -500, -407, -309, -208, -105);
   MaxDesk = 12;
 
+Type
+  TFdNmArr = Array[0..199] Of String[63];
+
 Var
   { Propriete de Affichage : boite ouverte, profondeurs proposees,
     resolutions de la profondeur choisie, question de redemarrage }
@@ -12809,7 +12812,7 @@ Var
   { boite Ouvrir / Enregistrer sous }
   FdW, FdMode, FdOwner, FdN, FdSel, FdTop, FdFiltN, FdFiltI : LongInt;
   FdDir, FdName, FdMask, FdResult, FdDefExt, FdTitle : String;
-  FdNm : Array[0..199] Of String[63];
+  FdNm : ^TFdNmArr;                 { dans le tas (image sous 4 Mo) }
   FdIsDir : Array[0..199] Of Boolean;
   FdFiltDesc : Array[0..7] Of String[63];
   FdFiltPat : Array[0..7] Of String[127];
@@ -17039,12 +17042,15 @@ Const
   DevCats = 13;
   MaxRow = 96;
 
+Type
+  TDevResArr = Array[0..MaxDev - 1] Of String[160];
+
 Var
   DevN : LongInt;
   DevCat, DevIco : Array[0..MaxDev - 1] Of LongInt;
   DevName : Array[0..MaxDev - 1] Of String[63];
   DevMfg : Array[0..MaxDev - 1] Of String[31];
-  DevRes : Array[0..MaxDev - 1] Of String[160];
+  DevRes : ^TDevResArr;             { dans le tas (image sous 4 Mo) }
   CatOpen : Array[0..DevCats - 1] Of Boolean;
   RowN : LongInt;
   RowKind, RowIdx : Array[0..MaxRow - 1] Of LongInt;
@@ -17114,7 +17120,7 @@ Procedure DevAdd(C : LongInt; Const N, M, R : String);
 Begin
   If DevN >= MaxDev Then Exit;
   DevCat[DevN] := C; DevName[DevN] := N; DevMfg[DevN] := M;
-  DevRes[DevN] := R; DevIco[DevN] := CatIcon(C);
+  DevRes^[DevN] := R; DevIco[DevN] := CatIcon(C);
   Inc(DevN);
 End;
 
@@ -17819,7 +17825,7 @@ Begin
   GroupBox(X1 + 12, Y1 + 166, X2 - 12, Y2 - 40, L('Ressources',
            'Resources', 'Ressourcen', 'Risorse', 'Recursos'));
   Sunken(X1 + 22, Y1 + 182, X2 - 22, Y2 - 50, cWhite);
-  R := DevRes[D]; Y := Y1 + 186;
+  R := DevRes^[D]; Y := Y1 + 186;
   If R = '' Then
     OutTxt(X1 + 28, Y, L('Aucune ressource requise.', 'No resources ' +
            'required.', 'Keine Ressourcen.', 'Nessuna risorsa.',
@@ -18054,12 +18060,12 @@ Begin
       { insertion triee : dossiers d'abord, puis par nom }
       J := FdN;
       While (J > 0) And ((Dir And Not FdIsDir[J - 1]) Or
-            ((Dir = FdIsDir[J - 1]) And (UpStr(Nm) < UpStr(FdNm[J - 1])))) Do
+            ((Dir = FdIsDir[J - 1]) And (UpStr(Nm) < UpStr(FdNm^[J - 1])))) Do
       Begin
-        FdNm[J] := FdNm[J - 1]; FdIsDir[J] := FdIsDir[J - 1];
+        FdNm^[J] := FdNm^[J - 1]; FdIsDir[J] := FdIsDir[J - 1];
         Dec(J);
       End;
-      FdNm[J] := Nm; FdIsDir[J] := Dir;
+      FdNm^[J] := Nm; FdIsDir[J] := Dir;
       Inc(FdN);
     End;
   Until FindNextFileA(H, LongInt(@Fd)) = 0;
@@ -18151,10 +18157,10 @@ Begin
     Fg := cBlack;
     If I = FdSel Then
     Begin
-      FBar(LX1 + 23, Y, LX1 + 26 + TextW(FdNm[I]), Y + 16, cNavy);
+      FBar(LX1 + 23, Y, LX1 + 26 + TextW(FdNm^[I]), Y + 16, cNavy);
       Fg := cWhite;
     End;
-    OutTxt(LX1 + 25, Y, Fit(FdNm[I], LX2 - LX1 - 50), Fg);
+    OutTxt(LX1 + 25, Y, Fit(FdNm^[I], LX2 - LX1 - 50), Fg);
   End;
   If FdN > Vis Then
   Begin
@@ -18214,7 +18220,7 @@ Procedure FdAccept;
 Var N, F : String; Attr, Size, Time, Lba, Ram : LongInt;
 Begin
   N := Trim(FdName);
-  If (N = '') And (FdSel >= 0) Then N := FdNm[FdSel];
+  If (N = '') And (FdSel >= 0) Then N := FdNm^[FdSel];
   If N = '' Then Exit;
   If (Pos('*', N) > 0) Or (Pos('?', N) > 0) Then
   Begin
@@ -18298,13 +18304,13 @@ Begin
            (Ticks - FdClickT < 700))) Then
         Begin
           FdClickR := -1;
-          FdName := FdNm[R];
+          FdName := FdNm^[R];
           FdAccept;
           If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
           Exit;
         End;
         FdSel := R; FdClickR := R; FdClickT := Ticks;
-        If Not FdIsDir[R] Then FdName := FdNm[R];
+        If Not FdIsDir[R] Then FdName := FdNm^[R];
         KRepaint(W);
       End;
       Exit;
@@ -18351,7 +18357,7 @@ Begin
     Begin
       If VK = $26 Then FdSel := Max(0, FdSel - 1)
       Else FdSel := Min(FdN - 1, FdSel + 1);
-      If (FdSel >= 0) And Not FdIsDir[FdSel] Then FdName := FdNm[FdSel];
+      If (FdSel >= 0) And Not FdIsDir[FdSel] Then FdName := FdNm^[FdSel];
       If FdSel < FdTop Then FdTop := FdSel;
       If FdSel >= FdTop + Vis Then FdTop := FdSel - Vis + 1;
     End;
@@ -32168,12 +32174,70 @@ Begin
   OpenMutexA := KOpenNamed(Name, koMutex);
 End;
 
-Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
-Var S : String;
+{ Chemin complet (X:\...) -> nom long (Long) ou court (8.3) de chaque
+  composant, lus dans les repertoires ; un composant avec des jokers
+  est garde tel quel. False si un composant n'existe pas. }
+Function PathConv(S : String; Long : Boolean; Var R : String) : Boolean;
+Var Fd : Array[0..319] Of Byte; Part, Cur, N : String; P, H : LongInt;
 Begin
-  S := PStr(PLong);
-  If (PShort <> 0) And (N > Length(S)) Then PutPStr(PShort, S, N);
-  GetShortPathNameA := Length(S);
+  PathConv := False;
+  R := '';
+  If (Length(S) < 2) Or (S[2] <> ':') Then Exit;
+  R := UpCase(S[1]) + ':';
+  S := Copy(S, 3, 255);
+  While S <> '' Do
+  Begin
+    P := Pos('\', S);
+    If P > 0 Then
+    Begin
+      Part := Copy(S, 1, P - 1);
+      Delete(S, 1, P);
+    End
+    Else
+    Begin
+      Part := S;
+      S := '';
+    End;
+    If Part = '' Then Continue;
+    If (Pos('*', Part) > 0) Or (Pos('?', Part) > 0) Then N := Part
+    Else
+    Begin
+      Cur := R + '\' + Part + #0;
+      H := FindFirstFileA(LongInt(@Cur[1]), LongInt(@Fd));
+      If H = INVALID_HANDLE Then Exit;
+      FindClose(H);
+      N := PStr(LongInt(@Fd) + 44);
+      If Not Long And (PStr(LongInt(@Fd) + 304) <> '') Then
+        N := PStr(LongInt(@Fd) + 304);
+      If N = '' Then N := Part;
+    End;
+    R := R + '\' + N;
+  End;
+  If Length(R) = 2 Then R := R + '\';
+  PathConv := True;
+End;
+
+{ GetShortPathName et GetLongPathName : un chemin complet existant est
+  converti ; sinon il est rendu tel quel }
+Function PathConvApi(PIn, POut, N : LongInt; Long : Boolean) : LongInt;
+Var S, R : String;
+Begin
+  S := PStr(PIn);
+  If (Length(S) >= 3) And (S[2] = ':') And (S[3] = '\') Then
+    If PathConv(S, Long, R) Then S := R;
+  If (POut <> 0) And (N > Length(S)) Then PutPStr(POut, S, N);
+  If N > Length(S) Then PathConvApi := Length(S)
+  Else PathConvApi := Length(S) + 1;
+End;
+
+Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
+Begin
+  GetShortPathNameA := PathConvApi(PLong, PShort, N, False);
+End;
+
+Function GetLongPathNameA(PShort, PLong, N : LongInt) : LongInt;
+Begin
+  GetLongPathNameA := PathConvApi(PShort, PLong, N, True);
 End;
 
 Function GetLogicalDriveStringsA(N, Buf : LongInt) : LongInt;
@@ -55412,6 +55476,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  GetLongPathNameA,
   TrackPopupMenuEx, LoadMenuW, LoadMenuIndirectA, LoadMenuIndirectW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
@@ -55714,6 +55779,11 @@ Var
   VmFindH, VmFindSeq : Array[0..VmMaxFind - 1] Of LongInt;
   VmFindNext, VmFindCnt : LongInt;
   VmTmp : LongInt;              { tampon du noyau (1 Ko) }
+  VmKeepCase : Boolean;         { VmFullPath conserve la casse (LFN) }
+  { recherches des noms longs (AX=714Eh) : poignee du noyau, attributs
+    permis et exiges, format des dates }
+  VmLfH, VmLfAttr, VmLfFmt : Array[0..VmMaxFind - 1] Of LongInt;
+  VmLfNext : LongInt;
   VmLine : String;              { reste d'une ligne lue sur CON }
   VmLineOk : Boolean;
   { souris (INT 33h) }
@@ -55856,7 +55926,22 @@ Begin
 End;
 
 Function VmRegStr : String;
+Var K : LongInt;
 Begin
+  If VmPM And Vm32 Then
+  Begin
+    { client DPMI 32 bits : registres complets }
+    VmRegStr := 'EAX=' + HexStr(MemL[0:VmF + fEax], 8) + ' EBX=' +
+      HexStr(MemL[0:VmF + fEbx], 8) + ' ECX=' +
+      HexStr(MemL[0:VmF + fEcx], 8) + ' EDX=' +
+      HexStr(MemL[0:VmF + fEdx], 8) + ' ESI=' +
+      HexStr(MemL[0:VmF + fEsi], 8) + ' EDI=' +
+      HexStr(MemL[0:VmF + fEdi], 8) + ' DS=' + HexStr(VR(fDs), 4) +
+      ' ES=' + HexStr(VR(fEs), 4) + ' SS:ESP=' + HexStr(VR(fSs), 4) +
+      ':' + HexStr(MemL[0:VmF + fEsp], 8);
+    Exit;
+  End;
+  K := 0;
   VmRegStr := 'AX=' + HexStr(VR(fEax), 4) + ' BX=' + HexStr(VR(fEbx), 4) +
     ' CX=' + HexStr(VR(fEcx), 4) + ' DX=' + HexStr(VR(fEdx), 4) +
     ' SI=' + HexStr(VR(fEsi), 4) + ' DI=' + HexStr(VR(fEdi), 4) +
@@ -56723,6 +56808,9 @@ End;
 Var
   VgPlanes : LongInt;            { 4 plans de 64 Ko (tas, 0 : aucun) }
   VgPlanar : Boolean;            { memoire a plans (pages absentes) }
+  { VESA (INT 10h AX=4Fxxh) : memoire de 384 Ko (alignee), fenetre de
+    64 Ko en A0000h projetee par la table des pages }
+  VgVbeBlk, VgVbe, VgBank : LongInt;
   VgMode, VgW, VgH, VgBpl : LongInt;  { mode, taille, octets par ligne }
   VgLatch : Array[0..3] Of LongInt;
   VgSeqI, VgGcI, VgAcI : LongInt;
@@ -56924,7 +57012,8 @@ Begin
   Begin
     DDW := 640;
     If VgMode = $10 Then DDH := 350
-    Else If VgMode = $12 Then DDH := 480 Else DDH := 400;
+    Else If (VgMode = $12) Or (VgMode = $101) Then DDH := 480
+    Else DDH := 400;
     If DDBufSz < DDW * DDH Then
     Begin
       I := HeapOwner; HeapOwner := 0;
@@ -57081,6 +57170,23 @@ Var Y, X, Ofs, D, Lo, Hi, K, P, C, Dy, Src, V, Sh : LongInt;
 Begin
   If Not VgShown Or (DDBuf = 0) Then Exit;
   If VgPalDirty Then VgPalSync;
+  { mode VESA : memoire lineaire de 640 points par ligne }
+  If VgMode >= $100 Then
+  Begin
+    For Y := 0 To VgH - 1 Do
+    Begin
+      Src := VgVbe + (VgStart + Y * 640) Mod (6 * 65536);
+      D := DDBuf + Y * 640;
+      For X := 0 To 159 Do
+        If MemL[0:Src + X * 4] <> MemL[0:D + X * 4] Then
+        Begin
+          MoveMem(Src, D, 640);
+          Break;
+        End;
+    End;
+    DDDirty := True;
+    Exit;
+  End;
   { memoire lineaire (13h, CGA) : lignes changees depuis la copie }
   If Not VgPlanar Then
     For Y := 0 To VgH - 1 Do
@@ -57355,12 +57461,144 @@ Begin
   If (Mode And 1) = 0 Then VmSetCur(Pg, Ox, Oy);
 End;
 
+{ ------------------------------------------------------------------ }
+{ VESA BIOS Extensions 1.2 (INT 10h AX=4Fxxh)                         }
+{ ------------------------------------------------------------------ }
+{ Modes 100h (640x400) et 101h (640x480) en 256 couleurs ; fenetre A de
+  64 Ko en A000h (AX=4F05h ou fonction de fenetre en F000:VbeO+48) }
+
+Const
+  VbeO = $4800;             { F000:4800h : nom, liste des modes, fenetre }
+
+Procedure VgMapBank;
+Var I : LongInt;
+Begin
+  For I := 0 To 15 Do
+    MemL[0:VmPt + ($A0 + I) * 4] := (VgVbe + VgBank * 65536 + I * 4096) Or 7;
+  SetCr3(GetCr3);
+End;
+
+Function VgSetVbe(M : LongInt; Clear : Boolean) : Boolean;
+Var Own : LongInt;
+Begin
+  VgSetVbe := False;
+  If (M <> $100) And (M <> $101) Then Exit;
+  If VgVbeBlk = 0 Then
+  Begin
+    Own := HeapOwner; HeapOwner := VmOwner;
+    VgVbeBlk := KAlloc(6 * 65536 + 4096);
+    HeapOwner := Own;
+    If VgVbeBlk = 0 Then Exit;
+    VgVbe := (VgVbeBlk + 4095) And Not 4095;
+    Clear := True;
+  End;
+  If Clear Then FillMem(VgVbe, 6 * 65536, 0);
+  VmGfx := True;
+  VgMode := M; VgW := 640; VgBpl := 640; VgStart := 0;
+  If M = $100 Then VgH := 400 Else VgH := 480;
+  VgPlanar := False;
+  VgBank := 0;
+  VgMapBank;
+  VgDefPal;
+  VgShow(True);
+  Mem[0:VmBda($84)] := VgH Div 16 - 1;
+  MemW[0:VmBda($85)] := 16;
+  MemW[0:VmBda($4A)] := 80;
+  VgSetVbe := True;
+End;
+
+Procedure VmVbe;
+Const
+  Win : Array[0..7] Of Byte = ($50, $B8, $05, $4F, $CD, $10, $58, $CB);
+Var AL, P, M, I : LongInt; Ok : Boolean; S : String;
+Begin
+  AL := VRL(fEax);
+  Ok := True;
+  { nom, liste des modes et fonction de fenetre dans le BIOS }
+  P := VmRam + VmBios * 16 + VbeO;
+  S := 'Pasdows 95 VBE'#0;
+  For I := 1 To Length(S) Do Mem[0:P + I - 1] := Ord(S[I]);
+  MemW[0:P + 32] := $100; MemW[0:P + 34] := $101; MemW[0:P + 36] := $FFFF;
+  For I := 0 To 7 Do Mem[0:P + 48 + I] := Win[I];
+  Case AL Of
+    0 :
+    Begin
+      P := VmPtr(fEs, fEdi);
+      FillMem(P, 256, 0);
+      Mem[0:P] := Ord('V'); Mem[0:P + 1] := Ord('E');
+      Mem[0:P + 2] := Ord('S'); Mem[0:P + 3] := Ord('A');
+      MemW[0:P + 4] := $0102;
+      MemL[0:P + 6] := (LongInt(VmBios) Shl 16) + VbeO;
+      MemL[0:P + 14] := (LongInt(VmBios) Shl 16) + VbeO + 32;
+      MemW[0:P + 18] := 6;
+    End;
+    1 :
+    Begin
+      M := VR(fEcx) And $1FF;
+      If (M <> $100) And (M <> $101) Then Ok := False
+      Else
+      Begin
+        P := VmPtr(fEs, fEdi);
+        FillMem(P, 256, 0);
+        MemW[0:P] := $1B;
+        Mem[0:P + 2] := 7;
+        MemW[0:P + 4] := 64; MemW[0:P + 6] := 64;
+        MemW[0:P + 8] := $A000;
+        MemL[0:P + 12] := (LongInt(VmBios) Shl 16) + VbeO + 48;
+        MemW[0:P + 16] := 640;
+        MemW[0:P + 18] := 640;
+        If M = $100 Then MemW[0:P + 20] := 400 Else MemW[0:P + 20] := 480;
+        Mem[0:P + 22] := 8; Mem[0:P + 23] := 16;
+        Mem[0:P + 24] := 1; Mem[0:P + 25] := 8; Mem[0:P + 26] := 1;
+        Mem[0:P + 27] := 4; Mem[0:P + 30] := 1;
+      End;
+    End;
+    2 :
+    Begin
+      M := VR(fEbx);
+      If (M And $3FFF) < $100 Then
+        VmSetMode((M And $7F) Or ((M Shr 8) And $80))
+      Else If ((M And $4000) <> 0) Or
+              Not VgSetVbe(M And $1FF, (M And $8000) = 0) Then Ok := False;
+    End;
+    3 :
+      If VgMode >= $100 Then VS(fEbx, VgMode)
+      Else VS(fEbx, Mem[0:VmBda($49)]);
+    5 :
+      If VRH(fEbx) = 1 Then VS(fEdx, VgBank)
+      Else If (VRL(fEbx) <> 0) Or (VR(fEdx) > 5) Then Ok := False
+      Else
+      Begin
+        VgBank := VR(fEdx);
+        If VgMode >= $100 Then VgMapBank;
+      End;
+    6 :
+    Begin
+      VS(fEbx, 640); VS(fEcx, 640); VS(fEdx, 6 * 65536 Div 640);
+    End;
+    7 :
+      If VRL(fEbx) = 1 Then
+      Begin
+        VSH(fEbx, 0);
+        VS(fEcx, VgStart Mod 640); VS(fEdx, VgStart Div 640);
+      End
+      Else VgStart := VR(fEdx) * 640 + VR(fEcx);
+    8 : VSH(fEbx, 6);
+  Else
+    Ok := False;
+  End;
+  If Ok Then VS(fEax, $004F) Else VS(fEax, $014F);
+End;
+
 Procedure VmInt10;
 Var AH, AL, Pg, X, Y, A, I, N, P : LongInt;
 Begin
   AH := VRH(fEax); AL := VRL(fEax);
+  If VmTrace And Not (AH In [2, 3, 8, 9, $0E]) Then
+    KLog('INT 10h ' + VmRegStr);
   Case AH Of
     $00 : VmSetMode(AL);
+    $4F : VmVbe;
     $01 : MemW[0:VmBda($60)] := VR(fEcx);
     $02 : VmSetCur(VRH(fEbx) And 7, VRL(fEdx), VRH(fEdx));
     $03 :
@@ -57748,7 +57986,12 @@ End;
 Function VmFullPath(S : String) : String;
 Var D, P : LongInt; R, Part : String;
 Begin
-  S := UpStr(Trim(S));
+  If VmKeepCase Then
+  Begin
+    S := Trim(S);
+    If (Length(S) >= 2) And (S[2] = ':') Then S[1] := UpCase(S[1]);
+  End
+  Else S := UpStr(Trim(S));
   For P := 1 To Length(S) Do If S[P] = '/' Then S[P] := '\';
   D := VmDrive;
   If (Length(S) >= 2) And (S[2] = ':') Then
@@ -57806,7 +58049,7 @@ End;
 Function VmDevName(Path : String) : LongInt;
 Var B : String; P : LongInt;
 Begin
-  B := BaseName(Path);
+  B := UpStr(BaseName(Path));
   P := Pos('.', B);
   If P > 0 Then B := Copy(B, 1, P - 1);
   VmDevName := 0;
@@ -59235,6 +59478,511 @@ End;
 
 Function DpDos(AH, AL : LongInt) : Boolean; Forward;
 
+{ ------------------------------------------------------------------ }
+{ DOS : noms longs de Windows 95 (INT 21h AX=71xxh)                   }
+{ ------------------------------------------------------------------ }
+{ Les noms longs des volumes FAT (VFAT), NTFS et HPFS sont accessibles
+  aux programmes DOS et aux clients DPMI (pointeurs selecteur:decalage
+  traduits par VmPtr). Une fonction inconnue rend CF=1 et AX=7100h,
+  comme un DOS sans noms longs. }
+
+{ Chemin complet d'un nom long de la machine (casse conservee) }
+Function VmLfnPath(Lin : LongInt) : String;
+Begin
+  VmKeepCase := True;
+  VmLfnPath := VmFullPath(PStr(Lin));
+  VmKeepCase := False;
+End;
+
+{ Chemin dans VmTmp + K (ASCIIZ) }
+Procedure VmTmpPut(K : LongInt; Const S : String);
+Begin
+  PutPStr(VmTmp + K, S, 256);
+End;
+
+{ Attributs acceptes (CL : caches, systeme, repertoires permis ; CH :
+  attributs exiges) }
+Function VmLfAttrOk(A, Allow, Need : LongInt) : Boolean;
+Begin
+  VmLfAttrOk := ((A And $16 And Not Allow) = 0) And ((A And Need) = Need);
+End;
+
+{ FILETIME en Ft -> date et heure du DOS (date en poids fort) }
+Function VmFtDos(Ft : LongInt) : LongInt;
+Var D, T : LongInt;
+Begin
+  D := 0; T := 0;
+  FileTimeToDosDateTime(Ft, LongInt(@D), LongInt(@T));
+  VmFtDos := ((D And $FFFF) Shl 16) Or (T And $FFFF);
+End;
+
+{ WIN32_FIND_DATA du noyau (Fd) -> tampon du programme (Dst) }
+Procedure VmLfPut(Fd, Dst, Fmt : LongInt);
+Var K : LongInt;
+Begin
+  MoveMem(Fd, Dst, 318);
+  MemL[0:Dst] := MemL[0:Fd] And $3F;
+  If Fmt = 1 Then
+    For K := 0 To 2 Do
+    Begin
+      MemL[0:Dst + 4 + K * 8] := VmFtDos(Fd + 4 + K * 8);
+      MemL[0:Dst + 8 + K * 8] := 0;
+    End;
+  { nom court seulement s'il differe du nom long }
+  If UpStr(PStr(Fd + 304)) = UpStr(PStr(Fd + 44)) Then Mem[0:Dst + 304] := 0;
+End;
+
+{ Recherche suivante d'une entree K de VmLfH ; True si trouve }
+Function VmLfStep(K, Dst : LongInt; First : Boolean) : Boolean;
+Var Fd, Ok : LongInt;
+Begin
+  VmLfStep := False;
+  Fd := VmTmp + 512;
+  If First Then Ok := 1 Else Ok := FindNextFileA(VmLfH[K], Fd);
+  While Ok <> 0 Do
+  Begin
+    If VmLfAttrOk(MemL[0:Fd] And $3F, VmLfAttr[K] And $FF,
+                  (VmLfAttr[K] Shr 8) And $FF) Then
+    Begin
+      VmLfPut(Fd, Dst, VmLfFmt[K]);
+      VmLfStep := True;
+      Exit;
+    End;
+    Ok := FindNextFileA(VmLfH[K], Fd);
+  End;
+End;
+
+{ Nom court de base (sans ~n) d'un nom long : 8.3 ou 11 caracteres }
+Function VmLfnShort(S : String; Fcb : Boolean) : String;
+Var B, E, T : String; I, P : LongInt;
+Begin
+  S := UpStr(S);
+  T := '';
+  For I := 1 To Length(S) Do If S[I] <> ' ' Then T := T + S[I];
+  While (Length(T) > 0) And (T[1] = '.') Do Delete(T, 1, 1);
+  P := Length(T);
+  While (P > 0) And (T[P] <> '.') Do Dec(P);
+  If P > 0 Then
+  Begin
+    B := Copy(T, 1, P - 1); E := Copy(T, P + 1, 255);
+  End
+  Else
+  Begin
+    B := T; E := '';
+  End;
+  T := '';
+  For I := 1 To Length(B) Do
+    If (B[I] <> '.') And (Length(T) < 8) Then
+      If Valid83Ch(B[I]) Then T := T + B[I] Else T := T + '_';
+  B := T;
+  T := '';
+  For I := 1 To Length(E) Do
+    If Length(T) < 3 Then
+      If Valid83Ch(E[I]) Then T := T + E[I] Else T := T + '_';
+  E := T;
+  If Fcb Then
+  Begin
+    While Length(B) < 8 Do B := B + ' ';
+    While Length(E) < 3 Do E := E + ' ';
+    VmLfnShort := B + E;
+  End
+  Else If E <> '' Then VmLfnShort := B + '.' + E
+  Else VmLfnShort := B;
+End;
+
+{ Repertoire courant d'un lecteur (X:\...) }
+Function VmCurDirOf(D : LongInt) : String;
+Begin
+  If VmDir[D] = '' Then VmCurDirOf := Chr(65 + D) + ':\'
+  Else VmCurDirOf := Chr(65 + D) + ':' + VmDir[D];
+End;
+
+{ AX=716Ch : ouverture ou creation etendue }
+Procedure VmLfnOpen(Path : String);
+Var A, Disp, Act, S, H, Mode, Fl : LongInt;
+Begin
+  Mode := VR(fEbx) And $FF;
+  Fl := VR(fEdx);
+  VmTmpPut(0, Path);
+  A := GetFileAttributesA(VmTmp);
+  If (A <> -1) And (VmDevName(Path) = 0) Then
+  Begin
+    If (A And $10) <> 0 Then
+    Begin
+      VmFail(5);
+      Exit;
+    End;
+    If (Fl And 3) = 0 Then
+    Begin
+      VmFail(80);
+      Exit;
+    End;
+    If (Fl And 2) <> 0 Then
+    Begin
+      Disp := 2; Act := 3;
+    End
+    Else
+    Begin
+      Disp := 3; Act := 1;
+    End;
+  End
+  Else If VmDevName(Path) <> 0 Then
+  Begin
+    Disp := 3; Act := 1;
+  End
+  Else If (Fl And $10) <> 0 Then
+  Begin
+    Disp := 1; Act := 2;
+  End
+  Else
+  Begin
+    If GetFileAttributesA(VmTmp) = -1 Then
+    Begin
+      PutPStr(VmTmp + 256, ParentDir(Path), 256);
+      If (Length(ParentDir(Path)) > 3) And
+         (GetFileAttributesA(VmTmp + 256) = -1) Then VmFail(3)
+      Else VmFail(2);
+    End;
+    Exit;
+  End;
+  S := VmOpen(Path, Mode, Disp);
+  If S < 0 Then
+  Begin
+    VmFail(VmLastErr);
+    Exit;
+  End;
+  If (Mode And $80) <> 0 Then SftMode[S] := SftMode[S] Or $80;
+  H := VmHNew(S);
+  If H < 0 Then
+  Begin
+    SftRelease(S);
+    VmFail(4);
+    Exit;
+  End;
+  { attributs du nouveau fichier (lecture seule, cache, systeme) }
+  If (Act = 2) And ((VR(fEcx) And 7) <> 0) Then
+    SetFileAttributesA(VmTmp, VR(fEcx) And $27);
+  VS(fEax, H);
+  VS(fEcx, Act);
+End;
+
+{ AX=7143h : attributs et dates d'un fichier (BL) }
+Procedure VmLfnAttr(Path : String);
+Var A, H, Fd, T, Sub : LongInt;
+Begin
+  VmTmpPut(0, Path);
+  Sub := VRL(fEbx);
+  A := GetFileAttributesA(VmTmp);
+  If A = -1 Then
+  Begin
+    VmFail(VmErrOf(2));
+    Exit;
+  End;
+  Fd := VmTmp + 512;
+  Case Sub Of
+    0 :
+    Begin
+      If A = $80 Then A := 0;
+      VS(fEcx, A And $37);
+    End;
+    1 : If SetFileAttributesA(VmTmp, VR(fEcx) And $27) = 0 Then
+          VmFail(VmErrOf(5));
+    2, 4, 6, 8 :
+    Begin
+      H := FindFirstFileA(VmTmp, Fd);
+      If H = INVALID_HANDLE Then
+      Begin
+        VmFail(2);
+        Exit;
+      End;
+      FindClose(H);
+      Case Sub Of
+        2 :
+        Begin
+          VS(fEax, MemL[0:Fd + 32]); VS(fEdx, MemL[0:Fd + 32] Shr 16);
+        End;
+        4 :
+        Begin
+          T := VmFtDos(Fd + 20);
+          VS(fEcx, T); VS(fEdi, T Shr 16);
+        End;
+        6 :
+        Begin
+          T := VmFtDos(Fd + 12);
+          VS(fEdi, T Shr 16);
+        End;
+      Else
+        T := VmFtDos(Fd + 4);
+        VS(fEcx, T); VS(fEdi, T Shr 16); VS(fEsi, 0);
+      End;
+    End;
+    3, 5, 7 :
+    Begin
+      If (A And $10) <> 0 Then Exit;
+      If Sub = 5 Then DosDateTimeToFileTime(VR(fEdi), 0, VmTmp + 256)
+      Else DosDateTimeToFileTime(VR(fEdi), VR(fEcx), VmTmp + 256);
+      H := KOpenFile(Path, True, 3);
+      If H = INVALID_HANDLE Then
+      Begin
+        VmFail(VmErrOf(5));
+        Exit;
+      End;
+      Case Sub Of
+        3 : SetFileTime(H, 0, 0, VmTmp + 256);
+        5 : SetFileTime(H, 0, VmTmp + 256, 0);
+      Else
+        SetFileTime(H, VmTmp + 256, 0, 0);
+      End;
+      CloseHandle(H);
+    End;
+  Else
+    VmFail(1);
+  End;
+End;
+
+{ AX=7141h : supprimer (SI=1 : jokers, CL/CH attributs) }
+Procedure VmLfnDelete(Path : String);
+Var H, Fd, Ok, N, Allow, Need : LongInt; Dir, F : String;
+Begin
+  VmTmpPut(0, Path);
+  If VR(fEsi) <> 1 Then
+  Begin
+    If DeleteFileA(VmTmp) = 0 Then VmFail(VmErrOf(2));
+    Exit;
+  End;
+  Allow := VRL(fEcx); Need := VRH(fEcx);
+  Dir := ParentDir(Path);
+  If (Dir <> '') And (Dir[Length(Dir)] <> '\') Then Dir := Dir + '\';
+  Fd := VmTmp + 512;
+  H := FindFirstFileA(VmTmp, Fd);
+  If H = INVALID_HANDLE Then
+  Begin
+    VmFail(2);
+    Exit;
+  End;
+  N := 0;
+  Ok := 1;
+  While Ok <> 0 Do
+  Begin
+    F := PStr(Fd + 44);
+    If ((MemL[0:Fd] And $10) = 0) And
+       VmLfAttrOk(MemL[0:Fd] And $3F, Allow, Need) Then
+    Begin
+      VmTmpPut(256, Dir + F);
+      If DeleteFileA(VmTmp + 256) <> 0 Then Inc(N);
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  FindClose(H);
+  If N = 0 Then VmFail(2);
+End;
+
+{ AX=71A6h : informations d'un fichier ouvert (BY_HANDLE_FILE_INFO) }
+Procedure VmLfnInfo;
+Var S, I, B, A : LongInt;
+Begin
+  S := VmSftOf(VR(fEbx));
+  If S < 0 Then
+  Begin
+    VmFail(6);
+    Exit;
+  End;
+  B := VmPtr(fDs, fEdx);
+  FillMem(B, 52, 0);
+  If SftDev[S] <> 0 Then Exit;
+  I := KObjOf(SftH[S], koFile);
+  A := $20;
+  If I >= 0 Then
+  Begin
+    PutPStr(VmTmp, KObjs^[I].Name, 256);
+    A := GetFileAttributesA(VmTmp);
+    If (A = -1) Or (A = $80) Then A := $20;
+  End;
+  MemL[0:B] := A And $37;
+  GetFileTime(SftH[S], B + 4, B + 12, B + 20);
+  MemL[0:B + 28] := $12345678;
+  MemL[0:B + 32] := 0;
+  MemL[0:B + 36] := GetFileSize(SftH[S], 0);
+  MemL[0:B + 40] := 1;
+  MemL[0:B + 44] := 0; MemL[0:B + 48] := S;
+End;
+
+{ AX=71A0h : informations du volume }
+Procedure VmLfnVolume;
+Var P, D, Mc, Fl, N : LongInt; R, Fs : String;
+Begin
+  P := VmPtr(fDs, fEdx);
+  R := PStr(P);
+  If (Length(R) >= 1) And (UpCase(R[1]) In ['A'..'Z']) Then
+    D := Ord(UpCase(R[1])) - 65
+  Else D := VmDrive;
+  If Not VmDriveOk(D) Then
+  Begin
+    VmFail(15);
+    Exit;
+  End;
+  VmTmpPut(0, Chr(65 + D) + ':\');
+  Mc := 255; Fl := 0;
+  FillMem(VmTmp + 256, 32, 0);
+  If GetVolumeInformationA(VmTmp, 0, 0, 0, LongInt(@Mc), LongInt(@Fl),
+                           VmTmp + 256, 32) = 0 Then
+  Begin
+    VmFail(15);
+    Exit;
+  End;
+  Fs := PStr(VmTmp + 256);
+  If Fs = '' Then Fs := 'FAT';
+  N := VR(fEcx);
+  If N > 0 Then PutPStr(VmPtr(fEs, fEdi), Fs, N);
+  { recherche sans tenir compte de la casse, casse conservee, Unicode,
+    fonctions des noms longs }
+  If Mc > 12 Then VS(fEbx, $4006) Else VS(fEbx, $4000);
+  VS(fEcx, Mc);
+  VS(fEdx, Mc + 5);
+End;
+
+Procedure VmLfn(AL : LongInt);
+Var P, K, H, Fd, T, D : LongInt; Path, R : String;
+Begin
+  VmSetCF(False);
+  Case AL Of
+    $0D : ;
+    $39, $3A :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEdx));
+      VmTmpPut(0, Path);
+      If AL = $39 Then K := CreateDirectoryA(VmTmp, 0)
+      Else K := RemoveDirectoryA(VmTmp);
+      If K = 0 Then VmFail(VmErrOf(5));
+    End;
+    $3B :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEdx));
+      { le DOS garde le chemin court du repertoire courant }
+      If Not PathConv(Path, False, R) Or Not VmChDir(R) Then VmFail(3);
+    End;
+    $41 : VmLfnDelete(VmLfnPath(VmPtr(fDs, fEdx)));
+    $43 : VmLfnAttr(VmLfnPath(VmPtr(fDs, fEdx)));
+    $47 :
+    Begin
+      D := VRL(fEdx);
+      If D = 0 Then D := VmDrive Else D := D - 1;
+      If Not VmDriveOk(D) Then
+      Begin
+        VmFail(15);
+        Exit;
+      End;
+      Path := VmCurDirOf(D);
+      If Not PathConv(Path, True, R) Then R := Path;
+      PutPStr(VmPtr(fDs, fEsi), Copy(R, 4, 255), 260);
+    End;
+    $4E :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEdx));
+      VmTmpPut(0, Path);
+      Fd := VmTmp + 512;
+      H := FindFirstFileA(VmTmp, Fd);
+      If H = INVALID_HANDLE Then
+      Begin
+        PutPStr(VmTmp + 256, ParentDir(Path), 256);
+        If (Length(ParentDir(Path)) = 3) Or
+           ((GetFileAttributesA(VmTmp + 256) <> -1) And
+            ((GetFileAttributesA(VmTmp + 256) And $10) <> 0)) Then
+          VmFail(18)
+        Else VmFail(3);
+        Exit;
+      End;
+      K := VmLfNext;
+      VmLfNext := (VmLfNext + 1) Mod VmMaxFind;
+      If VmLfH[K] <> 0 Then FindClose(VmLfH[K]);
+      VmLfH[K] := H;
+      VmLfAttr[K] := VR(fEcx);
+      VmLfFmt[K] := VR(fEsi) And 1;
+      If VmLfStep(K, VmPtr(fEs, fEdi), True) Then
+      Begin
+        VS(fEax, K + 1);
+        VS(fEcx, 0);
+      End
+      Else
+      Begin
+        FindClose(H);
+        VmLfH[K] := 0;
+        VmFail(18);
+      End;
+    End;
+    $4F :
+    Begin
+      K := VR(fEbx) - 1;
+      If (K < 0) Or (K >= VmMaxFind) Or (VmLfH[K] = 0) Then
+      Begin
+        VmFail(6);
+        Exit;
+      End;
+      VmLfFmt[K] := VR(fEsi) And 1;
+      If VmLfStep(K, VmPtr(fEs, fEdi), False) Then VS(fEcx, 0)
+      Else VmFail(18);
+    End;
+    $A1 :
+    Begin
+      K := VR(fEbx) - 1;
+      If (K < 0) Or (K >= VmMaxFind) Or (VmLfH[K] = 0) Then VmFail(6)
+      Else
+      Begin
+        FindClose(VmLfH[K]);
+        VmLfH[K] := 0;
+      End;
+    End;
+    $56 :
+    Begin
+      VmTmpPut(0, VmLfnPath(VmPtr(fDs, fEdx)));
+      VmTmpPut(256, VmLfnPath(VmPtr(fEs, fEdi)));
+      If MoveFileA(VmTmp, VmTmp + 256) = 0 Then VmFail(VmErrOf(5));
+    End;
+    $60 :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEsi));
+      Case VRL(fEcx) Of
+        0 : R := Path;
+        1, 2 :
+          If Not PathConv(Path, VRL(fEcx) = 2, R) Then
+          Begin
+            PutPStr(VmTmp, ParentDir(Path), 256);
+            If (Length(ParentDir(Path)) > 3) And
+               (GetFileAttributesA(VmTmp) = -1) Then VmFail(3)
+            Else VmFail(2);
+            Exit;
+          End;
+      Else
+        VmFail(1);
+        Exit;
+      End;
+      PutPStr(VmPtr(fEs, fEdi), R, 261);
+    End;
+    $6C, $A9 : VmLfnOpen(VmLfnPath(VmPtr(fDs, fEsi)));
+    $A0 : VmLfnVolume;
+    $A6 : VmLfnInfo;
+    $A7 :
+      If VRL(fEbx) = 0 Then
+      Begin
+        T := VmFtDos(VmPtr(fDs, fEsi));
+        VS(fEcx, T); VS(fEdx, T Shr 16); VSH(fEbx, 0);
+      End
+      Else If VRL(fEbx) = 1 Then
+        DosDateTimeToFileTime(VR(fEdx), VR(fEcx), VmPtr(fEs, fEdi))
+      Else VmFail(1);
+    $A8 :
+    Begin
+      R := VmLfnShort(PStr(VmPtr(fDs, fEsi)), VRH(fEdx) = 0);
+      P := VmPtr(fEs, fEdi);
+      If VRH(fEdx) = 0 Then
+        For K := 1 To 11 Do Mem[0:P + K - 1] := Ord(R[K])
+      Else PutPStr(P, R, 13);
+    End;
+  Else
+    VmFail($7100);
+  End;
+End;
+
 Procedure VmInt21;
 Var AH, AL, S, H, N, R, P, D, T, Max : LongInt; Path : String;
 Begin
@@ -59754,7 +60502,7 @@ Begin
         If (MemL[0:VmF + fFl] And 1) = 0 Then VS(fEcx, R);
       End;
     End;
-    $71 : VmFail($7100);
+    $71 : VmLfn(AL);
     $73 : VmFail($7300);
   Else
     VmFail(1);
@@ -60071,6 +60819,11 @@ Procedure VmOut(Port, V : LongInt);
 Var P : LongInt;
 Begin
   V := V And $FF;
+  If VmTrace And ((Port = $3C5) Or (Port = $3D5) Or (Port = $3CF) Or
+     (Port = $3C2) Or (Port = $20) Or (Port = $43) Or (Port = $40)) Then
+    KLog('OUT ' + HexStr(Port, 3) + ' [' + HexStr(VgSeqI * Ord(Port = $3C5) +
+         VmCrtIdx * Ord(Port = $3D5) + VgGcI * Ord(Port = $3CF), 2) +
+         '] = ' + HexStr(V, 2));
   Case Port Of
     $20 :
       If V = $20 Then
@@ -61781,7 +62534,7 @@ Const
   VmVendorO = $0506;        { API du fournisseur 'MS-DOS' (CALL FAR) }
   DpOwner = $DD;            { proprietaire des selecteurs du client }
   VmSvMax = 16;
-  VmSvW = 22;               { mots par contexte sauve }
+  VmSvW = 23;               { mots par contexte sauve }
 
 Var
   VmDpmi : Boolean;
@@ -61798,7 +62551,13 @@ Var
   VmSgSeg, VmSgSel : Array[0..63] Of LongInt;
   VmSgN : LongInt;
   VmIrqSv : Array[0..47] Of LongInt;
+  VmIrqVec : Array[0..15] Of LongInt;  { vecteur de chaque niveau }
+  { gestionnaires en cours par IRQ (0-15) : une IRQ n'est pas redonnee
+    tant que son gestionnaire n'est pas termine (les tics en retard de
+    l'horloge emulee arriveraient sinon en rafale, imbriques) }
+  VmIrqAct : Array[0..15] Of LongInt;
   VmIrqN : LongInt;
+  VmHwRefl : Boolean;           { reflexion d'une interruption materielle }
   VmLdtSel : LongInt;           { alias de la LDT (API 'MS-DOS' 0100h) }
 
 { ------------------------- descripteurs ---------------------------- }
@@ -61959,10 +62718,28 @@ End;
 
 { Interruption N reflechie en mode reel ; PopFr : un cadre IRET du
   client est a retirer au retour (gestionnaire par defaut atteint) }
-Procedure VmReflect(N : LongInt; PopFr : Boolean);
-Var V : LongInt;
+{ IRQ (0-15) d'un vecteur d'interruption materielle ; -1 sinon }
+Function VmIrqIdx(N : LongInt) : LongInt;
 Begin
-  VmSave(1, Ord(PopFr));
+  If (N >= 8) And (N <= $0F) Then VmIrqIdx := N - 8
+  Else If (N >= $70) And (N <= $77) Then VmIrqIdx := N - $70 + 8
+  Else VmIrqIdx := -1;
+End;
+
+Procedure VmReflect(N : LongInt; PopFr : Boolean);
+Var V, A, K : LongInt;
+Begin
+  { interruption materielle (IRQ, horloge 1Ch) arrivee en mode protege :
+    le code interrompu retrouve tous ses registres ; une interruption
+    logicielle rend les registres du mode reel }
+  A := Ord(PopFr);
+  If VmHwRefl Or ((VmIrqN > 0) And (((N >= 8) And (N <= $0F)) Or
+     (N = $1C) Or ((N >= $70) And (N <= $77)))) Then A := A Or 2;
+  VmHwRefl := False;
+  VmSave(1, A);
+  K := VmIrqIdx(N);
+  VmSv[(VmSvN - 1) * VmSvW + 22] := K;
+  If ((A And 2) <> 0) And (K >= 0) Then Inc(VmIrqAct[K]);
   VmToRm;
   VmPush(VmVFlags); VmPush(VmBios); VmPush(VmRmRetO);
   VmIF := False;
@@ -61986,11 +62763,17 @@ Begin
   Fl := R[10];
   If K = 1 Then
   Begin
-    { interruption : registres generaux et indicateurs du resultat }
-    For I := 0 To 7 Do
-      If I <> 3 Then VmCtx[I] := R[I];
-    VmCtx[10] := (VmCtx[10] And Not $8D5) Or (Fl And $8D5);
-    If VmSv[B + 19] <> 0 Then
+    { interruption logicielle : registres generaux et indicateurs du
+      resultat ; materielle (bit 1) : registres du code interrompu }
+    If (VmSv[B + 19] And 2) = 0 Then
+    Begin
+      For I := 0 To 7 Do
+        If I <> 3 Then VmCtx[I] := R[I];
+      VmCtx[10] := (VmCtx[10] And Not $8D5) Or (Fl And $8D5);
+    End
+    Else If (VmSv[B + 22] >= 0) And (VmIrqAct[VmSv[B + 22]] > 0) Then
+      Dec(VmIrqAct[VmSv[B + 22]]);
+    If (VmSv[B + 19] And 1) <> 0 Then
     Begin
       { IRET du cadre empile par le client }
       L := VmPmPop(VmPmSz);
@@ -62051,6 +62834,7 @@ Begin
   End;
   Vm32 := (VR(fEax) And 1) <> 0;
   VmSgN := 0; VmSvN := 0; VmIrqN := 0;
+  FillMem(LongInt(@VmIrqAct), SizeOf(VmIrqAct), 0);
   For I := 0 To 63 Do VmMbBlk[I] := 0;
   For I := 0 To 15 Do VmCbUsed[I] := False;
   { pile reelle du serveur : les 4 Ko (SI = 100h paragraphes) donnes
@@ -62221,10 +63005,14 @@ Begin
     End;
   If (H < 0) Or (Size <= 0) Or (Size > HeapFreeBytes - 8 * 1048576) Then
     Exit;
+  { pages entieres, comme les serveurs DPMI : les extenseurs (DOS/4GW)
+    se servent de la fin de la derniere page }
+  Size := (Size + 4095) And Not 4095;
   Own := HeapOwner; HeapOwner := VmOwner;
   A := KAlloc(Size + 4096);
   HeapOwner := Own;
   If A = 0 Then Exit;
+  FillMem(A, Size + 4096, 0);
   VmMbBlk[H] := A;
   VmMbLin[H] := (A + 4095) And Not 4095;
   VmMbSize[H] := Size;
@@ -62555,7 +63343,9 @@ Var Sz : LongInt;
 Begin
   If VmPmDef(N) Then
   Begin
+    VmHwRefl := Hw;
     VmPmDefault(N, False);
+    VmHwRefl := False;
     Exit;
   End;
   Sz := VmPmSz;
@@ -62565,7 +63355,9 @@ Begin
     VmIrqSv[VmIrqN * 3] := VR(fCs);
     VmIrqSv[VmIrqN * 3 + 1] := MemL[0:VmF + fEip];
     VmIrqSv[VmIrqN * 3 + 2] := MemL[0:VmF + fFl];
+    VmIrqVec[VmIrqN] := N;
     Inc(VmIrqN);
+    If VmIrqIdx(N) >= 0 Then Inc(VmIrqAct[VmIrqIdx(N)]);
     VmPmPush(VmPmFlags, Sz); VmPmPush(VmHostCs, Sz); VmPmPush(VmIrqRetO, Sz);
     VmIF := False;
   End
@@ -62890,7 +63682,7 @@ End;
 
 { HLT d'une souche du serveur en mode protege }
 Procedure VmHostPm(Ip : LongInt);
-Var Sz, P, B, L : LongInt;
+Var Sz, P, B, L, I : LongInt;
 Begin
   If VmTrace And (Ip <> VmPmDefO + $21) And (Ip <> VmPmDefO + $31) Then
     KLog('PM souche ' + HexStr(Ip, 4) + ' ' + VmRegStr);
@@ -62913,6 +63705,8 @@ Begin
     If VmIrqN > 0 Then
     Begin
       Dec(VmIrqN);
+      I := VmIrqIdx(VmIrqVec[VmIrqN]);
+      If (I >= 0) And (VmIrqAct[I] > 0) Then Dec(VmIrqAct[I]);
       VSeg(fCs, VmIrqSv[VmIrqN * 3]);
       MemL[0:VmF + fEip] := VmIrqSv[VmIrqN * 3 + 1];
       MemL[0:VmF + fFl] := VmIrqSv[VmIrqN * 3 + 2];
@@ -63066,7 +63860,7 @@ Begin
   If Not VmIF Then Exit;
   VmTimeUpd;
   If (VmTickDue > 0) And ((VmPicMask And 1) = 0) And
-     ((VmIsr And 1) = 0) Then
+     ((VmIsr And 1) = 0) And (VmIrqAct[0] = 0) Then
   Begin
     Dec(VmTickDue);
     VmIsr := VmIsr Or 1;
@@ -63074,7 +63868,7 @@ Begin
     Exit;
   End;
   If (VmKqHead <> VmKqTail) And ((VmPicMask And 2) = 0) And
-     ((VmIsr And 3) = 0) Then
+     ((VmIsr And 3) = 0) And (VmIrqAct[1] = 0) Then
   Begin
     VmCurKey := VmKq[VmKqHead];
     VmKqHead := (VmKqHead + 1) Mod VmKqMax;
@@ -63093,7 +63887,7 @@ Begin
   If Not VmIF Then Exit;
   VmTimeUpd;
   If (VmTickDue > 0) And ((VmPicMask And 1) = 0) And
-     ((VmIsr And 1) = 0) Then
+     ((VmIsr And 1) = 0) And (VmIrqAct[0] = 0) Then
   Begin
     If Not VmPmDef(8) Then
     Begin
@@ -63112,12 +63906,22 @@ Begin
         Mem[0:VmBda($70)] := 1;
       End;
       MemL[0:VmBda($6C)] := T;
+    End
+    Else
+    Begin
+      { gestionnaire du mode reel (pilote, extenseur) : l'horloge lui
+        est reflechie meme si le client tourne dans une boucle sans
+        appel au systeme }
+      Dec(VmTickDue);
+      VmIsr := VmIsr Or 1;
+      VmPmDeliver(8, True);
+      Exit;
     End;
   End;
   If (VmKqHead <> VmKqTail) And ((VmPicMask And 2) = 0) And
-     ((VmIsr And 3) = 0) Then
+     ((VmIsr And 3) = 0) And (VmIrqAct[1] = 0) Then
   Begin
-    If Not VmPmDef(9) Then
+    If Not VmPmDef(9) Or Not VmVecDefault(9) Then
     Begin
       VmCurKey := VmKq[VmKqHead];
       VmKqHead := (VmKqHead + 1) Mod VmKqMax;
@@ -63462,6 +64266,7 @@ Begin
   DpEnd;
   VgShow(False);
   VgPlanes := 0; VgShadow := 0; VgPlanar := False; VgMode := 3;
+  VgVbeBlk := 0;
   VmGfx := False;
   VmRam := 0;
   VmT := -1;
@@ -64897,6 +65702,10 @@ BEGIN
   NextPid := 1132;
   I := KAlloc(SizeOf(TMItemArr));
   Move(I, MItemsP, 4);
+  I := KAlloc(SizeOf(TFdNmArr));
+  Move(I, FdNm, 4);
+  I := KAlloc(SizeOf(TDevResArr));
+  Move(I, DevRes, 4);
   I := KAlloc(SizeOf(TGdiArr));
   Move(I, Gdis, 4);
   I := KAlloc(SizeOf(TWndArr));
