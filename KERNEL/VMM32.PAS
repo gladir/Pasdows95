@@ -32168,12 +32168,70 @@ Begin
   OpenMutexA := KOpenNamed(Name, koMutex);
 End;
 
-Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
-Var S : String;
+{ Chemin complet (X:\...) -> nom long (Long) ou court (8.3) de chaque
+  composant, lus dans les repertoires ; un composant avec des jokers
+  est garde tel quel. False si un composant n'existe pas. }
+Function PathConv(S : String; Long : Boolean; Var R : String) : Boolean;
+Var Fd : Array[0..319] Of Byte; Part, Cur, N : String; P, H : LongInt;
 Begin
-  S := PStr(PLong);
-  If (PShort <> 0) And (N > Length(S)) Then PutPStr(PShort, S, N);
-  GetShortPathNameA := Length(S);
+  PathConv := False;
+  R := '';
+  If (Length(S) < 2) Or (S[2] <> ':') Then Exit;
+  R := UpCase(S[1]) + ':';
+  S := Copy(S, 3, 255);
+  While S <> '' Do
+  Begin
+    P := Pos('\', S);
+    If P > 0 Then
+    Begin
+      Part := Copy(S, 1, P - 1);
+      Delete(S, 1, P);
+    End
+    Else
+    Begin
+      Part := S;
+      S := '';
+    End;
+    If Part = '' Then Continue;
+    If (Pos('*', Part) > 0) Or (Pos('?', Part) > 0) Then N := Part
+    Else
+    Begin
+      Cur := R + '\' + Part + #0;
+      H := FindFirstFileA(LongInt(@Cur[1]), LongInt(@Fd));
+      If H = INVALID_HANDLE Then Exit;
+      FindClose(H);
+      N := PStr(LongInt(@Fd) + 44);
+      If Not Long And (PStr(LongInt(@Fd) + 304) <> '') Then
+        N := PStr(LongInt(@Fd) + 304);
+      If N = '' Then N := Part;
+    End;
+    R := R + '\' + N;
+  End;
+  If Length(R) = 2 Then R := R + '\';
+  PathConv := True;
+End;
+
+{ GetShortPathName et GetLongPathName : un chemin complet existant est
+  converti ; sinon il est rendu tel quel }
+Function PathConvApi(PIn, POut, N : LongInt; Long : Boolean) : LongInt;
+Var S, R : String;
+Begin
+  S := PStr(PIn);
+  If (Length(S) >= 3) And (S[2] = ':') And (S[3] = '\') Then
+    If PathConv(S, Long, R) Then S := R;
+  If (POut <> 0) And (N > Length(S)) Then PutPStr(POut, S, N);
+  If N > Length(S) Then PathConvApi := Length(S)
+  Else PathConvApi := Length(S) + 1;
+End;
+
+Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
+Begin
+  GetShortPathNameA := PathConvApi(PLong, PShort, N, False);
+End;
+
+Function GetLongPathNameA(PShort, PLong, N : LongInt) : LongInt;
+Begin
+  GetLongPathNameA := PathConvApi(PShort, PLong, N, True);
 End;
 
 Function GetLogicalDriveStringsA(N, Buf : LongInt) : LongInt;
@@ -55412,6 +55470,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  GetLongPathNameA,
   TrackPopupMenuEx, LoadMenuW, LoadMenuIndirectA, LoadMenuIndirectW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
@@ -55714,6 +55773,11 @@ Var
   VmFindH, VmFindSeq : Array[0..VmMaxFind - 1] Of LongInt;
   VmFindNext, VmFindCnt : LongInt;
   VmTmp : LongInt;              { tampon du noyau (1 Ko) }
+  VmKeepCase : Boolean;         { VmFullPath conserve la casse (LFN) }
+  { recherches des noms longs (AX=714Eh) : poignee du noyau, attributs
+    permis et exiges, format des dates }
+  VmLfH, VmLfAttr, VmLfFmt : Array[0..VmMaxFind - 1] Of LongInt;
+  VmLfNext : LongInt;
   VmLine : String;              { reste d'une ligne lue sur CON }
   VmLineOk : Boolean;
   { souris (INT 33h) }
@@ -57748,7 +57812,12 @@ End;
 Function VmFullPath(S : String) : String;
 Var D, P : LongInt; R, Part : String;
 Begin
-  S := UpStr(Trim(S));
+  If VmKeepCase Then
+  Begin
+    S := Trim(S);
+    If (Length(S) >= 2) And (S[2] = ':') Then S[1] := UpCase(S[1]);
+  End
+  Else S := UpStr(Trim(S));
   For P := 1 To Length(S) Do If S[P] = '/' Then S[P] := '\';
   D := VmDrive;
   If (Length(S) >= 2) And (S[2] = ':') Then
@@ -57806,7 +57875,7 @@ End;
 Function VmDevName(Path : String) : LongInt;
 Var B : String; P : LongInt;
 Begin
-  B := BaseName(Path);
+  B := UpStr(BaseName(Path));
   P := Pos('.', B);
   If P > 0 Then B := Copy(B, 1, P - 1);
   VmDevName := 0;
@@ -59235,6 +59304,511 @@ End;
 
 Function DpDos(AH, AL : LongInt) : Boolean; Forward;
 
+{ ------------------------------------------------------------------ }
+{ DOS : noms longs de Windows 95 (INT 21h AX=71xxh)                   }
+{ ------------------------------------------------------------------ }
+{ Les noms longs des volumes FAT (VFAT), NTFS et HPFS sont accessibles
+  aux programmes DOS et aux clients DPMI (pointeurs selecteur:decalage
+  traduits par VmPtr). Une fonction inconnue rend CF=1 et AX=7100h,
+  comme un DOS sans noms longs. }
+
+{ Chemin complet d'un nom long de la machine (casse conservee) }
+Function VmLfnPath(Lin : LongInt) : String;
+Begin
+  VmKeepCase := True;
+  VmLfnPath := VmFullPath(PStr(Lin));
+  VmKeepCase := False;
+End;
+
+{ Chemin dans VmTmp + K (ASCIIZ) }
+Procedure VmTmpPut(K : LongInt; Const S : String);
+Begin
+  PutPStr(VmTmp + K, S, 256);
+End;
+
+{ Attributs acceptes (CL : caches, systeme, repertoires permis ; CH :
+  attributs exiges) }
+Function VmLfAttrOk(A, Allow, Need : LongInt) : Boolean;
+Begin
+  VmLfAttrOk := ((A And $16 And Not Allow) = 0) And ((A And Need) = Need);
+End;
+
+{ FILETIME en Ft -> date et heure du DOS (date en poids fort) }
+Function VmFtDos(Ft : LongInt) : LongInt;
+Var D, T : LongInt;
+Begin
+  D := 0; T := 0;
+  FileTimeToDosDateTime(Ft, LongInt(@D), LongInt(@T));
+  VmFtDos := ((D And $FFFF) Shl 16) Or (T And $FFFF);
+End;
+
+{ WIN32_FIND_DATA du noyau (Fd) -> tampon du programme (Dst) }
+Procedure VmLfPut(Fd, Dst, Fmt : LongInt);
+Var K : LongInt;
+Begin
+  MoveMem(Fd, Dst, 318);
+  MemL[0:Dst] := MemL[0:Fd] And $3F;
+  If Fmt = 1 Then
+    For K := 0 To 2 Do
+    Begin
+      MemL[0:Dst + 4 + K * 8] := VmFtDos(Fd + 4 + K * 8);
+      MemL[0:Dst + 8 + K * 8] := 0;
+    End;
+  { nom court seulement s'il differe du nom long }
+  If UpStr(PStr(Fd + 304)) = UpStr(PStr(Fd + 44)) Then Mem[0:Dst + 304] := 0;
+End;
+
+{ Recherche suivante d'une entree K de VmLfH ; True si trouve }
+Function VmLfStep(K, Dst : LongInt; First : Boolean) : Boolean;
+Var Fd, Ok : LongInt;
+Begin
+  VmLfStep := False;
+  Fd := VmTmp + 512;
+  If First Then Ok := 1 Else Ok := FindNextFileA(VmLfH[K], Fd);
+  While Ok <> 0 Do
+  Begin
+    If VmLfAttrOk(MemL[0:Fd] And $3F, VmLfAttr[K] And $FF,
+                  (VmLfAttr[K] Shr 8) And $FF) Then
+    Begin
+      VmLfPut(Fd, Dst, VmLfFmt[K]);
+      VmLfStep := True;
+      Exit;
+    End;
+    Ok := FindNextFileA(VmLfH[K], Fd);
+  End;
+End;
+
+{ Nom court de base (sans ~n) d'un nom long : 8.3 ou 11 caracteres }
+Function VmLfnShort(S : String; Fcb : Boolean) : String;
+Var B, E, T : String; I, P : LongInt;
+Begin
+  S := UpStr(S);
+  T := '';
+  For I := 1 To Length(S) Do If S[I] <> ' ' Then T := T + S[I];
+  While (Length(T) > 0) And (T[1] = '.') Do Delete(T, 1, 1);
+  P := Length(T);
+  While (P > 0) And (T[P] <> '.') Do Dec(P);
+  If P > 0 Then
+  Begin
+    B := Copy(T, 1, P - 1); E := Copy(T, P + 1, 255);
+  End
+  Else
+  Begin
+    B := T; E := '';
+  End;
+  T := '';
+  For I := 1 To Length(B) Do
+    If (B[I] <> '.') And (Length(T) < 8) Then
+      If Valid83Ch(B[I]) Then T := T + B[I] Else T := T + '_';
+  B := T;
+  T := '';
+  For I := 1 To Length(E) Do
+    If Length(T) < 3 Then
+      If Valid83Ch(E[I]) Then T := T + E[I] Else T := T + '_';
+  E := T;
+  If Fcb Then
+  Begin
+    While Length(B) < 8 Do B := B + ' ';
+    While Length(E) < 3 Do E := E + ' ';
+    VmLfnShort := B + E;
+  End
+  Else If E <> '' Then VmLfnShort := B + '.' + E
+  Else VmLfnShort := B;
+End;
+
+{ Repertoire courant d'un lecteur (X:\...) }
+Function VmCurDirOf(D : LongInt) : String;
+Begin
+  If VmDir[D] = '' Then VmCurDirOf := Chr(65 + D) + ':\'
+  Else VmCurDirOf := Chr(65 + D) + ':' + VmDir[D];
+End;
+
+{ AX=716Ch : ouverture ou creation etendue }
+Procedure VmLfnOpen(Path : String);
+Var A, Disp, Act, S, H, Mode, Fl : LongInt;
+Begin
+  Mode := VR(fEbx) And $FF;
+  Fl := VR(fEdx);
+  VmTmpPut(0, Path);
+  A := GetFileAttributesA(VmTmp);
+  If (A <> -1) And (VmDevName(Path) = 0) Then
+  Begin
+    If (A And $10) <> 0 Then
+    Begin
+      VmFail(5);
+      Exit;
+    End;
+    If (Fl And 3) = 0 Then
+    Begin
+      VmFail(80);
+      Exit;
+    End;
+    If (Fl And 2) <> 0 Then
+    Begin
+      Disp := 2; Act := 3;
+    End
+    Else
+    Begin
+      Disp := 3; Act := 1;
+    End;
+  End
+  Else If VmDevName(Path) <> 0 Then
+  Begin
+    Disp := 3; Act := 1;
+  End
+  Else If (Fl And $10) <> 0 Then
+  Begin
+    Disp := 1; Act := 2;
+  End
+  Else
+  Begin
+    If GetFileAttributesA(VmTmp) = -1 Then
+    Begin
+      PutPStr(VmTmp + 256, ParentDir(Path), 256);
+      If (Length(ParentDir(Path)) > 3) And
+         (GetFileAttributesA(VmTmp + 256) = -1) Then VmFail(3)
+      Else VmFail(2);
+    End;
+    Exit;
+  End;
+  S := VmOpen(Path, Mode, Disp);
+  If S < 0 Then
+  Begin
+    VmFail(VmLastErr);
+    Exit;
+  End;
+  If (Mode And $80) <> 0 Then SftMode[S] := SftMode[S] Or $80;
+  H := VmHNew(S);
+  If H < 0 Then
+  Begin
+    SftRelease(S);
+    VmFail(4);
+    Exit;
+  End;
+  { attributs du nouveau fichier (lecture seule, cache, systeme) }
+  If (Act = 2) And ((VR(fEcx) And 7) <> 0) Then
+    SetFileAttributesA(VmTmp, VR(fEcx) And $27);
+  VS(fEax, H);
+  VS(fEcx, Act);
+End;
+
+{ AX=7143h : attributs et dates d'un fichier (BL) }
+Procedure VmLfnAttr(Path : String);
+Var A, H, Fd, T, Sub : LongInt;
+Begin
+  VmTmpPut(0, Path);
+  Sub := VRL(fEbx);
+  A := GetFileAttributesA(VmTmp);
+  If A = -1 Then
+  Begin
+    VmFail(VmErrOf(2));
+    Exit;
+  End;
+  Fd := VmTmp + 512;
+  Case Sub Of
+    0 :
+    Begin
+      If A = $80 Then A := 0;
+      VS(fEcx, A And $37);
+    End;
+    1 : If SetFileAttributesA(VmTmp, VR(fEcx) And $27) = 0 Then
+          VmFail(VmErrOf(5));
+    2, 4, 6, 8 :
+    Begin
+      H := FindFirstFileA(VmTmp, Fd);
+      If H = INVALID_HANDLE Then
+      Begin
+        VmFail(2);
+        Exit;
+      End;
+      FindClose(H);
+      Case Sub Of
+        2 :
+        Begin
+          VS(fEax, MemL[0:Fd + 32]); VS(fEdx, MemL[0:Fd + 32] Shr 16);
+        End;
+        4 :
+        Begin
+          T := VmFtDos(Fd + 20);
+          VS(fEcx, T); VS(fEdi, T Shr 16);
+        End;
+        6 :
+        Begin
+          T := VmFtDos(Fd + 12);
+          VS(fEdi, T Shr 16);
+        End;
+      Else
+        T := VmFtDos(Fd + 4);
+        VS(fEcx, T); VS(fEdi, T Shr 16); VS(fEsi, 0);
+      End;
+    End;
+    3, 5, 7 :
+    Begin
+      If (A And $10) <> 0 Then Exit;
+      If Sub = 5 Then DosDateTimeToFileTime(VR(fEdi), 0, VmTmp + 256)
+      Else DosDateTimeToFileTime(VR(fEdi), VR(fEcx), VmTmp + 256);
+      H := KOpenFile(Path, True, 3);
+      If H = INVALID_HANDLE Then
+      Begin
+        VmFail(VmErrOf(5));
+        Exit;
+      End;
+      Case Sub Of
+        3 : SetFileTime(H, 0, 0, VmTmp + 256);
+        5 : SetFileTime(H, 0, VmTmp + 256, 0);
+      Else
+        SetFileTime(H, VmTmp + 256, 0, 0);
+      End;
+      CloseHandle(H);
+    End;
+  Else
+    VmFail(1);
+  End;
+End;
+
+{ AX=7141h : supprimer (SI=1 : jokers, CL/CH attributs) }
+Procedure VmLfnDelete(Path : String);
+Var H, Fd, Ok, N, Allow, Need : LongInt; Dir, F : String;
+Begin
+  VmTmpPut(0, Path);
+  If VR(fEsi) <> 1 Then
+  Begin
+    If DeleteFileA(VmTmp) = 0 Then VmFail(VmErrOf(2));
+    Exit;
+  End;
+  Allow := VRL(fEcx); Need := VRH(fEcx);
+  Dir := ParentDir(Path);
+  If (Dir <> '') And (Dir[Length(Dir)] <> '\') Then Dir := Dir + '\';
+  Fd := VmTmp + 512;
+  H := FindFirstFileA(VmTmp, Fd);
+  If H = INVALID_HANDLE Then
+  Begin
+    VmFail(2);
+    Exit;
+  End;
+  N := 0;
+  Ok := 1;
+  While Ok <> 0 Do
+  Begin
+    F := PStr(Fd + 44);
+    If ((MemL[0:Fd] And $10) = 0) And
+       VmLfAttrOk(MemL[0:Fd] And $3F, Allow, Need) Then
+    Begin
+      VmTmpPut(256, Dir + F);
+      If DeleteFileA(VmTmp + 256) <> 0 Then Inc(N);
+    End;
+    Ok := FindNextFileA(H, Fd);
+  End;
+  FindClose(H);
+  If N = 0 Then VmFail(2);
+End;
+
+{ AX=71A6h : informations d'un fichier ouvert (BY_HANDLE_FILE_INFO) }
+Procedure VmLfnInfo;
+Var S, I, B, A : LongInt;
+Begin
+  S := VmSftOf(VR(fEbx));
+  If S < 0 Then
+  Begin
+    VmFail(6);
+    Exit;
+  End;
+  B := VmPtr(fDs, fEdx);
+  FillMem(B, 52, 0);
+  If SftDev[S] <> 0 Then Exit;
+  I := KObjOf(SftH[S], koFile);
+  A := $20;
+  If I >= 0 Then
+  Begin
+    PutPStr(VmTmp, KObjs^[I].Name, 256);
+    A := GetFileAttributesA(VmTmp);
+    If (A = -1) Or (A = $80) Then A := $20;
+  End;
+  MemL[0:B] := A And $37;
+  GetFileTime(SftH[S], B + 4, B + 12, B + 20);
+  MemL[0:B + 28] := $12345678;
+  MemL[0:B + 32] := 0;
+  MemL[0:B + 36] := GetFileSize(SftH[S], 0);
+  MemL[0:B + 40] := 1;
+  MemL[0:B + 44] := 0; MemL[0:B + 48] := S;
+End;
+
+{ AX=71A0h : informations du volume }
+Procedure VmLfnVolume;
+Var P, D, Mc, Fl, N : LongInt; R, Fs : String;
+Begin
+  P := VmPtr(fDs, fEdx);
+  R := PStr(P);
+  If (Length(R) >= 1) And (UpCase(R[1]) In ['A'..'Z']) Then
+    D := Ord(UpCase(R[1])) - 65
+  Else D := VmDrive;
+  If Not VmDriveOk(D) Then
+  Begin
+    VmFail(15);
+    Exit;
+  End;
+  VmTmpPut(0, Chr(65 + D) + ':\');
+  Mc := 255; Fl := 0;
+  FillMem(VmTmp + 256, 32, 0);
+  If GetVolumeInformationA(VmTmp, 0, 0, 0, LongInt(@Mc), LongInt(@Fl),
+                           VmTmp + 256, 32) = 0 Then
+  Begin
+    VmFail(15);
+    Exit;
+  End;
+  Fs := PStr(VmTmp + 256);
+  If Fs = '' Then Fs := 'FAT';
+  N := VR(fEcx);
+  If N > 0 Then PutPStr(VmPtr(fEs, fEdi), Fs, N);
+  { recherche sans tenir compte de la casse, casse conservee, Unicode,
+    fonctions des noms longs }
+  If Mc > 12 Then VS(fEbx, $4006) Else VS(fEbx, $4000);
+  VS(fEcx, Mc);
+  VS(fEdx, Mc + 5);
+End;
+
+Procedure VmLfn(AL : LongInt);
+Var P, K, H, Fd, T, D : LongInt; Path, R : String;
+Begin
+  VmSetCF(False);
+  Case AL Of
+    $0D : ;
+    $39, $3A :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEdx));
+      VmTmpPut(0, Path);
+      If AL = $39 Then K := CreateDirectoryA(VmTmp, 0)
+      Else K := RemoveDirectoryA(VmTmp);
+      If K = 0 Then VmFail(VmErrOf(5));
+    End;
+    $3B :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEdx));
+      { le DOS garde le chemin court du repertoire courant }
+      If Not PathConv(Path, False, R) Or Not VmChDir(R) Then VmFail(3);
+    End;
+    $41 : VmLfnDelete(VmLfnPath(VmPtr(fDs, fEdx)));
+    $43 : VmLfnAttr(VmLfnPath(VmPtr(fDs, fEdx)));
+    $47 :
+    Begin
+      D := VRL(fEdx);
+      If D = 0 Then D := VmDrive Else D := D - 1;
+      If Not VmDriveOk(D) Then
+      Begin
+        VmFail(15);
+        Exit;
+      End;
+      Path := VmCurDirOf(D);
+      If Not PathConv(Path, True, R) Then R := Path;
+      PutPStr(VmPtr(fDs, fEsi), Copy(R, 4, 255), 260);
+    End;
+    $4E :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEdx));
+      VmTmpPut(0, Path);
+      Fd := VmTmp + 512;
+      H := FindFirstFileA(VmTmp, Fd);
+      If H = INVALID_HANDLE Then
+      Begin
+        PutPStr(VmTmp + 256, ParentDir(Path), 256);
+        If (Length(ParentDir(Path)) = 3) Or
+           ((GetFileAttributesA(VmTmp + 256) <> -1) And
+            ((GetFileAttributesA(VmTmp + 256) And $10) <> 0)) Then
+          VmFail(18)
+        Else VmFail(3);
+        Exit;
+      End;
+      K := VmLfNext;
+      VmLfNext := (VmLfNext + 1) Mod VmMaxFind;
+      If VmLfH[K] <> 0 Then FindClose(VmLfH[K]);
+      VmLfH[K] := H;
+      VmLfAttr[K] := VR(fEcx);
+      VmLfFmt[K] := VR(fEsi) And 1;
+      If VmLfStep(K, VmPtr(fEs, fEdi), True) Then
+      Begin
+        VS(fEax, K + 1);
+        VS(fEcx, 0);
+      End
+      Else
+      Begin
+        FindClose(H);
+        VmLfH[K] := 0;
+        VmFail(18);
+      End;
+    End;
+    $4F :
+    Begin
+      K := VR(fEbx) - 1;
+      If (K < 0) Or (K >= VmMaxFind) Or (VmLfH[K] = 0) Then
+      Begin
+        VmFail(6);
+        Exit;
+      End;
+      VmLfFmt[K] := VR(fEsi) And 1;
+      If VmLfStep(K, VmPtr(fEs, fEdi), False) Then VS(fEcx, 0)
+      Else VmFail(18);
+    End;
+    $A1 :
+    Begin
+      K := VR(fEbx) - 1;
+      If (K < 0) Or (K >= VmMaxFind) Or (VmLfH[K] = 0) Then VmFail(6)
+      Else
+      Begin
+        FindClose(VmLfH[K]);
+        VmLfH[K] := 0;
+      End;
+    End;
+    $56 :
+    Begin
+      VmTmpPut(0, VmLfnPath(VmPtr(fDs, fEdx)));
+      VmTmpPut(256, VmLfnPath(VmPtr(fEs, fEdi)));
+      If MoveFileA(VmTmp, VmTmp + 256) = 0 Then VmFail(VmErrOf(5));
+    End;
+    $60 :
+    Begin
+      Path := VmLfnPath(VmPtr(fDs, fEsi));
+      Case VRL(fEcx) Of
+        0 : R := Path;
+        1, 2 :
+          If Not PathConv(Path, VRL(fEcx) = 2, R) Then
+          Begin
+            PutPStr(VmTmp, ParentDir(Path), 256);
+            If (Length(ParentDir(Path)) > 3) And
+               (GetFileAttributesA(VmTmp) = -1) Then VmFail(3)
+            Else VmFail(2);
+            Exit;
+          End;
+      Else
+        VmFail(1);
+        Exit;
+      End;
+      PutPStr(VmPtr(fEs, fEdi), R, 261);
+    End;
+    $6C, $A9 : VmLfnOpen(VmLfnPath(VmPtr(fDs, fEsi)));
+    $A0 : VmLfnVolume;
+    $A6 : VmLfnInfo;
+    $A7 :
+      If VRL(fEbx) = 0 Then
+      Begin
+        T := VmFtDos(VmPtr(fDs, fEsi));
+        VS(fEcx, T); VS(fEdx, T Shr 16); VSH(fEbx, 0);
+      End
+      Else If VRL(fEbx) = 1 Then
+        DosDateTimeToFileTime(VR(fEdx), VR(fEcx), VmPtr(fEs, fEdi))
+      Else VmFail(1);
+    $A8 :
+    Begin
+      R := VmLfnShort(PStr(VmPtr(fDs, fEsi)), VRH(fEdx) = 0);
+      P := VmPtr(fEs, fEdi);
+      If VRH(fEdx) = 0 Then
+        For K := 1 To 11 Do Mem[0:P + K - 1] := Ord(R[K])
+      Else PutPStr(P, R, 13);
+    End;
+  Else
+    VmFail($7100);
+  End;
+End;
+
 Procedure VmInt21;
 Var AH, AL, S, H, N, R, P, D, T, Max : LongInt; Path : String;
 Begin
@@ -59754,7 +60328,7 @@ Begin
         If (MemL[0:VmF + fFl] And 1) = 0 Then VS(fEcx, R);
       End;
     End;
-    $71 : VmFail($7100);
+    $71 : VmLfn(AL);
     $73 : VmFail($7300);
   Else
     VmFail(1);
