@@ -682,7 +682,14 @@ Var
  Error:Word;
  FirstParam,Dir,CurrPath:String;
 Begin
- FirstParam:=ExtractParam(1);
+ { tout le reste de la ligne : CD \Program Files\Oni ou CD "..." }
+ FirstParam:=ParamList;
+ While(Length(FirstParam)>0)and(FirstParam[Length(FirstParam)]in[' ',#9])do
+  Dec(FirstParam[0]);
+ If(Length(FirstParam)>=2)and(FirstParam[1]='"')Then Begin
+  Delete(FirstParam,1,1);
+  If FirstParam[Length(FirstParam)]='"'Then Dec(FirstParam[0]);
+ End;
  If FirstParam='/?'Then Begin
   Case Language of
    _Germany:Begin

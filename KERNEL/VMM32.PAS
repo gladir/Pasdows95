@@ -148,6 +148,7 @@ Var
   SerialOk   : Boolean;
   LogOn      : Boolean;
   ApiTrace   : Boolean;          { journal des appels d API (serie) }
+  TrI : LongInt;
   PreemptOn  : Boolean;          { preemption des taches Win32 }
   SliceStart : LongInt;          { debut de la tranche de temps }
   KImgLo, KImgHi : LongInt;      { image du noyau (jamais preemptee) }
@@ -9007,10 +9008,15 @@ End;
 
 { Texte avec retour a la ligne automatique ; retourne le nombre de
   lignes. Draw = False : seulement compter }
+Var
+  WrapClipY : LongInt;          { lignes dessinees au-dessus de cette limite }
+
 Function WrapText(X, Y, W : LongInt; Const S : String; C : LongInt;
                   Draw : Boolean) : LongInt;
 Var Cols, I, N, Last : LongInt; Line, Word0 : String;
 Begin
+  If WrapClipY = 0 Then WrapClipY := $7FFFFFFF;
+  If Draw And (Y >= WrapClipY) Then Draw := False;
   Cols := W Div 8;
   N := 0; Line := ''; Word0 := '';
   I := 1;
@@ -9022,7 +9028,8 @@ Begin
       Begin
         If Line <> '' Then
         Begin
-          If Draw Then OutTxt(X, Y + N * 16, Line, C);
+          If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
+            OutTxt(X, Y + N * 16, Line, C);
           Inc(N);
         End;
         Line := Word0;
@@ -9032,7 +9039,8 @@ Begin
       Word0 := '';
       If (I <= Length(S)) And (S[I] = '|') Then
       Begin
-        If Draw Then OutTxt(X, Y + N * 16, Line, C);
+        If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
+          OutTxt(X, Y + N * 16, Line, C);
         Inc(N);
         Line := '';
       End;
@@ -9043,7 +9051,8 @@ Begin
   End;
   If Line <> '' Then
   Begin
-    If Draw Then OutTxt(X, Y + N * 16, Line, C);
+    If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
+      OutTxt(X, Y + N * 16, Line, C);
     Inc(N);
   End;
   Last := N;
@@ -10203,6 +10212,28 @@ Begin
   Cr3Now := V;
 End;
 
+{ True si l'adresse lineaire A est presente dans l'espace courant }
+Function LinOk(A : LongInt) : Boolean;
+Var D, E : LongInt;
+Begin
+  LinOk := False;
+  D := Cr3Now And Not 4095;
+  If D = 0 Then
+  Begin
+    LinOk := (A >= 0) And (A < MemTop);
+    Exit;
+  End;
+  E := MemL[0:D + ((A Shr 22) And 1023) * 4];
+  If (E And 1) = 0 Then Exit;
+  If (E And $80) <> 0 Then
+  Begin
+    LinOk := True;
+    Exit;
+  End;
+  E := MemL[0:(E And Not 4095) + ((A Shr 12) And 1023) * 4];
+  LinOk := (E And 1) <> 0;
+End;
+
 Procedure SetCr3(V : LongInt);
 Begin
   If (KPd = 0) Or (V = 0) Then Exit;
@@ -10963,6 +10994,7 @@ Type
     Style, ExStyle : LongInt;
     X, Y, W, H : LongInt;    { relatif au client du parent (ou ecran) }
     Text     : String[127];
+    LongTxt  : LongInt;      { texte complet (ASCIIZ, tas) s'il depasse }
     Proc     : LongInt;
     IKind    : LongInt;
     Thread   : LongInt;
@@ -11955,6 +11987,8 @@ Begin
     SurfFree(Wnds^[W].Surf);
   End;
   If Wnds^[W].Extra <> 0 Then KFree(Wnds^[W].Extra);
+  If Wnds^[W].LongTxt <> 0 Then KFree(Wnds^[W].LongTxt);
+  Wnds^[W].LongTxt := 0;
   T := Wnds^[W].Thread;
   Wnds^[W].Used := False;
   If CaptureWin = W Then CaptureWin := -1;
@@ -11967,6 +12001,85 @@ Begin
     ActivateNext;
   End;
   TaskbarChanged;
+End;
+
+{ Texte d'une fenetre depuis une chaine ASCIIZ : les 127 premiers
+  caracteres dans Text, le texte complet dans le tas s'il est plus long
+  (textes des programmes d'installation) }
+Procedure WndSetTextZ(W, A : LongInt);
+Var N, H : LongInt;
+Begin
+  Wnds^[W].Text := PStr(A);
+  If Wnds^[W].LongTxt <> 0 Then KFree(Wnds^[W].LongTxt);
+  Wnds^[W].LongTxt := 0;
+  If A = 0 Then Exit;
+  N := StrLenZ(A);
+  If N <= 127 Then Exit;
+  H := HeapOwner; HeapOwner := 0;
+  Wnds^[W].LongTxt := KAlloc(N + 1);
+  HeapOwner := H;
+  If Wnds^[W].LongTxt <> 0 Then MoveMem(A, Wnds^[W].LongTxt, N + 1);
+End;
+
+Function WndTextLen(W : LongInt) : LongInt;
+Begin
+  If Wnds^[W].LongTxt <> 0 Then WndTextLen := StrLenZ(Wnds^[W].LongTxt)
+  Else WndTextLen := Length(Wnds^[W].Text);
+End;
+
+{ WM_GETTEXT : au plus N - 1 caracteres et le zero ; rend la longueur }
+Function WndGetTextZ(W, Buf, N : LongInt) : LongInt;
+Var L : LongInt;
+Begin
+  WndGetTextZ := 0;
+  If (Buf = 0) Or (N <= 0) Then Exit;
+  If Wnds^[W].LongTxt = 0 Then
+  Begin
+    PutPStr(Buf, Wnds^[W].Text, N);
+    WndGetTextZ := Min(Length(Wnds^[W].Text), N - 1);
+    Exit;
+  End;
+  L := Min(StrLenZ(Wnds^[W].LongTxt), N - 1);
+  MoveMem(Wnds^[W].LongTxt, Buf, L);
+  Mem[0:Buf + L] := 0;
+  WndGetTextZ := L;
+End;
+
+{ Texte multiligne (CR LF) de longueur quelconque, coupe en morceaux
+  pour WrapText ; rend le nombre de lignes }
+Function WrapZ(X, Y, Wd, A, C : LongInt; Draw : Boolean) : LongInt;
+Var Ch, N : LongInt; S : String;
+Begin
+  S := ''; N := 0;
+  While True Do
+  Begin
+    Ch := Mem[0:A];
+    { morceaux coupes de preference en fin de ligne }
+    If (Ch = 0) Or ((Ch = 32) And (Length(S) >= 240)) Or
+       (Length(S) >= 250) Then
+    Begin
+      If S <> '' Then N := N + WrapText(X, Y + N * 16, Wd, S, C, Draw);
+      S := '';
+      If Ch = 0 Then Break;
+      If Ch = 32 Then
+      Begin
+        Inc(A);
+        Continue;
+      End;
+    End;
+    If Ch = 10 Then
+    Begin
+      S := S + '|';
+      If Length(S) >= 150 Then
+      Begin
+        N := N + WrapText(X, Y + N * 16, Wd, S, C, Draw);
+        S := '';
+      End;
+    End
+    Else If Ch <> 13 Then S := S + Chr(Ch);
+    Inc(A);
+  End;
+  WrapZ := N;
 End;
 
 { Creer une fenetre ; indice ou -1. Param : CREATESTRUCT.lpCreateParams }
@@ -19253,14 +19366,37 @@ Begin
       Else
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
-        If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2, Y1,
-                                 Wnds^[W].W, T, Fg, True)
+        If Wnds^[W].LongTxt <> 0 Then
+          WrapZ(X1, Y1, Wnds^[W].W, Wnds^[W].LongTxt, Fg, True)
+        Else If (Pos(#10, T) > 0) Or (Pos(#13, T) > 0) Then
+        Begin
+          T := T + #0;
+          WrapZ(X1, Y1, Wnds^[W].W, LongInt(@T[1]), Fg, True);
+        End
+        Else If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2,
+                                      Y1, Wnds^[W].W, T, Fg, True)
         Else WrapText(X1, Y1, Wnds^[W].W, T, Fg, True);
       End;
     End;
     ikEdit :
     Begin
       Sunken(X1, Y1, X2, Y2, cWhite);
+      If (Wnds^[W].Style And 4) <> 0 Then
+      Begin
+        { ES_MULTILINE : lignes et retour a la ligne, sans defilement }
+        WrapClipY := Y2 - 2;
+        If Wnds^[W].LongTxt <> 0 Then
+          WrapZ(X1 + 4, Y1 + 3, Wnds^[W].W - 24, Wnds^[W].LongTxt, cBlack,
+                True)
+        Else
+        Begin
+          T := T + #0;
+          WrapZ(X1 + 4, Y1 + 3, Wnds^[W].W - 24, LongInt(@T[1]), cBlack,
+                True);
+        End;
+        WrapClipY := $7FFFFFFF;
+      End
+      Else
       OutTxt(X1 + 4, Y1 + (Wnds^[W].H - 16) Div 2, Fit(T, Wnds^[W].W - 8),
              cBlack);
       If W = FocusWin Then
@@ -19362,16 +19498,15 @@ Begin
       End;
     WM_SETTEXT :
     Begin
-      Wnds^[W].Text := PStr(LP);
+      WndSetTextZ(W, LP);
       KWndProc := 1;
       If IsChildW(W) Then InvalAll(W, True) Else Wnds^[W].NeedNc := True;
     End;
     WM_GETTEXT :
     Begin
-      PutPStr(LP, Wnds^[W].Text, WP);
-      KWndProc := Min(Length(Wnds^[W].Text), Max(0, WP - 1));
+      KWndProc := WndGetTextZ(W, LP, WP);
     End;
-    WM_GETTEXTLENGTH : KWndProc := Length(Wnds^[W].Text);
+    WM_GETTEXTLENGTH : KWndProc := WndTextLen(W);
     WM_PAINT : If IsChildW(W) Then DrawCtl(W);
     WM_SETFONT : Wnds^[W].Font := WP;
     WM_GETFONT : KWndProc := Wnds^[W].Font;
@@ -19505,6 +19640,14 @@ Begin
        HexStr(MemL[0:Frame + 16], 8) + ' EDI=' + HexStr(MemL[0:Frame + 12], 8)
        + ' EBP=' + HexStr(MemL[0:Frame + 20], 8) + ' ESP=' +
        HexStr(Frame + 56 + 4 * Ord(Vec >= 256), 8);
+  If V = 14 Then
+  Begin
+    asm
+      mov eax,cr2
+      mov X,eax
+    end;
+    S := S + ' CR2=' + HexStr(X, 8);
+  End;
   KLog('FAUTE (tache ' + IntStr(CurT) + ') ' + S);
   X := Frame + 56 + 4 * Ord(Vec >= 256);
   Nm := 'Pile :';
@@ -25474,6 +25617,8 @@ Begin
      (Classes^[C].MenuName <> 0) Then
     Menu := LoadMenuA(Inst, Classes^[C].MenuName);
   R := CreateW(Ex, C, Nm, Style, X, Y, W, H, P, Menu, Inst, Param);
+  If (R >= 0) And (Name >= $10000) And (StrLenZ(Name) > 127) Then
+    WndSetTextZ(R, Name);
   If (R >= 0) And Not IsChildW(R) Then
     KLog('Fenetre ' + HexStr(HwndOf(R), 8) + ' ' + Classes^[C].Name + ' "' +
          Nm + '" ' + IntStr(Wnds^[R].X) + ',' + IntStr(Wnds^[R].Y) + ' ' +
@@ -25929,7 +26074,7 @@ Var W : LongInt;
 Begin
   W := WndOf(H);
   GetWindowTextLengthA := 0;
-  If W >= 0 Then GetWindowTextLengthA := Length(Wnds^[W].Text);
+  If W >= 0 Then GetWindowTextLengthA := WndTextLen(W);
 End;
 
 Function GetWindowLongA(H, I : LongInt) : LongInt;
@@ -27166,6 +27311,23 @@ Begin
   OemToCharA := 1;
 End;
 
+Function IsCharAlphaNumericA(C : LongInt) : LongInt;
+Begin
+  C := UpCh(C And 255);
+  IsCharAlphaNumericA := Ord(((C >= 65) And (C <= 90)) Or
+                             ((C >= 48) And (C <= 57)) Or (C >= 192));
+End;
+
+Function LockWindowUpdate(H : LongInt) : LongInt;
+Begin
+  LockWindowUpdate := 1;
+End;
+
+Function DdeGetData(H, P, N, Ofs : LongInt) : LongInt;
+Begin
+  DdeGetData := 0;
+End;
+
 Function IsCharAlphaA(C : LongInt) : LongInt;
 Begin
   C := UpCh(C And 255);
@@ -28371,17 +28533,16 @@ Begin
     End;
     WM_SETTEXT :
     Begin
-      Wnds^[W].Text := PStr(LP);
+      WndSetTextZ(W, LP);
       Wnds^[W].NeedNc := True;
       TaskbarChanged;
       DefWindowProcA := 1;
     End;
     WM_GETTEXT :
     Begin
-      PutPStr(LP, Wnds^[W].Text, WP);
-      DefWindowProcA := Min(Length(Wnds^[W].Text), Max(0, WP - 1));
+      DefWindowProcA := WndGetTextZ(W, LP, WP);
     End;
-    WM_GETTEXTLENGTH : DefWindowProcA := Length(Wnds^[W].Text);
+    WM_GETTEXTLENGTH : DefWindowProcA := WndTextLen(W);
     WM_SYSCOMMAND : SysCommand(TopOf(W), WP);
     WM_SYSKEYDOWN :
       If WP = $73 Then PostMsgW(TopOf(W), WM_CLOSE, 0, 0);
@@ -30412,8 +30573,10 @@ Procedure RegSetStr(Path, Nm, V : String);
 Var K : LongInt;
 Begin
   K := RegWalk(2, Path, True);
-  V := V + #0;
   RegSetK(K, Nm, 1, LongInt(@V[1]), Length(V));
+  { RegSetK met deux zeros apres les donnees : compter le terminateur }
+  K := RegVal(K, Nm);
+  If K >= 0 Then RVSize[K] := Length(V) + 1;
 End;
 
 Procedure RegDelTree(K : LongInt);
@@ -30550,7 +30713,13 @@ Begin
   If PD <> 0 Then
   Begin
     If MemL[0:PN] < RVSize[V] Then RegQueryValueExA := 234
-    Else MoveMem(RVData[V], PD, RVSize[V]);
+    Else
+    Begin
+      MoveMem(RVData[V], PD, RVSize[V]);
+      { chaine sans terminateur : en ajouter un s'il y a la place }
+      If (RVType[V] In [1, 2, 7]) And (MemL[0:PN] > RVSize[V]) Then
+        Mem[0:PD + RVSize[V]] := 0;
+    End;
   End;
   MemL[0:PN] := RVSize[V];
 End;
@@ -30716,14 +30885,14 @@ End;
 
 Const
   MaxMod = 64;
-  SysDllN = 27;
+  SysDllN = 28;
   SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
     'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
     'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
     'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
     'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL', 'WS2_32.DLL',
     'ICMP.DLL', 'WININET.DLL', 'D3DIM.DLL', 'D3DIM700.DLL', 'D3D8.DLL',
-    'DINPUT8.DLL', 'DPLAYX.DLL', 'DPLAY.DLL');
+    'DINPUT8.DLL', 'DPLAYX.DLL', 'DPLAY.DLL', 'MSACM32.DLL');
 
 Type
   TModule = Record
@@ -30880,7 +31049,8 @@ Begin
     For D := 0 To 3 Do
     Begin
       R := MemL[0:F + 48 + D * 4];
-      If (R >= $10000) And (R < MemTop) Then
+      If (R >= $10000) And (R < MemTop - 256) And LinOk(R) And
+         LinOk(R + 63) Then
         If (Mem[0:R] >= 32) And (Mem[0:R] < 127) And
            ((Mem[0:R + 1] = 0) Or ((Mem[0:R + 1] >= 32) And
            (Mem[0:R + 1] < 127))) Then
@@ -31046,6 +31216,7 @@ Procedure NetAppExit; Forward;
 
 Procedure DXAppDone; Forward;
 Function DXOrdName(Dll : String; N : LongInt) : String; Forward;
+Function OleOrdName(N : LongInt) : String; Forward;
 
 Function ResolveImport(Dll, Name : String; Ordinal : LongInt) : LongInt;
 Var M, A : LongInt; Nm : String;
@@ -31063,6 +31234,8 @@ Begin
      (Ordinal = 2) Then Name := 'VideoForWindowsVersion';
   If (Name = '') And (UpStr(BaseName(Dll)) = 'COMCTL32.DLL') And
      (Ordinal = 17) Then Name := 'InitCommonControls';
+  If (Name = '') And (UpStr(BaseName(Dll)) = 'OLEAUT32.DLL') Then
+    Name := OleOrdName(Ordinal);
   If (A = 0) And Not IsSysDll(Dll) Then
   Begin
     M := FindModule(Dll);
@@ -32037,6 +32210,346 @@ Begin
     If I >= 0 Then MemL[0:PI + 12] := ThreadId(I) Else MemL[0:PI + 12] := 0;
   End;
   CreateProcessA := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Services, jetons, dossiers speciaux, ShellExecuteEx, bibliotheques  }
+{ de types : comme sous Windows 95                                    }
+{ ------------------------------------------------------------------ }
+{ Windows 95 n'a ni services ni jetons de securite : ces fonctions
+  echouent avec ERROR_CALL_NOT_IMPLEMENTED (120), ce que les programmes
+  d'installation savent traiter. }
+
+Function NoNt : LongInt;
+Begin
+  SetErr(120);
+  NoNt := 0;
+End;
+
+Function OpenSCManagerA(M, D, A : LongInt) : LongInt;
+Begin
+  OpenSCManagerA := NoNt;
+End;
+
+Function OpenServiceA(H, N, A : LongInt) : LongInt;
+Begin
+  OpenServiceA := NoNt;
+End;
+
+Function CreateServiceA(H, N, Dn, A, T, St, E, Bin, G, Tag, Dep, U,
+                        Pw : LongInt) : LongInt;
+Begin
+  CreateServiceA := NoNt;
+End;
+
+Function CloseServiceHandle(H : LongInt) : LongInt;
+Begin
+  CloseServiceHandle := NoNt;
+End;
+
+Function DeleteService(H : LongInt) : LongInt;
+Begin
+  DeleteService := NoNt;
+End;
+
+Function StartServiceA(H, N, A : LongInt) : LongInt;
+Begin
+  StartServiceA := NoNt;
+End;
+
+Function ControlService(H, C, St : LongInt) : LongInt;
+Begin
+  ControlService := NoNt;
+End;
+
+Function QueryServiceStatus(H, St : LongInt) : LongInt;
+Begin
+  QueryServiceStatus := NoNt;
+End;
+
+Function OpenProcessToken(H, A, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  OpenProcessToken := NoNt;
+End;
+
+Function LookupPrivilegeValueA(Sys, N, L : LongInt) : LongInt;
+Begin
+  LookupPrivilegeValueA := NoNt;
+End;
+
+Function AdjustTokenPrivileges(H, Dis, N, L, Prev, R : LongInt) : LongInt;
+Begin
+  AdjustTokenPrivileges := NoNt;
+End;
+
+{ Dossiers speciaux (CSIDL_*) ; crees au besoin }
+Function ShFolder(Csidl : LongInt) : String;
+Var B : Array[0..259] Of Char; W, R, Part : String; K : LongInt;
+Begin
+  B[0] := #0;
+  GetWindowsDirectoryA(LongInt(@B), 256);
+  W := PStr(LongInt(@B));
+  If W = '' Then W := 'C:\WINDOWS';
+  Case Csidl And $FF Of
+    0, $10, $19 : R := W + '\Desktop';
+    2, $17 : R := W + '\Start Menu\Programs';
+    5 : R := 'C:\My Documents';
+    6, $1F : R := W + '\Favorites';
+    7, $18 : R := W + '\Start Menu\Programs\StartUp';
+    8 : R := W + '\Recent';
+    9 : R := W + '\SendTo';
+    $0B, $16 : R := W + '\Start Menu';
+    $13 : R := W + '\NetHood';
+    $14 : R := W + '\Fonts';
+    $15 : R := W + '\ShellNew';
+    $1A, $1C, $23 : R := W + '\Application Data';
+    $20 : R := W + '\Temporary Internet Files';
+    $21 : R := W + '\Cookies';
+    $22 : R := W + '\History';
+    $24 : R := W;
+    $25, $29 : R := W + '\SYSTEM';
+    $26 : R := 'C:\Program Files';
+    $2B : R := 'C:\Program Files\Common Files';
+  Else
+    R := '';
+  End;
+  { creer le chemin, dossier par dossier }
+  If R <> '' Then
+    For K := 4 To Length(R) + 1 Do
+      If (K > Length(R)) Or (R[K] = '\') Then
+      Begin
+        Part := Copy(R, 1, K - 1) + #0;
+        CreateDirectoryA(LongInt(@Part[1]), 0);
+      End;
+  ShFolder := R;
+End;
+
+Const
+  PidlMagic = $4C445050;                 { 'PPDL' : liste d'un chemin }
+
+{ ITEMIDLIST d'un chemin : cb, marque, chemin ASCIIZ, puis cb = 0 }
+Function PidlOf(Const Path : String) : LongInt;
+Var A, N : LongInt;
+Begin
+  N := 2 + 4 + Length(Path) + 1;
+  A := KAlloc(N + 2);
+  PidlOf := A;
+  If A = 0 Then Exit;
+  MemW[0:A] := N;
+  MemL[0:A + 2] := PidlMagic;
+  PutPStr(A + 6, Path, Length(Path) + 1);
+  MemW[0:A + N] := 0;
+End;
+
+Function SHGetSpecialFolderLocation(H, Csidl, PP : LongInt) : LongInt;
+Var S : String;
+Begin
+  SHGetSpecialFolderLocation := LongInt($80070057);
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  S := ShFolder(Csidl);
+  If S = '' Then Exit;
+  MemL[0:PP] := PidlOf(S);
+  SHGetSpecialFolderLocation := 0;
+End;
+
+Function SHGetPathFromIDListA(Pidl, Buf : LongInt) : LongInt;
+Begin
+  SHGetPathFromIDListA := 0;
+  If (Pidl = 0) Or (Buf = 0) Then Exit;
+  Mem[0:Buf] := 0;
+  If (MemW[0:Pidl] < 7) Or (MemL[0:Pidl + 2] <> PidlMagic) Then Exit;
+  PutPStr(Buf, PStr(Pidl + 6), 260);
+  SHGetPathFromIDListA := 1;
+End;
+
+Function SHGetSpecialFolderPathA(H, Buf, Csidl, Create : LongInt) : LongInt;
+Var S : String;
+Begin
+  S := ShFolder(Csidl);
+  SHGetSpecialFolderPathA := Ord(S <> '');
+  If (Buf <> 0) And (S <> '') Then PutPStr(Buf, S, 260);
+End;
+
+Function SHGetFolderPathA(H, Csidl, Tok, Fl, Buf : LongInt) : LongInt;
+Var S : String;
+Begin
+  S := ShFolder(Csidl);
+  If S = '' Then SHGetFolderPathA := LongInt($80070057)
+  Else
+  Begin
+    If Buf <> 0 Then PutPStr(Buf, S, 260);
+    SHGetFolderPathA := 0;
+  End;
+End;
+
+Procedure SHChangeNotify(E, F, A, B : LongInt);
+Begin
+  { le bureau relit ses icones : sans effet ici }
+End;
+
+{ IMalloc du shell (SHGetMalloc) : blocs du tas, comme CoTaskMemAlloc }
+Var
+  ShMallocObj : LongInt;
+
+Function ImQueryInterface(This, Riid, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := This;
+  ImQueryInterface := 0;
+End;
+
+Function ImAddRef(This : LongInt) : LongInt;
+Begin
+  ImAddRef := 1;
+End;
+
+Function ImRelease(This : LongInt) : LongInt;
+Begin
+  ImRelease := 1;
+End;
+
+Function ImAlloc(This, N : LongInt) : LongInt;
+Begin
+  ImAlloc := KAlloc(N);
+End;
+
+Function ImRealloc(This, A, N : LongInt) : LongInt;
+Begin
+  If A = 0 Then ImRealloc := KAlloc(N) Else ImRealloc := KRealloc(A, N);
+End;
+
+Procedure ImFree(This, A : LongInt);
+Begin
+  If A <> 0 Then KFree(A);
+End;
+
+Function ImGetSize(This, A : LongInt) : LongInt;
+Begin
+  If A = 0 Then ImGetSize := -1 Else ImGetSize := KSize(A);
+End;
+
+Function ImDidAlloc(This, A : LongInt) : LongInt;
+Begin
+  ImDidAlloc := -1;
+End;
+
+Procedure ImHeapMinimize(This : LongInt);
+Begin
+End;
+
+Function SHGetMalloc(PP : LongInt) : LongInt;
+Var V, H : LongInt;
+Begin
+  If ShMallocObj = 0 Then
+  Begin
+    H := HeapOwner; HeapOwner := 0;
+    V := KAlloc(9 * 4 + 4);
+    HeapOwner := H;
+    MemL[0:V + 4] := KernelExport('ImQueryInterface');
+    MemL[0:V + 8] := KernelExport('ImAddRef');
+    MemL[0:V + 12] := KernelExport('ImRelease');
+    MemL[0:V + 16] := KernelExport('ImAlloc');
+    MemL[0:V + 20] := KernelExport('ImRealloc');
+    MemL[0:V + 24] := KernelExport('ImFree');
+    MemL[0:V + 28] := KernelExport('ImGetSize');
+    MemL[0:V + 32] := KernelExport('ImDidAlloc');
+    MemL[0:V + 36] := KernelExport('ImHeapMinimize');
+    MemL[0:V] := V + 4;
+    ShMallocObj := V;
+  End;
+  If PP <> 0 Then MemL[0:PP] := ShMallocObj;
+  SHGetMalloc := 0;
+End;
+
+{ ShellExecuteEx : programme lance par CreateProcess (poignee du
+  processus si SEE_MASK_NOCLOSEPROCESS), document par ShellExecute }
+Function ShellExecuteExA(P : LongInt) : LongInt;
+Var F, Prm, Cmd, Ext : String; Si : Array[0..16] Of LongInt;
+    Pi : Array[0..3] Of LongInt; D, K : LongInt;
+Begin
+  ShellExecuteExA := 0;
+  If P = 0 Then Exit;
+  F := PStr(MemL[0:P + 16]);
+  Prm := '';
+  If MemL[0:P + 20] <> 0 Then Prm := PStr(MemL[0:P + 20]);
+  D := MemL[0:P + 24];
+  MemL[0:P + 56] := 0;
+  Ext := UpStr(F);
+  K := Length(Ext);
+  While (K > 0) And (Ext[K] <> '.') And (Ext[K] <> '\') Do Dec(K);
+  If (K > 0) And (Ext[K] = '.') Then Ext := Copy(Ext, K, 4) Else Ext := '';
+  If (Ext = '') Or (Ext = '.EXE') Or (Ext = '.COM') Or (Ext = '.BAT') Then
+  Begin
+    Cmd := '"' + F + '" ' + Prm + #0;
+    FillMem(LongInt(@Si), SizeOf(Si), 0);
+    Si[0] := 68;
+    If CreateProcessA(0, LongInt(@Cmd[1]), 0, 0, 0, 0, 0, D, LongInt(@Si),
+                      LongInt(@Pi)) = 0 Then
+    Begin
+      MemL[0:P + 32] := 2;
+      Exit;
+    End;
+    CloseHandle(Pi[1]);
+    If (MemL[0:P + 4] And $40) <> 0 Then MemL[0:P + 56] := Pi[0]
+    Else CloseHandle(Pi[0]);
+    MemL[0:P + 32] := 33;
+    ShellExecuteExA := 1;
+  End
+  Else
+  Begin
+    K := ShellExecuteA(MemL[0:P + 8], MemL[0:P + 12], MemL[0:P + 16],
+                       MemL[0:P + 20], D, MemL[0:P + 28]);
+    MemL[0:P + 32] := K;
+    ShellExecuteExA := Ord(K > 32);
+  End;
+End;
+
+{ OLEAUT32 : pas de bibliotheques de types (TYPE_E_CANTLOADLIBRARY) }
+Function LoadTypeLib(F, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  LoadTypeLib := LongInt($80029C4A);
+End;
+
+Function LoadTypeLibEx(F, K, PP : LongInt) : LongInt;
+Begin
+  LoadTypeLibEx := LoadTypeLib(F, PP);
+End;
+
+Function LoadRegTypeLib(G, Ma, Mi, L, PP : LongInt) : LongInt;
+Begin
+  LoadRegTypeLib := LoadTypeLib(0, PP);
+End;
+
+Function RegisterTypeLib(T, F, H : LongInt) : LongInt;
+Begin
+  RegisterTypeLib := LongInt($80029C4A);
+End;
+
+Function UnRegisterTypeLib(G, Ma, Mi, L, K : LongInt) : LongInt;
+Begin
+  UnRegisterTypeLib := 0;
+End;
+
+{ Ordinaux d'OLEAUT32 (importations sans nom) }
+Function OleOrdName(N : LongInt) : String;
+Begin
+  Case N Of
+    2 : OleOrdName := 'SysAllocString';
+    4 : OleOrdName := 'SysAllocStringLen';
+    6 : OleOrdName := 'SysFreeString';
+    7 : OleOrdName := 'SysStringLen';
+    8 : OleOrdName := 'VariantInit';
+    9 : OleOrdName := 'VariantClear';
+    161 : OleOrdName := 'LoadTypeLib';
+    162 : OleOrdName := 'LoadRegTypeLib';
+    163 : OleOrdName := 'RegisterTypeLib';
+    183 : OleOrdName := 'LoadTypeLibEx';
+    186 : OleOrdName := 'UnRegisterTypeLib';
+  Else
+    OleOrdName := '';
+  End;
 End;
 
 Function GetExitCodeProcess(H, P : LongInt) : LongInt;
@@ -41266,6 +41779,200 @@ Begin
   If DXBpp = 15 Then DXBpp := 16;
   DDCleared := False;
   DD_RestoreDisplayMode := DD_OK;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Modes d'affichage (USER32) et formats de pixels (GDI32)            }
+{ ------------------------------------------------------------------ }
+
+{ DEVMODEA : dmSize 36, dmFields 40, dmBitsPerPel 104, dmPelsWidth 108,
+  dmPelsHeight 112, dmDisplayFrequency 120 }
+Procedure DevModeFill(P, W, H, B : LongInt);
+Var S : String;
+Begin
+  FillMem(P, 124, 0);
+  S := 'DISPLAY';
+  MoveMem(LongInt(@S[1]), P, Length(S));
+  MemW[0:P + 32] := $400;
+  MemW[0:P + 36] := 124;
+  MemL[0:P + 40] := $5C0000;
+  MemL[0:P + 104] := B;
+  MemL[0:P + 108] := W;
+  MemL[0:P + 112] := H;
+  MemL[0:P + 120] := 60;
+End;
+
+Function EnumDisplaySettingsA(Dev, N, P : LongInt) : LongInt;
+Var I, K, B, C : LongInt;
+Begin
+  EnumDisplaySettingsA := 0;
+  If P = 0 Then Exit;
+  If N < 0 Then
+  Begin
+    DevModeFill(P, ScrW, ScrH, DXDispBpp);
+    EnumDisplaySettingsA := 1;
+    Exit;
+  End;
+  C := 0;
+  For I := 0 To 3 Do
+  Begin
+    Case I Of
+      0 : B := 8;
+      1 : B := 16;
+      2 : B := 24;
+    Else
+      B := 32;
+    End;
+    For K := 0 To DXModeN - 1 Do
+      If DXModeOk(DXModeW[K], DXModeH[K], B) Then
+      Begin
+        If C = N Then
+        Begin
+          DevModeFill(P, DXModeW[K], DXModeH[K], B);
+          EnumDisplaySettingsA := 1;
+          Exit;
+        End;
+        Inc(C);
+      End;
+  End;
+End;
+
+Function EnumDisplaySettingsW(Dev, N, P : LongInt) : LongInt;
+Begin
+  EnumDisplaySettingsW := EnumDisplaySettingsA(0, N, P);
+End;
+
+{ DISP_CHANGE_SUCCESSFUL 0, DISP_CHANGE_BADMODE -2 }
+Function ChangeDisplaySettingsA(P, Fl : LongInt) : LongInt;
+Var W, H, B, F : LongInt;
+Begin
+  ChangeDisplaySettingsA := 0;
+  If P = 0 Then
+  Begin
+    If DXModeSet Then DD_RestoreDisplayMode(0);
+    DXModeSet := False;
+    Exit;
+  End;
+  F := MemL[0:P + 40];
+  W := ScrW; H := ScrH; B := DXDispBpp;
+  If (F And $40000) <> 0 Then B := MemL[0:P + 104];
+  If (F And $80000) <> 0 Then W := MemL[0:P + 108];
+  If (F And $100000) <> 0 Then H := MemL[0:P + 112];
+  KLog('ChangeDisplaySettings ' + IntStr(W) + 'x' + IntStr(H) + 'x' +
+       IntStr(B) + ' fl=' + HexStr(Fl, 4));
+  If B = 15 Then B := 16;
+  If Not DXModeOk(W, H, B) Then
+  Begin
+    ChangeDisplaySettingsA := -2;
+    Exit;
+  End;
+  { CDS_TEST : verifier seulement }
+  If (Fl And 2) <> 0 Then Exit;
+  If (W = ScrW) And (H = ScrH) And (B = DXDispBpp) Then Exit;
+  If DXSetMode(W, H, B) <> DD_OK Then ChangeDisplaySettingsA := -2;
+End;
+
+{ un seul format : RGBA, double tampon, profondeur 16 bits, logiciel }
+Function DescribePixelFormat(Dc, I, N, P : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  DescribePixelFormat := 1;
+  If (P = 0) Or (I <> 1) Or (N < 40) Then Exit;
+  B := DXDispBpp;
+  If B < 16 Then B := 16;
+  FillMem(P, 40, 0);
+  MemW[0:P] := 40;
+  MemW[0:P + 2] := 1;
+  { PFD_DRAW_TO_WINDOW, SUPPORT_OPENGL, DOUBLEBUFFER, GENERIC_FORMAT }
+  MemL[0:P + 4] := $4 Or $20 Or $1 Or $40;
+  Mem[0:P + 8] := 0;
+  Mem[0:P + 9] := B;
+  Mem[0:P + 23] := 16;
+End;
+
+Function ChoosePixelFormat(Dc, P : LongInt) : LongInt;
+Begin
+  ChoosePixelFormat := 1;
+End;
+
+Function SetPixelFormat(Dc, F, P : LongInt) : LongInt;
+Begin
+  SetPixelFormat := Ord(F = 1);
+End;
+
+Function GetPixelFormat(Dc : LongInt) : LongInt;
+Begin
+  GetPixelFormat := 1;
+End;
+
+Function SwapBuffers(Dc : LongInt) : LongInt;
+Begin
+  SwapBuffers := 1;
+End;
+
+Function GetDeviceGammaRamp(Dc, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GetDeviceGammaRamp := 0;
+  If P = 0 Then Exit;
+  For I := 0 To 255 Do
+  Begin
+    MemW[0:P + I * 2] := I * 257;
+    MemW[0:P + 512 + I * 2] := I * 257;
+    MemW[0:P + 1024 + I * 2] := I * 257;
+  End;
+  GetDeviceGammaRamp := 1;
+End;
+
+Function SetDeviceGammaRamp(Dc, P : LongInt) : LongInt;
+Begin
+  SetDeviceGammaRamp := Ord(P <> 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ MSACM32 : pas de codec (ACMERR_NOTPOSSIBLE)                        }
+{ ------------------------------------------------------------------ }
+
+Function acmFormatSuggest(D, Src, Dst, N, Fl : LongInt) : LongInt;
+Begin
+  acmFormatSuggest := 512;
+End;
+
+Function acmStreamOpen(PH, D, Src, Dst, Flt, Cb, Inst, Fl : LongInt)
+  : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  acmStreamOpen := 512;
+End;
+
+Function acmStreamClose(H, Fl : LongInt) : LongInt;
+Begin
+  acmStreamClose := 5;
+End;
+
+Function acmStreamSize(H, N, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamSize := 5;
+End;
+
+Function acmStreamPrepareHeader(H, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamPrepareHeader := 5;
+End;
+
+Function acmStreamUnprepareHeader(H, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamUnprepareHeader := 5;
+End;
+
+Function acmStreamConvert(H, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamConvert := 5;
+End;
+
+Function acmGetVersion : LongInt;
+Begin
+  acmGetVersion := $04000000;
 End;
 
 Function DD_FlipToGDISurface(T : LongInt) : LongInt;
@@ -55476,7 +56183,20 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
-  GetLongPathNameA,
+  GetLongPathNameA, OpenSCManagerA, OpenServiceA, CreateServiceA,
+  CloseServiceHandle, DeleteService, StartServiceA, ControlService,
+  QueryServiceStatus, OpenProcessToken, LookupPrivilegeValueA,
+  AdjustTokenPrivileges, SHGetSpecialFolderLocation, SHGetPathFromIDListA,
+  SHGetSpecialFolderPathA, SHGetFolderPathA, SHChangeNotify, SHGetMalloc,
+  ImQueryInterface, ImAddRef, ImRelease, ImAlloc, ImRealloc, ImFree,
+  ImGetSize, ImDidAlloc, ImHeapMinimize, ShellExecuteExA, LoadTypeLib,
+  LoadTypeLibEx, LoadRegTypeLib, RegisterTypeLib, UnRegisterTypeLib,
+  IsCharAlphaNumericA, LockWindowUpdate, DdeGetData,
+  EnumDisplaySettingsA, EnumDisplaySettingsW, ChangeDisplaySettingsA,
+  DescribePixelFormat, ChoosePixelFormat, SetPixelFormat, GetPixelFormat,
+  SwapBuffers, GetDeviceGammaRamp, SetDeviceGammaRamp, acmFormatSuggest,
+  acmStreamOpen, acmStreamClose, acmStreamSize, acmStreamPrepareHeader,
+  acmStreamUnprepareHeader, acmStreamConvert, acmGetVersion,
   TrackPopupMenuEx, LoadMenuW, LoadMenuIndirectA, LoadMenuIndirectW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
@@ -65772,8 +66492,9 @@ BEGIN
   BootStep(3);
   { ApiTrace := True journalise chaque appel d'API d'un programme Win32
     (nom, appelant, arguments, resultat) sur le port serie COM1 }
-  ApiTrace := False;
   LoadEnvironment;
+  { variable APITRACE de AUTOEXEC.BAT : journal des appels d'API }
+  ApiTrace := EnvFind('APITRACE', TrI);
   InitInput;
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
