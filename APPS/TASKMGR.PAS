@@ -421,9 +421,9 @@ End;
 
 Function Title : String;
 Begin
-  Title := L('Gestionnaire des t'#131'ches de Windows', 'Windows Task Manager',
-             'Windows Task-Manager', 'Task Manager di Windows',
-             'Administrador de tareas de Windows');
+  Title := L('Gestionnaire des t'#131'ches de Pasdows', 'Pasdows Task Manager',
+             'Pasdows Task-Manager', 'Task Manager di Pasdows',
+             'Administrador de tareas de Pasdows');
 End;
 
 Function TabName(I : LongInt) : String;
