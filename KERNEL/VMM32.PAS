@@ -148,6 +148,7 @@ Var
   SerialOk   : Boolean;
   LogOn      : Boolean;
   ApiTrace   : Boolean;          { journal des appels d API (serie) }
+  TrI : LongInt;
   PreemptOn  : Boolean;          { preemption des taches Win32 }
   SliceStart : LongInt;          { debut de la tranche de temps }
   KImgLo, KImgHi : LongInt;      { image du noyau (jamais preemptee) }
@@ -497,6 +498,36 @@ Begin
   If A - 16 < HeapRover Then HeapRover := A - 16;
 End;
 
+Var
+  HeapBad : LongInt;
+
+{ Verification du tas : signatures et tailles de tous les blocs ; le
+  premier bloc invalide et son predecesseur sont signales une fois }
+Function HeapCheck(Tag : String) : Boolean;
+Var P, BS, Prev, PrevSz : LongInt;
+Begin
+  HeapCheck := True;
+  P := HeapStart; Prev := HeapStart; PrevSz := 0;
+  While P < HeapEnd Do
+  Begin
+    BS := MemL[0:P + 4];
+    If ((MemL[0:P] <> HeapUsed) And (MemL[0:P] <> HeapFree0)) Or
+       (BS < 16) Or ((BS And 15) <> 0) Or (P + BS > HeapEnd) Then
+    Begin
+      If HeapBad <> P Then
+        KLog('TAS CORROMPU (' + Tag + ') bloc ' + HexStr(P, 8) + ' : ' +
+             HexStr(MemL[0:P], 8) + ' ' + HexStr(BS, 8) + ' ; precedent ' +
+             HexStr(Prev, 8) + ' taille ' + HexStr(PrevSz, 8) +
+             ' proprietaire ' + IntStr(MemL[0:Prev + 8]));
+      HeapBad := P;
+      HeapCheck := False;
+      Exit;
+    End;
+    Prev := P; PrevSz := BS;
+    P := P + BS;
+  End;
+End;
+
 Function KSize(A : LongInt) : LongInt;
 Begin
   If (A >= HeapStart + 16) And (A < HeapEnd) And
@@ -654,6 +685,7 @@ Begin
 End;
 
 Procedure KFault(Vec, Frame : LongInt); Forward;
+Procedure GlDumpRing; Forward;
 
 Procedure Trap(Vec : LongInt);
 Var F : LongInt;
@@ -9007,10 +9039,15 @@ End;
 
 { Texte avec retour a la ligne automatique ; retourne le nombre de
   lignes. Draw = False : seulement compter }
+Var
+  WrapClipY : LongInt;          { lignes dessinees au-dessus de cette limite }
+
 Function WrapText(X, Y, W : LongInt; Const S : String; C : LongInt;
                   Draw : Boolean) : LongInt;
 Var Cols, I, N, Last : LongInt; Line, Word0 : String;
 Begin
+  If WrapClipY = 0 Then WrapClipY := $7FFFFFFF;
+  If Draw And (Y >= WrapClipY) Then Draw := False;
   Cols := W Div 8;
   N := 0; Line := ''; Word0 := '';
   I := 1;
@@ -9022,7 +9059,8 @@ Begin
       Begin
         If Line <> '' Then
         Begin
-          If Draw Then OutTxt(X, Y + N * 16, Line, C);
+          If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
+            OutTxt(X, Y + N * 16, Line, C);
           Inc(N);
         End;
         Line := Word0;
@@ -9032,7 +9070,8 @@ Begin
       Word0 := '';
       If (I <= Length(S)) And (S[I] = '|') Then
       Begin
-        If Draw Then OutTxt(X, Y + N * 16, Line, C);
+        If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
+          OutTxt(X, Y + N * 16, Line, C);
         Inc(N);
         Line := '';
       End;
@@ -9043,7 +9082,8 @@ Begin
   End;
   If Line <> '' Then
   Begin
-    If Draw Then OutTxt(X, Y + N * 16, Line, C);
+    If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
+      OutTxt(X, Y + N * 16, Line, C);
     Inc(N);
   End;
   Last := N;
@@ -10203,6 +10243,28 @@ Begin
   Cr3Now := V;
 End;
 
+{ True si l'adresse lineaire A est presente dans l'espace courant }
+Function LinOk(A : LongInt) : Boolean;
+Var D, E : LongInt;
+Begin
+  LinOk := False;
+  D := Cr3Now And Not 4095;
+  If D = 0 Then
+  Begin
+    LinOk := (A >= 0) And (A < MemTop);
+    Exit;
+  End;
+  E := MemL[0:D + ((A Shr 22) And 1023) * 4];
+  If (E And 1) = 0 Then Exit;
+  If (E And $80) <> 0 Then
+  Begin
+    LinOk := True;
+    Exit;
+  End;
+  E := MemL[0:(E And Not 4095) + ((A Shr 12) And 1023) * 4];
+  LinOk := (E And 1) <> 0;
+End;
+
 Procedure SetCr3(V : LongInt);
 Begin
   If (KPd = 0) Or (V = 0) Then Exit;
@@ -10963,6 +11025,7 @@ Type
     Style, ExStyle : LongInt;
     X, Y, W, H : LongInt;    { relatif au client du parent (ou ecran) }
     Text     : String[127];
+    LongTxt  : LongInt;      { texte complet (ASCIIZ, tas) s'il depasse }
     Proc     : LongInt;
     IKind    : LongInt;
     Thread   : LongInt;
@@ -11955,6 +12018,8 @@ Begin
     SurfFree(Wnds^[W].Surf);
   End;
   If Wnds^[W].Extra <> 0 Then KFree(Wnds^[W].Extra);
+  If Wnds^[W].LongTxt <> 0 Then KFree(Wnds^[W].LongTxt);
+  Wnds^[W].LongTxt := 0;
   T := Wnds^[W].Thread;
   Wnds^[W].Used := False;
   If CaptureWin = W Then CaptureWin := -1;
@@ -11967,6 +12032,85 @@ Begin
     ActivateNext;
   End;
   TaskbarChanged;
+End;
+
+{ Texte d'une fenetre depuis une chaine ASCIIZ : les 127 premiers
+  caracteres dans Text, le texte complet dans le tas s'il est plus long
+  (textes des programmes d'installation) }
+Procedure WndSetTextZ(W, A : LongInt);
+Var N, H : LongInt;
+Begin
+  Wnds^[W].Text := PStr(A);
+  If Wnds^[W].LongTxt <> 0 Then KFree(Wnds^[W].LongTxt);
+  Wnds^[W].LongTxt := 0;
+  If A = 0 Then Exit;
+  N := StrLenZ(A);
+  If N <= 127 Then Exit;
+  H := HeapOwner; HeapOwner := 0;
+  Wnds^[W].LongTxt := KAlloc(N + 1);
+  HeapOwner := H;
+  If Wnds^[W].LongTxt <> 0 Then MoveMem(A, Wnds^[W].LongTxt, N + 1);
+End;
+
+Function WndTextLen(W : LongInt) : LongInt;
+Begin
+  If Wnds^[W].LongTxt <> 0 Then WndTextLen := StrLenZ(Wnds^[W].LongTxt)
+  Else WndTextLen := Length(Wnds^[W].Text);
+End;
+
+{ WM_GETTEXT : au plus N - 1 caracteres et le zero ; rend la longueur }
+Function WndGetTextZ(W, Buf, N : LongInt) : LongInt;
+Var L : LongInt;
+Begin
+  WndGetTextZ := 0;
+  If (Buf = 0) Or (N <= 0) Then Exit;
+  If Wnds^[W].LongTxt = 0 Then
+  Begin
+    PutPStr(Buf, Wnds^[W].Text, N);
+    WndGetTextZ := Min(Length(Wnds^[W].Text), N - 1);
+    Exit;
+  End;
+  L := Min(StrLenZ(Wnds^[W].LongTxt), N - 1);
+  MoveMem(Wnds^[W].LongTxt, Buf, L);
+  Mem[0:Buf + L] := 0;
+  WndGetTextZ := L;
+End;
+
+{ Texte multiligne (CR LF) de longueur quelconque, coupe en morceaux
+  pour WrapText ; rend le nombre de lignes }
+Function WrapZ(X, Y, Wd, A, C : LongInt; Draw : Boolean) : LongInt;
+Var Ch, N : LongInt; S : String;
+Begin
+  S := ''; N := 0;
+  While True Do
+  Begin
+    Ch := Mem[0:A];
+    { morceaux coupes de preference en fin de ligne }
+    If (Ch = 0) Or ((Ch = 32) And (Length(S) >= 240)) Or
+       (Length(S) >= 250) Then
+    Begin
+      If S <> '' Then N := N + WrapText(X, Y + N * 16, Wd, S, C, Draw);
+      S := '';
+      If Ch = 0 Then Break;
+      If Ch = 32 Then
+      Begin
+        Inc(A);
+        Continue;
+      End;
+    End;
+    If Ch = 10 Then
+    Begin
+      S := S + '|';
+      If Length(S) >= 150 Then
+      Begin
+        N := N + WrapText(X, Y + N * 16, Wd, S, C, Draw);
+        S := '';
+      End;
+    End
+    Else If Ch <> 13 Then S := S + Chr(Ch);
+    Inc(A);
+  End;
+  WrapZ := N;
 End;
 
 { Creer une fenetre ; indice ou -1. Param : CREATESTRUCT.lpCreateParams }
@@ -19253,14 +19397,37 @@ Begin
       Else
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
-        If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2, Y1,
-                                 Wnds^[W].W, T, Fg, True)
+        If Wnds^[W].LongTxt <> 0 Then
+          WrapZ(X1, Y1, Wnds^[W].W, Wnds^[W].LongTxt, Fg, True)
+        Else If (Pos(#10, T) > 0) Or (Pos(#13, T) > 0) Then
+        Begin
+          T := T + #0;
+          WrapZ(X1, Y1, Wnds^[W].W, LongInt(@T[1]), Fg, True);
+        End
+        Else If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2,
+                                      Y1, Wnds^[W].W, T, Fg, True)
         Else WrapText(X1, Y1, Wnds^[W].W, T, Fg, True);
       End;
     End;
     ikEdit :
     Begin
       Sunken(X1, Y1, X2, Y2, cWhite);
+      If (Wnds^[W].Style And 4) <> 0 Then
+      Begin
+        { ES_MULTILINE : lignes et retour a la ligne, sans defilement }
+        WrapClipY := Y2 - 2;
+        If Wnds^[W].LongTxt <> 0 Then
+          WrapZ(X1 + 4, Y1 + 3, Wnds^[W].W - 24, Wnds^[W].LongTxt, cBlack,
+                True)
+        Else
+        Begin
+          T := T + #0;
+          WrapZ(X1 + 4, Y1 + 3, Wnds^[W].W - 24, LongInt(@T[1]), cBlack,
+                True);
+        End;
+        WrapClipY := $7FFFFFFF;
+      End
+      Else
       OutTxt(X1 + 4, Y1 + (Wnds^[W].H - 16) Div 2, Fit(T, Wnds^[W].W - 8),
              cBlack);
       If W = FocusWin Then
@@ -19362,16 +19529,15 @@ Begin
       End;
     WM_SETTEXT :
     Begin
-      Wnds^[W].Text := PStr(LP);
+      WndSetTextZ(W, LP);
       KWndProc := 1;
       If IsChildW(W) Then InvalAll(W, True) Else Wnds^[W].NeedNc := True;
     End;
     WM_GETTEXT :
     Begin
-      PutPStr(LP, Wnds^[W].Text, WP);
-      KWndProc := Min(Length(Wnds^[W].Text), Max(0, WP - 1));
+      KWndProc := WndGetTextZ(W, LP, WP);
     End;
-    WM_GETTEXTLENGTH : KWndProc := Length(Wnds^[W].Text);
+    WM_GETTEXTLENGTH : KWndProc := WndTextLen(W);
     WM_PAINT : If IsChildW(W) Then DrawCtl(W);
     WM_SETFONT : Wnds^[W].Font := WP;
     WM_GETFONT : KWndProc := Wnds^[W].Font;
@@ -19505,11 +19671,37 @@ Begin
        HexStr(MemL[0:Frame + 16], 8) + ' EDI=' + HexStr(MemL[0:Frame + 12], 8)
        + ' EBP=' + HexStr(MemL[0:Frame + 20], 8) + ' ESP=' +
        HexStr(Frame + 56 + 4 * Ord(Vec >= 256), 8);
+  If V = 14 Then
+  Begin
+    asm
+      mov eax,cr2
+      mov X,eax
+    end;
+    S := S + ' CR2=' + HexStr(X, 8);
+  End;
   KLog('FAUTE (tache ' + IntStr(CurT) + ') ' + S);
+  GlDumpRing;
+  HeapCheck('faute');
   X := Frame + 56 + 4 * Ord(Vec >= 256);
   Nm := 'Pile :';
   For V := 0 To 11 Do Nm := Nm + ' ' + HexStr(MemL[0:X + V * 4], 8);
   KLog(Nm);
+  { sous la pile, puis chaine des cadres EBP (8 niveaux) }
+  Nm := 'Sous ESP :';
+  For V := 12 DownTo 1 Do Nm := Nm + ' ' + HexStr(MemL[0:X - V * 4], 8);
+  KLog(Nm);
+  Nm := 'Cadres :';
+  Eip := MemL[0:Frame + 20];
+  For V := 0 To 7 Do
+    If (Eip > $1000) And (Eip < MemTop - 8) Then
+    Begin
+      Nm := Nm + ' ' + HexStr(Eip, 8) + '>' + HexStr(MemL[0:Eip + 4], 8);
+      Eip := MemL[0:Eip];
+    End;
+  KLog(Nm);
+  If CurT >= 0 Then
+    KLog('Tache ' + IntStr(CurT) + ' pile ' + HexStr(Threads[CurT].Stack, 8) +
+         ' taille ' + HexStr(Threads[CurT].StackSz, 8));
   V := Vec And 255;
   HeapOwner := 0;
   If (CurT > 0) And Threads[CurT].IsApp Then
@@ -19876,6 +20068,12 @@ End;
 Procedure Sleep(Ms : LongInt);
 Begin
   If Ms <= 0 Then KYield Else KSleep(Ms);
+End;
+
+Function SleepEx(Ms, Alert : LongInt) : LongInt;
+Begin
+  Sleep(Ms);
+  SleepEx := 0;
 End;
 
 Function DaysFrom1601(Y, M, D : LongInt) : LongInt;
@@ -25474,6 +25672,8 @@ Begin
      (Classes^[C].MenuName <> 0) Then
     Menu := LoadMenuA(Inst, Classes^[C].MenuName);
   R := CreateW(Ex, C, Nm, Style, X, Y, W, H, P, Menu, Inst, Param);
+  If (R >= 0) And (Name >= $10000) And (StrLenZ(Name) > 127) Then
+    WndSetTextZ(R, Name);
   If (R >= 0) And Not IsChildW(R) Then
     KLog('Fenetre ' + HexStr(HwndOf(R), 8) + ' ' + Classes^[C].Name + ' "' +
          Nm + '" ' + IntStr(Wnds^[R].X) + ',' + IntStr(Wnds^[R].Y) + ' ' +
@@ -25929,7 +26129,7 @@ Var W : LongInt;
 Begin
   W := WndOf(H);
   GetWindowTextLengthA := 0;
-  If W >= 0 Then GetWindowTextLengthA := Length(Wnds^[W].Text);
+  If W >= 0 Then GetWindowTextLengthA := WndTextLen(W);
 End;
 
 Function GetWindowLongA(H, I : LongInt) : LongInt;
@@ -27166,6 +27366,23 @@ Begin
   OemToCharA := 1;
 End;
 
+Function IsCharAlphaNumericA(C : LongInt) : LongInt;
+Begin
+  C := UpCh(C And 255);
+  IsCharAlphaNumericA := Ord(((C >= 65) And (C <= 90)) Or
+                             ((C >= 48) And (C <= 57)) Or (C >= 192));
+End;
+
+Function LockWindowUpdate(H : LongInt) : LongInt;
+Begin
+  LockWindowUpdate := 1;
+End;
+
+Function DdeGetData(H, P, N, Ofs : LongInt) : LongInt;
+Begin
+  DdeGetData := 0;
+End;
+
 Function IsCharAlphaA(C : LongInt) : LongInt;
 Begin
   C := UpCh(C And 255);
@@ -28371,17 +28588,16 @@ Begin
     End;
     WM_SETTEXT :
     Begin
-      Wnds^[W].Text := PStr(LP);
+      WndSetTextZ(W, LP);
       Wnds^[W].NeedNc := True;
       TaskbarChanged;
       DefWindowProcA := 1;
     End;
     WM_GETTEXT :
     Begin
-      PutPStr(LP, Wnds^[W].Text, WP);
-      DefWindowProcA := Min(Length(Wnds^[W].Text), Max(0, WP - 1));
+      DefWindowProcA := WndGetTextZ(W, LP, WP);
     End;
-    WM_GETTEXTLENGTH : DefWindowProcA := Length(Wnds^[W].Text);
+    WM_GETTEXTLENGTH : DefWindowProcA := WndTextLen(W);
     WM_SYSCOMMAND : SysCommand(TopOf(W), WP);
     WM_SYSKEYDOWN :
       If WP = $73 Then PostMsgW(TopOf(W), WM_CLOSE, 0, 0);
@@ -30412,8 +30628,10 @@ Procedure RegSetStr(Path, Nm, V : String);
 Var K : LongInt;
 Begin
   K := RegWalk(2, Path, True);
-  V := V + #0;
   RegSetK(K, Nm, 1, LongInt(@V[1]), Length(V));
+  { RegSetK met deux zeros apres les donnees : compter le terminateur }
+  K := RegVal(K, Nm);
+  If K >= 0 Then RVSize[K] := Length(V) + 1;
 End;
 
 Procedure RegDelTree(K : LongInt);
@@ -30550,7 +30768,13 @@ Begin
   If PD <> 0 Then
   Begin
     If MemL[0:PN] < RVSize[V] Then RegQueryValueExA := 234
-    Else MoveMem(RVData[V], PD, RVSize[V]);
+    Else
+    Begin
+      MoveMem(RVData[V], PD, RVSize[V]);
+      { chaine sans terminateur : en ajouter un s'il y a la place }
+      If (RVType[V] In [1, 2, 7]) And (MemL[0:PN] > RVSize[V]) Then
+        Mem[0:PD + RVSize[V]] := 0;
+    End;
   End;
   MemL[0:PN] := RVSize[V];
 End;
@@ -30716,14 +30940,15 @@ End;
 
 Const
   MaxMod = 64;
-  SysDllN = 27;
+  SysDllN = 29;
   SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
     'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
     'OLE32.DLL', 'MSVFW32.DLL', 'ADVAPI32.DLL', 'VERSION.DLL',
     'COMCTL32.DLL', 'OLEAUT32.DLL', 'MSVCRT.DLL', 'WSOCK32.DLL',
     'DDRAW.DLL', 'DSOUND.DLL', 'DINPUT.DLL', 'DSETUP.DLL', 'WS2_32.DLL',
     'ICMP.DLL', 'WININET.DLL', 'D3DIM.DLL', 'D3DIM700.DLL', 'D3D8.DLL',
-    'DINPUT8.DLL', 'DPLAYX.DLL', 'DPLAY.DLL');
+    'DINPUT8.DLL', 'DPLAYX.DLL', 'DPLAY.DLL', 'MSACM32.DLL',
+    'OPENGL32.DLL');
 
 Type
   TModule = Record
@@ -30880,7 +31105,8 @@ Begin
     For D := 0 To 3 Do
     Begin
       R := MemL[0:F + 48 + D * 4];
-      If (R >= $10000) And (R < MemTop) Then
+      If (R >= $10000) And (R < MemTop - 256) And LinOk(R) And
+         LinOk(R + 63) Then
         If (Mem[0:R] >= 32) And (Mem[0:R] < 127) And
            ((Mem[0:R + 1] = 0) Or ((Mem[0:R + 1] >= 32) And
            (Mem[0:R + 1] < 127))) Then
@@ -31045,7 +31271,9 @@ Function WsOrdName(N : LongInt) : String; Forward;
 Procedure NetAppExit; Forward;
 
 Procedure DXAppDone; Forward;
+Procedure GlProcDone(P : LongInt); Forward;
 Function DXOrdName(Dll : String; N : LongInt) : String; Forward;
+Function OleOrdName(N : LongInt) : String; Forward;
 
 Function ResolveImport(Dll, Name : String; Ordinal : LongInt) : LongInt;
 Var M, A : LongInt; Nm : String;
@@ -31063,6 +31291,8 @@ Begin
      (Ordinal = 2) Then Name := 'VideoForWindowsVersion';
   If (Name = '') And (UpStr(BaseName(Dll)) = 'COMCTL32.DLL') And
      (Ordinal = 17) Then Name := 'InitCommonControls';
+  If (Name = '') And (UpStr(BaseName(Dll)) = 'OLEAUT32.DLL') Then
+    Name := OleOrdName(Ordinal);
   If (A = 0) And Not IsSysDll(Dll) Then
   Begin
     M := FindModule(Dll);
@@ -31751,6 +31981,7 @@ Begin
     If Classes^[I].Used And (Classes^[I].IKind = ikNone) And
        (Classes^[I].PrcId = P) Then
       Classes^[I].Used := False;
+  GlProcDone(P);
   If DXProc = P Then
   Begin
     DXAppDone;
@@ -32037,6 +32268,346 @@ Begin
     If I >= 0 Then MemL[0:PI + 12] := ThreadId(I) Else MemL[0:PI + 12] := 0;
   End;
   CreateProcessA := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Services, jetons, dossiers speciaux, ShellExecuteEx, bibliotheques  }
+{ de types : comme sous Windows 95                                    }
+{ ------------------------------------------------------------------ }
+{ Windows 95 n'a ni services ni jetons de securite : ces fonctions
+  echouent avec ERROR_CALL_NOT_IMPLEMENTED (120), ce que les programmes
+  d'installation savent traiter. }
+
+Function NoNt : LongInt;
+Begin
+  SetErr(120);
+  NoNt := 0;
+End;
+
+Function OpenSCManagerA(M, D, A : LongInt) : LongInt;
+Begin
+  OpenSCManagerA := NoNt;
+End;
+
+Function OpenServiceA(H, N, A : LongInt) : LongInt;
+Begin
+  OpenServiceA := NoNt;
+End;
+
+Function CreateServiceA(H, N, Dn, A, T, St, E, Bin, G, Tag, Dep, U,
+                        Pw : LongInt) : LongInt;
+Begin
+  CreateServiceA := NoNt;
+End;
+
+Function CloseServiceHandle(H : LongInt) : LongInt;
+Begin
+  CloseServiceHandle := NoNt;
+End;
+
+Function DeleteService(H : LongInt) : LongInt;
+Begin
+  DeleteService := NoNt;
+End;
+
+Function StartServiceA(H, N, A : LongInt) : LongInt;
+Begin
+  StartServiceA := NoNt;
+End;
+
+Function ControlService(H, C, St : LongInt) : LongInt;
+Begin
+  ControlService := NoNt;
+End;
+
+Function QueryServiceStatus(H, St : LongInt) : LongInt;
+Begin
+  QueryServiceStatus := NoNt;
+End;
+
+Function OpenProcessToken(H, A, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 0;
+  OpenProcessToken := NoNt;
+End;
+
+Function LookupPrivilegeValueA(Sys, N, L : LongInt) : LongInt;
+Begin
+  LookupPrivilegeValueA := NoNt;
+End;
+
+Function AdjustTokenPrivileges(H, Dis, N, L, Prev, R : LongInt) : LongInt;
+Begin
+  AdjustTokenPrivileges := NoNt;
+End;
+
+{ Dossiers speciaux (CSIDL_*) ; crees au besoin }
+Function ShFolder(Csidl : LongInt) : String;
+Var B : Array[0..259] Of Char; W, R, Part : String; K : LongInt;
+Begin
+  B[0] := #0;
+  GetWindowsDirectoryA(LongInt(@B), 256);
+  W := PStr(LongInt(@B));
+  If W = '' Then W := 'C:\WINDOWS';
+  Case Csidl And $FF Of
+    0, $10, $19 : R := W + '\Desktop';
+    2, $17 : R := W + '\Start Menu\Programs';
+    5 : R := 'C:\My Documents';
+    6, $1F : R := W + '\Favorites';
+    7, $18 : R := W + '\Start Menu\Programs\StartUp';
+    8 : R := W + '\Recent';
+    9 : R := W + '\SendTo';
+    $0B, $16 : R := W + '\Start Menu';
+    $13 : R := W + '\NetHood';
+    $14 : R := W + '\Fonts';
+    $15 : R := W + '\ShellNew';
+    $1A, $1C, $23 : R := W + '\Application Data';
+    $20 : R := W + '\Temporary Internet Files';
+    $21 : R := W + '\Cookies';
+    $22 : R := W + '\History';
+    $24 : R := W;
+    $25, $29 : R := W + '\SYSTEM';
+    $26 : R := 'C:\Program Files';
+    $2B : R := 'C:\Program Files\Common Files';
+  Else
+    R := '';
+  End;
+  { creer le chemin, dossier par dossier }
+  If R <> '' Then
+    For K := 4 To Length(R) + 1 Do
+      If (K > Length(R)) Or (R[K] = '\') Then
+      Begin
+        Part := Copy(R, 1, K - 1) + #0;
+        CreateDirectoryA(LongInt(@Part[1]), 0);
+      End;
+  ShFolder := R;
+End;
+
+Const
+  PidlMagic = $4C445050;                 { 'PPDL' : liste d'un chemin }
+
+{ ITEMIDLIST d'un chemin : cb, marque, chemin ASCIIZ, puis cb = 0 }
+Function PidlOf(Const Path : String) : LongInt;
+Var A, N : LongInt;
+Begin
+  N := 2 + 4 + Length(Path) + 1;
+  A := KAlloc(N + 2);
+  PidlOf := A;
+  If A = 0 Then Exit;
+  MemW[0:A] := N;
+  MemL[0:A + 2] := PidlMagic;
+  PutPStr(A + 6, Path, Length(Path) + 1);
+  MemW[0:A + N] := 0;
+End;
+
+Function SHGetSpecialFolderLocation(H, Csidl, PP : LongInt) : LongInt;
+Var S : String;
+Begin
+  SHGetSpecialFolderLocation := LongInt($80070057);
+  If PP = 0 Then Exit;
+  MemL[0:PP] := 0;
+  S := ShFolder(Csidl);
+  If S = '' Then Exit;
+  MemL[0:PP] := PidlOf(S);
+  SHGetSpecialFolderLocation := 0;
+End;
+
+Function SHGetPathFromIDListA(Pidl, Buf : LongInt) : LongInt;
+Begin
+  SHGetPathFromIDListA := 0;
+  If (Pidl = 0) Or (Buf = 0) Then Exit;
+  Mem[0:Buf] := 0;
+  If (MemW[0:Pidl] < 7) Or (MemL[0:Pidl + 2] <> PidlMagic) Then Exit;
+  PutPStr(Buf, PStr(Pidl + 6), 260);
+  SHGetPathFromIDListA := 1;
+End;
+
+Function SHGetSpecialFolderPathA(H, Buf, Csidl, Create : LongInt) : LongInt;
+Var S : String;
+Begin
+  S := ShFolder(Csidl);
+  SHGetSpecialFolderPathA := Ord(S <> '');
+  If (Buf <> 0) And (S <> '') Then PutPStr(Buf, S, 260);
+End;
+
+Function SHGetFolderPathA(H, Csidl, Tok, Fl, Buf : LongInt) : LongInt;
+Var S : String;
+Begin
+  S := ShFolder(Csidl);
+  If S = '' Then SHGetFolderPathA := LongInt($80070057)
+  Else
+  Begin
+    If Buf <> 0 Then PutPStr(Buf, S, 260);
+    SHGetFolderPathA := 0;
+  End;
+End;
+
+Procedure SHChangeNotify(E, F, A, B : LongInt);
+Begin
+  { le bureau relit ses icones : sans effet ici }
+End;
+
+{ IMalloc du shell (SHGetMalloc) : blocs du tas, comme CoTaskMemAlloc }
+Var
+  ShMallocObj : LongInt;
+
+Function ImQueryInterface(This, Riid, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := This;
+  ImQueryInterface := 0;
+End;
+
+Function ImAddRef(This : LongInt) : LongInt;
+Begin
+  ImAddRef := 1;
+End;
+
+Function ImRelease(This : LongInt) : LongInt;
+Begin
+  ImRelease := 1;
+End;
+
+Function ImAlloc(This, N : LongInt) : LongInt;
+Begin
+  ImAlloc := KAlloc(N);
+End;
+
+Function ImRealloc(This, A, N : LongInt) : LongInt;
+Begin
+  If A = 0 Then ImRealloc := KAlloc(N) Else ImRealloc := KRealloc(A, N);
+End;
+
+Procedure ImFree(This, A : LongInt);
+Begin
+  If A <> 0 Then KFree(A);
+End;
+
+Function ImGetSize(This, A : LongInt) : LongInt;
+Begin
+  If A = 0 Then ImGetSize := -1 Else ImGetSize := KSize(A);
+End;
+
+Function ImDidAlloc(This, A : LongInt) : LongInt;
+Begin
+  ImDidAlloc := -1;
+End;
+
+Procedure ImHeapMinimize(This : LongInt);
+Begin
+End;
+
+Function SHGetMalloc(PP : LongInt) : LongInt;
+Var V, H : LongInt;
+Begin
+  If ShMallocObj = 0 Then
+  Begin
+    H := HeapOwner; HeapOwner := 0;
+    V := KAlloc(9 * 4 + 4);
+    HeapOwner := H;
+    MemL[0:V + 4] := KernelExport('ImQueryInterface');
+    MemL[0:V + 8] := KernelExport('ImAddRef');
+    MemL[0:V + 12] := KernelExport('ImRelease');
+    MemL[0:V + 16] := KernelExport('ImAlloc');
+    MemL[0:V + 20] := KernelExport('ImRealloc');
+    MemL[0:V + 24] := KernelExport('ImFree');
+    MemL[0:V + 28] := KernelExport('ImGetSize');
+    MemL[0:V + 32] := KernelExport('ImDidAlloc');
+    MemL[0:V + 36] := KernelExport('ImHeapMinimize');
+    MemL[0:V] := V + 4;
+    ShMallocObj := V;
+  End;
+  If PP <> 0 Then MemL[0:PP] := ShMallocObj;
+  SHGetMalloc := 0;
+End;
+
+{ ShellExecuteEx : programme lance par CreateProcess (poignee du
+  processus si SEE_MASK_NOCLOSEPROCESS), document par ShellExecute }
+Function ShellExecuteExA(P : LongInt) : LongInt;
+Var F, Prm, Cmd, Ext : String; Si : Array[0..16] Of LongInt;
+    Pi : Array[0..3] Of LongInt; D, K : LongInt;
+Begin
+  ShellExecuteExA := 0;
+  If P = 0 Then Exit;
+  F := PStr(MemL[0:P + 16]);
+  Prm := '';
+  If MemL[0:P + 20] <> 0 Then Prm := PStr(MemL[0:P + 20]);
+  D := MemL[0:P + 24];
+  MemL[0:P + 56] := 0;
+  Ext := UpStr(F);
+  K := Length(Ext);
+  While (K > 0) And (Ext[K] <> '.') And (Ext[K] <> '\') Do Dec(K);
+  If (K > 0) And (Ext[K] = '.') Then Ext := Copy(Ext, K, 4) Else Ext := '';
+  If (Ext = '') Or (Ext = '.EXE') Or (Ext = '.COM') Or (Ext = '.BAT') Then
+  Begin
+    Cmd := '"' + F + '" ' + Prm + #0;
+    FillMem(LongInt(@Si), SizeOf(Si), 0);
+    Si[0] := 68;
+    If CreateProcessA(0, LongInt(@Cmd[1]), 0, 0, 0, 0, 0, D, LongInt(@Si),
+                      LongInt(@Pi)) = 0 Then
+    Begin
+      MemL[0:P + 32] := 2;
+      Exit;
+    End;
+    CloseHandle(Pi[1]);
+    If (MemL[0:P + 4] And $40) <> 0 Then MemL[0:P + 56] := Pi[0]
+    Else CloseHandle(Pi[0]);
+    MemL[0:P + 32] := 33;
+    ShellExecuteExA := 1;
+  End
+  Else
+  Begin
+    K := ShellExecuteA(MemL[0:P + 8], MemL[0:P + 12], MemL[0:P + 16],
+                       MemL[0:P + 20], D, MemL[0:P + 28]);
+    MemL[0:P + 32] := K;
+    ShellExecuteExA := Ord(K > 32);
+  End;
+End;
+
+{ OLEAUT32 : pas de bibliotheques de types (TYPE_E_CANTLOADLIBRARY) }
+Function LoadTypeLib(F, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  LoadTypeLib := LongInt($80029C4A);
+End;
+
+Function LoadTypeLibEx(F, K, PP : LongInt) : LongInt;
+Begin
+  LoadTypeLibEx := LoadTypeLib(F, PP);
+End;
+
+Function LoadRegTypeLib(G, Ma, Mi, L, PP : LongInt) : LongInt;
+Begin
+  LoadRegTypeLib := LoadTypeLib(0, PP);
+End;
+
+Function RegisterTypeLib(T, F, H : LongInt) : LongInt;
+Begin
+  RegisterTypeLib := LongInt($80029C4A);
+End;
+
+Function UnRegisterTypeLib(G, Ma, Mi, L, K : LongInt) : LongInt;
+Begin
+  UnRegisterTypeLib := 0;
+End;
+
+{ Ordinaux d'OLEAUT32 (importations sans nom) }
+Function OleOrdName(N : LongInt) : String;
+Begin
+  Case N Of
+    2 : OleOrdName := 'SysAllocString';
+    4 : OleOrdName := 'SysAllocStringLen';
+    6 : OleOrdName := 'SysFreeString';
+    7 : OleOrdName := 'SysStringLen';
+    8 : OleOrdName := 'VariantInit';
+    9 : OleOrdName := 'VariantClear';
+    161 : OleOrdName := 'LoadTypeLib';
+    162 : OleOrdName := 'LoadRegTypeLib';
+    163 : OleOrdName := 'RegisterTypeLib';
+    183 : OleOrdName := 'LoadTypeLibEx';
+    186 : OleOrdName := 'UnRegisterTypeLib';
+  Else
+    OleOrdName := '';
+  End;
 End;
 
 Function GetExitCodeProcess(H, P : LongInt) : LongInt;
@@ -34581,1767 +35152,720 @@ End;
 
 Const
   W16ApiN = 1760;
-  W16Apis : Array[0..W16ApiN - 1] Of String[40] = (
-    'K001:X>W FatalExit',
-    'K002:>W ExitKernel',
-    'K003:>L GetVersion',
-    'K004:WWW>W LocalInit',
-    'K005:WW>W LocalAlloc',
-    'K006:WWW>W LocalReAlloc',
-    'K007:W>W LocalFree',
-    'K008:W>L LocalLock',
-    'K009:W>W LocalUnlock',
-    'K010:W>W LocalSize',
-    'K011:W>W LocalHandle',
-    'K012:W>W LocalFlags',
-    'K013:W>W LocalCompact',
-    'K014:L>L LocalNotify',
-    'K015:WL>W GlobalAlloc',
-    'K016:WLW>W GlobalReAlloc',
-    'K017:W>W GlobalFree',
-    'K018:W>L GlobalLock',
-    'K019:W>W GlobalUnlock',
-    'K020:W>L GlobalSize',
-    'K021:W>L GlobalHandle',
-    'K022:W>W GlobalFlags',
-    'K023:W>W LockSegment',
-    'K024:W>W UnlockSegment',
-    'K025:L>L GlobalCompact',
-    'K026:W>W GlobalFreeAll',
-    'K027:WPW>W GetModuleName',
-    'K028:>L GlobalMasterHandle',
-    'K029:>W Yield',
-    'K030:W>W WaitEvent',
-    'K031:W>W PostEvent',
-    'K032:WI>W SetPriority',
-    'K033:W>W LockCurrentTask',
-    'K034:WW>W SetTaskQueue',
-    'K035:W>W GetTaskQueue',
-    'K036:>L GetCurrentTask',
-    'K037:>L GetCurrentPDB',
-    'K038:WS>L SetTaskSignalProc',
-    'K039:X>W SetTaskSwitchProc',
-    'K040:X>W SetTaskInterchange',
-    'K041:>W EnableDos',
-    'K042:>W DisableDos',
-    'K043:X>W IsScreenGrab',
-    'K044:X>W BuildPDB',
-    'K045:PP>W LoadModule',
-    'K046:W>W FreeModule',
-    'K047:S>L GetModuleHandle',
-    'K048:W>W GetModuleUsage',
-    'K049:WPI>W GetModuleFileName',
-    'K050:WP>L GetProcAddress',
-    'K051:SW>L MakeProcInstance',
-    'K052:S>W FreeProcInstance',
-    'K053:X>W CallProcInstance',
-    'K054:WWW>W GetInstanceData',
-    'K055:R>R Catch',
-    'K056:R>R Throw',
-    'K057:PPI>W GetProfileInt',
-    'K058:PPPPW>W GetProfileString',
-    'K059:PPP>W WriteProfileString',
-    'K060:WPP>W FindResource',
-    'K061:WW>W LoadResource',
-    'K062:W>L LockResource',
-    'K063:W>W FreeResource',
-    'K064:WW>W AccessResource',
-    'K065:WW>L SizeofResource',
-    'K066:WWL>W AllocResource',
-    'K067:WPS>L SetResourceHandler',
-    'K068:W>W InitAtomTable',
-    'K069:P>W FindAtom',
-    'K070:P>W AddAtom',
-    'K071:W>W DeleteAtom',
-    'K072:WPW>W GetAtomName',
-    'K073:W>W GetAtomHandle',
-    'K074:PPW>W OpenFile',
-    'K075:X>W OpenPathName',
-    'K076:X>W DeletePathName',
-    'K077:S>L Reserved1',
-    'K078:SS>L Reserved2',
-    'K079:S>L Reserved3',
-    'K080:S>L Reserved4',
-    'K081:W>W _lclose',
-    'K082:WSW>W _lread',
-    'K083:PW>W _lcreat',
-    'K084:WLW>L _llseek',
-    'K085:PW>W _lopen',
-    'K086:WPW>W _lwrite',
-    'K087:PP>W Reserved5',
-    'K088:SP>L lstrcpy',
-    'K089:SP>L lstrcat',
-    'K090:P>W lstrlen',
-    'K091:R>R InitTask',
-    'K092:W>L GetTempDrive',
-    'K093:S>L GetCodeHandle',
-    'K094:W>W DefineHandleTable',
-    'K095:P>W LoadLibrary',
-    'K096:W>W FreeLibrary',
-    'K097:WPWP>W GetTempFileName',
-    'K098:>W GetLastDiskChange',
-    'K099:>L GetLPErrMode',
-    'K100:>W ValidateCodeSegments',
-    'K101:X>W NoHookDosCall',
-    'K102:R>R DOS3Call',
-    'K103:R>R NetBIOSCall',
-    'K104:SP>W GetCodeInfo',
-    'K105:>W GetExeVersion',
-    'K106:W>L SetSwapAreaSize',
-    'K107:W>W SetErrorMode',
-    'K108:WWW>W SwitchStackTo',
-    'K109:R>R SwitchStackBack',
-    'K110:W>L PatchCodeHandle',
-    'K111:W>L GlobalWire',
-    'K112:W>W GlobalUnWire',
-    'K113:=3 __AHSHIFT',
-    'K114:=8 __AHINCR',
-    'K115:P>W OutputDebugString',
-    'K116:X>W InitLib',
-    'K117:>W OldYield',
-    'K118:>W GetTaskQueueDS',
-    'K119:>W GetTaskQueueES',
-    'K120:X>W UndefDynLink',
-    'K121:WW>W LocalShrink',
-    'K122:>W IsTaskLocked',
-    'K123:>W KbdRst',
-    'K124:>W EnableKernel',
-    'K125:>W DisableKernel',
-    'K126:X>W MemoryFreed',
-    'K127:PPIP>W GetPrivateProfileInt',
-    'K128:PPPPWP>W GetPrivateProfileStrin',
-    'K129:PPPP>W WritePrivateProfileStr',
-    'K130:P>L FileCDR',
-    'K131:>L GetDOSEnvironment',
-    'K132:>L GetWinFlags',
-    'K133:W>W GetExePtr',
-    'K134:PW>W GetWindowsDirectory',
-    'K135:PW>W GetSystemDirectory',
-    'K136:W>W GetDriveType',
-    'K137:WP>W FatalAppExit',
-    'K138:W>L GetHeapSpaces',
-    'K139:X>W DoSignal',
-    'K140:SPPWW>W SetSigHandler',
-    'K141:X>W InitTask1',
-    'K142:PW>W GetProfileSectionNames',
-    'K143:PWP>W GetPrivateProfileSecti',
-    'K144:PP>W CreateDirectory',
-    'K145:P>W RemoveDirectory',
-    'K146:P>W DeleteFile',
-    'K147:L>W SetLastError',
-    'K148:>L GetLastError',
-    'K149:P>W GetVersionEx',
-    'K150:W>W DirectedYield',
-    'K151:X>W WinOldApCall',
-    'K152:>W GetNumTasks',
-    'K154:S>W GlobalNotify',
-    'K155:>W GetTaskDS',
-    'K156:L>L LimitEMSPages',
-    'K157:L>L GetCurPID',
-    'K158:W>W IsWinOldApTask',
-    'K159:W>L GlobalHandleNoRIP',
-    'K160:X>W EMSCopy',
-    'K161:>W LocalCountFree',
-    'K162:>W LocalHeapSize',
-    'K163:W>W GlobalLRUOldest',
-    'K164:W>W GlobalLRUNewest',
-    'K165:W>W A20Proc',
-    'K166:PW>W WinExec',
-    'K167:W>W GetExpWinVer',
-    'K168:WWW>W DirectResAlloc',
-    'K169:W>L GetFreeSpace',
-    'K170:W>W AllocCStoDSAlias',
-    'K171:W>W AllocDStoCSAlias',
-    'K172:W>W AllocAlias',
-    'K173:=0 __ROMBIOS',
-    'K174:=0 __A000H',
-    'K175:W>W AllocSelector',
-    'K176:W>W FreeSelector',
-    'K177:WW>W PrestoChangoSelector',
-    'K178:=1043 __WINFLAGS',
-    'K179:=0 __D000H',
-    'K180:LL>W LongPtrAdd',
-    'K181:=0 __B000H',
-    'K182:=0 __B800H',
-    'K183:=0 __0000H',
-    'K184:L>L GlobalDOSAlloc',
-    'K185:W>W GlobalDOSFree',
-    'K186:W>L GetSelectorBase',
-    'K187:WL>W SetSelectorBase',
-    'K188:W>L GetSelectorLimit',
-    'K189:WL>W SetSelectorLimit',
-    'K190:=0 __E000H',
-    'K191:W>W GlobalPageLock',
-    'K192:W>W GlobalPageUnlock',
-    'K193:=0 __0040H',
-    'K194:=0 __F000H',
-    'K195:=0 __C000H',
-    'K196:WWW>W SelectorAccessRights',
-    'K197:W>W GlobalFix',
-    'K198:W>W GlobalUnfix',
-    'K199:W>W SetHandleCount',
-    'K200:>W ValidateFreeSpaces',
-    'K201:X>W ReplaceInst',
-    'K202:X>W RegisterPtrace',
-    'K203:R>R DebugBreak',
-    'K204:X>W SwapRecording',
-    'K205:X>W CVWBreak',
-    'K206:W>W AllocSelectorArray',
-    'K207:W>W IsDBCSLeadByte',
-    'K208:WLLL>L K208',
-    'K209:LLWL>L K209',
-    'K210:LLWLL>L K210',
-    'K211:LLW>L K211',
-    'K213:LLWW>L K213',
-    'K214:LLW>L K214',
-    'K215:LW>L K215',
-    'K216:LLPL>L RegEnumKey',
-    'K217:LPP>L RegOpenKey',
-    'K218:LPP>L RegCreateKey',
-    'K219:LP>L RegDeleteKey',
-    'K220:L>L RegCloseKey',
-    'K221:LPLPL>L RegSetValue',
-    'K222:LP>L RegDeleteValue',
-    'K223:LLPPPPPP>L RegEnumValue',
-    'K224:LPPP>L RegQueryValue',
-    'K225:LPPPPP>L RegQueryValueEx',
-    'K226:LPLLPL>L RegSetValueEx',
-    'K227:L>L RegFlushKey',
-    'K228:W>W K228',
-    'K229:L>W K229',
-    'K230:W>L GlobalSmartPageLock',
-    'K231:W>L GlobalSmartPageUnlock',
-    'K232:X>W RegLoadKey',
-    'K233:X>W RegUnloadKey',
-    'K234:X>W RegSaveKey',
-    'K235:X>W InvalidateNlsCache',
-    'K236:X>W GetProductName',
-    'K237:>W K237',
-    'K262:X>W WOWWaitForMsgAndEvent',
-    'K263:X>W WOWMsgBox',
-    'K273:X>W K273',
-    'K274:PPW>W GetShortPathName',
-    'K310:W>W LocalHandleDelta',
-    'K311:P>L GetSetKernelDOSProc',
-    'K314:X>W DebugDefineSegment',
-    'K315:>W WriteOutProfiles',
-    'K316:>L GetFreeMemInfo',
-    'K318:X>W FatalExitHook',
-    'K319:X>W FlushCachedFileHandle',
-    'K320:W>W IsTask',
-    'K323:W>W IsRomModule',
-    'K324:WP>W LogError',
-    'K325:WPP>W LogParamError',
-    'K326:W>W IsRomFile',
-    'K327:R>R K327',
-    'K328:V>W _DebugOutput',
-    'K329:PW>W K329',
-    'K332:=0 THHOOK',
-    'K334:SW>W IsBadReadPtr',
-    'K335:SW>W IsBadWritePtr',
-    'K336:S>W IsBadCodePtr',
-    'K337:SW>W IsBadStringPtr',
-    'K338:S>W HasGPHandler',
-    'K339:>W DiagQuery',
-    'K340:P>W DiagOutput',
-    'K341:P>L ToolHelpHook',
-    'K342:=0 __GP',
-    'K343:X>W RegisterWinOldApHook',
-    'K344:X>W GetWinOldApHooks',
-    'K345:W>W IsSharedSelector',
-    'K346:SL>W IsBadHugeReadPtr',
-    'K347:SL>W IsBadHugeWritePtr',
-    'K348:PPL>W hmemcpy',
-    'K349:WSL>L _hread',
-    'K350:WPL>L _hwrite',
-    'K351:>W BUNNY_351',
-    'K352:SPW>L lstrcatn',
-    'K353:SPW>L lstrcpyn',
-    'K354:W>L GetAppCompatFlags',
-    'K355:PW>W GetWinDebugInfo',
-    'K356:P>W SetWinDebugInfo',
-    'K357:S>L MapSL',
-    'K358:L>L MapLS',
-    'K359:S>L UnMapLS',
-    'K360:PPW>W OpenFileEx',
-    'K361:>W PIGLET_361',
-    'K362:X>W ThunkTerminateProcess',
-    'K365:R>R GlobalChangeLockCount',
-    'K403:WW>W FarSetOwner',
-    'K404:W>W FarGetOwner',
-    'K406:PPPWP>W WritePrivateProfileStr',
-    'K407:PPPWP>W GetPrivateProfileStruc',
-    'K408:X>W KERNEL_408',
-    'K409:X>W KERNEL_409',
-    'K410:X>W CreateProcessFromWinEx',
-    'K411:LP>L GetCurrentDirectory',
-    'K412:P>W SetCurrentDirectory',
-    'K413:PP>W FindFirstFile',
-    'K414:WP>W FindNextFile',
-    'K415:W>W FindClose',
-    'K416:PPP>W WritePrivateProfileSec',
-    'K417:PP>W WriteProfileSection',
-    'K418:PPWP>W GetPrivateProfileSecti',
-    'K419:PPW>W GetProfileSection',
-    'K420:P>L GetFileAttributes',
-    'K421:PL>W SetFileAttributes',
-    'K422:PPPPP>W GetDiskFreeSpace',
-    'K423:P>W LogApiThk',
-    'K431:PW>W IsPeFormat',
-    'K432:X>W FileTimeToLocalFileTim',
-    'K434:PPW>W UnicodeToAnsi',
-    'K435:X>W GetTaskFlags',
-    'K436:P>W _ConfirmSysLevel',
-    'K437:P>W _CheckNotSysLevel',
-    'K438:PL>W _CreateSysLevel',
-    'K439:P>W _EnterSysLevel',
-    'K440:P>W _LeaveSysLevel',
-    'K441:PLSSLP>L CreateThread16',
-    'K442:>L VWin32_EventCreate',
-    'K443:L>L VWin32_EventDestroy',
-    'K444:PW>W Local32Info',
-    'K445:PW>W Local32First',
-    'K446:P>W Local32Next',
-    'K447:>W WIN32_OldYield',
-    'K448:X>W KERNEL_448',
-    'K449:>L GetpWin16Lock',
-    'K450:L>L VWin32_EventWait',
-    'K451:L>L VWin32_EventSet',
-    'K452:P>L LoadLibrary32',
-    'K453:LP>L GetProcAddress32',
-    'K454:=0 __FLATCS',
-    'K455:=0 __FLATDS',
-    'K456:WWW>L DefResourceHandler',
-    'K457:LL>L CreateW32Event',
-    'K458:L>L SetW32Event',
-    'K459:L>L ResetW32Event',
-    'K460:LL>L WaitForSingleObject',
-    'K461:LPLL>L WaitForMultipleObjects',
-    'K462:>L GetCurrentThreadId',
-    'K463:LW>L SetThreadQueue',
-    'K464:L>L GetThreadQueue',
-    'K465:X>W NukeProcess',
-    'K466:W>W ExitProcess',
-    'K467:X>W WOACreateConsole',
-    'K468:X>W WOASpawnConApp',
-    'K469:X>W WOAGimmeTitle',
-    'K470:X>W WOADestroyConsole',
-    'K471:>L GetCurrentProcessId',
-    'K472:R>R MapHInstLS',
-    'K473:R>R MapHInstSL',
-    'K474:L>L CloseW32Handle',
-    'K475:>W GetTEBSelectorFS',
-    'K476:L>L ConvertToGlobalHandle',
-    'K477:X>W WOAFullScreen',
-    'K478:X>W WOATerminateProcess',
-    'K479:L>L KERNEL_479',
-    'K480:>W _EnterWin16Lock',
-    'K481:>W _LeaveWin16Lock',
-    'K482:P>L LoadSystemLibrary32',
-    'K483:L>L MapProcessHandle',
-    'K484:LIL>L SetProcessDword',
-    'K485:LI>L GetProcessDword',
-    'K486:L>L FreeLibrary32',
-    'K487:LPW>L GetModuleFileName32',
-    'K488:P>L GetModuleHandle32',
-    'K489:X>W KERNEL_489',
-    'K490:W>W KERNEL_490',
-    'K491:LL>L RegisterServiceProcess',
-    'K492:X>W WOAAbort',
-    'K493:LLLL>W UTInit',
-    'K494:X>W KERNEL_494',
-    'K495:LPLLL>L WaitForMultipleObjects',
-    'K500:V>L WOW16Call',
-    'K501:X>W KDDBGOUT',
-    'K502:X>W WOWGETNEXTVDMCOMMAND',
-    'K503:X>W WOWREGISTERSHELLWINDOW',
-    'K504:X>W WOWLOADMODULE',
-    'K505:X>W WOWQUERYPERFORMANCECOU',
-    'K506:X>W WOWCURSORICONOP',
-    'K507:X>W WOWFAILEDEXEC',
-    'K508:X>W WOWCLOSECOMPORT',
-    'K511:X>W WOWKILLREMOTETASK',
-    'K512:X>W WOWQUERYDEBUG',
-    'K513:PLL>L LoadLibraryEx32W',
-    'K514:L>L FreeLibrary32W',
-    'K515:LP>L GetProcAddress32W',
-    'K516:SW>L GetVDMPointer32W',
-    'K517:V>L CallProc32W',
-    'K518:V>L _CallProcEx32W',
-    'K519:X>W EXITKERNELTHUNK',
-    'K520:=4200 __MOD_KERNEL',
-    'K521:=4201 __MOD_DKERNEL',
-    'K522:=4203 __MOD_USER',
-    'K523:=4204 __MOD_DUSER',
-    'K524:=4205 __MOD_GDI',
-    'K525:=4206 __MOD_DGDI',
-    'K526:=4207 __MOD_KEYBOARD',
-    'K527:=4208 __MOD_SOUND',
-    'K528:=4209 __MOD_SHELL',
-    'K529:=4210 __MOD_WINSOCK',
-    'K530:=4211 __MOD_TOOLHELP',
-    'K531:=4212 __MOD_MMEDIA',
-    'K532:=4213 __MOD_COMMDLG',
-    'K541:X>W WOWSETEXITONLASTAPP',
-    'K544:X>W WOWSETCOMPATHANDLE',
-    'K533:X>W ConvertDDEHandleLS',
-    'K534:X>W ConvertDDEHandleSL',
-    'K535:LL>L VWin32_BoostThreadGrou',
-    'K536:LL>L VWin32_BoostThreadStat',
-    'K537:X>W KERNEL_537',
-    'K538:X>W ThunkTheTemplateHandle',
-    'K540:X>W KERNEL_540',
-    'K542:X>W KERNEL_542',
-    'K543:X>W KERNEL_543',
-    'K560:LS>L SetThunkletCallbackGlu',
-    'K561:SL>L AllocLSThunkletCallbac',
-    'K562:LL>L AllocSLThunkletCallbac',
-    'K563:SL>L FindLSThunkletCallback',
-    'K564:LL>L FindSLThunkletCallback',
-    'K566:X>W KERNEL_566',
-    'K567:SLW>L AllocLSThunkletCallbac',
-    'K568:LLW>L AllocSLThunkletCallbac',
-    'K600:X>W AllocCodeAlias',
-    'K601:X>W FreeCodeAlias',
-    'K602:>W GetDummyModuleHandleDS',
-    'K603:X>W KERNEL_603',
-    'K604:R>R CBClientGlueSL',
-    'K605:LL>L AllocSLThunkletCallbac',
-    'K606:SL>L AllocLSThunkletCallbac',
-    'K607:SLL>L AllocLSThunkletSysthun',
-    'K608:LSL>L AllocSLThunkletSysthun',
-    'K609:SL>L FindLSThunkletCallback',
-    'K610:LL>L FindSLThunkletCallback',
-    'K611:LL>W FreeThunklet',
-    'K612:P>W IsSLThunklet',
-    'K613:X>W HugeMapLS',
-    'K614:X>W HugeUnMapLS',
-    'K615:LLL>W ConvertDialog32To16',
-    'K616:LLL>W ConvertMenu32To16',
-    'K617:P>W GetMenu32Size',
-    'K618:P>W GetDialog32Size',
-    'K619:WSL>W RegisterCBClient',
-    'K620:R>R CBClientThunkSL',
-    'K621:R>R CBClientThunkSLEx',
-    'K622:WSL>W UnRegisterCBClient',
-    'K623:L>W InitCBClient',
-    'K624:LL>L SetFastQueue',
-    'K625:>L GetFastQueue',
-    'K626:X>W SmashEnvironment',
-    'K627:SLW>W IsBadFlatReadWritePtr',
-    'K630:R>R C16ThkSL',
-    'K631:R>R C16ThkSL01',
-    'K651:PPWLPPW>L ThunkConnect16',
-    'K652:X>W IsThreadId',
-    'K653:X>W OkWithKernelToChangeUs',
-    'K666:PLPL>L UTGlue16',
-    'K667:WW>L EntryAddrProc',
-    'K668:WWW>L MyAlloc',
-    'K669:LWWWLW>W DllEntryPoint',
-    'K700:>L SSInit',
-    'K701:X>W SSOnBigStack',
-    'K702:X>W SSCall',
-    'K703:X>W CallProc32WFix',
-    'K704:R>R SSConfirmSmallStack',
-    'K901:R>R __wine_vxd_vmm',
-    'K905:R>R __wine_vxd_timer',
-    'K909:R>R __wine_vxd_reboot',
-    'K910:R>R __wine_vxd_vdd',
-    'K912:R>R __wine_vxd_vmd',
-    'K914:R>R __wine_vxd_comm',
-    'K923:R>R __wine_vxd_shell',
-    'K933:R>R __wine_vxd_pagefile',
-    'K938:R>R __wine_vxd_apm',
-    'K939:R>R __wine_vxd_vxdloader',
-    'K945:R>R __wine_vxd_win32s',
-    'K951:R>R __wine_vxd_configmg',
-    'K955:R>R __wine_vxd_enable',
-    'U001:WPPW>W MessageBox',
-    'U002:>W OldExitWindows',
-    'U003:X>W EnableOEMLayer',
-    'U004:X>W DisableOEMLayer',
-    'U005:W>W InitApp',
-    'U006:W>W PostQuitMessage',
-    'U007:LW>W ExitWindows',
-    'U010:WWWS>W SetTimer',
-    'U011:WWWS>W SetSystemTimer',
-    'U012:WW>W KillTimer',
-    'U013:>L GetTickCount',
-    'U014:>L GetTimerResolution',
-    'U015:>L GetCurrentTime',
-    'U016:P>W ClipCursor',
-    'U017:P>W GetCursorPos',
-    'U018:W>W SetCapture',
-    'U019:>W ReleaseCapture',
-    'U020:W>W SetDoubleClickTime',
-    'U021:>W GetDoubleClickTime',
-    'U022:W>W SetFocus',
-    'U023:>W GetFocus',
-    'U024:WP>W RemoveProp',
-    'U025:WP>W GetProp',
-    'U026:WPW>W SetProp',
-    'U027:WS>W EnumProps',
-    'U028:WP>W ClientToScreen',
-    'U029:WP>W ScreenToClient',
-    'U030:L>W WindowFromPoint',
-    'U031:W>W IsIconic',
-    'U032:WP>W GetWindowRect',
-    'U033:WP>W GetClientRect',
-    'U034:WW>W EnableWindow',
-    'U035:W>W IsWindowEnabled',
-    'U036:WSW>W GetWindowText',
-    'U037:WS>W SetWindowText',
-    'U038:W>W GetWindowTextLength',
-    'U039:WP>W BeginPaint',
-    'U040:WP>W EndPaint',
-    'U041:PPLIIIIWWWS>W CreateWindow',
-    'U042:WW>W ShowWindow',
-    'U043:W>W CloseWindow',
-    'U044:W>W OpenIcon',
-    'U045:W>W BringWindowToTop',
-    'U046:W>W GetParent',
-    'U047:W>W IsWindow',
-    'U048:WW>W IsChild',
-    'U049:W>W IsWindowVisible',
-    'U050:PP>W FindWindow',
-    'U051:X>W BEAR51',
-    'U052:>W AnyPopup',
-    'U053:W>W DestroyWindow',
-    'U054:SL>W EnumWindows',
-    'U055:WSL>W EnumChildWindows',
-    'U056:WWWWWW>W MoveWindow',
-    'U057:P>W RegisterClass',
-    'U058:WPW>W GetClassName',
-    'U059:W>W SetActiveWindow',
-    'U060:>W GetActiveWindow',
-    'U061:WIIPP>W ScrollWindow',
-    'U062:WWIW>W SetScrollPos',
-    'U063:WW>W GetScrollPos',
-    'U064:WWIIW>W SetScrollRange',
-    'U065:WWPP>W GetScrollRange',
-    'U066:W>W GetDC',
-    'U067:W>W GetWindowDC',
-    'U068:WW>W ReleaseDC',
-    'U069:W>W SetCursor',
-    'U070:WW>W SetCursorPos',
-    'U071:W>W ShowCursor',
-    'U072:PIIII>W SetRect',
-    'U073:P>W SetRectEmpty',
-    'U074:PP>W CopyRect',
-    'U075:P>W IsRectEmpty',
-    'U076:PL>W PtInRect',
-    'U077:PII>W OffsetRect',
-    'U078:PII>W InflateRect',
-    'U079:PPP>W IntersectRect',
-    'U080:PPP>W UnionRect',
-    'U081:WPW>W FillRect',
-    'U082:WP>W InvertRect',
-    'U083:WPW>W FrameRect',
-    'U084:WIIW>W DrawIcon',
-    'U085:WPIPW>W DrawText',
-    'U086:>L IconSize',
-    'U087:WPWS>W DialogBox',
-    'U088:WI>W EndDialog',
-    'U089:WPWS>W CreateDialog',
-    'U090:WP>W IsDialogMessage',
-    'U091:WW>W GetDlgItem',
-    'U092:WWS>W SetDlgItemText',
-    'U093:WWSW>W GetDlgItemText',
-    'U094:WWWW>W SetDlgItemInt',
-    'U095:WIPW>W GetDlgItemInt',
-    'U096:WWWW>W CheckRadioButton',
-    'U097:WWW>W CheckDlgButton',
-    'U098:WW>W IsDlgButtonChecked',
-    'U099:WPW>W DlgDirSelect',
-    'U100:WPWWW>W DlgDirList',
-    'U101:WWWWL>L SendDlgItemMessage',
-    'U102:PLW>W AdjustWindowRect',
-    'U103:WP>W MapDialogRect',
-    'U104:W>W MessageBeep',
-    'U105:WW>W FlashWindow',
-    'U106:W>W GetKeyState',
-    'U107:WWWL>L DefWindowProc',
-    'U108:PWWW>W GetMessage',
-    'U109:PWWWW>W PeekMessage',
-    'U110:WWWL>W PostMessage',
-    'U111:WWWL>L SendMessage',
-    'U112:>W WaitMessage',
-    'U113:P>W TranslateMessage',
-    'U114:P>L DispatchMessage',
-    'U115:L>W ReplyMessage',
-    'U116:WWWL>W PostAppMessage',
-    'U117:W>W WindowFromDC',
-    'U118:P>W RegisterWindowMessage',
-    'U119:>L GetMessagePos',
-    'U120:>L GetMessageTime',
-    'U121:IS>L SetWindowsHook',
-    'U122:SWWWL>L CallWindowProc',
-    'U123:PI>W CallMsgFilter',
-    'U124:W>W UpdateWindow',
-    'U125:WPW>W InvalidateRect',
-    'U126:WWW>W InvalidateRgn',
-    'U127:WP>W ValidateRect',
-    'U128:WW>W ValidateRgn',
-    'U129:WI>W GetClassWord',
-    'U130:WIW>W SetClassWord',
-    'U131:WI>L GetClassLong',
-    'U132:WIL>L SetClassLong',
-    'U133:WI>W GetWindowWord',
-    'U134:WIW>W SetWindowWord',
-    'U135:WI>L GetWindowLong',
-    'U136:WIL>L SetWindowLong',
-    'U137:W>W OpenClipboard',
-    'U138:>W CloseClipboard',
-    'U139:>W EmptyClipboard',
-    'U140:>W GetClipboardOwner',
-    'U141:WW>W SetClipboardData',
-    'U142:W>W GetClipboardData',
-    'U143:>W CountClipboardFormats',
-    'U144:W>W EnumClipboardFormats',
-    'U145:P>W RegisterClipboardForma',
-    'U146:WPI>W GetClipboardFormatName',
-    'U147:W>W SetClipboardViewer',
-    'U148:>W GetClipboardViewer',
-    'U149:WW>W ChangeClipboardChain',
-    'U150:WP>W LoadMenu',
-    'U151:>W CreateMenu',
-    'U152:W>W DestroyMenu',
-    'U153:WWSWW>W ChangeMenu',
-    'U154:WWW>W CheckMenuItem',
-    'U155:WWW>W EnableMenuItem',
-    'U156:WW>W GetSystemMenu',
-    'U157:W>W GetMenu',
-    'U158:WW>W SetMenu',
-    'U159:WW>W GetSubMenu',
-    'U160:W>W DrawMenuBar',
-    'U161:WWPIW>W GetMenuString',
-    'U162:WWWW>W HiliteMenuItem',
-    'U163:WWWW>W CreateCaret',
-    'U164:>W DestroyCaret',
-    'U165:WW>W SetCaretPos',
-    'U166:W>W HideCaret',
-    'U167:W>W ShowCaret',
-    'U168:W>W SetCaretBlinkTime',
-    'U169:>W GetCaretBlinkTime',
-    'U170:W>W ArrangeIconicWindows',
-    'U171:WPWL>W WinHelp',
-    'U172:WW>W SwitchToThisWindow',
-    'U173:WP>W LoadCursor',
-    'U174:WP>W LoadIcon',
-    'U175:WP>W LoadBitmap',
-    'U176:WWPI>W LoadString',
-    'U177:WP>W LoadAccelerators',
-    'U178:WWP>W TranslateAccelerator',
-    'U179:I>W GetSystemMetrics',
-    'U180:W>L GetSysColor',
-    'U181:WPP>W SetSysColors',
-    'U182:WW>W KillSystemTimer',
-    'U183:P>W GetCaretPos',
-    'U184:X>W QuerySendMessage',
-    'U185:WWSSIIIII>W GrayString',
-    'U186:W>W SwapMouseButton',
-    'U187:>W EndMenu',
-    'U188:W>W SetSysModalWindow',
-    'U189:>W GetSysModalWindow',
-    'U190:WPW>W GetUpdateRect',
-    'U191:WL>W ChildWindowFromPoint',
-    'U192:>W InSendMessage',
-    'U193:W>W IsClipboardFormatAvail',
-    'U194:WPW>W DlgDirSelectComboBox',
-    'U195:WPWWW>W DlgDirListComboBox',
-    'U196:WIIPIIPI>L TabbedTextOut',
-    'U197:WPWWP>L GetTabbedTextExtent',
-    'U198:WW>W CascadeChildWindows',
-    'U199:WW>W TileChildWindows',
-    'U200:PWW>W OpenComm',
-    'U201:P>W SetCommState',
-    'U202:WP>W GetCommState',
-    'U203:WP>W GetCommError',
-    'U204:WPW>W ReadComm',
-    'U205:WPW>W WriteComm',
-    'U206:WW>W TransmitCommChar',
-    'U207:W>W CloseComm',
-    'U208:WW>L SetCommEventMask',
-    'U209:WW>W GetCommEventMask',
-    'U210:W>W SetCommBreak',
-    'U211:W>W ClearCommBreak',
-    'U212:WW>W UngetCommChar',
-    'U213:PP>W BuildCommDCB',
-    'U214:WW>L EscapeCommFunction',
-    'U215:WW>W FlushComm',
-    'U216:WWWW>L UserSeeUserDo',
-    'U217:WI>W LookupMenuHandle',
-    'U218:WWWS>W DialogBoxIndirect',
-    'U219:WPWS>W CreateDialogIndirect',
-    'U220:P>W LoadMenuIndirect',
-    'U221:WIIPPWP>W ScrollDC',
-    'U222:P>W GetKeyboardState',
-    'U223:P>W SetKeyboardState',
-    'U224:W>W GetWindowTask',
-    'U225:WSL>W EnumTaskWindows',
-    'U226:X>W LockInput',
-    'U227:WWW>W GetNextDlgGroupItem',
-    'U228:WWW>W GetNextDlgTabItem',
-    'U229:W>W GetTopWindow',
-    'U230:WW>W GetNextWindow',
-    'U231:>W GetSystemDebugState',
-    'U232:WWWWWWW>W SetWindowPos',
-    'U233:WW>W SetParent',
-    'U234:IS>W UnhookWindowsHook',
-    'U235:IWLP>L DefHookProc',
-    'U236:>W GetCapture',
-    'U237:WWW>W GetUpdateRgn',
-    'U238:WW>W ExcludeUpdateRgn',
-    'U239:WPWSL>W DialogBoxParam',
-    'U240:WWWSL>W DialogBoxIndirectParam',
-    'U241:WPWSL>W CreateDialogParam',
-    'U242:WPWSL>W CreateDialogIndirectPa',
-    'U243:>L GetDialogBaseUnits',
-    'U244:PP>W EqualRect',
-    'U245:IWII>W EnableCommNotification',
-    'U246:PP>W ExitWindowsExec',
-    'U247:>W GetCursor',
-    'U248:>W GetOpenClipboardWindow',
-    'U249:W>W GetAsyncKeyState',
-    'U250:WWW>W GetMenuState',
-    'U251:WWLL>L SendDriverMessage',
-    'U252:PPL>W OpenDriver',
-    'U253:WLL>L CloseDriver',
-    'U254:W>W GetDriverModuleHandle',
-    'U255:LWWLL>L DefDriverProc',
-    'U256:WP>W GetDriverInfo',
-    'U257:WL>W GetNextDriver',
-    'U258:WWPW>W MapWindowPoints',
-    'U259:I>W BeginDeferWindowPos',
-    'U260:WWWIIIIW>W DeferWindowPos',
-    'U261:W>W EndDeferWindowPos',
-    'U262:WW>W GetWindow',
-    'U263:W>W GetMenuItemCount',
-    'U264:WW>W GetMenuItemID',
-    'U265:WW>W ShowOwnedPopups',
-    'U266:W>W SetMessageQueue',
-    'U267:WWW>W ShowScrollBar',
-    'U268:P>W GlobalAddAtom',
-    'U269:W>W GlobalDeleteAtom',
-    'U270:P>W GlobalFindAtom',
-    'U271:WPI>W GlobalGetAtomName',
-    'U272:W>W IsZoomed',
-    'U273:WWP>W ControlPanelInfo',
-    'U274:X>W GetNextQueueWindow',
-    'U275:X>W RepaintScreen',
-    'U276:X>W LockMyTask',
-    'U277:W>W GetDlgCtrlID',
-    'U278:>W GetDesktopHwnd',
-    'U279:>W OldSetDeskPattern',
-    'U280:WW>W SetSystemMenu',
-    'U281:W>W GetSysColorBrush',
-    'U282:WWW>W SelectPalette',
-    'U283:W>W RealizePalette',
-    'U284:W>W GetFreeSystemResources',
-    'U285:P>W SetDeskWallpaper',
-    'U286:>W GetDesktopWindow',
-    'U287:W>W GetLastActivePopup',
-    'U288:>L GetMessageExtraInfo',
-    'U289:R>R keybd_event',
-    'U290:WPWW>W RedrawWindow',
-    'U291:ISWW>L SetWindowsHookEx',
-    'U292:S>W UnhookWindowsHookEx',
-    'U293:SIWL>L CallNextHookEx',
-    'U294:W>W LockWindowUpdate',
-    'U299:R>R mouse_event',
-    'U300:X>W UnloadInstalledDrivers',
-    'U301:X>W EDITWNDPROC',
-    'U302:X>W STATICWNDPROC',
-    'U303:X>W BUTTONWNDPROC',
-    'U304:X>W SBWNDPROC',
-    'U305:X>W DESKTOPWNDPROC',
-    'U306:X>W MENUWNDPROC',
-    'U307:X>W LBOXCTLWNDPROC',
-    'U308:WWWL>L DefDlgProc',
-    'U309:P>W GetClipCursor',
-    'U314:WWWWW>W SignalProc',
-    'U319:WIIPPWPW>W ScrollWindowEx',
-    'U320:X>W SysErrorBox',
-    'U321:S>L SetEventHook',
-    'U322:X>W WinOldAppHackOMatic',
-    'U323:X>W GetMessage2',
-    'U324:WWWW>W FillWindow',
-    'U325:WWWWP>W PaintRect',
-    'U326:WWW>W GetControlBrush',
-    'U331:W>W EnableHardwareInput',
-    'U332:>W UserYield',
-    'U333:>W IsUserIdle',
-    'U334:W>L GetQueueStatus',
-    'U335:>W GetInputState',
-    'U336:WWW>W LoadCursorIconHandler',
-    'U337:>L GetMouseEventProc',
-    'U338:X>W ECGETDS',
-    'U343:X>W GetFilePortName',
-    'U344:X>W COMBOBOXCTLWNDPROC',
-    'U345:X>W BEAR345',
-    'U356:WWW>W LoadDIBCursorHandler',
-    'U357:WWW>W LoadDIBIconHandler',
-    'U358:W>W IsMenu',
-    'U359:WWL>W GetDCEx',
-    'U362:WWLL>W DCHook',
-    'U364:PWWWW>W LookupIconIdFromDirect',
-    'U368:WW>W CopyIcon',
-    'U369:WW>W CopyCursor',
-    'U370:WP>W GetWindowPlacement',
-    'U371:WP>W SetWindowPlacement',
-    'U372:X>W GetInternalIconHeader',
-    'U373:PPP>W SubtractRect',
-    'U374:LWWWLW>W DllEntryPoint',
-    'U375:X>W DrawTextEx',
-    'U376:X>W SetMessageExtraInfo',
-    'U378:X>W SetPropEx',
-    'U379:X>W GetPropEx',
-    'U380:X>W RemovePropEx',
-    'U382:X>W SetWindowContextHelpID',
-    'U383:X>W GetWindowContextHelpID',
-    'U384:WW>W SetMenuContextHelpId',
-    'U385:W>W GetMenuContextHelpId',
-    'U389:WPWWWW>L LoadImage',
-    'U390:WWWWW>W CopyImage',
-    'U391:LLLW>W SignalProc32',
-    'U394:WWWWWWWWW>W DrawIconEx',
-    'U395:WP>W GetIconInfo',
-    'U397:P>W RegisterClassEx',
-    'U398:WSP>W GetClassInfoEx',
-    'U399:WLW>W ChildWindowFromPointEx',
-    'U400:>W FinalUserInit',
-    'U402:PI>W GetPriorityClipboardFo',
-    'U403:PW>W UnregisterClass',
-    'U404:WSP>W GetClassInfo',
-    'U406:WWWWWPP>W CreateCursor',
-    'U407:WWWWWPP>W CreateIcon',
-    'U408:WPPP>W CreateCursorIconIndire',
-    'U409:WW>W InitThreadInput',
-    'U410:WWWWS>W InsertMenu',
-    'U411:WWWS>W AppendMenu',
-    'U412:WWW>W RemoveMenu',
-    'U413:WWW>W DeleteMenu',
-    'U414:WWWWS>W ModifyMenu',
-    'U415:>W CreatePopupMenu',
-    'U416:WWIIIWP>W TrackPopupMenu',
-    'U417:>L GetMenuCheckMarkDimens',
-    'U418:WWWWW>W SetMenuItemBitmaps',
-    'U420:V>W _wsprintf',
-    'U421:PPP>W wvsprintf',
-    'U422:WPWW>W DlgDirSelectEx',
-    'U423:WPWW>W DlgDirSelectComboBoxEx',
-    'U427:WWPP>W FindWindowEx',
-    'U428:X>W TileWindows',
-    'U429:X>W CascadeWindows',
-    'U430:PP>W lstrcmp',
-    'U431:S>L AnsiUpper',
-    'U432:S>L AnsiLower',
-    'U433:W>W IsCharAlpha',
-    'U434:W>W IsCharAlphaNumeric',
-    'U435:W>W IsCharUpper',
-    'U436:W>W IsCharLower',
-    'U437:PW>W AnsiUpperBuff',
-    'U438:PW>W AnsiLowerBuff',
-    'U441:WWWP>W InsertMenuItem',
-    'U443:X>W GetMenuItemInfo',
-    'U445:WWWWL>L DefFrameProc',
-    'U446:X>W SetMenuItemInfo',
-    'U447:WWWL>L DefMDIChildProc',
-    'U448:WWPP>W DrawAnimatedRects',
-    'U449:WWSLWIIIIW>W DrawState',
-    'U450:PLWLWWW>W CreateIconFromResource',
-    'U451:WP>W TranslateMDISysAccel',
-    'U452:LPPLIIIIWWWS>W CreateWindowEx',
-    'U454:PLWL>W AdjustWindowRectEx',
-    'U455:WL>W GetIconID',
-    'U456:WW>W LoadIconHandler',
-    'U457:W>W DestroyIcon',
-    'U458:W>W DestroyCursor',
-    'U459:SPPP>L DumpIcon',
-    'U460:WPP>W GetInternalWindowPos',
-    'U461:WWPP>W SetInternalWindowPos',
-    'U462:WW>W CalcChildScroll',
-    'U463:WWWL>W ScrollChildren',
-    'U464:WWWWWW>L DragObject',
-    'U465:WL>W DragDetect',
-    'U466:WP>W DrawFocusRect',
-    'U470:X>W StringFunc',
-    'U471:PP>W lstrcmpi',
-    'U472:S>L AnsiNext',
-    'U473:PS>L AnsiPrev',
-    'U475:WIPW>W SetScrollInfo',
-    'U476:WIP>W GetScrollInfo',
-    'U477:P>W GetKeyboardLayoutName',
-    'U478:X>W LoadKeyboardLayout',
-    'U479:X>W MenuItemFromPoint',
-    'U480:X>W GetUserLocalObjType',
-    'U482:WWW>W EnableScrollBar',
-    'U483:WWPW>W SystemParametersInfo',
-    'U489:>W USER_489',
-    'U490:>W USER_490',
-    'U492:>W USER_492',
-    'U496:>W USER_496',
-    'U498:X>W BEAR498',
-    'U499:WPW>W WNetErrorText',
-    'U500:X>W FARCALLNETDRIVER',
-    'U501:PPWP>W WNetOpenJob',
-    'U502:WPP>W WNetCloseJob',
-    'U503:PW>W WNetAbortJob',
-    'U504:PW>W WNetHoldJob',
-    'U505:PW>W WNetReleaseJob',
-    'U506:PW>W WNetCancelJob',
-    'U507:PWW>W WNetSetJobCopies',
-    'U508:WPPW>W WNetWatchQueue',
-    'U509:P>W WNetUnwatchQueue',
-    'U510:PPP>W WNetLockQueueData',
-    'U511:P>W WNetUnlockQueueData',
-    'U512:PPP>W WNetGetConnection',
-    'U513:W>W WNetGetCaps',
-    'U514:W>W WNetDeviceMode',
-    'U515:WWP>W WNetBrowseDialog',
-    'U516:PP>W WNetGetUser',
-    'U517:PPP>W WNetAddConnection',
-    'U518:PW>W WNetCancelConnection',
-    'U519:P>W WNetGetError',
-    'U520:WPP>W WNetGetErrorText',
-    'U521:X>W WNetEnable',
-    'U522:X>W WNetDisable',
-    'U523:WP>W WNetRestoreConnection',
-    'U524:WPP>W WNetWriteJob',
-    'U525:WW>W WNetConnectDialog',
-    'U526:WW>W WNetDisconnectDialog',
-    'U527:WW>W WNetConnectionDialog',
-    'U528:WP>W WNetViewQueueDialog',
-    'U529:WWWPW>W WNetPropertyDialog',
-    'U530:PP>W WNetGetDirectoryType',
-    'U531:WPW>W WNetDirectoryNotify',
-    'U532:WWPPWW>W WNetGetPropertyText',
-    'U533:X>W WNetInitialize',
-    'U534:X>W WNetLogon',
-    'U535:X>W WOWWORDBREAKPROC',
-    'U537:X>W MOUSEEVENT',
-    'U538:X>W KEYBDEVENT',
-    'U595:X>W OLDEXITWINDOWS',
-    'U600:>W GetShellWindow',
-    'U601:X>W DoHotkeyStuff',
-    'U602:X>W SetCheckCursorTimer',
-    'U604:X>W BroadcastSystemMessage',
-    'U605:X>W HackTaskMonitor',
-    'U606:LSWWPWP>W FormatMessage',
-    'U608:>W GetForegroundWindow',
-    'U609:W>W SetForegroundWindow',
-    'U610:WW>W DestroyIcon32',
-    'U620:PL>L ChangeDisplaySettings',
-    'U621:PLP>W EnumDisplaySettings',
-    'U640:LPLLL>L MsgWaitForMultipleObje',
-    'U650:X>W ActivateKeyboardLayout',
-    'U651:X>W GetKeyboardLayout',
-    'U652:X>W GetKeyboardLayoutList',
-    'U654:X>W UnloadKeyboardLayout',
-    'U655:X>W PostPostedMessages',
-    'U656:WPWW>W DrawFrameControl',
-    'U657:WWPWWPW>W DrawCaptionTemp',
-    'U658:X>W DispatchInput',
-    'U659:WPWW>W DrawEdge',
-    'U660:WWPW>W DrawCaption',
-    'U661:X>W SetSysColorsTemp',
-    'U662:X>W DrawMenubarTemp',
-    'U663:X>W GetMenuDefaultItem',
-    'U664:X>W SetMenuDefaultItem',
-    'U665:WWWP>W GetMenuItemRect',
-    'U666:WWWWW>W CheckMenuRadioItem',
-    'U667:X>W TrackPopupMenuEx',
-    'U668:WWW>W SetWindowRgn',
-    'U669:X>W GetWindowRgn',
-    'U800:X>W CHOOSEFONT_CALLBACK16',
-    'U801:X>W FINDREPLACE_CALLBACK16',
-    'U802:X>W OPENFILENAME_CALLBACK1',
-    'U803:X>W PRINTDLG_CALLBACK16',
-    'U804:X>W CHOOSECOLOR_CALLBACK16',
-    'U819:PWWWWW>W PeekMessage32',
-    'U820:PWWWW>L GetMessage32',
-    'U821:PW>W TranslateMessage32',
-    'U822:PW>L DispatchMessage32',
-    'U823:PWW>W CallMsgFilter32',
-    'U825:X>W PostMessage32',
-    'U826:X>W PostThreadMessage32',
-    'U827:P>W MessageBoxIndirect',
-    'U851:X>W MsgThkConnectionDataLS',
-    'U853:X>W FT_USRFTHKTHKCONNECTIO',
-    'U854:X>W FT__USRF2THKTHKCONNECT',
-    'U855:X>W Usr32ThkConnectionData',
-    'U890:X>W InstallIMT',
-    'U891:X>W UninstallIMT',
-    'U902:WWPWW>W LoadSystemLanguageStri',
-    'U905:>W ChangeDialogTemplate',
-    'U906:>W GetNumLanguages',
-    'U907:WWPW>W GetLanguageName',
-    'U909:WPW>W SetWindowTextEx',
-    'U910:>W BiDiMessageBoxEx',
-    'U911:WWPW>W SetDlgItemTextEx',
-    'U912:WW>L ChangeKeyboardLanguage',
-    'U913:WW>W GetCodePageSystemFont',
-    'U914:WWWL>W QueryCodePage',
-    'U915:W>L GetAppCodePage',
-    'U916:WPWPLWWPW>W CreateDialogIndirectPa',
-    'U918:WWWPLWWPW>W DialogBoxIndirectParam',
-    'U919:WWWPW>W LoadLanguageString',
-    'U920:WWWW>L SetAppCodePage',
-    'U922:>L GetBaseCodePage',
-    'U923:WPPW>W FindLanguageResource',
-    'U924:WW>L ChangeKeyboardCodePage',
-    'U930:WPPWW>W MessageBoxEx',
-    'G001:WL>L SetBkColor',
-    'G002:WW>W SetBkMode',
-    'G003:WW>W SetMapMode',
-    'G004:WW>W SetROP2',
-    'G005:WW>W SetRelAbs',
-    'G006:WW>W SetPolyFillMode',
-    'G007:WW>W SetStretchBltMode',
-    'G008:WI>W SetTextCharacterExtra',
-    'G009:WL>L SetTextColor',
-    'G010:WII>W SetTextJustification',
-    'G011:WII>L SetWindowOrg',
-    'G012:WII>L SetWindowExt',
-    'G013:WII>L SetViewportOrg',
-    'G014:WII>L SetViewportExt',
-    'G015:WII>L OffsetWindowOrg',
-    'G016:WIIII>L ScaleWindowExt',
-    'G017:WII>L OffsetViewportOrg',
-    'G018:WIIII>L ScaleViewportExt',
-    'G019:WII>W LineTo',
-    'G020:WII>L MoveTo',
-    'G021:WIIII>W ExcludeClipRect',
-    'G022:WIIII>W IntersectClipRect',
-    'G023:WIIIIIIII>W Arc',
-    'G024:WIIII>W Ellipse',
-    'G025:WIIL>W FloodFill',
-    'G026:WIIIIIIII>W Pie',
-    'G027:WIIII>W Rectangle',
-    'G028:WIIIIII>W RoundRect',
-    'G029:WIIIIL>W PatBlt',
-    'G030:W>W SaveDC',
-    'G031:WIIL>L SetPixel',
-    'G032:WII>W OffsetClipRgn',
-    'G033:WIIPW>W TextOut',
-    'G034:WIIIIWIIL>W BitBlt',
-    'G035:WIIIIWIIIIL>W StretchBlt',
-    'G036:>W Polygon',
-    'G037:>W Polyline',
-    'G038:WWWSP>L Escape',
-    'G039:WI>W RestoreDC',
-    'G040:WWW>W FillRgn',
-    'G041:WWWWW>W FrameRgn',
-    'G042:WW>W InvertRgn',
-    'G043:WW>W PaintRgn',
-    'G044:WW>W SelectClipRgn',
-    'G045:WW>W SelectObject',
-    'G046:X>W BITMAPBITS',
-    'G047:WWWI>W CombineRgn',
-    'G048:WWWWP>W CreateBitmap',
-    'G049:P>W CreateBitmapIndirect',
-    'G050:P>W CreateBrushIndirect',
-    'G051:WWW>W CreateCompatibleBitmap',
-    'G052:W>W CreateCompatibleDC',
-    'G053:PPPP>W CreateDC',
-    'G054:IIII>W CreateEllipticRgn',
-    'G055:P>W CreateEllipticRgnIndir',
-    'G056:IIIIIWWWWWWWWP>W CreateFont',
-    'G057:P>W CreateFontIndirect',
-    'G058:WL>W CreateHatchBrush',
-    'G060:W>W CreatePatternBrush',
-    'G061:IIL>W CreatePen',
-    'G062:P>W CreatePenIndirect',
-    'G063:PWW>W CreatePolygonRgn',
-    'G064:IIII>W CreateRectRgn',
-    'G065:P>W CreateRectRgnIndirect',
-    'G066:L>W CreateSolidBrush',
-    'G067:WPI>W DPtoLP',
-    'G068:W>W DeleteDC',
-    'G069:W>W DeleteObject',
-    'G070:WPSL>W EnumFonts',
-    'G071:WWSL>W EnumObjects',
-    'G072:WW>W EqualRgn',
-    'G073:WIIII>W ExcludeVisRect',
-    'G074:WLP>L GetBitmapBits',
-    'G075:W>L GetBkColor',
-    'G076:W>W GetBkMode',
-    'G077:WP>W GetClipBox',
-    'G078:W>L GetCurrentPosition',
-    'G079:W>L GetDCOrg',
-    'G080:WI>W GetDeviceCaps',
-    'G081:W>W GetMapMode',
-    'G082:WIP>W GetObject',
-    'G083:WII>L GetPixel',
-    'G084:W>W GetPolyFillMode',
-    'G085:W>W GetROP2',
-    'G086:W>W GetRelAbs',
-    'G087:W>W GetStockObject',
-    'G088:W>W GetStretchBltMode',
-    'G089:W>W GetTextCharacterExtra',
-    'G090:W>L GetTextColor',
-    'G091:WPI>L GetTextExtent',
-    'G092:WIP>W GetTextFace',
-    'G093:WP>W GetTextMetrics',
-    'G094:W>L GetViewportExt',
-    'G095:W>L GetViewportOrg',
-    'G096:W>L GetWindowExt',
-    'G097:W>L GetWindowOrg',
-    'G098:WIIII>W IntersectVisRect',
-    'G099:WPI>W LPtoDP',
-    'G100:IIIISL>W LineDDA',
-    'G101:WII>W OffsetRgn',
-    'G102:WII>W OffsetVisRgn',
-    'G103:WII>W PtVisible',
-    'G104:WP>W RectVisibleOld',
-    'G105:WW>W SelectVisRgn',
-    'G106:WLP>L SetBitmapBits',
-    'G117:WII>L SetDCOrg',
-    'G118:X>W InternalCreateDC',
-    'G119:P>W AddFontResource',
-    'G120:X>W GetContinuingTextExten',
-    'G121:W>W Death',
-    'G122:WWWWWWW>W Resurrection',
-    'G123:WW>W PlayMetaFile',
-    'G124:P>W GetMetaFile',
-    'G125:P>W CreateMetaFile',
-    'G126:W>W CloseMetaFile',
-    'G127:W>W DeleteMetaFile',
-    'G128:III>W MulDiv',
-    'G129:W>W SaveVisRgn',
-    'G130:W>W RestoreVisRgn',
-    'G131:W>W InquireVisRgn',
-    'G132:PPW>W SetEnvironment',
-    'G133:PPW>W GetEnvironment',
-    'G134:WP>W GetRgnBox',
-    'G136:P>W RemoveFontResource',
-    'G137:X>W GSV',
-    'G138:X>W DPXlate',
-    'G139:X>W SetWinViewExt',
-    'G140:X>W ScaleExt',
-    'G141:X>W WordSet',
-    'G142:X>W RectStuff',
-    'G143:X>W OffsetOrg',
-    'G144:X>W LockDC',
-    'G145:X>W UnlockDC',
-    'G146:X>W LockUnlock',
-    'G147:X>W GDI_FarFrame',
-    'G148:WII>L SetBrushOrg',
-    'G149:W>L GetBrushOrg',
-    'G150:W>W UnrealizeObject',
-    'G151:WP>W CopyMetaFile',
-    'G152:X>W GDIInitApp',
-    'G153:PPPP>W CreateIC',
-    'G154:WL>L GetNearestColor',
-    'G155:WW>W QueryAbort',
-    'G156:WWW>W CreateDiscardableBitma',
-    'G157:X>W CompatibleBitmap',
-    'G158:X>W EnumCallback',
-    'G159:W>W GetMetaFileBits',
-    'G160:W>W SetMetaFileBits',
-    'G161:WII>W PtInRegion',
-    'G162:W>L GetBitmapDimension',
-    'G163:WII>L SetBitmapDimension',
-    'G164:X>W PixToLine',
-    'G169:X>W IsDCDirty',
-    'G170:X>W SetDCStatus',
-    'G171:X>W LVBUNION',
-    'G172:WIIII>W SetRectRgn',
-    'G173:W>W GetClipRgn',
-    'G174:X>W BLOAT',
-    'G175:WWSL>W EnumMetaFile',
-    'G176:WPPW>W PlayMetaFileRecord',
-    'G177:X>W RCOS',
-    'G178:X>W RSIN',
-    'G179:W>W GetDCState',
-    'G180:WW>W SetDCState',
-    'G181:WP>W RectInRegionOld',
-    'G182:X>W REQUESTSEM',
-    'G183:X>W CLEARSEM',
-    'G184:X>W STUFFVISIBLE',
-    'G185:X>W STUFFINREGION',
-    'G186:X>W DELETEABOVELINEFONTS',
-    'G188:X>W GetTextExtentEx',
-    'G190:WSL>W SetDCHook',
-    'G191:WP>L GetDCHook',
-    'G192:WW>W SetHookFlags',
-    'G193:WPW>W SetBoundsRect',
-    'G194:WPW>W GetBoundsRect',
-    'G195:X>W SelectBitmap',
-    'G196:W>W SetMetaFileBitsBetter',
-    'G201:X>W DMBITBLT',
-    'G202:X>W DMCOLORINFO',
-    'G206:X>W dmEnumDFonts',
-    'G207:X>W DMENUMOBJ',
-    'G208:X>W DMOUTPUT',
-    'G209:X>W DMPIXEL',
-    'G210:X>W dmRealizeObject',
-    'G211:X>W DMSTRBLT',
-    'G212:X>W DMSCANLR',
-    'G213:X>W BRUTE',
-    'G214:X>W DMEXTTEXTOUT',
-    'G215:X>W DMGETCHARWIDTH',
-    'G216:X>W DMSTRETCHBLT',
-    'G217:X>W DMDIBBITS',
-    'G218:X>W DMSTRETCHDIBITS',
-    'G219:X>W DMSETDIBTODEV',
-    'G220:X>W DMTRANSPOSE',
-    'G230:W>W CreatePQ',
-    'G231:W>W MinPQ',
-    'G232:W>W ExtractPQ',
-    'G233:WWW>W InsertPQ',
-    'G234:WW>W SizePQ',
-    'G235:W>W DeletePQ',
-    'G240:PPW>W OpenJob',
-    'G241:WPW>W WriteSpool',
-    'G242:WPW>W WriteDialog',
-    'G243:W>W CloseJob',
-    'G244:WW>W DeleteJob',
-    'G245:WP>L GetSpoolJob',
-    'G246:W>W StartSpoolPage',
-    'G247:W>W EndSpoolPage',
-    'G248:X>W QueryJob',
-    'G250:PPW>W Copy',
-    'G253:X>W DeleteSpoolPage',
-    'G254:X>W SpoolFile',
-    'G267:X>W StartDocPrintEra',
-    'G268:X>W StartPagePrinter',
-    'G269:X>W WritePrinter',
-    'G270:X>W EndPagePrinter',
-    'G271:X>W AbortPrinter',
-    'G272:X>W EndDocPrinter',
-    'G274:X>W ClosePrinter',
-    'G280:X>W GetRealDriverInfo',
-    'G281:PPLPL>L DrvSetPrinterData',
-    'G282:PPPPLP>L DrvGetPrinterData',
-    'G299:X>W ENGINEGETCHARWIDTHEX',
-    'G300:PSL>L EngineEnumerateFont',
-    'G301:P>W EngineDeleteFont',
-    'G302:PPP>L EngineRealizeFont',
-    'G303:PWWP>W EngineGetCharWidth',
-    'G304:PW>W EngineSetFontContext',
-    'G305:WPWWPLP>W EngineGetGlyphBMP',
-    'G306:WPP>L EngineMakeFontDir',
-    'G307:WWWP>W GetCharABCWidths',
-    'G308:WWP>W GetOutlineTextMetrics',
-    'G309:WWWPLPP>L GetGlyphOutline',
-    'G310:WPPP>W CreateScalableFontReso',
-    'G311:WLLPL>L GetFontData',
-    'G312:X>W ConvertOutLineFontFile',
-    'G313:PW>W GetRasterizerCaps',
-    'G314:X>W EngineExtTextOut',
-    'G315:LLLL>L EngineRealizeFontExt',
-    'G316:X>W EngineGetCharWidthStr',
-    'G317:X>W EngineGetGlyphBmpExt',
-    'G330:WPSL>W EnumFontFamilies',
-    'G332:WWP>W GetKerningPairs',
-    'G345:W>W GetTextAlign',
-    'G346:WW>W SetTextAlign',
-    'G347:X>W MFDRAWTEXT',
-    'G348:WIIIIIIII>W Chord',
-    'G349:WL>L SetMapperFlags',
-    'G350:WWWP>W GetCharWidth',
-    'G351:WIIWPPWP>W ExtTextOut',
-    'G352:X>W GetPhysicalFontHandle',
-    'G353:X>W GetAspectRatioFilter',
-    'G354:X>W ShrinkGDIHeap',
-    'G355:X>W FTrapping0',
-    'G360:P>W CreatePalette',
-    'G361:WWW>W GDISelectPalette',
-    'G362:W>W GDIRealizePalette',
-    'G363:WWWP>W GetPaletteEntries',
-    'G364:WWWP>W SetPaletteEntries',
-    'G365:W>W RealizeDefaultPalette',
-    'G366:W>W UpdateColors',
-    'G367:WWWP>W AnimatePalette',
-    'G368:WW>W ResizePalette',
-    'G370:WL>W GetNearestPaletteIndex',
-    'G372:WIILW>W ExtFloodFill',
-    'G373:WW>W SetSystemPaletteUse',
-    'G374:W>W GetSystemPaletteUse',
-    'G375:WWWP>W GetSystemPaletteEntrie',
-    'G376:WP>W ResetDC',
-    'G377:WP>W StartDoc',
-    'G378:W>W EndDoc',
-    'G379:W>W StartPage',
-    'G380:W>W EndPage',
-    'G381:WS>W SetAbortProc',
-    'G382:W>W AbortDoc',
-    'G400:WPIIL>W FastWindowFrame',
-    'G401:X>W GDIMOVEBITMAP',
-    'G402:X>W GDIGETBITSGLOBAL',
-    'G403:WW>W GdiInit2',
-    'G404:X>W GetTTGlyphIndexMap',
-    'G405:W>W FinalGdiInit',
-    'G406:X>W CREATEREALBITMAPINDIRE',
-    'G407:WWWWP>W CreateUserBitmap',
-    'G408:X>W CREATEREALBITMAP',
-    'G409:WWW>W CreateUserDiscardableB',
-    'G410:>W IsValidMetaFile',
-    'G411:W>W GetCurLogFont',
-    'G412:W>W IsDCCurrentPalette',
-    'G439:>W StretchDIBits',
-    'G440:WWWWPPW>W SetDIBits',
-    'G441:WWWWPPW>W GetDIBits',
-    'G442:WPLPPW>W CreateDIBitmap',
-    'G443:WIIIIIIWWPPW>W SetDIBitsToDevice',
-    'G444:IIIIII>W CreateRoundRectRgn',
-    'G445:WW>W CreateDIBPatternBrush',
-    'G449:X>W DEVICECOLORMATCH',
-    'G450:WPPW>W PolyPolygon',
-    'G451:PPWW>W CreatePolyPolygonRgn',
-    'G452:WWWW>L GdiSeeGdiDo',
-    'G460:X>W GDITASKTERMINATION',
-    'G461:WW>W SetObjectOwner',
-    'G462:W>W IsGDIObject',
-    'G463:WW>W MakeObjectPrivate',
-    'G464:X>W FIXUPBOGUSPUBLISHERMET',
-    'G465:WP>W RectVisible',
-    'G466:WP>W RectInRegion',
-    'G467:X>W UNICODETOANSI',
-    'G468:WP>W GetBitmapDimensionEx',
-    'G469:WP>W GetBrushOrgEx',
-    'G470:WP>W GetCurrentPositionEx',
-    'G471:WPIP>W GetTextExtentPoint',
-    'G472:WP>W GetViewportExtEx',
-    'G473:WP>W GetViewportOrgEx',
-    'G474:WP>W GetWindowExtEx',
-    'G475:WP>W GetWindowOrgEx',
-    'G476:WIIP>W OffsetViewportOrgEx',
-    'G477:WIIP>W OffsetWindowOrgEx',
-    'G478:WIIP>W SetBitmapDimensionEx',
-    'G479:WIIP>W SetViewportExtEx',
-    'G480:WIIP>W SetViewportOrgEx',
-    'G481:WIIP>W SetWindowExtEx',
-    'G482:WIIP>W SetWindowOrgEx',
-    'G483:WIIP>W MoveToEx',
-    'G484:WIIIIP>W ScaleViewportExtEx',
-    'G485:WIIIIP>W ScaleWindowExtEx',
-    'G486:WP>W GetAspectRatioFilterEx',
-    'G489:WPWPLL>W CreateDIBSection',
-    'G490:X>W CloseEnhMetafile',
-    'G491:X>W CopyEnhMetafile',
-    'G492:X>W CreateEnhMetafile',
-    'G493:X>W DeleteEnhMetafile',
-    'G495:X>W GDIComment',
-    'G496:X>W GetEnhMetafile',
-    'G497:X>W GetEnhMetafileBits',
-    'G498:X>W GetEnhMetafileDescript',
-    'G499:X>W GetEnhMetafileHeader',
-    'G501:X>W GetEnhMetafilePaletteE',
-    'G502:WPW>W PolyBezier',
-    'G503:WPW>W PolyBezierTo',
-    'G504:X>W PlayEnhMetafileRecord',
-    'G505:X>W SetEnhMetafileBits',
-    'G506:X>W SetMetaRgn',
-    'G508:WWW>W ExtSelectClipRgn',
-    'G511:W>W AbortPath',
-    'G512:W>W BeginPath',
-    'G513:W>W CloseFigure',
-    'G514:W>W EndPath',
-    'G515:W>W FillPath',
-    'G516:W>W FlattenPath',
-    'G517:WPPW>W GetPath',
-    'G518:W>W PathToRegion',
-    'G519:WW>W SelectClipPath',
-    'G520:W>W StrokeAndFillPath',
-    'G521:W>W StrokePath',
-    'G522:W>W WidenPath',
-    'G523:X>W ExtCreatePen',
-    'G524:W>W GetArcDirection',
-    'G525:WW>W SetArcDirection',
-    'G526:X>W GetMiterLimit',
-    'G527:X>W SetMiterLimit',
-    'G528:X>W GDIParametersInfo',
-    'G529:W>W CreateHalftonePalette',
-    'G530:>W RawTextOut',
-    'G531:>W RawExtTextOut',
-    'G532:WPW>W RawGetTextExtent',
-    'G536:>W BiDiLayout',
-    'G538:>W BiDiCreateTabString',
-    'G540:>W BiDiGlyphOut',
-    'G543:>W BiDiGetStringExtent',
-    'G555:>W BiDiDeleteString',
-    'G556:>W BiDiSetDefaults',
-    'G558:>W BiDiGetDefaults',
-    'G560:>W BiDiShape',
-    'G561:>W BiDiFontComplement',
-    'G564:>W BiDiSetKashida',
-    'G565:>W BiDiKExtTextOut',
-    'G566:>W BiDiShapeEx',
-    'G569:>W BiDiCreateStringEx',
-    'G571:>W GetTextExtentRtoL',
-    'G572:>W GetHDCCharSet',
-    'G573:>W BiDiLayoutEx',
-    'G602:WWWP>W SetDIBColorTable',
-    'G603:WWWP>W GetDIBColorTable',
-    'G604:WL>W SetSolidBrush',
-    'G605:W>W SysDeleteObject',
-    'G606:WLW>W SetMagicColors',
-    'G607:WLP>L GetRegionData',
-    'G608:X>W ExtCreateRegion',
-    'G609:L>W GdiFreeResources',
-    'G610:LLLW>W GdiSignalProc32',
-    'G611:X>W GetRandomRgn',
-    'G612:W>W GetTextCharset',
-    'G613:WPSLL>W EnumFontFamiliesEx',
-    'G614:X>W AddLpkToGDI',
-    'G615:X>W GetCharacterPlacement',
-    'G616:W>L GetFontLanguageInfo',
-    'G650:X>W BuildInverseTableDIB',
-    'G701:X>W GDITHKCONNECTIONDATALS',
-    'G702:X>W FT_GDIFTHKTHKCONNECTIO',
-    'G703:X>W FDTHKCONNECTIONDATASL',
-    'G704:X>W ICMTHKCONNECTIONDATASL',
-    'G820:X>W ICMCreateTransform',
-    'G821:X>W ICMDeleteTransform',
-    'G822:X>W ICMTranslateRGB',
-    'G823:X>W ICMTranslateRGBs',
-    'G824:X>W ICMCheckColorsInGamut',
-    'B001:P>W Inquire',
-    'B002:SP>W Enable',
-    'B003:>W Disable',
-    'B004:WWPPW>W ToAscii',
-    'B005:PP>W AnsiToOem',
-    'B006:PP>W OemToAnsi',
-    'B007:W>W SetSpeed',
-    'B009:X>W INQUIREEX',
-    'B010:X>W TOASCIIEX',
-    'B011:X>W VKKEYSCANEX',
-    'B012:X>W MAPVIRTUALKEYEX',
-    'B013:X>W NEWTABLEEX',
-    'B014:X>W __EXPORTEDSTUB',
-    'B100:W>L ScreenSwitchEnable',
-    'B128:W>L OemKeyScan',
-    'B129:W>W VkKeyScan',
-    'B130:W>W GetKeyboardType',
-    'B131:WW>W MapVirtualKey',
-    'B132:>W GetKBCodePage',
-    'B133:LPW>W GetKeyNameText',
-    'B134:PPW>W AnsiToOemBuff',
-    'B135:PPW>W OemToAnsiBuff',
-    'L001:WW>L LZCopy',
-    'L002:PPW>W LZOpenFile',
-    'L003:W>W LZInit',
-    'L004:WLW>L LZSeek',
-    'L005:WPW>W LZRead',
-    'L006:W>W LZClose',
-    'L007:>W LZStart',
-    'L008:WW>L CopyLZFile',
-    'L009:>W LZDone',
-    'L010:PP>W GetExpandedName',
-    'S001:LPP>L RegOpenKey',
-    'S002:LPP>L RegCreateKey',
-    'S003:L>L RegCloseKey',
-    'S004:LP>L RegDeleteKey',
-    'S005:LPLPL>L RegSetValue',
-    'S006:LPPP>L RegQueryValue',
-    'S007:LLPL>L RegEnumKey',
-    'S009:WW>W DragAcceptFiles',
-    'S011:WIPI>W DragQueryFile',
-    'S012:W>W DragFinish',
-    'S013:WP>W DragQueryPoint',
-    'S020:WPPPPI>W ShellExecute',
-    'S021:PPP>W FindExecutable',
-    'S022:WPPW>W ShellAbout',
-    'S033:WWWL>W AboutDlgProc',
-    'S034:WPI>W ExtractIcon',
-    'S036:WPP>W ExtractAssociatedIcon',
-    'S037:PW>L DoEnvironmentSubst',
-    'S038:P>L FindEnvironmentString',
-    'S039:WPIW>W InternalExtractIcon',
-    'S040:PWPPW>W ExtractIconEx',
-    'S101:LWWWLW>L DllEntryPoint',
-    'S102:WW>W RegisterShellHook',
-    'S103:WWL>L ShellHookProc',
-    'S157:X>W RESTARTDIALOG',
-    'S262:L>W DriveType',
-    'S401:X>W SHCHECKDRIVE',
-    'M001:WWWP>L WEP',
-    'M002:PW>L sndPlaySound',
-    'M003:PWL>L PlaySound',
-    'M004:LWWWLW>L DllEntryPoint',
-    'M005:>L mmsystemGetVersion',
-    'M006:LWWLL>L DriverProc',
-    'M008:>L WMMMidiRunOnce',
-    'M030:P>W OutputDebugStr',
-    'M031:LWWWLLL>L DriverCallback',
-    'M032:>L StackEnter',
-    'M033:>L StackLeave',
-    'M034:X>W MMDRVINSTALL',
-    'M101:>L joyGetNumDevs',
-    'M102:WPW>L joyGetDevCaps',
-    'M103:WP>L joyGetPos',
-    'M104:WP>L joyGetThreshold',
-    'M105:W>L joyReleaseCapture',
-    'M106:WWWW>L joySetCapture',
-    'M107:WW>L joySetThreshold',
-    'M109:W>L joySetCalibration',
-    'M110:WP>L joyGetPosEx',
-    'M111:X>W JOYCONFIGCHANGED',
-    'M201:>L midiOutGetNumDevs',
-    'M202:WPW>L midiOutGetDevCaps',
-    'M203:WPW>L midiOutGetErrorText',
-    'M204:PWLLL>L midiOutOpen',
-    'M205:W>L midiOutClose',
-    'M206:WSW>L midiOutPrepareHeader',
-    'M207:WSW>L midiOutUnprepareHeader',
-    'M208:WL>L midiOutShortMsg',
-    'M209:WSW>L midiOutLongMsg',
-    'M210:W>L midiOutReset',
-    'M211:WP>L midiOutGetVolume',
-    'M212:WL>L midiOutSetVolume',
-    'M213:WWPW>L midiOutCachePatches',
-    'M214:WWPW>L midiOutCacheDrumPatche',
-    'M215:WP>L midiOutGetID',
-    'M216:WWLL>L midiOutMessage',
-    'M250:WPL>L midiStreamProperty',
-    'M251:PPLLLL>L midiStreamOpen',
-    'M252:W>L midiStreamClose',
-    'M253:WPW>L midiStreamPosition',
-    'M254:WPW>L midiStreamOut',
-    'M255:W>L midiStreamPause',
-    'M256:W>L midiStreamRestart',
-    'M257:W>L midiStreamStop',
-    'M301:>L midiInGetNumDevs',
-    'M302:WPW>L midiInGetDevCaps',
-    'M303:WPW>L midiInGetErrorText',
-    'M304:PWLLL>L midiInOpen',
-    'M305:W>L midiInClose',
-    'M306:WSW>L midiInPrepareHeader',
-    'M307:WSW>L midiInUnprepareHeader',
-    'M308:WSW>L midiInAddBuffer',
-    'M309:W>L midiInStart',
-    'M310:W>L midiInStop',
-    'M311:W>L midiInReset',
-    'M312:WP>L midiInGetID',
-    'M313:WWLL>L midiInMessage',
-    'M350:>L auxGetNumDevs',
-    'M351:WPW>L auxGetDevCaps',
-    'M352:WP>L auxGetVolume',
-    'M353:WL>L auxSetVolume',
-    'M354:WWLL>L auxOutMessage',
-    'M401:>L waveOutGetNumDevs',
-    'M402:WPW>L waveOutGetDevCaps',
-    'M403:WPW>L waveOutGetErrorText',
-    'M404:PWPLLL>L waveOutOpen',
-    'M405:W>L waveOutClose',
-    'M406:WSW>L waveOutPrepareHeader',
-    'M407:WSW>L waveOutUnprepareHeader',
-    'M408:WSW>L waveOutWrite',
-    'M409:W>L waveOutPause',
-    'M410:W>L waveOutRestart',
-    'M411:W>L waveOutReset',
-    'M412:WPW>L waveOutGetPosition',
-    'M413:WP>L waveOutGetPitch',
-    'M414:WL>L waveOutSetPitch',
-    'M415:WP>L waveOutGetVolume',
-    'M416:WL>L waveOutSetVolume',
-    'M417:WP>L waveOutGetPlaybackRate',
-    'M418:WL>L waveOutSetPlaybackRate',
-    'M419:W>L waveOutBreakLoop',
-    'M420:WP>L waveOutGetID',
-    'M421:WWLL>L waveOutMessage',
-    'M501:>L waveInGetNumDevs',
-    'M502:WPW>L waveInGetDevCaps',
-    'M503:WPW>L waveInGetErrorText',
-    'M504:PWPLLL>L waveInOpen',
-    'M505:W>L waveInClose',
-    'M506:WSW>L waveInPrepareHeader',
-    'M507:WSW>L waveInUnprepareHeader',
-    'M508:WSW>L waveInAddBuffer',
-    'M509:W>L waveInStart',
-    'M510:W>L waveInStop',
-    'M511:W>L waveInReset',
-    'M512:WPW>L waveInGetPosition',
-    'M513:WP>L waveInGetID',
-    'M514:WWLL>L waveInMessage',
-    'M601:PW>L timeGetSystemTime',
-    'M602:WWSLW>L timeSetEvent',
-    'M603:W>L timeKillEvent',
-    'M604:PW>L timeGetDevCaps',
-    'M605:W>L timeBeginPeriod',
-    'M606:W>L timeEndPeriod',
-    'M607:>L timeGetTime',
-    'M701:WWLL>L mciSendCommand',
-    'M702:PPWW>L mciSendString',
-    'M703:P>L mciGetDeviceID',
-    'M705:WPW>L mciLoadCommandResource',
-    'M706:LPW>L mciGetErrorString',
-    'M707:WL>L mciSetDriverData',
-    'M708:W>L mciGetDriverData',
-    'M710:W>L mciDriverYield',
-    'M711:WWW>L mciDriverNotify',
-    'M712:P>L mciExecute',
-    'M713:W>L mciFreeCommandResource',
-    'M714:WPL>L mciSetYieldProc',
-    'M715:LP>L mciGetDeviceIDFromElem',
-    'M716:WP>L mciGetYieldProc',
-    'M717:W>L mciGetCreatorTask',
-    'M800:>L mixerGetNumDevs',
-    'M801:WPW>L mixerGetDevCaps',
-    'M802:PWLLL>L mixerOpen',
-    'M803:W>L mixerClose',
-    'M804:WWLL>L mixerMessage',
-    'M805:WPL>L mixerGetLineInfo',
-    'M806:WPL>L mixerGetID',
-    'M807:WPL>L mixerGetLineControls',
-    'M808:WPL>L mixerGetControlDetails',
-    'M809:WPL>L mixerSetControlDetails',
-    'M900:LPL>L mmTaskCreate',
-    'M902:W>L mmTaskBlock',
-    'M903:W>L mmTaskSignal',
-    'M904:>W mmGetCurrentTask',
-    'M905:>L mmTaskYield',
-    'E001:R>R __fpMath',
-    'E003:PW>W __WinEm87Info',
-    'E004:PW>W __WinEm87Restore',
-    'E005:PW>W __WinEm87Save',
-    'V002:PPPP>L GetFileResourceSize',
-    'V003:PPPLLP>L GetFileResource',
-    'V006:PP>L GetFileVersionInfoSize',
-    'V007:PLLP>L GetFileVersionInfo',
-    'V008:WPPPPPPP>L VerFindFile',
-    'V009:WPPPPPPP>L VerInstallFile',
-    'V010:WPW>L VerLanguageName',
-    'V011:SPPP>L VerQueryValue',
-    'V020:X>W GETFILEVERSIONINFORAW',
-    'C001:S>W GetOpenFileName',
-    'C002:S>W GetSaveFileName',
-    'C005:P>W ChooseColor',
-    'C006:WWWL>L FileOpenDlgProc',
-    'C007:WWWL>L FileSaveDlgProc',
-    'C008:WWWL>L ColorDlgProc',
-    'C011:S>W FindText',
-    'C012:S>W ReplaceText',
-    'C013:WWWL>L FindTextDlgProc',
-    'C014:WWWL>L ReplaceTextDlgProc',
-    'C015:P>W ChooseFont',
-    'C016:WWWL>W FormatCharDlgProc',
-    'C018:PPWL>W FontStyleEnumProc',
-    'C019:PPWL>W FontFamilyEnumProc',
-    'C020:P>W PrintDlg',
-    'C021:WWWL>L PrintDlgProc',
-    'C022:WWWL>L PrintSetupDlgProc',
-    'C026:>L CommDlgExtendedError',
-    'C027:PPW>W GetFileTitle',
-    'T050:W>W GlobalHandleToSel',
-    'T051:PW>W GlobalFirst',
-    'T052:PW>W GlobalNext',
-    'T053:P>W GlobalInfo',
-    'T054:PW>W GlobalEntryHandle',
-    'T055:PWW>W GlobalEntryModule',
-    'T056:PW>W LocalInfo',
-    'T057:PW>W LocalFirst',
-    'T058:P>W LocalNext',
-    'T059:P>W ModuleFirst',
-    'T060:P>W ModuleNext',
-    'T061:PP>W ModuleFindName',
-    'T062:PW>W ModuleFindHandle',
-    'T063:P>W TaskFirst',
-    'T064:P>W TaskNext',
-    'T065:PW>W TaskFindHandle',
-    'T066:PW>W StackTraceFirst',
-    'T067:PWWWW>W StackTraceCSIPFirst',
-    'T068:P>W StackTraceNext',
-    'T069:X>W ClassFirst',
-    'T070:X>W ClassNext',
-    'T071:P>W SystemHeapInfo',
-    'T072:P>W MemManInfo',
-    'T073:WSW>W NotifyRegister',
-    'T074:W>W NotifyUnregister',
-    'T075:WS>W InterruptRegister',
-    'T076:W>W InterruptUnRegister',
-    'T077:WW>W TerminateApp',
-    'T078:WLPL>L MemoryRead',
-    'T079:WLPL>L MemoryWrite',
-    'T080:P>W TimerCount',
-    'T081:X>W TASKSETCSIP',
-    'T082:X>W TASKGETCSIP',
-    'T083:X>W TASKSWITCH',
-    'T084:PW>W Local32Info',
-    'T085:PW>W Local32First',
-    'T086:P>W Local32Next',
-    'Y001:WW>L InquireSystem',
-    'Y002:WS>W CreateSystemTimer',
-    'Y003:W>W KillSystemTimer',
-    'Y004:>W EnableSystemTimers',
-    'Y005:>W DisableSystemTimers',
-    'Y006:>L GetSystemMSecCount',
-    'Y007:>W Get80x87SaveSize',
-    'Y008:P>W Save80x87State',
-    'Y009:P>W Restore80x87State',
-    'Y013:X>W INQUIRELONGINTS',
-    'Y020:W>W A20_Proc',
-    'D001:X>W BitBlt',
-    'D002:X>W ColorInfo',
-    'D003:X>W Control',
-    'D004:X>W Disable',
-    'D005:X>W Enable',
-    'D006:X>W EnumFonts',
-    'D007:X>W EnumObj',
-    'D008:X>W Output',
-    'D009:X>W Pixel',
-    'D010:X>W RealizeObject',
-    'D011:X>W StrBlt',
-    'D012:X>W ScanLR',
-    'D013:X>W DeviceMode',
-    'D014:X>W ExtTextOut',
-    'D015:X>W GetCharWidth',
-    'D016:X>W DeviceBitmap',
-    'D017:X>W FastBorder',
-    'D018:X>W SetAttribute',
-    'D019:X>W DeviceBitmapBits',
-    'D020:X>W CreateBitmap',
-    'D021:X>W DIBScreenBlt',
-    'D022:X>W SetPalette',
-    'D023:X>W GetPalette',
-    'D024:X>W SetPaletteTranslate',
-    'D025:X>W GetPaletteTranslate',
-    'D026:X>W UpdateColors',
-    'D027:X>W StretchBlt',
-    'D028:X>W StretchDIBits',
-    'D029:X>W SelectBitmap',
-    'D030:X>W BitmapBits',
-    'D031:X>W ReEnable',
-    'D039:X>W DIBBlt',
-    'D040:X>W CreateDIBitmap',
-    'D041:X>W DIBToDevice',
-    'D090:X>W Do_Polylines',
-    'D091:X>W Do_Scanlines',
-    'D092:X>W SaveScreenBitmap',
-    'D101:P>W Inquire',
-    'D102:P>W SetCursor',
-    'D103:WW>W MoveCursor',
-    'D104:>W CheckCursor',
-    'D400:X>W PExtTextOut',
-    'D401:X>W PStrBlt',
-    'D402:X>W RExtTextOut',
-    'D403:X>W RStrBlt',
-    'D450:WP>L GetDriverResourceID',
-    'D500:W>W UserRepaintDisable',
-    'D501:X>W ORDINAL_ONLY1',
-    'D502:X>W ORDINAL_ONLY2',
-    'D600:X>W InkReady',
-    'D601:X>W GetLPDevice',
-    'O001:>W OpenSound',
-    'O002:>W CloseSound',
-    'O003:WW>W SetVoiceQueueSize',
-    'O004:WWWW>W SetVoiceNote',
-    'O005:WWWWW>W SetVoiceAccent',
-    'O006:WWW>W SetVoiceEnvelope',
-    'O007:WW>W SetSoundNoise',
-    'O008:WLW>W SetVoiceSound',
-    'O009:>W StartSound',
-    'O010:>W StopSound',
-    'O011:W>W WaitSoundState',
-    'O012:>W SyncAllVoices',
-    'O013:W>W CountVoiceNotes',
-    'O014:>L GetThresholdEvent',
-    'O015:>W GetThresholdStatus',
-    'O016:WW>W SetVoiceThreshold',
-    'O017:>W DoBeep',
-    'O018:X>W MYOPENSOUND');
+  W16ApiB = 178;
+  { entrees terminees par '|', regroupees par blocs de 255 caracteres
+    (une chaine occupe toujours 256 octets) }
+  W16ApiTxt : Array[0..W16ApiB - 1] Of String[255] = (
+    'K001:X>W FatalExit|K002:>W ExitKernel|K003:>L GetVersion|K004:WWW>W Lo' +
+    'calInit|K005:WW>W LocalAlloc|K006:WWW>W LocalReAlloc|K007:W>W LocalFre' +
+    'e|K008:W>L LocalLock|K009:W>W LocalUnlock|K010:W>W LocalSize|K011:W>W ' +
+    'LocalHandle|K012:W>W LocalFlags|',
+    'K013:W>W LocalCompact|K014:L>L LocalNotify|K015:WL>W GlobalAlloc|K016:' +
+    'WLW>W GlobalReAlloc|K017:W>W GlobalFree|K018:W>L GlobalLock|K019:W>W G' +
+    'lobalUnlock|K020:W>L GlobalSize|K021:W>L GlobalHandle|K022:W>W GlobalF' +
+    'lags|K023:W>W LockSegment|',
+    'K024:W>W UnlockSegment|K025:L>L GlobalCompact|K026:W>W GlobalFreeAll|K' +
+    '027:WPW>W GetModuleName|K028:>L GlobalMasterHandle|K029:>W Yield|K030:' +
+    'W>W WaitEvent|K031:W>W PostEvent|K032:WI>W SetPriority|K033:W>W LockCu' +
+    'rrentTask|K034:WW>W SetTaskQueue|',
+    'K035:W>W GetTaskQueue|K036:>L GetCurrentTask|K037:>L GetCurrentPDB|K03' +
+    '8:WS>L SetTaskSignalProc|K039:X>W SetTaskSwitchProc|K040:X>W SetTaskIn' +
+    'terchange|K041:>W EnableDos|K042:>W DisableDos|K043:X>W IsScreenGrab|K' +
+    '044:X>W BuildPDB|K045:PP>W LoadModule|',
+    'K046:W>W FreeModule|K047:S>L GetModuleHandle|K048:W>W GetModuleUsage|K' +
+    '049:WPI>W GetModuleFileName|K050:WP>L GetProcAddress|K051:SW>L MakePro' +
+    'cInstance|K052:S>W FreeProcInstance|K053:X>W CallProcInstance|K054:WWW' +
+    '>W GetInstanceData|K055:R>R Catch|',
+    'K056:R>R Throw|K057:PPI>W GetProfileInt|K058:PPPPW>W GetProfileString|' +
+    'K059:PPP>W WriteProfileString|K060:WPP>W FindResource|K061:WW>W LoadRe' +
+    'source|K062:W>L LockResource|K063:W>W FreeResource|K064:WW>W AccessRes' +
+    'ource|K065:WW>L SizeofResource|',
+    'K066:WWL>W AllocResource|K067:WPS>L SetResourceHandler|K068:W>W InitAt' +
+    'omTable|K069:P>W FindAtom|K070:P>W AddAtom|K071:W>W DeleteAtom|K072:WP' +
+    'W>W GetAtomName|K073:W>W GetAtomHandle|K074:PPW>W OpenFile|K075:X>W Op' +
+    'enPathName|K076:X>W DeletePathName|',
+    'K077:S>L Reserved1|K078:SS>L Reserved2|K079:S>L Reserved3|K080:S>L Res' +
+    'erved4|K081:W>W _lclose|K082:WSW>W _lread|K083:PW>W _lcreat|K084:WLW>L' +
+    ' _llseek|K085:PW>W _lopen|K086:WPW>W _lwrite|K087:PP>W Reserved5|K088:' +
+    'SP>L lstrcpy|K089:SP>L lstrcat|',
+    'K090:P>W lstrlen|K091:R>R InitTask|K092:W>L GetTempDrive|K093:S>L GetC' +
+    'odeHandle|K094:W>W DefineHandleTable|K095:P>W LoadLibrary|K096:W>W Fre' +
+    'eLibrary|K097:WPWP>W GetTempFileName|K098:>W GetLastDiskChange|K099:>L' +
+    ' GetLPErrMode|K100:>W ValidateCodeSegments|',
+    'K101:X>W NoHookDosCall|K102:R>R DOS3Call|K103:R>R NetBIOSCall|K104:SP>' +
+    'W GetCodeInfo|K105:>W GetExeVersion|K106:W>L SetSwapAreaSize|K107:W>W ' +
+    'SetErrorMode|K108:WWW>W SwitchStackTo|K109:R>R SwitchStackBack|K110:W>' +
+    'L PatchCodeHandle|K111:W>L GlobalWire|',
+    'K112:W>W GlobalUnWire|K113:=3 __AHSHIFT|K114:=8 __AHINCR|K115:P>W Outp' +
+    'utDebugString|K116:X>W InitLib|K117:>W OldYield|K118:>W GetTaskQueueDS' +
+    '|K119:>W GetTaskQueueES|K120:X>W UndefDynLink|K121:WW>W LocalShrink|K1' +
+    '22:>W IsTaskLocked|K123:>W KbdRst|',
+    'K124:>W EnableKernel|K125:>W DisableKernel|K126:X>W MemoryFreed|K127:P' +
+    'PIP>W GetPrivateProfileInt|K128:PPPPWP>W GetPrivateProfileStrin|K129:P' +
+    'PPP>W WritePrivateProfileStr|K130:P>L FileCDR|K131:>L GetDOSEnvironmen' +
+    't|K132:>L GetWinFlags|K133:W>W GetExePtr|',
+    'K134:PW>W GetWindowsDirectory|K135:PW>W GetSystemDirectory|K136:W>W Ge' +
+    'tDriveType|K137:WP>W FatalAppExit|K138:W>L GetHeapSpaces|K139:X>W DoSi' +
+    'gnal|K140:SPPWW>W SetSigHandler|K141:X>W InitTask1|K142:PW>W GetProfil' +
+    'eSectionNames|',
+    'K143:PWP>W GetPrivateProfileSecti|K144:PP>W CreateDirectory|K145:P>W R' +
+    'emoveDirectory|K146:P>W DeleteFile|K147:L>W SetLastError|K148:>L GetLa' +
+    'stError|K149:P>W GetVersionEx|K150:W>W DirectedYield|K151:X>W WinOldAp' +
+    'Call|K152:>W GetNumTasks|',
+    'K154:S>W GlobalNotify|K155:>W GetTaskDS|K156:L>L LimitEMSPages|K157:L>' +
+    'L GetCurPID|K158:W>W IsWinOldApTask|K159:W>L GlobalHandleNoRIP|K160:X>' +
+    'W EMSCopy|K161:>W LocalCountFree|K162:>W LocalHeapSize|K163:W>W Global' +
+    'LRUOldest|K164:W>W GlobalLRUNewest|',
+    'K165:W>W A20Proc|K166:PW>W WinExec|K167:W>W GetExpWinVer|K168:WWW>W Di' +
+    'rectResAlloc|K169:W>L GetFreeSpace|K170:W>W AllocCStoDSAlias|K171:W>W ' +
+    'AllocDStoCSAlias|K172:W>W AllocAlias|K173:=0 __ROMBIOS|K174:=0 __A000H' +
+    '|K175:W>W AllocSelector|',
+    'K176:W>W FreeSelector|K177:WW>W PrestoChangoSelector|K178:=1043 __WINF' +
+    'LAGS|K179:=0 __D000H|K180:LL>W LongPtrAdd|K181:=0 __B000H|K182:=0 __B8' +
+    '00H|K183:=0 __0000H|K184:L>L GlobalDOSAlloc|K185:W>W GlobalDOSFree|K18' +
+    '6:W>L GetSelectorBase|',
+    'K187:WL>W SetSelectorBase|K188:W>L GetSelectorLimit|K189:WL>W SetSelec' +
+    'torLimit|K190:=0 __E000H|K191:W>W GlobalPageLock|K192:W>W GlobalPageUn' +
+    'lock|K193:=0 __0040H|K194:=0 __F000H|K195:=0 __C000H|K196:WWW>W Select' +
+    'orAccessRights|K197:W>W GlobalFix|',
+    'K198:W>W GlobalUnfix|K199:W>W SetHandleCount|K200:>W ValidateFreeSpace' +
+    's|K201:X>W ReplaceInst|K202:X>W RegisterPtrace|K203:R>R DebugBreak|K20' +
+    '4:X>W SwapRecording|K205:X>W CVWBreak|K206:W>W AllocSelectorArray|K207' +
+    ':W>W IsDBCSLeadByte|K208:WLLL>L K208|',
+    'K209:LLWL>L K209|K210:LLWLL>L K210|K211:LLW>L K211|K213:LLWW>L K213|K2' +
+    '14:LLW>L K214|K215:LW>L K215|K216:LLPL>L RegEnumKey|K217:LPP>L RegOpen' +
+    'Key|K218:LPP>L RegCreateKey|K219:LP>L RegDeleteKey|K220:L>L RegCloseKe' +
+    'y|K221:LPLPL>L RegSetValue|',
+    'K222:LP>L RegDeleteValue|K223:LLPPPPPP>L RegEnumValue|K224:LPPP>L RegQ' +
+    'ueryValue|K225:LPPPPP>L RegQueryValueEx|K226:LPLLPL>L RegSetValueEx|K2' +
+    '27:L>L RegFlushKey|K228:W>W K228|K229:L>W K229|K230:W>L GlobalSmartPag' +
+    'eLock|K231:W>L GlobalSmartPageUnlock|',
+    'K232:X>W RegLoadKey|K233:X>W RegUnloadKey|K234:X>W RegSaveKey|K235:X>W' +
+    ' InvalidateNlsCache|K236:X>W GetProductName|K237:>W K237|K262:X>W WOWW' +
+    'aitForMsgAndEvent|K263:X>W WOWMsgBox|K273:X>W K273|K274:PPW>W GetShort' +
+    'PathName|K310:W>W LocalHandleDelta|',
+    'K311:P>L GetSetKernelDOSProc|K314:X>W DebugDefineSegment|K315:>W Write' +
+    'OutProfiles|K316:>L GetFreeMemInfo|K318:X>W FatalExitHook|K319:X>W Flu' +
+    'shCachedFileHandle|K320:W>W IsTask|K323:W>W IsRomModule|K324:WP>W LogE' +
+    'rror|K325:WPP>W LogParamError|',
+    'K326:W>W IsRomFile|K327:R>R K327|K328:V>W _DebugOutput|K329:PW>W K329|' +
+    'K332:=0 THHOOK|K334:SW>W IsBadReadPtr|K335:SW>W IsBadWritePtr|K336:S>W' +
+    ' IsBadCodePtr|K337:SW>W IsBadStringPtr|K338:S>W HasGPHandler|K339:>W D' +
+    'iagQuery|K340:P>W DiagOutput|',
+    'K341:P>L ToolHelpHook|K342:=0 __GP|K343:X>W RegisterWinOldApHook|K344:' +
+    'X>W GetWinOldApHooks|K345:W>W IsSharedSelector|K346:SL>W IsBadHugeRead' +
+    'Ptr|K347:SL>W IsBadHugeWritePtr|K348:PPL>W hmemcpy|K349:WSL>L _hread|K' +
+    '350:WPL>L _hwrite|K351:>W BUNNY_351|',
+    'K352:SPW>L lstrcatn|K353:SPW>L lstrcpyn|K354:W>L GetAppCompatFlags|K35' +
+    '5:PW>W GetWinDebugInfo|K356:P>W SetWinDebugInfo|K357:S>L MapSL|K358:L>' +
+    'L MapLS|K359:S>L UnMapLS|K360:PPW>W OpenFileEx|K361:>W PIGLET_361|K362' +
+    ':X>W ThunkTerminateProcess|',
+    'K365:R>R GlobalChangeLockCount|K403:WW>W FarSetOwner|K404:W>W FarGetOw' +
+    'ner|K406:PPPWP>W WritePrivateProfileStr|K407:PPPWP>W GetPrivateProfile' +
+    'Struc|K408:X>W KERNEL_408|K409:X>W KERNEL_409|K410:X>W CreateProcessFr' +
+    'omWinEx|K411:LP>L GetCurrentDirectory|',
+    'K412:P>W SetCurrentDirectory|K413:PP>W FindFirstFile|K414:WP>W FindNex' +
+    'tFile|K415:W>W FindClose|K416:PPP>W WritePrivateProfileSec|K417:PP>W W' +
+    'riteProfileSection|K418:PPWP>W GetPrivateProfileSecti|K419:PPW>W GetPr' +
+    'ofileSection|K420:P>L GetFileAttributes|',
+    'K421:PL>W SetFileAttributes|K422:PPPPP>W GetDiskFreeSpace|K423:P>W Log' +
+    'ApiThk|K431:PW>W IsPeFormat|K432:X>W FileTimeToLocalFileTim|K434:PPW>W' +
+    ' UnicodeToAnsi|K435:X>W GetTaskFlags|K436:P>W _ConfirmSysLevel|K437:P>' +
+    'W _CheckNotSysLevel|',
+    'K438:PL>W _CreateSysLevel|K439:P>W _EnterSysLevel|K440:P>W _LeaveSysLe' +
+    'vel|K441:PLSSLP>L CreateThread16|K442:>L VWin32_EventCreate|K443:L>L V' +
+    'Win32_EventDestroy|K444:PW>W Local32Info|K445:PW>W Local32First|K446:P' +
+    '>W Local32Next|K447:>W WIN32_OldYield|',
+    'K448:X>W KERNEL_448|K449:>L GetpWin16Lock|K450:L>L VWin32_EventWait|K4' +
+    '51:L>L VWin32_EventSet|K452:P>L LoadLibrary32|K453:LP>L GetProcAddress' +
+    '32|K454:=0 __FLATCS|K455:=0 __FLATDS|K456:WWW>L DefResourceHandler|K45' +
+    '7:LL>L CreateW32Event|K458:L>L SetW32Event|',
+    'K459:L>L ResetW32Event|K460:LL>L WaitForSingleObject|K461:LPLL>L WaitF' +
+    'orMultipleObjects|K462:>L GetCurrentThreadId|K463:LW>L SetThreadQueue|' +
+    'K464:L>L GetThreadQueue|K465:X>W NukeProcess|K466:W>W ExitProcess|K467' +
+    ':X>W WOACreateConsole|',
+    'K468:X>W WOASpawnConApp|K469:X>W WOAGimmeTitle|K470:X>W WOADestroyCons' +
+    'ole|K471:>L GetCurrentProcessId|K472:R>R MapHInstLS|K473:R>R MapHInstS' +
+    'L|K474:L>L CloseW32Handle|K475:>W GetTEBSelectorFS|K476:L>L ConvertToG' +
+    'lobalHandle|K477:X>W WOAFullScreen|',
+    'K478:X>W WOATerminateProcess|K479:L>L KERNEL_479|K480:>W _EnterWin16Lo' +
+    'ck|K481:>W _LeaveWin16Lock|K482:P>L LoadSystemLibrary32|K483:L>L MapPr' +
+    'ocessHandle|K484:LIL>L SetProcessDword|K485:LI>L GetProcessDword|K486:' +
+    'L>L FreeLibrary32|',
+    'K487:LPW>L GetModuleFileName32|K488:P>L GetModuleHandle32|K489:X>W KER' +
+    'NEL_489|K490:W>W KERNEL_490|K491:LL>L RegisterServiceProcess|K492:X>W ' +
+    'WOAAbort|K493:LLLL>W UTInit|K494:X>W KERNEL_494|K495:LPLLL>L WaitForMu' +
+    'ltipleObjects|K500:V>L WOW16Call|',
+    'K501:X>W KDDBGOUT|K502:X>W WOWGETNEXTVDMCOMMAND|K503:X>W WOWREGISTERSH' +
+    'ELLWINDOW|K504:X>W WOWLOADMODULE|K505:X>W WOWQUERYPERFORMANCECOU|K506:' +
+    'X>W WOWCURSORICONOP|K507:X>W WOWFAILEDEXEC|K508:X>W WOWCLOSECOMPORT|K5' +
+    '11:X>W WOWKILLREMOTETASK|',
+    'K512:X>W WOWQUERYDEBUG|K513:PLL>L LoadLibraryEx32W|K514:L>L FreeLibrar' +
+    'y32W|K515:LP>L GetProcAddress32W|K516:SW>L GetVDMPointer32W|K517:V>L C' +
+    'allProc32W|K518:V>L _CallProcEx32W|K519:X>W EXITKERNELTHUNK|K520:=4200' +
+    ' __MOD_KERNEL|K521:=4201 __MOD_DKERNEL|',
+    'K522:=4203 __MOD_USER|K523:=4204 __MOD_DUSER|K524:=4205 __MOD_GDI|K525' +
+    ':=4206 __MOD_DGDI|K526:=4207 __MOD_KEYBOARD|K527:=4208 __MOD_SOUND|K52' +
+    '8:=4209 __MOD_SHELL|K529:=4210 __MOD_WINSOCK|K530:=4211 __MOD_TOOLHELP' +
+    '|K531:=4212 __MOD_MMEDIA|',
+    'K532:=4213 __MOD_COMMDLG|K541:X>W WOWSETEXITONLASTAPP|K544:X>W WOWSETC' +
+    'OMPATHANDLE|K533:X>W ConvertDDEHandleLS|K534:X>W ConvertDDEHandleSL|K5' +
+    '35:LL>L VWin32_BoostThreadGrou|K536:LL>L VWin32_BoostThreadStat|K537:X' +
+    '>W KERNEL_537|',
+    'K538:X>W ThunkTheTemplateHandle|K540:X>W KERNEL_540|K542:X>W KERNEL_54' +
+    '2|K543:X>W KERNEL_543|K560:LS>L SetThunkletCallbackGlu|K561:SL>L Alloc' +
+    'LSThunkletCallbac|K562:LL>L AllocSLThunkletCallbac|K563:SL>L FindLSThu' +
+    'nkletCallback|',
+    'K564:LL>L FindSLThunkletCallback|K566:X>W KERNEL_566|K567:SLW>L AllocL' +
+    'SThunkletCallbac|K568:LLW>L AllocSLThunkletCallbac|K600:X>W AllocCodeA' +
+    'lias|K601:X>W FreeCodeAlias|K602:>W GetDummyModuleHandleDS|K603:X>W KE' +
+    'RNEL_603|K604:R>R CBClientGlueSL|',
+    'K605:LL>L AllocSLThunkletCallbac|K606:SL>L AllocLSThunkletCallbac|K607' +
+    ':SLL>L AllocLSThunkletSysthun|K608:LSL>L AllocSLThunkletSysthun|K609:S' +
+    'L>L FindLSThunkletCallback|K610:LL>L FindSLThunkletCallback|K611:LL>W ' +
+    'FreeThunklet|K612:P>W IsSLThunklet|',
+    'K613:X>W HugeMapLS|K614:X>W HugeUnMapLS|K615:LLL>W ConvertDialog32To16' +
+    '|K616:LLL>W ConvertMenu32To16|K617:P>W GetMenu32Size|K618:P>W GetDialo' +
+    'g32Size|K619:WSL>W RegisterCBClient|K620:R>R CBClientThunkSL|K621:R>R ' +
+    'CBClientThunkSLEx|',
+    'K622:WSL>W UnRegisterCBClient|K623:L>W InitCBClient|K624:LL>L SetFastQ' +
+    'ueue|K625:>L GetFastQueue|K626:X>W SmashEnvironment|K627:SLW>W IsBadFl' +
+    'atReadWritePtr|K630:R>R C16ThkSL|K631:R>R C16ThkSL01|K651:PPWLPPW>L Th' +
+    'unkConnect16|K652:X>W IsThreadId|',
+    'K653:X>W OkWithKernelToChangeUs|K666:PLPL>L UTGlue16|K667:WW>L EntryAd' +
+    'drProc|K668:WWW>L MyAlloc|K669:LWWWLW>W DllEntryPoint|K700:>L SSInit|K' +
+    '701:X>W SSOnBigStack|K702:X>W SSCall|K703:X>W CallProc32WFix|K704:R>R ' +
+    'SSConfirmSmallStack|K901:R>R __wine_vxd_vmm|',
+    'K905:R>R __wine_vxd_timer|K909:R>R __wine_vxd_reboot|K910:R>R __wine_v' +
+    'xd_vdd|K912:R>R __wine_vxd_vmd|K914:R>R __wine_vxd_comm|K923:R>R __win' +
+    'e_vxd_shell|K933:R>R __wine_vxd_pagefile|K938:R>R __wine_vxd_apm|K939:' +
+    'R>R __wine_vxd_vxdloader|',
+    'K945:R>R __wine_vxd_win32s|K951:R>R __wine_vxd_configmg|K955:R>R __win' +
+    'e_vxd_enable|U001:WPPW>W MessageBox|U002:>W OldExitWindows|U003:X>W En' +
+    'ableOEMLayer|U004:X>W DisableOEMLayer|U005:W>W InitApp|U006:W>W PostQu' +
+    'itMessage|U007:LW>W ExitWindows|',
+    'U010:WWWS>W SetTimer|U011:WWWS>W SetSystemTimer|U012:WW>W KillTimer|U0' +
+    '13:>L GetTickCount|U014:>L GetTimerResolution|U015:>L GetCurrentTime|U' +
+    '016:P>W ClipCursor|U017:P>W GetCursorPos|U018:W>W SetCapture|U019:>W R' +
+    'eleaseCapture|U020:W>W SetDoubleClickTime|',
+    'U021:>W GetDoubleClickTime|U022:W>W SetFocus|U023:>W GetFocus|U024:WP>' +
+    'W RemoveProp|U025:WP>W GetProp|U026:WPW>W SetProp|U027:WS>W EnumProps|' +
+    'U028:WP>W ClientToScreen|U029:WP>W ScreenToClient|U030:L>W WindowFromP' +
+    'oint|U031:W>W IsIconic|',
+    'U032:WP>W GetWindowRect|U033:WP>W GetClientRect|U034:WW>W EnableWindow' +
+    '|U035:W>W IsWindowEnabled|U036:WSW>W GetWindowText|U037:WS>W SetWindow' +
+    'Text|U038:W>W GetWindowTextLength|U039:WP>W BeginPaint|U040:WP>W EndPa' +
+    'int|U041:PPLIIIIWWWS>W CreateWindow|',
+    'U042:WW>W ShowWindow|U043:W>W CloseWindow|U044:W>W OpenIcon|U045:W>W B' +
+    'ringWindowToTop|U046:W>W GetParent|U047:W>W IsWindow|U048:WW>W IsChild' +
+    '|U049:W>W IsWindowVisible|U050:PP>W FindWindow|U051:X>W BEAR51|U052:>W' +
+    ' AnyPopup|U053:W>W DestroyWindow|',
+    'U054:SL>W EnumWindows|U055:WSL>W EnumChildWindows|U056:WWWWWW>W MoveWi' +
+    'ndow|U057:P>W RegisterClass|U058:WPW>W GetClassName|U059:W>W SetActive' +
+    'Window|U060:>W GetActiveWindow|U061:WIIPP>W ScrollWindow|U062:WWIW>W S' +
+    'etScrollPos|U063:WW>W GetScrollPos|',
+    'U064:WWIIW>W SetScrollRange|U065:WWPP>W GetScrollRange|U066:W>W GetDC|' +
+    'U067:W>W GetWindowDC|U068:WW>W ReleaseDC|U069:W>W SetCursor|U070:WW>W ' +
+    'SetCursorPos|U071:W>W ShowCursor|U072:PIIII>W SetRect|U073:P>W SetRect' +
+    'Empty|U074:PP>W CopyRect|',
+    'U075:P>W IsRectEmpty|U076:PL>W PtInRect|U077:PII>W OffsetRect|U078:PII' +
+    '>W InflateRect|U079:PPP>W IntersectRect|U080:PPP>W UnionRect|U081:WPW>' +
+    'W FillRect|U082:WP>W InvertRect|U083:WPW>W FrameRect|U084:WIIW>W DrawI' +
+    'con|U085:WPIPW>W DrawText|U086:>L IconSize|',
+    'U087:WPWS>W DialogBox|U088:WI>W EndDialog|U089:WPWS>W CreateDialog|U09' +
+    '0:WP>W IsDialogMessage|U091:WW>W GetDlgItem|U092:WWS>W SetDlgItemText|' +
+    'U093:WWSW>W GetDlgItemText|U094:WWWW>W SetDlgItemInt|U095:WIPW>W GetDl' +
+    'gItemInt|U096:WWWW>W CheckRadioButton|',
+    'U097:WWW>W CheckDlgButton|U098:WW>W IsDlgButtonChecked|U099:WPW>W DlgD' +
+    'irSelect|U100:WPWWW>W DlgDirList|U101:WWWWL>L SendDlgItemMessage|U102:' +
+    'PLW>W AdjustWindowRect|U103:WP>W MapDialogRect|U104:W>W MessageBeep|U1' +
+    '05:WW>W FlashWindow|U106:W>W GetKeyState|',
+    'U107:WWWL>L DefWindowProc|U108:PWWW>W GetMessage|U109:PWWWW>W PeekMess' +
+    'age|U110:WWWL>W PostMessage|U111:WWWL>L SendMessage|U112:>W WaitMessag' +
+    'e|U113:P>W TranslateMessage|U114:P>L DispatchMessage|U115:L>W ReplyMes' +
+    'sage|U116:WWWL>W PostAppMessage|',
+    'U117:W>W WindowFromDC|U118:P>W RegisterWindowMessage|U119:>L GetMessag' +
+    'ePos|U120:>L GetMessageTime|U121:IS>L SetWindowsHook|U122:SWWWL>L Call' +
+    'WindowProc|U123:PI>W CallMsgFilter|U124:W>W UpdateWindow|U125:WPW>W In' +
+    'validateRect|U126:WWW>W InvalidateRgn|',
+    'U127:WP>W ValidateRect|U128:WW>W ValidateRgn|U129:WI>W GetClassWord|U1' +
+    '30:WIW>W SetClassWord|U131:WI>L GetClassLong|U132:WIL>L SetClassLong|U' +
+    '133:WI>W GetWindowWord|U134:WIW>W SetWindowWord|U135:WI>L GetWindowLon' +
+    'g|U136:WIL>L SetWindowLong|',
+    'U137:W>W OpenClipboard|U138:>W CloseClipboard|U139:>W EmptyClipboard|U' +
+    '140:>W GetClipboardOwner|U141:WW>W SetClipboardData|U142:W>W GetClipbo' +
+    'ardData|U143:>W CountClipboardFormats|U144:W>W EnumClipboardFormats|U1' +
+    '45:P>W RegisterClipboardForma|',
+    'U146:WPI>W GetClipboardFormatName|U147:W>W SetClipboardViewer|U148:>W ' +
+    'GetClipboardViewer|U149:WW>W ChangeClipboardChain|U150:WP>W LoadMenu|U' +
+    '151:>W CreateMenu|U152:W>W DestroyMenu|U153:WWSWW>W ChangeMenu|U154:WW' +
+    'W>W CheckMenuItem|U155:WWW>W EnableMenuItem|',
+    'U156:WW>W GetSystemMenu|U157:W>W GetMenu|U158:WW>W SetMenu|U159:WW>W G' +
+    'etSubMenu|U160:W>W DrawMenuBar|U161:WWPIW>W GetMenuString|U162:WWWW>W ' +
+    'HiliteMenuItem|U163:WWWW>W CreateCaret|U164:>W DestroyCaret|U165:WW>W ' +
+    'SetCaretPos|U166:W>W HideCaret|',
+    'U167:W>W ShowCaret|U168:W>W SetCaretBlinkTime|U169:>W GetCaretBlinkTim' +
+    'e|U170:W>W ArrangeIconicWindows|U171:WPWL>W WinHelp|U172:WW>W SwitchTo' +
+    'ThisWindow|U173:WP>W LoadCursor|U174:WP>W LoadIcon|U175:WP>W LoadBitma' +
+    'p|U176:WWPI>W LoadString|',
+    'U177:WP>W LoadAccelerators|U178:WWP>W TranslateAccelerator|U179:I>W Ge' +
+    'tSystemMetrics|U180:W>L GetSysColor|U181:WPP>W SetSysColors|U182:WW>W ' +
+    'KillSystemTimer|U183:P>W GetCaretPos|U184:X>W QuerySendMessage|U185:WW' +
+    'SSIIIII>W GrayString|',
+    'U186:W>W SwapMouseButton|U187:>W EndMenu|U188:W>W SetSysModalWindow|U1' +
+    '89:>W GetSysModalWindow|U190:WPW>W GetUpdateRect|U191:WL>W ChildWindow' +
+    'FromPoint|U192:>W InSendMessage|U193:W>W IsClipboardFormatAvail|U194:W' +
+    'PW>W DlgDirSelectComboBox|',
+    'U195:WPWWW>W DlgDirListComboBox|U196:WIIPIIPI>L TabbedTextOut|U197:WPW' +
+    'WP>L GetTabbedTextExtent|U198:WW>W CascadeChildWindows|U199:WW>W TileC' +
+    'hildWindows|U200:PWW>W OpenComm|U201:P>W SetCommState|U202:WP>W GetCom' +
+    'mState|U203:WP>W GetCommError|',
+    'U204:WPW>W ReadComm|U205:WPW>W WriteComm|U206:WW>W TransmitCommChar|U2' +
+    '07:W>W CloseComm|U208:WW>L SetCommEventMask|U209:WW>W GetCommEventMask' +
+    '|U210:W>W SetCommBreak|U211:W>W ClearCommBreak|U212:WW>W UngetCommChar' +
+    '|U213:PP>W BuildCommDCB|',
+    'U214:WW>L EscapeCommFunction|U215:WW>W FlushComm|U216:WWWW>L UserSeeUs' +
+    'erDo|U217:WI>W LookupMenuHandle|U218:WWWS>W DialogBoxIndirect|U219:WPW' +
+    'S>W CreateDialogIndirect|U220:P>W LoadMenuIndirect|U221:WIIPPWP>W Scro' +
+    'llDC|U222:P>W GetKeyboardState|',
+    'U223:P>W SetKeyboardState|U224:W>W GetWindowTask|U225:WSL>W EnumTaskWi' +
+    'ndows|U226:X>W LockInput|U227:WWW>W GetNextDlgGroupItem|U228:WWW>W Get' +
+    'NextDlgTabItem|U229:W>W GetTopWindow|U230:WW>W GetNextWindow|U231:>W G' +
+    'etSystemDebugState|',
+    'U232:WWWWWWW>W SetWindowPos|U233:WW>W SetParent|U234:IS>W UnhookWindow' +
+    'sHook|U235:IWLP>L DefHookProc|U236:>W GetCapture|U237:WWW>W GetUpdateR' +
+    'gn|U238:WW>W ExcludeUpdateRgn|U239:WPWSL>W DialogBoxParam|U240:WWWSL>W' +
+    ' DialogBoxIndirectParam|',
+    'U241:WPWSL>W CreateDialogParam|U242:WPWSL>W CreateDialogIndirectPa|U24' +
+    '3:>L GetDialogBaseUnits|U244:PP>W EqualRect|U245:IWII>W EnableCommNoti' +
+    'fication|U246:PP>W ExitWindowsExec|U247:>W GetCursor|U248:>W GetOpenCl' +
+    'ipboardWindow|U249:W>W GetAsyncKeyState|',
+    'U250:WWW>W GetMenuState|U251:WWLL>L SendDriverMessage|U252:PPL>W OpenD' +
+    'river|U253:WLL>L CloseDriver|U254:W>W GetDriverModuleHandle|U255:LWWLL' +
+    '>L DefDriverProc|U256:WP>W GetDriverInfo|U257:WL>W GetNextDriver|U258:' +
+    'WWPW>W MapWindowPoints|',
+    'U259:I>W BeginDeferWindowPos|U260:WWWIIIIW>W DeferWindowPos|U261:W>W E' +
+    'ndDeferWindowPos|U262:WW>W GetWindow|U263:W>W GetMenuItemCount|U264:WW' +
+    '>W GetMenuItemID|U265:WW>W ShowOwnedPopups|U266:W>W SetMessageQueue|U2' +
+    '67:WWW>W ShowScrollBar|',
+    'U268:P>W GlobalAddAtom|U269:W>W GlobalDeleteAtom|U270:P>W GlobalFindAt' +
+    'om|U271:WPI>W GlobalGetAtomName|U272:W>W IsZoomed|U273:WWP>W ControlPa' +
+    'nelInfo|U274:X>W GetNextQueueWindow|U275:X>W RepaintScreen|U276:X>W Lo' +
+    'ckMyTask|U277:W>W GetDlgCtrlID|',
+    'U278:>W GetDesktopHwnd|U279:>W OldSetDeskPattern|U280:WW>W SetSystemMe' +
+    'nu|U281:W>W GetSysColorBrush|U282:WWW>W SelectPalette|U283:W>W Realize' +
+    'Palette|U284:W>W GetFreeSystemResources|U285:P>W SetDeskWallpaper|U286' +
+    ':>W GetDesktopWindow|',
+    'U287:W>W GetLastActivePopup|U288:>L GetMessageExtraInfo|U289:R>R keybd' +
+    '_event|U290:WPWW>W RedrawWindow|U291:ISWW>L SetWindowsHookEx|U292:S>W ' +
+    'UnhookWindowsHookEx|U293:SIWL>L CallNextHookEx|U294:W>W LockWindowUpda' +
+    'te|U299:R>R mouse_event|',
+    'U300:X>W UnloadInstalledDrivers|U301:X>W EDITWNDPROC|U302:X>W STATICWN' +
+    'DPROC|U303:X>W BUTTONWNDPROC|U304:X>W SBWNDPROC|U305:X>W DESKTOPWNDPRO' +
+    'C|U306:X>W MENUWNDPROC|U307:X>W LBOXCTLWNDPROC|U308:WWWL>L DefDlgProc|' +
+    'U309:P>W GetClipCursor|',
+    'U314:WWWWW>W SignalProc|U319:WIIPPWPW>W ScrollWindowEx|U320:X>W SysErr' +
+    'orBox|U321:S>L SetEventHook|U322:X>W WinOldAppHackOMatic|U323:X>W GetM' +
+    'essage2|U324:WWWW>W FillWindow|U325:WWWWP>W PaintRect|U326:WWW>W GetCo' +
+    'ntrolBrush|U331:W>W EnableHardwareInput|',
+    'U332:>W UserYield|U333:>W IsUserIdle|U334:W>L GetQueueStatus|U335:>W G' +
+    'etInputState|U336:WWW>W LoadCursorIconHandler|U337:>L GetMouseEventPro' +
+    'c|U338:X>W ECGETDS|U343:X>W GetFilePortName|U344:X>W COMBOBOXCTLWNDPRO' +
+    'C|U345:X>W BEAR345|',
+    'U356:WWW>W LoadDIBCursorHandler|U357:WWW>W LoadDIBIconHandler|U358:W>W' +
+    ' IsMenu|U359:WWL>W GetDCEx|U362:WWLL>W DCHook|U364:PWWWW>W LookupIconI' +
+    'dFromDirect|U368:WW>W CopyIcon|U369:WW>W CopyCursor|U370:WP>W GetWindo' +
+    'wPlacement|U371:WP>W SetWindowPlacement|',
+    'U372:X>W GetInternalIconHeader|U373:PPP>W SubtractRect|U374:LWWWLW>W D' +
+    'llEntryPoint|U375:X>W DrawTextEx|U376:X>W SetMessageExtraInfo|U378:X>W' +
+    ' SetPropEx|U379:X>W GetPropEx|U380:X>W RemovePropEx|U382:X>W SetWindow' +
+    'ContextHelpID|',
+    'U383:X>W GetWindowContextHelpID|U384:WW>W SetMenuContextHelpId|U385:W>' +
+    'W GetMenuContextHelpId|U389:WPWWWW>L LoadImage|U390:WWWWW>W CopyImage|' +
+    'U391:LLLW>W SignalProc32|U394:WWWWWWWWW>W DrawIconEx|U395:WP>W GetIcon' +
+    'Info|U397:P>W RegisterClassEx|',
+    'U398:WSP>W GetClassInfoEx|U399:WLW>W ChildWindowFromPointEx|U400:>W Fi' +
+    'nalUserInit|U402:PI>W GetPriorityClipboardFo|U403:PW>W UnregisterClass' +
+    '|U404:WSP>W GetClassInfo|U406:WWWWWPP>W CreateCursor|U407:WWWWWPP>W Cr' +
+    'eateIcon|U408:WPPP>W CreateCursorIconIndire|',
+    'U409:WW>W InitThreadInput|U410:WWWWS>W InsertMenu|U411:WWWS>W AppendMe' +
+    'nu|U412:WWW>W RemoveMenu|U413:WWW>W DeleteMenu|U414:WWWWS>W ModifyMenu' +
+    '|U415:>W CreatePopupMenu|U416:WWIIIWP>W TrackPopupMenu|U417:>L GetMenu' +
+    'CheckMarkDimens|',
+    'U418:WWWWW>W SetMenuItemBitmaps|U420:V>W _wsprintf|U421:PPP>W wvsprint' +
+    'f|U422:WPWW>W DlgDirSelectEx|U423:WPWW>W DlgDirSelectComboBoxEx|U427:W' +
+    'WPP>W FindWindowEx|U428:X>W TileWindows|U429:X>W CascadeWindows|U430:P' +
+    'P>W lstrcmp|U431:S>L AnsiUpper|',
+    'U432:S>L AnsiLower|U433:W>W IsCharAlpha|U434:W>W IsCharAlphaNumeric|U4' +
+    '35:W>W IsCharUpper|U436:W>W IsCharLower|U437:PW>W AnsiUpperBuff|U438:P' +
+    'W>W AnsiLowerBuff|U441:WWWP>W InsertMenuItem|U443:X>W GetMenuItemInfo|' +
+    'U445:WWWWL>L DefFrameProc|',
+    'U446:X>W SetMenuItemInfo|U447:WWWL>L DefMDIChildProc|U448:WWPP>W DrawA' +
+    'nimatedRects|U449:WWSLWIIIIW>W DrawState|U450:PLWLWWW>W CreateIconFrom' +
+    'Resource|U451:WP>W TranslateMDISysAccel|U452:LPPLIIIIWWWS>W CreateWind' +
+    'owEx|U454:PLWL>W AdjustWindowRectEx|',
+    'U455:WL>W GetIconID|U456:WW>W LoadIconHandler|U457:W>W DestroyIcon|U45' +
+    '8:W>W DestroyCursor|U459:SPPP>L DumpIcon|U460:WPP>W GetInternalWindowP' +
+    'os|U461:WWPP>W SetInternalWindowPos|U462:WW>W CalcChildScroll|U463:WWW' +
+    'L>W ScrollChildren|U464:WWWWWW>L DragObject|',
+    'U465:WL>W DragDetect|U466:WP>W DrawFocusRect|U470:X>W StringFunc|U471:' +
+    'PP>W lstrcmpi|U472:S>L AnsiNext|U473:PS>L AnsiPrev|U475:WIPW>W SetScro' +
+    'llInfo|U476:WIP>W GetScrollInfo|U477:P>W GetKeyboardLayoutName|U478:X>' +
+    'W LoadKeyboardLayout|',
+    'U479:X>W MenuItemFromPoint|U480:X>W GetUserLocalObjType|U482:WWW>W Ena' +
+    'bleScrollBar|U483:WWPW>W SystemParametersInfo|U489:>W USER_489|U490:>W' +
+    ' USER_490|U492:>W USER_492|U496:>W USER_496|U498:X>W BEAR498|U499:WPW>' +
+    'W WNetErrorText|U500:X>W FARCALLNETDRIVER|',
+    'U501:PPWP>W WNetOpenJob|U502:WPP>W WNetCloseJob|U503:PW>W WNetAbortJob' +
+    '|U504:PW>W WNetHoldJob|U505:PW>W WNetReleaseJob|U506:PW>W WNetCancelJo' +
+    'b|U507:PWW>W WNetSetJobCopies|U508:WPPW>W WNetWatchQueue|U509:P>W WNet' +
+    'UnwatchQueue|U510:PPP>W WNetLockQueueData|',
+    'U511:P>W WNetUnlockQueueData|U512:PPP>W WNetGetConnection|U513:W>W WNe' +
+    'tGetCaps|U514:W>W WNetDeviceMode|U515:WWP>W WNetBrowseDialog|U516:PP>W' +
+    ' WNetGetUser|U517:PPP>W WNetAddConnection|U518:PW>W WNetCancelConnecti' +
+    'on|U519:P>W WNetGetError|',
+    'U520:WPP>W WNetGetErrorText|U521:X>W WNetEnable|U522:X>W WNetDisable|U' +
+    '523:WP>W WNetRestoreConnection|U524:WPP>W WNetWriteJob|U525:WW>W WNetC' +
+    'onnectDialog|U526:WW>W WNetDisconnectDialog|U527:WW>W WNetConnectionDi' +
+    'alog|U528:WP>W WNetViewQueueDialog|',
+    'U529:WWWPW>W WNetPropertyDialog|U530:PP>W WNetGetDirectoryType|U531:WP' +
+    'W>W WNetDirectoryNotify|U532:WWPPWW>W WNetGetPropertyText|U533:X>W WNe' +
+    'tInitialize|U534:X>W WNetLogon|U535:X>W WOWWORDBREAKPROC|U537:X>W MOUS' +
+    'EEVENT|U538:X>W KEYBDEVENT|',
+    'U595:X>W OLDEXITWINDOWS|U600:>W GetShellWindow|U601:X>W DoHotkeyStuff|' +
+    'U602:X>W SetCheckCursorTimer|U604:X>W BroadcastSystemMessage|U605:X>W ' +
+    'HackTaskMonitor|U606:LSWWPWP>W FormatMessage|U608:>W GetForegroundWind' +
+    'ow|U609:W>W SetForegroundWindow|',
+    'U610:WW>W DestroyIcon32|U620:PL>L ChangeDisplaySettings|U621:PLP>W Enu' +
+    'mDisplaySettings|U640:LPLLL>L MsgWaitForMultipleObje|U650:X>W Activate' +
+    'KeyboardLayout|U651:X>W GetKeyboardLayout|U652:X>W GetKeyboardLayoutLi' +
+    'st|U654:X>W UnloadKeyboardLayout|',
+    'U655:X>W PostPostedMessages|U656:WPWW>W DrawFrameControl|U657:WWPWWPW>' +
+    'W DrawCaptionTemp|U658:X>W DispatchInput|U659:WPWW>W DrawEdge|U660:WWP' +
+    'W>W DrawCaption|U661:X>W SetSysColorsTemp|U662:X>W DrawMenubarTemp|U66' +
+    '3:X>W GetMenuDefaultItem|',
+    'U664:X>W SetMenuDefaultItem|U665:WWWP>W GetMenuItemRect|U666:WWWWW>W C' +
+    'heckMenuRadioItem|U667:X>W TrackPopupMenuEx|U668:WWW>W SetWindowRgn|U6' +
+    '69:X>W GetWindowRgn|U800:X>W CHOOSEFONT_CALLBACK16|U801:X>W FINDREPLAC' +
+    'E_CALLBACK16|U802:X>W OPENFILENAME_CALLBACK1|',
+    'U803:X>W PRINTDLG_CALLBACK16|U804:X>W CHOOSECOLOR_CALLBACK16|U819:PWWW' +
+    'WW>W PeekMessage32|U820:PWWWW>L GetMessage32|U821:PW>W TranslateMessag' +
+    'e32|U822:PW>L DispatchMessage32|U823:PWW>W CallMsgFilter32|U825:X>W Po' +
+    'stMessage32|U826:X>W PostThreadMessage32|',
+    'U827:P>W MessageBoxIndirect|U851:X>W MsgThkConnectionDataLS|U853:X>W F' +
+    'T_USRFTHKTHKCONNECTIO|U854:X>W FT__USRF2THKTHKCONNECT|U855:X>W Usr32Th' +
+    'kConnectionData|U890:X>W InstallIMT|U891:X>W UninstallIMT|U902:WWPWW>W' +
+    ' LoadSystemLanguageStri|',
+    'U905:>W ChangeDialogTemplate|U906:>W GetNumLanguages|U907:WWPW>W GetLa' +
+    'nguageName|U909:WPW>W SetWindowTextEx|U910:>W BiDiMessageBoxEx|U911:WW' +
+    'PW>W SetDlgItemTextEx|U912:WW>L ChangeKeyboardLanguage|U913:WW>W GetCo' +
+    'dePageSystemFont|U914:WWWL>W QueryCodePage|',
+    'U915:W>L GetAppCodePage|U916:WPWPLWWPW>W CreateDialogIndirectPa|U918:W' +
+    'WWPLWWPW>W DialogBoxIndirectParam|U919:WWWPW>W LoadLanguageString|U920' +
+    ':WWWW>L SetAppCodePage|U922:>L GetBaseCodePage|U923:WPPW>W FindLanguag' +
+    'eResource|U924:WW>L ChangeKeyboardCodePage|',
+    'U930:WPPWW>W MessageBoxEx|G001:WL>L SetBkColor|G002:WW>W SetBkMode|G00' +
+    '3:WW>W SetMapMode|G004:WW>W SetROP2|G005:WW>W SetRelAbs|G006:WW>W SetP' +
+    'olyFillMode|G007:WW>W SetStretchBltMode|G008:WI>W SetTextCharacterExtr' +
+    'a|G009:WL>L SetTextColor|',
+    'G010:WII>W SetTextJustification|G011:WII>L SetWindowOrg|G012:WII>L Set' +
+    'WindowExt|G013:WII>L SetViewportOrg|G014:WII>L SetViewportExt|G015:WII' +
+    '>L OffsetWindowOrg|G016:WIIII>L ScaleWindowExt|G017:WII>L OffsetViewpo' +
+    'rtOrg|G018:WIIII>L ScaleViewportExt|',
+    'G019:WII>W LineTo|G020:WII>L MoveTo|G021:WIIII>W ExcludeClipRect|G022:' +
+    'WIIII>W IntersectClipRect|G023:WIIIIIIII>W Arc|G024:WIIII>W Ellipse|G0' +
+    '25:WIIL>W FloodFill|G026:WIIIIIIII>W Pie|G027:WIIII>W Rectangle|G028:W' +
+    'IIIIII>W RoundRect|G029:WIIIIL>W PatBlt|',
+    'G030:W>W SaveDC|G031:WIIL>L SetPixel|G032:WII>W OffsetClipRgn|G033:WII' +
+    'PW>W TextOut|G034:WIIIIWIIL>W BitBlt|G035:WIIIIWIIIIL>W StretchBlt|G03' +
+    '6:>W Polygon|G037:>W Polyline|G038:WWWSP>L Escape|G039:WI>W RestoreDC|' +
+    'G040:WWW>W FillRgn|G041:WWWWW>W FrameRgn|',
+    'G042:WW>W InvertRgn|G043:WW>W PaintRgn|G044:WW>W SelectClipRgn|G045:WW' +
+    '>W SelectObject|G046:X>W BITMAPBITS|G047:WWWI>W CombineRgn|G048:WWWWP>' +
+    'W CreateBitmap|G049:P>W CreateBitmapIndirect|G050:P>W CreateBrushIndir' +
+    'ect|G051:WWW>W CreateCompatibleBitmap|',
+    'G052:W>W CreateCompatibleDC|G053:PPPP>W CreateDC|G054:IIII>W CreateEll' +
+    'ipticRgn|G055:P>W CreateEllipticRgnIndir|G056:IIIIIWWWWWWWWP>W CreateF' +
+    'ont|G057:P>W CreateFontIndirect|G058:WL>W CreateHatchBrush|G060:W>W Cr' +
+    'eatePatternBrush|G061:IIL>W CreatePen|',
+    'G062:P>W CreatePenIndirect|G063:PWW>W CreatePolygonRgn|G064:IIII>W Cre' +
+    'ateRectRgn|G065:P>W CreateRectRgnIndirect|G066:L>W CreateSolidBrush|G0' +
+    '67:WPI>W DPtoLP|G068:W>W DeleteDC|G069:W>W DeleteObject|G070:WPSL>W En' +
+    'umFonts|G071:WWSL>W EnumObjects|',
+    'G072:WW>W EqualRgn|G073:WIIII>W ExcludeVisRect|G074:WLP>L GetBitmapBit' +
+    's|G075:W>L GetBkColor|G076:W>W GetBkMode|G077:WP>W GetClipBox|G078:W>L' +
+    ' GetCurrentPosition|G079:W>L GetDCOrg|G080:WI>W GetDeviceCaps|G081:W>W' +
+    ' GetMapMode|G082:WIP>W GetObject|',
+    'G083:WII>L GetPixel|G084:W>W GetPolyFillMode|G085:W>W GetROP2|G086:W>W' +
+    ' GetRelAbs|G087:W>W GetStockObject|G088:W>W GetStretchBltMode|G089:W>W' +
+    ' GetTextCharacterExtra|G090:W>L GetTextColor|G091:WPI>L GetTextExtent|' +
+    'G092:WIP>W GetTextFace|',
+    'G093:WP>W GetTextMetrics|G094:W>L GetViewportExt|G095:W>L GetViewportO' +
+    'rg|G096:W>L GetWindowExt|G097:W>L GetWindowOrg|G098:WIIII>W IntersectV' +
+    'isRect|G099:WPI>W LPtoDP|G100:IIIISL>W LineDDA|G101:WII>W OffsetRgn|G1' +
+    '02:WII>W OffsetVisRgn|G103:WII>W PtVisible|',
+    'G104:WP>W RectVisibleOld|G105:WW>W SelectVisRgn|G106:WLP>L SetBitmapBi' +
+    'ts|G117:WII>L SetDCOrg|G118:X>W InternalCreateDC|G119:P>W AddFontResou' +
+    'rce|G120:X>W GetContinuingTextExten|G121:W>W Death|G122:WWWWWWW>W Resu' +
+    'rrection|G123:WW>W PlayMetaFile|',
+    'G124:P>W GetMetaFile|G125:P>W CreateMetaFile|G126:W>W CloseMetaFile|G1' +
+    '27:W>W DeleteMetaFile|G128:III>W MulDiv|G129:W>W SaveVisRgn|G130:W>W R' +
+    'estoreVisRgn|G131:W>W InquireVisRgn|G132:PPW>W SetEnvironment|G133:PPW' +
+    '>W GetEnvironment|G134:WP>W GetRgnBox|',
+    'G136:P>W RemoveFontResource|G137:X>W GSV|G138:X>W DPXlate|G139:X>W Set' +
+    'WinViewExt|G140:X>W ScaleExt|G141:X>W WordSet|G142:X>W RectStuff|G143:' +
+    'X>W OffsetOrg|G144:X>W LockDC|G145:X>W UnlockDC|G146:X>W LockUnlock|G1' +
+    '47:X>W GDI_FarFrame|G148:WII>L SetBrushOrg|',
+    'G149:W>L GetBrushOrg|G150:W>W UnrealizeObject|G151:WP>W CopyMetaFile|G' +
+    '152:X>W GDIInitApp|G153:PPPP>W CreateIC|G154:WL>L GetNearestColor|G155' +
+    ':WW>W QueryAbort|G156:WWW>W CreateDiscardableBitma|G157:X>W Compatible' +
+    'Bitmap|G158:X>W EnumCallback|',
+    'G159:W>W GetMetaFileBits|G160:W>W SetMetaFileBits|G161:WII>W PtInRegio' +
+    'n|G162:W>L GetBitmapDimension|G163:WII>L SetBitmapDimension|G164:X>W P' +
+    'ixToLine|G169:X>W IsDCDirty|G170:X>W SetDCStatus|G171:X>W LVBUNION|G17' +
+    '2:WIIII>W SetRectRgn|G173:W>W GetClipRgn|',
+    'G174:X>W BLOAT|G175:WWSL>W EnumMetaFile|G176:WPPW>W PlayMetaFileRecord' +
+    '|G177:X>W RCOS|G178:X>W RSIN|G179:W>W GetDCState|G180:WW>W SetDCState|' +
+    'G181:WP>W RectInRegionOld|G182:X>W REQUESTSEM|G183:X>W CLEARSEM|G184:X' +
+    '>W STUFFVISIBLE|G185:X>W STUFFINREGION|',
+    'G186:X>W DELETEABOVELINEFONTS|G188:X>W GetTextExtentEx|G190:WSL>W SetD' +
+    'CHook|G191:WP>L GetDCHook|G192:WW>W SetHookFlags|G193:WPW>W SetBoundsR' +
+    'ect|G194:WPW>W GetBoundsRect|G195:X>W SelectBitmap|G196:W>W SetMetaFil' +
+    'eBitsBetter|G201:X>W DMBITBLT|',
+    'G202:X>W DMCOLORINFO|G206:X>W dmEnumDFonts|G207:X>W DMENUMOBJ|G208:X>W' +
+    ' DMOUTPUT|G209:X>W DMPIXEL|G210:X>W dmRealizeObject|G211:X>W DMSTRBLT|' +
+    'G212:X>W DMSCANLR|G213:X>W BRUTE|G214:X>W DMEXTTEXTOUT|G215:X>W DMGETC' +
+    'HARWIDTH|G216:X>W DMSTRETCHBLT|',
+    'G217:X>W DMDIBBITS|G218:X>W DMSTRETCHDIBITS|G219:X>W DMSETDIBTODEV|G22' +
+    '0:X>W DMTRANSPOSE|G230:W>W CreatePQ|G231:W>W MinPQ|G232:W>W ExtractPQ|' +
+    'G233:WWW>W InsertPQ|G234:WW>W SizePQ|G235:W>W DeletePQ|G240:PPW>W Open' +
+    'Job|G241:WPW>W WriteSpool|',
+    'G242:WPW>W WriteDialog|G243:W>W CloseJob|G244:WW>W DeleteJob|G245:WP>L' +
+    ' GetSpoolJob|G246:W>W StartSpoolPage|G247:W>W EndSpoolPage|G248:X>W Qu' +
+    'eryJob|G250:PPW>W Copy|G253:X>W DeleteSpoolPage|G254:X>W SpoolFile|G26' +
+    '7:X>W StartDocPrintEra|',
+    'G268:X>W StartPagePrinter|G269:X>W WritePrinter|G270:X>W EndPagePrinte' +
+    'r|G271:X>W AbortPrinter|G272:X>W EndDocPrinter|G274:X>W ClosePrinter|G' +
+    '280:X>W GetRealDriverInfo|G281:PPLPL>L DrvSetPrinterData|G282:PPPPLP>L' +
+    ' DrvGetPrinterData|',
+    'G299:X>W ENGINEGETCHARWIDTHEX|G300:PSL>L EngineEnumerateFont|G301:P>W ' +
+    'EngineDeleteFont|G302:PPP>L EngineRealizeFont|G303:PWWP>W EngineGetCha' +
+    'rWidth|G304:PW>W EngineSetFontContext|G305:WPWWPLP>W EngineGetGlyphBMP' +
+    '|G306:WPP>L EngineMakeFontDir|',
+    'G307:WWWP>W GetCharABCWidths|G308:WWP>W GetOutlineTextMetrics|G309:WWW' +
+    'PLPP>L GetGlyphOutline|G310:WPPP>W CreateScalableFontReso|G311:WLLPL>L' +
+    ' GetFontData|G312:X>W ConvertOutLineFontFile|G313:PW>W GetRasterizerCa' +
+    'ps|G314:X>W EngineExtTextOut|',
+    'G315:LLLL>L EngineRealizeFontExt|G316:X>W EngineGetCharWidthStr|G317:X' +
+    '>W EngineGetGlyphBmpExt|G330:WPSL>W EnumFontFamilies|G332:WWP>W GetKer' +
+    'ningPairs|G345:W>W GetTextAlign|G346:WW>W SetTextAlign|G347:X>W MFDRAW' +
+    'TEXT|G348:WIIIIIIII>W Chord|',
+    'G349:WL>L SetMapperFlags|G350:WWWP>W GetCharWidth|G351:WIIWPPWP>W ExtT' +
+    'extOut|G352:X>W GetPhysicalFontHandle|G353:X>W GetAspectRatioFilter|G3' +
+    '54:X>W ShrinkGDIHeap|G355:X>W FTrapping0|G360:P>W CreatePalette|G361:W' +
+    'WW>W GDISelectPalette|',
+    'G362:W>W GDIRealizePalette|G363:WWWP>W GetPaletteEntries|G364:WWWP>W S' +
+    'etPaletteEntries|G365:W>W RealizeDefaultPalette|G366:W>W UpdateColors|' +
+    'G367:WWWP>W AnimatePalette|G368:WW>W ResizePalette|G370:WL>W GetNeares' +
+    'tPaletteIndex|G372:WIILW>W ExtFloodFill|',
+    'G373:WW>W SetSystemPaletteUse|G374:W>W GetSystemPaletteUse|G375:WWWP>W' +
+    ' GetSystemPaletteEntrie|G376:WP>W ResetDC|G377:WP>W StartDoc|G378:W>W ' +
+    'EndDoc|G379:W>W StartPage|G380:W>W EndPage|G381:WS>W SetAbortProc|G382' +
+    ':W>W AbortDoc|G400:WPIIL>W FastWindowFrame|',
+    'G401:X>W GDIMOVEBITMAP|G402:X>W GDIGETBITSGLOBAL|G403:WW>W GdiInit2|G4' +
+    '04:X>W GetTTGlyphIndexMap|G405:W>W FinalGdiInit|G406:X>W CREATEREALBIT' +
+    'MAPINDIRE|G407:WWWWP>W CreateUserBitmap|G408:X>W CREATEREALBITMAP|G409' +
+    ':WWW>W CreateUserDiscardableB|',
+    'G410:>W IsValidMetaFile|G411:W>W GetCurLogFont|G412:W>W IsDCCurrentPal' +
+    'ette|G439:>W StretchDIBits|G440:WWWWPPW>W SetDIBits|G441:WWWWPPW>W Get' +
+    'DIBits|G442:WPLPPW>W CreateDIBitmap|G443:WIIIIIIWWPPW>W SetDIBitsToDev' +
+    'ice|G444:IIIIII>W CreateRoundRectRgn|',
+    'G445:WW>W CreateDIBPatternBrush|G449:X>W DEVICECOLORMATCH|G450:WPPW>W ' +
+    'PolyPolygon|G451:PPWW>W CreatePolyPolygonRgn|G452:WWWW>L GdiSeeGdiDo|G' +
+    '460:X>W GDITASKTERMINATION|G461:WW>W SetObjectOwner|G462:W>W IsGDIObje' +
+    'ct|G463:WW>W MakeObjectPrivate|',
+    'G464:X>W FIXUPBOGUSPUBLISHERMET|G465:WP>W RectVisible|G466:WP>W RectIn' +
+    'Region|G467:X>W UNICODETOANSI|G468:WP>W GetBitmapDimensionEx|G469:WP>W' +
+    ' GetBrushOrgEx|G470:WP>W GetCurrentPositionEx|G471:WPIP>W GetTextExten' +
+    'tPoint|G472:WP>W GetViewportExtEx|',
+    'G473:WP>W GetViewportOrgEx|G474:WP>W GetWindowExtEx|G475:WP>W GetWindo' +
+    'wOrgEx|G476:WIIP>W OffsetViewportOrgEx|G477:WIIP>W OffsetWindowOrgEx|G' +
+    '478:WIIP>W SetBitmapDimensionEx|G479:WIIP>W SetViewportExtEx|G480:WIIP' +
+    '>W SetViewportOrgEx|',
+    'G481:WIIP>W SetWindowExtEx|G482:WIIP>W SetWindowOrgEx|G483:WIIP>W Move' +
+    'ToEx|G484:WIIIIP>W ScaleViewportExtEx|G485:WIIIIP>W ScaleWindowExtEx|G' +
+    '486:WP>W GetAspectRatioFilterEx|G489:WPWPLL>W CreateDIBSection|G490:X>' +
+    'W CloseEnhMetafile|G491:X>W CopyEnhMetafile|',
+    'G492:X>W CreateEnhMetafile|G493:X>W DeleteEnhMetafile|G495:X>W GDIComm' +
+    'ent|G496:X>W GetEnhMetafile|G497:X>W GetEnhMetafileBits|G498:X>W GetEn' +
+    'hMetafileDescript|G499:X>W GetEnhMetafileHeader|G501:X>W GetEnhMetafil' +
+    'ePaletteE|G502:WPW>W PolyBezier|',
+    'G503:WPW>W PolyBezierTo|G504:X>W PlayEnhMetafileRecord|G505:X>W SetEnh' +
+    'MetafileBits|G506:X>W SetMetaRgn|G508:WWW>W ExtSelectClipRgn|G511:W>W ' +
+    'AbortPath|G512:W>W BeginPath|G513:W>W CloseFigure|G514:W>W EndPath|G51' +
+    '5:W>W FillPath|G516:W>W FlattenPath|',
+    'G517:WPPW>W GetPath|G518:W>W PathToRegion|G519:WW>W SelectClipPath|G52' +
+    '0:W>W StrokeAndFillPath|G521:W>W StrokePath|G522:W>W WidenPath|G523:X>' +
+    'W ExtCreatePen|G524:W>W GetArcDirection|G525:WW>W SetArcDirection|G526' +
+    ':X>W GetMiterLimit|G527:X>W SetMiterLimit|',
+    'G528:X>W GDIParametersInfo|G529:W>W CreateHalftonePalette|G530:>W RawT' +
+    'extOut|G531:>W RawExtTextOut|G532:WPW>W RawGetTextExtent|G536:>W BiDiL' +
+    'ayout|G538:>W BiDiCreateTabString|G540:>W BiDiGlyphOut|G543:>W BiDiGet' +
+    'StringExtent|G555:>W BiDiDeleteString|',
+    'G556:>W BiDiSetDefaults|G558:>W BiDiGetDefaults|G560:>W BiDiShape|G561' +
+    ':>W BiDiFontComplement|G564:>W BiDiSetKashida|G565:>W BiDiKExtTextOut|' +
+    'G566:>W BiDiShapeEx|G569:>W BiDiCreateStringEx|G571:>W GetTextExtentRt' +
+    'oL|G572:>W GetHDCCharSet|',
+    'G573:>W BiDiLayoutEx|G602:WWWP>W SetDIBColorTable|G603:WWWP>W GetDIBCo' +
+    'lorTable|G604:WL>W SetSolidBrush|G605:W>W SysDeleteObject|G606:WLW>W S' +
+    'etMagicColors|G607:WLP>L GetRegionData|G608:X>W ExtCreateRegion|G609:L' +
+    '>W GdiFreeResources|',
+    'G610:LLLW>W GdiSignalProc32|G611:X>W GetRandomRgn|G612:W>W GetTextChar' +
+    'set|G613:WPSLL>W EnumFontFamiliesEx|G614:X>W AddLpkToGDI|G615:X>W GetC' +
+    'haracterPlacement|G616:W>L GetFontLanguageInfo|G650:X>W BuildInverseTa' +
+    'bleDIB|G701:X>W GDITHKCONNECTIONDATALS|',
+    'G702:X>W FT_GDIFTHKTHKCONNECTIO|G703:X>W FDTHKCONNECTIONDATASL|G704:X>' +
+    'W ICMTHKCONNECTIONDATASL|G820:X>W ICMCreateTransform|G821:X>W ICMDelet' +
+    'eTransform|G822:X>W ICMTranslateRGB|G823:X>W ICMTranslateRGBs|G824:X>W' +
+    ' ICMCheckColorsInGamut|B001:P>W Inquire|',
+    'B002:SP>W Enable|B003:>W Disable|B004:WWPPW>W ToAscii|B005:PP>W AnsiTo' +
+    'Oem|B006:PP>W OemToAnsi|B007:W>W SetSpeed|B009:X>W INQUIREEX|B010:X>W ' +
+    'TOASCIIEX|B011:X>W VKKEYSCANEX|B012:X>W MAPVIRTUALKEYEX|B013:X>W NEWTA' +
+    'BLEEX|B014:X>W __EXPORTEDSTUB|',
+    'B100:W>L ScreenSwitchEnable|B128:W>L OemKeyScan|B129:W>W VkKeyScan|B13' +
+    '0:W>W GetKeyboardType|B131:WW>W MapVirtualKey|B132:>W GetKBCodePage|B1' +
+    '33:LPW>W GetKeyNameText|B134:PPW>W AnsiToOemBuff|B135:PPW>W OemToAnsiB' +
+    'uff|L001:WW>L LZCopy|L002:PPW>W LZOpenFile|',
+    'L003:W>W LZInit|L004:WLW>L LZSeek|L005:WPW>W LZRead|L006:W>W LZClose|L' +
+    '007:>W LZStart|L008:WW>L CopyLZFile|L009:>W LZDone|L010:PP>W GetExpand' +
+    'edName|S001:LPP>L RegOpenKey|S002:LPP>L RegCreateKey|S003:L>L RegClose' +
+    'Key|S004:LP>L RegDeleteKey|',
+    'S005:LPLPL>L RegSetValue|S006:LPPP>L RegQueryValue|S007:LLPL>L RegEnum' +
+    'Key|S009:WW>W DragAcceptFiles|S011:WIPI>W DragQueryFile|S012:W>W DragF' +
+    'inish|S013:WP>W DragQueryPoint|S020:WPPPPI>W ShellExecute|S021:PPP>W F' +
+    'indExecutable|S022:WPPW>W ShellAbout|',
+    'S033:WWWL>W AboutDlgProc|S034:WPI>W ExtractIcon|S036:WPP>W ExtractAsso' +
+    'ciatedIcon|S037:PW>L DoEnvironmentSubst|S038:P>L FindEnvironmentString' +
+    '|S039:WPIW>W InternalExtractIcon|S040:PWPPW>W ExtractIconEx|S101:LWWWL' +
+    'W>L DllEntryPoint|',
+    'S102:WW>W RegisterShellHook|S103:WWL>L ShellHookProc|S157:X>W RESTARTD' +
+    'IALOG|S262:L>W DriveType|S401:X>W SHCHECKDRIVE|M001:WWWP>L WEP|M002:PW' +
+    '>L sndPlaySound|M003:PWL>L PlaySound|M004:LWWWLW>L DllEntryPoint|M005:' +
+    '>L mmsystemGetVersion|',
+    'M006:LWWLL>L DriverProc|M008:>L WMMMidiRunOnce|M030:P>W OutputDebugStr' +
+    '|M031:LWWWLLL>L DriverCallback|M032:>L StackEnter|M033:>L StackLeave|M' +
+    '034:X>W MMDRVINSTALL|M101:>L joyGetNumDevs|M102:WPW>L joyGetDevCaps|M1' +
+    '03:WP>L joyGetPos|M104:WP>L joyGetThreshold|',
+    'M105:W>L joyReleaseCapture|M106:WWWW>L joySetCapture|M107:WW>L joySetT' +
+    'hreshold|M109:W>L joySetCalibration|M110:WP>L joyGetPosEx|M111:X>W JOY' +
+    'CONFIGCHANGED|M201:>L midiOutGetNumDevs|M202:WPW>L midiOutGetDevCaps|M' +
+    '203:WPW>L midiOutGetErrorText|',
+    'M204:PWLLL>L midiOutOpen|M205:W>L midiOutClose|M206:WSW>L midiOutPrepa' +
+    'reHeader|M207:WSW>L midiOutUnprepareHeader|M208:WL>L midiOutShortMsg|M' +
+    '209:WSW>L midiOutLongMsg|M210:W>L midiOutReset|M211:WP>L midiOutGetVol' +
+    'ume|M212:WL>L midiOutSetVolume|',
+    'M213:WWPW>L midiOutCachePatches|M214:WWPW>L midiOutCacheDrumPatche|M21' +
+    '5:WP>L midiOutGetID|M216:WWLL>L midiOutMessage|M250:WPL>L midiStreamPr' +
+    'operty|M251:PPLLLL>L midiStreamOpen|M252:W>L midiStreamClose|M253:WPW>' +
+    'L midiStreamPosition|',
+    'M254:WPW>L midiStreamOut|M255:W>L midiStreamPause|M256:W>L midiStreamR' +
+    'estart|M257:W>L midiStreamStop|M301:>L midiInGetNumDevs|M302:WPW>L mid' +
+    'iInGetDevCaps|M303:WPW>L midiInGetErrorText|M304:PWLLL>L midiInOpen|M3' +
+    '05:W>L midiInClose|',
+    'M306:WSW>L midiInPrepareHeader|M307:WSW>L midiInUnprepareHeader|M308:W' +
+    'SW>L midiInAddBuffer|M309:W>L midiInStart|M310:W>L midiInStop|M311:W>L' +
+    ' midiInReset|M312:WP>L midiInGetID|M313:WWLL>L midiInMessage|M350:>L a' +
+    'uxGetNumDevs|M351:WPW>L auxGetDevCaps|',
+    'M352:WP>L auxGetVolume|M353:WL>L auxSetVolume|M354:WWLL>L auxOutMessag' +
+    'e|M401:>L waveOutGetNumDevs|M402:WPW>L waveOutGetDevCaps|M403:WPW>L wa' +
+    'veOutGetErrorText|M404:PWPLLL>L waveOutOpen|M405:W>L waveOutClose|M406' +
+    ':WSW>L waveOutPrepareHeader|',
+    'M407:WSW>L waveOutUnprepareHeader|M408:WSW>L waveOutWrite|M409:W>L wav' +
+    'eOutPause|M410:W>L waveOutRestart|M411:W>L waveOutReset|M412:WPW>L wav' +
+    'eOutGetPosition|M413:WP>L waveOutGetPitch|M414:WL>L waveOutSetPitch|M4' +
+    '15:WP>L waveOutGetVolume|',
+    'M416:WL>L waveOutSetVolume|M417:WP>L waveOutGetPlaybackRate|M418:WL>L ' +
+    'waveOutSetPlaybackRate|M419:W>L waveOutBreakLoop|M420:WP>L waveOutGetI' +
+    'D|M421:WWLL>L waveOutMessage|M501:>L waveInGetNumDevs|M502:WPW>L waveI' +
+    'nGetDevCaps|M503:WPW>L waveInGetErrorText|',
+    'M504:PWPLLL>L waveInOpen|M505:W>L waveInClose|M506:WSW>L waveInPrepare' +
+    'Header|M507:WSW>L waveInUnprepareHeader|M508:WSW>L waveInAddBuffer|M50' +
+    '9:W>L waveInStart|M510:W>L waveInStop|M511:W>L waveInReset|M512:WPW>L ' +
+    'waveInGetPosition|M513:WP>L waveInGetID|',
+    'M514:WWLL>L waveInMessage|M601:PW>L timeGetSystemTime|M602:WWSLW>L tim' +
+    'eSetEvent|M603:W>L timeKillEvent|M604:PW>L timeGetDevCaps|M605:W>L tim' +
+    'eBeginPeriod|M606:W>L timeEndPeriod|M607:>L timeGetTime|M701:WWLL>L mc' +
+    'iSendCommand|M702:PPWW>L mciSendString|',
+    'M703:P>L mciGetDeviceID|M705:WPW>L mciLoadCommandResource|M706:LPW>L m' +
+    'ciGetErrorString|M707:WL>L mciSetDriverData|M708:W>L mciGetDriverData|' +
+    'M710:W>L mciDriverYield|M711:WWW>L mciDriverNotify|M712:P>L mciExecute' +
+    '|M713:W>L mciFreeCommandResource|',
+    'M714:WPL>L mciSetYieldProc|M715:LP>L mciGetDeviceIDFromElem|M716:WP>L ' +
+    'mciGetYieldProc|M717:W>L mciGetCreatorTask|M800:>L mixerGetNumDevs|M80' +
+    '1:WPW>L mixerGetDevCaps|M802:PWLLL>L mixerOpen|M803:W>L mixerClose|M80' +
+    '4:WWLL>L mixerMessage|',
+    'M805:WPL>L mixerGetLineInfo|M806:WPL>L mixerGetID|M807:WPL>L mixerGetL' +
+    'ineControls|M808:WPL>L mixerGetControlDetails|M809:WPL>L mixerSetContr' +
+    'olDetails|M900:LPL>L mmTaskCreate|M902:W>L mmTaskBlock|M903:W>L mmTask' +
+    'Signal|M904:>W mmGetCurrentTask|',
+    'M905:>L mmTaskYield|E001:R>R __fpMath|E003:PW>W __WinEm87Info|E004:PW>' +
+    'W __WinEm87Restore|E005:PW>W __WinEm87Save|V002:PPPP>L GetFileResource' +
+    'Size|V003:PPPLLP>L GetFileResource|V006:PP>L GetFileVersionInfoSize|V0' +
+    '07:PLLP>L GetFileVersionInfo|',
+    'V008:WPPPPPPP>L VerFindFile|V009:WPPPPPPP>L VerInstallFile|V010:WPW>L ' +
+    'VerLanguageName|V011:SPPP>L VerQueryValue|V020:X>W GETFILEVERSIONINFOR' +
+    'AW|C001:S>W GetOpenFileName|C002:S>W GetSaveFileName|C005:P>W ChooseCo' +
+    'lor|C006:WWWL>L FileOpenDlgProc|',
+    'C007:WWWL>L FileSaveDlgProc|C008:WWWL>L ColorDlgProc|C011:S>W FindText' +
+    '|C012:S>W ReplaceText|C013:WWWL>L FindTextDlgProc|C014:WWWL>L ReplaceT' +
+    'extDlgProc|C015:P>W ChooseFont|C016:WWWL>W FormatCharDlgProc|C018:PPWL' +
+    '>W FontStyleEnumProc|',
+    'C019:PPWL>W FontFamilyEnumProc|C020:P>W PrintDlg|C021:WWWL>L PrintDlgP' +
+    'roc|C022:WWWL>L PrintSetupDlgProc|C026:>L CommDlgExtendedError|C027:PP' +
+    'W>W GetFileTitle|T050:W>W GlobalHandleToSel|T051:PW>W GlobalFirst|T052' +
+    ':PW>W GlobalNext|T053:P>W GlobalInfo|',
+    'T054:PW>W GlobalEntryHandle|T055:PWW>W GlobalEntryModule|T056:PW>W Loc' +
+    'alInfo|T057:PW>W LocalFirst|T058:P>W LocalNext|T059:P>W ModuleFirst|T0' +
+    '60:P>W ModuleNext|T061:PP>W ModuleFindName|T062:PW>W ModuleFindHandle|' +
+    'T063:P>W TaskFirst|T064:P>W TaskNext|',
+    'T065:PW>W TaskFindHandle|T066:PW>W StackTraceFirst|T067:PWWWW>W StackT' +
+    'raceCSIPFirst|T068:P>W StackTraceNext|T069:X>W ClassFirst|T070:X>W Cla' +
+    'ssNext|T071:P>W SystemHeapInfo|T072:P>W MemManInfo|T073:WSW>W NotifyRe' +
+    'gister|T074:W>W NotifyUnregister|',
+    'T075:WS>W InterruptRegister|T076:W>W InterruptUnRegister|T077:WW>W Ter' +
+    'minateApp|T078:WLPL>L MemoryRead|T079:WLPL>L MemoryWrite|T080:P>W Time' +
+    'rCount|T081:X>W TASKSETCSIP|T082:X>W TASKGETCSIP|T083:X>W TASKSWITCH|T' +
+    '084:PW>W Local32Info|T085:PW>W Local32First|',
+    'T086:P>W Local32Next|Y001:WW>L InquireSystem|Y002:WS>W CreateSystemTim' +
+    'er|Y003:W>W KillSystemTimer|Y004:>W EnableSystemTimers|Y005:>W Disable' +
+    'SystemTimers|Y006:>L GetSystemMSecCount|Y007:>W Get80x87SaveSize|Y008:' +
+    'P>W Save80x87State|',
+    'Y009:P>W Restore80x87State|Y013:X>W INQUIRELONGINTS|Y020:W>W A20_Proc|' +
+    'D001:X>W BitBlt|D002:X>W ColorInfo|D003:X>W Control|D004:X>W Disable|D' +
+    '005:X>W Enable|D006:X>W EnumFonts|D007:X>W EnumObj|D008:X>W Output|D00' +
+    '9:X>W Pixel|D010:X>W RealizeObject|',
+    'D011:X>W StrBlt|D012:X>W ScanLR|D013:X>W DeviceMode|D014:X>W ExtTextOu' +
+    't|D015:X>W GetCharWidth|D016:X>W DeviceBitmap|D017:X>W FastBorder|D018' +
+    ':X>W SetAttribute|D019:X>W DeviceBitmapBits|D020:X>W CreateBitmap|D021' +
+    ':X>W DIBScreenBlt|D022:X>W SetPalette|',
+    'D023:X>W GetPalette|D024:X>W SetPaletteTranslate|D025:X>W GetPaletteTr' +
+    'anslate|D026:X>W UpdateColors|D027:X>W StretchBlt|D028:X>W StretchDIBi' +
+    'ts|D029:X>W SelectBitmap|D030:X>W BitmapBits|D031:X>W ReEnable|D039:X>' +
+    'W DIBBlt|D040:X>W CreateDIBitmap|',
+    'D041:X>W DIBToDevice|D090:X>W Do_Polylines|D091:X>W Do_Scanlines|D092:' +
+    'X>W SaveScreenBitmap|D101:P>W Inquire|D102:P>W SetCursor|D103:WW>W Mov' +
+    'eCursor|D104:>W CheckCursor|D400:X>W PExtTextOut|D401:X>W PStrBlt|D402' +
+    ':X>W RExtTextOut|D403:X>W RStrBlt|',
+    'D450:WP>L GetDriverResourceID|D500:W>W UserRepaintDisable|D501:X>W ORD' +
+    'INAL_ONLY1|D502:X>W ORDINAL_ONLY2|D600:X>W InkReady|D601:X>W GetLPDevi' +
+    'ce|O001:>W OpenSound|O002:>W CloseSound|O003:WW>W SetVoiceQueueSize|O0' +
+    '04:WWWW>W SetVoiceNote|',
+    'O005:WWWWW>W SetVoiceAccent|O006:WWW>W SetVoiceEnvelope|O007:WW>W SetS' +
+    'oundNoise|O008:WLW>W SetVoiceSound|O009:>W StartSound|O010:>W StopSoun' +
+    'd|O011:W>W WaitSoundState|O012:>W SyncAllVoices|O013:W>W CountVoiceNot' +
+    'es|O014:>L GetThresholdEvent|',
+    'O015:>W GetThresholdStatus|O016:WW>W SetVoiceThreshold|O017:>W DoBeep|' +
+    'O018:X>W MYOPENSOUND|');
 
 { ==================================================================== }
 { Partie 14 - Sous-systeme Win16 : anneau 3, LDT, passerelles, memoire }
@@ -36908,10 +36432,42 @@ Var
   ArgRaw : Array[1..16] Of LongInt;
   ArgLin, ArgF, ArgIdx : LongInt;
 
+Var
+  W16ApiIx : LongInt;  { tas : (bloc Shl 16) Or (debut Shl 8) Or longueur }
+
+{ Index des entrees de W16ApiTxt }
+Procedure W16ApiIndex;
+Var B, P, Q, N, H : LongInt;
+Begin
+  H := HeapOwner; HeapOwner := 0;
+  W16ApiIx := KAlloc(W16ApiN * 4 + 16);
+  HeapOwner := H;
+  N := 0;
+  For B := 0 To W16ApiB - 1 Do
+  Begin
+    P := 1;
+    For Q := 1 To Length(W16ApiTxt[B]) Do
+      If W16ApiTxt[B][Q] = '|' Then
+      Begin
+        If N < W16ApiN Then
+          MemL[0:W16ApiIx + N * 4] := (B Shl 16) Or (P Shl 8) Or (Q - P);
+        Inc(N);
+        P := Q + 1;
+      End;
+  End;
+End;
+
+Function W16Apis(I : LongInt) : String;
+Var V : LongInt;
+Begin
+  V := MemL[0:W16ApiIx + I * 4];
+  W16Apis := Copy(W16ApiTxt[V Shr 16], (V Shr 8) And 255, V And 255);
+End;
+
 Function ApiSig(I : LongInt) : String;
 Var S : String; P : LongInt;
 Begin
-  S := W16Apis[I];
+  S := W16Apis(I);
   P := Pos(':', S);
   S := Copy(S, P + 1, 40);
   P := Pos('>', S);
@@ -36921,7 +36477,7 @@ End;
 Function ApiRet(I : LongInt) : Char;
 Var S : String; P : LongInt;
 Begin
-  S := W16Apis[I];
+  S := W16Apis(I);
   P := Pos('>', S);
   If P > 0 Then ApiRet := S[P + 1] Else ApiRet := 'W';
 End;
@@ -36929,7 +36485,7 @@ End;
 Function ApiName(I : LongInt) : String;
 Var S : String; P : LongInt;
 Begin
-  S := W16Apis[I];
+  S := W16Apis(I);
   P := Pos(' ', S);
   ApiName := Copy(S, P + 1, 40);
 End;
@@ -36952,9 +36508,10 @@ Procedure InitW16Apis;
 Var I, A, V : LongInt; S, Sg : String;
 Begin
   SysLetS := W16SysLet;
+  W16ApiIndex;
   For I := 0 To W16ApiN - 1 Do
   Begin
-    S := W16Apis[I];
+    S := W16Apis(I);
     ApiLet[I] := S[1];
     Val(Copy(S, 2, 3), ApiOrd[I], V);
     ApiEq[I] := -1;
@@ -41268,6 +40825,163 @@ Begin
   DD_RestoreDisplayMode := DD_OK;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Modes d'affichage (USER32) et formats de pixels (GDI32)            }
+{ ------------------------------------------------------------------ }
+
+{ DEVMODEA : dmSize 36, dmFields 40, dmBitsPerPel 104, dmPelsWidth 108,
+  dmPelsHeight 112, dmDisplayFrequency 120 }
+Procedure DevModeFill(P, W, H, B : LongInt);
+Var S : String;
+Begin
+  FillMem(P, 124, 0);
+  S := 'DISPLAY';
+  MoveMem(LongInt(@S[1]), P, Length(S));
+  MemW[0:P + 32] := $400;
+  MemW[0:P + 36] := 124;
+  MemL[0:P + 40] := $5C0000;
+  MemL[0:P + 104] := B;
+  MemL[0:P + 108] := W;
+  MemL[0:P + 112] := H;
+  MemL[0:P + 120] := 60;
+End;
+
+Function EnumDisplaySettingsA(Dev, N, P : LongInt) : LongInt;
+Var I, K, B, C : LongInt;
+Begin
+  EnumDisplaySettingsA := 0;
+  If P = 0 Then Exit;
+  If N < 0 Then
+  Begin
+    DevModeFill(P, ScrW, ScrH, DXDispBpp);
+    EnumDisplaySettingsA := 1;
+    Exit;
+  End;
+  C := 0;
+  For I := 0 To 3 Do
+  Begin
+    Case I Of
+      0 : B := 8;
+      1 : B := 16;
+      2 : B := 24;
+    Else
+      B := 32;
+    End;
+    For K := 0 To DXModeN - 1 Do
+      If DXModeOk(DXModeW[K], DXModeH[K], B) Then
+      Begin
+        If C = N Then
+        Begin
+          DevModeFill(P, DXModeW[K], DXModeH[K], B);
+          EnumDisplaySettingsA := 1;
+          Exit;
+        End;
+        Inc(C);
+      End;
+  End;
+End;
+
+Function EnumDisplaySettingsW(Dev, N, P : LongInt) : LongInt;
+Begin
+  EnumDisplaySettingsW := EnumDisplaySettingsA(0, N, P);
+End;
+
+{ DISP_CHANGE_SUCCESSFUL 0, DISP_CHANGE_BADMODE -2 }
+Function ChangeDisplaySettingsA(P, Fl : LongInt) : LongInt;
+Var W, H, B, F : LongInt;
+Begin
+  ChangeDisplaySettingsA := 0;
+  If P = 0 Then
+  Begin
+    If DXModeSet Then DD_RestoreDisplayMode(0);
+    DXModeSet := False;
+    Exit;
+  End;
+  F := MemL[0:P + 40];
+  W := ScrW; H := ScrH; B := DXDispBpp;
+  If (F And $40000) <> 0 Then B := MemL[0:P + 104];
+  If (F And $80000) <> 0 Then W := MemL[0:P + 108];
+  If (F And $100000) <> 0 Then H := MemL[0:P + 112];
+  KLog('ChangeDisplaySettings ' + IntStr(W) + 'x' + IntStr(H) + 'x' +
+       IntStr(B) + ' fl=' + HexStr(Fl, 4));
+  If B = 15 Then B := 16;
+  If Not DXModeOk(W, H, B) Then
+  Begin
+    ChangeDisplaySettingsA := -2;
+    Exit;
+  End;
+  { CDS_TEST : verifier seulement }
+  If (Fl And 2) <> 0 Then Exit;
+  If (W = ScrW) And (H = ScrH) And (B = DXDispBpp) Then Exit;
+  If CurProc > 0 Then DXProc := CurProc;
+  If DXSetMode(W, H, B) <> DD_OK Then ChangeDisplaySettingsA := -2;
+End;
+
+Function GetDeviceGammaRamp(Dc, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GetDeviceGammaRamp := 0;
+  If P = 0 Then Exit;
+  For I := 0 To 255 Do
+  Begin
+    MemW[0:P + I * 2] := I * 257;
+    MemW[0:P + 512 + I * 2] := I * 257;
+    MemW[0:P + 1024 + I * 2] := I * 257;
+  End;
+  GetDeviceGammaRamp := 1;
+End;
+
+Function SetDeviceGammaRamp(Dc, P : LongInt) : LongInt;
+Begin
+  SetDeviceGammaRamp := Ord(P <> 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ MSACM32 : pas de codec (ACMERR_NOTPOSSIBLE)                        }
+{ ------------------------------------------------------------------ }
+
+Function acmFormatSuggest(D, Src, Dst, N, Fl : LongInt) : LongInt;
+Begin
+  acmFormatSuggest := 512;
+End;
+
+Function acmStreamOpen(PH, D, Src, Dst, Flt, Cb, Inst, Fl : LongInt)
+  : LongInt;
+Begin
+  If PH <> 0 Then MemL[0:PH] := 0;
+  acmStreamOpen := 512;
+End;
+
+Function acmStreamClose(H, Fl : LongInt) : LongInt;
+Begin
+  acmStreamClose := 5;
+End;
+
+Function acmStreamSize(H, N, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamSize := 5;
+End;
+
+Function acmStreamPrepareHeader(H, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamPrepareHeader := 5;
+End;
+
+Function acmStreamUnprepareHeader(H, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamUnprepareHeader := 5;
+End;
+
+Function acmStreamConvert(H, P, Fl : LongInt) : LongInt;
+Begin
+  acmStreamConvert := 5;
+End;
+
+Function acmGetVersion : LongInt;
+Begin
+  acmGetVersion := $04000000;
+End;
+
 Function DD_FlipToGDISurface(T : LongInt) : LongInt;
 Begin
   DD_FlipToGDISurface := DD_OK;
@@ -45128,6 +44842,8 @@ Var
   NStage : LongInt;
   ClipL, ClipT, ClipR, ClipB : LongInt;
   D3DStats : LongInt;
+  GlScOn : Boolean;             { decoupe d'OpenGL (glScissor) }
+  GlScL, GlScT, GlScR, GlScB : LongInt;
 
 { Choisir le peripherique du coeur C }
 Function DevSel(C : LongInt) : Boolean;
@@ -46133,6 +45849,292 @@ Begin
   DRound := Round(D);
 End;
 
+{ ------------------------------------------------------------------ }
+{ Chemin rapide : segment de N points sans appel par point           }
+{ ------------------------------------------------------------------ }
+{ Cas courant (OpenGL et Direct3D a un etage) : cible 32 bits, une
+  texture (16 ou 32 bits) prise telle quelle ou multipliee par la
+  couleur diffuse, tests Z et alpha, brouillard et melange. D3DSetup
+  decide (FastOn) ; sinon D3DPixel point par point. }
+
+Var
+  FastOn : Boolean;
+  FastCol, FastAlp : LongInt;   { 0 diffuse, 1 texture, 2 tex x diffuse }
+  FastPow : Boolean;            { texture en puissances de 2, repetee }
+
+{ (A x B) / 255 exact pour A, B dans [0, 255] }
+Function M255(T : LongInt) : LongInt;
+Begin
+  T := T + 128;
+  M255 := (T + (T Shr 8)) Shr 8;
+End;
+
+{ facteur de melange F pour la composante C de la source (S) et de la
+  destination (D) ; SA, DA : alphas }
+Function FBl(F, S, D, SA, DA : LongInt) : LongInt;
+Begin
+  Case F Of
+    1 : FBl := 0;
+    2 : FBl := 255;
+    3 : FBl := S;
+    4 : FBl := 255 - S;
+    5 : FBl := SA;
+    6 : FBl := 255 - SA;
+    7 : FBl := DA;
+    8 : FBl := 255 - DA;
+    9 : FBl := D;
+    10 : FBl := 255 - D;
+    11 : If SA < 255 - DA Then FBl := SA Else FBl := 255 - DA;
+  Else
+    FBl := 255;
+  End;
+End;
+
+{ argument d'etage simple : 0 diffuse, 1 texture, 2 produit ; -1 sinon }
+Function FastArg(Op, A1, A2 : LongInt) : LongInt;
+Begin
+  FastArg := -1;
+  If (A1 And $30) <> 0 Then Exit;
+  If (Op = 4) And ((A2 And $30) <> 0) Then Exit;
+  A1 := A1 And 7; A2 := A2 And 7;
+  If A1 = 1 Then A1 := 0;
+  If A2 = 1 Then A2 := 0;
+  Case Op Of
+    2 :
+      If A1 = 0 Then FastArg := 0
+      Else If A1 = 2 Then FastArg := 1;
+    3 :
+      If A2 = 0 Then FastArg := 0
+      Else If A2 = 2 Then FastArg := 1;
+    4 :
+      If ((A1 = 2) And (A2 = 0)) Or ((A1 = 0) And (A2 = 2)) Then
+        FastArg := 2
+      Else If (A1 = 0) And (A2 = 0) Then FastArg := 0;
+  End;
+End;
+
+{ le chemin rapide convient-il a l'etat prepare par D3DSetup ? }
+Procedure FastDecide;
+Var K : LongInt;
+Begin
+  FastOn := False;
+  If (RKind <> 5) And (RKind <> 6) Then Exit;
+  If (D3G^.UseTSS = 0) Or (NStage > 1) Or TxOn[1] Or (RSpec <> 0) Then Exit;
+  If (RZOn <> 0) And (ZBy <> 2) And (ZBy <> 4) Then Exit;
+  If NStage = 0 Then
+  Begin
+    FastCol := 0; FastAlp := 0;
+  End
+  Else
+  Begin
+    FastCol := FastArg(TxCOp[0], TxCA1[0], TxCA2[0]);
+    If TxAOp[0] <= 1 Then FastAlp := 0
+    Else FastAlp := FastArg(TxAOp[0], TxAA1[0], TxAA2[0]);
+    If (FastCol < 0) Or (FastAlp < 0) Then Exit;
+  End;
+  If Not TxOn[0] Then
+  Begin
+    If (FastCol <> 0) Or (FastAlp <> 0) Then Exit;
+  End
+  Else
+  Begin
+    K := TxKind[0];
+    If (K <> 2) And (K <> 5) And (K <> 6) And (K <> 7) And (K <> 8) Then
+      Exit;
+    If (TxKeyOn[0] <> 0) And (RCKey <> 0) Then Exit;
+    FastPow := ((TxW[0] And (TxW[0] - 1)) = 0) And
+               ((TxH[0] And (TxH[0] - 1)) = 0) And
+               (TxAddrU[0] <= 1) And (TxAddrV[0] <= 1);
+  End;
+  FastOn := True;
+End;
+
+{ coordonnee de texel (16.16) -> indice (repetition ou bord) }
+Function FastTc(C, N, Md : LongInt) : LongInt;
+Var X : LongInt;
+Begin
+  If C >= 0 Then X := C Shr 16 Else X := -1 - ((-C - 1) Shr 16);
+  If (Md = 3) Or (Md = 4) Then
+  Begin
+    If X < 0 Then X := 0;
+    If X >= N Then X := N - 1;
+  End
+  Else
+  Begin
+    X := X Mod N;
+    If X < 0 Then X := X + N;
+  End;
+  FastTc := X;
+End;
+
+Procedure D3DSpan(X, Y, N, Z, DZ, CA, DCA, CR, DCR, CG, DCG, CB, DCB, FF,
+                  DFF, IU, DU, IV, DV : LongInt);
+Var K, RA, ZA, ZO, ZC, A, R, G, B, TA, TR, TG, TB, V, TX, TY, TBits,
+    TPit, TWm, THm, Kd, DR, DG, DB, DA, F, Fs, Fd : LongInt;
+    Ok : Boolean;
+Begin
+  RA := RBits + Y * RPitch + X * 4;
+  ZA := 0;
+  If RZOn <> 0 Then ZA := ZBits + Y * ZPitch + X * ZBy;
+  TBits := TxBits[0]; TPit := TxPitch[0]; TWm := TxW[0] - 1;
+  THm := TxH[0] - 1; Kd := TxKind[0];
+  TA := 255; TR := 255; TG := 255; TB := 255;
+  Fs := RSrc; Fd := RDst;
+  If (Fs = 12) Or (Fs = 13) Then
+  Begin
+    If Fs = 12 Then Fs := 5 Else Fs := 6;
+    Fd := 11 - Fs;
+  End;
+  For K := 1 To N Do
+  Begin
+    Ok := True;
+    ZC := Z;
+    If ZC < 0 Then ZC := 0;
+    If ZC > $FFFFFF Then ZC := $FFFFFF;
+    If RZOn <> 0 Then
+    Begin
+      If ZBy = 2 Then
+      Begin
+        ZO := MemW[0:ZA]; ZC := ZC Shr 8;
+      End
+      Else ZO := MemL[0:ZA] And $FFFFFF;
+      Case RZFn Of
+        1 : Ok := False;
+        2 : Ok := ZC < ZO;
+        3 : Ok := ZC = ZO;
+        4 : Ok := ZC <= ZO;
+        5 : Ok := ZC > ZO;
+        6 : Ok := ZC <> ZO;
+        7 : Ok := ZC >= ZO;
+      End;
+    End;
+    If Ok Then
+    Begin
+      A := CA Div 65536; R := CR Div 65536; G := CG Div 65536;
+      B := CB Div 65536;
+      If A < 0 Then A := 0 Else If A > 255 Then A := 255;
+      If R < 0 Then R := 0 Else If R > 255 Then R := 255;
+      If G < 0 Then G := 0 Else If G > 255 Then G := 255;
+      If B < 0 Then B := 0 Else If B > 255 Then B := 255;
+      If (FastCol <> 0) Or (FastAlp <> 0) Then
+      Begin
+        If FastPow Then
+        Begin
+          TX := (IU Shr 16) And TWm; TY := (IV Shr 16) And THm;
+        End
+        Else
+        Begin
+          TX := FastTc(IU, TWm + 1, TxAddrU[0]);
+          TY := FastTc(IV, THm + 1, TxAddrV[0]);
+        End;
+        Case Kd Of
+          2 :
+          Begin
+            V := MemW[0:TBits + TY * TPit + TX * 2];
+            TR := (V Shr 11) And 31; TG := (V Shr 5) And 63; TB := V And 31;
+            TR := (TR Shl 3) Or (TR Shr 2); TG := (TG Shl 2) Or (TG Shr 4);
+            TB := (TB Shl 3) Or (TB Shr 2); TA := 255;
+          End;
+          7 :
+          Begin
+            V := MemW[0:TBits + TY * TPit + TX * 2];
+            TR := (V Shr 10) And 31; TG := (V Shr 5) And 31; TB := V And 31;
+            TR := (TR Shl 3) Or (TR Shr 2); TG := (TG Shl 3) Or (TG Shr 2);
+            TB := (TB Shl 3) Or (TB Shr 2);
+            If (V And $8000) <> 0 Then TA := 255 Else TA := 0;
+          End;
+          8 :
+          Begin
+            V := MemW[0:TBits + TY * TPit + TX * 2];
+            TA := ((V Shr 12) And 15) * 17; TR := ((V Shr 8) And 15) * 17;
+            TG := ((V Shr 4) And 15) * 17; TB := (V And 15) * 17;
+          End;
+        Else
+          Begin
+            V := MemL[0:TBits + TY * TPit + TX * 4];
+            TR := (V Shr 16) And 255; TG := (V Shr 8) And 255; TB := V And 255;
+            If Kd = 6 Then TA := (V Shr 24) And 255 Else TA := 255;
+          End;
+        End;
+        If FastCol = 1 Then
+        Begin
+          R := TR; G := TG; B := TB;
+        End
+        Else If FastCol = 2 Then
+        Begin
+          R := M255(R * TR); G := M255(G * TG); B := M255(B * TB);
+        End;
+        If FastAlp = 1 Then A := TA
+        Else If FastAlp = 2 Then A := M255(A * TA);
+      End;
+      If RATst <> 0 Then
+        Case RAFn Of
+          1 : Ok := False;
+          2 : Ok := A < RARef;
+          3 : Ok := A = RARef;
+          4 : Ok := A <= RARef;
+          5 : Ok := A > RARef;
+          6 : Ok := A <> RARef;
+          7 : Ok := A >= RARef;
+        End;
+      If Ok Then
+      Begin
+        If RFogOn <> 0 Then
+        Begin
+          F := FF Div 65536;
+          If F < 0 Then F := 0;
+          If F < 255 Then
+          Begin
+            R := M255(R * F + ((RFogC Shr 16) And 255) * (255 - F));
+            G := M255(G * F + ((RFogC Shr 8) And 255) * (255 - F));
+            B := M255(B * F + (RFogC And 255) * (255 - F));
+          End;
+        End;
+        If RABl <> 0 Then
+        Begin
+          V := MemL[0:RA];
+          DR := (V Shr 16) And 255; DG := (V Shr 8) And 255; DB := V And 255;
+          If RKind = 6 Then DA := (V Shr 24) And 255 Else DA := 255;
+          If (Fs = 5) And (Fd = 6) Then
+          Begin
+            R := M255(R * A + DR * (255 - A));
+            G := M255(G * A + DG * (255 - A));
+            B := M255(B * A + DB * (255 - A));
+          End
+          Else If (Fs = 2) And (Fd = 2) Then
+          Begin
+            R := R + DR; G := G + DG; B := B + DB;
+          End
+          Else
+          Begin
+            R := M255(R * FBl(Fs, R, DR, A, DA) + DR * FBl(Fd, R, DR, A, DA));
+            G := M255(G * FBl(Fs, G, DG, A, DA) + DG * FBl(Fd, G, DG, A, DA));
+            B := M255(B * FBl(Fs, B, DB, A, DA) + DB * FBl(Fd, B, DB, A, DA));
+            A := M255(A * FBl(Fs, A, DA, A, DA) + DA * FBl(Fd, A, DA, A, DA));
+          End;
+          If R > 255 Then R := 255;
+          If G > 255 Then G := 255;
+          If B > 255 Then B := 255;
+          If A > 255 Then A := 255;
+        End;
+        If RKind = 6 Then
+          MemL[0:RA] := (A Shl 24) Or (R Shl 16) Or (G Shl 8) Or B
+        Else MemL[0:RA] := (R Shl 16) Or (G Shl 8) Or B;
+        If (RZOn <> 0) And (RZWr <> 0) Then
+        Begin
+          If ZBy = 2 Then MemW[0:ZA] := ZC
+          Else MemL[0:ZA] := (MemL[0:ZA] And LongInt($FF000000)) Or ZC;
+        End;
+      End;
+    End;
+    RA := RA + 4;
+    If RZOn <> 0 Then ZA := ZA + ZBy;
+    Z := Z + DZ;
+    CA := CA + DCA; CR := CR + DCR; CG := CG + DCG; CB := CB + DCB;
+    FF := FF + DFF; IU := IU + DU; IV := IV + DV;
+  End;
+End;
+
 Procedure D3DLine(Var P, Q : TVtx); Forward;
 Procedure D3DPoint(Var P : TVtx); Forward;
 
@@ -46197,11 +46199,14 @@ Begin
         Begin YA := Y2; T := X2; W := Y0; U := X0; End;
       End;
       If YA = W Then Continue;
-      If YA < W Then
+      { arete calculee depuis son sommet haut : la meme valeur pour les
+        deux triangles qui la partagent (ni trou ni recouvrement) }
+      If YA > W Then
       Begin
-        If (Y < YA) Or (Y >= W) Then Continue;
-      End
-      Else If (Y < W) Or (Y >= YA) Then Continue;
+        V := YA; YA := W; W := V;
+        V := T; T := U; U := V;
+      End;
+      If (Y < YA) Or (Y >= W) Then Continue;
       V := T + (Y - YA) * (U - T) / (W - YA);
       If V < XL Then XL := V;
       If V > XR Then XR := V;
@@ -46257,6 +46262,17 @@ Begin
           DV3 := (DRound(VE3 * TxH[1] * 65536 - 32768) - IV2) Div N;
         End;
       End;
+      If FastOn Then
+      Begin
+        D3DSpan(X, Y, N, Z, DZ, CA, DCA, CR, DCR, CG, DCG, CB, DCB, FF, DFF,
+                IU, DU, IV, DV2);
+        Z := Z + DZ * N;
+        CA := CA + DCA * N; CR := CR + DCR * N; CG := CG + DCG * N;
+        CB := CB + DCB * N; SR := SR + DSR * N; SG := SG + DSG * N;
+        SB := SB + DSB * N; FF := FF + DFF * N;
+        X := X + N;
+      End
+      Else
       For K := 0 To N - 1 Do
       Begin
         Dif := (Clamp8(CA Div 65536) Shl 24) Or (Clamp8(CR Div 65536) Shl 16)
@@ -46389,6 +46405,11 @@ Begin
   RW := MemL[0:RTs + 64]; RH := MemL[0:RTs + 68];
   ClipL := Max(0, D3G^.VX); ClipT := Max(0, D3G^.VY);
   ClipR := Min(RW, D3G^.VX + D3G^.VW); ClipB := Min(RH, D3G^.VY + D3G^.VH);
+  If GlScOn Then
+  Begin
+    ClipL := Max(ClipL, GlScL); ClipT := Max(ClipT, GlScT);
+    ClipR := Min(ClipR, GlScR); ClipB := Min(ClipB, GlScB);
+  End;
   Z := D3G^.ZB;
   If Z = 0 Then Z := MemL[0:RTs + 120];
   RZOn := 0;
@@ -46466,6 +46487,7 @@ Begin
   Begin
     TxW[1] := 1; TxH[1] := 1;
   End;
+  FastDecide;
   D3DSetup := (ClipL < ClipR) And (ClipT < ClipB);
 End;
 
@@ -46654,6 +46676,4782 @@ Begin
   End;
   If (D3G^.RT = DXPrim) And DXOn Then DXTouch(0, DXH, False);
 End;
+
+{ ------------------------------------------------------------------ }
+{ OpenGL 1.1 logiciel (OPENGL32.DLL) sur le moteur de Direct3D       }
+{ ------------------------------------------------------------------ }
+{ Un contexte (wglCreateContext) possede un etat TD3D, un tampon de
+  couleur 32 bits (XRGB) et un tampon Z de 24 bits a la taille de la
+  zone client de la fenetre. Les sommets (glBegin/glEnd, tableaux de
+  sommets) sont transformes ici (matrices GL, en colonnes : la meme
+  memoire que les matrices "lignes" de Direct3D), eclaires par
+  D3DLight, puis passes en coordonnees de decoupage a D3DPrims qui
+  decoupe, projette et rasterise. La profondeur GL [-w, w] est ramenee
+  a [0, w]. SwapBuffers copie le tampon dans la fenetre. Les textures
+  sont des surfaces internes (32 bits ARGB ou 16 bits selon le format
+  interne demande), sans mipmaps (niveau 0 seulement). }
+
+Const
+  GlMaxTex = 4096;              { noms de textures }
+  GlTexSz = 48;                 { +0 utilise, +4 surface, +8 L, +12 H,
+                                  +16 enveloppe S, +20 T, +24 format,
+                                  +28 alpha }
+  GL_TEXTURE_2D = $0DE1;
+
+Type
+  TGLLt = Record
+    Amb, Dif, Spe, Pos : Array[0..3] Of Double;
+    SDir : Array[0..2] Of Double;
+    SExp, SCut, A0, A1, A2 : Double;
+  End;
+  { etat sauvegarde par glPushAttrib (en bloc) }
+  TGLA = Record
+    TexOn : Array[0..1] Of LongInt;
+    DepOn, DepFn, DepMsk, BlOn, BlSrc, BlDst, AlOn, AlFn : LongInt;
+    AlRef : Double;
+    CullOn, CullMd, Front, Shade, PolyMd : LongInt;
+    ScOn, ScX, ScY, ScW, ScH, VpX, VpY, VpW, VpH : LongInt;
+    DNear, DFar : Double;
+    FogOn, FogMd : LongInt;
+    FogS, FogE, FogD : Double;
+    FogC : Array[0..3] Of Double;
+    LitOn, CmOn, CmMode, NormOn : LongInt;
+    LtOn : Array[0..7] Of LongInt;
+    Lt : Array[0..7] Of TGLLt;
+    MAmb, MDif, MSpe, MEmi, LMAmb : Array[0..3] Of Double;
+    MShin : Double;
+    Env : Array[0..1] Of LongInt;
+    EnvC : Array[0..3] Of Double;
+    Bound : Array[0..1] Of LongInt;
+    ActTex : LongInt;
+    ClrC : Array[0..3] Of Double;
+    ClrZ : Double;
+    POfOn : LongInt;
+    POfF, POfU : Double;
+    TgOn, TgMd : Array[0..3] Of LongInt;
+    TgOP, TgEP : Array[0..15] Of Double;
+    Col : Array[0..3] Of Double;
+    Nrm : Array[0..2] Of Double;
+    Tc0, Tc1 : Array[0..3] Of Double;
+    PtSz, LnW : Double;
+    DitOn, CMask : LongInt;
+  End;
+  { etat client (tableaux de sommets, stockage des pixels) }
+  TGLCA = Record
+    AOn, ASz, ATy, ASt, APt : Array[0..5] Of LongInt;
+    CliTex, UnpA, UnpRL, PackA : LongInt;
+  End;
+  TGLC = Record
+    S : TGLA;
+    AStk : Array[0..7] Of TGLA;
+    ASp : LongInt;
+    CA : TGLCA;
+    CStk : Array[0..3] Of TGLCA;
+    CSp : LongInt;
+    D3, Wnd, Dc, BW, BH, RT, ZB : LongInt;
+    MMode, MVTop, PRTop, TXTop : LongInt;
+    MV : Array[0..31] Of TMat;
+    PR : Array[0..3] Of TMat;
+    TX : Array[0..3] Of TMat;
+    MVP, PZ : TMat;
+    MOk, TxId : Boolean;
+    Err, Prim, InBeg, Made : LongInt;
+    RPos : Array[0..3] Of Double;
+  End;
+  PGLC = ^TGLC;
+  T4D = Array[0..3] Of Double;
+  T4L = Array[0..3] Of LongInt;
+
+Var
+  Gc : PGLC;                    { contexte courant (nil : aucun) }
+  GcA : LongInt;                { son adresse }
+  GlProc : LongInt;             { processus qui utilise OpenGL }
+  GlCtx : Array[0..15] Of LongInt;
+  GV : PVtxArr;                 { sommets de la primitive en cours }
+  GVCap, GVN : LongInt;
+  GIx, GIxCap : LongInt;        { indices des primitives (32 bits) }
+  GSq, GSqCap : LongInt;        { suite des sommets (glDrawElements) }
+  GlTexT : LongInt;             { table des textures (GlMaxTex x 48) }
+  GlStrs : Array[0..3] Of LongInt;
+  GlTodoS : String;
+
+Var
+  GlRing : Array[0..63] Of LongInt;   { derniers appels (numeros) }
+  GlRingP : LongInt;
+
+Var
+  GlTop0, GlTopBad : LongInt;
+
+{ appel numero N ; la pile du coprocesseur doit etre vide aux appels
+  (sommet inchange depuis l'appel precedent) }
+Procedure GlTr(N : LongInt);
+Var S : LongInt;
+Begin
+  asm
+    xor eax,eax
+    fnstsw ax
+    mov S,eax
+  end;
+  S := (S Shr 11) And 7;
+  If GlRingP = 0 Then GlTop0 := S
+  Else If (S <> GlTop0) And (GlTopBad < 8) Then
+  Begin
+    Inc(GlTopBad);
+    KLog('OpenGL : pile FPU ' + IntStr(GlTop0) + ' -> ' + IntStr(S) +
+         ' avant l''appel ' + IntStr(N) + ', apres ' +
+         IntStr(GlRing[(GlRingP - 1) And 63]));
+    GlTop0 := S;
+  End;
+  GlRing[GlRingP And 63] := N;
+  Inc(GlRingP);
+End;
+
+Procedure GlDumpRing;
+Var I : LongInt; S : String;
+Begin
+  If GlRingP = 0 Then Exit;
+  S := 'OpenGL : derniers appels';
+  For I := Max(0, GlRingP - 24) To GlRingP - 1 Do
+    S := S + ' ' + IntStr(GlRing[I And 63]);
+  KLog(S);
+End;
+
+Function DblOf(Lo, Hi : LongInt) : Double;
+Var D : Double;
+Begin
+  MemL[0:LongInt(@D)] := Lo;
+  MemL[0:LongInt(@D) + 4] := Hi;
+  DblOf := D;
+End;
+
+Function DbM(A : LongInt) : Double;
+Begin
+  DbM := DblOf(MemL[0:A], MemL[0:A + 4]);
+End;
+
+Procedure DbPut(A : LongInt; D : Double);
+Begin
+  MemL[0:A] := MemL[0:LongInt(@D)];
+  MemL[0:A + 4] := MemL[0:LongInt(@D) + 4];
+End;
+
+Function Cl01(D : Double) : Double;
+Begin
+  If D < 0 Then D := 0;
+  If D > 1 Then D := 1;
+  Cl01 := D;
+End;
+
+{ couleur (0..1) -> ARGB }
+Function GlArgb(R, G, B, A : Double) : LongInt;
+Begin
+  GlArgb := (DRound(Cl01(A) * 255) Shl 24) Or
+            (DRound(Cl01(R) * 255) Shl 16) Or
+            (DRound(Cl01(G) * 255) Shl 8) Or DRound(Cl01(B) * 255);
+End;
+
+Procedure GlErr(E : LongInt);
+Begin
+  If (GcA <> 0) And (Gc^.Err = 0) Then Gc^.Err := E;
+End;
+
+{ fonction non realisee : signalee une fois dans le journal }
+Procedure GlTodo(Nm : String);
+Begin
+  If Pos(' ' + Nm + ' ', GlTodoS) > 0 Then Exit;
+  If Length(GlTodoS) + Length(Nm) < 240 Then
+    GlTodoS := GlTodoS + Nm + ' ';
+  KLog('OpenGL : ' + Nm + ' non realise');
+End;
+
+{ ------------------------------------------------------------------ }
+{ Surfaces internes (memes champs que les surfaces DirectDraw)       }
+{ ------------------------------------------------------------------ }
+
+Function GlSurf(W, H, Bpp, RM, GM, BM, AM : LongInt) : LongInt;
+Var S, P : LongInt;
+Begin
+  GlSurf := 0;
+  If W < 1 Then W := 1;
+  If H < 1 Then H := 1;
+  S := KAlloc(300);
+  If S = 0 Then Exit;
+  FillMem(S, 300, 0);
+  P := ((W * ((Bpp + 7) Div 8)) + 3) And Not 3;
+  MemL[0:S + 64] := W; MemL[0:S + 68] := H; MemL[0:S + 72] := P;
+  MemL[0:S + 76] := KAlloc(P * H + 16);
+  If MemL[0:S + 76] = 0 Then
+  Begin
+    KFree(S);
+    Exit;
+  End;
+  FillMem(MemL[0:S + 76], P * H, 0);
+  MemL[0:S + 88] := Bpp; MemL[0:S + 92] := $40;
+  If AM <> 0 Then MemL[0:S + 92] := $41;
+  MemL[0:S + 96] := RM; MemL[0:S + 100] := GM; MemL[0:S + 104] := BM;
+  MemL[0:S + 108] := AM;
+  SfInfo(S);
+  GlSurf := S;
+End;
+
+Procedure GlSurfFree(S : LongInt);
+Begin
+  If S = 0 Then Exit;
+  If MemL[0:S + 76] <> 0 Then KFree(MemL[0:S + 76]);
+  KFree(S);
+End;
+
+{ tampons du contexte a la taille de la zone client }
+Procedure GlBuffers;
+Var R : Array[0..3] Of LongInt; W, H : LongInt;
+Begin
+  W := 0; H := 0;
+  If Gc^.Wnd <> 0 Then
+  Begin
+    GetClientRect(Gc^.Wnd, LongInt(@R));
+    W := R[2] - R[0]; H := R[3] - R[1];
+  End;
+  If (W <= 0) Or (H <= 0) Then
+  Begin
+    W := ScrW; H := ScrH;
+  End;
+  If (Gc^.RT <> 0) And (W = Gc^.BW) And (H = Gc^.BH) Then Exit;
+  GlSurfFree(Gc^.RT); GlSurfFree(Gc^.ZB);
+  Gc^.RT := GlSurf(W, H, 32, $FF0000, $FF00, $FF, 0);
+  Gc^.ZB := GlSurf(W, H, 32, 0, 0, 0, 0);
+  If Gc^.ZB <> 0 Then
+  Begin
+    MemL[0:Gc^.ZB + 92] := $400;
+    FillMem(MemL[0:Gc^.ZB + 76], MemL[0:Gc^.ZB + 72] * H, -1);
+  End;
+  Gc^.BW := W; Gc^.BH := H;
+  Move(Gc^.D3, D3G, 4);
+  D3G^.RT := Gc^.RT; D3G^.ZB := Gc^.ZB;
+  KLog('OpenGL : tampons ' + IntStr(W) + 'x' + IntStr(H));
+End;
+
+{ ------------------------------------------------------------------ }
+{ Matrices                                                           }
+{ ------------------------------------------------------------------ }
+
+{ matrice courante (selon glMatrixMode) : adresse }
+Function GlCurM : LongInt;
+Begin
+  Case Gc^.MMode Of
+    $1701 : GlCurM := LongInt(@Gc^.PR[Gc^.PRTop]);
+    $1702 : GlCurM := LongInt(@Gc^.TX[Gc^.TXTop]);
+  Else
+    GlCurM := LongInt(@Gc^.MV[Gc^.MVTop]);
+  End;
+End;
+
+Procedure GlMChanged;
+Begin
+  Gc^.MOk := False;
+End;
+
+{ courante := M x courante (ordre de Direct3D : M appliquee d'abord) }
+Procedure GlMulM(Var M : TMat);
+Var C : TMat; A : LongInt;
+Begin
+  A := GlCurM;
+  MoveMem(A, LongInt(@C), SizeOf(TMat));
+  MatMul(C, M, C);
+  MoveMem(LongInt(@C), A, SizeOf(TMat));
+  GlMChanged;
+End;
+
+Procedure GlLoadM(Var M : TMat);
+Begin
+  MoveMem(LongInt(@M), GlCurM, SizeOf(TMat));
+  GlMChanged;
+End;
+
+Function MatIsId(Var M : TMat) : Boolean;
+Var I : LongInt; R : Boolean;
+Begin
+  R := True;
+  For I := 0 To 15 Do
+    If (I Mod 5 = 0) Then
+    Begin
+      If M[I] <> 1 Then R := False;
+    End
+    Else If M[I] <> 0 Then R := False;
+  MatIsId := R;
+End;
+
+{ MVP = MV x P x (z' = (z + w) / 2) }
+Procedure GlMats;
+Var Z : TMat;
+Begin
+  If Gc^.MOk Then Exit;
+  MatId(Z);
+  Z[10] := 0.5; Z[14] := 0.5;
+  MatMul(Gc^.PZ, Gc^.PR[Gc^.PRTop], Z);
+  MatMul(Gc^.MVP, Gc^.MV[Gc^.MVTop], Gc^.PZ);
+  Gc^.TxId := MatIsId(Gc^.TX[Gc^.TXTop]);
+  Gc^.MOk := True;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Etat -> Direct3D                                                   }
+{ ------------------------------------------------------------------ }
+
+Function GlCmp(F : LongInt) : LongInt;
+Begin
+  If (F >= $200) And (F <= $207) Then GlCmp := F - $200 + 1
+  Else GlCmp := 8;
+End;
+
+Function GlBlF(F : LongInt) : LongInt;
+Begin
+  Case F Of
+    0 : GlBlF := 1;
+    1 : GlBlF := 2;
+    $300..$308 : GlBlF := F - $300 + 3;
+  Else
+    GlBlF := 2;
+  End;
+End;
+
+Function GlTexEnt(N : LongInt) : LongInt;
+Begin
+  GlTexEnt := 0;
+  If (GlTexT = 0) Or (N < 0) Or (N >= GlMaxTex) Then Exit;
+  GlTexEnt := GlTexT + N * GlTexSz;
+End;
+
+{ etage K de Direct3D d'apres l'unite de texture K }
+Procedure GlStage(K : LongInt; On : Boolean);
+Var T, E, B, Al : LongInt;
+Begin
+  B := K * 32;
+  T := 0;
+  If On And (Gc^.S.TexOn[K] <> 0) Then
+  Begin
+    E := GlTexEnt(Gc^.S.Bound[K]);
+    If (E <> 0) And (MemL[0:E + 4] <> 0) Then T := MemL[0:E + 4];
+  End;
+  D3G^.Tex[K] := T;
+  If T = 0 Then
+  Begin
+    If K = 0 Then
+    Begin
+      D3G^.TS[B + tsCOp] := 2; D3G^.TS[B + tsCA1] := 0;
+      D3G^.TS[B + tsAOp] := 2; D3G^.TS[B + tsAA1] := 0;
+    End
+    Else
+    Begin
+      D3G^.TS[B + tsCOp] := 1; D3G^.TS[B + tsAOp] := 1;
+    End;
+    Exit;
+  End;
+  If K = 0 Then Al := 0 Else Al := 1;
+  E := GlTexEnt(Gc^.S.Bound[K]);
+  If MemL[0:E + 16] = $2901 Then D3G^.TS[B + tsAddrU] := 1
+  Else D3G^.TS[B + tsAddrU] := 3;
+  If MemL[0:E + 20] = $2901 Then D3G^.TS[B + tsAddrV] := 1
+  Else D3G^.TS[B + tsAddrV] := 3;
+  D3G^.TS[B + tsCA1] := 2; D3G^.TS[B + tsCA2] := Al;
+  D3G^.TS[B + tsAA1] := 2; D3G^.TS[B + tsAA2] := Al;
+  Case Gc^.S.Env[K] Of
+    $1E01 :
+    Begin
+      { REPLACE }
+      D3G^.TS[B + tsCOp] := 2;
+      If MemL[0:E + 28] <> 0 Then D3G^.TS[B + tsAOp] := 2
+      Else
+      Begin
+        D3G^.TS[B + tsAOp] := 2; D3G^.TS[B + tsAA1] := Al;
+      End;
+    End;
+    $2101 :
+    Begin
+      { DECAL : texture melangee selon son alpha }
+      D3G^.TS[B + tsCOp] := 13;
+      D3G^.TS[B + tsAOp] := 2; D3G^.TS[B + tsAA1] := Al;
+    End;
+    $0104 :
+    Begin
+      { ADD }
+      D3G^.TS[B + tsCOp] := 7; D3G^.TS[B + tsAOp] := 4;
+    End;
+  Else
+    Begin
+      { MODULATE (et BLEND, approche) }
+      D3G^.TS[B + tsCOp] := 4; D3G^.TS[B + tsAOp] := 4;
+    End;
+  End;
+End;
+
+{ lumieres et materiau GL -> Direct3D (positions deja dans l'oeil) }
+Procedure GlLights;
+Var I, K : LongInt; C : Double;
+Begin
+  For I := 0 To 15 Do D3G^.Lt[I].On := 0;
+  For I := 0 To 7 Do
+  Begin
+    If Gc^.S.LtOn[I] = 0 Then Continue;
+    D3G^.Lt[I].On := 1;
+    For K := 0 To 3 Do
+    Begin
+      D3G^.Lt[I].Dif[K] := Gc^.S.Lt[I].Dif[K];
+      D3G^.Lt[I].Spe[K] := Gc^.S.Lt[I].Spe[K];
+      D3G^.Lt[I].Amb[K] := Gc^.S.Lt[I].Amb[K];
+    End;
+    If Gc^.S.Lt[I].Pos[3] = 0 Then
+    Begin
+      D3G^.Lt[I].Typ := 3;
+      For K := 0 To 2 Do D3G^.Lt[I].Dir[K] := -Gc^.S.Lt[I].Pos[K];
+    End
+    Else
+    Begin
+      C := Gc^.S.Lt[I].Pos[3];
+      For K := 0 To 2 Do D3G^.Lt[I].Pos[K] := Gc^.S.Lt[I].Pos[K] / C;
+      D3G^.Lt[I].Typ := 1;
+      If Gc^.S.Lt[I].SCut < 180 Then
+      Begin
+        D3G^.Lt[I].Typ := 2;
+        For K := 0 To 2 Do D3G^.Lt[I].Dir[K] := Gc^.S.Lt[I].SDir[K];
+        D3G^.Lt[I].Ph := Gc^.S.Lt[I].SCut * 2 * 3.14159265358979 / 180;
+        D3G^.Lt[I].Th := D3G^.Lt[I].Ph * 0.8;
+      End;
+    End;
+    D3G^.Lt[I].A0 := Gc^.S.Lt[I].A0; D3G^.Lt[I].A1 := Gc^.S.Lt[I].A1;
+    D3G^.Lt[I].A2 := Gc^.S.Lt[I].A2;
+    D3G^.Lt[I].Rng := 0;
+  End;
+  For K := 0 To 3 Do
+  Begin
+    D3G^.Mt[K] := Gc^.S.MDif[K]; D3G^.Mt[4 + K] := Gc^.S.MAmb[K];
+    D3G^.Mt[8 + K] := Gc^.S.MSpe[K]; D3G^.Mt[12 + K] := Gc^.S.MEmi[K];
+  End;
+  D3G^.Mt[16] := Gc^.S.MShin;
+  D3G^.RS[rsAmbient] := GlArgb(Gc^.S.LMAmb[0], Gc^.S.LMAmb[1],
+                               Gc^.S.LMAmb[2], 1);
+  D3G^.RS[rsColorVtx] := Gc^.S.CmOn;
+  D3G^.RS[rsDifSrc] := 0; D3G^.RS[rsAmbSrc] := 0; D3G^.RS[rsSpcSrc] := 0;
+  If (Gc^.S.CmMode = $1201) Or (Gc^.S.CmMode = $1602) Then
+    D3G^.RS[rsDifSrc] := 1;
+  If (Gc^.S.CmMode = $1200) Or (Gc^.S.CmMode = $1602) Then
+    D3G^.RS[rsAmbSrc] := 1;
+  MatId(D3G^.Viw);
+  D3DLightsView;
+End;
+
+{ choisir le peripherique du contexte et lui donner l'etat GL }
+Procedure GlSync;
+Var C : LongInt;
+Begin
+  Move(Gc^.D3, D3G, 4);
+  D3G^.RT := Gc^.RT; D3G^.ZB := Gc^.ZB;
+  D3G^.UseTSS := 1;
+  D3G^.VX := Gc^.S.VpX; D3G^.VY := Gc^.BH - (Gc^.S.VpY + Gc^.S.VpH);
+  D3G^.VW := Max(1, Gc^.S.VpW); D3G^.VH := Max(1, Gc^.S.VpH);
+  { centres des pixels a +0,5 comme dans OpenGL }
+  D3G^.ClX := -1 + 1 / D3G^.VW; D3G^.ClW := 2;
+  D3G^.ClY := 1 - 1 / D3G^.VH; D3G^.ClH := 2;
+  D3G^.VMinZ := Gc^.S.DNear; D3G^.VMaxZ := Gc^.S.DFar;
+  D3G^.RS[rsZEnable] := Gc^.S.DepOn;
+  D3G^.RS[rsZWrite] := Gc^.S.DepMsk;
+  D3G^.RS[rsZFunc] := GlCmp(Gc^.S.DepFn);
+  D3G^.RS[rsABlend] := Gc^.S.BlOn;
+  D3G^.RS[rsSrcBl] := GlBlF(Gc^.S.BlSrc);
+  D3G^.RS[rsDstBl] := GlBlF(Gc^.S.BlDst);
+  D3G^.RS[rsATest] := Gc^.S.AlOn;
+  D3G^.RS[rsAFunc] := GlCmp(Gc^.S.AlFn);
+  D3G^.RS[rsARef] := DRound(Cl01(Gc^.S.AlRef) * 255);
+  C := 1;
+  If Gc^.S.CullOn <> 0 Then
+  Begin
+    { face rejetee : sens horaire (GL) -> 2, antihoraire -> 3 }
+    If (Gc^.S.CullMd = $405) = (Gc^.S.Front = $901) Then C := 2 Else C := 3;
+    If Gc^.S.CullMd = $408 Then C := 1;
+  End;
+  D3G^.RS[rsCull] := C;
+  If Gc^.S.Shade = $1D00 Then D3G^.RS[rsShade] := 1
+  Else D3G^.RS[rsShade] := 2;
+  Case Gc^.S.PolyMd Of
+    $1B00 : D3G^.RS[rsFill] := 1;
+    $1B01 : D3G^.RS[rsFill] := 2;
+  Else
+    D3G^.RS[rsFill] := 3;
+  End;
+  D3G^.RS[rsFog] := Gc^.S.FogOn;
+  D3G^.RS[rsFogColor] := GlArgb(Gc^.S.FogC[0], Gc^.S.FogC[1],
+                                Gc^.S.FogC[2], 1);
+  Case Gc^.S.FogMd Of
+    $800 : D3G^.RS[rsFogVtx] := 1;
+    $801 : D3G^.RS[rsFogVtx] := 2;
+  Else
+    D3G^.RS[rsFogVtx] := 3;
+  End;
+  D3G^.RS[rsFogStart] := LFl(Gc^.S.FogS);
+  D3G^.RS[rsFogEnd] := LFl(Gc^.S.FogE);
+  D3G^.RS[rsFogDens] := LFl(Gc^.S.FogD);
+  D3G^.RS[rsLighting] := Gc^.S.LitOn;
+  D3G^.RS[rsSpecular] := Gc^.S.LitOn;
+  D3G^.RS[rsCKey] := 0;
+  D3G^.RS[rsTFactor] := GlArgb(Gc^.S.EnvC[0], Gc^.S.EnvC[1], Gc^.S.EnvC[2],
+                               Gc^.S.EnvC[3]);
+  GlStage(0, True);
+  GlStage(1, D3G^.Tex[0] <> 0);
+  If Gc^.S.LitOn <> 0 Then GlLights;
+  GlScOn := Gc^.S.ScOn <> 0;
+  If GlScOn Then
+  Begin
+    GlScL := Gc^.S.ScX; GlScR := Gc^.S.ScX + Gc^.S.ScW;
+    GlScT := Gc^.BH - (Gc^.S.ScY + Gc^.S.ScH); GlScB := Gc^.BH - Gc^.S.ScY;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Sommets                                                            }
+{ ------------------------------------------------------------------ }
+
+Procedure GlGrowV(N : LongInt);
+Var P, Q, H, C : LongInt;
+Begin
+  If N <= GVCap Then Exit;
+  C := Max(N + N Div 2, 1024);
+  H := HeapOwner; HeapOwner := 0;
+  P := KAlloc(C * SizeOf(TVtx) + 16);
+  HeapOwner := H;
+  If P = 0 Then Exit;
+  If GVCap > 0 Then
+  Begin
+    Q := 0;
+    Move(GV, Q, 4);
+    MoveMem(Q, P, GVN * SizeOf(TVtx));
+    KFree(Q);
+  End;
+  Move(P, GV, 4);
+  GVCap := C;
+End;
+
+Procedure GlGrowI(N : LongInt);
+Var P, H, C : LongInt;
+Begin
+  If N <= GIxCap Then Exit;
+  C := Max(N + N Div 2, 4096);
+  H := HeapOwner; HeapOwner := 0;
+  P := KAlloc(C * 4 + 16);
+  HeapOwner := H;
+  If P = 0 Then Exit;
+  If GIx <> 0 Then KFree(GIx);
+  GIx := P; GIxCap := C;
+End;
+
+Procedure GlGrowS(N : LongInt);
+Var P, H, C : LongInt;
+Begin
+  If N <= GSqCap Then Exit;
+  C := Max(N + N Div 2, 4096);
+  H := HeapOwner; HeapOwner := 0;
+  P := KAlloc(C * 4 + 16);
+  HeapOwner := H;
+  If P = 0 Then Exit;
+  If GSq <> 0 Then KFree(GSq);
+  GSq := P; GSqCap := C;
+End;
+
+{ coordonnees de texture generees (unite 0) : composante C (0 S .. 3 Q) }
+Function GlTexGen(C : LongInt; Var Ob, Ey, Nr : T4D;
+                  Def : Double) : Double;
+Var M : LongInt; X, Y, Z, D, NE, RX, RY, RZ : Double;
+Begin
+  GlTexGen := Def;
+  If Gc^.S.TgOn[C] = 0 Then Exit;
+  M := Gc^.S.TgMd[C];
+  Case M Of
+    $2401 :
+      GlTexGen := Gc^.S.TgOP[C * 4] * Ob[0] + Gc^.S.TgOP[C * 4 + 1] * Ob[1] +
+                  Gc^.S.TgOP[C * 4 + 2] * Ob[2] + Gc^.S.TgOP[C * 4 + 3] * Ob[3];
+    $2400 :
+      GlTexGen := Gc^.S.TgEP[C * 4] * Ey[0] + Gc^.S.TgEP[C * 4 + 1] * Ey[1] +
+                  Gc^.S.TgEP[C * 4 + 2] * Ey[2] + Gc^.S.TgEP[C * 4 + 3] * Ey[3];
+    $2402 :
+    Begin
+      { SPHERE_MAP }
+      X := Ey[0]; Y := Ey[1]; Z := Ey[2];
+      D := Sqrt(X * X + Y * Y + Z * Z);
+      If D > 0.000001 Then
+      Begin
+        X := X / D; Y := Y / D; Z := Z / D;
+      End;
+      NE := Nr[0] * X + Nr[1] * Y + Nr[2] * Z;
+      RX := X - 2 * Nr[0] * NE; RY := Y - 2 * Nr[1] * NE;
+      RZ := Z - 2 * Nr[2] * NE + 1;
+      D := 2 * Sqrt(RX * RX + RY * RY + RZ * RZ);
+      If D < 0.000001 Then D := 0.000001;
+      If C = 0 Then GlTexGen := RX / D + 0.5
+      Else GlTexGen := RY / D + 0.5;
+    End;
+  End;
+End;
+
+{ sommet (X, Y, Z, W) avec les attributs courants -> GV[GVN] }
+Procedure GlVtx(X, Y, Z, W : Double);
+Var M : TMat; J, DCol : LongInt; D, S, T, R, Q, S2, T2 : Double;
+    Ob, Ey, Nr : T4D; NeedE : Boolean;
+Begin
+  If GcA = 0 Then Exit;
+  GlGrowV(GVN + 1);
+  If GVN >= GVCap Then Exit;
+  J := GVN;
+  M := Gc^.MVP;
+  GV^[J].X := X * M[0] + Y * M[4] + Z * M[8] + W * M[12];
+  GV^[J].Y := X * M[1] + Y * M[5] + Z * M[9] + W * M[13];
+  GV^[J].Z := X * M[2] + Y * M[6] + Z * M[10] + W * M[14];
+  GV^[J].W := X * M[3] + Y * M[7] + Z * M[11] + W * M[15];
+  GV^[J].CF := -1;
+  If (Gc^.S.POfOn <> 0) Then
+    GV^[J].Z := GV^[J].Z + (Gc^.S.POfU * 4 + Gc^.S.POfF * 8) / 16777215 *
+                GV^[J].W;
+  NeedE := (Gc^.S.LitOn <> 0) Or (Gc^.S.FogOn <> 0) Or
+           ((Gc^.S.TgOn[0] Or Gc^.S.TgOn[1]) <> 0);
+  If NeedE Then
+  Begin
+    Ob[0] := X; Ob[1] := Y; Ob[2] := Z; Ob[3] := W;
+    M := Gc^.MV[Gc^.MVTop];
+    Ey[0] := X * M[0] + Y * M[4] + Z * M[8] + W * M[12];
+    Ey[1] := X * M[1] + Y * M[5] + Z * M[9] + W * M[13];
+    Ey[2] := X * M[2] + Y * M[6] + Z * M[10] + W * M[14];
+    Ey[3] := X * M[3] + Y * M[7] + Z * M[11] + W * M[15];
+    If Abs(Ey[3]) > 0.0000001 Then
+    Begin
+      Ey[0] := Ey[0] / Ey[3]; Ey[1] := Ey[1] / Ey[3];
+      Ey[2] := Ey[2] / Ey[3];
+    End;
+    Nr[0] := Gc^.S.Nrm[0] * M[0] + Gc^.S.Nrm[1] * M[4] + Gc^.S.Nrm[2] * M[8];
+    Nr[1] := Gc^.S.Nrm[0] * M[1] + Gc^.S.Nrm[1] * M[5] + Gc^.S.Nrm[2] * M[9];
+    Nr[2] := Gc^.S.Nrm[0] * M[2] + Gc^.S.Nrm[1] * M[6] +
+             Gc^.S.Nrm[2] * M[10];
+    D := Sqrt(Nr[0] * Nr[0] + Nr[1] * Nr[1] + Nr[2] * Nr[2]);
+    If D > 0.000001 Then
+    Begin
+      Nr[0] := Nr[0] / D; Nr[1] := Nr[1] / D; Nr[2] := Nr[2] / D;
+    End;
+  End;
+  If Gc^.S.LitOn <> 0 Then
+  Begin
+    DCol := GlArgb(Gc^.S.Col[0], Gc^.S.Col[1], Gc^.S.Col[2],
+                   Gc^.S.Col[3]);
+    If DCol = 0 Then DCol := 1;
+    D3DLight(Ey[0], Ey[1], Ey[2], Nr[0], Nr[1], Nr[2], DCol, 0, GV^[J]);
+    If (Gc^.S.CmOn = 0) Or (Gc^.S.CmMode = $1200) Then
+      GV^[J].A := Cl01(Gc^.S.MDif[3]) * 255
+    Else GV^[J].A := Cl01(Gc^.S.Col[3]) * 255;
+  End
+  Else
+  Begin
+    GV^[J].R := Cl01(Gc^.S.Col[0]) * 255; GV^[J].G := Cl01(Gc^.S.Col[1]) * 255;
+    GV^[J].B := Cl01(Gc^.S.Col[2]) * 255; GV^[J].A := Cl01(Gc^.S.Col[3]) * 255;
+    GV^[J].SR := 0; GV^[J].SG := 0; GV^[J].SB := 0;
+  End;
+  If Gc^.S.FogOn <> 0 Then GV^[J].F := D3DFogOf(Abs(Ey[2]))
+  Else GV^[J].F := 1;
+  S := Gc^.S.Tc0[0]; T := Gc^.S.Tc0[1]; R := Gc^.S.Tc0[2];
+  Q := Gc^.S.Tc0[3];
+  If NeedE Then
+  Begin
+    S := GlTexGen(0, Ob, Ey, Nr, S); T := GlTexGen(1, Ob, Ey, Nr, T);
+    R := GlTexGen(2, Ob, Ey, Nr, R); Q := GlTexGen(3, Ob, Ey, Nr, Q);
+  End;
+  If Not Gc^.TxId Then
+  Begin
+    M := Gc^.TX[Gc^.TXTop];
+    S2 := S * M[0] + T * M[4] + R * M[8] + Q * M[12];
+    T2 := S * M[1] + T * M[5] + R * M[9] + Q * M[13];
+    Q := S * M[3] + T * M[7] + R * M[11] + Q * M[15];
+    S := S2; T := T2;
+  End;
+  If Abs(Q) < 0.0000001 Then Q := 1;
+  GV^[J].U0 := S / Q; GV^[J].V0 := T / Q;
+  Q := Gc^.S.Tc1[3];
+  If Abs(Q) < 0.0000001 Then Q := 1;
+  GV^[J].U1 := Gc^.S.Tc1[0] / Q; GV^[J].V1 := Gc^.S.Tc1[1] / Q;
+  Inc(GVN);
+End;
+
+{ indice de la suite (0 : directe) }
+Function GlSeq(Sq, K : LongInt) : LongInt;
+Begin
+  If Sq = 0 Then GlSeq := K Else GlSeq := MemL[0:Sq + K * 4];
+End;
+
+Var
+  GlNI : LongInt;
+
+Procedure GlPutI(A : LongInt);
+Begin
+  MemL[0:GIx + GlNI * 4] := A;
+  Inc(GlNI);
+End;
+
+{ triangle (A, B, C) dont le sommet P (0, 1, 2) donne la couleur unie }
+Procedure GlTri3(A, B, C, P : LongInt);
+Begin
+  If (P = 2) And (Gc^.S.Shade = $1D00) Then
+  Begin
+    GlPutI(C); GlPutI(A); GlPutI(B);
+  End
+  Else If (P = 1) And (Gc^.S.Shade = $1D00) Then
+  Begin
+    GlPutI(B); GlPutI(C); GlPutI(A);
+  End
+  Else
+  Begin
+    GlPutI(A); GlPutI(B); GlPutI(C);
+  End;
+End;
+
+{ dessiner N sommets de GV (suite Sq) en primitives GL de type Md }
+Procedure GlDraw(Md, N, Sq : LongInt);
+Var I, A, B, C, D, Pt : LongInt; Old : PVtxArr;
+Begin
+  If (N <= 0) Or (GVN <= 0) Then Exit;
+  If (Gc^.S.CullOn <> 0) And (Gc^.S.CullMd = $408) And (Md >= 4) Then Exit;
+  GlGrowI(N * 3 + 16);
+  GlNI := 0;
+  Case Md Of
+    0 :
+    Begin
+      Pt := 1;
+      For I := 0 To N - 1 Do GlPutI(GlSeq(Sq, I));
+    End;
+    1 :
+    Begin
+      Pt := 2;
+      For I := 0 To (N Div 2) * 2 - 1 Do GlPutI(GlSeq(Sq, I));
+    End;
+    2, 3 :
+    Begin
+      Pt := 2;
+      For I := 0 To N - 2 Do
+      Begin
+        GlPutI(GlSeq(Sq, I)); GlPutI(GlSeq(Sq, I + 1));
+      End;
+      If (Md = 2) And (N > 2) Then
+      Begin
+        GlPutI(GlSeq(Sq, N - 1)); GlPutI(GlSeq(Sq, 0));
+      End;
+    End;
+    4 :
+    Begin
+      Pt := 4;
+      For I := 0 To N Div 3 - 1 Do
+        GlTri3(GlSeq(Sq, I * 3), GlSeq(Sq, I * 3 + 1), GlSeq(Sq, I * 3 + 2),
+               2);
+    End;
+    5 :
+    Begin
+      Pt := 4;
+      For I := 0 To N - 3 Do
+      Begin
+        A := GlSeq(Sq, I); B := GlSeq(Sq, I + 1); C := GlSeq(Sq, I + 2);
+        If Odd(I) Then GlTri3(B, A, C, 2) Else GlTri3(A, B, C, 2);
+      End;
+    End;
+    6 :
+    Begin
+      Pt := 4;
+      A := GlSeq(Sq, 0);
+      For I := 1 To N - 2 Do
+        GlTri3(A, GlSeq(Sq, I), GlSeq(Sq, I + 1), 2);
+    End;
+    7 :
+    Begin
+      Pt := 4;
+      For I := 0 To N Div 4 - 1 Do
+      Begin
+        A := GlSeq(Sq, I * 4); B := GlSeq(Sq, I * 4 + 1);
+        C := GlSeq(Sq, I * 4 + 2); D := GlSeq(Sq, I * 4 + 3);
+        GlTri3(A, B, D, 2); GlTri3(B, C, D, 1);
+      End;
+    End;
+    8 :
+    Begin
+      Pt := 4;
+      For I := 0 To N Div 2 - 2 Do
+      Begin
+        A := GlSeq(Sq, I * 2); B := GlSeq(Sq, I * 2 + 1);
+        C := GlSeq(Sq, I * 2 + 2); D := GlSeq(Sq, I * 2 + 3);
+        GlTri3(A, B, D, 2); GlTri3(A, D, C, 1);
+      End;
+    End;
+    9 :
+    Begin
+      Pt := 4;
+      A := GlSeq(Sq, 0);
+      For I := 1 To N - 2 Do
+        GlTri3(GlSeq(Sq, I), GlSeq(Sq, I + 1), A, 2);
+    End;
+  Else
+    Begin
+      GlErr($500);
+      Exit;
+    End;
+  End;
+  If GlNI = 0 Then Exit;
+  GlSync;
+  Old := DV;
+  DV := GV;
+  D3DPrims(Pt, GIx, 4, GlNI, GVN);
+  DV := Old;
+  GlScOn := False;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Tableaux de sommets                                                }
+{ ------------------------------------------------------------------ }
+
+{ composante K de l'element I du tableau T (0 sommet, 1 normale,
+  2 couleur, 3 et 4 textures) ; Norm : entiers ramenes a [0, 1] }
+Procedure GlArrGet(T, I : LongInt; Var V : T4D; Norm : Boolean);
+Var A, K, N, Ty, St, Sz : LongInt; X : Double;
+Begin
+  Ty := Gc^.CA.ATy[T]; N := Gc^.CA.ASz[T];
+  Case Ty Of
+    $1400, $1401 : Sz := 1;
+    $1402, $1403 : Sz := 2;
+    $140A : Sz := 8;
+  Else
+    Sz := 4;
+  End;
+  St := Gc^.CA.ASt[T];
+  If St = 0 Then St := Sz * N;
+  A := Gc^.CA.APt[T] + I * St;
+  For K := 0 To N - 1 Do
+  Begin
+    Case Ty Of
+      $1400 :
+      Begin
+        X := Mem[0:A + K];
+        If X > 127 Then X := X - 256;
+        If Norm Then X := X / 127;
+      End;
+      $1401 :
+      Begin
+        X := Mem[0:A + K];
+        If Norm Then X := X / 255;
+      End;
+      $1402 :
+      Begin
+        X := MemW[0:A + K * 2];
+        If X > 32767 Then X := X - 65536;
+        If Norm Then X := X / 32767;
+      End;
+      $1403 :
+      Begin
+        X := MemW[0:A + K * 2];
+        If Norm Then X := X / 65535;
+      End;
+      $1404, $1405 :
+      Begin
+        X := MemL[0:A + K * 4];
+        If Norm Then X := X / 2147483647.0;
+      End;
+      $140A : X := DbM(A + K * 8);
+    Else
+      X := FlM(A + K * 4);
+    End;
+    V[K] := X;
+  End;
+End;
+
+{ element I des tableaux actifs : attributs courants puis sommet }
+Procedure GlArrElem(I : LongInt);
+Var V : T4D; K : LongInt;
+Begin
+  If Gc^.CA.AOn[1] <> 0 Then
+  Begin
+    GlArrGet(1, I, V, True);
+    For K := 0 To 2 Do Gc^.S.Nrm[K] := V[K];
+  End;
+  If Gc^.CA.AOn[2] <> 0 Then
+  Begin
+    V[3] := 1;
+    GlArrGet(2, I, V, True);
+    For K := 0 To 3 Do Gc^.S.Col[K] := V[K];
+  End;
+  If Gc^.CA.AOn[3] <> 0 Then
+  Begin
+    V[1] := 0; V[2] := 0; V[3] := 1;
+    GlArrGet(3, I, V, False);
+    For K := 0 To 3 Do Gc^.S.Tc0[K] := V[K];
+  End;
+  If Gc^.CA.AOn[4] <> 0 Then
+  Begin
+    V[1] := 0; V[2] := 0; V[3] := 1;
+    GlArrGet(4, I, V, False);
+    For K := 0 To 3 Do Gc^.S.Tc1[K] := V[K];
+  End;
+  If Gc^.CA.AOn[0] <> 0 Then
+  Begin
+    V[2] := 0; V[3] := 1;
+    GlArrGet(0, I, V, False);
+    GlVtx(V[0], V[1], V[2], V[3]);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pixels : formats et types                                          }
+{ ------------------------------------------------------------------ }
+
+Function GlComps(F : LongInt) : LongInt;
+Begin
+  Case F Of
+    $190A : GlComps := 2;
+    $1907, $80E0 : GlComps := 3;
+    $1908, $80E1 : GlComps := 4;
+  Else
+    GlComps := 1;
+  End;
+End;
+
+{ octets par point }
+Function GlPixBytes(F, T : LongInt) : LongInt;
+Begin
+  Case T Of
+    $8032, $8362 : GlPixBytes := 1;
+    $8033, $8034, $8363..$8366 : GlPixBytes := 2;
+    $8035, $8036, $8367, $8368 : GlPixBytes := 4;
+    $1400, $1401 : GlPixBytes := GlComps(F);
+    $1402, $1403 : GlPixBytes := GlComps(F) * 2;
+  Else
+    GlPixBytes := GlComps(F) * 4;
+  End;
+End;
+
+{ largeurs (en bits) des champs d'un type compacte, du poids fort au
+  poids faible ; Rev : la premiere composante est au poids faible }
+Function GlPacked(T : LongInt; Var W : T4L; Var Rev : Boolean) : LongInt;
+Begin
+  GlPacked := 0; Rev := False;
+  Case T Of
+    $8032 : Begin W[0] := 3; W[1] := 3; W[2] := 2; GlPacked := 3; End;
+    $8362 : Begin W[0] := 2; W[1] := 3; W[2] := 3; GlPacked := 3;
+                  Rev := True; End;
+    $8033, $8365 : Begin W[0] := 4; W[1] := 4; W[2] := 4; W[3] := 4;
+                         GlPacked := 4; Rev := T = $8365; End;
+    $8034 : Begin W[0] := 5; W[1] := 5; W[2] := 5; W[3] := 1;
+                  GlPacked := 4; End;
+    $8366 : Begin W[0] := 1; W[1] := 5; W[2] := 5; W[3] := 5;
+                  GlPacked := 4; Rev := True; End;
+    $8363, $8364 : Begin W[0] := 5; W[1] := 6; W[2] := 5; GlPacked := 3;
+                         Rev := T = $8364; End;
+    $8035, $8367 : Begin W[0] := 8; W[1] := 8; W[2] := 8; W[3] := 8;
+                         GlPacked := 4; Rev := T = $8367; End;
+    $8036 : Begin W[0] := 10; W[1] := 10; W[2] := 10; W[3] := 2;
+                  GlPacked := 4; End;
+    $8368 : Begin W[0] := 2; W[1] := 10; W[2] := 10; W[3] := 10;
+                  GlPacked := 4; Rev := True; End;
+  End;
+End;
+
+{ point a l'adresse A -> ARGB }
+Function GlRdPix(A, F, T : LongInt) : LongInt;
+Var C, W : T4L;
+    N, K, V, Sh, Tot, M, R, G, B, Al : LongInt; X : Double; Rev : Boolean;
+Begin
+  N := GlPacked(T, W, Rev);
+  If N > 0 Then
+  Begin
+    Case GlPixBytes(F, T) Of
+      1 : V := Mem[0:A];
+      2 : V := MemW[0:A];
+    Else
+      V := MemL[0:A];
+    End;
+    Tot := 0;
+    For K := 0 To N - 1 Do Tot := Tot + W[K];
+    Sh := 0;
+    If Rev Then
+      For K := 0 To N - 1 Do
+      Begin
+        { composante K : champ N - 1 - K (poids faible d'abord) }
+        M := W[N - 1 - K];
+        C[K] := ((V Shr Sh) And ((1 Shl M) - 1)) * 255 Div ((1 Shl M) - 1);
+        Sh := Sh + M;
+      End
+    Else
+    Begin
+      Sh := Tot;
+      For K := 0 To N - 1 Do
+      Begin
+        M := W[K];
+        Sh := Sh - M;
+        C[K] := ((V Shr Sh) And ((1 Shl M) - 1)) * 255 Div ((1 Shl M) - 1);
+      End;
+    End;
+    If N = 3 Then C[3] := 255;
+  End
+  Else
+  Begin
+    N := GlComps(F);
+    For K := 0 To N - 1 Do
+    Begin
+      Case T Of
+        $1401 : V := Mem[0:A + K];
+        $1400 :
+        Begin
+          V := Mem[0:A + K];
+          If V > 127 Then V := 0;
+          V := V * 2;
+        End;
+        $1403 : V := MemW[0:A + K * 2] Shr 8;
+        $1402 :
+        Begin
+          V := MemW[0:A + K * 2];
+          If V > 32767 Then V := 0;
+          V := V Shr 7;
+        End;
+        $1405 : V := (MemL[0:A + K * 4] Shr 24) And 255;
+        $1404 : V := Max(0, MemL[0:A + K * 4]) Shr 23;
+        $1406 :
+        Begin
+          X := FlM(A + K * 4);
+          V := DRound(Cl01(X) * 255);
+        End;
+      Else
+        V := 0;
+      End;
+      If V > 255 Then V := 255;
+      C[K] := V;
+    End;
+  End;
+  R := 255; G := 255; B := 255; Al := 255;
+  Case F Of
+    $1907, $1908 :
+    Begin
+      R := C[0]; G := C[1]; B := C[2];
+      If F = $1908 Then Al := C[3];
+    End;
+    $80E0, $80E1 :
+    Begin
+      B := C[0]; G := C[1]; R := C[2];
+      If F = $80E1 Then Al := C[3];
+    End;
+    $1909 :
+    Begin
+      R := C[0]; G := C[0]; B := C[0];
+    End;
+    $190A :
+    Begin
+      R := C[0]; G := C[0]; B := C[0]; Al := C[1];
+    End;
+    $1906 : Al := C[0];
+    $1903 : Begin R := C[0]; G := 0; B := 0; End;
+    $1904 : Begin R := 0; G := C[0]; B := 0; End;
+    $1905 : Begin R := 0; G := 0; B := C[0]; End;
+  Else
+    Begin
+      R := C[0]; G := C[0]; B := C[0];
+    End;
+  End;
+  GlRdPix := (Al Shl 24) Or (R Shl 16) Or (G Shl 8) Or B;
+End;
+
+{ ARGB -> texel de la surface S (format de stockage) }
+Procedure GlWrTex(S, X, Y, C : LongInt);
+Var A, V : LongInt;
+Begin
+  A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+  Case MemL[0:S + 88] Of
+    16 :
+    Begin
+      If MemL[0:S + 108] = $8000 Then
+        V := ((C Shr 16) And $8000) Or ((C Shr 9) And $7C00) Or
+             ((C Shr 6) And $3E0) Or ((C Shr 3) And $1F)
+      Else If MemL[0:S + 108] = $F000 Then
+        V := ((C Shr 16) And $F000) Or ((C Shr 12) And $F00) Or
+             ((C Shr 8) And $F0) Or ((C Shr 4) And $F)
+      Else
+        V := ((C Shr 8) And $F800) Or ((C Shr 5) And $7E0) Or
+             ((C Shr 3) And $1F);
+      MemW[0:A + X * 2] := V;
+    End;
+  Else
+    MemL[0:A + X * 4] := C;
+  End;
+End;
+
+{ debut de la ligne Y d'une image (stockage : alignement, longueur) }
+Function GlRowAdr(P, W, Y, F, T : LongInt; Pack : Boolean) : LongInt;
+Var L, Al, B : LongInt;
+Begin
+  If Pack Then
+  Begin
+    Al := Gc^.CA.PackA; L := W;
+  End
+  Else
+  Begin
+    Al := Gc^.CA.UnpA; L := Gc^.CA.UnpRL;
+    If L <= 0 Then L := W;
+  End;
+  If Al <= 0 Then Al := 4;
+  B := L * GlPixBytes(F, T);
+  B := ((B + Al - 1) Div Al) * Al;
+  GlRowAdr := P + Y * B;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Contextes (wgl*) et presentation                                   }
+{ ------------------------------------------------------------------ }
+
+Procedure GlSel(P : LongInt);
+Begin
+  GcA := P;
+  Move(GcA, Gc, 4);
+End;
+
+Procedure GlLtDef(Var L : TGLLt; I : LongInt);
+Var K : LongInt;
+Begin
+  For K := 0 To 3 Do
+  Begin
+    L.Amb[K] := 0; L.Dif[K] := 0; L.Spe[K] := 0; L.Pos[K] := 0;
+  End;
+  L.Amb[3] := 1; L.Dif[3] := 1; L.Spe[3] := 1;
+  If I = 0 Then
+    For K := 0 To 2 Do
+    Begin
+      L.Dif[K] := 1; L.Spe[K] := 1;
+    End;
+  L.Pos[2] := 1;
+  L.SDir[0] := 0; L.SDir[1] := 0; L.SDir[2] := -1;
+  L.SExp := 0; L.SCut := 180; L.A0 := 1; L.A1 := 0; L.A2 := 0;
+End;
+
+{ etat initial d'un contexte (le contexte P devient courant) }
+Procedure GlInitCtx(P, D : LongInt);
+Var I : LongInt;
+Begin
+  GlSel(P);
+  Gc^.D3 := D;
+  Move(D, D3G, 4);
+  D3G^.Ver := 7; D3G^.UseTSS := 1;
+  D3DDefaults;
+  Gc^.S.DepFn := $201; Gc^.S.DepMsk := 1;
+  Gc^.S.BlSrc := 1; Gc^.S.BlDst := 0;
+  Gc^.S.AlFn := $207; Gc^.S.AlRef := 0;
+  Gc^.S.CullMd := $405; Gc^.S.Front := $901; Gc^.S.Shade := $1D01;
+  Gc^.S.PolyMd := $1B02;
+  Gc^.S.DNear := 0; Gc^.S.DFar := 1;
+  Gc^.S.FogMd := $800; Gc^.S.FogS := 0; Gc^.S.FogE := 1; Gc^.S.FogD := 1;
+  Gc^.S.CmMode := $1602;
+  For I := 0 To 7 Do GlLtDef(Gc^.S.Lt[I], I);
+  For I := 0 To 3 Do
+  Begin
+    Gc^.S.MAmb[I] := 0.2; Gc^.S.MDif[I] := 0.8; Gc^.S.MSpe[I] := 0;
+    Gc^.S.MEmi[I] := 0; Gc^.S.LMAmb[I] := 0.2; Gc^.S.Col[I] := 1;
+    Gc^.S.Tc0[I] := 0; Gc^.S.Tc1[I] := 0;
+  End;
+  Gc^.S.MAmb[3] := 1; Gc^.S.MDif[3] := 1; Gc^.S.MSpe[3] := 1;
+  Gc^.S.MEmi[3] := 1; Gc^.S.LMAmb[3] := 1;
+  Gc^.S.Tc0[3] := 1; Gc^.S.Tc1[3] := 1;
+  Gc^.S.Nrm[0] := 0; Gc^.S.Nrm[1] := 0; Gc^.S.Nrm[2] := 1;
+  Gc^.S.Env[0] := $2100; Gc^.S.Env[1] := $2100;
+  Gc^.S.ClrZ := 1;
+  Gc^.S.PtSz := 1; Gc^.S.LnW := 1; Gc^.S.DitOn := 1; Gc^.S.CMask := 15;
+  For I := 0 To 3 Do Gc^.S.TgMd[I] := $2400;
+  Gc^.S.TgOP[0] := 1; Gc^.S.TgOP[5] := 1;
+  Gc^.S.TgEP[0] := 1; Gc^.S.TgEP[5] := 1;
+  Gc^.CA.UnpA := 4; Gc^.CA.PackA := 4;
+  For I := 0 To 5 Do
+  Begin
+    Gc^.CA.ASz[I] := 4; Gc^.CA.ATy[I] := $1406;
+  End;
+  Gc^.CA.ASz[1] := 3;
+  MatId(Gc^.MV[0]); MatId(Gc^.PR[0]); MatId(Gc^.TX[0]);
+  Gc^.MMode := $1700;
+  Gc^.MOk := False;
+End;
+
+Function wglCreateContext(Hdc : LongInt) : LongInt;
+Var I, P, D, Old : LongInt;
+Begin
+  GlTr(1);
+  wglCreateContext := 0;
+  I := 0;
+  While (I < 16) And (GlCtx[I] <> 0) Do Inc(I);
+  If I >= 16 Then Exit;
+  P := KAlloc(SizeOf(TGLC) + 16);
+  D := KAlloc(SizeOf(TD3D) + 16);
+  If (P = 0) Or (D = 0) Then Exit;
+  FillMem(P, SizeOf(TGLC), 0);
+  FillMem(D, SizeOf(TD3D), 0);
+  If GlTexT = 0 Then
+  Begin
+    GlTexT := KAlloc(GlMaxTex * GlTexSz + 16);
+    If GlTexT <> 0 Then FillMem(GlTexT, GlMaxTex * GlTexSz, 0);
+  End;
+  If GlStrs[0] = 0 Then
+  Begin
+    GlStrs[0] := KAllocSys(32); PutPStr(GlStrs[0], 'Pasdows', 32);
+    GlStrs[1] := KAllocSys(64);
+    PutPStr(GlStrs[1], 'Pasdows OpenGL (rendu logiciel)', 64);
+    GlStrs[2] := KAllocSys(32); PutPStr(GlStrs[2], '1.1.0 Pasdows', 32);
+    GlStrs[3] := KAllocSys(64); PutPStr(GlStrs[3], '', 64);
+  End;
+  Old := GcA;
+  GlInitCtx(P, D);
+  GlSel(Old);
+  GlCtx[I] := P;
+  If CurProc > 0 Then GlProc := CurProc;
+  KLog('OpenGL : contexte ' + HexStr(P, 8));
+  wglCreateContext := P;
+End;
+
+Function GlCtxOk(P : LongInt) : Boolean;
+Var I : LongInt;
+Begin
+  GlCtxOk := False;
+  If P = 0 Then Exit;
+  For I := 0 To 15 Do
+    If GlCtx[I] = P Then GlCtxOk := True;
+End;
+
+Function wglMakeCurrent(Hdc, P : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  GlTr(2);
+  wglMakeCurrent := 1;
+  If P = 0 Then
+  Begin
+    GlSel(0);
+    Exit;
+  End;
+  If Not GlCtxOk(P) Then
+  Begin
+    wglMakeCurrent := 0;
+    Exit;
+  End;
+  GlSel(P);
+  Gc^.Dc := Hdc;
+  Gc^.Wnd := 0;
+  D := DcOf(Hdc);
+  If (D >= 0) And (Dcs[D].Wnd >= 0) Then Gc^.Wnd := HwndOf(Dcs[D].Wnd);
+  GlBuffers;
+  If Gc^.Made = 0 Then
+  Begin
+    Gc^.Made := 1;
+    Gc^.S.VpW := Gc^.BW; Gc^.S.VpH := Gc^.BH;
+    Gc^.S.ScW := Gc^.BW; Gc^.S.ScH := Gc^.BH;
+  End;
+  If CurProc > 0 Then GlProc := CurProc;
+End;
+
+Function wglDeleteContext(P : LongInt) : LongInt;
+Var I, Old : LongInt;
+Begin
+  GlTr(3);
+  wglDeleteContext := 0;
+  If Not GlCtxOk(P) Then Exit;
+  Old := GcA;
+  If P = GcA Then Old := 0;
+  For I := 0 To 15 Do
+    If GlCtx[I] = P Then GlCtx[I] := 0;
+  GlSel(P);
+  GlSurfFree(Gc^.RT); GlSurfFree(Gc^.ZB);
+  If Gc^.D3 <> 0 Then KFree(Gc^.D3);
+  GlSel(Old);
+  KFree(P);
+  wglDeleteContext := 1;
+End;
+
+Function wglGetCurrentContext : LongInt;
+Begin
+  GlTr(4);
+  wglGetCurrentContext := GcA;
+End;
+
+Function wglGetCurrentDC : LongInt;
+Begin
+  GlTr(5);
+  If GcA = 0 Then wglGetCurrentDC := 0 Else wglGetCurrentDC := Gc^.Dc;
+End;
+
+Function wglGetProcAddress(P : LongInt) : LongInt;
+Var S : String; R : LongInt;
+Begin
+  GlTr(6);
+  S := PStr(P);
+  R := 0;
+  If (Length(S) > 2) And (Copy(S, 1, 2) = 'gl') Then R := KernelExport(S);
+  If R = 0 Then KLog('wglGetProcAddress ' + S + ' : absent');
+  wglGetProcAddress := R;
+End;
+
+Function wglShareLists(A, B : LongInt) : LongInt;
+Begin
+  GlTr(7);
+  wglShareLists := 1;
+End;
+
+Function wglCopyContext(A, B, M : LongInt) : LongInt;
+Begin
+  GlTr(8);
+  wglCopyContext := 1;
+End;
+
+Function wglCreateLayerContext(Hdc, L : LongInt) : LongInt;
+Begin
+  GlTr(9);
+  If L = 0 Then wglCreateLayerContext := wglCreateContext(Hdc)
+  Else wglCreateLayerContext := 0;
+End;
+
+Function wglUseFontBitmapsA(Hdc, F, N, B : LongInt) : LongInt;
+Begin
+  GlTr(10);
+  GlTodo('wglUseFontBitmaps');
+  wglUseFontBitmapsA := 1;
+End;
+
+Function wglUseFontBitmapsW(Hdc, F, N, B : LongInt) : LongInt;
+Begin
+  GlTr(11);
+  wglUseFontBitmapsW := wglUseFontBitmapsA(Hdc, F, N, B);
+End;
+
+Function wglSwapIntervalEXT(N : LongInt) : LongInt;
+Begin
+  GlTr(12);
+  wglSwapIntervalEXT := 1;
+End;
+
+{ un seul format : RGBA 32 bits, double tampon, Z 24 bits }
+Function DescribePixelFormat(Dc, I, N, P : LongInt) : LongInt;
+Begin
+  DescribePixelFormat := 1;
+  If (P = 0) Or (I <> 1) Or (N < 40) Then Exit;
+  FillMem(P, 40, 0);
+  MemW[0:P] := 40;
+  MemW[0:P + 2] := 1;
+  { PFD_DRAW_TO_WINDOW, SUPPORT_OPENGL, DOUBLEBUFFER (accelere) }
+  MemL[0:P + 4] := $4 Or $20 Or $1;
+  Mem[0:P + 9] := 32;
+  Mem[0:P + 10] := 8; Mem[0:P + 11] := 16;
+  Mem[0:P + 12] := 8; Mem[0:P + 13] := 8;
+  Mem[0:P + 14] := 8; Mem[0:P + 15] := 0;
+  Mem[0:P + 23] := 24;
+End;
+
+Function ChoosePixelFormat(Dc, P : LongInt) : LongInt;
+Begin
+  ChoosePixelFormat := 1;
+End;
+
+Function SetPixelFormat(Dc, F, P : LongInt) : LongInt;
+Begin
+  SetPixelFormat := Ord(F = 1);
+End;
+
+Function GetPixelFormat(Dc : LongInt) : LongInt;
+Begin
+  GetPixelFormat := 1;
+End;
+
+Function wglDescribePixelFormat(Dc, I, N, P : LongInt) : LongInt;
+Begin
+  GlTr(13);
+  wglDescribePixelFormat := DescribePixelFormat(Dc, I, N, P);
+End;
+
+Function wglChoosePixelFormat(Dc, P : LongInt) : LongInt;
+Begin
+  GlTr(14);
+  wglChoosePixelFormat := 1;
+End;
+
+Function wglSetPixelFormat(Dc, F, P : LongInt) : LongInt;
+Begin
+  GlTr(15);
+  wglSetPixelFormat := Ord(F = 1);
+End;
+
+Function wglGetPixelFormat(Dc : LongInt) : LongInt;
+Begin
+  GlTr(16);
+  wglGetPixelFormat := 1;
+End;
+
+Var
+  GlBmi : LongInt;
+  GlFrames : LongInt;
+
+{ tampon arriere -> fenetre }
+Function SwapBuffers(Hdc : LongInt) : LongInt;
+Var H : LongInt;
+Begin
+  SwapBuffers := 1;
+  If (GcA = 0) Or (Gc^.RT = 0) Then Exit;
+  Move(Gc^.D3, D3G, 4);
+  If GlBmi = 0 Then GlBmi := KAllocSys(64);
+  FillMem(GlBmi, 44, 0);
+  MemL[0:GlBmi] := 40;
+  MemL[0:GlBmi + 4] := Gc^.BW; MemL[0:GlBmi + 8] := -Gc^.BH;
+  MemW[0:GlBmi + 12] := 1; MemW[0:GlBmi + 14] := 32;
+  H := Hdc;
+  If H = 0 Then H := Gc^.Dc;
+  SetDIBitsToDevice(H, 0, 0, Gc^.BW, Gc^.BH, 0, 0, 0, Gc^.BH,
+                    MemL[0:Gc^.RT + 76], GlBmi, 0);
+  Inc(GlFrames);
+  HeapCheck('SwapBuffers');
+  If (GlFrames < 4) Or (GlFrames Mod 100 = 0) Then
+    KLog('OpenGL : image ' + IntStr(GlFrames) + ' (' + IntStr(D3G^.Tris) +
+         ' triangles)');
+  GlBuffers;
+End;
+
+Function wglSwapBuffers(Hdc : LongInt) : LongInt;
+Begin
+  GlTr(17);
+  wglSwapBuffers := SwapBuffers(Hdc);
+End;
+
+Function wglSwapLayerBuffers(Hdc, Fl : LongInt) : LongInt;
+Begin
+  GlTr(18);
+  wglSwapLayerBuffers := SwapBuffers(Hdc);
+End;
+
+{ fin du processus : contextes et textures oublies (blocs liberes par
+  KFreeOwner) }
+Procedure GlProcDone(P : LongInt);
+Var I : LongInt;
+Begin
+  If (GlProc <> P) Or (GlProc = 0) Then Exit;
+  For I := 0 To 15 Do GlCtx[I] := 0;
+  GlSel(0);
+  GlTexT := 0;
+  GlProc := 0;
+  GlScOn := False;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Etat                                                               }
+{ ------------------------------------------------------------------ }
+
+Function GlOk : Boolean;
+Begin
+  GlOk := GcA <> 0;
+End;
+
+Procedure GlCap(C, V : LongInt);
+Begin
+  If Not GlOk Then Exit;
+  Case C Of
+    $0DE0, $0DE1 : Gc^.S.TexOn[Gc^.S.ActTex] := V;
+    $0B71 : Gc^.S.DepOn := V;
+    $0BE2 : Gc^.S.BlOn := V;
+    $0BC0 : Gc^.S.AlOn := V;
+    $0B44 : Gc^.S.CullOn := V;
+    $0B60 : Gc^.S.FogOn := V;
+    $0B50 : Gc^.S.LitOn := V;
+    $4000..$4007 : Gc^.S.LtOn[C - $4000] := V;
+    $0B57 : Gc^.S.CmOn := V;
+    $0BA1, $803A : Gc^.S.NormOn := V;
+    $0C11 : Gc^.S.ScOn := V;
+    $8037, $2A01, $2A02 : Gc^.S.POfOn := V;
+    $0C60..$0C63 : Gc^.S.TgOn[C - $0C60] := V;
+    $0BD0 : Gc^.S.DitOn := V;
+  End;
+End;
+
+Function GlCapOn(C : LongInt) : LongInt;
+Begin
+  GlCapOn := 0;
+  If Not GlOk Then Exit;
+  Case C Of
+    $0DE0, $0DE1 : GlCapOn := Gc^.S.TexOn[Gc^.S.ActTex];
+    $0B71 : GlCapOn := Gc^.S.DepOn;
+    $0BE2 : GlCapOn := Gc^.S.BlOn;
+    $0BC0 : GlCapOn := Gc^.S.AlOn;
+    $0B44 : GlCapOn := Gc^.S.CullOn;
+    $0B60 : GlCapOn := Gc^.S.FogOn;
+    $0B50 : GlCapOn := Gc^.S.LitOn;
+    $4000..$4007 : GlCapOn := Gc^.S.LtOn[C - $4000];
+    $0B57 : GlCapOn := Gc^.S.CmOn;
+    $0BA1, $803A : GlCapOn := Gc^.S.NormOn;
+    $0C11 : GlCapOn := Gc^.S.ScOn;
+    $8037 : GlCapOn := Gc^.S.POfOn;
+    $0C60..$0C63 : GlCapOn := Gc^.S.TgOn[C - $0C60];
+    $0BD0 : GlCapOn := Gc^.S.DitOn;
+    $8074 : GlCapOn := Gc^.CA.AOn[0];
+    $8075 : GlCapOn := Gc^.CA.AOn[1];
+    $8076 : GlCapOn := Gc^.CA.AOn[2];
+    $8078 : GlCapOn := Gc^.CA.AOn[3 + Gc^.CA.CliTex];
+  End;
+End;
+
+Procedure glEnable(C : LongInt);
+Begin
+  GlTr(19);
+  GlCap(C, 1);
+End;
+
+Procedure glDisable(C : LongInt);
+Begin
+  GlTr(20);
+  GlCap(C, 0);
+End;
+
+Function glIsEnabled(C : LongInt) : LongInt;
+Begin
+  GlTr(21);
+  glIsEnabled := GlCapOn(C);
+End;
+
+Function GlArrOf(C : LongInt) : LongInt;
+Begin
+  Case C Of
+    $8074 : GlArrOf := 0;
+    $8075 : GlArrOf := 1;
+    $8076 : GlArrOf := 2;
+    $8078 : GlArrOf := 3 + Gc^.CA.CliTex;
+    $8079 : GlArrOf := 5;
+  Else
+    GlArrOf := -1;
+  End;
+End;
+
+Procedure glEnableClientState(C : LongInt);
+Var A : LongInt;
+Begin
+  GlTr(22);
+  If Not GlOk Then Exit;
+  A := GlArrOf(C);
+  If A >= 0 Then Gc^.CA.AOn[A] := 1;
+End;
+
+Procedure glDisableClientState(C : LongInt);
+Var A : LongInt;
+Begin
+  GlTr(23);
+  If Not GlOk Then Exit;
+  A := GlArrOf(C);
+  If A >= 0 Then Gc^.CA.AOn[A] := 0;
+End;
+
+Procedure GlSetArr(A, Sz, Ty, St, P : LongInt);
+Begin
+  If Not GlOk Then Exit;
+  Gc^.CA.ASz[A] := Sz; Gc^.CA.ATy[A] := Ty; Gc^.CA.ASt[A] := St;
+  Gc^.CA.APt[A] := P;
+End;
+
+Procedure glVertexPointer(Sz, Ty, St, P : LongInt);
+Begin
+  GlTr(24);
+  GlSetArr(0, Sz, Ty, St, P);
+End;
+
+Procedure glNormalPointer(Ty, St, P : LongInt);
+Begin
+  GlTr(25);
+  GlSetArr(1, 3, Ty, St, P);
+End;
+
+Procedure glColorPointer(Sz, Ty, St, P : LongInt);
+Begin
+  GlTr(26);
+  GlSetArr(2, Sz, Ty, St, P);
+End;
+
+Procedure glTexCoordPointer(Sz, Ty, St, P : LongInt);
+Begin
+  GlTr(27);
+  If GlOk Then GlSetArr(3 + Gc^.CA.CliTex, Sz, Ty, St, P);
+End;
+
+Procedure glEdgeFlagPointer(St, P : LongInt);
+Begin
+  GlTr(28);
+  GlSetArr(5, 1, $1401, St, P);
+End;
+
+Procedure glIndexPointer(Ty, St, P : LongInt);
+Begin
+  GlTr(29);
+End;
+
+Procedure glGetPointerv(N, P : LongInt);
+Var A : LongInt;
+Begin
+  GlTr(30);
+  If Not GlOk Or (P = 0) Then Exit;
+  A := -1;
+  Case N Of
+    $808E : A := 0;
+    $808F : A := 1;
+    $8090 : A := 2;
+    $8092 : A := 3 + Gc^.CA.CliTex;
+    $8093 : A := 5;
+  End;
+  If A >= 0 Then MemL[0:P] := Gc^.CA.APt[A] Else MemL[0:P] := 0;
+End;
+
+{ glInterleavedArrays : t texture, c couleur, n normale, v sommet }
+Procedure glInterleavedArrays(F, St, P : LongInt);
+Var Tc, Cc, Ct, Vc, O, S, K : LongInt; N : Boolean;
+Begin
+  GlTr(31);
+  If Not GlOk Then Exit;
+  K := F - $2A20;
+  If (K < 0) Or (K > 13) Then
+  Begin
+    GlErr($500);
+    Exit;
+  End;
+  Tc := 0; Cc := 0; Ct := $1406; Vc := 3; N := False;
+  Case K Of
+    0 : Vc := 2;
+    2 : Begin Cc := 4; Ct := $1401; Vc := 2; End;
+    3 : Begin Cc := 4; Ct := $1401; End;
+    4 : Cc := 3;
+    5 : N := True;
+    6 : Begin Cc := 4; N := True; End;
+    7 : Tc := 2;
+    8 : Begin Tc := 4; Vc := 4; End;
+    9 : Begin Tc := 2; Cc := 4; Ct := $1401; End;
+    10 : Begin Tc := 2; Cc := 3; End;
+    11 : Begin Tc := 2; N := True; End;
+    12 : Begin Tc := 2; Cc := 4; N := True; End;
+    13 : Begin Tc := 4; Cc := 4; N := True; Vc := 4; End;
+  End;
+  S := Tc * 4 + Vc * 4;
+  If N Then S := S + 12;
+  If Ct = $1401 Then S := S + Cc Else S := S + Cc * 4;
+  If St = 0 Then St := S;
+  For K := 0 To 5 Do Gc^.CA.AOn[K] := 0;
+  O := P;
+  If Tc > 0 Then
+  Begin
+    GlSetArr(3, Tc, $1406, St, O); Gc^.CA.AOn[3] := 1;
+    O := O + Tc * 4;
+  End;
+  If Cc > 0 Then
+  Begin
+    GlSetArr(2, Cc, Ct, St, O); Gc^.CA.AOn[2] := 1;
+    If Ct = $1401 Then O := O + Cc Else O := O + Cc * 4;
+  End;
+  If N Then
+  Begin
+    GlSetArr(1, 3, $1406, St, O); Gc^.CA.AOn[1] := 1;
+    O := O + 12;
+  End;
+  GlSetArr(0, Vc, $1406, St, O); Gc^.CA.AOn[0] := 1;
+End;
+
+Procedure glArrayElement(I : LongInt);
+Begin
+  GlTr(32);
+  If GlOk Then GlArrElem(I);
+End;
+
+Procedure glDrawArrays(Md, F, N : LongInt);
+Var I : LongInt;
+Begin
+  GlTr(33);
+  If Not GlOk Or (N <= 0) Then Exit;
+  If Gc^.CA.AOn[0] = 0 Then Exit;
+  GlMats;
+  GVN := 0;
+  GlGrowV(N);
+  For I := F To F + N - 1 Do GlArrElem(I);
+  GlDraw(Md, GVN, 0);
+  GVN := 0;
+End;
+
+Function GlIdx(Ty, P, K : LongInt) : LongInt;
+Begin
+  Case Ty Of
+    $1401 : GlIdx := Mem[0:P + K];
+    $1403 : GlIdx := MemW[0:P + K * 2];
+  Else
+    GlIdx := MemL[0:P + K * 4];
+  End;
+End;
+
+Procedure glDrawElements(Md, N, Ty, P : LongInt);
+Var I, Mn, Mx, V : LongInt;
+Begin
+  GlTr(34);
+  If Not GlOk Or (N <= 0) Or (P = 0) Then Exit;
+  If Gc^.CA.AOn[0] = 0 Then Exit;
+  GlMats;
+  Mn := GlIdx(Ty, P, 0); Mx := Mn;
+  For I := 1 To N - 1 Do
+  Begin
+    V := GlIdx(Ty, P, I);
+    If V < Mn Then Mn := V;
+    If V > Mx Then Mx := V;
+  End;
+  GVN := 0;
+  If (Mn >= 0) And (Mx - Mn + 1 <= Max(N * 4, 256)) Then
+  Begin
+    { sommets [Mn, Mx] traites une fois, puis suite d'indices }
+    GlGrowV(Mx - Mn + 1);
+    GlGrowS(N);
+    If GSq = 0 Then Exit;
+    For I := Mn To Mx Do GlArrElem(I);
+    If GVN <> Mx - Mn + 1 Then
+    Begin
+      GVN := 0;
+      Exit;
+    End;
+    For I := 0 To N - 1 Do MemL[0:GSq + I * 4] := GlIdx(Ty, P, I) - Mn;
+    GlDraw(Md, N, GSq);
+  End
+  Else
+  Begin
+    GlGrowV(N);
+    For I := 0 To N - 1 Do GlArrElem(GlIdx(Ty, P, I));
+    GlDraw(Md, GVN, 0);
+  End;
+  GVN := 0;
+End;
+
+Procedure glDrawRangeElements(Md, A, B, N, Ty, P : LongInt);
+Begin
+  GlTr(35);
+  glDrawElements(Md, N, Ty, P);
+End;
+
+Procedure glBegin(Md : LongInt);
+Begin
+  GlTr(36);
+  If Not GlOk Then Exit;
+  If Gc^.InBeg <> 0 Then
+  Begin
+    GlErr($502);
+    Exit;
+  End;
+  GlMats;
+  Gc^.InBeg := 1; Gc^.Prim := Md;
+  GVN := 0;
+End;
+
+Procedure glEnd;
+Begin
+  GlTr(37);
+  If Not GlOk Then Exit;
+  If Gc^.InBeg = 0 Then
+  Begin
+    GlErr($502);
+    Exit;
+  End;
+  Gc^.InBeg := 0;
+  GlDraw(Gc^.Prim, GVN, 0);
+  GVN := 0;
+End;
+
+{ attributs courants (appeles par les variantes glVertex*, glColor*...) }
+Procedure GlSetV(X, Y, Z, W : Double);
+Begin
+  If GlOk Then
+    If Gc^.InBeg <> 0 Then GlVtx(X, Y, Z, W);
+End;
+
+Procedure GlSetC(R, G, B, A : Double);
+Begin
+  If Not GlOk Then Exit;
+  Gc^.S.Col[0] := R; Gc^.S.Col[1] := G; Gc^.S.Col[2] := B;
+  Gc^.S.Col[3] := A;
+End;
+
+Procedure GlSetN(X, Y, Z : Double);
+Begin
+  If Not GlOk Then Exit;
+  Gc^.S.Nrm[0] := X; Gc^.S.Nrm[1] := Y; Gc^.S.Nrm[2] := Z;
+End;
+
+Procedure GlSetT(U : LongInt; S, T, R, Q : Double);
+Begin
+  If Not GlOk Then Exit;
+  If U = 1 Then
+  Begin
+    Gc^.S.Tc1[0] := S; Gc^.S.Tc1[1] := T; Gc^.S.Tc1[2] := R;
+    Gc^.S.Tc1[3] := Q;
+  End
+  Else
+  Begin
+    Gc^.S.Tc0[0] := S; Gc^.S.Tc0[1] := T; Gc^.S.Tc0[2] := R;
+    Gc^.S.Tc0[3] := Q;
+  End;
+End;
+
+{ position raster : fenetre (origine en bas a gauche) }
+Procedure GlSetR(X, Y, Z, W : Double);
+Var M : TMat; CX, CY, CW : Double;
+Begin
+  If Not GlOk Then Exit;
+  GlMats;
+  M := Gc^.MVP;
+  CX := X * M[0] + Y * M[4] + Z * M[8] + W * M[12];
+  CY := X * M[1] + Y * M[5] + Z * M[9] + W * M[13];
+  CW := X * M[3] + Y * M[7] + Z * M[11] + W * M[15];
+  If Abs(CW) < 0.0000001 Then CW := 1;
+  Gc^.RPos[0] := Gc^.S.VpX + (CX / CW + 1) * Gc^.S.VpW / 2;
+  Gc^.RPos[1] := Gc^.S.VpY + (CY / CW + 1) * Gc^.S.VpH / 2;
+End;
+
+Procedure GlSetI(V : Double);
+Begin
+End;
+
+Procedure glEnd; Forward;
+
+Procedure GlRectQ(X1, Y1, X2, Y2 : Double);
+Begin
+  If Not GlOk Or (Gc^.InBeg <> 0) Then Exit;
+  GlMats;
+  Gc^.InBeg := 1; Gc^.Prim := 9;
+  GVN := 0;
+  GlVtx(X1, Y1, 0, 1); GlVtx(X2, Y1, 0, 1);
+  GlVtx(X2, Y2, 0, 1); GlVtx(X1, Y2, 0, 1);
+  glEnd;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Effacement et etats simples                                        }
+{ ------------------------------------------------------------------ }
+
+Procedure glClear(M : LongInt);
+Var L, T, R, B : LongInt;
+Begin
+  GlTr(38);
+  If Not GlOk Or (Gc^.RT = 0) Then Exit;
+  L := 0; T := 0; R := Gc^.BW; B := Gc^.BH;
+  If Gc^.S.ScOn <> 0 Then
+  Begin
+    L := Max(0, Gc^.S.ScX); R := Min(Gc^.BW, Gc^.S.ScX + Gc^.S.ScW);
+    T := Max(0, Gc^.BH - (Gc^.S.ScY + Gc^.S.ScH));
+    B := Min(Gc^.BH, Gc^.BH - Gc^.S.ScY);
+  End;
+  If (M And $4000) <> 0 Then
+    SfFill(Gc^.RT, L, T, R, B, GlArgb(Gc^.S.ClrC[0], Gc^.S.ClrC[1],
+           Gc^.S.ClrC[2], 0) And $FFFFFF);
+  If ((M And $100) <> 0) And (Gc^.S.DepMsk <> 0) And (Gc^.ZB <> 0) Then
+    SfFill(Gc^.ZB, L, T, R, B, DRound(Cl01(Gc^.S.ClrZ) * 16777215));
+End;
+
+Procedure glClearColor(R, G, B, A : LongInt);
+Begin
+  GlTr(39);
+  If Not GlOk Then Exit;
+  Gc^.S.ClrC[0] := FlL(R); Gc^.S.ClrC[1] := FlL(G);
+  Gc^.S.ClrC[2] := FlL(B); Gc^.S.ClrC[3] := FlL(A);
+End;
+
+Procedure glClearDepth(Lo, Hi : LongInt);
+Begin
+  GlTr(40);
+  If GlOk Then Gc^.S.ClrZ := DblOf(Lo, Hi);
+End;
+
+Procedure glViewport(X, Y, W, H : LongInt);
+Begin
+  GlTr(41);
+  If Not GlOk Then Exit;
+  Gc^.S.VpX := X; Gc^.S.VpY := Y; Gc^.S.VpW := W; Gc^.S.VpH := H;
+End;
+
+Procedure glScissor(X, Y, W, H : LongInt);
+Begin
+  GlTr(42);
+  If Not GlOk Then Exit;
+  Gc^.S.ScX := X; Gc^.S.ScY := Y; Gc^.S.ScW := W; Gc^.S.ScH := H;
+End;
+
+Procedure glDepthRange(NL, NH, FL, FH : LongInt);
+Begin
+  GlTr(43);
+  If Not GlOk Then Exit;
+  Gc^.S.DNear := Cl01(DblOf(NL, NH)); Gc^.S.DFar := Cl01(DblOf(FL, FH));
+End;
+
+Procedure glDepthFunc(F : LongInt);
+Begin
+  GlTr(44);
+  If GlOk Then Gc^.S.DepFn := F;
+End;
+
+Procedure glDepthMask(F : LongInt);
+Begin
+  GlTr(45);
+  If GlOk Then Gc^.S.DepMsk := Ord((F And 255) <> 0);
+End;
+
+Procedure glBlendFunc(S, D : LongInt);
+Begin
+  GlTr(46);
+  If Not GlOk Then Exit;
+  Gc^.S.BlSrc := S; Gc^.S.BlDst := D;
+End;
+
+Procedure glAlphaFunc(F, R : LongInt);
+Begin
+  GlTr(47);
+  If Not GlOk Then Exit;
+  Gc^.S.AlFn := F; Gc^.S.AlRef := FlL(R);
+End;
+
+Procedure glCullFace(M : LongInt);
+Begin
+  GlTr(48);
+  If GlOk Then Gc^.S.CullMd := M;
+End;
+
+Procedure glFrontFace(M : LongInt);
+Begin
+  GlTr(49);
+  If GlOk Then Gc^.S.Front := M;
+End;
+
+Procedure glShadeModel(M : LongInt);
+Begin
+  GlTr(50);
+  If GlOk Then Gc^.S.Shade := M;
+End;
+
+Procedure glPolygonMode(F, M : LongInt);
+Begin
+  GlTr(51);
+  If GlOk And (F <> $404) Then Gc^.S.PolyMd := M;
+End;
+
+Procedure glPolygonOffset(F, U : LongInt);
+Begin
+  GlTr(52);
+  If Not GlOk Then Exit;
+  Gc^.S.POfF := FlL(F); Gc^.S.POfU := FlL(U);
+End;
+
+Procedure glColorMask(R, G, B, A : LongInt);
+Begin
+  GlTr(53);
+  If GlOk Then
+    Gc^.S.CMask := Ord(R <> 0) Or (Ord(G <> 0) Shl 1) Or (Ord(B <> 0) Shl 2)
+                   Or (Ord(A <> 0) Shl 3);
+End;
+
+Procedure glLineWidth(W : LongInt);
+Begin
+  GlTr(54);
+  If GlOk Then Gc^.S.LnW := FlL(W);
+End;
+
+Procedure glPointSize(W : LongInt);
+Begin
+  GlTr(55);
+  If GlOk Then Gc^.S.PtSz := FlL(W);
+End;
+
+Procedure glHint(T, M : LongInt);
+Begin
+  GlTr(56);
+End;
+
+Procedure glFlush;
+Begin
+  GlTr(57);
+End;
+
+Procedure glFinish;
+Begin
+  GlTr(58);
+End;
+
+Function glGetError : LongInt;
+Begin
+  GlTr(59);
+  glGetError := 0;
+  If Not GlOk Then Exit;
+  glGetError := Gc^.Err;
+  Gc^.Err := 0;
+End;
+
+Function glGetString(N : LongInt) : LongInt;
+Begin
+  GlTr(60);
+  glGetString := 0;
+  If (N >= $1F00) And (N <= $1F03) Then glGetString := GlStrs[N - $1F00];
+End;
+
+Procedure glDrawBuffer(M : LongInt);
+Begin
+  GlTr(61);
+End;
+
+Procedure glReadBuffer(M : LongInt);
+Begin
+  GlTr(62);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Brouillard, lumieres, materiaux                                    }
+{ ------------------------------------------------------------------ }
+
+{ parametre GL : K-ieme valeur (I : entiers, F : flottants 32 bits) }
+Function GlPv(P, K : LongInt; Fl : Boolean) : Double;
+Begin
+  If Fl Then GlPv := FlM(P + K * 4) Else GlPv := MemL[0:P + K * 4];
+End;
+
+{ couleur entiere -> [0, 1] (glLightiv, glMaterialiv...) }
+Function GlPc(P, K : LongInt; Fl : Boolean) : Double;
+Begin
+  If Fl Then GlPc := FlM(P + K * 4)
+  Else GlPc := MemL[0:P + K * 4] / 2147483647.0;
+End;
+
+Procedure GlFog(N, P : LongInt; Fl : Boolean);
+Var K : LongInt;
+Begin
+  If Not GlOk Or (P = 0) Then Exit;
+  Case N Of
+    $0B65 :
+    Begin
+      Gc^.S.FogMd := DRound(GlPv(P, 0, Fl));
+      If Fl Then Gc^.S.FogMd := DRound(FlM(P));
+    End;
+    $0B62 : Gc^.S.FogD := GlPv(P, 0, Fl);
+    $0B63 : Gc^.S.FogS := GlPv(P, 0, Fl);
+    $0B64 : Gc^.S.FogE := GlPv(P, 0, Fl);
+    $0B66 : For K := 0 To 3 Do Gc^.S.FogC[K] := GlPc(P, K, Fl);
+  End;
+End;
+
+Procedure glFogfv(N, P : LongInt);
+Begin
+  GlTr(63);
+  GlFog(N, P, True);
+End;
+
+Procedure glFogiv(N, P : LongInt);
+Begin
+  GlTr(64);
+  GlFog(N, P, False);
+End;
+
+Procedure glFogf(N, V : LongInt);
+Begin
+  GlTr(65);
+  GlFog(N, LongInt(@V), True);
+End;
+
+Procedure glFogi(N, V : LongInt);
+Begin
+  GlTr(66);
+  GlFog(N, LongInt(@V), False);
+End;
+
+Procedure GlLight(L, N, P : LongInt; Fl : Boolean);
+Var I, K : LongInt; M : TMat; X, Y, Z, W : Double;
+Begin
+  If Not GlOk Or (P = 0) Then Exit;
+  I := L - $4000;
+  If (I < 0) Or (I > 7) Then Exit;
+  M := Gc^.MV[Gc^.MVTop];
+  Case N Of
+    $1200 : For K := 0 To 3 Do Gc^.S.Lt[I].Amb[K] := GlPc(P, K, Fl);
+    $1201 : For K := 0 To 3 Do Gc^.S.Lt[I].Dif[K] := GlPc(P, K, Fl);
+    $1202 : For K := 0 To 3 Do Gc^.S.Lt[I].Spe[K] := GlPc(P, K, Fl);
+    $1203 :
+    Begin
+      { position transformee par la matrice modele-vue courante }
+      X := GlPv(P, 0, Fl); Y := GlPv(P, 1, Fl); Z := GlPv(P, 2, Fl);
+      W := GlPv(P, 3, Fl);
+      Gc^.S.Lt[I].Pos[0] := X * M[0] + Y * M[4] + Z * M[8] + W * M[12];
+      Gc^.S.Lt[I].Pos[1] := X * M[1] + Y * M[5] + Z * M[9] + W * M[13];
+      Gc^.S.Lt[I].Pos[2] := X * M[2] + Y * M[6] + Z * M[10] + W * M[14];
+      Gc^.S.Lt[I].Pos[3] := W;
+    End;
+    $1204 :
+    Begin
+      X := GlPv(P, 0, Fl); Y := GlPv(P, 1, Fl); Z := GlPv(P, 2, Fl);
+      Gc^.S.Lt[I].SDir[0] := X * M[0] + Y * M[4] + Z * M[8];
+      Gc^.S.Lt[I].SDir[1] := X * M[1] + Y * M[5] + Z * M[9];
+      Gc^.S.Lt[I].SDir[2] := X * M[2] + Y * M[6] + Z * M[10];
+    End;
+    $1205 : Gc^.S.Lt[I].SExp := GlPv(P, 0, Fl);
+    $1206 : Gc^.S.Lt[I].SCut := GlPv(P, 0, Fl);
+    $1207 : Gc^.S.Lt[I].A0 := GlPv(P, 0, Fl);
+    $1208 : Gc^.S.Lt[I].A1 := GlPv(P, 0, Fl);
+    $1209 : Gc^.S.Lt[I].A2 := GlPv(P, 0, Fl);
+  End;
+End;
+
+Procedure glLightfv(L, N, P : LongInt);
+Begin
+  GlTr(67);
+  GlLight(L, N, P, True);
+End;
+
+Procedure glLightiv(L, N, P : LongInt);
+Begin
+  GlTr(68);
+  GlLight(L, N, P, False);
+End;
+
+Procedure glLightf(L, N, V : LongInt);
+Begin
+  GlTr(69);
+  GlLight(L, N, LongInt(@V), True);
+End;
+
+Procedure glLighti(L, N, V : LongInt);
+Begin
+  GlTr(70);
+  GlLight(L, N, LongInt(@V), False);
+End;
+
+Procedure glGetLightfv(L, N, P : LongInt);
+Var I, K : LongInt;
+Begin
+  GlTr(71);
+  If Not GlOk Or (P = 0) Then Exit;
+  I := L - $4000;
+  If (I < 0) Or (I > 7) Then Exit;
+  For K := 0 To 3 Do
+    Case N Of
+      $1200 : MemL[0:P + K * 4] := LFl(Gc^.S.Lt[I].Amb[K]);
+      $1201 : MemL[0:P + K * 4] := LFl(Gc^.S.Lt[I].Dif[K]);
+      $1202 : MemL[0:P + K * 4] := LFl(Gc^.S.Lt[I].Spe[K]);
+      $1203 : MemL[0:P + K * 4] := LFl(Gc^.S.Lt[I].Pos[K]);
+    End;
+End;
+
+Procedure glGetLightiv(L, N, P : LongInt);
+Begin
+  GlTr(72);
+  glGetLightfv(L, N, P);
+End;
+
+Procedure GlLModel(N, P : LongInt; Fl : Boolean);
+Var K : LongInt;
+Begin
+  If Not GlOk Or (P = 0) Then Exit;
+  If N = $0B53 Then
+    For K := 0 To 3 Do Gc^.S.LMAmb[K] := GlPc(P, K, Fl);
+End;
+
+Procedure glLightModelfv(N, P : LongInt);
+Begin
+  GlTr(73);
+  GlLModel(N, P, True);
+End;
+
+Procedure glLightModeliv(N, P : LongInt);
+Begin
+  GlTr(74);
+  GlLModel(N, P, False);
+End;
+
+Procedure glLightModelf(N, V : LongInt);
+Begin
+  GlTr(75);
+End;
+
+Procedure glLightModeli(N, V : LongInt);
+Begin
+  GlTr(76);
+End;
+
+Procedure GlMaterial(F, N, P : LongInt; Fl : Boolean);
+Var K : LongInt;
+Begin
+  If Not GlOk Or (P = 0) Or (F = $404) Then Exit;
+  For K := 0 To 3 Do
+    Case N Of
+      $1200 : Gc^.S.MAmb[K] := GlPc(P, K, Fl);
+      $1201 : Gc^.S.MDif[K] := GlPc(P, K, Fl);
+      $1202 : Gc^.S.MSpe[K] := GlPc(P, K, Fl);
+      $1600 : Gc^.S.MEmi[K] := GlPc(P, K, Fl);
+      $1602 :
+      Begin
+        Gc^.S.MAmb[K] := GlPc(P, K, Fl); Gc^.S.MDif[K] := GlPc(P, K, Fl);
+      End;
+    End;
+  If N = $1601 Then Gc^.S.MShin := GlPv(P, 0, Fl);
+End;
+
+Procedure glMaterialfv(F, N, P : LongInt);
+Begin
+  GlTr(77);
+  GlMaterial(F, N, P, True);
+End;
+
+Procedure glMaterialiv(F, N, P : LongInt);
+Begin
+  GlTr(78);
+  GlMaterial(F, N, P, False);
+End;
+
+Procedure glMaterialf(F, N, V : LongInt);
+Begin
+  GlTr(79);
+  GlMaterial(F, N, LongInt(@V), True);
+End;
+
+Procedure glMateriali(F, N, V : LongInt);
+Begin
+  GlTr(80);
+  GlMaterial(F, N, LongInt(@V), False);
+End;
+
+Procedure glGetMaterialfv(F, N, P : LongInt);
+Var K : LongInt;
+Begin
+  GlTr(81);
+  If Not GlOk Or (P = 0) Then Exit;
+  For K := 0 To 3 Do
+    Case N Of
+      $1200 : MemL[0:P + K * 4] := LFl(Gc^.S.MAmb[K]);
+      $1201 : MemL[0:P + K * 4] := LFl(Gc^.S.MDif[K]);
+      $1202 : MemL[0:P + K * 4] := LFl(Gc^.S.MSpe[K]);
+      $1600 : MemL[0:P + K * 4] := LFl(Gc^.S.MEmi[K]);
+    End;
+  If N = $1601 Then MemL[0:P] := LFl(Gc^.S.MShin);
+End;
+
+Procedure glGetMaterialiv(F, N, P : LongInt);
+Begin
+  GlTr(82);
+  glGetMaterialfv(F, N, P);
+End;
+
+Procedure glColorMaterial(F, M : LongInt);
+Begin
+  GlTr(83);
+  If GlOk Then Gc^.S.CmMode := M;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Matrices                                                           }
+{ ------------------------------------------------------------------ }
+
+Procedure glMatrixMode(M : LongInt);
+Begin
+  GlTr(84);
+  If GlOk Then Gc^.MMode := M;
+End;
+
+Procedure glLoadIdentity;
+Var M : TMat;
+Begin
+  GlTr(85);
+  If Not GlOk Then Exit;
+  MatId(M);
+  GlLoadM(M);
+End;
+
+Procedure glLoadMatrixf(P : LongInt);
+Var M : TMat;
+Begin
+  GlTr(86);
+  If Not GlOk Or (P = 0) Then Exit;
+  MatLoad(M, P);
+  GlLoadM(M);
+End;
+
+Procedure glLoadMatrixd(P : LongInt);
+Var M : TMat; I : LongInt;
+Begin
+  GlTr(87);
+  If Not GlOk Or (P = 0) Then Exit;
+  For I := 0 To 15 Do M[I] := DbM(P + I * 8);
+  GlLoadM(M);
+End;
+
+Procedure glMultMatrixf(P : LongInt);
+Var M : TMat;
+Begin
+  GlTr(88);
+  If Not GlOk Or (P = 0) Then Exit;
+  MatLoad(M, P);
+  GlMulM(M);
+End;
+
+Procedure glMultMatrixd(P : LongInt);
+Var M : TMat; I : LongInt;
+Begin
+  GlTr(89);
+  If Not GlOk Or (P = 0) Then Exit;
+  For I := 0 To 15 Do M[I] := DbM(P + I * 8);
+  GlMulM(M);
+End;
+
+Procedure glPushMatrix;
+Begin
+  GlTr(90);
+  If Not GlOk Then Exit;
+  Case Gc^.MMode Of
+    $1701 :
+      If Gc^.PRTop < 3 Then
+      Begin
+        Gc^.PR[Gc^.PRTop + 1] := Gc^.PR[Gc^.PRTop]; Inc(Gc^.PRTop);
+      End
+      Else GlErr($503);
+    $1702 :
+      If Gc^.TXTop < 3 Then
+      Begin
+        Gc^.TX[Gc^.TXTop + 1] := Gc^.TX[Gc^.TXTop]; Inc(Gc^.TXTop);
+      End
+      Else GlErr($503);
+  Else
+    If Gc^.MVTop < 31 Then
+    Begin
+      Gc^.MV[Gc^.MVTop + 1] := Gc^.MV[Gc^.MVTop]; Inc(Gc^.MVTop);
+    End
+    Else GlErr($503);
+  End;
+End;
+
+Procedure glPopMatrix;
+Begin
+  GlTr(91);
+  If Not GlOk Then Exit;
+  Case Gc^.MMode Of
+    $1701 : If Gc^.PRTop > 0 Then Dec(Gc^.PRTop) Else GlErr($504);
+    $1702 : If Gc^.TXTop > 0 Then Dec(Gc^.TXTop) Else GlErr($504);
+  Else
+    If Gc^.MVTop > 0 Then Dec(Gc^.MVTop) Else GlErr($504);
+  End;
+  GlMChanged;
+End;
+
+Procedure GlTrans(X, Y, Z : Double);
+Var M : TMat;
+Begin
+  If Not GlOk Then Exit;
+  MatId(M);
+  M[12] := X; M[13] := Y; M[14] := Z;
+  GlMulM(M);
+End;
+
+Procedure GlScale(X, Y, Z : Double);
+Var M : TMat;
+Begin
+  If Not GlOk Then Exit;
+  MatId(M);
+  M[0] := X; M[5] := Y; M[10] := Z;
+  GlMulM(M);
+End;
+
+Procedure GlRot(A, X, Y, Z : Double);
+Var M : TMat; C, S, T, D : Double;
+Begin
+  If Not GlOk Then Exit;
+  D := Sqrt(X * X + Y * Y + Z * Z);
+  If D < 0.0000001 Then Exit;
+  X := X / D; Y := Y / D; Z := Z / D;
+  A := A * 3.14159265358979 / 180;
+  C := Cos(A); S := Sin(A); T := 1 - C;
+  MatId(M);
+  M[0] := X * X * T + C; M[1] := Y * X * T + Z * S; M[2] := X * Z * T - Y * S;
+  M[4] := X * Y * T - Z * S; M[5] := Y * Y * T + C; M[6] := Y * Z * T + X * S;
+  M[8] := X * Z * T + Y * S; M[9] := Y * Z * T - X * S; M[10] := Z * Z * T + C;
+  GlMulM(M);
+End;
+
+Procedure glTranslatef(X, Y, Z : LongInt);
+Begin
+  GlTr(92);
+  GlTrans(FlL(X), FlL(Y), FlL(Z));
+End;
+
+Procedure glTranslated(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(93);
+  GlTrans(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH));
+End;
+
+Procedure glScalef(X, Y, Z : LongInt);
+Begin
+  GlTr(94);
+  GlScale(FlL(X), FlL(Y), FlL(Z));
+End;
+
+Procedure glScaled(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(95);
+  GlScale(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH));
+End;
+
+Procedure glRotatef(A, X, Y, Z : LongInt);
+Begin
+  GlTr(96);
+  GlRot(FlL(A), FlL(X), FlL(Y), FlL(Z));
+End;
+
+Procedure glRotated(AL, AH, XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(97);
+  GlRot(DblOf(AL, AH), DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH));
+End;
+
+Procedure GlOrthoM(L, R, B, T, N, F : Double);
+Var M : TMat;
+Begin
+  If Not GlOk Then Exit;
+  If (R = L) Or (T = B) Or (F = N) Then
+  Begin
+    GlErr($501);
+    Exit;
+  End;
+  MatId(M);
+  M[0] := 2 / (R - L); M[5] := 2 / (T - B); M[10] := -2 / (F - N);
+  M[12] := -(R + L) / (R - L); M[13] := -(T + B) / (T - B);
+  M[14] := -(F + N) / (F - N);
+  GlMulM(M);
+End;
+
+Procedure GlFrustumM(L, R, B, T, N, F : Double);
+Var M : TMat;
+Begin
+  If Not GlOk Then Exit;
+  If (R = L) Or (T = B) Or (F = N) Or (N <= 0) Then
+  Begin
+    GlErr($501);
+    Exit;
+  End;
+  MatId(M);
+  M[0] := 2 * N / (R - L); M[5] := 2 * N / (T - B);
+  M[8] := (R + L) / (R - L); M[9] := (T + B) / (T - B);
+  M[10] := -(F + N) / (F - N); M[11] := -1;
+  M[14] := -2 * F * N / (F - N); M[15] := 0;
+  GlMulM(M);
+End;
+
+Procedure glOrtho(LL, LH, RL, RH, BL, BH, TL, TH, NL, NH, FL, FH : LongInt);
+Begin
+  GlTr(98);
+  GlOrthoM(DblOf(LL, LH), DblOf(RL, RH), DblOf(BL, BH), DblOf(TL, TH),
+           DblOf(NL, NH), DblOf(FL, FH));
+End;
+
+Procedure glFrustum(LL, LH, RL, RH, BL, BH, TL, TH, NL, NH, FL, FH : LongInt);
+Begin
+  GlTr(99);
+  GlFrustumM(DblOf(LL, LH), DblOf(RL, RH), DblOf(BL, BH), DblOf(TL, TH),
+             DblOf(NL, NH), DblOf(FL, FH));
+End;
+
+{ ------------------------------------------------------------------ }
+{ Generation de coordonnees de texture                               }
+{ ------------------------------------------------------------------ }
+
+Procedure GlTexGenP(C, N, P : LongInt; Ty : LongInt);
+Var I, K : LongInt; V : Double;
+Begin
+  If Not GlOk Or (P = 0) Then Exit;
+  I := C - $2000;
+  If (I < 0) Or (I > 3) Then Exit;
+  If N = $2500 Then
+  Begin
+    Case Ty Of
+      0 : V := MemL[0:P];
+      1 : V := FlM(P);
+    Else
+      V := DbM(P);
+    End;
+    Gc^.S.TgMd[I] := DRound(V);
+    Exit;
+  End;
+  For K := 0 To 3 Do
+  Begin
+    Case Ty Of
+      0 : V := MemL[0:P + K * 4];
+      1 : V := FlM(P + K * 4);
+    Else
+      V := DbM(P + K * 8);
+    End;
+    If N = $2501 Then Gc^.S.TgOP[I * 4 + K] := V
+    Else If N = $2502 Then Gc^.S.TgEP[I * 4 + K] := V;
+  End;
+End;
+
+Procedure glTexGeni(C, N, V : LongInt);
+Begin
+  GlTr(100);
+  GlTexGenP(C, N, LongInt(@V), 0);
+End;
+
+Procedure glTexGenf(C, N, V : LongInt);
+Begin
+  GlTr(101);
+  GlTexGenP(C, N, LongInt(@V), 1);
+End;
+
+Procedure glTexGend(C, N, VL, VH : LongInt);
+Var D : Double;
+Begin
+  GlTr(102);
+  D := DblOf(VL, VH);
+  GlTexGenP(C, N, LongInt(@D), 2);
+End;
+
+Procedure glTexGeniv(C, N, P : LongInt);
+Begin
+  GlTr(103);
+  GlTexGenP(C, N, P, 0);
+End;
+
+Procedure glTexGenfv(C, N, P : LongInt);
+Begin
+  GlTr(104);
+  GlTexGenP(C, N, P, 1);
+End;
+
+Procedure glTexGendv(C, N, P : LongInt);
+Begin
+  GlTr(105);
+  GlTexGenP(C, N, P, 2);
+End;
+
+Procedure glGetTexGeniv(C, N, P : LongInt);
+Begin
+  GlTr(106);
+  If GlOk And (P <> 0) And (N = $2500) And (C >= $2000) And (C <= $2003) Then
+    MemL[0:P] := Gc^.S.TgMd[C - $2000];
+End;
+
+Procedure glGetTexGenfv(C, N, P : LongInt);
+Begin
+  GlTr(107);
+  If GlOk And (P <> 0) And (N = $2500) And (C >= $2000) And (C <= $2003) Then
+    MemL[0:P] := LFl(Gc^.S.TgMd[C - $2000]);
+End;
+
+Procedure glGetTexGendv(C, N, P : LongInt);
+Begin
+  GlTr(108);
+  If GlOk And (P <> 0) And (N = $2500) And (C >= $2000) And (C <= $2003) Then
+    DbPut(P, Gc^.S.TgMd[C - $2000]);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Textures                                                           }
+{ ------------------------------------------------------------------ }
+
+Procedure glGenTextures(N, P : LongInt);
+Var I, K : LongInt;
+Begin
+  GlTr(109);
+  If (GlTexT = 0) Or (P = 0) Then Exit;
+  K := 1;
+  For I := 0 To N - 1 Do
+  Begin
+    While (K < GlMaxTex) And (MemL[0:GlTexEnt(K)] <> 0) Do Inc(K);
+    If K >= GlMaxTex Then
+    Begin
+      MemL[0:P + I * 4] := 0;
+      GlErr($505);
+    End
+    Else
+    Begin
+      MemL[0:GlTexEnt(K)] := 2;          { reserve }
+      MemL[0:P + I * 4] := K;
+      Inc(K);
+    End;
+  End;
+End;
+
+Procedure GlTexFree(N : LongInt);
+Var E : LongInt;
+Begin
+  E := GlTexEnt(N);
+  If E = 0 Then Exit;
+  GlSurfFree(MemL[0:E + 4]);
+  FillMem(E, GlTexSz, 0);
+End;
+
+Procedure glDeleteTextures(N, P : LongInt);
+Var I, T : LongInt;
+Begin
+  GlTr(110);
+  If (GlTexT = 0) Or (P = 0) Then Exit;
+  For I := 0 To N - 1 Do
+  Begin
+    T := MemL[0:P + I * 4];
+    If (T > 0) And (T < GlMaxTex) Then
+    Begin
+      GlTexFree(T);
+      If GlOk Then
+      Begin
+        If Gc^.S.Bound[0] = T Then Gc^.S.Bound[0] := 0;
+        If Gc^.S.Bound[1] = T Then Gc^.S.Bound[1] := 0;
+      End;
+    End;
+  End;
+End;
+
+Function glIsTexture(T : LongInt) : LongInt;
+Begin
+  GlTr(111);
+  glIsTexture := 0;
+  If (T > 0) And (GlTexEnt(T) <> 0) Then
+    glIsTexture := Ord(MemL[0:GlTexEnt(T)] <> 0);
+End;
+
+Function glAreTexturesResident(N, P, R : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GlTr(112);
+  If R <> 0 Then
+    For I := 0 To N - 1 Do Mem[0:R + I] := 1;
+  glAreTexturesResident := 1;
+End;
+
+Procedure glPrioritizeTextures(N, P, R : LongInt);
+Begin
+  GlTr(113);
+End;
+
+{ entree de la texture liee a l'unite active (creee au besoin) }
+Function GlBoundEnt : LongInt;
+Var E : LongInt;
+Begin
+  GlBoundEnt := 0;
+  If Not GlOk Then Exit;
+  E := GlTexEnt(Gc^.S.Bound[Gc^.S.ActTex]);
+  If E = 0 Then Exit;
+  If MemL[0:E] <> 1 Then
+  Begin
+    MemL[0:E] := 1;
+    MemL[0:E + 16] := $2901; MemL[0:E + 20] := $2901;
+  End;
+  GlBoundEnt := E;
+End;
+
+Procedure glBindTexture(T, N : LongInt);
+Begin
+  GlTr(114);
+  If Not GlOk Then Exit;
+  If (N < 0) Or (N >= GlMaxTex) Then
+  Begin
+    GlErr($505);
+    Exit;
+  End;
+  Gc^.S.Bound[Gc^.S.ActTex] := N;
+  GlBoundEnt;
+End;
+
+{ format de stockage selon le format interne : 7 (1555), 8 (4444),
+  2 (565), 6 (ARGB 32 bits), 5 (XRGB 32 bits) }
+Function GlStore(F : LongInt) : LongInt;
+Begin
+  Case F Of
+    $8057 : GlStore := 7;
+    $8055, $8056 : GlStore := 8;
+    $2A10, $804F, $8050 : GlStore := 2;
+    3, $1907, $8051..$8054, $80E0 : GlStore := 5;
+  Else
+    GlStore := 6;
+  End;
+End;
+
+Function GlTexSurf(K, W, H : LongInt) : LongInt;
+Begin
+  Case K Of
+    7 : GlTexSurf := GlSurf(W, H, 16, $7C00, $3E0, $1F, $8000);
+    8 : GlTexSurf := GlSurf(W, H, 16, $F00, $F0, $F, $F000);
+    2 : GlTexSurf := GlSurf(W, H, 16, $F800, $7E0, $1F, 0);
+    5 : GlTexSurf := GlSurf(W, H, 32, $FF0000, $FF00, $FF, 0);
+  Else
+    GlTexSurf := GlSurf(W, H, 32, $FF0000, $FF00, $FF, LongInt($FF000000));
+  End;
+End;
+
+{ copier une image (W x H, format F, type T) en (X, Y) de la surface }
+Procedure GlTexPut(S, X, Y, W, H, F, T, P : LongInt);
+Var I, J, A, B, SW, SH : LongInt;
+Begin
+  If (P = 0) Or (S = 0) Then Exit;
+  SW := MemL[0:S + 64]; SH := MemL[0:S + 68];
+  B := GlPixBytes(F, T);
+  For J := 0 To H - 1 Do
+  Begin
+    If (Y + J < 0) Or (Y + J >= SH) Then Continue;
+    A := GlRowAdr(P, W, J, F, T, False);
+    For I := 0 To W - 1 Do
+      If (X + I >= 0) And (X + I < SW) Then
+        GlWrTex(S, X + I, Y + J, GlRdPix(A + I * B, F, T));
+  End;
+End;
+
+Procedure glTexImage2D(Tg, Lv, IF2, W, H, Bd, F, T, P : LongInt);
+Var E, K : LongInt;
+Begin
+  GlTr(115);
+  If (Lv <> 0) Or (W <= 0) Or (H <= 0) Then Exit;
+  E := GlBoundEnt;
+  If E = 0 Then Exit;
+  K := GlStore(IF2);
+  If (MemL[0:E + 4] = 0) Or (MemL[0:E + 8] <> W) Or (MemL[0:E + 12] <> H)
+     Or (MemL[0:E + 24] <> IF2) Then
+  Begin
+    GlSurfFree(MemL[0:E + 4]);
+    MemL[0:E + 4] := GlTexSurf(K, W, H);
+    If MemL[0:E + 4] = 0 Then
+    Begin
+      GlErr($505);
+      Exit;
+    End;
+  End;
+  HeapCheck('glTexImage2D');
+  MemL[0:E + 8] := W; MemL[0:E + 12] := H; MemL[0:E + 24] := IF2;
+  MemL[0:E + 28] := Ord((K = 6) Or (K = 7) Or (K = 8));
+  GlTexPut(MemL[0:E + 4], 0, 0, W, H, F, T, P);
+End;
+
+Procedure glTexImage1D(Tg, Lv, IF2, W, Bd, F, T, P : LongInt);
+Begin
+  GlTr(116);
+  glTexImage2D(Tg, Lv, IF2, W, 1, Bd, F, T, P);
+End;
+
+Procedure glTexSubImage2D(Tg, Lv, X, Y, W, H, F, T, P : LongInt);
+Var E : LongInt;
+Begin
+  GlTr(117);
+  If Lv <> 0 Then Exit;
+  E := GlBoundEnt;
+  If (E = 0) Or (MemL[0:E + 4] = 0) Then Exit;
+  GlTexPut(MemL[0:E + 4], X, Y, W, H, F, T, P);
+End;
+
+Procedure glTexSubImage1D(Tg, Lv, X, W, F, T, P : LongInt);
+Begin
+  GlTr(118);
+  glTexSubImage2D(Tg, Lv, X, 0, W, 1, F, T, P);
+End;
+
+{ copie depuis le tampon de couleur (origine en bas a gauche) }
+Procedure GlCopyTex(S, DX, DY, X, Y, W, H : LongInt);
+Var I, J, SY, A : LongInt;
+Begin
+  If (S = 0) Or Not GlOk Or (Gc^.RT = 0) Then Exit;
+  For J := 0 To H - 1 Do
+  Begin
+    SY := Gc^.BH - 1 - (Y + J);
+    If (SY < 0) Or (SY >= Gc^.BH) Then Continue;
+    A := MemL[0:Gc^.RT + 76] + SY * MemL[0:Gc^.RT + 72];
+    For I := 0 To W - 1 Do
+      If (X + I >= 0) And (X + I < Gc^.BW) And (DX + I < MemL[0:S + 64]) And
+         (DY + J < MemL[0:S + 68]) Then
+        GlWrTex(S, DX + I, DY + J, MemL[0:A + (X + I) * 4] Or
+                LongInt($FF000000));
+  End;
+End;
+
+Procedure glCopyTexImage2D(Tg, Lv, IF2, X, Y, W, H, Bd : LongInt);
+Var E : LongInt;
+Begin
+  GlTr(119);
+  If Lv <> 0 Then Exit;
+  glTexImage2D(Tg, 0, IF2, W, H, 0, $1908, $1401, 0);
+  E := GlBoundEnt;
+  If E <> 0 Then GlCopyTex(MemL[0:E + 4], 0, 0, X, Y, W, H);
+End;
+
+Procedure glCopyTexImage1D(Tg, Lv, IF2, X, Y, W, Bd : LongInt);
+Begin
+  GlTr(120);
+  glCopyTexImage2D(Tg, Lv, IF2, X, Y, W, 1, Bd);
+End;
+
+Procedure glCopyTexSubImage2D(Tg, Lv, DX, DY, X, Y, W, H : LongInt);
+Var E : LongInt;
+Begin
+  GlTr(121);
+  If Lv <> 0 Then Exit;
+  E := GlBoundEnt;
+  If E <> 0 Then GlCopyTex(MemL[0:E + 4], DX, DY, X, Y, W, H);
+End;
+
+Procedure glCopyTexSubImage1D(Tg, Lv, DX, X, Y, W : LongInt);
+Begin
+  GlTr(122);
+  glCopyTexSubImage2D(Tg, Lv, DX, 0, X, Y, W, 1);
+End;
+
+Procedure glGetTexImage(Tg, Lv, F, T, P : LongInt);
+Begin
+  GlTr(123);
+  GlTodo('glGetTexImage');
+End;
+
+Procedure GlTexParam(N, P : LongInt; Fl : Boolean);
+Var E, V : LongInt;
+Begin
+  E := GlBoundEnt;
+  If (E = 0) Or (P = 0) Then Exit;
+  If Fl Then V := DRound(FlM(P)) Else V := MemL[0:P];
+  Case N Of
+    $2802 : MemL[0:E + 16] := V;
+    $2803 : MemL[0:E + 20] := V;
+  End;
+End;
+
+Procedure glTexParameteri(T, N, V : LongInt);
+Begin
+  GlTr(124);
+  GlTexParam(N, LongInt(@V), False);
+End;
+
+Procedure glTexParameterf(T, N, V : LongInt);
+Begin
+  GlTr(125);
+  GlTexParam(N, LongInt(@V), True);
+End;
+
+Procedure glTexParameteriv(T, N, P : LongInt);
+Begin
+  GlTr(126);
+  GlTexParam(N, P, False);
+End;
+
+Procedure glTexParameterfv(T, N, P : LongInt);
+Begin
+  GlTr(127);
+  GlTexParam(N, P, True);
+End;
+
+Procedure glGetTexParameteriv(T, N, P : LongInt);
+Var E : LongInt;
+Begin
+  GlTr(128);
+  E := GlBoundEnt;
+  If (E = 0) Or (P = 0) Then Exit;
+  Case N Of
+    $2802 : MemL[0:P] := MemL[0:E + 16];
+    $2803 : MemL[0:P] := MemL[0:E + 20];
+    $2800 : MemL[0:P] := $2601;
+    $2801 : MemL[0:P] := $2601;
+  Else
+    MemL[0:P] := 0;
+  End;
+End;
+
+Procedure glGetTexParameterfv(T, N, P : LongInt);
+Begin
+  GlTr(129);
+  glGetTexParameteriv(T, N, P);
+  If P <> 0 Then MemL[0:P] := LFl(MemL[0:P]);
+End;
+
+Procedure glGetTexLevelParameteriv(T, Lv, N, P : LongInt);
+Var E, V : LongInt;
+Begin
+  GlTr(130);
+  If P = 0 Then Exit;
+  MemL[0:P] := 0;
+  E := GlBoundEnt;
+  If (E = 0) Or (Lv <> 0) Then Exit;
+  V := 0;
+  Case N Of
+    $1000 : V := MemL[0:E + 8];
+    $1001 : V := MemL[0:E + 12];
+    $1003 : V := MemL[0:E + 24];
+    $805C..$805E : V := 8;
+    $805F : V := 8 * MemL[0:E + 28];
+  End;
+  MemL[0:P] := V;
+End;
+
+Procedure glGetTexLevelParameterfv(T, Lv, N, P : LongInt);
+Begin
+  GlTr(131);
+  glGetTexLevelParameteriv(T, Lv, N, P);
+  If P <> 0 Then MemL[0:P] := LFl(MemL[0:P]);
+End;
+
+Procedure GlTexEnv(N, P : LongInt; Fl : Boolean);
+Var K : LongInt;
+Begin
+  If Not GlOk Or (P = 0) Then Exit;
+  If N = $2200 Then
+  Begin
+    If Fl Then Gc^.S.Env[Gc^.S.ActTex] := DRound(FlM(P))
+    Else Gc^.S.Env[Gc^.S.ActTex] := MemL[0:P];
+  End
+  Else If N = $2201 Then
+    For K := 0 To 3 Do Gc^.S.EnvC[K] := GlPc(P, K, Fl);
+End;
+
+Procedure glTexEnvi(T, N, V : LongInt);
+Begin
+  GlTr(132);
+  GlTexEnv(N, LongInt(@V), False);
+End;
+
+Procedure glTexEnvf(T, N, V : LongInt);
+Begin
+  GlTr(133);
+  GlTexEnv(N, LongInt(@V), True);
+End;
+
+Procedure glTexEnviv(T, N, P : LongInt);
+Begin
+  GlTr(134);
+  GlTexEnv(N, P, False);
+End;
+
+Procedure glTexEnvfv(T, N, P : LongInt);
+Begin
+  GlTr(135);
+  GlTexEnv(N, P, True);
+End;
+
+Procedure glGetTexEnviv(T, N, P : LongInt);
+Begin
+  GlTr(136);
+  If GlOk And (P <> 0) And (N = $2200) Then
+    MemL[0:P] := Gc^.S.Env[Gc^.S.ActTex];
+End;
+
+Procedure glGetTexEnvfv(T, N, P : LongInt);
+Begin
+  GlTr(137);
+  If GlOk And (P <> 0) And (N = $2200) Then
+    MemL[0:P] := LFl(Gc^.S.Env[Gc^.S.ActTex]);
+End;
+
+Procedure glPixelStorei(N, V : LongInt);
+Begin
+  GlTr(138);
+  If Not GlOk Then Exit;
+  Case N Of
+    $0CF5 : Gc^.CA.UnpA := V;
+    $0CF2 : Gc^.CA.UnpRL := V;
+    $0D05 : Gc^.CA.PackA := V;
+  End;
+End;
+
+Procedure glPixelStoref(N, V : LongInt);
+Begin
+  GlTr(139);
+  glPixelStorei(N, DRound(FlL(V)));
+End;
+
+{ multitexture (GL_ARB_multitexture) }
+Procedure glActiveTextureARB(U : LongInt);
+Begin
+  GlTr(140);
+  If GlOk And (U >= $84C0) And (U <= $84C1) Then Gc^.S.ActTex := U - $84C0;
+End;
+
+Procedure glClientActiveTextureARB(U : LongInt);
+Begin
+  GlTr(141);
+  If GlOk And (U >= $84C0) And (U <= $84C1) Then Gc^.CA.CliTex := U - $84C0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pixels                                                             }
+{ ------------------------------------------------------------------ }
+
+Procedure glReadPixels(X, Y, W, H, F, T, P : LongInt);
+Var I, J, A, D, C, SY, B : LongInt;
+Begin
+  GlTr(142);
+  If Not GlOk Or (P = 0) Or (Gc^.RT = 0) Then Exit;
+  B := GlComps(F);
+  For J := 0 To H - 1 Do
+  Begin
+    SY := Gc^.BH - 1 - (Y + J);
+    D := GlRowAdr(P, W, J, F, $1401, True);
+    If (SY < 0) Or (SY >= Gc^.BH) Then Continue;
+    A := MemL[0:Gc^.RT + 76] + SY * MemL[0:Gc^.RT + 72];
+    For I := 0 To W - 1 Do
+    Begin
+      If (X + I < 0) Or (X + I >= Gc^.BW) Then C := 0
+      Else C := MemL[0:A + (X + I) * 4];
+      Case F Of
+        $80E0, $80E1 :
+        Begin
+          Mem[0:D] := C; Mem[0:D + 1] := C Shr 8; Mem[0:D + 2] := C Shr 16;
+          If B = 4 Then Mem[0:D + 3] := 255;
+        End;
+      Else
+        Begin
+          Mem[0:D] := C Shr 16;
+          If B > 1 Then Mem[0:D + 1] := C Shr 8;
+          If B > 2 Then Mem[0:D + 2] := C;
+          If B > 3 Then Mem[0:D + 3] := 255;
+        End;
+      End;
+      D := D + B;
+    End;
+  End;
+End;
+
+Procedure glDrawPixels(W, H, F, T, P : LongInt);
+Var I, J, A, D, X0, Y0, SY, B, C : LongInt;
+Begin
+  GlTr(143);
+  If Not GlOk Or (P = 0) Or (Gc^.RT = 0) Then Exit;
+  X0 := DRound(Gc^.RPos[0]); Y0 := DRound(Gc^.RPos[1]);
+  B := GlPixBytes(F, T);
+  For J := 0 To H - 1 Do
+  Begin
+    SY := Gc^.BH - 1 - (Y0 + J);
+    If (SY < 0) Or (SY >= Gc^.BH) Then Continue;
+    A := GlRowAdr(P, W, J, F, T, False);
+    D := MemL[0:Gc^.RT + 76] + SY * MemL[0:Gc^.RT + 72];
+    For I := 0 To W - 1 Do
+      If (X0 + I >= 0) And (X0 + I < Gc^.BW) Then
+      Begin
+        C := GlRdPix(A + I * B, F, T);
+        If (Gc^.S.AlOn = 0) Or (((C Shr 24) And 255) > 0) Then
+          MemL[0:D + (X0 + I) * 4] := C And $FFFFFF;
+      End;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Pile d'attributs                                                   }
+{ ------------------------------------------------------------------ }
+
+Procedure glPushAttrib(M : LongInt);
+Begin
+  GlTr(144);
+  If Not GlOk Then Exit;
+  If Gc^.ASp >= 8 Then
+  Begin
+    GlErr($503);
+    Exit;
+  End;
+  Gc^.AStk[Gc^.ASp] := Gc^.S;
+  Inc(Gc^.ASp);
+End;
+
+Procedure glPopAttrib;
+Begin
+  GlTr(145);
+  If Not GlOk Then Exit;
+  If Gc^.ASp <= 0 Then
+  Begin
+    GlErr($504);
+    Exit;
+  End;
+  Dec(Gc^.ASp);
+  Gc^.S := Gc^.AStk[Gc^.ASp];
+End;
+
+Procedure glPushClientAttrib(M : LongInt);
+Begin
+  GlTr(146);
+  If Not GlOk Then Exit;
+  If Gc^.CSp >= 4 Then
+  Begin
+    GlErr($503);
+    Exit;
+  End;
+  Gc^.CStk[Gc^.CSp] := Gc^.CA;
+  Inc(Gc^.CSp);
+End;
+
+Procedure glPopClientAttrib;
+Begin
+  GlTr(147);
+  If Not GlOk Then Exit;
+  If Gc^.CSp <= 0 Then
+  Begin
+    GlErr($504);
+    Exit;
+  End;
+  Dec(Gc^.CSp);
+  Gc^.CA := Gc^.CStk[Gc^.CSp];
+End;
+
+{ ------------------------------------------------------------------ }
+{ Interrogations                                                     }
+{ ------------------------------------------------------------------ }
+
+Var
+  GlQv : Array[0..15] Of Double;
+
+{ valeurs de l'etat N dans GlQv ; resultat : nombre (0 : inconnu) }
+Function GlQuery(N : LongInt) : LongInt;
+Var K, C : LongInt; M : TMat;
+Begin
+  GlQuery := 1;
+  For K := 0 To 15 Do GlQv[K] := 0;
+  C := 1;
+  Case N Of
+    $0BA2 :
+    Begin
+      GlQv[0] := Gc^.S.VpX; GlQv[1] := Gc^.S.VpY;
+      GlQv[2] := Gc^.S.VpW; GlQv[3] := Gc^.S.VpH; C := 4;
+    End;
+    $0C10 :
+    Begin
+      GlQv[0] := Gc^.S.ScX; GlQv[1] := Gc^.S.ScY;
+      GlQv[2] := Gc^.S.ScW; GlQv[3] := Gc^.S.ScH; C := 4;
+    End;
+    $0BA6, $0BA7, $0BA8 :
+    Begin
+      Case N Of
+        $0BA6 : M := Gc^.MV[Gc^.MVTop];
+        $0BA7 : M := Gc^.PR[Gc^.PRTop];
+      Else
+        M := Gc^.TX[Gc^.TXTop];
+      End;
+      For K := 0 To 15 Do GlQv[K] := M[K];
+      C := 16;
+    End;
+    $0BA0 : GlQv[0] := Gc^.MMode;
+    $0BA3 : GlQv[0] := Gc^.MVTop + 1;
+    $0BA4 : GlQv[0] := Gc^.PRTop + 1;
+    $0BA5 : GlQv[0] := Gc^.TXTop + 1;
+    $0D33 : GlQv[0] := 1024;
+    $0D31 : GlQv[0] := 8;
+    $0D32 : GlQv[0] := 6;
+    $0D36 : GlQv[0] := 32;
+    $0D38, $0D39 : GlQv[0] := 4;
+    $0D35 : GlQv[0] := 8;
+    $0D3B : GlQv[0] := 4;
+    $0D3A :
+    Begin
+      GlQv[0] := 2048; GlQv[1] := 2048; C := 2;
+    End;
+    $0D52, $0D53, $0D54 : GlQv[0] := 8;
+    $0D55, $0D57..$0D5B, $0D51 : GlQv[0] := 0;
+    $0D50 : GlQv[0] := 4;
+    $0D56 : GlQv[0] := 24;
+    $0C32 : GlQv[0] := 1;
+    $0C33 : GlQv[0] := 0;
+    $84E2 : GlQv[0] := 2;
+    $86A2 : GlQv[0] := 0;
+    $8069 : GlQv[0] := Gc^.S.Bound[Gc^.S.ActTex];
+    $84E0 : GlQv[0] := $84C0 + Gc^.S.ActTex;
+    $84E1 : GlQv[0] := $84C0 + Gc^.CA.CliTex;
+    $0CF5 : GlQv[0] := Gc^.CA.UnpA;
+    $0D05 : GlQv[0] := Gc^.CA.PackA;
+    $0B70 :
+    Begin
+      GlQv[0] := Gc^.S.DNear; GlQv[1] := Gc^.S.DFar; C := 2;
+    End;
+    $0C22 :
+    Begin
+      For K := 0 To 3 Do GlQv[K] := Gc^.S.ClrC[K];
+      C := 4;
+    End;
+    $0B73 : GlQv[0] := Gc^.S.ClrZ;
+    $0B00 :
+    Begin
+      For K := 0 To 3 Do GlQv[K] := Gc^.S.Col[K];
+      C := 4;
+    End;
+    $0B02 :
+    Begin
+      For K := 0 To 2 Do GlQv[K] := Gc^.S.Nrm[K];
+      C := 3;
+    End;
+    $0B03 :
+    Begin
+      For K := 0 To 3 Do GlQv[K] := Gc^.S.Tc0[K];
+      C := 4;
+    End;
+    $0B74 : GlQv[0] := Gc^.S.DepFn;
+    $0B72 : GlQv[0] := Gc^.S.DepMsk;
+    $0BE1 : GlQv[0] := Gc^.S.BlSrc;
+    $0BE0 : GlQv[0] := Gc^.S.BlDst;
+    $0BC1 : GlQv[0] := Gc^.S.AlFn;
+    $0BC2 : GlQv[0] := Gc^.S.AlRef;
+    $0B45 : GlQv[0] := Gc^.S.CullMd;
+    $0B46 : GlQv[0] := Gc^.S.Front;
+    $0B54 : GlQv[0] := Gc^.S.Shade;
+    $0B07 :
+    Begin
+      GlQv[0] := Gc^.RPos[0]; GlQv[1] := Gc^.RPos[1]; GlQv[3] := 1; C := 4;
+    End;
+    $0B08 : GlQv[0] := 1;
+    $0B11, $0B21 : GlQv[0] := 1;
+    $0B12, $0B22 :
+    Begin
+      GlQv[0] := 1; GlQv[1] := 64; C := 2;
+    End;
+  Else
+    Begin
+      C := 1;
+      GlQv[0] := GlCapOn(N);
+    End;
+  End;
+  GlQuery := C;
+End;
+
+Procedure glGetIntegerv(N, P : LongInt);
+Var K, C : LongInt;
+Begin
+  GlTr(148);
+  If Not GlOk Or (P = 0) Then Exit;
+  C := GlQuery(N);
+  For K := 0 To C - 1 Do MemL[0:P + K * 4] := DRound(GlQv[K]);
+End;
+
+Procedure glGetFloatv(N, P : LongInt);
+Var K, C : LongInt;
+Begin
+  GlTr(149);
+  If Not GlOk Or (P = 0) Then Exit;
+  C := GlQuery(N);
+  For K := 0 To C - 1 Do MemL[0:P + K * 4] := LFl(GlQv[K]);
+End;
+
+Procedure glGetDoublev(N, P : LongInt);
+Var K, C : LongInt;
+Begin
+  GlTr(150);
+  If Not GlOk Or (P = 0) Then Exit;
+  C := GlQuery(N);
+  For K := 0 To C - 1 Do DbPut(P + K * 8, GlQv[K]);
+End;
+
+Procedure glGetBooleanv(N, P : LongInt);
+Var K, C : LongInt;
+Begin
+  GlTr(151);
+  If Not GlOk Or (P = 0) Then Exit;
+  C := GlQuery(N);
+  For K := 0 To C - 1 Do Mem[0:P + K] := Ord(GlQv[K] <> 0);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Listes d'affichage : non enregistrees (signalees)                  }
+{ ------------------------------------------------------------------ }
+
+Var
+  GlListN : LongInt;
+
+Function glGenLists(N : LongInt) : LongInt;
+Begin
+  GlTr(152);
+  GlTodo('glGenLists');
+  glGenLists := GlListN + 1;
+  GlListN := GlListN + N;
+End;
+
+Procedure glNewList(L, M : LongInt);
+Begin
+  GlTr(153);
+  GlTodo('glNewList');
+End;
+
+Procedure glEndList;
+Begin
+  GlTr(154);
+End;
+
+Procedure glCallList(L : LongInt);
+Begin
+  GlTr(155);
+End;
+
+Procedure glCallLists(N, T, P : LongInt);
+Begin
+  GlTr(156);
+End;
+
+Procedure glDeleteLists(L, N : LongInt);
+Begin
+  GlTr(157);
+End;
+
+Function glIsList(L : LongInt) : LongInt;
+Begin
+  GlTr(158);
+  glIsList := Ord((L > 0) And (L <= GlListN));
+End;
+
+Procedure glListBase(B : LongInt);
+Begin
+  GlTr(159);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Variantes (fichier genere : types et nombres de composantes)       }
+{ ------------------------------------------------------------------ }
+
+Function GlB(V : LongInt) : LongInt;
+Begin
+  V := V And 255;
+  If V > 127 Then V := V - 256;
+  GlB := V;
+End;
+
+Function GlS(V : LongInt) : LongInt;
+Begin
+  V := V And $FFFF;
+  If V > 32767 Then V := V - 65536;
+  GlS := V;
+End;
+
+Function GlUI(V : LongInt) : Double;
+Begin
+  If V < 0 Then GlUI := V + 4294967296.0 Else GlUI := V;
+End;
+
+Procedure glVertex2d(XL, XH, YL, YH : LongInt);
+Begin
+  GlTr(160);
+  GlSetV(DblOf(XL, XH), DblOf(YL, YH), 0, 1);
+End;
+
+Procedure glVertex2dv(P : LongInt);
+Begin
+  GlTr(161);
+  If P = 0 Then Exit;
+  GlSetV(DbM(P), DbM(P + 8), 0, 1);
+End;
+
+Procedure glVertex2f(X, Y : LongInt);
+Begin
+  GlTr(162);
+  GlSetV(FlL(X), FlL(Y), 0, 1);
+End;
+
+Procedure glVertex2fv(P : LongInt);
+Begin
+  GlTr(163);
+  If P = 0 Then Exit;
+  GlSetV(FlM(P), FlM(P + 4), 0, 1);
+End;
+
+Procedure glVertex2i(X, Y : LongInt);
+Begin
+  GlTr(164);
+  GlSetV(X, Y, 0, 1);
+End;
+
+Procedure glVertex2iv(P : LongInt);
+Begin
+  GlTr(165);
+  If P = 0 Then Exit;
+  GlSetV(MemL[0:P], MemL[0:P + 4], 0, 1);
+End;
+
+Procedure glVertex2s(X, Y : LongInt);
+Begin
+  GlTr(166);
+  GlSetV(GlS(X), GlS(Y), 0, 1);
+End;
+
+Procedure glVertex2sv(P : LongInt);
+Begin
+  GlTr(167);
+  If P = 0 Then Exit;
+  GlSetV(GlS(MemW[0:P]), GlS(MemW[0:P + 2]), 0, 1);
+End;
+
+Procedure glVertex3d(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(168);
+  GlSetV(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), 1);
+End;
+
+Procedure glVertex3dv(P : LongInt);
+Begin
+  GlTr(169);
+  If P = 0 Then Exit;
+  GlSetV(DbM(P), DbM(P + 8), DbM(P + 16), 1);
+End;
+
+Procedure glVertex3f(X, Y, Z : LongInt);
+Begin
+  GlTr(170);
+  GlSetV(FlL(X), FlL(Y), FlL(Z), 1);
+End;
+
+Procedure glVertex3fv(P : LongInt);
+Begin
+  GlTr(171);
+  If P = 0 Then Exit;
+  GlSetV(FlM(P), FlM(P + 4), FlM(P + 8), 1);
+End;
+
+Procedure glVertex3i(X, Y, Z : LongInt);
+Begin
+  GlTr(172);
+  GlSetV(X, Y, Z, 1);
+End;
+
+Procedure glVertex3iv(P : LongInt);
+Begin
+  GlTr(173);
+  If P = 0 Then Exit;
+  GlSetV(MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], 1);
+End;
+
+Procedure glVertex3s(X, Y, Z : LongInt);
+Begin
+  GlTr(174);
+  GlSetV(GlS(X), GlS(Y), GlS(Z), 1);
+End;
+
+Procedure glVertex3sv(P : LongInt);
+Begin
+  GlTr(175);
+  If P = 0 Then Exit;
+  GlSetV(GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]), 1);
+End;
+
+Procedure glVertex4d(XL, XH, YL, YH, ZL, ZH, WL, WH : LongInt);
+Begin
+  GlTr(176);
+  GlSetV(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), DblOf(WL, WH));
+End;
+
+Procedure glVertex4dv(P : LongInt);
+Begin
+  GlTr(177);
+  If P = 0 Then Exit;
+  GlSetV(DbM(P), DbM(P + 8), DbM(P + 16), DbM(P + 24));
+End;
+
+Procedure glVertex4f(X, Y, Z, W : LongInt);
+Begin
+  GlTr(178);
+  GlSetV(FlL(X), FlL(Y), FlL(Z), FlL(W));
+End;
+
+Procedure glVertex4fv(P : LongInt);
+Begin
+  GlTr(179);
+  If P = 0 Then Exit;
+  GlSetV(FlM(P), FlM(P + 4), FlM(P + 8), FlM(P + 12));
+End;
+
+Procedure glVertex4i(X, Y, Z, W : LongInt);
+Begin
+  GlTr(180);
+  GlSetV(X, Y, Z, W);
+End;
+
+Procedure glVertex4iv(P : LongInt);
+Begin
+  GlTr(181);
+  If P = 0 Then Exit;
+  GlSetV(MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], MemL[0:P + 12]);
+End;
+
+Procedure glVertex4s(X, Y, Z, W : LongInt);
+Begin
+  GlTr(182);
+  GlSetV(GlS(X), GlS(Y), GlS(Z), GlS(W));
+End;
+
+Procedure glVertex4sv(P : LongInt);
+Begin
+  GlTr(183);
+  If P = 0 Then Exit;
+  GlSetV(GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]),
+      GlS(MemW[0:P + 6]));
+End;
+
+Procedure glColor3b(X, Y, Z : LongInt);
+Begin
+  GlTr(184);
+  GlSetC((GlB(X) / 127), (GlB(Y) / 127), (GlB(Z) / 127), 1);
+End;
+
+Procedure glColor3bv(P : LongInt);
+Begin
+  GlTr(185);
+  If P = 0 Then Exit;
+  GlSetC((GlB(Mem[0:P]) / 127), (GlB(Mem[0:P + 1]) / 127),
+      (GlB(Mem[0:P + 2]) / 127), 1);
+End;
+
+Procedure glColor3d(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(186);
+  GlSetC(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), 1);
+End;
+
+Procedure glColor3dv(P : LongInt);
+Begin
+  GlTr(187);
+  If P = 0 Then Exit;
+  GlSetC(DbM(P), DbM(P + 8), DbM(P + 16), 1);
+End;
+
+Procedure glColor3f(X, Y, Z : LongInt);
+Begin
+  GlTr(188);
+  GlSetC(FlL(X), FlL(Y), FlL(Z), 1);
+End;
+
+Procedure glColor3fv(P : LongInt);
+Begin
+  GlTr(189);
+  If P = 0 Then Exit;
+  GlSetC(FlM(P), FlM(P + 4), FlM(P + 8), 1);
+End;
+
+Procedure glColor3i(X, Y, Z : LongInt);
+Begin
+  GlTr(190);
+  GlSetC((X / 2147483647.0), (Y / 2147483647.0), (Z / 2147483647.0), 1);
+End;
+
+Procedure glColor3iv(P : LongInt);
+Begin
+  GlTr(191);
+  If P = 0 Then Exit;
+  GlSetC((MemL[0:P] / 2147483647.0), (MemL[0:P + 4] / 2147483647.0),
+      (MemL[0:P + 8] / 2147483647.0), 1);
+End;
+
+Procedure glColor3s(X, Y, Z : LongInt);
+Begin
+  GlTr(192);
+  GlSetC((GlS(X) / 32767), (GlS(Y) / 32767), (GlS(Z) / 32767), 1);
+End;
+
+Procedure glColor3sv(P : LongInt);
+Begin
+  GlTr(193);
+  If P = 0 Then Exit;
+  GlSetC((GlS(MemW[0:P]) / 32767), (GlS(MemW[0:P + 2]) / 32767),
+      (GlS(MemW[0:P + 4]) / 32767), 1);
+End;
+
+Procedure glColor3ub(X, Y, Z : LongInt);
+Begin
+  GlTr(194);
+  GlSetC(((X And 255) / 255), ((Y And 255) / 255), ((Z And 255) / 255), 1);
+End;
+
+Procedure glColor3ubv(P : LongInt);
+Begin
+  GlTr(195);
+  If P = 0 Then Exit;
+  GlSetC(((Mem[0:P] And 255) / 255), ((Mem[0:P + 1] And 255) / 255),
+      ((Mem[0:P + 2] And 255) / 255), 1);
+End;
+
+Procedure glColor3ui(X, Y, Z : LongInt);
+Begin
+  GlTr(196);
+  GlSetC((GlUI(X) / 4294967295.0), (GlUI(Y) / 4294967295.0),
+      (GlUI(Z) / 4294967295.0), 1);
+End;
+
+Procedure glColor3uiv(P : LongInt);
+Begin
+  GlTr(197);
+  If P = 0 Then Exit;
+  GlSetC((GlUI(MemL[0:P]) / 4294967295.0),
+      (GlUI(MemL[0:P + 4]) / 4294967295.0),
+      (GlUI(MemL[0:P + 8]) / 4294967295.0), 1);
+End;
+
+Procedure glColor3us(X, Y, Z : LongInt);
+Begin
+  GlTr(198);
+  GlSetC(((X And $FFFF) / 65535), ((Y And $FFFF) / 65535),
+      ((Z And $FFFF) / 65535), 1);
+End;
+
+Procedure glColor3usv(P : LongInt);
+Begin
+  GlTr(199);
+  If P = 0 Then Exit;
+  GlSetC(((MemW[0:P] And $FFFF) / 65535),
+      ((MemW[0:P + 2] And $FFFF) / 65535),
+      ((MemW[0:P + 4] And $FFFF) / 65535), 1);
+End;
+
+Procedure glColor4b(X, Y, Z, W : LongInt);
+Begin
+  GlTr(200);
+  GlSetC((GlB(X) / 127), (GlB(Y) / 127), (GlB(Z) / 127), (GlB(W) / 127));
+End;
+
+Procedure glColor4bv(P : LongInt);
+Begin
+  GlTr(201);
+  If P = 0 Then Exit;
+  GlSetC((GlB(Mem[0:P]) / 127), (GlB(Mem[0:P + 1]) / 127),
+      (GlB(Mem[0:P + 2]) / 127), (GlB(Mem[0:P + 3]) / 127));
+End;
+
+Procedure glColor4d(XL, XH, YL, YH, ZL, ZH, WL, WH : LongInt);
+Begin
+  GlTr(202);
+  GlSetC(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), DblOf(WL, WH));
+End;
+
+Procedure glColor4dv(P : LongInt);
+Begin
+  GlTr(203);
+  If P = 0 Then Exit;
+  GlSetC(DbM(P), DbM(P + 8), DbM(P + 16), DbM(P + 24));
+End;
+
+Procedure glColor4f(X, Y, Z, W : LongInt);
+Begin
+  GlTr(204);
+  GlSetC(FlL(X), FlL(Y), FlL(Z), FlL(W));
+End;
+
+Procedure glColor4fv(P : LongInt);
+Begin
+  GlTr(205);
+  If P = 0 Then Exit;
+  GlSetC(FlM(P), FlM(P + 4), FlM(P + 8), FlM(P + 12));
+End;
+
+Procedure glColor4i(X, Y, Z, W : LongInt);
+Begin
+  GlTr(206);
+  GlSetC((X / 2147483647.0), (Y / 2147483647.0), (Z / 2147483647.0),
+      (W / 2147483647.0));
+End;
+
+Procedure glColor4iv(P : LongInt);
+Begin
+  GlTr(207);
+  If P = 0 Then Exit;
+  GlSetC((MemL[0:P] / 2147483647.0), (MemL[0:P + 4] / 2147483647.0),
+      (MemL[0:P + 8] / 2147483647.0), (MemL[0:P + 12] / 2147483647.0));
+End;
+
+Procedure glColor4s(X, Y, Z, W : LongInt);
+Begin
+  GlTr(208);
+  GlSetC((GlS(X) / 32767), (GlS(Y) / 32767), (GlS(Z) / 32767),
+      (GlS(W) / 32767));
+End;
+
+Procedure glColor4sv(P : LongInt);
+Begin
+  GlTr(209);
+  If P = 0 Then Exit;
+  GlSetC((GlS(MemW[0:P]) / 32767), (GlS(MemW[0:P + 2]) / 32767),
+      (GlS(MemW[0:P + 4]) / 32767), (GlS(MemW[0:P + 6]) / 32767));
+End;
+
+Procedure glColor4ub(X, Y, Z, W : LongInt);
+Begin
+  GlTr(210);
+  GlSetC(((X And 255) / 255), ((Y And 255) / 255), ((Z And 255) / 255),
+      ((W And 255) / 255));
+End;
+
+Procedure glColor4ubv(P : LongInt);
+Begin
+  GlTr(211);
+  If P = 0 Then Exit;
+  GlSetC(((Mem[0:P] And 255) / 255), ((Mem[0:P + 1] And 255) / 255),
+      ((Mem[0:P + 2] And 255) / 255), ((Mem[0:P + 3] And 255) / 255));
+End;
+
+Procedure glColor4ui(X, Y, Z, W : LongInt);
+Begin
+  GlTr(212);
+  GlSetC((GlUI(X) / 4294967295.0), (GlUI(Y) / 4294967295.0),
+      (GlUI(Z) / 4294967295.0), (GlUI(W) / 4294967295.0));
+End;
+
+Procedure glColor4uiv(P : LongInt);
+Begin
+  GlTr(213);
+  If P = 0 Then Exit;
+  GlSetC((GlUI(MemL[0:P]) / 4294967295.0),
+      (GlUI(MemL[0:P + 4]) / 4294967295.0),
+      (GlUI(MemL[0:P + 8]) / 4294967295.0),
+      (GlUI(MemL[0:P + 12]) / 4294967295.0));
+End;
+
+Procedure glColor4us(X, Y, Z, W : LongInt);
+Begin
+  GlTr(214);
+  GlSetC(((X And $FFFF) / 65535), ((Y And $FFFF) / 65535),
+      ((Z And $FFFF) / 65535), ((W And $FFFF) / 65535));
+End;
+
+Procedure glColor4usv(P : LongInt);
+Begin
+  GlTr(215);
+  If P = 0 Then Exit;
+  GlSetC(((MemW[0:P] And $FFFF) / 65535),
+      ((MemW[0:P + 2] And $FFFF) / 65535),
+      ((MemW[0:P + 4] And $FFFF) / 65535),
+      ((MemW[0:P + 6] And $FFFF) / 65535));
+End;
+
+Procedure glNormal3b(X, Y, Z : LongInt);
+Begin
+  GlTr(216);
+  GlSetN((GlB(X) / 127), (GlB(Y) / 127), (GlB(Z) / 127));
+End;
+
+Procedure glNormal3bv(P : LongInt);
+Begin
+  GlTr(217);
+  If P = 0 Then Exit;
+  GlSetN((GlB(Mem[0:P]) / 127), (GlB(Mem[0:P + 1]) / 127),
+      (GlB(Mem[0:P + 2]) / 127));
+End;
+
+Procedure glNormal3d(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(218);
+  GlSetN(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH));
+End;
+
+Procedure glNormal3dv(P : LongInt);
+Begin
+  GlTr(219);
+  If P = 0 Then Exit;
+  GlSetN(DbM(P), DbM(P + 8), DbM(P + 16));
+End;
+
+Procedure glNormal3f(X, Y, Z : LongInt);
+Begin
+  GlTr(220);
+  GlSetN(FlL(X), FlL(Y), FlL(Z));
+End;
+
+Procedure glNormal3fv(P : LongInt);
+Begin
+  GlTr(221);
+  If P = 0 Then Exit;
+  GlSetN(FlM(P), FlM(P + 4), FlM(P + 8));
+End;
+
+Procedure glNormal3i(X, Y, Z : LongInt);
+Begin
+  GlTr(222);
+  GlSetN((X / 2147483647.0), (Y / 2147483647.0), (Z / 2147483647.0));
+End;
+
+Procedure glNormal3iv(P : LongInt);
+Begin
+  GlTr(223);
+  If P = 0 Then Exit;
+  GlSetN((MemL[0:P] / 2147483647.0), (MemL[0:P + 4] / 2147483647.0),
+      (MemL[0:P + 8] / 2147483647.0));
+End;
+
+Procedure glNormal3s(X, Y, Z : LongInt);
+Begin
+  GlTr(224);
+  GlSetN((GlS(X) / 32767), (GlS(Y) / 32767), (GlS(Z) / 32767));
+End;
+
+Procedure glNormal3sv(P : LongInt);
+Begin
+  GlTr(225);
+  If P = 0 Then Exit;
+  GlSetN((GlS(MemW[0:P]) / 32767), (GlS(MemW[0:P + 2]) / 32767),
+      (GlS(MemW[0:P + 4]) / 32767));
+End;
+
+Procedure glTexCoord1d(XL, XH : LongInt);
+Begin
+  GlTr(226);
+  GlSetT(0, DblOf(XL, XH), 0, 0, 1);
+End;
+
+Procedure glTexCoord1dv(P : LongInt);
+Begin
+  GlTr(227);
+  If P = 0 Then Exit;
+  GlSetT(0, DbM(P), 0, 0, 1);
+End;
+
+Procedure glTexCoord1f(X : LongInt);
+Begin
+  GlTr(228);
+  GlSetT(0, FlL(X), 0, 0, 1);
+End;
+
+Procedure glTexCoord1fv(P : LongInt);
+Begin
+  GlTr(229);
+  If P = 0 Then Exit;
+  GlSetT(0, FlM(P), 0, 0, 1);
+End;
+
+Procedure glTexCoord1i(X : LongInt);
+Begin
+  GlTr(230);
+  GlSetT(0, X, 0, 0, 1);
+End;
+
+Procedure glTexCoord1iv(P : LongInt);
+Begin
+  GlTr(231);
+  If P = 0 Then Exit;
+  GlSetT(0, MemL[0:P], 0, 0, 1);
+End;
+
+Procedure glTexCoord1s(X : LongInt);
+Begin
+  GlTr(232);
+  GlSetT(0, GlS(X), 0, 0, 1);
+End;
+
+Procedure glTexCoord1sv(P : LongInt);
+Begin
+  GlTr(233);
+  If P = 0 Then Exit;
+  GlSetT(0, GlS(MemW[0:P]), 0, 0, 1);
+End;
+
+Procedure glTexCoord2d(XL, XH, YL, YH : LongInt);
+Begin
+  GlTr(234);
+  GlSetT(0, DblOf(XL, XH), DblOf(YL, YH), 0, 1);
+End;
+
+Procedure glTexCoord2dv(P : LongInt);
+Begin
+  GlTr(235);
+  If P = 0 Then Exit;
+  GlSetT(0, DbM(P), DbM(P + 8), 0, 1);
+End;
+
+Procedure glTexCoord2f(X, Y : LongInt);
+Begin
+  GlTr(236);
+  GlSetT(0, FlL(X), FlL(Y), 0, 1);
+End;
+
+Procedure glTexCoord2fv(P : LongInt);
+Begin
+  GlTr(237);
+  If P = 0 Then Exit;
+  GlSetT(0, FlM(P), FlM(P + 4), 0, 1);
+End;
+
+Procedure glTexCoord2i(X, Y : LongInt);
+Begin
+  GlTr(238);
+  GlSetT(0, X, Y, 0, 1);
+End;
+
+Procedure glTexCoord2iv(P : LongInt);
+Begin
+  GlTr(239);
+  If P = 0 Then Exit;
+  GlSetT(0, MemL[0:P], MemL[0:P + 4], 0, 1);
+End;
+
+Procedure glTexCoord2s(X, Y : LongInt);
+Begin
+  GlTr(240);
+  GlSetT(0, GlS(X), GlS(Y), 0, 1);
+End;
+
+Procedure glTexCoord2sv(P : LongInt);
+Begin
+  GlTr(241);
+  If P = 0 Then Exit;
+  GlSetT(0, GlS(MemW[0:P]), GlS(MemW[0:P + 2]), 0, 1);
+End;
+
+Procedure glTexCoord3d(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(242);
+  GlSetT(0, DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), 1);
+End;
+
+Procedure glTexCoord3dv(P : LongInt);
+Begin
+  GlTr(243);
+  If P = 0 Then Exit;
+  GlSetT(0, DbM(P), DbM(P + 8), DbM(P + 16), 1);
+End;
+
+Procedure glTexCoord3f(X, Y, Z : LongInt);
+Begin
+  GlTr(244);
+  GlSetT(0, FlL(X), FlL(Y), FlL(Z), 1);
+End;
+
+Procedure glTexCoord3fv(P : LongInt);
+Begin
+  GlTr(245);
+  If P = 0 Then Exit;
+  GlSetT(0, FlM(P), FlM(P + 4), FlM(P + 8), 1);
+End;
+
+Procedure glTexCoord3i(X, Y, Z : LongInt);
+Begin
+  GlTr(246);
+  GlSetT(0, X, Y, Z, 1);
+End;
+
+Procedure glTexCoord3iv(P : LongInt);
+Begin
+  GlTr(247);
+  If P = 0 Then Exit;
+  GlSetT(0, MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], 1);
+End;
+
+Procedure glTexCoord3s(X, Y, Z : LongInt);
+Begin
+  GlTr(248);
+  GlSetT(0, GlS(X), GlS(Y), GlS(Z), 1);
+End;
+
+Procedure glTexCoord3sv(P : LongInt);
+Begin
+  GlTr(249);
+  If P = 0 Then Exit;
+  GlSetT(0, GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]), 1);
+End;
+
+Procedure glTexCoord4d(XL, XH, YL, YH, ZL, ZH, WL, WH : LongInt);
+Begin
+  GlTr(250);
+  GlSetT(0, DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), DblOf(WL, WH));
+End;
+
+Procedure glTexCoord4dv(P : LongInt);
+Begin
+  GlTr(251);
+  If P = 0 Then Exit;
+  GlSetT(0, DbM(P), DbM(P + 8), DbM(P + 16), DbM(P + 24));
+End;
+
+Procedure glTexCoord4f(X, Y, Z, W : LongInt);
+Begin
+  GlTr(252);
+  GlSetT(0, FlL(X), FlL(Y), FlL(Z), FlL(W));
+End;
+
+Procedure glTexCoord4fv(P : LongInt);
+Begin
+  GlTr(253);
+  If P = 0 Then Exit;
+  GlSetT(0, FlM(P), FlM(P + 4), FlM(P + 8), FlM(P + 12));
+End;
+
+Procedure glTexCoord4i(X, Y, Z, W : LongInt);
+Begin
+  GlTr(254);
+  GlSetT(0, X, Y, Z, W);
+End;
+
+Procedure glTexCoord4iv(P : LongInt);
+Begin
+  GlTr(255);
+  If P = 0 Then Exit;
+  GlSetT(0, MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], MemL[0:P + 12]);
+End;
+
+Procedure glTexCoord4s(X, Y, Z, W : LongInt);
+Begin
+  GlTr(256);
+  GlSetT(0, GlS(X), GlS(Y), GlS(Z), GlS(W));
+End;
+
+Procedure glTexCoord4sv(P : LongInt);
+Begin
+  GlTr(257);
+  If P = 0 Then Exit;
+  GlSetT(0, GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]),
+      GlS(MemW[0:P + 6]));
+End;
+
+Procedure glRasterPos2d(XL, XH, YL, YH : LongInt);
+Begin
+  GlTr(258);
+  GlSetR(DblOf(XL, XH), DblOf(YL, YH), 0, 1);
+End;
+
+Procedure glRasterPos2dv(P : LongInt);
+Begin
+  GlTr(259);
+  If P = 0 Then Exit;
+  GlSetR(DbM(P), DbM(P + 8), 0, 1);
+End;
+
+Procedure glRasterPos2f(X, Y : LongInt);
+Begin
+  GlTr(260);
+  GlSetR(FlL(X), FlL(Y), 0, 1);
+End;
+
+Procedure glRasterPos2fv(P : LongInt);
+Begin
+  GlTr(261);
+  If P = 0 Then Exit;
+  GlSetR(FlM(P), FlM(P + 4), 0, 1);
+End;
+
+Procedure glRasterPos2i(X, Y : LongInt);
+Begin
+  GlTr(262);
+  GlSetR(X, Y, 0, 1);
+End;
+
+Procedure glRasterPos2iv(P : LongInt);
+Begin
+  GlTr(263);
+  If P = 0 Then Exit;
+  GlSetR(MemL[0:P], MemL[0:P + 4], 0, 1);
+End;
+
+Procedure glRasterPos2s(X, Y : LongInt);
+Begin
+  GlTr(264);
+  GlSetR(GlS(X), GlS(Y), 0, 1);
+End;
+
+Procedure glRasterPos2sv(P : LongInt);
+Begin
+  GlTr(265);
+  If P = 0 Then Exit;
+  GlSetR(GlS(MemW[0:P]), GlS(MemW[0:P + 2]), 0, 1);
+End;
+
+Procedure glRasterPos3d(XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(266);
+  GlSetR(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), 1);
+End;
+
+Procedure glRasterPos3dv(P : LongInt);
+Begin
+  GlTr(267);
+  If P = 0 Then Exit;
+  GlSetR(DbM(P), DbM(P + 8), DbM(P + 16), 1);
+End;
+
+Procedure glRasterPos3f(X, Y, Z : LongInt);
+Begin
+  GlTr(268);
+  GlSetR(FlL(X), FlL(Y), FlL(Z), 1);
+End;
+
+Procedure glRasterPos3fv(P : LongInt);
+Begin
+  GlTr(269);
+  If P = 0 Then Exit;
+  GlSetR(FlM(P), FlM(P + 4), FlM(P + 8), 1);
+End;
+
+Procedure glRasterPos3i(X, Y, Z : LongInt);
+Begin
+  GlTr(270);
+  GlSetR(X, Y, Z, 1);
+End;
+
+Procedure glRasterPos3iv(P : LongInt);
+Begin
+  GlTr(271);
+  If P = 0 Then Exit;
+  GlSetR(MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], 1);
+End;
+
+Procedure glRasterPos3s(X, Y, Z : LongInt);
+Begin
+  GlTr(272);
+  GlSetR(GlS(X), GlS(Y), GlS(Z), 1);
+End;
+
+Procedure glRasterPos3sv(P : LongInt);
+Begin
+  GlTr(273);
+  If P = 0 Then Exit;
+  GlSetR(GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]), 1);
+End;
+
+Procedure glRasterPos4d(XL, XH, YL, YH, ZL, ZH, WL, WH : LongInt);
+Begin
+  GlTr(274);
+  GlSetR(DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), DblOf(WL, WH));
+End;
+
+Procedure glRasterPos4dv(P : LongInt);
+Begin
+  GlTr(275);
+  If P = 0 Then Exit;
+  GlSetR(DbM(P), DbM(P + 8), DbM(P + 16), DbM(P + 24));
+End;
+
+Procedure glRasterPos4f(X, Y, Z, W : LongInt);
+Begin
+  GlTr(276);
+  GlSetR(FlL(X), FlL(Y), FlL(Z), FlL(W));
+End;
+
+Procedure glRasterPos4fv(P : LongInt);
+Begin
+  GlTr(277);
+  If P = 0 Then Exit;
+  GlSetR(FlM(P), FlM(P + 4), FlM(P + 8), FlM(P + 12));
+End;
+
+Procedure glRasterPos4i(X, Y, Z, W : LongInt);
+Begin
+  GlTr(278);
+  GlSetR(X, Y, Z, W);
+End;
+
+Procedure glRasterPos4iv(P : LongInt);
+Begin
+  GlTr(279);
+  If P = 0 Then Exit;
+  GlSetR(MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], MemL[0:P + 12]);
+End;
+
+Procedure glRasterPos4s(X, Y, Z, W : LongInt);
+Begin
+  GlTr(280);
+  GlSetR(GlS(X), GlS(Y), GlS(Z), GlS(W));
+End;
+
+Procedure glRasterPos4sv(P : LongInt);
+Begin
+  GlTr(281);
+  If P = 0 Then Exit;
+  GlSetR(GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]),
+      GlS(MemW[0:P + 6]));
+End;
+
+Procedure glMultiTexCoord1dARB(U, XL, XH : LongInt);
+Begin
+  GlTr(282);
+  GlSetT(U - $84C0, DblOf(XL, XH), 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1dvARB(U, P : LongInt);
+Begin
+  GlTr(283);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, DbM(P), 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1fARB(U, X : LongInt);
+Begin
+  GlTr(284);
+  GlSetT(U - $84C0, FlL(X), 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1fvARB(U, P : LongInt);
+Begin
+  GlTr(285);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, FlM(P), 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1iARB(U, X : LongInt);
+Begin
+  GlTr(286);
+  GlSetT(U - $84C0, X, 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1ivARB(U, P : LongInt);
+Begin
+  GlTr(287);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, MemL[0:P], 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1sARB(U, X : LongInt);
+Begin
+  GlTr(288);
+  GlSetT(U - $84C0, GlS(X), 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord1svARB(U, P : LongInt);
+Begin
+  GlTr(289);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, GlS(MemW[0:P]), 0, 0, 1);
+End;
+
+Procedure glMultiTexCoord2dARB(U, XL, XH, YL, YH : LongInt);
+Begin
+  GlTr(290);
+  GlSetT(U - $84C0, DblOf(XL, XH), DblOf(YL, YH), 0, 1);
+End;
+
+Procedure glMultiTexCoord2dvARB(U, P : LongInt);
+Begin
+  GlTr(291);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, DbM(P), DbM(P + 8), 0, 1);
+End;
+
+Procedure glMultiTexCoord2fARB(U, X, Y : LongInt);
+Begin
+  GlTr(292);
+  GlSetT(U - $84C0, FlL(X), FlL(Y), 0, 1);
+End;
+
+Procedure glMultiTexCoord2fvARB(U, P : LongInt);
+Begin
+  GlTr(293);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, FlM(P), FlM(P + 4), 0, 1);
+End;
+
+Procedure glMultiTexCoord2iARB(U, X, Y : LongInt);
+Begin
+  GlTr(294);
+  GlSetT(U - $84C0, X, Y, 0, 1);
+End;
+
+Procedure glMultiTexCoord2ivARB(U, P : LongInt);
+Begin
+  GlTr(295);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, MemL[0:P], MemL[0:P + 4], 0, 1);
+End;
+
+Procedure glMultiTexCoord2sARB(U, X, Y : LongInt);
+Begin
+  GlTr(296);
+  GlSetT(U - $84C0, GlS(X), GlS(Y), 0, 1);
+End;
+
+Procedure glMultiTexCoord2svARB(U, P : LongInt);
+Begin
+  GlTr(297);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, GlS(MemW[0:P]), GlS(MemW[0:P + 2]), 0, 1);
+End;
+
+Procedure glMultiTexCoord3dARB(U, XL, XH, YL, YH, ZL, ZH : LongInt);
+Begin
+  GlTr(298);
+  GlSetT(U - $84C0, DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), 1);
+End;
+
+Procedure glMultiTexCoord3dvARB(U, P : LongInt);
+Begin
+  GlTr(299);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, DbM(P), DbM(P + 8), DbM(P + 16), 1);
+End;
+
+Procedure glMultiTexCoord3fARB(U, X, Y, Z : LongInt);
+Begin
+  GlTr(300);
+  GlSetT(U - $84C0, FlL(X), FlL(Y), FlL(Z), 1);
+End;
+
+Procedure glMultiTexCoord3fvARB(U, P : LongInt);
+Begin
+  GlTr(301);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, FlM(P), FlM(P + 4), FlM(P + 8), 1);
+End;
+
+Procedure glMultiTexCoord3iARB(U, X, Y, Z : LongInt);
+Begin
+  GlTr(302);
+  GlSetT(U - $84C0, X, Y, Z, 1);
+End;
+
+Procedure glMultiTexCoord3ivARB(U, P : LongInt);
+Begin
+  GlTr(303);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], 1);
+End;
+
+Procedure glMultiTexCoord3sARB(U, X, Y, Z : LongInt);
+Begin
+  GlTr(304);
+  GlSetT(U - $84C0, GlS(X), GlS(Y), GlS(Z), 1);
+End;
+
+Procedure glMultiTexCoord3svARB(U, P : LongInt);
+Begin
+  GlTr(305);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]),
+      1);
+End;
+
+Procedure glMultiTexCoord4dARB(U, XL, XH, YL, YH, ZL, ZH, WL, WH : LongInt);
+Begin
+  GlTr(306);
+  GlSetT(U - $84C0, DblOf(XL, XH), DblOf(YL, YH), DblOf(ZL, ZH), DblOf(WL,
+      WH));
+End;
+
+Procedure glMultiTexCoord4dvARB(U, P : LongInt);
+Begin
+  GlTr(307);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, DbM(P), DbM(P + 8), DbM(P + 16), DbM(P + 24));
+End;
+
+Procedure glMultiTexCoord4fARB(U, X, Y, Z, W : LongInt);
+Begin
+  GlTr(308);
+  GlSetT(U - $84C0, FlL(X), FlL(Y), FlL(Z), FlL(W));
+End;
+
+Procedure glMultiTexCoord4fvARB(U, P : LongInt);
+Begin
+  GlTr(309);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, FlM(P), FlM(P + 4), FlM(P + 8), FlM(P + 12));
+End;
+
+Procedure glMultiTexCoord4iARB(U, X, Y, Z, W : LongInt);
+Begin
+  GlTr(310);
+  GlSetT(U - $84C0, X, Y, Z, W);
+End;
+
+Procedure glMultiTexCoord4ivARB(U, P : LongInt);
+Begin
+  GlTr(311);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, MemL[0:P], MemL[0:P + 4], MemL[0:P + 8], MemL[0:P + 12]);
+End;
+
+Procedure glMultiTexCoord4sARB(U, X, Y, Z, W : LongInt);
+Begin
+  GlTr(312);
+  GlSetT(U - $84C0, GlS(X), GlS(Y), GlS(Z), GlS(W));
+End;
+
+Procedure glMultiTexCoord4svARB(U, P : LongInt);
+Begin
+  GlTr(313);
+  If P = 0 Then Exit;
+  GlSetT(U - $84C0, GlS(MemW[0:P]), GlS(MemW[0:P + 2]), GlS(MemW[0:P + 4]),
+      GlS(MemW[0:P + 6]));
+End;
+
+Procedure glIndexd(XL, XH : LongInt);
+Begin
+  GlTr(314);
+  GlSetI(DblOf(XL, XH));
+End;
+
+Procedure glIndexdv(P : LongInt);
+Begin
+  GlTr(315);
+  If P = 0 Then Exit;
+  GlSetI(DbM(P));
+End;
+
+Procedure glIndexf(X : LongInt);
+Begin
+  GlTr(316);
+  GlSetI(FlL(X));
+End;
+
+Procedure glIndexfv(P : LongInt);
+Begin
+  GlTr(317);
+  If P = 0 Then Exit;
+  GlSetI(FlM(P));
+End;
+
+Procedure glIndexi(X : LongInt);
+Begin
+  GlTr(318);
+  GlSetI(X);
+End;
+
+Procedure glIndexiv(P : LongInt);
+Begin
+  GlTr(319);
+  If P = 0 Then Exit;
+  GlSetI(MemL[0:P]);
+End;
+
+Procedure glIndexs(X : LongInt);
+Begin
+  GlTr(320);
+  GlSetI(GlS(X));
+End;
+
+Procedure glIndexsv(P : LongInt);
+Begin
+  GlTr(321);
+  If P = 0 Then Exit;
+  GlSetI(GlS(MemW[0:P]));
+End;
+
+Procedure glIndexub(X : LongInt);
+Begin
+  GlTr(322);
+  GlSetI((X And 255));
+End;
+
+Procedure glIndexubv(P : LongInt);
+Begin
+  GlTr(323);
+  If P = 0 Then Exit;
+  GlSetI((Mem[0:P] And 255));
+End;
+
+Procedure glRectd(AL, AH, BL, BH, CL, CH, DL, DH : LongInt);
+Begin
+  GlTr(324);
+  GlRectQ(DblOf(AL, AH), DblOf(BL, BH), DblOf(CL, CH), DblOf(DL, DH));
+End;
+
+Procedure glRectdv(P1, P2 : LongInt);
+Begin
+  GlTr(325);
+  If (P1 = 0) Or (P2 = 0) Then Exit;
+  GlRectQ(DbM(P1), DbM(P1 + 8), DbM(P2), DbM(P2 + 8));
+End;
+
+Procedure glRectf(A, B, C, D : LongInt);
+Begin
+  GlTr(326);
+  GlRectQ(FlL(A), FlL(B), FlL(C), FlL(D));
+End;
+
+Procedure glRectfv(P1, P2 : LongInt);
+Begin
+  GlTr(327);
+  If (P1 = 0) Or (P2 = 0) Then Exit;
+  GlRectQ(FlM(P1), FlM(P1 + 4), FlM(P2), FlM(P2 + 4));
+End;
+
+Procedure glRecti(A, B, C, D : LongInt);
+Begin
+  GlTr(328);
+  GlRectQ(A, B, C, D);
+End;
+
+Procedure glRectiv(P1, P2 : LongInt);
+Begin
+  GlTr(329);
+  If (P1 = 0) Or (P2 = 0) Then Exit;
+  GlRectQ(MemL[0:P1], MemL[0:P1 + 4], MemL[0:P2], MemL[0:P2 + 4]);
+End;
+
+Procedure glRects(A, B, C, D : LongInt);
+Begin
+  GlTr(330);
+  GlRectQ(GlS(A), GlS(B), GlS(C), GlS(D));
+End;
+
+Procedure glRectsv(P1, P2 : LongInt);
+Begin
+  GlTr(331);
+  If (P1 = 0) Or (P2 = 0) Then Exit;
+  GlRectQ(GlS(MemW[0:P1]), GlS(MemW[0:P1 + 2]), GlS(MemW[0:P2]),
+      GlS(MemW[0:P2 + 2]));
+End;
+
+Procedure glAccum(A0, A1 : LongInt);
+Begin
+  GlTr(332);
+  GlTodo('glAccum');
+End;
+
+Procedure glBitmap(A0, A1, A2, A3, A4, A5, A6 : LongInt);
+Begin
+  GlTr(333);
+  GlTodo('glBitmap');
+End;
+
+Procedure glClearAccum(A0, A1, A2, A3 : LongInt);
+Begin
+  GlTr(334);
+End;
+
+Procedure glClearIndex(A0 : LongInt);
+Begin
+  GlTr(335);
+End;
+
+Procedure glClearStencil(A0 : LongInt);
+Begin
+  GlTr(336);
+End;
+
+Procedure glClipPlane(A0, A1 : LongInt);
+Begin
+  GlTr(337);
+  GlTodo('glClipPlane');
+End;
+
+Procedure glGetClipPlane(A0, A1 : LongInt);
+Begin
+  GlTr(338);
+End;
+
+Procedure glCopyPixels(A0, A1, A2, A3, A4 : LongInt);
+Begin
+  GlTr(339);
+  GlTodo('glCopyPixels');
+End;
+
+Procedure glEdgeFlag(A0 : LongInt);
+Begin
+  GlTr(340);
+End;
+
+Procedure glEdgeFlagv(A0 : LongInt);
+Begin
+  GlTr(341);
+End;
+
+Procedure glEvalCoord1d(A0, A1 : LongInt);
+Begin
+  GlTr(342);
+End;
+
+Procedure glEvalCoord1dv(A0 : LongInt);
+Begin
+  GlTr(343);
+End;
+
+Procedure glEvalCoord1f(A0 : LongInt);
+Begin
+  GlTr(344);
+End;
+
+Procedure glEvalCoord1fv(A0 : LongInt);
+Begin
+  GlTr(345);
+End;
+
+Procedure glEvalCoord2d(A0, A1, A2, A3 : LongInt);
+Begin
+  GlTr(346);
+End;
+
+Procedure glEvalCoord2dv(A0 : LongInt);
+Begin
+  GlTr(347);
+End;
+
+Procedure glEvalCoord2f(A0, A1 : LongInt);
+Begin
+  GlTr(348);
+End;
+
+Procedure glEvalCoord2fv(A0 : LongInt);
+Begin
+  GlTr(349);
+End;
+
+Procedure glEvalMesh1(A0, A1, A2 : LongInt);
+Begin
+  GlTr(350);
+End;
+
+Procedure glEvalMesh2(A0, A1, A2, A3, A4 : LongInt);
+Begin
+  GlTr(351);
+End;
+
+Procedure glEvalPoint1(A0 : LongInt);
+Begin
+  GlTr(352);
+End;
+
+Procedure glEvalPoint2(A0, A1 : LongInt);
+Begin
+  GlTr(353);
+End;
+
+Procedure glFeedbackBuffer(A0, A1, A2 : LongInt);
+Begin
+  GlTr(354);
+  GlTodo('glFeedbackBuffer');
+End;
+
+Procedure glGetMapdv(A0, A1, A2 : LongInt);
+Begin
+  GlTr(355);
+End;
+
+Procedure glGetMapfv(A0, A1, A2 : LongInt);
+Begin
+  GlTr(356);
+End;
+
+Procedure glGetMapiv(A0, A1, A2 : LongInt);
+Begin
+  GlTr(357);
+End;
+
+Procedure glGetPixelMapfv(A0, A1 : LongInt);
+Begin
+  GlTr(358);
+End;
+
+Procedure glGetPixelMapuiv(A0, A1 : LongInt);
+Begin
+  GlTr(359);
+End;
+
+Procedure glGetPixelMapusv(A0, A1 : LongInt);
+Begin
+  GlTr(360);
+End;
+
+Procedure glGetPolygonStipple(A0 : LongInt);
+Begin
+  GlTr(361);
+End;
+
+Procedure glIndexMask(A0 : LongInt);
+Begin
+  GlTr(362);
+End;
+
+Procedure glInitNames;
+Begin
+  GlTr(363);
+End;
+
+Procedure glLoadName(A0 : LongInt);
+Begin
+  GlTr(364);
+End;
+
+Procedure glPushName(A0 : LongInt);
+Begin
+  GlTr(365);
+End;
+
+Procedure glPopName;
+Begin
+  GlTr(366);
+End;
+
+Procedure glPassThrough(A0 : LongInt);
+Begin
+  GlTr(367);
+End;
+
+Procedure glSelectBuffer(A0, A1 : LongInt);
+Begin
+  GlTr(368);
+  GlTodo('glSelectBuffer');
+End;
+
+Procedure glLineStipple(A0, A1 : LongInt);
+Begin
+  GlTr(369);
+End;
+
+Procedure glLogicOp(A0 : LongInt);
+Begin
+  GlTr(370);
+  GlTodo('glLogicOp');
+End;
+
+Procedure glMap1d(A0, A1, A2, A3, A4, A5, A6, A7 : LongInt);
+Begin
+  GlTr(371);
+End;
+
+Procedure glMap1f(A0, A1, A2, A3, A4, A5 : LongInt);
+Begin
+  GlTr(372);
+End;
+
+Procedure glMap2d(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12,
+  A13 : LongInt);
+Begin
+  GlTr(373);
+End;
+
+Procedure glMap2f(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9 : LongInt);
+Begin
+  GlTr(374);
+End;
+
+Procedure glMapGrid1d(A0, A1, A2, A3, A4 : LongInt);
+Begin
+  GlTr(375);
+End;
+
+Procedure glMapGrid1f(A0, A1, A2 : LongInt);
+Begin
+  GlTr(376);
+End;
+
+Procedure glMapGrid2d(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9 : LongInt);
+Begin
+  GlTr(377);
+End;
+
+Procedure glMapGrid2f(A0, A1, A2, A3, A4, A5 : LongInt);
+Begin
+  GlTr(378);
+End;
+
+Procedure glPixelMapfv(A0, A1, A2 : LongInt);
+Begin
+  GlTr(379);
+End;
+
+Procedure glPixelMapuiv(A0, A1, A2 : LongInt);
+Begin
+  GlTr(380);
+End;
+
+Procedure glPixelMapusv(A0, A1, A2 : LongInt);
+Begin
+  GlTr(381);
+End;
+
+Procedure glPixelTransferf(A0, A1 : LongInt);
+Begin
+  GlTr(382);
+End;
+
+Procedure glPixelTransferi(A0, A1 : LongInt);
+Begin
+  GlTr(383);
+End;
+
+Procedure glPixelZoom(A0, A1 : LongInt);
+Begin
+  GlTr(384);
+End;
+
+Procedure glPolygonStipple(A0 : LongInt);
+Begin
+  GlTr(385);
+End;
+
+Procedure glStencilFunc(A0, A1, A2 : LongInt);
+Begin
+  GlTr(386);
+  GlTodo('glStencilFunc');
+End;
+
+Procedure glStencilMask(A0 : LongInt);
+Begin
+  GlTr(387);
+End;
+
+Procedure glStencilOp(A0, A1, A2 : LongInt);
+Begin
+  GlTr(388);
+End;
+
+Function glRenderMode(M : LongInt) : LongInt;
+Begin
+  GlTr(389);
+  glRenderMode := 0;
+End;
+
 
 { ------------------------------------------------------------------ }
 { Direct3D 1 a 7 : objets                                            }
@@ -55476,7 +60274,103 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
   GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
-  GetLongPathNameA,
+  GetLongPathNameA, OpenSCManagerA, OpenServiceA, CreateServiceA,
+  CloseServiceHandle, DeleteService, StartServiceA, ControlService,
+  QueryServiceStatus, OpenProcessToken, LookupPrivilegeValueA,
+  AdjustTokenPrivileges, SHGetSpecialFolderLocation, SHGetPathFromIDListA,
+  SHGetSpecialFolderPathA, SHGetFolderPathA, SHChangeNotify, SHGetMalloc,
+  ImQueryInterface, ImAddRef, ImRelease, ImAlloc, ImRealloc, ImFree,
+  ImGetSize, ImDidAlloc, ImHeapMinimize, ShellExecuteExA, LoadTypeLib,
+  LoadTypeLibEx, LoadRegTypeLib, RegisterTypeLib, UnRegisterTypeLib,
+  IsCharAlphaNumericA, LockWindowUpdate, DdeGetData,
+  EnumDisplaySettingsA, EnumDisplaySettingsW, ChangeDisplaySettingsA,
+  DescribePixelFormat, ChoosePixelFormat, SetPixelFormat, GetPixelFormat,
+  SwapBuffers, GetDeviceGammaRamp, SetDeviceGammaRamp, acmFormatSuggest,
+  acmStreamOpen, acmStreamClose, acmStreamSize, acmStreamPrepareHeader,
+  acmStreamUnprepareHeader, acmStreamConvert, acmGetVersion,
+  SleepEx,
+  wglCreateContext, wglMakeCurrent, wglDeleteContext, wglGetCurrentContext,
+  wglGetCurrentDC, wglGetProcAddress, wglShareLists, wglCopyContext,
+  wglCreateLayerContext, wglUseFontBitmapsA, wglUseFontBitmapsW,
+  wglSwapIntervalEXT, wglDescribePixelFormat, wglChoosePixelFormat,
+  wglSetPixelFormat, wglGetPixelFormat, wglSwapBuffers, wglSwapLayerBuffers,
+  glEnable, glDisable, glIsEnabled, glEnableClientState, glDisableClientState,
+  glVertexPointer, glNormalPointer, glColorPointer, glTexCoordPointer,
+  glEdgeFlagPointer, glIndexPointer, glGetPointerv, glInterleavedArrays,
+  glArrayElement, glDrawArrays, glDrawElements, glDrawRangeElements, glBegin,
+  glEnd, glClear, glClearColor, glClearDepth, glViewport, glScissor,
+  glDepthRange, glDepthFunc, glDepthMask, glBlendFunc, glAlphaFunc,
+  glCullFace, glFrontFace, glShadeModel, glPolygonMode, glPolygonOffset,
+  glColorMask, glLineWidth, glPointSize, glHint, glFlush, glFinish,
+  glGetError, glGetString, glDrawBuffer, glReadBuffer, glFogfv, glFogiv,
+  glFogf, glFogi, glLightfv, glLightiv, glLightf, glLighti, glGetLightfv,
+  glGetLightiv, glLightModelfv, glLightModeliv, glLightModelf, glLightModeli,
+  glMaterialfv, glMaterialiv, glMaterialf, glMateriali, glGetMaterialfv,
+  glGetMaterialiv, glColorMaterial, glMatrixMode, glLoadIdentity,
+  glLoadMatrixf, glLoadMatrixd, glMultMatrixf, glMultMatrixd, glPushMatrix,
+  glPopMatrix, glTranslatef, glTranslated, glScalef, glScaled, glRotatef,
+  glRotated, glOrtho, glFrustum, glTexGeni, glTexGenf, glTexGend, glTexGeniv,
+  glTexGenfv, glTexGendv, glGetTexGeniv, glGetTexGenfv, glGetTexGendv,
+  glGenTextures, glDeleteTextures, glIsTexture, glAreTexturesResident,
+  glPrioritizeTextures, glBindTexture, glTexImage2D, glTexImage1D,
+  glTexSubImage2D, glTexSubImage1D, glCopyTexImage2D, glCopyTexImage1D,
+  glCopyTexSubImage2D, glCopyTexSubImage1D, glGetTexImage, glTexParameteri,
+  glTexParameterf, glTexParameteriv, glTexParameterfv, glGetTexParameteriv,
+  glGetTexParameterfv, glGetTexLevelParameteriv, glGetTexLevelParameterfv,
+  glTexEnvi, glTexEnvf, glTexEnviv, glTexEnvfv, glGetTexEnviv, glGetTexEnvfv,
+  glPixelStorei, glPixelStoref, glActiveTextureARB, glClientActiveTextureARB,
+  glReadPixels, glDrawPixels, glPushAttrib, glPopAttrib, glPushClientAttrib,
+  glPopClientAttrib, glGetIntegerv, glGetFloatv, glGetDoublev, glGetBooleanv,
+  glGenLists, glNewList, glEndList, glCallList, glCallLists, glDeleteLists,
+  glIsList, glListBase, glVertex2d, glVertex2dv, glVertex2f, glVertex2fv,
+  glVertex2i, glVertex2iv, glVertex2s, glVertex2sv, glVertex3d, glVertex3dv,
+  glVertex3f, glVertex3fv, glVertex3i, glVertex3iv, glVertex3s, glVertex3sv,
+  glVertex4d, glVertex4dv, glVertex4f, glVertex4fv, glVertex4i, glVertex4iv,
+  glVertex4s, glVertex4sv, glColor3b, glColor3bv, glColor3d, glColor3dv,
+  glColor3f, glColor3fv, glColor3i, glColor3iv, glColor3s, glColor3sv,
+  glColor3ub, glColor3ubv, glColor3ui, glColor3uiv, glColor3us, glColor3usv,
+  glColor4b, glColor4bv, glColor4d, glColor4dv, glColor4f, glColor4fv,
+  glColor4i, glColor4iv, glColor4s, glColor4sv, glColor4ub, glColor4ubv,
+  glColor4ui, glColor4uiv, glColor4us, glColor4usv, glNormal3b, glNormal3bv,
+  glNormal3d, glNormal3dv, glNormal3f, glNormal3fv, glNormal3i, glNormal3iv,
+  glNormal3s, glNormal3sv, glTexCoord1d, glTexCoord1dv, glTexCoord1f,
+  glTexCoord1fv, glTexCoord1i, glTexCoord1iv, glTexCoord1s, glTexCoord1sv,
+  glTexCoord2d, glTexCoord2dv, glTexCoord2f, glTexCoord2fv, glTexCoord2i,
+  glTexCoord2iv, glTexCoord2s, glTexCoord2sv, glTexCoord3d, glTexCoord3dv,
+  glTexCoord3f, glTexCoord3fv, glTexCoord3i, glTexCoord3iv, glTexCoord3s,
+  glTexCoord3sv, glTexCoord4d, glTexCoord4dv, glTexCoord4f, glTexCoord4fv,
+  glTexCoord4i, glTexCoord4iv, glTexCoord4s, glTexCoord4sv, glRasterPos2d,
+  glRasterPos2dv, glRasterPos2f, glRasterPos2fv, glRasterPos2i,
+  glRasterPos2iv, glRasterPos2s, glRasterPos2sv, glRasterPos3d,
+  glRasterPos3dv, glRasterPos3f, glRasterPos3fv, glRasterPos3i,
+  glRasterPos3iv, glRasterPos3s, glRasterPos3sv, glRasterPos4d,
+  glRasterPos4dv, glRasterPos4f, glRasterPos4fv, glRasterPos4i,
+  glRasterPos4iv, glRasterPos4s, glRasterPos4sv, glMultiTexCoord1dARB,
+  glMultiTexCoord1dvARB, glMultiTexCoord1fARB, glMultiTexCoord1fvARB,
+  glMultiTexCoord1iARB, glMultiTexCoord1ivARB, glMultiTexCoord1sARB,
+  glMultiTexCoord1svARB, glMultiTexCoord2dARB, glMultiTexCoord2dvARB,
+  glMultiTexCoord2fARB, glMultiTexCoord2fvARB, glMultiTexCoord2iARB,
+  glMultiTexCoord2ivARB, glMultiTexCoord2sARB, glMultiTexCoord2svARB,
+  glMultiTexCoord3dARB, glMultiTexCoord3dvARB, glMultiTexCoord3fARB,
+  glMultiTexCoord3fvARB, glMultiTexCoord3iARB, glMultiTexCoord3ivARB,
+  glMultiTexCoord3sARB, glMultiTexCoord3svARB, glMultiTexCoord4dARB,
+  glMultiTexCoord4dvARB, glMultiTexCoord4fARB, glMultiTexCoord4fvARB,
+  glMultiTexCoord4iARB, glMultiTexCoord4ivARB, glMultiTexCoord4sARB,
+  glMultiTexCoord4svARB, glIndexd, glIndexdv, glIndexf, glIndexfv, glIndexi,
+  glIndexiv, glIndexs, glIndexsv, glIndexub, glIndexubv, glRectd, glRectdv,
+  glRectf, glRectfv, glRecti, glRectiv, glRects, glRectsv, glAccum, glBitmap,
+  glClearAccum, glClearIndex, glClearStencil, glClipPlane, glGetClipPlane,
+  glCopyPixels, glEdgeFlag, glEdgeFlagv, glEvalCoord1d, glEvalCoord1dv,
+  glEvalCoord1f, glEvalCoord1fv, glEvalCoord2d, glEvalCoord2dv, glEvalCoord2f,
+  glEvalCoord2fv, glEvalMesh1, glEvalMesh2, glEvalPoint1, glEvalPoint2,
+  glFeedbackBuffer, glGetMapdv, glGetMapfv, glGetMapiv, glGetPixelMapfv,
+  glGetPixelMapuiv, glGetPixelMapusv, glGetPolygonStipple, glIndexMask,
+  glInitNames, glLoadName, glPushName, glPopName, glPassThrough,
+  glSelectBuffer, glLineStipple, glLogicOp, glMap1d, glMap1f, glMap2d,
+  glMap2f, glMapGrid1d, glMapGrid1f, glMapGrid2d, glMapGrid2f, glPixelMapfv,
+  glPixelMapuiv, glPixelMapusv, glPixelTransferf, glPixelTransferi,
+  glPixelZoom, glPolygonStipple, glStencilFunc, glStencilMask, glStencilOp,
+  glRenderMode,
   TrackPopupMenuEx, LoadMenuW, LoadMenuIndirectA, LoadMenuIndirectW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
@@ -65772,8 +70666,9 @@ BEGIN
   BootStep(3);
   { ApiTrace := True journalise chaque appel d'API d'un programme Win32
     (nom, appelant, arguments, resultat) sur le port serie COM1 }
-  ApiTrace := False;
   LoadEnvironment;
+  { variable APITRACE de AUTOEXEC.BAT : journal des appels d'API }
+  ApiTrace := EnvFind('APITRACE', TrI);
   InitInput;
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
