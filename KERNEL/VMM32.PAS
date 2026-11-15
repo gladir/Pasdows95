@@ -85,13 +85,13 @@ Const
 
   { Tables }
   MaxWnd      = 256;
-  MaxClass    = 64;
+  MaxClass    = 128;
   MaxGdi      = 1024;
-  MaxKObj     = 256;
-  MaxThread   = 16;
+  MaxKObj     = 512;
+  MaxThread   = 64;
   MaxQueue    = 256;
-  MaxTimer    = 32;
-  MaxMMTimer  = 16;
+  MaxTimer    = 64;
+  MaxMMTimer  = 32;
   MaxAtom     = 128;
   MaxRam      = 32;
   MaxMenu     = 64;
@@ -110,6 +110,7 @@ Const
   { Sortes d'objets du noyau }
   koFile      = 1;  koFind = 2;   koThread = 3; koEvent = 4;
   koSemaphore = 5;  koMutex = 6;  koProcess = 7; koConsole = 8;
+  koMapping   = 9;  koSnapshot = 10;
 
   { Sortes d'objets GDI }
   goPen = 1; goBrush = 2; goFont = 3; goBitmap = 4; goPalette = 5;
@@ -151,6 +152,11 @@ Var
   SliceStart : LongInt;          { debut de la tranche de temps }
   KImgLo, KImgHi : LongInt;      { image du noyau (jamais preemptee) }
   Ticks      : LongInt;          { millisecondes depuis le demarrage }
+  { temps processeur, compte a chaque milliseconde par l'horloge }
+  InIdle     : Boolean;          { processeur arrete (HLT) en attente }
+  IdleMs, BusyMs : LongInt;
+  { carte reseau : octets et trames envoyes et recus }
+  NicTxB, NicTxP, NicRxB, NicRxP : LongInt;
   { ecran : mode VESA choisi par IO.SYS ou par le Panneau de
     configuration (Affichage) ; ScrBpp : 4 (VGA 16 couleurs, plans),
     8 (256 couleurs) ou 15, 16, 24, 32 (couleurs directes) }
@@ -539,6 +545,21 @@ Begin
   HeapRover := HeapStart;
 End;
 
+Function HeapOwnerBytes(Owner : LongInt) : LongInt;
+Var P, BS, T : LongInt;
+Begin
+  T := 0;
+  P := HeapStart;
+  While P < HeapEnd Do
+  Begin
+    BS := MemL[0:P + 4];
+    If BS <= 0 Then Break;
+    If (MemL[0:P] = HeapUsed) And (MemL[0:P + 8] = Owner) Then T := T + BS;
+    P := P + BS;
+  End;
+  HeapOwnerBytes := T;
+End;
+
 Function HeapFreeBytes : LongInt;
 Var P, BS, T : LongInt;
 Begin
@@ -675,10 +696,12 @@ Begin
 End;
 
 Procedure TimerTail; Forward;
+Procedure CpuTick; Forward;
 
 Procedure IrqTimer; Interrupt;
 Begin
   Inc(Ticks);
+  CpuTick;
   Port[$20] := $20;
   If PreemptOn Then TimerTail;
 End;
@@ -793,10 +816,12 @@ End;
 
 Procedure Idle;
 Begin
+  InIdle := True;
   asm
     sti
     hlt
   end;
+  InIdle := False;
 End;
 
 Procedure KDelay(Ms : LongInt);
@@ -1003,6 +1028,8 @@ Type
 Type
   TKObjArr = Array[0..MaxKObj - 1] Of TKObj;
   PKObjArr = ^TKObjArr;
+  TKObjPrArr = Array[0..MaxKObj * 32 - 1] Of Byte;
+  PKObjPrArr = ^TKObjPrArr;
 
 Var
   AtaBase, AtaCtrl : LongInt;
@@ -1014,6 +1041,10 @@ Var
   VolLabel  : String[32];
   KObjs     : PKObjArr;       { alloue dans le tas (place sous 4 Mo) }
   KObjOwner : Array[0..MaxKObj - 1] Of LongInt;
+  { references des objets de synchronisation et des mappages : total et
+    par processus (KObjPr^[objet * 32 + processus]) }
+  KObjRef   : Array[0..MaxKObj - 1] Of LongInt;
+  KObjPr    : PKObjPrArr;
   RamFiles  : Array[0..MaxRam - 1] Of TRamFile;
   CurDirS   : String[127];
   LastErr0  : LongInt;
@@ -1331,6 +1362,8 @@ Begin
       KObjs^[I].F4 := 0; KObjs^[I].F5 := 0; KObjs^[I].F6 := 0;
       KObjs^[I].Name := ''; KObjs^[I].Mask := '';
       KObjOwner[I] := HeapOwner;
+      KObjRef[I] := 0;
+      If KObjPr <> Nil Then FillMem(LongInt(@KObjPr^[I * 32]), 32, 0);
       KObjNew := I;
       Exit;
     End;
@@ -1342,6 +1375,31 @@ Begin
 End;
 
 { Index de l'objet de la poignee H (de la sorte Kind, 0 = toute) }
+{ Objet nomme (evenement, semaphore, mutex, mappage : un seul espace de
+  noms, comme sous Windows) ; prefixes Global\ et Local\ ignores }
+Function KNameNorm(Name : LongInt) : String;
+Var S : String;
+Begin
+  S := UpStr(PStr(Name));
+  If Copy(S, 1, 7) = 'GLOBAL\' Then S := Copy(S, 8, 255);
+  If Copy(S, 1, 6) = 'LOCAL\' Then S := Copy(S, 7, 255);
+  KNameNorm := S;
+End;
+
+Function KNamed(Const S : String) : LongInt;
+Var I : LongInt;
+Begin
+  KNamed := -1;
+  If S = '' Then Exit;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used And (KObjs^[I].Kind In [koEvent, koSemaphore, koMutex,
+       koMapping]) And (KObjs^[I].Name = S) Then
+    Begin
+      KNamed := I;
+      Exit;
+    End;
+End;
+
 Function KObjOf(H, Kind : LongInt) : LongInt;
 Var I : LongInt;
 Begin
@@ -8099,13 +8157,20 @@ Begin
   FatFormat := VolN > 0;
 End;
 { ==================================================================== }
-{ Partie 4 - Graphisme 8 bits, palette, police, composition, pointeur  }
+{ Partie 4 - Graphisme, palette, police, composition, pointeur          }
 { ==================================================================== }
-{ Chaque fenetre de premier niveau dessine dans sa propre surface 8 bits
-  (indices de la palette systeme, comme un affichage 256 couleurs de
-  Windows 95). L'ecran est compose dans un tampon (bureau puis fenetres
-  dans l'ordre Z) et seule la zone modifiee est recopiee dans la memoire
-  video lineaire ; le pointeur de la souris est dessine par-dessus. }
+{ Chaque fenetre de premier niveau dessine dans sa propre surface. En
+  256 couleurs (et en VGA 16 couleurs), les surfaces contiennent des
+  indices de la palette systeme, comme un affichage 256 couleurs de
+  Windows 95. En High Color et True Color, elles ont le format de la
+  carte (15, 16, 24 ou 32 bits, couleurs vraies) : les images des
+  programmes gardent leurs couleurs exactes. L'ecran est compose dans un
+  tampon (bureau puis fenetres dans l'ordre Z) et seule la zone modifiee
+  est recopiee dans la memoire video lineaire ; le pointeur de la souris
+  est dessine par-dessus.
+  Une couleur passee aux primitives est un indice de la palette systeme
+  (0..255, couleurs de l'interface) ou une couleur directe CDirect Or
+  00RRGGBB, convertie au format de la surface cible. }
 
 Const
   icComputer = 1;  icRecycle  = 2;  icDos      = 3;  icNotepad  = 4;
@@ -8142,6 +8207,7 @@ Const
 Type
   TSurf = Record
     Bits, W, H, Pitch : LongInt;
+    Bpp : LongInt;     { 8 (indices), 15 (5-5-5), 16 (5-6-5), 24 ou 32 }
   End;
 
 Var
@@ -8169,7 +8235,12 @@ Var
   VgaTab    : Array[0..2047] Of LongInt;
   VgaTabOk  : Boolean;
   Back      : TSurf;
+  { format des surfaces composees : 8 (palette systeme) ou celui de la
+    carte en couleurs vraies (15, 16, 24, 32) }
+  ScrFmt    : LongInt;
+  ScrDirect : Boolean;   { ScrFmt est exactement le format de la carte }
   SysPal    : Array[0..767] Of Byte;       { R, G, B (8 bits) }
+  SysX      : Array[0..255] Of LongInt;    { la meme en 00RRGGBB }
   PalVer    : LongInt;
   NcKey     : Array[0..4095] Of LongInt;   { antememoire RGB -> indice }
   NcVal     : Array[0..4095] Of Byte;
@@ -8186,17 +8257,122 @@ Var
   CurCustom  : LongInt;      { curseur Win32 (bits AND/XOR 32x32) }
   CurHotX, CurHotY : LongInt;
 
+{ Octets par point d'un format }
+Function PxBytes(Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    15, 16 : PxBytes := 2;
+    24 : PxBytes := 3;
+    32 : PxBytes := 4;
+  Else
+    PxBytes := 1;
+  End;
+End;
+
+Function SurfNewF(Var S : TSurf; W, H, Bpp : LongInt) : Boolean;
+Begin
+  S.W := W; S.H := H; S.Bpp := Bpp;
+  S.Pitch := (W * PxBytes(Bpp) + 3) And Not 3;
+  S.Bits := KAlloc(S.Pitch * H + 16);
+  SurfNewF := S.Bits <> 0;
+End;
+
+{ Surface au format de l'ecran }
 Function SurfNew(Var S : TSurf; W, H : LongInt) : Boolean;
 Begin
-  S.W := W; S.H := H; S.Pitch := (W + 3) And Not 3;
-  S.Bits := KAlloc(S.Pitch * H + 16);
-  SurfNew := S.Bits <> 0;
+  If ScrFmt = 0 Then ScrFmt := 8;
+  SurfNew := SurfNewF(S, W, H, ScrFmt);
 End;
 
 Procedure SurfFree(Var S : TSurf);
 Begin
   If S.Bits <> 0 Then KFree(S.Bits);
   S.Bits := 0; S.W := 0; S.H := 0;
+End;
+
+{ Remplir N points de 32 ou 16 bits }
+Procedure FillL(A, N, V : LongInt);
+Begin
+  If N <= 0 Then Exit;
+  asm
+    push edi
+    mov edi,A
+    mov ecx,N
+    mov eax,V
+    cld
+    rep stosd
+    pop edi
+  end;
+End;
+
+Procedure FillW(A, N, V : LongInt);
+Begin
+  If N <= 0 Then Exit;
+  asm
+    push edi
+    mov edi,A
+    mov ecx,N
+    mov eax,V
+    cld
+    rep stosw
+    pop edi
+  end;
+End;
+
+{ N points de valeur brute V a l'adresse A, au format Bpp }
+Procedure FillRaw(A, N, V, Bpp : LongInt);
+Var I : LongInt;
+Begin
+  Case Bpp Of
+    32 : FillL(A, N, V);
+    15, 16 : FillW(A, N, V);
+    24 :
+      For I := 0 To N - 1 Do
+      Begin
+        MemW[0:A + I * 3] := V;
+        Mem[0:A + I * 3 + 2] := V Shr 16;
+      End;
+  Else
+    FillMem(A, N, V);
+  End;
+End;
+
+Procedure PutRaw(A, V, Bpp : LongInt);
+Begin
+  Case Bpp Of
+    32 : MemL[0:A] := V;
+    15, 16 : MemW[0:A] := V;
+    24 :
+    Begin
+      MemW[0:A] := V;
+      Mem[0:A + 2] := V Shr 16;
+    End;
+  Else
+    Mem[0:A] := V;
+  End;
+End;
+
+Function GetRaw(A, Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    32 : GetRaw := MemL[0:A] And $FFFFFF;
+    15, 16 : GetRaw := MemW[0:A];
+    24 : GetRaw := MemW[0:A] Or (Mem[0:A + 2] Shl 16);
+  Else
+    GetRaw := Mem[0:A];
+  End;
+End;
+
+{ Masque de tous les bits d'un point (ROP, inversion) }
+Function RawMask(Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    15 : RawMask := $7FFF;
+    16 : RawMask := $FFFF;
+    24, 32 : RawMask := $FFFFFF;
+  Else
+    RawMask := 255;
+  End;
 End;
 
 { ------------------------------------------------------------------ }
@@ -8408,6 +8584,7 @@ End;
 Procedure SysPalSet(I, R, G, B : LongInt);
 Begin
   SysPal[I * 3] := R; SysPal[I * 3 + 1] := G; SysPal[I * 3 + 2] := B;
+  SysX[I] := ((R And 255) Shl 16) Or ((G And 255) Shl 8) Or (B And 255);
 End;
 
 { 20 couleurs statiques, cube 6x6x6 et gris au milieu }
@@ -8479,6 +8656,93 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
+{ Couleurs vraies : conversions entre 00RRGGBB et les formats         }
+{ ------------------------------------------------------------------ }
+
+Const
+  CDirect = $1000000;     { couleur directe 00RRGGBB (sinon un indice) }
+
+{ 00RRGGBB -> point brut du format Bpp (8 : indice systeme proche) }
+Function XToRaw(X, Bpp : LongInt) : LongInt;
+Begin
+  Case Bpp Of
+    32, 24 : XToRaw := X And $FFFFFF;
+    16 : XToRaw := ((X Shr 8) And $F800) Or ((X Shr 5) And $7E0) Or
+                   ((X Shr 3) And $1F);
+    15 : XToRaw := ((X Shr 9) And $7C00) Or ((X Shr 6) And $3E0) Or
+                   ((X Shr 3) And $1F);
+  Else
+    XToRaw := NearestIdx((X Shr 16) And 255, (X Shr 8) And 255, X And 255);
+  End;
+End;
+
+{ Point brut du format Bpp -> 00RRGGBB (8 : palette systeme) }
+Function RawToX(V, Bpp : LongInt) : LongInt;
+Var R, G, B : LongInt;
+Begin
+  Case Bpp Of
+    32, 24 : RawToX := V And $FFFFFF;
+    16 :
+    Begin
+      R := (V Shr 11) And 31; G := (V Shr 5) And 63; B := V And 31;
+      RawToX := (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                (((G Shl 2) Or (G Shr 4)) Shl 8) Or ((B Shl 3) Or (B Shr 2));
+    End;
+    15 :
+    Begin
+      R := (V Shr 10) And 31; G := (V Shr 5) And 31; B := V And 31;
+      RawToX := (((R Shl 3) Or (R Shr 2)) Shl 16) Or
+                (((G Shl 3) Or (G Shr 2)) Shl 8) Or ((B Shl 3) Or (B Shr 2));
+    End;
+  Else
+    RawToX := SysX[V And 255];
+  End;
+End;
+
+{ Couleur (indice ou CDirect) -> point brut du format Bpp }
+Function RawOf(C, Bpp : LongInt) : LongInt;
+Begin
+  If (C And CDirect) <> 0 Then RawOf := XToRaw(C And $FFFFFF, Bpp)
+  Else If Bpp = 8 Then RawOf := C And 255
+  Else RawOf := XToRaw(SysX[C And 255], Bpp);
+End;
+
+{ COLORREF (00BBGGRR ; 01xxxxxx PALETTEINDEX) -> couleur directe }
+Function DirOf(C : LongInt) : LongInt;
+Begin
+  If (C Shr 24) = 1 Then DirOf := C And 255
+  Else DirOf := CDirect Or ((C And 255) Shl 16) Or (C And $FF00) Or
+                ((C Shr 16) And 255);
+End;
+
+{ 00RRGGBB -> COLORREF }
+Function XToCr(X : LongInt) : LongInt;
+Begin
+  XToCr := ((X Shr 16) And 255) Or (X And $FF00) Or ((X And 255) Shl 16);
+End;
+
+{ Format des surfaces composees d'apres le mode de la carte : celui de la
+  carte si ses composantes sont usuelles, 32 bits sinon (converti a la
+  copie) ; 8 bits en 256 couleurs et en VGA 16 couleurs }
+Procedure ScrFmtSet;
+Begin
+  ScrDirect := True;
+  If VgaPlanar Or (ScrBpp <= 8) Then ScrFmt := 8
+  Else If (ScrBpp = 15) And (RMs = 5) And (RPs = 10) And (GMs = 5) And
+          (GPs = 5) And (BMs = 5) And (BPs = 0) Then ScrFmt := 15
+  Else If (ScrBpp = 16) And (RMs = 5) And (RPs = 11) And (GMs = 6) And
+          (GPs = 5) And (BMs = 5) And (BPs = 0) Then ScrFmt := 16
+  Else If (ScrBpp = 24) And (RMs = 8) And (RPs = 16) And (GMs = 8) And
+          (GPs = 8) And (BMs = 8) And (BPs = 0) Then ScrFmt := 24
+  Else
+  Begin
+    ScrFmt := 32;
+    ScrDirect := (ScrBpp = 32) And (RMs = 8) And (RPs = 16) And
+                 (GMs = 8) And (GPs = 8) And (BMs = 8) And (BPs = 0);
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
 { Cible de dessin et primitives (bornes incluses, coord. ecran)      }
 { ------------------------------------------------------------------ }
 
@@ -8509,10 +8773,21 @@ Begin
   If Y2 > ClipY2 Then Y2 := ClipY2;
   If (X1 > X2) Or (Y1 > Y2) Then Exit;
   N := X2 - X1 + 1;
-  A := DS.Bits + (Y1 - DOY) * DS.Pitch + (X1 - DOX);
+  If DS.Bpp = 8 Then
+  Begin
+    A := DS.Bits + (Y1 - DOY) * DS.Pitch + (X1 - DOX);
+    For Y := Y1 To Y2 Do
+    Begin
+      FillMem(A, N, RawOf(C, 8));
+      A := A + DS.Pitch;
+    End;
+    Exit;
+  End;
+  C := RawOf(C, DS.Bpp);
+  A := DS.Bits + (Y1 - DOY) * DS.Pitch + (X1 - DOX) * PxBytes(DS.Bpp);
   For Y := Y1 To Y2 Do
   Begin
-    FillMem(A, N, C);
+    FillRaw(A, N, C, DS.Bpp);
     A := A + DS.Pitch;
   End;
 End;
@@ -8531,15 +8806,28 @@ Procedure Pix(X, Y : LongInt; C : LongInt);
 Begin
   If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then
     Exit;
-  Mem[0:DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX)] := C;
+  PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PxBytes(DS.Bpp),
+         RawOf(C, DS.Bpp), DS.Bpp);
 End;
 
+{ Ou exclusif du point brut (X, Y) de la cible avec M }
+Procedure XorPix(X, Y, M : LongInt);
+Var A : LongInt;
+Begin
+  If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then
+    Exit;
+  A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PxBytes(DS.Bpp);
+  PutRaw(A, GetRaw(A, DS.Bpp) Xor M, DS.Bpp);
+End;
+
+{ Point brut de la cible (indice en 256 couleurs) }
 Function GetPix(X, Y : LongInt) : LongInt;
 Begin
   If (X < DOX) Or (Y < DOY) Or (X >= DOX + DS.W) Or (Y >= DOY + DS.H) Then
     GetPix := 0
   Else
-    GetPix := Mem[0:DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX)];
+    GetPix := GetRaw(DS.Bits + (Y - DOY) * DS.Pitch +
+                     (X - DOX) * PxBytes(DS.Bpp), DS.Bpp);
 End;
 
 Procedure Box(X1, Y1, X2, Y2 : LongInt; C : LongInt);
@@ -8550,16 +8838,17 @@ End;
 
 { Trame : couleur C sur un point sur deux }
 Procedure Dither(X1, Y1, X2, Y2 : LongInt; C : LongInt; Phase : LongInt);
-Var X, Y : LongInt;
+Var X, Y, B : LongInt;
 Begin
+  C := RawOf(C, DS.Bpp); B := PxBytes(DS.Bpp);
   For Y := Max(Y1, ClipY1) To Min(Y2, ClipY2) Do
     For X := Max(X1, ClipX1) To Min(X2, ClipX2) Do
       If Odd(X + Y + Phase) Then
-        Mem[0:DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX)] := C;
+        PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * B, C, DS.Bpp);
 End;
 
 Procedure DrawChar(X, Y : LongInt; Ch : Char; C : LongInt);
-Var R, CX, B, F, A : LongInt;
+Var R, CX, B, F, A, V, PB : LongInt;
 Begin
   If (X > ClipX2) Or (X + 7 < ClipX1) Or (Y > ClipY2) Or
      (Y + 15 < ClipY1) Then Exit;
@@ -8567,13 +8856,18 @@ Begin
   If (X >= ClipX1) And (X + 7 <= ClipX2) And (Y >= ClipY1) And
      (Y + 15 <= ClipY2) Then
   Begin
-    A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
+    V := RawOf(C, DS.Bpp); PB := PxBytes(DS.Bpp);
+    A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PB;
     For R := 0 To 15 Do
     Begin
       B := Mem[0:F + R];
       If B <> 0 Then
         For CX := 0 To 7 Do
-          If (B And ($80 Shr CX)) <> 0 Then Mem[0:A + CX] := C;
+          If (B And ($80 Shr CX)) <> 0 Then
+          Begin
+            If PB = 1 Then Mem[0:A + CX] := V
+            Else PutRaw(A + CX * PB, V, DS.Bpp);
+          End;
       A := A + DS.Pitch;
     End;
     Exit;
@@ -9330,6 +9624,59 @@ Begin
   End;
 End;
 
+{ 00RRGGBB -> valeur de la memoire video (composantes de la carte) }
+Function LfbOfX(X : LongInt) : LongInt;
+Begin
+  LfbOfX := ((((X Shr 16) And 255) Shr (8 - RMs)) Shl RPs) Or
+            ((((X Shr 8) And 255) Shr (8 - GMs)) Shl GPs) Or
+            (((X And 255) Shr (8 - BMs)) Shl BPs);
+End;
+
+{ Ligne de N points du tampon compose en couleurs vraies (S, format
+  ScrFmt) vers la memoire video : copie directe quand le format est
+  celui de la carte, conversion depuis 32 bits sinon }
+Procedure OutRowTC(S, D, N : LongInt);
+Var I, V : LongInt;
+Begin
+  If ScrDirect Then
+  Begin
+    MoveMem(S, D, N * PxBytes(ScrFmt));
+    Exit;
+  End;
+  For I := 0 To N - 1 Do
+  Begin
+    V := LfbOfX(MemL[0:S + I * 4]);
+    Case ScrBytes Of
+      2 : MemW[0:D + I * 2] := V;
+      3 :
+      Begin
+        MemW[0:D + I * 3] := V;
+        Mem[0:D + I * 3 + 2] := V Shr 16;
+      End;
+    Else
+      MemL[0:D + I * 4] := V;
+    End;
+  End;
+End;
+
+{ Valeur brute V (format de la carte) en (X, Y) de la memoire video }
+Procedure OutRaw(X, Y, V : LongInt);
+Var A : LongInt;
+Begin
+  A := Lfb + Y * LfbPitch + X * ScrBytes;
+  Case ScrBytes Of
+    2 : MemW[0:A] := V;
+    3 :
+    Begin
+      MemW[0:A] := V;
+      Mem[0:A + 2] := V Shr 16;
+    End;
+    4 : MemL[0:A] := V;
+  Else
+    Mem[0:A] := V;
+  End;
+End;
+
 { Un pixel d'indice C en (X, Y) de la memoire video }
 Procedure OutPix(X, Y, C : LongInt);
 Var A, V : LongInt;
@@ -9378,11 +9725,11 @@ Begin
     Exit;
   End;
   N := R.R - R.L;
-  S := Back.Bits + R.T * Back.Pitch + R.L;
+  S := Back.Bits + R.T * Back.Pitch + R.L * PxBytes(Back.Bpp);
   D := Lfb + R.T * LfbPitch + R.L * ScrBytes;
   For Y := R.T To R.B - 1 Do
   Begin
-    OutRow(S, D, N);
+    If Back.Bpp = 8 Then OutRow(S, D, N) Else OutRowTC(S, D, N);
     S := S + Back.Pitch;
     D := D + LfbPitch;
   End;
@@ -9503,8 +9850,11 @@ Begin
         Begin
           If V = 1 Then OutPix(PX, PY, cBlack)
           Else If V = 2 Then OutPix(PX, PY, cWhite)
-          Else OutPix(PX, PY,
-                      Mem[0:Back.Bits + PY * Back.Pitch + PX] Xor 255);
+          Else If Back.Bpp = 8 Then
+            OutPix(PX, PY, Mem[0:Back.Bits + PY * Back.Pitch + PX] Xor 255)
+          Else
+            OutRaw(PX, PY, LfbOfX(RawToX(GetRaw(Back.Bits + PY * Back.Pitch +
+                   PX * PxBytes(Back.Bpp), Back.Bpp), Back.Bpp) Xor $FFFFFF));
         End;
       End;
   End;
@@ -9543,6 +9893,9 @@ Var R, C, I : TRect; Y, X0, Y0, Z : LongInt;
 Begin
   { VGA 16 couleurs ou couleurs directes : palette changee, tout l'ecran
     a reconvertir }
+  { (en couleurs vraies, l'ecran compose ne depend pas de la palette) }
+  If (ScrBpp > 8) And OutPalChanged And (Back.Bpp > 8) And Not DDShow Then
+    OutPalChanged := False;
   If (VgaPlanar And VgaMapChanged) Or ((ScrBpp > 8) And OutPalChanged) Then
   Begin
     VgaMapChanged := False;
@@ -9658,6 +10011,11 @@ Type
     IsApp    : Boolean;
     PaintReq : Boolean;
     Susp     : LongInt;                 { compteur de SuspendThread }
+    WaitN    : LongInt;                 { attente de WaitN objets (0 : un) }
+    WaitAll  : Boolean;
+    WaitMsg  : Boolean;                 { ... ou d'un message }
+    PulseH   : LongInt;                 { evenement pulse pendant l'attente }
+    Abandon  : Boolean;                 { mutex abandonne obtenu }
   End;
 
   TMsgRec = Record
@@ -9667,15 +10025,19 @@ Type
   TMMTimer = Record
     Used : Boolean;
     Delay, Next, Proc, User, Flags : LongInt;
+    PrcId : LongInt;              { processus de la fonction de rappel }
   End;
 
 Type
   TMsgQArr = Array[0..MaxThread * MaxQueue - 1] Of TMsgRec;
   PMsgQArr = ^TMsgQArr;
+  TWaitArr = Array[0..MaxThread * 64 - 1] Of LongInt;
+  PWaitArr = ^TWaitArr;
 
 Var
   Threads  : Array[0..MaxThread - 1] Of TThread;
   MsgQ     : PMsgQArr;        { alloue dans le tas }
+  WaitHs   : PWaitArr;        { objets attendus (64 par tache) }
   CurT     : LongInt;
   FpuArea  : Array[0..MaxThread * 112 - 1] Of Byte;
   { par tache : pile de l'anneau 0 pour le code 16 bits (TSS.ESP0),
@@ -9698,6 +10060,207 @@ Var
   SwCr3P, SwCr3N : LongInt;
   VmOn     : Boolean;           { machine virtuelle DOS en cours }
   VmT      : LongInt;           { sa tache }
+
+{ ------------------------------------------------------------------ }
+{ Processus                                                          }
+{ ------------------------------------------------------------------ }
+{ Chaque programme Win32 (et la machine virtuelle MS-DOS) est un
+  processus : ses taches, ses modules, ses blocs du tas (proprietaire
+  100h + numero), ses objets GDI et ses poignees lui appartiennent et
+  sont liberes a sa fin. Comme sous Windows 95, l'image du programme
+  est privee et le reste est partage : chaque processus a son propre
+  repertoire de pages, qui ne differe de celui du noyau que dans la
+  fenetre des images (4 Mo a ExeTop) ; le premier programme y est
+  charge en identite (memoire physique de la fenetre), les suivants dans
+  des pages du tas placees a leur adresse preferee par des tables de
+  pages de 4 Ko. Le processus 0 est le systeme (noyau, bureau, Win16).
+  Les variables App* et CurDirS forment le contexte du processus
+  courant : l'ordonnanceur les range et les recharge quand il passe a une
+  tache d'un autre processus. }
+
+Const
+  MaxProc = 32;
+  pkSystem = 0; pkWin32 = 1; pkDos = 2;
+
+Type
+  TProc = Record
+    Used     : Boolean;
+    Kind     : LongInt;
+    Pid      : LongInt;
+    Parent   : LongInt;           { identifiant du processus parent }
+    Owner    : LongInt;           { proprietaire de ses blocs du tas }
+    Pd       : LongInt;           { repertoire de pages (0 : du noyau) }
+    Obj      : LongInt;           { objet processus (poignees, attente) }
+    Killing  : Boolean;
+    ExitCode : LongInt;
+    StartT   : LongInt;           { Ticks au lancement }
+    CpuMs    : LongInt;           { temps des taches terminees (ms) }
+    KrnMs    : LongInt;
+    PrioCls  : LongInt;
+    Show     : LongInt;           { nCmdShow du lancement }
+    { contexte (variables globales quand il s'execute) }
+    Base, Size, Entry, Cmd, Env, StdOut, ErrMode, ExcFilter : LongInt;
+    MainT    : LongInt;
+    Console  : Boolean;
+    Path     : String[127];
+    Cwd      : String[127];
+  End;
+
+  TProcArr = Array[0..MaxProc - 1] Of TProc;
+  PProcArr = ^TProcArr;
+
+Var
+  Procs    : PProcArr;         { alloue dans le tas }
+  CurProc  : LongInt;           { processus du contexte courant }
+  ProcCnt  : LongInt;           { processus Win32 et DOS en cours }
+  ThrProc  : Array[0..MaxThread - 1] Of LongInt;   { processus de la tache }
+  ThrCurP  : Array[0..MaxThread - 1] Of LongInt;   { contexte en cours }
+  ThrPxD   : Array[0..MaxThread - 1] Of LongInt;   { appels imbriques }
+  PxProc, PxOwn, PxCr3 : Array[0..MaxThread * 4 - 1] Of LongInt;
+  WinProc  : LongInt;           { processus en identite dans la fenetre }
+  NextPid  : LongInt;
+  DXProc   : LongInt;           { processus qui utilise DirectX }
+  VmOwner  : LongInt;           { proprietaire des blocs de la VM DOS }
+  VmProc   : LongInt;
+  { contexte du processus courant }
+  AppBase, AppSize, AppEntry : LongInt;
+  AppPath    : String[127];
+  AppCmd     : LongInt;     { ligne de commande ASCIIZ }
+  AppEnv     : LongInt;     { bloc d'environnement }
+  AppStdOut  : LongInt;
+  AppErrMode : LongInt;
+  AppExcFilter : LongInt;
+  AppProcObj : LongInt;
+  AppMainT  : LongInt;
+  AppConsole : Boolean;                  { programme du sous-systeme console }
+
+Var
+  ThrCpu   : Array[0..MaxThread - 1] Of LongInt;   { ms de la tache }
+  ProcsOk  : Boolean;
+  PeakCommit : LongInt;
+
+{ Une milliseconde de l'horloge : au repos, ou a la tache courante et a
+  son processus (le processus 0 compte le noyau et le bureau) }
+Procedure CpuTick;
+Var P : LongInt;
+Begin
+  If InIdle Then
+  Begin
+    Inc(IdleMs);
+    Exit;
+  End;
+  Inc(BusyMs);
+  If (CurT < 0) Or (CurT >= MaxThread) Then Exit;
+  Inc(ThrCpu[CurT]);
+  P := ThrProc[CurT];
+  If ProcsOk And (P >= 0) And (P < MaxProc) Then
+    Procs^[P].CpuMs := Procs^[P].CpuMs + 1;
+End;
+
+Procedure ProcCtxSave(P : LongInt);
+Begin
+  If (P < 0) Or (P >= MaxProc) Then Exit;
+  Procs^[P].Base := AppBase; Procs^[P].Size := AppSize;
+  Procs^[P].Entry := AppEntry; Procs^[P].Cmd := AppCmd;
+  Procs^[P].Env := AppEnv; Procs^[P].StdOut := AppStdOut;
+  Procs^[P].ErrMode := AppErrMode; Procs^[P].ExcFilter := AppExcFilter;
+  Procs^[P].Obj := AppProcObj; Procs^[P].MainT := AppMainT;
+  Procs^[P].Console := AppConsole;
+  Procs^[P].Path := AppPath; Procs^[P].Cwd := CurDirS;
+End;
+
+Procedure ProcCtxLoad(P : LongInt);
+Begin
+  If (P < 0) Or (P >= MaxProc) Then Exit;
+  AppBase := Procs^[P].Base; AppSize := Procs^[P].Size;
+  AppEntry := Procs^[P].Entry; AppCmd := Procs^[P].Cmd;
+  AppEnv := Procs^[P].Env; AppStdOut := Procs^[P].StdOut;
+  AppErrMode := Procs^[P].ErrMode; AppExcFilter := Procs^[P].ExcFilter;
+  AppProcObj := Procs^[P].Obj; AppMainT := Procs^[P].MainT;
+  AppConsole := Procs^[P].Console;
+  AppPath := Procs^[P].Path;
+  If Procs^[P].Cwd <> '' Then CurDirS := Procs^[P].Cwd;
+End;
+
+{ Passer au contexte du processus P (variables globales) }
+Procedure ProcCtxSwap(P : LongInt);
+Begin
+  If P = CurProc Then Exit;
+  ProcCtxSave(CurProc);
+  ProcCtxLoad(P);
+  CurProc := P;
+End;
+
+Function Cr3Now : LongInt;
+Var V : LongInt;
+Begin
+  V := 0;
+  If KPd <> 0 Then
+    asm
+      mov eax,cr3
+      mov V,eax
+    end;
+  Cr3Now := V;
+End;
+
+Procedure SetCr3(V : LongInt);
+Begin
+  If (KPd = 0) Or (V = 0) Then Exit;
+  asm
+    mov eax,V
+    mov cr3,eax
+  end;
+End;
+
+{ Repertoire de pages du processus P }
+Function ProcCr3(P : LongInt) : LongInt;
+Begin
+  If (P > 0) And (P < MaxProc) And Procs^[P].Used And (Procs^[P].Pd <> 0) Then
+    ProcCr3 := Procs^[P].Pd
+  Else ProcCr3 := KPd;
+End;
+
+Function ProcOfThread(T : LongInt) : LongInt;
+Begin
+  If (T < 0) Or (T >= MaxThread) Then ProcOfThread := 0
+  Else ProcOfThread := ThrProc[T];
+End;
+
+{ Executer du code du processus P depuis une tache d'un autre processus
+  (procedure de fenetre, minuterie, fonction de rappel) : son espace
+  d'adresses et son contexte, jusqu'a ProcLeave. False si rien a faire }
+Function ProcEnter(P : LongInt) : Boolean;
+Var D : LongInt;
+Begin
+  ProcEnter := False;
+  If (P < 0) Or (P >= MaxProc) Or (P = CurProc) Then Exit;
+  If Not Procs^[P].Used Then Exit;
+  D := ThrPxD[CurT];
+  If D >= 4 Then Exit;
+  PxProc[CurT * 4 + D] := CurProc;
+  PxOwn[CurT * 4 + D] := ThrOwner[CurT];
+  PxCr3[CurT * 4 + D] := Cr3Now;
+  ThrPxD[CurT] := D + 1;
+  ProcCtxSwap(P);
+  ThrCurP[CurT] := P;
+  If P > 0 Then ThrOwner[CurT] := Procs^[P].Owner;
+  HeapOwner := ThrOwner[CurT];
+  SetCr3(ProcCr3(P));
+  ProcEnter := True;
+End;
+
+Procedure ProcLeave;
+Var D : LongInt;
+Begin
+  D := ThrPxD[CurT] - 1;
+  If D < 0 Then Exit;
+  ThrPxD[CurT] := D;
+  ProcCtxSwap(PxProc[CurT * 4 + D]);
+  ThrCurP[CurT] := CurProc;
+  ThrOwner[CurT] := PxOwn[CurT * 4 + D];
+  HeapOwner := ThrOwner[CurT];
+  SetCr3(PxCr3[CurT * 4 + D]);
+End;
 
 Procedure VmTick(B : LongInt); Forward;
 
@@ -9759,6 +10322,7 @@ Begin
 End;
 
 Function ObjSignaled(H : LongInt; Consume : Boolean) : Boolean; Forward;
+Function WaitReady(T : LongInt; Consume : Boolean) : LongInt; Forward;
 Function MsgPending(T : LongInt) : Boolean; Forward;
 Procedure RunMMTimers; Forward;
 
@@ -9771,7 +10335,7 @@ Begin
     tsReady : ThreadRunnable := True;
     tsSleep : ThreadRunnable := Ticks >= Threads[T].WakeAt;
     tsWait :
-      ThreadRunnable := ObjSignaled(Threads[T].WaitH, False) Or
+      ThreadRunnable := (WaitReady(T, False) >= 0) Or
                         ((Threads[T].WakeAt >= 0) And
                          (Ticks >= Threads[T].WakeAt));
     tsMsg :
@@ -9807,6 +10371,7 @@ Begin
   SwNew := Threads[N].Esp;
   SwCr3P := LongInt(@ThrCr3[CurT]);
   SwCr3N := ThrCr3[N];
+  ProcCtxSwap(ThrCurP[N]);
   CurT := N;
   HeapOwner := ThrOwner[N];
   If TssBase <> 0 Then MemL[0:TssBase + 4] := ThrEsp0[N];
@@ -9957,9 +10522,17 @@ Begin
   Threads[T].Susp := 0;
   Threads[T].IsApp := IsApp;
   ThrOwner[T] := Ord(IsApp);
+  ThrProc[T] := 0; ThrCurP[T] := 0; ThrPxD[T] := 0;
+  ThrCpu[T] := 0;
+  If IsApp And (CurProc > 0) Then
+  Begin
+    { tache d'un programme : celle de son processus }
+    ThrProc[T] := CurProc; ThrCurP[T] := CurProc;
+    ThrOwner[T] := Procs^[CurProc].Owner;
+  End;
   ThrW16[T] := False;
   ThrEsp0[T] := (Threads[T].Stack + StackSz - 64) And Not 15;
-  ThrCr3[T] := KPd;
+  ThrCr3[T] := ProcCr3(ThrProc[T]);
   Threads[T].PaintReq := False;
   Threads[T].KObj := KObjNew(koThread);
   If Threads[T].KObj >= 0 Then KObjs^[Threads[T].KObj].F1 := T;
@@ -9974,11 +10547,26 @@ Begin
   ThreadNew := T;
 End;
 
+Procedure KillProc(P, Code : LongInt); Forward;
+Procedure MutexAbandon(T : LongInt); Forward;
+
 Procedure ExitThreadK(Code : LongInt);
+Var P, I, N : LongInt;
 Begin
   Threads[CurT].ExitCode := Code;
   Threads[CurT].State := tsDead;
+  MutexAbandon(CurT);
   If CurT = 0 Then Exit;
+  { derniere tache d'un processus : fin du processus }
+  P := ThrProc[CurT];
+  If (P > 0) And Procs^[P].Used And Not Procs^[P].Killing Then
+  Begin
+    N := 0;
+    For I := 1 To MaxThread - 1 Do
+      If Threads[I].Used And (ThrProc[I] = P) And
+         (Threads[I].State <> tsDead) Then Inc(N);
+    If N = 0 Then KillProc(P, Code);
+  End;
   KSchedule;
 End;
 
@@ -10013,79 +10601,213 @@ End;
 { Objets de synchronisation                                          }
 { ------------------------------------------------------------------ }
 
-Function ObjSignaled(H : LongInt; Consume : Boolean) : Boolean;
+{ L'objet H est-il signale pour la tache T ? Consume : l'obtenir
+  (mutex, semaphore, evenement automatique) }
+Function ObjSignaledT(H, T : LongInt; Consume : Boolean) : Boolean;
 Var I : LongInt;
 Begin
-  ObjSignaled := False;
+  ObjSignaledT := False;
   I := KObjOf(H, 0);
   If I < 0 Then
   Begin
-    ObjSignaled := True;
+    ObjSignaledT := True;
     Exit;
   End;
   Case KObjs^[I].Kind Of
     koEvent :
-      If KObjs^[I].F1 <> 0 Then
+      If (KObjs^[I].F1 <> 0) Or (Threads[T].PulseH = H) Then
       Begin
-        ObjSignaled := True;
-        If Consume And (KObjs^[I].F2 = 0) Then KObjs^[I].F1 := 0;
+        ObjSignaledT := True;
+        If Consume Then
+        Begin
+          If Threads[T].PulseH = H Then Threads[T].PulseH := 0
+          Else If KObjs^[I].F2 = 0 Then KObjs^[I].F1 := 0;
+        End;
       End;
     koSemaphore :
       If KObjs^[I].F1 > 0 Then
       Begin
-        ObjSignaled := True;
+        ObjSignaledT := True;
         If Consume Then Dec(KObjs^[I].F1);
       End;
     koMutex :
-      If (KObjs^[I].F1 = 0) Or (KObjs^[I].F1 = ThreadId(CurT)) Then
+      If (KObjs^[I].F1 = 0) Or (KObjs^[I].F1 = ThreadId(T)) Then
       Begin
-        ObjSignaled := True;
+        ObjSignaledT := True;
         If Consume Then
         Begin
-          KObjs^[I].F1 := ThreadId(CurT);
+          KObjs^[I].F1 := ThreadId(T);
           Inc(KObjs^[I].F2);
+          { mutex abandonne par une tache terminee : WAIT_ABANDONED }
+          If KObjs^[I].F3 <> 0 Then
+          Begin
+            KObjs^[I].F3 := 0;
+            Threads[T].Abandon := True;
+          End;
         End;
       End;
     koThread :
-      ObjSignaled := (KObjs^[I].F2 <> 0) Or
-                     Not Threads[KObjs^[I].F1].Used Or
-                     (Threads[KObjs^[I].F1].State = tsDead);
+      ObjSignaledT := (KObjs^[I].F2 <> 0) Or
+                      Not Threads[KObjs^[I].F1].Used Or
+                      (Threads[KObjs^[I].F1].State = tsDead);
     koProcess :
-      ObjSignaled := KObjs^[I].F2 <> 0;
+      ObjSignaledT := KObjs^[I].F2 <> 0;
   Else
-    ObjSignaled := True;
+    ObjSignaledT := True;
   End;
 End;
 
+Function ObjSignaled(H : LongInt; Consume : Boolean) : Boolean;
+Begin
+  ObjSignaled := ObjSignaledT(H, CurT, Consume);
+End;
+
+{ Attente de la tache T prete ? Rend -1, ou le resultat : indice de
+  l'objet (+80h si mutex abandonne), WaitN pour un message }
+Function WaitReady(T : LongInt; Consume : Boolean) : LongInt;
+Var I, N, B, R : LongInt; Ok : Boolean;
+Begin
+  WaitReady := -1;
+  N := Threads[T].WaitN;
+  B := T * 64;
+  Threads[T].Abandon := False;
+  R := -1;
+  If N = 0 Then
+  Begin
+    If ObjSignaledT(Threads[T].WaitH, T, Consume) Then R := 0;
+  End
+  Else If Threads[T].WaitAll Then
+  Begin
+    Ok := True;
+    For I := 0 To N - 1 Do
+      If Not ObjSignaledT(WaitHs^[B + I], T, False) Then Ok := False;
+    If Ok Then
+    Begin
+      If Consume Then
+        For I := 0 To N - 1 Do ObjSignaledT(WaitHs^[B + I], T, True);
+      R := 0;
+    End;
+  End
+  Else
+    For I := 0 To N - 1 Do
+      If (R < 0) And (WaitHs^[B + I] <> -1) Then
+        If ObjSignaledT(WaitHs^[B + I], T, Consume) Then R := I;
+  If (R >= 0) And Threads[T].Abandon Then R := R + $80;
+  If (R < 0) And Threads[T].WaitMsg And MsgPending(T) Then R := N;
+  WaitReady := R;
+End;
+
 { Attente d'un objet : 0 signale, 102h delai ecoule }
+{ Attendre : la tache courante a prepare WaitH (un objet) ou WaitN objets
+  dans WaitHs ; resultat de WaitReady, 102h delai ecoule }
+Function KWaitPrep(Ms : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := WaitReady(CurT, True);
+  If (R < 0) And (Ms <> 0) Then
+  Begin
+    Threads[CurT].State := tsWait;
+    If Ms = -1 Then Threads[CurT].WakeAt := -1
+    Else Threads[CurT].WakeAt := Ticks + Ms;
+    Repeat
+      If CurT = 0 Then KDelay(1) Else KSchedule;
+      R := WaitReady(CurT, True);
+      If (R < 0) And (Ms <> -1) And (Ticks >= Threads[CurT].WakeAt) Then
+        Break;
+      Threads[CurT].State := tsWait;
+    Until R >= 0;
+    Threads[CurT].State := tsReady;
+  End;
+  Threads[CurT].WaitN := 0; Threads[CurT].WaitMsg := False;
+  Threads[CurT].PulseH := 0;
+  If R < 0 Then R := $102;
+  KWaitPrep := R;
+End;
+
+{ Attente d'un objet : 0 signale (80h mutex abandonne), 102h delai }
 Function KWait(H, Ms : LongInt) : LongInt;
 Begin
-  If ObjSignaled(H, True) Then
+  Threads[CurT].WaitH := H;
+  Threads[CurT].WaitN := 0;
+  Threads[CurT].WaitMsg := False;
+  KWait := KWaitPrep(Ms);
+End;
+
+{ Attente de N objets (copies dans WaitHs : la liste de l'appelant est
+  dans la memoire de son processus) }
+Function KWaitMulti(N, Arr, All, Ms : LongInt; Msg : Boolean) : LongInt;
+Var I : LongInt;
+Begin
+  If (N <= 0) Or (N > 64) Then
   Begin
-    KWait := 0;
+    KWaitMulti := -1;
     Exit;
   End;
-  KWait := $102;
-  If Ms = 0 Then Exit;
-  Threads[CurT].State := tsWait;
-  Threads[CurT].WaitH := H;
-  If Ms = -1 Then Threads[CurT].WakeAt := -1
-  Else Threads[CurT].WakeAt := Ticks + Ms;
-  Repeat
-    If CurT = 0 Then KDelay(1) Else KSchedule;
-    If ObjSignaled(H, True) Then
+  For I := 0 To N - 1 Do WaitHs^[CurT * 64 + I] := MemL[0:Arr + I * 4];
+  Threads[CurT].WaitN := N;
+  Threads[CurT].WaitAll := All <> 0;
+  Threads[CurT].WaitMsg := Msg;
+  KWaitMulti := KWaitPrep(Ms);
+End;
+
+{ References des objets de synchronisation : une par ouverture, par
+  processus ; l'objet est detruit quand il n'en reste plus }
+Procedure KRefAdd(I : LongInt);
+Var K : LongInt;
+Begin
+  Inc(KObjRef[I]);
+  K := I * 32 + CurProc;
+  If KObjPr^[K] < 255 Then KObjPr^[K] := KObjPr^[K] + 1;
+End;
+
+Procedure KObjDrop(I : LongInt);
+Begin
+  If (KObjs^[I].Kind = koMapping) And (KObjs^[I].F4 <> 0) Then
+  Begin
+    KFree(KObjs^[I].F4);
+    KObjs^[I].F4 := 0;
+  End;
+  KObjs^[I].Used := False;
+  KObjRef[I] := 0;
+End;
+
+{ Fermer une reference de l'objet I pour le processus P }
+Procedure KRefClose(I, P : LongInt);
+Var K : LongInt;
+Begin
+  K := I * 32 + P;
+  If KObjPr^[K] > 0 Then KObjPr^[K] := KObjPr^[K] - 1;
+  Dec(KObjRef[I]);
+  If KObjRef[I] <= 0 Then KObjDrop(I);
+End;
+
+{ Fin du processus P : ses references sont rendues }
+Procedure KRefProcExit(P : LongInt);
+Var I, K : LongInt;
+Begin
+  For I := 0 To MaxKObj - 1 Do
+  Begin
+    K := I * 32 + P;
+    If KObjs^[I].Used And (KObjPr^[K] > 0) Then
     Begin
-      Threads[CurT].State := tsReady;
-      KWait := 0;
-      Exit;
+      KObjRef[I] := KObjRef[I] - KObjPr^[K];
+      KObjPr^[K] := 0;
+      If KObjRef[I] <= 0 Then KObjDrop(I);
     End;
-    If (Ms <> -1) And (Ticks >= Threads[CurT].WakeAt) Then
+  End;
+End;
+
+{ Fin de la tache T : ses mutex sont abandonnes (le prochain qui les
+  obtient recoit WAIT_ABANDONED) }
+Procedure MutexAbandon(T : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
+       (KObjs^[I].F1 = ThreadId(T)) Then
     Begin
-      Threads[CurT].State := tsReady;
-      Exit;
+      KObjs^[I].F1 := 0; KObjs^[I].F2 := 0; KObjs^[I].F3 := 1;
     End;
-    Threads[CurT].State := tsWait;
-  Until False;
 End;
 
 { ------------------------------------------------------------------ }
@@ -10125,7 +10847,7 @@ End;
 
 { Multimedia : timeSetEvent (appeles par la tache 0) }
 Procedure RunMMTimers;
-Var I, P, U, Id : LongInt;
+Var I, P, U, Id : LongInt; En : Boolean;
 Begin
   If InMMTimer Then Exit;
   InMMTimer := True;
@@ -10144,6 +10866,8 @@ Begin
         If Id >= 0 Then KObjs^[Id].F1 := 1;
       End
       Else If P <> 0 Then
+      Begin
+        En := ProcEnter(MMTimers[I].PrcId);
         asm
           push 0
           push 0
@@ -10155,6 +10879,8 @@ Begin
           mov eax,P
           call eax
         end;
+        If En Then ProcLeave;
+      End;
     End;
   InMMTimer := False;
 End;
@@ -10225,6 +10951,7 @@ Type
     Icon, Cursor, Brush, MenuName : LongInt;
     IKind  : LongInt;
     Extra  : LongInt;
+    PrcId  : LongInt;             { processus qui l'a enregistree }
   End;
 
   TWnd = Record
@@ -10279,9 +11006,11 @@ Type
 Type
   TWndArr = Array[0..MaxWnd - 1] Of TWnd;
   PWndArr = ^TWndArr;
+  TClassArr = Array[0..MaxClass - 1] Of TClass;
+  PClassArr = ^TClassArr;
 
 Var
-  Classes  : Array[0..MaxClass - 1] Of TClass;
+  Classes  : PClassArr;       { alloue dans le tas }
   Wnds     : PWndArr;         { alloue dans le tas }
   ZList    : Array[0..MaxWnd - 1] Of LongInt;
   ZCnt     : LongInt;
@@ -10344,6 +11073,121 @@ Begin
   TopOf := W;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Menus Win32 : elements, barre de menus des fenetres                }
+{ ------------------------------------------------------------------ }
+
+Const
+  MF_POPUP = $10; MF_SEPARATOR = $800; MF_BYPOSITION = $400;
+  MF_CHECKED = 8; MF_GRAYED = 1; MF_DISABLED = 2;
+  mnW32 = 1000;                  { menus du noyau : mnW32 + menu Win32 }
+  cmW32Base = 100000;            { commande : cmW32Base + element }
+
+Type
+  TMenuItemR = Record
+    Used  : Boolean;
+    Menu  : LongInt;
+    Flags : LongInt;
+    Id    : LongInt;
+    Seq   : LongInt;
+    Text  : String[63];
+  End;
+  TMItemArr = Array[0..MaxMenuItem - 1] Of TMenuItemR;
+  PMItemArr = ^TMItemArr;
+
+Var
+  MenuUsed  : Array[0..MaxMenu - 1] Of Boolean;
+  { elements de menu : dans le tas (l'image du noyau doit finir sous
+    00400000h, adresse de chargement des programmes Win32) }
+  MItemsP   : PMItemArr;
+  MSeq      : LongInt;
+  MenuOwnerW : LongInt;          { fenetre qui recoit WM_COMMAND }
+  MBarW, MBarOpen : LongInt;     { barre de menus deroulee (element) }
+  MBarTogW, MBarTog : LongInt;   { menu ferme par le clic courant }
+  TrackOn : Boolean;             { TrackPopupMenu en attente }
+  TrackRes : LongInt;            { commande choisie }
+
+Function MenuIdx(H : LongInt) : LongInt;
+Begin
+  If (H >= HMenuBase) And (H < HMenuBase + MaxMenu * 4) And
+     MenuUsed[(H - HMenuBase) Div 4] Then MenuIdx := (H - HMenuBase) Div 4
+  Else MenuIdx := -1;
+End;
+
+{ N-ieme element d'un menu (par position) ; -1 si absent }
+Function MItemAt(M, Pos0 : LongInt) : LongInt;
+Var I, J, Best, BS, Last : LongInt;
+Begin
+  MItemAt := -1;
+  Last := -1;
+  For J := 0 To Pos0 Do
+  Begin
+    Best := -1; BS := $7FFFFFFF;
+    For I := 0 To MaxMenuItem - 1 Do
+      If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+         (MItemsP^[I].Seq > Last)
+         And (MItemsP^[I].Seq < BS) Then
+      Begin
+        Best := I; BS := MItemsP^[I].Seq;
+      End;
+    If Best < 0 Then Exit;
+    Last := BS;
+    MItemAt := Best;
+  End;
+End;
+
+{ Elements d'un menu, dans l'ordre (rend leur nombre) }
+Function MItemList(M : LongInt; Var L : Array Of LongInt) : LongInt;
+Var I, J, K, N, T : LongInt;
+Begin
+  N := 0;
+  For I := 0 To MaxMenuItem - 1 Do
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And (N <= High(L)) Then
+    Begin
+      L[N] := I;
+      Inc(N);
+    End;
+  For I := 1 To N - 1 Do
+  Begin
+    T := L[I]; J := I;
+    While (J > 0) And (MItemsP^[L[J - 1]].Seq > MItemsP^[T].Seq) Do
+    Begin
+      L[J] := L[J - 1];
+      Dec(J);
+    End;
+    L[J] := T;
+  End;
+  MItemList := N;
+  K := 0;
+End;
+
+{ Texte affiche d'un element : sans les '&' (un '&&' donne '&') }
+Function MText(I : LongInt) : String;
+Var S, R : String; K : LongInt;
+Begin
+  S := MItemsP^[I].Text;
+  R := '';
+  K := 1;
+  While K <= Length(S) Do
+  Begin
+    If S[K] = '&' Then Inc(K);
+    If K <= Length(S) Then R := R + S[K];
+    Inc(K);
+  End;
+  MText := R;
+End;
+
+{ La fenetre d'un programme a une barre de menus (menu non vide) }
+Function HasMenuBar(W : LongInt) : Boolean;
+Var M : LongInt;
+Begin
+  HasMenuBar := False;
+  If (W < 0) Or IsChildW(W) Or (Wnds^[W].IKind <> ikNone) Then Exit;
+  M := MenuIdx(Wnds^[W].Menu);
+  If M < 0 Then Exit;
+  HasMenuBar := MItemAt(M, 0) >= 0;
+End;
+
 { Metriques du cadre selon le style }
 Procedure CalcNc(W : LongInt);
 Var B, T : LongInt;
@@ -10356,6 +11200,7 @@ Begin
   If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then B := B + 2;
   T := B;
   If (Wnds^[W].Style And WS_CAPTION) = WS_CAPTION Then T := T + 19;
+  If HasMenuBar(W) Then T := T + 20;
   Wnds^[W].CL := B; Wnds^[W].CT := T;
   Wnds^[W].CR := Max(B, Wnds^[W].W - B);
   Wnds^[W].CB := Max(T, Wnds^[W].H - B);
@@ -10531,7 +11376,7 @@ End;
 
 { Composer une zone de l'ecran : bureau puis fenetres (ordre Z) }
 Procedure ComposeRect(R : TRect);
-Var I, W, Y, S, D, N, X0, Y0 : LongInt; WR, X : TRect;
+Var I, W, Y, S, D, N, X0, Y0, B : LongInt; WR, X : TRect;
 Begin
   DeskDraw(R);
   For I := 0 To ZCnt - 1 Do
@@ -10544,10 +11389,11 @@ Begin
            Wnds^[W].Y + Wnds^[W].H);
       If RInter(X, R, WR) Then
       Begin
-        N := X.R - X.L;
+        B := PxBytes(Back.Bpp);
+        N := (X.R - X.L) * B;
         X0 := X.L - Wnds^[W].X; Y0 := X.T - Wnds^[W].Y;
-        S := Wnds^[W].Surf.Bits + Y0 * Wnds^[W].Surf.Pitch + X0;
-        D := Back.Bits + X.T * Back.Pitch + X.L;
+        S := Wnds^[W].Surf.Bits + Y0 * Wnds^[W].Surf.Pitch + X0 * B;
+        D := Back.Bits + X.T * Back.Pitch + X.L * B;
         For Y := X.T To X.B - 1 Do
         Begin
           MoveMem(S, D, N);
@@ -10585,6 +11431,68 @@ Begin
   X1 := X2 - 15;
 End;
 
+{ Ligne superieure de la barre de menus (dans la fenetre) }
+Function MBarY(W : LongInt) : LongInt;
+Begin
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then
+    MBarY := Wnds^[W].CT - 22
+  Else MBarY := Wnds^[W].CT - 20;
+End;
+
+{ Element de la barre de menus sous (OX, OY) (coord. dans la fenetre) ;
+  IX : bord gauche de l'element }
+Function MBarHit(W, OX, OY : LongInt; Var IX : LongInt) : LongInt;
+Var L : Array[0..31] Of LongInt; N, I, X, Y, TW, Bd : LongInt;
+Begin
+  MBarHit := -1;
+  Y := MBarY(W);
+  If (OY < Y) Or (OY >= Y + 19) Then Exit;
+  Bd := Wnds^[W].CL;
+  If (Wnds^[W].ExStyle And WS_EX_CLIENTEDGE) <> 0 Then Bd := Bd - 2;
+  N := MItemList(MenuIdx(Wnds^[W].Menu), L);
+  X := Bd + 1;
+  For I := 0 To N - 1 Do
+  Begin
+    TW := TextW(MText(L[I])) + 16;
+    If X + TW > Wnds^[W].W - Bd Then
+    Begin
+      X := Bd + 1;
+    End;
+    If (OX >= X) And (OX < X + TW) Then
+    Begin
+      MBarHit := L[I];
+      IX := X;
+      Exit;
+    End;
+    X := X + TW;
+  End;
+End;
+
+Procedure NcMenuBar(W, X0, Y0, Bd : LongInt);
+Var L : Array[0..31] Of LongInt; N, I, X, Y, TW, C : LongInt; T : String;
+Begin
+  Y := Y0 + MBarY(W);
+  FBar(X0 + Bd, Y, X0 + Wnds^[W].W - Bd - 1, Y + 19, cSilver);
+  N := MItemList(MenuIdx(Wnds^[W].Menu), L);
+  X := X0 + Bd + 1;
+  For I := 0 To N - 1 Do
+  Begin
+    T := MText(L[I]);
+    TW := TextW(T) + 16;
+    If X + TW > X0 + Wnds^[W].W - Bd Then Break;
+    If (MBarW = W) And (MBarOpen = L[I]) Then
+      Edge(X, Y + 1, X + TW - 1, Y + 18, cGray, cWhite);
+    If (MItemsP^[L[I]].Flags And 3) <> 0 Then
+    Begin
+      OutTxt(X + 9, Y + 3, T, cWhite);
+      C := cGray;
+    End
+    Else C := cBlack;
+    OutTxt(X + 8, Y + 2, T, C);
+    X := X + TW;
+  End;
+End;
+
 Procedure NcPaint(W : LongInt);
 Var Bd, X0, Y0, WW, HH, B, I, X1, Y1, X2, Y2, D : LongInt;
     Active : Boolean; Fg, C : LongInt; T : String;
@@ -10610,6 +11518,7 @@ Begin
       Box(X0 + I, Y0 + I, X0 + WW - 1 - I, Y0 + HH - 1 - I, cSilver);
   End
   Else If Bd = 1 Then Box(X0, Y0, X0 + WW - 1, Y0 + HH - 1, cBlack);
+  If HasMenuBar(W) Then NcMenuBar(W, X0, Y0, Bd);
   If (Wnds^[W].Style And WS_CAPTION) = WS_CAPTION Then
   Begin
     Active := (W = ActiveWin);
@@ -10711,9 +11620,25 @@ End;
 { ------------------------------------------------------------------ }
 
 Function CallProc(P, H, M, WP, LP : LongInt) : LongInt;
-Var R : LongInt;
+Var R, W, T : LongInt; En : Boolean;
 Begin
   R := 0;
+  { procedure d'une fenetre d'un autre processus : dans son contexte }
+  En := False;
+  W := WndOf(H);
+  If W >= 0 Then
+  Begin
+    T := Wnds^[W].Thread;
+    If (T > 0) And (T < MaxThread) Then
+    Begin
+      If Procs^[ThrProc[T]].Killing Then
+      Begin
+        CallProc := 0;
+        Exit;
+      End;
+      En := ProcEnter(ThrProc[T]);
+    End;
+  End;
   asm
     mov eax,LP
     push eax
@@ -10727,6 +11652,7 @@ Begin
     call eax
     mov R,eax
   end;
+  If En Then ProcLeave;
   CallProc := R;
 End;
 
@@ -10774,17 +11700,23 @@ End;
 { Creation, destruction, activation                                  }
 { ------------------------------------------------------------------ }
 
+{ Classe d'apres son nom : celles du processus courant, puis celles du
+  systeme (deux programmes peuvent enregistrer le meme nom) }
 Function ClassFind(Name : String) : LongInt;
-Var I : LongInt;
+Var I, K : LongInt;
 Begin
   ClassFind := -1;
   Name := UpStr(Name);
-  For I := 0 To MaxClass - 1 Do
-    If Classes[I].Used And (Classes[I].Name = Name) Then
-    Begin
-      ClassFind := I;
-      Exit;
-    End;
+  For K := 0 To 1 Do
+    For I := 0 To MaxClass - 1 Do
+      If Classes^[I].Used And (Classes^[I].Name = Name) And
+         (((K = 0) And (Classes^[I].PrcId = CurProc)) Or
+          ((K = 1) And ((Classes^[I].PrcId = 0) Or
+                        (Classes^[I].IKind <> ikNone)))) Then
+      Begin
+        ClassFind := I;
+        Exit;
+      End;
 End;
 
 Function ClassAdd(Name : String; Proc, IKind, Style : LongInt) : LongInt;
@@ -10792,16 +11724,17 @@ Var I : LongInt;
 Begin
   ClassAdd := -1;
   For I := 0 To MaxClass - 1 Do
-    If Not Classes[I].Used Then
+    If Not Classes^[I].Used Then
     Begin
-      FillMem(LongInt(@Classes[I]), SizeOf(TClass), 0);
-      Classes[I].Used := True;
-      Classes[I].Name := UpStr(Name);
-      Classes[I].Atom := $C000 + I;
-      Classes[I].Proc := Proc;
-      Classes[I].IKind := IKind;
-      Classes[I].Style := Style;
-      Classes[I].Brush := 6;      { COLOR_WINDOW + 1 }
+      FillMem(LongInt(@Classes^[I]), SizeOf(TClass), 0);
+      Classes^[I].Used := True;
+      Classes^[I].Name := UpStr(Name);
+      Classes^[I].Atom := $C000 + I;
+      Classes^[I].Proc := Proc;
+      Classes^[I].IKind := IKind;
+      Classes^[I].Style := Style;
+      Classes^[I].Brush := 6;      { COLOR_WINDOW + 1 }
+      Classes^[I].PrcId := CurProc;
       ClassAdd := I;
       Exit;
     End;
@@ -10845,7 +11778,14 @@ Begin
   If (T >= 0) And (T < MaxThread) Then HeapOwner := ThrOwner[T]
   Else HeapOwner := 0;
   If SurfNew(Wnds^[W].Surf, WW, HH) Then
-    FillMem(Wnds^[W].Surf.Bits, Wnds^[W].Surf.Pitch * HH, cSilver);
+  Begin
+    If Wnds^[W].Surf.Bpp = 8 Then
+      FillMem(Wnds^[W].Surf.Bits, Wnds^[W].Surf.Pitch * HH, cSilver)
+    Else
+      For T := 0 To HH - 1 Do
+        FillRaw(Wnds^[W].Surf.Bits + T * Wnds^[W].Surf.Pitch, WW,
+                RawOf(cSilver, Wnds^[W].Surf.Bpp), Wnds^[W].Surf.Bpp);
+  End;
   HeapOwner := Own;
   Wnds^[W].NeedNc := True;
 End;
@@ -10991,7 +11931,7 @@ Begin
   Begin
     ConW := -1;
     ChainExec := ''; ChainRet := ''; ConKeep := False;
-    If AppRunning And AppConsole Then ConKillReq := True;
+    If AppRunning Then ConKillReq := True;
   End;
   If (W < 0) Or Not Wnds^[W].Used Or Wnds^[W].Destroying Then Exit;
   Wnds^[W].Destroying := True;
@@ -11041,11 +11981,11 @@ Begin
   Wnds^[W].Style := Style And Not WS_VISIBLE;
   Wnds^[W].ExStyle := ExStyle;
   Wnds^[W].Text := Name;
-  Wnds^[W].Proc := Classes[Cls].Proc;
-  Wnds^[W].IKind := Classes[Cls].IKind;
+  Wnds^[W].Proc := Classes^[Cls].Proc;
+  Wnds^[W].IKind := Classes^[Cls].IKind;
   Wnds^[W].Thread := CurT;
   Wnds^[W].Inst := Inst;
-  Wnds^[W].Cursor := Classes[Cls].Cursor;
+  Wnds^[W].Cursor := Classes^[Cls].Cursor;
   If (Style And WS_CHILD) <> 0 Then
   Begin
     Wnds^[W].Parent := Parent;
@@ -11056,10 +11996,10 @@ Begin
     Wnds^[W].Owner := Parent;
     Wnds^[W].Menu := Menu;
   End;
-  If Classes[Cls].WndExtra > 0 Then
+  If Classes^[Cls].WndExtra > 0 Then
   Begin
-    Wnds^[W].ExtraSz := Classes[Cls].WndExtra;
-    Wnds^[W].Extra := KAlloc(Classes[Cls].WndExtra);
+    Wnds^[W].ExtraSz := Classes^[Cls].WndExtra;
+    Wnds^[W].Extra := KAlloc(Classes^[Cls].WndExtra);
   End;
   { CW_USEDEFAULT }
   If X = LongInt($80000000) Then
@@ -11083,7 +12023,7 @@ Begin
   MemL[0:CS + 32] := Style;
   PutPStr(CS + 64, Name, 128);
   MemL[0:CS + 36] := CS + 64;
-  PutPStr(CS + 192, Classes[Cls].Name, 64);
+  PutPStr(CS + 192, Classes^[Cls].Name, 64);
   MemL[0:CS + 40] := CS + 192;
   MemL[0:CS + 44] := ExStyle;
   CreateW := W;
@@ -11319,6 +12259,10 @@ End;
 
 Function ModalBlocked(T : LongInt) : Boolean; Forward;
 
+Procedure CloseMenus(Lv : LongInt); Forward;
+Procedure MBarClick(W, It, IX : LongInt); Forward;
+Procedure W32MenuPick(K : LongInt); Forward;
+
 Procedure MouseButton(Down : Boolean; Btn : LongInt);
 Var T, W, B, X1, Y1, X2, Y2, Msg, OX, OY : LongInt; Dbl : Boolean;
 Begin
@@ -11373,6 +12317,13 @@ Begin
     Else KMouse(-1, WM_LBUTTONUP + 3 * (Btn - 1), CurX, CurY);
     Exit;
   End;
+  { un clic dans la fenetre d'un programme ferme les menus ouverts }
+  MBarTog := -1;
+  If Down And (MenuDepth > 0) And (Wnds^[T].IKind = ikNone) Then
+  Begin
+    MBarTog := MBarOpen; MBarTogW := MBarW;
+    CloseMenus(0);
+  End;
   If Down And ModalBlocked(T) Then
   Begin
     KBeep;
@@ -11385,6 +12336,15 @@ Begin
      Not InRect(OX, OY, Wnds^[T].CL, Wnds^[T].CT, Wnds^[T].CR - 1,
                 Wnds^[T].CB - 1) Then
   Begin
+    If HasMenuBar(T) Then
+    Begin
+      B := MBarHit(T, OX, OY, X1);
+      If B >= 0 Then
+      Begin
+        MBarClick(T, B, X1);
+        Exit;
+      End;
+    End;
     For B := 0 To CapButtonCount(T) - 1 Do
     Begin
       CapBtnRect(T, B, X1, Y1, X2, Y2);
@@ -11427,7 +12387,7 @@ Begin
              (Abs(CurX - LastClickX) < 4) And (Abs(CurY - LastClickY) < 4);
       LastClickW := W; LastClickT := Ticks;
       LastClickX := CurX; LastClickY := CurY;
-      If Dbl And (((Classes[Wnds^[W].Cls].Style And CS_DBLCLKS) <> 0) Or
+      If Dbl And (((Classes^[Wnds^[W].Cls].Style And CS_DBLCLKS) <> 0) Or
          (Wnds^[W].IKind <> ikNone)) Then
       Begin
         Msg := WM_LBUTTONDBLCLK;
@@ -11491,6 +12451,8 @@ End;
 { Clavier (tache 0)                                                  }
 { ------------------------------------------------------------------ }
 
+Function RunExe(Path, Args : String) : Boolean; Forward;
+
 Procedure KeyEvent(Sc : LongInt; Up, Ext : Boolean);
 Var Vk, Lp, Msg, W, Ch : LongInt; Alt : Boolean;
 Begin
@@ -11510,7 +12472,15 @@ Begin
   Ch := 0;
   If Not Up Then Ch := ScanToChar(Sc);
   KeyScan := Sc; KeyExt := Ext;
-  { raccourcis du systeme }
+  { raccourcis du systeme : Ctrl+Alt+Suppr et Ctrl+Maj+Echap ouvrent le
+    Gestionnaire des taches (comme Windows XP) }
+  If Not Up And ((KeyState[$11] And $80) <> 0) And
+     (((Vk = $2E) And Alt) Or ((Vk = $1B) And
+      ((KeyState[$10] And $80) <> 0))) Then
+  Begin
+    RunExe('TASKMGR.EXE', '');
+    Exit;
+  End;
   If Not Up Then
   Begin
     KKey(-1, WM_KEYDOWN, Vk, Ch);
@@ -11754,7 +12724,7 @@ Const
   cmSafeMode = 10; cmDosMode = 11; cmNetwork = 12; cmPrompt = 13;
   cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
-  cmSysProps = 22; cmPaint = 23;
+  cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -11772,7 +12742,7 @@ Const
   mnDesk = 5; mnArrange = 6; mnColors = 7; mnIcon = 8;
   mnMonths = 9; mnTz = 10; mnVolCtx = 11;
   mnNFile = 12; mnNEdit = 13; mnNSearch = 14; mnNHelp = 15;
-  mnFdDrives = 16; mnFdTypes = 17;
+  mnFdDrives = 16; mnFdTypes = 17; mnTaskCtx = 18;
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -11866,7 +12836,6 @@ Var
   ExeCnt    : LongInt;
   NoteBuf   : LongInt;
 
-Function RunExe(Path, Args : String) : Boolean; Forward;
 Procedure KCommand(Cmd : LongInt); Forward;
 Procedure NetConfigBox; Forward;
 Function NetRunCmd(S : String) : Boolean; Forward;
@@ -12208,7 +13177,6 @@ Begin
 End;
 
 Procedure OpenStartMenu; Forward;
-Procedure CloseMenus(Lv : LongInt); Forward;
 
 Procedure VolPopOpen; Forward;
 
@@ -12239,6 +13207,14 @@ Begin
         VolPopOpen;
       End;
     End;
+    Exit;
+  End;
+  { clic droit sur la barre : Reduire toutes les fenetres, Gestionnaire
+    des taches }
+  If Msg = WM_RBUTTONDOWN Then
+  Begin
+    CloseMenus(0);
+    OpenMenu(0, mnTaskCtx, X, TaskY, True);
     Exit;
   End;
   If Msg <> WM_LBUTTONDOWN Then Exit;
@@ -12476,14 +13452,20 @@ Begin
 End;
 
 Function MenuCount(M : LongInt) : LongInt;
-Var N : LongInt; S : String;
+Var N : LongInt; S : String; L : Array[0..63] Of LongInt;
 Begin
+  If M >= mnW32 Then
+  Begin
+    MenuCount := MItemList(M - mnW32, L);
+    Exit;
+  End;
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 5 + ExeCnt;
     mnSettings : MenuCount := 7;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
+    mnTaskCtx : MenuCount := 2;
     mnNFile : MenuCount := 9;
     mnNEdit : MenuCount := 10;
     mnNSearch : MenuCount := 2;
@@ -12509,8 +13491,25 @@ End;
 
 Procedure MenuItem(M, I : LongInt; Var T : String;
                    Var Cmd, Sub, Icon : LongInt);
+Var K, F : LongInt;
 Begin
   T := '-'; Cmd := cmNone; Sub := 0; Icon := 0;
+  If M >= mnW32 Then
+  Begin
+    K := MItemAt(M - mnW32, I);
+    If K < 0 Then Exit;
+    F := MItemsP^[K].Flags;
+    If (F And MF_SEPARATOR) <> 0 Then Exit;
+    T := MText(K);
+    If (T = '') Or (T = '-') Then T := ' ';
+    If (F And 3) <> 0 Then Cmd := cmGray Else Cmd := cmW32Base + K;
+    If (F And MF_POPUP) <> 0 Then
+    Begin
+      Sub := MenuIdx(MItemsP^[K].Id);
+      If Sub >= 0 Then Sub := mnW32 + Sub Else Sub := 0;
+    End;
+    Exit;
+  End;
   Case M Of
     mnStart :
       Case I Of
@@ -12787,6 +13786,20 @@ Begin
                'Regola propriet'#133' audio', 'Ajustar propiedades de audio');
         Cmd := cmAudioProps;
       End;
+    mnTaskCtx :
+      If I = 0 Then
+      Begin
+        T := L('R'#130'duire toutes les fen'#136'tres', 'Minimize All Windows',
+               'Alle Fenster minimieren', 'Riduci a icona tutte le finestre',
+               'Minimizar todas las ventanas');
+        Cmd := cmMinAll;
+      End
+      Else
+      Begin
+        T := L('Gestionnaire des t'#131'ches', 'Task Manager', 'Task-Manager',
+               'Task Manager', 'Administrador de tareas');
+        Cmd := cmTaskMgr;
+      End;
     mnMonths :
       Begin
         T := MonthName(I + 1);
@@ -12872,6 +13885,13 @@ Begin
   For I := MenuDepth - 1 DownTo Lv Do
     If (MenuW[I] >= 0) And Wnds^[MenuW[I]].Used Then DestroyW(MenuW[I]);
   If MenuDepth > Lv Then MenuDepth := Lv;
+  If Lv = 0 Then
+  Begin
+    { barre de menus d'un programme : plus d'element enfonce }
+    If (MBarW >= 0) And Wnds^[MBarW].Used Then Wnds^[MBarW].NeedNc := True;
+    MBarW := -1; MBarOpen := -1;
+    TrackOn := False;
+  End;
   TaskbarChanged;
 End;
 
@@ -12902,7 +13922,7 @@ Begin
 End;
 
 Procedure PaintMenu(W : LongInt);
-Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH, K : LongInt;
+Var I, X, Y, WW, HH, YY, Cmd, Sub, Ic, TX, M, Fg, IH, K, J : LongInt;
     T, A : String;
 Begin
   X := Wnds^[W].X; Y := Wnds^[W].Y; WW := Wnds^[W].W; HH := Wnds^[W].H;
@@ -12941,6 +13961,18 @@ Begin
       Begin
         If M = mnStart Then PaintIcon(Ic, TX, YY + 4, 24)
         Else PaintIcon(Ic, TX, YY + 2, 16);
+      End;
+      { coche d'un element de menu d'un programme }
+      If M >= mnW32 Then
+      Begin
+        K := MItemAt(M - mnW32, I);
+        If (K >= 0) And ((MItemsP^[K].Flags And MF_CHECKED) <> 0) Then
+          For J := 0 To 2 Do
+          Begin
+            VLine(TX + 4 + J, YY + 8 + J, YY + 10 + J, Fg);
+            VLine(TX + 7 + J, YY + 10 - J, YY + 12 - J, Fg);
+            VLine(TX + 10 + J, YY + 7 - J, YY + 9 - J, Fg);
+          End;
       End;
       K := Pos(#9, T);
       If K > 0 Then
@@ -13009,12 +14041,45 @@ Begin
     End;
     Exit;
   End;
-  If Msg = WM_LBUTTONUP Then
+  If (Msg = WM_LBUTTONUP) Or (Msg = WM_RBUTTONUP) Then
   Begin
     If (Sub <> 0) Or (Cmd = cmGray) Then Exit;
+    If Cmd >= cmW32Base Then
+    Begin
+      W32MenuPick(Cmd - cmW32Base);
+      CloseMenus(0);
+      Exit;
+    End;
+    If Msg = WM_RBUTTONUP Then Exit;
     CloseMenus(0);
     If Cmd <> cmNone Then KCommand(Cmd);
   End;
+End;
+
+{ Clic sur l'element It de la barre de menus de W (IX : son bord) }
+Procedure MBarClick(W, It, IX : LongInt);
+Var S : LongInt;
+Begin
+  If (MBarTogW = W) And (MBarTog = It) Then
+  Begin
+    { second clic sur le menu deroule : il reste ferme }
+    MBarTog := -1;
+    Exit;
+  End;
+  CloseMenus(0);
+  If (MItemsP^[It].Flags And 3) <> 0 Then Exit;
+  MenuOwnerW := W;
+  If (MItemsP^[It].Flags And MF_POPUP) = 0 Then
+  Begin
+    W32MenuPick(It);
+    Exit;
+  End;
+  S := MenuIdx(MItemsP^[It].Id);
+  If S < 0 Then Exit;
+  OpenMenu(0, mnW32 + S, Wnds^[W].X + IX, Wnds^[W].Y + MBarY(W) + 19,
+           False);
+  MBarW := W; MBarOpen := It;
+  Wnds^[W].NeedNc := True;
 End;
 
 { ------------------------------------------------------------------ }
@@ -13097,7 +14162,8 @@ Begin
   WW := 420;
   W := KCreate(ikMsgBox, Title, icLogo, (ScrW - WW) Div 2,
                (TaskY - (110 + N * 16)) Div 2, WW, 110 + N * 16,
-               WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+               WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+               WS_EX_DLGMODALFRAME Or WS_EX_TOPMOST);
   If W >= 0 Then
   Begin
     Wnds^[W].KS := Text;
@@ -14622,8 +15688,10 @@ End;
 { Passer au mode I de la table, sans redemarrer : nouvel ecran, barre
   des taches et fenetres agrandies a la nouvelle taille, fenetres
   ramenees dans l'ecran, WM_DISPLAYCHANGE aux programmes }
+Procedure BmpReformat(OldF, NewF : LongInt); Forward;
+
 Function KApplyMode(NW, NH, NB, MaskA, NLfb, Num : LongInt) : Boolean;
-Var W, X, Y : LongInt;
+Var W, X, Y, OldF : LongInt;
 Begin
   CurShownB := False;
   ScrW := NW; ScrH := NH; ScrBpp := NB;
@@ -14632,10 +15700,25 @@ Begin
   ScrMode := Num;
   VideoMasks(MaskA);
   VgaPlanar := False;
+  OldF := ScrFmt;
+  ScrFmtSet;
   LfbPitch := ScrW * ScrBytes;
   If NLfb <> 0 Then Lfb := NLfb;
   SurfFree(Back);
   SurfNew(Back, ScrW, ScrH);
+  { autre format de composition : bitmaps compatibles convertis, surfaces
+    des fenetres refaites et redessinees }
+  If OldF <> ScrFmt Then
+  Begin
+    BmpReformat(OldF, ScrFmt);
+    For W := 0 To MaxWnd - 1 Do
+      If Wnds^[W].Used And Not IsChildW(W) And (Wnds^[W].Surf.Bits <> 0) Then
+      Begin
+        SurfFree(Wnds^[W].Surf);
+        WndSurf(W);
+        InvalAll(W, True);
+      End;
+  End;
   FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
   DacAll;
   OutPalChanged := False;
@@ -14644,7 +15727,10 @@ Begin
   For W := 0 To MaxWnd - 1 Do
     If Wnds^[W].Used And Not IsChildW(W) And (W <> TaskbarW) Then
     Begin
-      If Wnds^[W].Max Then
+      If Wnds^[W].Max And ((Wnds^[W].Style And $C00000) <> $C00000) Then
+        MoveW(W, -Wnds^[W].CL, -Wnds^[W].CL, ScrW + 2 * Wnds^[W].CL,
+              ScrH + 2 * Wnds^[W].CL, True)
+      Else If Wnds^[W].Max Then
         MoveW(W, -Wnds^[W].CL, -Wnds^[W].CL, ScrW + 2 * Wnds^[W].CL,
               TaskY + 2 * Wnds^[W].CL, True)
       Else
@@ -17302,7 +18388,7 @@ Begin
 End;
 
 Procedure KCommand(Cmd : LongInt);
-Var W : LongInt; Nm : String;
+Var W, I : LongInt; Nm : String;
 Begin
   If (Cmd >= cmColorBase) And (Cmd < cmColorBase + 64) Then
   Begin
@@ -17346,6 +18432,12 @@ Begin
     cmDisplay : DispOpen;
     cmDateTime : DtOpen;
     cmMixer : MixerOpen;
+    cmTaskMgr : RunExe('TASKMGR.EXE', '');
+    cmMinAll :
+      For I := 0 To MaxWnd - 1 Do
+        If Wnds^[I].Used And Wnds^[I].Visible And Not IsChildW(I) And
+           (Wnds^[I].IKind <> ikTaskbar) And (Wnds^[I].IKind <> ikMenu) And
+           ((Wnds^[I].Style And WS_CAPTION) = WS_CAPTION) Then MinimizeW(I);
     cmSysProps : SysOpen;
     cmAudioProps : AudioOpen;
     cmAlign : MarkAll;
@@ -17557,7 +18649,6 @@ Var
   ConKillReq : Boolean;                  { fenetre fermee : arreter le
                                            programme (tache 0) }
   ConTitle : String[79];
-  AppConsole : Boolean;                  { programme du sous-systeme console }
   { programme lance depuis l'Invite (CreateProcessA), puis retour }
   ChainExec, ChainArgs, ChainRet, ChainRetArgs, ChainDir : String;
   ChainObj : LongInt;
@@ -17690,6 +18781,21 @@ End;
   assembleur : la version Pascal (112 tests et ecritures par cellule)
   prenait pres de 300 ms pour un ecran sous l'emulateur de DEVENV, et le
   programme console attendait pendant ce temps (DIR, echo du clavier). }
+{ Case de 8x16 points en couleurs vraies (valeurs brutes Fg, Bg) }
+Procedure ConCellX(A, F, Pitch, Fg, Bg, Bpp : LongInt);
+Var R, X, B, PB : LongInt;
+Begin
+  PB := PxBytes(Bpp);
+  For R := 0 To 15 Do
+  Begin
+    B := Mem[0:F + R];
+    For X := 0 To 7 Do
+      If (B And ($80 Shr X)) <> 0 Then PutRaw(A + X * PB, Fg, Bpp)
+      Else PutRaw(A + X * PB, Bg, Bpp);
+    A := A + Pitch;
+  End;
+End;
+
 Procedure ConCell(A, F, Pitch, Fg, Bg : LongInt);
 Begin
   asm
@@ -17796,14 +18902,16 @@ Begin
       Fg := ConPal[ConAt[I] And 15]; Bg := ConPal[(ConAt[I] Shr 4) And 15];
       F := FontAddr + ConCh[I] * 16;
       A := DS.Bits + (Y1 + R * ConChH - DOY) * DS.Pitch +
-           (X1 + C * ConCW - DOX);
-      ConCell(A, F, DS.Pitch, Fg, Bg);
+           (X1 + C * ConCW - DOX) * PxBytes(DS.Bpp);
+      If DS.Bpp = 8 Then ConCell(A, F, DS.Pitch, Fg, Bg)
+      Else ConCellX(A, F, DS.Pitch, RawOf(Fg, DS.Bpp), RawOf(Bg, DS.Bpp),
+                    DS.Bpp);
       { curseur : soulignement, fenetre active seulement }
       If ConCurVis And (R = ConY) And (C = ConX) And (W = ActiveWin) Then
       Begin
         P := A + 13 * DS.Pitch;
-        FillMem(P, ConCW, Fg);
-        FillMem(P + DS.Pitch, ConCW, Fg);
+        FillRaw(P, ConCW, RawOf(Fg, DS.Bpp), DS.Bpp);
+        FillRaw(P + DS.Pitch, ConCW, RawOf(Fg, DS.Bpp), DS.Bpp);
       End;
     End;
 End;
@@ -17837,8 +18945,25 @@ Begin
   Dec(ConQLen);
 End;
 
-Procedure KKey(W, Msg, VK, Ch : LongInt);
+{ Bouton par defaut (BS_DEFPUSHBUTTON) ou d'annulation (IDCANCEL)
+  d'une fenetre de premier niveau ; -1 si aucun }
+Function DefBtnOf(T : LongInt; Cancel : Boolean) : LongInt;
 Var I : LongInt;
+Begin
+  DefBtnOf := -1;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And (Wnds^[I].IKind = ikButton) And IsChildW(I) And
+       Wnds^[I].Visible And Wnds^[I].Enabled And (TopOf(I) = T) Then
+      If (Cancel And (Wnds^[I].Id = IDCANCEL)) Or
+         (Not Cancel And ((Wnds^[I].Style And $F) = 1)) Then
+      Begin
+        DefBtnOf := I;
+        Exit;
+      End;
+End;
+
+Procedure KKey(W, Msg, VK, Ch : LongInt);
+Var I, K : LongInt;
 Begin
   If W = -1 Then
   Begin
@@ -17901,6 +19026,16 @@ Begin
       PostMsgW(I, WM_COMMAND, IDOK, 0)
     Else If (VK = $1B) And (Wnds^[I].IKind = ikDialog) Then
       PostMsgW(I, WM_COMMAND, IDCANCEL, 0)
+    Else If ((VK = $0D) Or (VK = $1B)) And (Wnds^[I].IKind = ikNone) And
+            ((Wnds^[W].IKind <> ikEdit) Or
+             ((Wnds^[W].Style And $1004) = 0)) And
+            (DefBtnOf(I, VK = $1B) >= 0) Then
+    Begin
+      { fenetre d'un programme : Entree = bouton par defaut,
+        Echap = bouton Annuler (comme le gestionnaire de dialogues) }
+      K := DefBtnOf(I, VK = $1B);
+      PostMsgW(Wnds^[K].Parent, WM_COMMAND, Wnds^[K].Id And $FFFF, 0);
+    End
     Else If (Ch <> 0) And (Wnds^[W].IKind = ikEdit) Then
       KWndProc(W, WM_CHAR, Ch, 0);
     Exit;
@@ -18388,7 +19523,11 @@ Begin
     X := 0;
     SwSave := LongInt(@X);
     SwNew := Threads[0].Esp;
+    SwCr3P := LongInt(@ThrCr3[CurT]);
+    SwCr3N := ThrCr3[0];
+    ProcCtxSwap(ThrCurP[0]);
     CurT := 0;
+    HeapOwner := ThrOwner[0];
     ThreadSetFs(0);
     SwitchCtx;
   End;
@@ -18424,6 +19563,7 @@ Type
   TVBlk = Record
     Used : Boolean;
     Base, Size, Orig : LongInt;
+    Owner : LongInt;
   End;
 
   TAtom = Record
@@ -18433,14 +19573,6 @@ Type
   End;
 
 Var
-  { programme Win32 en cours }
-  AppBase, AppSize, AppEntry : LongInt;
-  AppPath    : String[127];
-  AppCmd     : LongInt;     { ligne de commande ASCIIZ }
-  AppEnv     : LongInt;     { bloc d'environnement }
-  AppStdOut  : LongInt;
-  AppErrMode : LongInt;
-  AppExcFilter : LongInt;
   VBlks      : Array[0..MaxVBlk - 1] Of TVBlk;
   Atoms      : Array[0..MaxAtom - 1] Of TAtom;
   EnvBlk     : Array[0..4095] Of Byte;
@@ -18605,7 +19737,8 @@ Procedure GetStartupInfoA(P : LongInt);
 Begin
   FillMem(P, 68, 0);
   MemL[0:P] := 68;
-  MemW[0:P + 48] := 1;
+  MemL[0:P + 44] := 1;
+  MemW[0:P + 48] := Procs^[CurProc].Show;
 End;
 
 Function GetStdHandle(N : LongInt) : LongInt;
@@ -18663,7 +19796,7 @@ End;
 
 Function GetCurrentProcessId : LongInt;
 Begin
-  GetCurrentProcessId := $50;
+  GetCurrentProcessId := Procs^[CurProc].Pid;
 End;
 
 Function GetCurrentThread : LongInt;
@@ -18684,8 +19817,26 @@ Begin
 End;
 
 Function TerminateProcess(H, Code : LongInt) : LongInt;
+Var I, P : LongInt;
 Begin
-  ExitProcessK(Code);
+  TerminateProcess := 0;
+  If H = -1 Then
+  Begin
+    ExitProcessK(Code);
+    Exit;
+  End;
+  I := KObjOf(H, koProcess);
+  If I < 0 Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  P := KObjs^[I].F1;
+  If (KObjs^[I].F2 = 0) And (P > 0) And (P < MaxProc) And Procs^[P].Used Then
+  Begin
+    If P = ThrProc[CurT] Then ExitProcessK(Code)
+    Else KillProc(P, Code);
+  End;
   TerminateProcess := 1;
 End;
 
@@ -19393,6 +20544,16 @@ Begin
   Begin
     { la tache continue ; l'objet sera libere a sa fin }
     If (KObjs^[I].F1 >= 0) And Threads[KObjs^[I].F1].Used Then Exit;
+  End;
+  { objet processus : garde (autres poignees, code de sortie) }
+  If KObjs^[I].Kind = koProcess Then Exit;
+  If (KObjs^[I].Kind = koSnapshot) And (KObjs^[I].F4 <> 0) Then
+    KFree(KObjs^[I].F4);
+  { synchronisation et mappages : une reference de moins }
+  If KObjs^[I].Kind In [koEvent, koSemaphore, koMutex, koMapping] Then
+  Begin
+    KRefClose(I, CurProc);
+    Exit;
   End;
   If (KObjs^[I].Kind = koFile) And (KObjs^[I].F4 <= -1000) Then
     FatClose(-1000 - KObjs^[I].F4);
@@ -20339,7 +21500,7 @@ Begin
       End;
       A := (O + 65535) And Not 65535;
       VBlks[I].Used := True; VBlks[I].Base := A; VBlks[I].Size := Size;
-      VBlks[I].Orig := O;
+      VBlks[I].Orig := O; VBlks[I].Owner := HeapOwner;
       VirtualAlloc := A;
       Exit;
     End;
@@ -20872,15 +22033,36 @@ Begin
 End;
 
 Function CreateSemaphoreA(Sec, Init, Mx, Name : LongInt) : LongInt;
-Var I : LongInt;
+Var I : LongInt; S : String;
 Begin
-  I := KObjNew(koSemaphore);
-  If I < 0 Then
+  CreateSemaphoreA := 0;
+  If (Mx <= 0) Or (Init < 0) Or (Init > Mx) Then
   Begin
-    CreateSemaphoreA := 0;
+    SetErr(87);
     Exit;
   End;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
+  I := KNamed(S);
+  If I >= 0 Then
+  Begin
+    If KObjs^[I].Kind <> koSemaphore Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateSemaphoreA := KHandle(I);
+    Exit;
+  End;
+  I := KObjNew(koSemaphore);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
   KObjs^[I].F1 := Init; KObjs^[I].F2 := Mx;
+  KObjs^[I].Name := S;
+  KRefAdd(I);
+  SetErr(0);
   CreateSemaphoreA := KHandle(I);
 End;
 
@@ -20889,23 +22071,83 @@ Var I : LongInt;
 Begin
   ReleaseSemaphore := 0;
   I := KObjOf(H, koSemaphore);
-  If I < 0 Then Exit;
+  If I < 0 Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  If (N <= 0) Or (KObjs^[I].F1 + N > KObjs^[I].F2) Then
+  Begin
+    SetErr(298);                 { ERROR_TOO_MANY_POSTS }
+    Exit;
+  End;
   If Prev <> 0 Then MemL[0:Prev] := KObjs^[I].F1;
-  KObjs^[I].F1 := Min(KObjs^[I].F1 + N, KObjs^[I].F2);
+  KObjs^[I].F1 := KObjs^[I].F1 + N;
   ReleaseSemaphore := 1;
 End;
 
 Function CreateEventA(Sec, Manual, Init, Name : LongInt) : LongInt;
-Var I : LongInt;
+Var I : LongInt; S : String;
 Begin
-  I := KObjNew(koEvent);
-  If I < 0 Then
+  CreateEventA := 0;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
+  I := KNamed(S);
+  If I >= 0 Then
   Begin
-    CreateEventA := 0;
+    If KObjs^[I].Kind <> koEvent Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateEventA := KHandle(I);
     Exit;
   End;
+  I := KObjNew(koEvent);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
   KObjs^[I].F1 := Ord(Init <> 0); KObjs^[I].F2 := Ord(Manual <> 0);
+  KObjs^[I].Name := S;
+  KRefAdd(I);
+  SetErr(0);
   CreateEventA := KHandle(I);
+End;
+
+{ Ouvrir un objet nomme de la sorte K }
+Function KOpenNamed(Name, K : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  KOpenNamed := 0;
+  If Name = 0 Then
+  Begin
+    SetErr(87);
+    Exit;
+  End;
+  I := KNamed(KNameNorm(Name));
+  If I < 0 Then
+  Begin
+    SetErr(ErrFileNotFound);
+    Exit;
+  End;
+  If KObjs^[I].Kind <> K Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  KRefAdd(I);
+  KOpenNamed := KHandle(I);
+End;
+
+Function OpenEventA(Acc, Inh, Name : LongInt) : LongInt;
+Begin
+  OpenEventA := KOpenNamed(Name, koEvent);
+End;
+
+Function OpenSemaphoreA(Acc, Inh, Name : LongInt) : LongInt;
+Begin
+  OpenSemaphoreA := KOpenNamed(Name, koSemaphore);
 End;
 
 Function SetEvent(H : LongInt) : LongInt;
@@ -20924,63 +22166,149 @@ Begin
   ResetEvent := Ord(I >= 0);
 End;
 
+{ PulseEvent : libere les taches qui attendent (toutes pour un evenement
+  manuel, une seule sinon) puis laisse l'evenement non signale }
 Function PulseEvent(H : LongInt) : LongInt;
+Var I, T, K : LongInt; W : Boolean;
 Begin
-  SetEvent(H);
-  KYield;
-  PulseEvent := ResetEvent(H);
+  PulseEvent := 0;
+  I := KObjOf(H, koEvent);
+  If I < 0 Then Exit;
+  For T := 1 To MaxThread - 1 Do
+    If Threads[T].Used And (Threads[T].State = tsWait) Then
+    Begin
+      W := (Threads[T].WaitN = 0) And (Threads[T].WaitH = H);
+      For K := 0 To Threads[T].WaitN - 1 Do
+        If WaitHs^[T * 64 + K] = H Then W := True;
+      If W Then
+      Begin
+        Threads[T].PulseH := H;
+        If KObjs^[I].F2 = 0 Then Break;
+      End;
+    End;
+  KObjs^[I].F1 := 0;
+  PulseEvent := 1;
 End;
 
 Function CreateMutexA(Sec, Own, Name : LongInt) : LongInt;
-Var I : LongInt;
+Var I : LongInt; S : String;
 Begin
+  CreateMutexA := 0;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
   { mutex nomme deja cree : meme objet, ERROR_ALREADY_EXISTS }
-  If Name <> 0 Then
-    For I := 0 To MaxKObj - 1 Do
-      If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
-         (KObjs^[I].Name = UpStr(PStr(Name))) Then
-      Begin
-        SetErr(183);
-        CreateMutexA := KHandle(I);
-        Exit;
-      End;
-  I := KObjNew(koMutex);
-  If I < 0 Then
+  I := KNamed(S);
+  If I >= 0 Then
   Begin
-    CreateMutexA := 0;
+    If KObjs^[I].Kind <> koMutex Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateMutexA := KHandle(I);
     Exit;
   End;
-  If Name <> 0 Then KObjs^[I].Name := UpStr(PStr(Name));
+  I := KObjNew(koMutex);
+  If I < 0 Then Exit;
+  KObjOwner[I] := 0;
+  KObjs^[I].Name := S;
   If Own <> 0 Then
   Begin
     KObjs^[I].F1 := ThreadId(CurT); KObjs^[I].F2 := 1;
   End;
+  KRefAdd(I);
+  SetErr(0);
   CreateMutexA := KHandle(I);
 End;
 
+{ ReleaseMutex : seulement par la tache proprietaire ; libere quand le
+  compte des acquisitions revient a 0 }
 Function ReleaseMutex(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  ReleaseMutex := 0;
   I := KObjOf(H, koMutex);
-  If I >= 0 Then
+  If I < 0 Then
   Begin
-    Dec(KObjs^[I].F2);
-    If KObjs^[I].F2 <= 0 Then
-    Begin
-      KObjs^[I].F1 := 0; KObjs^[I].F2 := 0;
-    End;
+    SetErr(6);
+    Exit;
   End;
-  ReleaseMutex := Ord(I >= 0);
+  If KObjs^[I].F1 <> ThreadId(CurT) Then
+  Begin
+    SetErr(288);                 { ERROR_NOT_OWNER }
+    Exit;
+  End;
+  Dec(KObjs^[I].F2);
+  If KObjs^[I].F2 <= 0 Then
+  Begin
+    KObjs^[I].F1 := 0; KObjs^[I].F2 := 0;
+  End;
+  ReleaseMutex := 1;
 End;
 
 Procedure ChainStart; Forward;
 
 Function WaitForSingleObject(H, Ms : LongInt) : LongInt;
 Begin
-  { programme lance par CreateProcessA : lui passer la main }
-  If (ChainExec <> '') And (ChainObj >= 0) And
-     (KObjOf(H, koProcess) = ChainObj) And (CurT <> 0) Then ChainStart;
   WaitForSingleObject := KWait(H, Ms);
+End;
+
+Function WaitForSingleObjectEx(H, Ms, Alert : LongInt) : LongInt;
+Begin
+  WaitForSingleObjectEx := KWait(H, Ms);
+End;
+
+{ WAIT_OBJECT_0 + i, WAIT_ABANDONED_0 + i (80h), WAIT_TIMEOUT (102h),
+  WAIT_FAILED (-1) }
+Function WaitForMultipleObjects(N, Arr, All, Ms : LongInt) : LongInt;
+Begin
+  WaitForMultipleObjects := KWaitMulti(N, Arr, All, Ms, False);
+End;
+
+Function WaitForMultipleObjectsEx(N, Arr, All, Ms, Alert : LongInt)
+  : LongInt;
+Begin
+  WaitForMultipleObjectsEx := KWaitMulti(N, Arr, All, Ms, False);
+End;
+
+{ ... ou un message dans la file (resultat N) }
+Function MsgWaitForMultipleObjects(N, Arr, All, Ms, Mask : LongInt)
+  : LongInt;
+Begin
+  If N = 0 Then
+  Begin
+    { seulement les messages : attente d'un objet toujours non signale }
+    Threads[CurT].WaitN := 1;
+    WaitHs^[CurT * 64] := -1;
+    Threads[CurT].WaitAll := False;
+    Threads[CurT].WaitMsg := True;
+    MsgWaitForMultipleObjects := KWaitPrep(Ms);
+    Exit;
+  End;
+  MsgWaitForMultipleObjects := KWaitMulti(N, Arr, All, Ms, True);
+End;
+
+Function MsgWaitForMultipleObjectsEx(N, Arr, Ms, Mask, Flags : LongInt)
+  : LongInt;
+Begin
+  MsgWaitForMultipleObjectsEx := MsgWaitForMultipleObjects(N, Arr,
+    Ord((Flags And 1) <> 0), Ms, Mask);
+End;
+
+{ Signaler un objet puis en attendre un autre }
+Function SignalObjectAndWait(HS, HW, Ms, Alert : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := KObjOf(HS, 0);
+  If I >= 0 Then
+    Case KObjs^[I].Kind Of
+      koEvent : SetEvent(HS);
+      koMutex : ReleaseMutex(HS);
+      koSemaphore : ReleaseSemaphore(HS, 1, 0);
+    End;
+  SignalObjectAndWait := KWait(HW, Ms);
 End;
 
 { CRITICAL_SECTION : +4 LockCount, +8 RecursionCount, +12 OwningThread }
@@ -21091,9 +22419,13 @@ End;
               vers la palette systeme (256 octets)
     region  : I1..I4 rectangle (bornes exclusives), I5 sorte
     contexte: I1 indice dans Dcs
-  Les bitmaps compatibles (DDB) contiennent des indices de la palette
-  systeme, 8 bits par point ; les DIB gardent leur format et leur table
-  de couleurs, traduites lors des transferts. }
+  Les bitmaps compatibles (DDB) ont le format de l'ecran : indices de la
+  palette systeme en 256 couleurs, couleurs vraies (15, 16, 24 ou 32
+  bits) en High Color et True Color ; ils sont convertis quand le mode
+  change. Les bitmaps monochromes gardent un octet 0 (noir) ou 1 (blanc)
+  par point. Les DIB gardent leur format et leur table de couleurs,
+  traduites lors des transferts (I7 : 10h pour une DIB 16 bits en
+  5-6-5). }
 
 Const
   MaxDC = 96;
@@ -21143,6 +22475,10 @@ Var
   SysPalUse : LongInt;
   DefPal    : LongInt;
   XlatTab   : Array[0..255] Of Byte;
+  XlatL     : Array[0..255] Of LongInt;  { indice source -> point cible }
+  GMono     : Boolean;        { cible : bitmap monochrome (0 ou 1) }
+  DibG6     : Boolean;        { DIB 16 bits en 5-6-5 (BI_BITFIELDS) }
+  RopMsk    : LongInt;        { tous les bits d'un point de la cible }
   { cible de dessin d'un contexte }
   GSurf     : TSurf;
   GOX, GOY  : LongInt;
@@ -21204,14 +22540,16 @@ Begin
   If B < 0 Then Exit;
   If W < 1 Then W := 1;
   If H < 1 Then H := 1;
-  Pitch := (W + 3) And Not 3;
+  If Mono Or (Bpp < 8) Then Bpp := 8;
+  Pitch := (W * PxBytes(Bpp) + 3) And Not 3;
   Gdis^[B].I1 := KAlloc(Pitch * H + 16);
   If Gdis^[B].I1 = 0 Then
   Begin
     Gdis^[B].Used := False;
     Exit;
   End;
-  Gdis^[B].I2 := W; Gdis^[B].I3 := H; Gdis^[B].I4 := 8; Gdis^[B].I5 := Pitch;
+  FillMem(Gdis^[B].I1, Pitch * H, 0);
+  Gdis^[B].I2 := W; Gdis^[B].I3 := H; Gdis^[B].I4 := Bpp; Gdis^[B].I5 := Pitch;
   Gdis^[B].I7 := 2;
   If Mono Then
   Begin
@@ -21221,12 +22559,32 @@ Begin
   BmpNew := B;
 End;
 
+{ Format des points d'un bitmap : 8 (indices, ou 0/1 si monochrome),
+  15, 16, 24, 32 ; 1 ou 4 pour une DIB de 1 ou 4 bits }
+Function BmpFmt(B : LongInt) : LongInt;
+Begin
+  If (Gdis^[B].I7 And 4) <> 0 Then BmpFmt := 8
+  Else If (Gdis^[B].I4 = 16) And ((Gdis^[B].I7 And 1) <> 0) And
+          ((Gdis^[B].I7 And $10) = 0) Then BmpFmt := 15
+  Else BmpFmt := Gdis^[B].I4;
+End;
+
+{ Bits par point annonces aux programmes (15 est annonce 16) }
+Function BmpBits(B : LongInt) : LongInt;
+Begin
+  If Gdis^[B].I4 = 15 Then BmpBits := 16 Else BmpBits := Gdis^[B].I4;
+End;
+
 { Surface d'un bitmap 8 bits (les DIB de bas en haut ont un pas negatif)}
 Function BmpSurf(B : LongInt; Var S : TSurf) : Boolean;
+Var F : LongInt;
 Begin
   BmpSurf := False;
-  If (B < 0) Or (Gdis^[B].I4 <> 8) And ((Gdis^[B].I7 And 4) = 0) Then Exit;
-  S.W := Gdis^[B].I2; S.H := Gdis^[B].I3;
+  If B < 0 Then Exit;
+  F := BmpFmt(B);
+  If (F <> 8) And (F <> 15) And (F <> 16) And (F <> 24) And (F <> 32) Then
+    Exit;
+  S.W := Gdis^[B].I2; S.H := Gdis^[B].I3; S.Bpp := F;
   If (Gdis^[B].I7 And 2) <> 0 Then
   Begin
     S.Bits := Gdis^[B].I1; S.Pitch := Gdis^[B].I5;
@@ -21237,6 +22595,37 @@ Begin
     S.Pitch := -Gdis^[B].I5;
   End;
   BmpSurf := True;
+End;
+
+{ Changement de format de l'ecran : les bitmaps compatibles (ni DIB, ni
+  monochromes, ni enveloppes de surfaces DirectDraw) prennent le nouveau
+  format, couleurs conservees }
+Procedure BmpReformat(OldF, NewF : LongInt);
+Var B, Own, P, NB, Y, X, SA, DA, SP, DP : LongInt;
+Begin
+  Own := HeapOwner;
+  SP := PxBytes(OldF); DP := PxBytes(NewF);
+  For B := 0 To MaxGdi - 1 Do
+    If Gdis^[B].Used And (Gdis^[B].Kind = goBitmap) And
+       ((Gdis^[B].I7 And (1 Or 4 Or 8)) = 0) And (Gdis^[B].I4 = OldF) Then
+    Begin
+      HeapOwner := Gdis^[B].Owner;
+      P := (Gdis^[B].I2 * DP + 3) And Not 3;
+      NB := KAlloc(P * Gdis^[B].I3 + 16);
+      If NB <> 0 Then
+      Begin
+        For Y := 0 To Gdis^[B].I3 - 1 Do
+        Begin
+          SA := Gdis^[B].I1 + Y * Gdis^[B].I5; DA := NB + Y * P;
+          For X := 0 To Gdis^[B].I2 - 1 Do
+            PutRaw(DA + X * DP, XToRaw(RawToX(GetRaw(SA + X * SP, OldF),
+                   OldF), NewF), NewF);
+        End;
+        KFree(Gdis^[B].I1);
+        Gdis^[B].I1 := NB; Gdis^[B].I5 := P; Gdis^[B].I4 := NewF;
+      End;
+    End;
+  HeapOwner := Own;
 End;
 
 Procedure BmpFree(B : LongInt);
@@ -21299,7 +22688,7 @@ Var S : TSurf; OX, OY, B : LongInt; Clip, R : TRect;
 Begin
   DcBegin := False;
   If (D < 0) Or Not Dcs[D].Used Then Exit;
-  GTab := 0; GTop := -1;
+  GTab := 0; GTop := -1; GMono := False;
   If Dcs[D].Wnd >= 0 Then
   Begin
     If Not Wnds^[Dcs[D].Wnd].Used Then Exit;
@@ -21319,6 +22708,7 @@ Begin
     OX := 0; OY := 0;
     SetR(Clip, 0, 0, S.W, S.H);
     GTab := Gdis^[B].I6;
+    GMono := (Gdis^[B].I7 And 4) <> 0;
   End;
   If Dcs[D].HasClip Then
   Begin
@@ -21360,12 +22750,37 @@ Begin
 End;
 
 { Couleur (COLORREF) -> indice dans la cible courante }
-Function GColor(C : LongInt) : LongInt;
-Var I, Best, BD, D, R, G, B, T : LongInt;
+{ Entree I de la palette logique du contexte D en 00RRGGBB }
+Function DcPalX(D, I : LongInt) : LongInt;
+Var P, E : LongInt;
 Begin
+  P := -1;
+  If (D >= 0) And Dcs[D].Used Then P := Dcs[D].Pal;
+  If (P >= 0) And (I >= 0) And (I < Gdis^[P].I2) Then
+  Begin
+    E := Gdis^[P].I1 + I * 4;
+    DcPalX := (Mem[0:E] Shl 16) Or (Mem[0:E + 1] Shl 8) Or Mem[0:E + 2];
+  End
+  Else DcPalX := SysX[I And 255];
+End;
+
+{ Couleur (COLORREF) -> couleur pour la cible courante : indice en 256
+  couleurs (ou dans la table d'une DIB), 0 ou 1 pour un bitmap
+  monochrome, couleur directe (CDirect) en couleurs vraies }
+Function GColor(C : LongInt) : LongInt;
+Var I, Best, BD, D, R, G, B, T, X : LongInt;
+Begin
+  If (C Shr 24) = 1 Then X := DcPalX(GDc, C And $FFFF)
+  Else X := ((C And 255) Shl 16) Or (C And $FF00) Or ((C Shr 16) And 255);
+  If GMono Then
+  Begin
+    GColor := Ord(((X Shr 16) And 255) * 30 + ((X Shr 8) And 255) * 59 +
+                  (X And 255) * 11 >= 12800);
+    Exit;
+  End;
   If GTab = 0 Then
   Begin
-    GColor := ColorIdx(C);
+    If DS.Bpp = 8 Then GColor := ColorIdx(C) Else GColor := CDirect Or X;
     Exit;
   End;
   If (C Shr 24) = 1 Then
@@ -21373,7 +22788,7 @@ Begin
     GColor := C And 255;
     Exit;
   End;
-  R := C And 255; G := (C Shr 8) And 255; B := (C Shr 16) And 255;
+  R := (X Shr 16) And 255; G := (X Shr 8) And 255; B := X And 255;
   Best := 0; BD := $7FFFFFFF;
   For I := 0 To 255 Do
   Begin
@@ -21387,6 +22802,40 @@ Begin
     End;
   End;
   GColor := Best;
+End;
+
+{ 00RRGGBB -> point brut de la cible courante }
+Function ToTgt(X : LongInt) : LongInt;
+Begin
+  If GMono Then
+    ToTgt := Ord(((X Shr 16) And 255) * 30 + ((X Shr 8) And 255) * 59 +
+                 (X And 255) * 11 >= 12800)
+  Else If (DS.Bpp = 8) And (GTab <> 0) Then ToTgt := GColor(XToCr(X))
+  Else ToTgt := XToRaw(X, DS.Bpp);
+End;
+
+{ Point brut V d'une source (format Bpp, table Tab pour 8 bits) en
+  00RRGGBB }
+Function SrcX(V, Bpp, Tab : LongInt) : LongInt;
+Begin
+  If (Bpp = 8) And (Tab <> 0) Then SrcX := MemL[0:Tab + (V And 255) * 4] And
+                                          $FFFFFF
+  Else SrcX := RawToX(V, Bpp);
+End;
+
+{ Masque d'inversion de la cible (1 pour un bitmap monochrome) }
+Function TgtMask : LongInt;
+Begin
+  If GMono Then TgtMask := 1 Else TgtMask := RawMask(DS.Bpp);
+End;
+
+{ Point brut V en (X, Y) de la cible, avec decoupage }
+Procedure PixRaw(X, Y, V : LongInt);
+Begin
+  If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then
+    Exit;
+  PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * PxBytes(DS.Bpp), V,
+         DS.Bpp);
 End;
 
 { ------------------------------------------------------------------ }
@@ -21619,9 +23068,11 @@ Begin
       MemL[0:Buf + 8] := Gdis^[I].I3;
       If (Gdis^[I].I7 And 4) <> 0 Then
         MemL[0:Buf + 12] := ((Gdis^[I].I2 + 15) Div 16) * 2
-      Else MemL[0:Buf + 12] := Gdis^[I].I5;
+      Else If (Gdis^[I].I7 And 1) <> 0 Then MemL[0:Buf + 12] := Gdis^[I].I5
+      Else MemL[0:Buf + 12] := ((Gdis^[I].I2 * StoreBits(Gdis^[I].I4) + 15)
+                                Div 16) * 2;
       MemW[0:Buf + 16] := 1;
-      MemW[0:Buf + 18] := Gdis^[I].I4;
+      MemW[0:Buf + 18] := BmpBits(I);
       If (Gdis^[I].I7 And 1) <> 0 Then MemL[0:Buf + 20] := Gdis^[I].I1;
       GetObjectA := 24;
       If ((Gdis^[I].I7 And 1) <> 0) And (N >= 84) Then
@@ -21738,6 +23189,17 @@ Begin
   P := Dcs[D].Pal;
   If (P < 0) Or (P = DefPal) Then Exit;
   N := Gdis^[P].I2;
+  If ScrFmt > 8 Then
+  Begin
+    For I := 0 To Min(N, 256) - 1 Do
+    Begin
+      E := Gdis^[P].I1 + I * 4;
+      Mem[0:Gdis^[P].I3 + I] := NearestIdx(Mem[0:E], Mem[0:E + 1],
+                                           Mem[0:E + 2]);
+    End;
+    RealizePalette := N;
+    Exit;
+  End;
   If SysPalUse = 2 Then
   Begin
     Lo := 1; Hi := 254;
@@ -22381,7 +23843,7 @@ End;
 
 { Remplir (X1,Y1)-(X2,Y2) inclus avec le pinceau B (indice GDI) }
 Procedure BrushFill(X1, Y1, X2, Y2, B : LongInt);
-Var C, X, Y, PB, PX, PY : LongInt; PS : TSurf;
+Var C, X, Y, PB, PX, PY, CT, CB : LongInt; PS : TSurf; PM, Same : Boolean;
 Begin
   If (B < 0) Or Not Gdis^[B].Used Then Exit;
   Case Gdis^[B].I1 Of
@@ -22399,6 +23861,11 @@ Begin
     Begin
       PB := Gdis^[B].I4;
       If (PB < 0) Or Not BmpSurf(PB, PS) Then Exit;
+      PM := (Gdis^[PB].I7 And 4) <> 0;
+      CT := RawOf(GColor(Dcs[GDc].TextColor), DS.Bpp);
+      CB := RawOf(GColor(Dcs[GDc].BkColor), DS.Bpp);
+      Same := (PS.Bpp = DS.Bpp) And Not GMono And Not PM And
+              ((PS.Bpp > 8) Or ((Gdis^[PB].I6 = 0) And (GTab = 0)));
       For Y := Max(Y1, ClipY1) To Min(Y2, ClipY2) Do
       Begin
         PY := Y Mod PS.H;
@@ -22407,17 +23874,13 @@ Begin
         Begin
           PX := X Mod PS.W;
           If PX < 0 Then PX := PX + PS.W;
-          C := Mem[0:PS.Bits + PY * PS.Pitch + PX];
-          If (Gdis^[PB].I7 And 4) <> 0 Then
+          C := GetRaw(PS.Bits + PY * PS.Pitch + PX * PxBytes(PS.Bpp), PS.Bpp);
+          If PM Then
           Begin
-            If C = 0 Then C := GColor(Dcs[GDc].TextColor)
-            Else C := GColor(Dcs[GDc].BkColor);
+            If C = 0 Then C := CT Else C := CB;
           End
-          Else If Gdis^[PB].I6 <> 0 Then
-            C := ColorIdx(((MemL[0:Gdis^[PB].I6 + C * 4] Shr 16) And 255) Or
-                 (MemL[0:Gdis^[PB].I6 + C * 4] And $FF00) Or
-                 ((MemL[0:Gdis^[PB].I6 + C * 4] And 255) Shl 16));
-          Pix(X, Y, C);
+          Else If Not Same Then C := ToTgt(SrcX(C, PS.Bpp, Gdis^[PB].I6));
+          PixRaw(X, Y, C);
         End;
       End;
     End;
@@ -22427,7 +23890,7 @@ Begin
 End;
 
 Function PatBlt(Hdc, X, Y, W, H, Rop : LongInt) : LongInt;
-Var D, C, YY, XX, A : LongInt;
+Var D, C, YY, XX : LongInt;
 Begin
   PatBlt := 1;
   D := DcOf(Hdc);
@@ -22446,14 +23909,12 @@ Begin
     WHITENESS : FBar(X, Y, X + W - 1, Y + H - 1, GColor($FFFFFF));
     DSTINVERT, PATINVERT :
     Begin
-      C := 255;
-      If Rop = PATINVERT Then C := GColor(Gdis^[Dcs[D].Brush].I2);
+      C := TgtMask;
+      If Rop = PATINVERT Then
+        C := RawOf(GColor(Gdis^[Dcs[D].Brush].I2), DS.Bpp);
       For YY := Max(Y, ClipY1) To Min(Y + H - 1, ClipY2) Do
         For XX := Max(X, ClipX1) To Min(X + W - 1, ClipX2) Do
-        Begin
-          A := DS.Bits + (YY - DOY) * DS.Pitch + (XX - DOX);
-          Mem[0:A] := Mem[0:A] Xor C;
-        End;
+          XorPix(XX, YY, C);
     End;
   Else
     BrushFill(X, Y, X + W - 1, Y + H - 1, Dcs[D].Brush);
@@ -22687,10 +24148,7 @@ Begin
   If (I < 0) Or Not DcBegin(D) Then Exit;
   For Y := Max(Gdis^[I].I2, ClipY1) To Min(Gdis^[I].I4 - 1, ClipY2) Do
     For X := Max(Gdis^[I].I1, ClipX1) To Min(Gdis^[I].I3 - 1, ClipX2) Do
-    Begin
-      A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
-      Mem[0:A] := Mem[0:A] Xor 255;
-    End;
+      XorPix(X, Y, TgtMask);
   DcDirty(Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
 End;
 
@@ -22712,11 +24170,15 @@ Begin
   If Not DcBegin(D) Then Exit;
   If (X < ClipX1) Or (X > ClipX2) Or (Y < ClipY1) Or (Y > ClipY2) Then Exit;
   I := GetPix(X, Y);
-  If GTab <> 0 Then
+  If GMono Then
+  Begin
+    If I <> 0 Then GetPixel := $FFFFFF Else GetPixel := 0;
+  End
+  Else If GTab <> 0 Then
     GetPixel := ((MemL[0:GTab + I * 4] Shr 16) And 255) Or
                 (MemL[0:GTab + I * 4] And $FF00) Or
                 ((MemL[0:GTab + I * 4] And 255) Shl 16)
-  Else GetPixel := IdxColor(I);
+  Else GetPixel := XToCr(RawToX(I, DS.Bpp));
 End;
 
 { ------------------------------------------------------------------ }
@@ -22906,8 +24368,21 @@ Begin
   BuildXlat := False;
   If SMono Then
   Begin
-    For I := 0 To 255 Do XlatTab[I] := GColor(Dcs[D].BkColor);
-    XlatTab[0] := GColor(Dcs[D].TextColor);
+    C := RawOf(GColor(Dcs[D].BkColor), DS.Bpp);
+    For I := 0 To 255 Do XlatL[I] := C;
+    XlatL[0] := RawOf(GColor(Dcs[D].TextColor), DS.Bpp);
+    BuildXlat := True;
+    Exit;
+  End;
+  If (DS.Bpp > 8) Or GMono Then
+  Begin
+    { couleurs vraies (ou monochrome) : couleur exacte de chaque indice }
+    For I := 0 To 255 Do
+    Begin
+      If STab <> 0 Then Q := MemL[0:STab + I * 4] And $FFFFFF
+      Else Q := SysX[I];
+      XlatL[I] := ToTgt(Q);
+    End;
     BuildXlat := True;
     Exit;
   End;
@@ -22930,10 +24405,10 @@ Begin
       Q := MemL[0:STab + I * 4];
       C := ((Q Shr 16) And 255) Or (Q And $FF00) Or ((Q And 255) Shl 16);
       If GTab = 0 Then
-        XlatTab[I] := PalMatch(D, I, Q And $FFFFFF, C)
-      Else XlatTab[I] := GColor(C);
+        XlatL[I] := PalMatch(D, I, Q And $FFFFFF, C)
+      Else XlatL[I] := GColor(C);
     End
-    Else XlatTab[I] := GColor(IdxColor(I));
+    Else XlatL[I] := GColor(IdxColor(I));
   End;
   BuildXlat := True;
 End;
@@ -22947,16 +24422,16 @@ Begin
     SRCPAINT : Rop3 := S Or D;
     SRCAND : Rop3 := S And D;
     SRCINVERT : Rop3 := S Xor D;
-    NOTSRCCOPY : Rop3 := (Not S) And 255;
-    SRCERASE : Rop3 := S And Not D And 255;
-    MERGEPAINT : Rop3 := (Not S Or D) And 255;
-    NOTSRCERASE : Rop3 := (Not (S Or D)) And 255;
+    NOTSRCCOPY : Rop3 := (Not S) And RopMsk;
+    SRCERASE : Rop3 := S And Not D And RopMsk;
+    MERGEPAINT : Rop3 := (Not S Or D) And RopMsk;
+    NOTSRCERASE : Rop3 := (Not (S Or D)) And RopMsk;
     MERGECOPY : Rop3 := P And S;
-    DSTINVERT : Rop3 := (Not D) And 255;
+    DSTINVERT : Rop3 := (Not D) And RopMsk;
     PATCOPY : Rop3 := P;
     PATINVERT : Rop3 := P Xor D;
     BLACKNESS : Rop3 := 0;
-    WHITENESS : Rop3 := 255;
+    WHITENESS : Rop3 := RopMsk;
   Else
     R := 0;
     I := (Rop Shr 16) And 255;
@@ -22968,16 +24443,17 @@ Begin
     If (I And $20) <> 0 Then R := R Or (P And Not S And D);
     If (I And $40) <> 0 Then R := R Or (P And S And Not D);
     If (I And $80) <> 0 Then R := R Or (P And S And D);
-    Rop3 := R And 255;
+    Rop3 := R And RopMsk;
   End;
 End;
 
 { Transfert (avec mise a l'echelle) de la source S vers le contexte
   courant (DcBegin deja fait). Coordonnees logiques de la cible }
 Procedure BltCore(DX, DY, DW, DH : LongInt; Var S : TSurf; SX, SY, SW,
-                  SH : LongInt; Xl : Boolean; Rop : LongInt);
-Var X, Y, SXX, SYY, A, V, P, X0, X1, Y0, Y1, SRow, Pc, DMono : LongInt;
-    Flip : Boolean; Simple : Boolean;
+                  SH : LongInt; Xl : Boolean; Rop, STab : LongInt;
+                  SMono : Boolean; SBk : LongInt);
+Var X, Y, SXX, SYY, A, V, X0, X1, Y0, Y1, SRow, Pc, PB, SPB, N : LongInt;
+    Simple : Boolean;
 Begin
   If (DW = 0) Or (DH = 0) Or (SW = 0) Or (SH = 0) Then Exit;
   If DW < 0 Then
@@ -22991,19 +24467,19 @@ Begin
   X0 := Max(DX, ClipX1); X1 := Min(DX + DW - 1, ClipX2);
   Y0 := Max(DY, ClipY1); Y1 := Min(DY + DH - 1, ClipY2);
   If (X0 > X1) Or (Y0 > Y1) Then Exit;
+  PB := PxBytes(DS.Bpp); SPB := PxBytes(S.Bpp);
+  RopMsk := TgtMask;
   Pc := 0;
-  If (Dcs[GDc].Brush >= 0) Then Pc := GColor(Gdis^[Dcs[GDc].Brush].I2);
-  DMono := 0;
-  If (Dcs[GDc].Bmp >= 0) And ((Gdis^[Dcs[GDc].Bmp].I7 And 4) <> 0) And
-     (Dcs[GDc].Wnd < 0) And Not Dcs[GDc].Screen Then DMono := 1;
+  If (Dcs[GDc].Brush >= 0) Then
+    Pc := RawOf(GColor(Gdis^[Dcs[GDc].Brush].I2), DS.Bpp);
   Simple := (Rop = SRCCOPY) And Not Xl And (DW = SW) And (DH = SH) And
-            (DMono = 0);
+            Not GMono And (S.Bpp = DS.Bpp);
   For Y := Y0 To Y1 Do
   Begin
     SYY := SY + ((Y - DY) * SH) Div DH;
     If (SYY < 0) Or (SYY >= S.H) Then Continue;
     SRow := S.Bits + SYY * S.Pitch;
-    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX;
+    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX * PB;
     If Simple Then
     Begin
       SXX := SX + (X0 - DX);
@@ -23012,23 +24488,26 @@ Begin
       Begin
         X := X - SXX; SXX := 0;
       End;
-      If X <= X1 Then
-        MoveMem(SRow + SXX, A + X, Min(X1 - X + 1, S.W - SXX));
+      N := Min(X1 - X + 1, S.W - SXX);
+      If (X <= X1) And (N > 0) Then
+        MoveMem(SRow + SXX * SPB, A + X * PB, N * PB);
       Continue;
     End;
     For X := X0 To X1 Do
     Begin
       SXX := SX + ((X - DX) * SW) Div DW;
       If (SXX < 0) Or (SXX >= S.W) Then Continue;
-      V := Mem[0:SRow + SXX];
-      If DMono = 1 Then
+      V := GetRaw(SRow + SXX * SPB, S.Bpp);
+      If GMono Then
       Begin
-        If Xl Then V := XlatTab[V];
-        If V = GColor(Dcs[GDc].BkColor) Then V := 1 Else V := 0;
+        { couleur -> monochrome : blanc pour la couleur de fond de la
+          source, noir sinon }
+        If Not SMono Then V := Ord(SrcX(V, S.Bpp, STab) = SBk);
       End
-      Else If Xl Then V := XlatTab[V];
-      If Rop <> SRCCOPY Then V := Rop3(Rop, Pc, V, Mem[0:A + X]);
-      Mem[0:A + X] := V;
+      Else If Xl Then V := XlatL[V And 255]
+      Else If S.Bpp <> DS.Bpp Then V := ToTgt(RawToX(V, S.Bpp));
+      If Rop <> SRCCOPY Then V := Rop3(Rop, Pc, V, GetRaw(A + X * PB, DS.Bpp));
+      PutRaw(A + X * PB, V, DS.Bpp);
     End;
   End;
   DcDirty(X0, Y0, X1, Y1);
@@ -23036,7 +24515,7 @@ End;
 
 Function StretchBlt(Hdc, X, Y, W, H, Src, SX, SY, SW, SH, Rop : LongInt)
   : LongInt;
-Var D, SD, STab, OX, OY : LongInt; S : TSurf; SMono, Xl : Boolean;
+Var D, SD, STab, OX, OY, SBk, C : LongInt; S : TSurf; SMono, Xl : Boolean;
 Begin
   StretchBlt := 1;
   D := DcOf(Hdc);
@@ -23048,9 +24527,13 @@ Begin
   End;
   SD := DcOf(Src);
   If Not SrcInfo(SD, S, STab, SMono, OX, OY) Then Exit;
+  C := Dcs[SD].BkColor;
+  SBk := ((C And 255) Shl 16) Or (C And $FF00) Or ((C Shr 16) And 255);
   If Not DcBegin(D) Then Exit;
-  Xl := BuildXlat(STab, SMono, D);
-  BltCore(X, Y, W, H, S, SX + OX, SY + OY, SW, SH, Xl, Rop);
+  Xl := False;
+  If S.Bpp = 8 Then Xl := BuildXlat(STab, SMono, D);
+  BltCore(X, Y, W, H, S, SX + OX, SY + OY, SW, SH, Xl, Rop, STab, SMono,
+          SBk);
 End;
 
 Function BitBlt(Hdc, X, Y, W, H, Src, SX, SY, Rop : LongInt) : LongInt;
@@ -23104,72 +24587,123 @@ End;
 
 { Lire le point (X, Y) d'une DIB (Y depuis le haut) comme indice de la
   table (1, 4, 8 bits) ou couleur RGB (16, 24, 32 bits, avec bit 31) }
-Function DibPix(Bits, W, H, Bpp, X, Y : LongInt; TopDown : Boolean)
-  : LongInt;
-Var Row, A, V : LongInt;
+{ DIB 16 bits en 5-6-5 : BI_BITFIELDS avec le masque vert 07E0h (les
+  masques suivent l'en-tete de 40 octets, ou y sont pour V4 et V5) }
+Function DibIs565(Bmi : LongInt) : Boolean;
 Begin
-  If Not TopDown Then Y := H - 1 - Y;
-  Row := Bits + Y * DibPitch(W, Bpp);
+  DibIs565 := (MemW[0:Bmi + 14] = 16) And (MemL[0:Bmi + 16] = 3) And
+              (MemL[0:Bmi + 44] = $7E0);
+End;
+
+{ Point X d'une ligne de DIB : indice de la table (1, 4, 8 bits) ou
+  couleur 00RRGGBB avec le bit 31 (16, 24, 32 bits ; 16 bits en 5-5-5,
+  ou 5-6-5 si DibG6) }
+Function DibPixRow(Row, Bpp, X : LongInt) : LongInt;
+Var A, V : LongInt;
+Begin
   Case Bpp Of
-    8 : DibPix := Mem[0:Row + X];
+    8 : DibPixRow := Mem[0:Row + X];
     4 :
     Begin
       V := Mem[0:Row + X Div 2];
-      If Odd(X) Then DibPix := V And 15 Else DibPix := V Shr 4;
+      If Odd(X) Then DibPixRow := V And 15 Else DibPixRow := V Shr 4;
     End;
-    1 : DibPix := (Mem[0:Row + X Div 8] Shr (7 - X Mod 8)) And 1;
+    1 : DibPixRow := (Mem[0:Row + X Div 8] Shr (7 - X Mod 8)) And 1;
     24 :
     Begin
       A := Row + X * 3;
-      DibPix := LongInt($80000000) Or (Mem[0:A + 2] Shl 16) Or
-                (Mem[0:A + 1] Shl 8) Or Mem[0:A];
+      DibPixRow := LongInt($80000000) Or (Mem[0:A + 2] Shl 16) Or
+                   (Mem[0:A + 1] Shl 8) Or Mem[0:A];
     End;
-    32 : DibPix := LongInt($80000000) Or (MemL[0:Row + X * 4] And $FFFFFF);
+    32 : DibPixRow := LongInt($80000000) Or (MemL[0:Row + X * 4] And $FFFFFF);
     16 :
     Begin
-      V := MemW[0:Row + X * 2];
-      DibPix := LongInt($80000000) Or (((V Shr 10) And 31) Shl 19) Or
-                (((V Shr 5) And 31) Shl 11) Or ((V And 31) Shl 3);
+      If DibG6 Then V := RawToX(MemW[0:Row + X * 2], 16)
+      Else V := RawToX(MemW[0:Row + X * 2], 15);
+      DibPixRow := LongInt($80000000) Or V;
     End;
   Else
-    DibPix := 0;
+    DibPixRow := 0;
   End;
+End;
+
+{ Ecrire le point X (00RRGGBB, ou indice I pour 1, 4, 8 bits) d'une
+  ligne de DIB }
+Procedure DibPutRow(Row, Bpp, X, V : LongInt);
+Var A, M : LongInt;
+Begin
+  Case Bpp Of
+    8 : Mem[0:Row + X] := V;
+    4 :
+    Begin
+      A := Row + X Div 2;
+      If Odd(X) Then Mem[0:A] := (Mem[0:A] And $F0) Or (V And 15)
+      Else Mem[0:A] := (Mem[0:A] And 15) Or ((V And 15) Shl 4);
+    End;
+    1 :
+    Begin
+      A := Row + X Div 8; M := $80 Shr (X Mod 8);
+      If (V And 1) <> 0 Then Mem[0:A] := Mem[0:A] Or M
+      Else Mem[0:A] := Mem[0:A] And Not M;
+    End;
+    16 :
+      If DibG6 Then MemW[0:Row + X * 2] := XToRaw(V, 16)
+      Else MemW[0:Row + X * 2] := XToRaw(V, 15);
+    24 :
+    Begin
+      A := Row + X * 3;
+      MemW[0:A] := V; Mem[0:A + 2] := V Shr 16;
+    End;
+    32 : MemL[0:Row + X * 4] := V And $FFFFFF;
+  End;
+End;
+
+Function DibPix(Bits, W, H, Bpp, X, Y : LongInt; TopDown : Boolean)
+  : LongInt;
+Begin
+  If Not TopDown Then Y := H - 1 - Y;
+  DibPix := DibPixRow(Bits + Y * DibPitch(W, Bpp), Bpp, X);
 End;
 
 { Transferer une DIB (memoire de l'appelant) vers le contexte courant }
 Procedure DibToDc(D, DX, DY, DW, DH, SX, SY, SW, SH, Bits, Bmi, Usage,
                   Rop : LongInt);
 Var W, H, Bpp, X, Y, SXX, SYY, V, A, X0, X1, Y0, Y1, Tab, Q, P, N,
-    T : LongInt;
+    T, PB, DP, Row : LongInt;
     Top : Boolean;
 Begin
   W := MemL[0:Bmi + 4]; H := MemL[0:Bmi + 8]; Bpp := MemW[0:Bmi + 14];
   Top := H < 0;
   If Top Then H := -H;
   If (DW = 0) Or (DH = 0) Or (SW = 0) Or (SH = 0) Then Exit;
-  Tab := KAlloc(1024);
-  DibTable(Bmi, Usage, D, Tab);
-  For V := 0 To 255 Do
+  DibG6 := DibIs565(Bmi);
+  PB := PxBytes(DS.Bpp);
+  RopMsk := TgtMask;
+  If Bpp <= 8 Then
   Begin
-    Q := MemL[0:Tab + V * 4];
-    XlatTab[V] := GColor(((Q Shr 16) And 255) Or (Q And $FF00) Or
-                         ((Q And 255) Shl 16));
-  End;
-  KFree(Tab);
-  { DIB_PAL_COLORS : indices de la palette logique -> indices systeme
-    realises (sans passer par RVB : les fondus de palette restent
-    possibles) }
-  If Usage = 1 Then
-  Begin
-    P := Dcs[D].Pal;
-    If (P >= 0) And (Gdis^[P].I3 <> 0) Then
+    Tab := KAlloc(1024);
+    DibTable(Bmi, Usage, D, Tab);
+    For V := 0 To 255 Do
     Begin
-      N := Min(DibColors(Bmi), 256);
-      T := Bmi + MemL[0:Bmi];
-      For V := 0 To N - 1 Do
+      Q := MemL[0:Tab + V * 4];
+      XlatL[V] := RawOf(GColor(XToCr(Q And $FFFFFF)), DS.Bpp);
+    End;
+    KFree(Tab);
+    { DIB_PAL_COLORS en 256 couleurs : indices de la palette logique ->
+      indices systeme realises (sans passer par RVB : les fondus de
+      palette restent possibles) }
+    If (Usage = 1) And (DS.Bpp = 8) And Not GMono And (GTab = 0) Then
+    Begin
+      P := Dcs[D].Pal;
+      If (P >= 0) And (Gdis^[P].I3 <> 0) Then
       Begin
-        Q := MemW[0:T + V * 2];
-        If Q < Gdis^[P].I2 Then XlatTab[V] := Mem[0:Gdis^[P].I3 + Q];
+        N := Min(DibColors(Bmi), 256);
+        T := Bmi + MemL[0:Bmi];
+        For V := 0 To N - 1 Do
+        Begin
+          Q := MemW[0:T + V * 2];
+          If Q < Gdis^[P].I2 Then XlatL[V] := Mem[0:Gdis^[P].I3 + Q];
+        End;
       End;
     End;
   End;
@@ -23184,22 +24718,26 @@ Begin
   X0 := Max(DX, ClipX1); X1 := Min(DX + DW - 1, ClipX2);
   Y0 := Max(DY, ClipY1); Y1 := Min(DY + DH - 1, ClipY2);
   If (X0 > X1) Or (Y0 > Y1) Then Exit;
+  DP := DibPitch(W, Bpp);
   For Y := Y0 To Y1 Do
   Begin
     SYY := SY + ((Y - DY) * SH) Div DH;
     If (SYY < 0) Or (SYY >= H) Then Continue;
-    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX;
+    If Top Then Row := Bits + SYY * DP Else Row := Bits + (H - 1 - SYY) * DP;
+    A := DS.Bits + (Y - DOY) * DS.Pitch - DOX * PB;
     For X := X0 To X1 Do
     Begin
       SXX := SX + ((X - DX) * SW) Div DW;
       If (SXX < 0) Or (SXX >= W) Then Continue;
-      V := DibPix(Bits, W, H, Bpp, SXX, SYY, Top);
+      V := DibPixRow(Row, Bpp, SXX);
       If V < 0 Then
-        V := GColor(((V Shr 16) And 255) Or (V And $FF00) Or
-                    ((V And 255) Shl 16))
-      Else V := XlatTab[V And 255];
-      If Rop <> SRCCOPY Then V := Rop3(Rop, 0, V, Mem[0:A + X]);
-      Mem[0:A + X] := V;
+      Begin
+        If DS.Bpp > 8 Then V := XToRaw(V And $FFFFFF, DS.Bpp)
+        Else V := RawOf(GColor(XToCr(V And $FFFFFF)), 8);
+      End
+      Else V := XlatL[V And 255];
+      If Rop <> SRCCOPY Then V := Rop3(Rop, 0, V, GetRaw(A + X * PB, DS.Bpp));
+      PutRaw(A + X * PB, V, DS.Bpp);
     End;
   End;
   DcDirty(X0, Y0, X1, Y1);
@@ -23231,35 +24769,88 @@ Begin
 End;
 
 { Creer un bitmap compatible (8 bits) a partir d'une DIB }
-Function CreateDIBitmapK(Bmi, Bits, Usage : LongInt) : LongInt;
-Var B, W, H, Y, X, V, Q, Tab : LongInt; Top : Boolean;
+{ 00RRGGBB -> point brut du bitmap B (format F, monochrome, table) }
+Function BmpRawOf(B, X, F : LongInt) : LongInt;
+Var I, Best, BD, D, T : LongInt;
 Begin
-  W := MemL[0:Bmi + 4]; H := MemL[0:Bmi + 8];
-  Top := H < 0;
-  If Top Then H := -H;
+  If (Gdis^[B].I7 And 4) <> 0 Then
+    BmpRawOf := Ord(((X Shr 16) And 255) * 30 + ((X Shr 8) And 255) * 59 +
+                    (X And 255) * 11 >= 12800)
+  Else If (F = 8) And (Gdis^[B].I6 <> 0) Then
+  Begin
+    Best := 0; BD := $7FFFFFFF;
+    For I := 0 To 255 Do
+    Begin
+      T := MemL[0:Gdis^[B].I6 + I * 4];
+      D := Sqr(((T Shr 16) And 255) - ((X Shr 16) And 255)) +
+           Sqr(((T Shr 8) And 255) - ((X Shr 8) And 255)) +
+           Sqr((T And 255) - (X And 255));
+      If D < BD Then
+      Begin
+        BD := D; Best := I;
+        If D = 0 Then Break;
+      End;
+    End;
+    BmpRawOf := Best;
+  End
+  Else BmpRawOf := XToRaw(X, F);
+End;
+
+{ Lignes Start..Start+Lines-1 d'une DIB (Bits commence a la ligne
+  Start) vers le bitmap B ; rend le nombre de lignes copiees }
+Function SetDIBitsK(B, Start, Lines, Bits, Bmi, Usage, D : LongInt)
+  : LongInt;
+Var DW, DH, L, X, SY, Row, V, I, Tab, DP, SA, Bpp, PB, N : LongInt;
+    S : TSurf; Top : Boolean;
+Begin
+  SetDIBitsK := 0;
+  If (B < 0) Or Not BmpSurf(B, S) Then Exit;
+  DW := MemL[0:Bmi + 4]; DH := MemL[0:Bmi + 8];
+  Top := DH < 0;
+  DH := Abs(DH);
+  Bpp := MemW[0:Bmi + 14];
+  DibG6 := DibIs565(Bmi);
+  DP := DibPitch(DW, Bpp); PB := PxBytes(S.Bpp);
+  If Bpp <= 8 Then
+  Begin
+    Tab := KAlloc(1024);
+    DibTable(Bmi, Usage, D, Tab);
+    For I := 0 To 255 Do
+      XlatL[I] := BmpRawOf(B, MemL[0:Tab + I * 4] And $FFFFFF, S.Bpp);
+    KFree(Tab);
+  End;
+  N := 0;
+  For L := 0 To Lines - 1 Do
+  Begin
+    If Start + L >= DH Then Break;
+    If Top Then SY := Start + L Else SY := S.H - 1 - (Start + L);
+    If (SY >= 0) And (SY < S.H) Then
+    Begin
+      Row := Bits + L * DP;
+      SA := S.Bits + SY * S.Pitch;
+      For X := 0 To Min(DW, S.W) - 1 Do
+      Begin
+        V := DibPixRow(Row, Bpp, X);
+        If V < 0 Then V := BmpRawOf(B, V And $FFFFFF, S.Bpp)
+        Else V := XlatL[V And 255];
+        PutRaw(SA + X * PB, V, S.Bpp);
+      End;
+    End;
+    Inc(N);
+  End;
+  SetDIBitsK := N;
+End;
+
+{ Creer un bitmap compatible (format de l'ecran) a partir d'une DIB }
+Function CreateDIBitmapK(Bmi, Bits, Usage : LongInt) : LongInt;
+Var B, W, H : LongInt;
+Begin
+  W := MemL[0:Bmi + 4]; H := Abs(MemL[0:Bmi + 8]);
   If Bits = 0 Then Bits := Bmi + MemL[0:Bmi] + DibColors(Bmi) * 4;
-  B := BmpNew(W, H, 8, False);
+  B := BmpNew(W, H, ScrFmt, False);
   CreateDIBitmapK := B;
   If B < 0 Then Exit;
-  Tab := KAlloc(1024);
-  DibTable(Bmi, Usage, -1, Tab);
-  For V := 0 To 255 Do
-  Begin
-    Q := MemL[0:Tab + V * 4];
-    XlatTab[V] := ColorIdx(((Q Shr 16) And 255) Or (Q And $FF00) Or
-                           ((Q And 255) Shl 16));
-  End;
-  KFree(Tab);
-  For Y := 0 To H - 1 Do
-    For X := 0 To W - 1 Do
-    Begin
-      V := DibPix(Bits, W, H, MemW[0:Bmi + 14], X, Y, Top);
-      If V < 0 Then
-        V := ColorIdx(((V Shr 16) And 255) Or (V And $FF00) Or
-                      ((V And 255) Shl 16))
-      Else V := XlatTab[V And 255];
-      Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] := V;
-    End;
+  SetDIBitsK(B, 0, H, Bits, Bmi, Usage, -1);
 End;
 
 Function CreateDIBitmap(Hdc, Bih, Init, Bits, Bmi, Usage : LongInt)
@@ -23269,7 +24860,7 @@ Begin
   If ((Init And 4) <> 0) And (Bits <> 0) And (Bmi <> 0) Then
     B := CreateDIBitmapK(Bmi, Bits, Usage)
   Else
-    B := BmpNew(MemL[0:Bih + 4], Abs(MemL[0:Bih + 8]), 8, False);
+    B := BmpNew(MemL[0:Bih + 4], Abs(MemL[0:Bih + 8]), ScrFmt, False);
   CreateDIBitmap := GdiH(B);
 End;
 
@@ -23288,6 +24879,8 @@ Begin
   Gdis^[B].I5 := Pitch;
   Gdis^[B].I7 := 1;
   If H < 0 Then Gdis^[B].I7 := Gdis^[B].I7 Or 2;
+  If DibIs565(Bmi) Then Gdis^[B].I7 := Gdis^[B].I7 Or $10;
+  If Gdis^[B].I1 <> 0 Then FillMem(Gdis^[B].I1, Pitch * Abs(H), 0);
   If Bpp <= 8 Then
   Begin
     Gdis^[B].I6 := KAlloc(1024);
@@ -23331,7 +24924,7 @@ Begin
   D := DcOf(Hdc);
   Mono := (D >= 0) And (Dcs[D].Wnd < 0) And Not Dcs[D].Screen And
           ((Dcs[D].Bmp < 0) Or (Dcs[D].Bmp = DefBmp));
-  B := BmpNew(W, H, 8, Mono);
+  B := BmpNew(W, H, ScrFmt, Mono);
   CreateCompatibleBitmap := GdiH(B);
 End;
 
@@ -23341,13 +24934,26 @@ Begin
 End;
 
 { CreateBitmap : 1 bit (lignes alignees sur 16 bits) ou 8 bits }
-Function CreateBitmap(W, H, Planes, Bpp, Bits : LongInt) : LongInt;
-Var B, X, Y, WB : LongInt;
+{ Bits par point en memoire d'un format (15 occupe 16 bits) }
+Function StoreBits(F : LongInt) : LongInt;
 Begin
-  B := BmpNew(W, H, 8, Bpp = 1);
+  If F = 15 Then StoreBits := 16 Else StoreBits := F;
+End;
+
+{ CreateBitmap : 1 bit (lignes alignees sur 16 bits), 8, 16, 24 ou 32
+  bits (16 bits : format de l'ecran, 5-5-5 ou 5-6-5) }
+Function CreateBitmap(W, H, Planes, Bpp, Bits : LongInt) : LongInt;
+Var B, X, Y, WB, F : LongInt;
+Begin
+  If Planes > 1 Then Bpp := Bpp * Planes;
+  F := Bpp;
+  If (F = 16) And (ScrFmt = 15) Then F := 15;
+  If (F <> 1) And (F <> 8) And (F <> 15) And (F <> 16) And (F <> 24) And
+     (F <> 32) Then F := ScrFmt;
+  B := BmpNew(W, H, F, F = 1);
   CreateBitmap := GdiH(B);
   If (B < 0) Or (Bits = 0) Then Exit;
-  If Bpp = 1 Then
+  If F = 1 Then
   Begin
     WB := ((W + 15) Div 16) * 2;
     For Y := 0 To H - 1 Do
@@ -23355,11 +24961,12 @@ Begin
         Mem[0:Gdis^[B].I1 + Y * Gdis^[B].I5 + X] :=
           (Mem[0:Bits + Y * WB + X Div 8] Shr (7 - X Mod 8)) And 1;
   End
-  Else If Bpp = 8 Then
+  Else
   Begin
-    WB := ((W + 1) Div 2) * 2;
+    WB := ((W * StoreBits(F) + 15) Div 16) * 2;
     For Y := 0 To H - 1 Do
-      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5, W);
+      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5,
+              W * PxBytes(F));
   End;
 End;
 
@@ -23370,7 +24977,7 @@ Begin
 End;
 
 Function GetBitmapBits(H, N, Bits : LongInt) : LongInt;
-Var B, Y, X, WB, V : LongInt;
+Var B, Y, X, WB, V, F : LongInt;
 Begin
   GetBitmapBits := 0;
   B := GdiOf(H, goBitmap);
@@ -23390,15 +24997,17 @@ Begin
     GetBitmapBits := Min(N, WB * Gdis^[B].I3);
     Exit;
   End;
-  WB := ((Gdis^[B].I2 + 1) Div 2) * 2;
+  F := BmpFmt(B);
+  WB := ((Gdis^[B].I2 * StoreBits(F) + 15) Div 16) * 2;
   For Y := 0 To Gdis^[B].I3 - 1 Do
     If (Y + 1) * WB <= N Then
-      MoveMem(Gdis^[B].I1 + Y * Gdis^[B].I5, Bits + Y * WB, Gdis^[B].I2);
+      MoveMem(Gdis^[B].I1 + Y * Gdis^[B].I5, Bits + Y * WB,
+              Gdis^[B].I2 * PxBytes(F));
   GetBitmapBits := Min(N, WB * Gdis^[B].I3);
 End;
 
 Function SetBitmapBits(H, N, Bits : LongInt) : LongInt;
-Var B, Y, X, WB : LongInt;
+Var B, Y, X, WB, F : LongInt;
 Begin
   SetBitmapBits := 0;
   B := GdiOf(H, goBitmap);
@@ -23414,88 +25023,144 @@ Begin
     SetBitmapBits := N;
     Exit;
   End;
-  WB := ((Gdis^[B].I2 + 1) Div 2) * 2;
+  F := BmpFmt(B);
+  WB := ((Gdis^[B].I2 * StoreBits(F) + 15) Div 16) * 2;
   For Y := 0 To Gdis^[B].I3 - 1 Do
     If (Y + 1) * WB <= N Then
-      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5, Gdis^[B].I2);
+      MoveMem(Bits + Y * WB, Gdis^[B].I1 + Y * Gdis^[B].I5,
+              Gdis^[B].I2 * PxBytes(F));
   SetBitmapBits := N;
 End;
 
 { GetDIBits : bitmap -> DIB (8 bits ; table de couleurs remplie) }
+{ Couleur VGA (16 couleurs) la plus proche de 00RRGGBB }
+Function Nearest16(X : LongInt) : LongInt;
+Var I, D, BD, Best, T : LongInt;
+Begin
+  Best := 0; BD := $7FFFFFFF;
+  For I := 0 To 15 Do
+  Begin
+    T := VgaRGB[I];
+    D := Sqr(((T Shr 16) And 255) - ((X Shr 16) And 255)) +
+         Sqr(((T Shr 8) And 255) - ((X Shr 8) And 255)) +
+         Sqr((T And 255) - (X And 255));
+    If D < BD Then
+    Begin
+      BD := D; Best := I;
+    End;
+  End;
+  Nearest16 := Best;
+End;
+
+{ GetDIBits : bitmap -> DIB de 1, 4, 8, 16 (5-5-5, ou 5-6-5 avec
+  BI_BITFIELDS), 24 ou 32 bits ; sans bits par point (0), decrit le
+  format du bitmap }
 Function GetDIBits(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt)
   : LongInt;
-Var B, W, Hh, Y, X, SY, Pitch, I, V, Bpp : LongInt;
+Var B, W, Hh, L, X, SY, OB, DP, Row, V, XX, I, F, SA, Tab, N, DW, SPB
+    : LongInt;
+    S : TSurf; Mono, Top : Boolean;
 Begin
   GetDIBits := 0;
   B := GdiOf(H, goBitmap);
   If B < 0 Then Exit;
   W := Gdis^[B].I2; Hh := Gdis^[B].I3;
+  F := BmpFmt(B); Mono := (Gdis^[B].I7 And 4) <> 0;
   If MemW[0:Bmi + 14] = 0 Then
   Begin
+    If Mono Then OB := 1 Else OB := BmpBits(B);
     MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := Hh;
-    MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
-    MemL[0:Bmi + 16] := 0; MemL[0:Bmi + 20] := ((W + 3) And Not 3) * Hh;
+    MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := OB;
+    MemL[0:Bmi + 16] := 0;
+    If F = 16 Then MemL[0:Bmi + 16] := 3;
+    MemL[0:Bmi + 20] := DibPitch(W, OB) * Hh;
     MemL[0:Bmi + 32] := 0;
     GetDIBits := Hh;
     Exit;
   End;
-  Bpp := MemW[0:Bmi + 14];
-  For I := 0 To 255 Do
+  OB := MemW[0:Bmi + 14];
+  DibG6 := (OB = 16) And (MemL[0:Bmi + 16] = 3);
+  DW := MemL[0:Bmi + 4];
+  Tab := Bmi + MemL[0:Bmi];
+  If OB <= 8 Then
   Begin
-    If Gdis^[B].I6 <> 0 Then V := MemL[0:Gdis^[B].I6 + I * 4]
-    Else V := (SysPal[I * 3] Shl 16) Or (SysPal[I * 3 + 1] Shl 8) Or
-              SysPal[I * 3 + 2];
-    MemL[0:Bmi + MemL[0:Bmi] + I * 4] := V;
+    For I := 0 To (1 Shl OB) - 1 Do
+    Begin
+      If OB = 1 Then
+      Begin
+        If I = 0 Then V := 0 Else V := $FFFFFF;
+      End
+      Else If OB = 4 Then V := VgaRGB[I]
+      Else If (F = 8) And Not Mono And (Gdis^[B].I6 <> 0) Then
+        V := MemL[0:Gdis^[B].I6 + I * 4] And $FFFFFF
+      Else V := SysX[I];
+      MemL[0:Tab + I * 4] := V;
+    End;
+  End
+  Else If DibG6 Then
+  Begin
+    MemL[0:Tab] := $F800; MemL[0:Tab + 4] := $7E0; MemL[0:Tab + 8] := $1F;
+  End
+  Else If (OB = 32) And (MemL[0:Bmi + 16] = 3) Then
+  Begin
+    MemL[0:Tab] := $FF0000; MemL[0:Tab + 4] := $FF00;
+    MemL[0:Tab + 8] := $FF;
   End;
-  If (Bits = 0) Or (Bpp <> 8) Then
+  MemL[0:Bmi + 20] := DibPitch(DW, OB) * Abs(MemL[0:Bmi + 8]);
+  If Bits = 0 Then
   Begin
     GetDIBits := Hh;
     Exit;
   End;
-  Pitch := DibPitch(W, 8);
-  For Y := Start To Min(Start + Lines, Hh) - 1 Do
+  If Not BmpSurf(B, S) Then Exit;
+  SPB := PxBytes(S.Bpp);
+  DP := DibPitch(DW, OB);
+  Top := MemL[0:Bmi + 8] < 0;
+  N := 0;
+  For L := Start To Min(Start + Lines, Hh) - 1 Do
   Begin
-    If (Gdis^[B].I7 And 2) <> 0 Then SY := Hh - 1 - Y Else SY := Y;
-    For X := 0 To W - 1 Do
-      Mem[0:Bits + (Y - Start) * Pitch + X] :=
-        Mem[0:Gdis^[B].I1 + SY * Gdis^[B].I5 + X];
+    If Top Then SY := L Else SY := Hh - 1 - L;
+    SA := S.Bits + SY * S.Pitch;
+    Row := Bits + (L - Start) * DP;
+    For X := 0 To Min(W, DW) - 1 Do
+    Begin
+      V := GetRaw(SA + X * SPB, S.Bpp);
+      If Mono Then
+      Begin
+        If V <> 0 Then XX := $FFFFFF Else XX := 0;
+      End
+      Else XX := SrcX(V, S.Bpp, Gdis^[B].I6);
+      Case OB Of
+        1 :
+        Begin
+          If Mono Then I := V
+          Else I := Ord(((XX Shr 16) And 255) * 30 + ((XX Shr 8) And 255) *
+                        59 + (XX And 255) * 11 >= 12800);
+          DibPutRow(Row, 1, X, I);
+        End;
+        4 : DibPutRow(Row, 4, X, Nearest16(XX));
+        8 :
+        Begin
+          If (S.Bpp = 8) And Not Mono Then I := V
+          Else If Mono Then I := V * 255
+          Else I := NearestIdx((XX Shr 16) And 255, (XX Shr 8) And 255,
+                               XX And 255);
+          DibPutRow(Row, 8, X, I);
+        End;
+      Else
+        DibPutRow(Row, OB, X, XX);
+      End;
+    End;
+    Inc(N);
   End;
-  GetDIBits := Min(Lines, Hh - Start);
+  GetDIBits := N;
 End;
 
 Function SetDIBits(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt)
   : LongInt;
-Var B, W, Hh, Y, X, V, Q, Tab, SY : LongInt; Top : Boolean;
 Begin
-  SetDIBits := 0;
-  B := GdiOf(H, goBitmap);
-  If B < 0 Then Exit;
-  W := MemL[0:Bmi + 4]; Hh := MemL[0:Bmi + 8];
-  Top := Hh < 0;
-  If Top Then Hh := -Hh;
-  Tab := KAlloc(1024);
-  DibTable(Bmi, Usage, DcOf(Hdc), Tab);
-  For V := 0 To 255 Do
-  Begin
-    Q := MemL[0:Tab + V * 4];
-    XlatTab[V] := ColorIdx(((Q Shr 16) And 255) Or (Q And $FF00) Or
-                           ((Q And 255) Shl 16));
-  End;
-  KFree(Tab);
-  For Y := 0 To Min(Hh, Gdis^[B].I3) - 1 Do
-  Begin
-    If (Gdis^[B].I7 And 2) <> 0 Then SY := Y Else SY := Gdis^[B].I3 - 1 - Y;
-    For X := 0 To Min(W, Gdis^[B].I2) - 1 Do
-    Begin
-      V := DibPix(Bits, W, Hh, MemW[0:Bmi + 14], X, Y, Top);
-      If V < 0 Then
-        V := ColorIdx(((V Shr 16) And 255) Or (V And $FF00) Or
-                      ((V And 255) Shl 16))
-      Else V := XlatTab[V And 255];
-      Mem[0:Gdis^[B].I1 + SY * Gdis^[B].I5 + X] := V;
-    End;
-  End;
-  SetDIBits := Lines;
+  SetDIBits := SetDIBitsK(GdiOf(H, goBitmap), Start, Lines, Bits, Bmi,
+                          Usage, DcOf(Hdc));
 End;
 
 { ------------------------------------------------------------------ }
@@ -23604,21 +25269,8 @@ End;
 Const
   HDesktop = HWndBase - 4;
   KProcToken = $7FFF0000;
-  MF_POPUP = $10; MF_SEPARATOR = $800; MF_BYPOSITION = $400;
-  MF_CHECKED = 8; MF_GRAYED = 1; MF_DISABLED = 2;
 
 Type
-  TMenuItemR = Record
-    Used  : Boolean;
-    Menu  : LongInt;
-    Flags : LongInt;
-    Id    : LongInt;
-    Seq   : LongInt;
-    Text  : String[63];
-  End;
-  TMItemArr = Array[0..MaxMenuItem - 1] Of TMenuItemR;
-  PMItemArr = ^TMItemArr;
-
   TCursorR = Record
     Used : Boolean;
     HX, HY : LongInt;
@@ -23626,11 +25278,6 @@ Type
   End;
 
 Var
-  MenuUsed  : Array[0..MaxMenu - 1] Of Boolean;
-  { elements de menu : dans le tas (l'image du noyau doit finir sous
-    00400000h, adresse de chargement des programmes Win32) }
-  MItemsP   : PMItemArr;
-  MSeq      : LongInt;
   Cursors   : Array[0..31] Of TCursorR;
   AppCursor : LongInt;
 
@@ -23655,7 +25302,7 @@ Begin
   If (P > 0) And (P < $10000) Then
   Begin
     For I := 0 To MaxClass - 1 Do
-      If Classes[I].Used And (Classes[I].Atom = P) Then
+      If Classes^[I].Used And (Classes^[I].Atom = P) Then
       Begin
         ClassOfName := I;
         Exit;
@@ -23682,33 +25329,33 @@ Begin
   N := MemL[0:P + 36];
   If (N > 0) And (N < $10000) Then Nm := '#' + IntStr(N) Else Nm := PStr(N);
   I := ClassFind(Nm);
-  If (I >= 0) And (Classes[I].IKind = ikNone) Then
+  If (I >= 0) And (Classes^[I].IKind = ikNone) Then
   Begin
     SetErr(1410);
     Exit;
   End;
   If I < 0 Then I := ClassAdd(Nm, 0, ikNone, 0);
   If I < 0 Then Exit;
-  Classes[I].IKind := ikNone;
-  Classes[I].Style := MemL[0:P];
-  Classes[I].Proc := MemL[0:P + 4];
-  Classes[I].ClsExtra := MemL[0:P + 8];
-  Classes[I].WndExtra := MemL[0:P + 12];
-  Classes[I].Inst := MemL[0:P + 16];
-  Classes[I].Icon := MemL[0:P + 20];
-  Classes[I].Cursor := MemL[0:P + 24];
-  Classes[I].Brush := MemL[0:P + 28];
-  Classes[I].MenuName := MemL[0:P + 32];
-  If Classes[I].ClsExtra > 0 Then
-    Classes[I].Extra := KAlloc(Classes[I].ClsExtra);
-  RegisterClassA := Classes[I].Atom;
+  Classes^[I].IKind := ikNone;
+  Classes^[I].Style := MemL[0:P];
+  Classes^[I].Proc := MemL[0:P + 4];
+  Classes^[I].ClsExtra := MemL[0:P + 8];
+  Classes^[I].WndExtra := MemL[0:P + 12];
+  Classes^[I].Inst := MemL[0:P + 16];
+  Classes^[I].Icon := MemL[0:P + 20];
+  Classes^[I].Cursor := MemL[0:P + 24];
+  Classes^[I].Brush := MemL[0:P + 28];
+  Classes^[I].MenuName := MemL[0:P + 32];
+  If Classes^[I].ClsExtra > 0 Then
+    Classes^[I].Extra := KAlloc(Classes^[I].ClsExtra);
+  RegisterClassA := Classes^[I].Atom;
 End;
 
 Function UnregisterClassA(N, Inst : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   I := ClassOfName(N);
-  If (I >= 0) And (Classes[I].IKind = ikNone) Then Classes[I].Used := False;
+  If (I >= 0) And (Classes^[I].IKind = ikNone) Then Classes^[I].Used := False;
   UnregisterClassA := Ord(I >= 0);
 End;
 
@@ -23718,13 +25365,13 @@ Begin
   GetClassInfoA := 0;
   I := ClassOfName(N);
   If I < 0 Then Exit;
-  MemL[0:P] := Classes[I].Style;
-  If Classes[I].Proc <> 0 Then MemL[0:P + 4] := Classes[I].Proc
-  Else MemL[0:P + 4] := KProcToken + Classes[I].IKind;
-  MemL[0:P + 8] := Classes[I].ClsExtra; MemL[0:P + 12] := Classes[I].WndExtra;
-  MemL[0:P + 16] := Classes[I].Inst; MemL[0:P + 20] := Classes[I].Icon;
-  MemL[0:P + 24] := Classes[I].Cursor; MemL[0:P + 28] := Classes[I].Brush;
-  MemL[0:P + 32] := Classes[I].MenuName; MemL[0:P + 36] := N;
+  MemL[0:P] := Classes^[I].Style;
+  If Classes^[I].Proc <> 0 Then MemL[0:P + 4] := Classes^[I].Proc
+  Else MemL[0:P + 4] := KProcToken + Classes^[I].IKind;
+  MemL[0:P + 8] := Classes^[I].ClsExtra; MemL[0:P + 12] := Classes^[I].WndExtra;
+  MemL[0:P + 16] := Classes^[I].Inst; MemL[0:P + 20] := Classes^[I].Icon;
+  MemL[0:P + 24] := Classes^[I].Cursor; MemL[0:P + 28] := Classes^[I].Brush;
+  MemL[0:P + 32] := Classes^[I].MenuName; MemL[0:P + 36] := N;
   GetClassInfoA := 1;
 End;
 
@@ -23734,8 +25381,8 @@ Begin
   W := WndOf(H);
   GetClassNameA := 0;
   If W < 0 Then Exit;
-  PutPStr(Buf, Classes[Wnds^[W].Cls].Name, N);
-  GetClassNameA := Length(Classes[Wnds^[W].Cls].Name);
+  PutPStr(Buf, Classes^[Wnds^[W].Cls].Name, N);
+  GetClassNameA := Length(Classes^[Wnds^[W].Cls].Name);
 End;
 
 Function SetClassLongA(H, I, V : LongInt) : LongInt;
@@ -23746,16 +25393,19 @@ Begin
   If W < 0 Then Exit;
   C := Wnds^[W].Cls;
   Case I Of
-    -10 : Begin SetClassLongA := Classes[C].Brush; Classes[C].Brush := V End;
-    -12 : Begin SetClassLongA := Classes[C].Cursor; Classes[C].Cursor := V End;
-    -14 : Begin SetClassLongA := Classes[C].Icon; Classes[C].Icon := V End;
-    -24 : Begin SetClassLongA := Classes[C].Proc; Classes[C].Proc := V End;
-    -26 : Begin SetClassLongA := Classes[C].Style; Classes[C].Style := V End;
-  Else
-    If (I >= 0) And (I + 4 <= Classes[C].ClsExtra) Then
+    -10 : Begin SetClassLongA := Classes^[C].Brush; Classes^[C].Brush := V End;
+    -12 :
     Begin
-      SetClassLongA := MemL[0:Classes[C].Extra + I];
-      MemL[0:Classes[C].Extra + I] := V;
+      SetClassLongA := Classes^[C].Cursor; Classes^[C].Cursor := V;
+    End;
+    -14 : Begin SetClassLongA := Classes^[C].Icon; Classes^[C].Icon := V End;
+    -24 : Begin SetClassLongA := Classes^[C].Proc; Classes^[C].Proc := V End;
+    -26 : Begin SetClassLongA := Classes^[C].Style; Classes^[C].Style := V End;
+  Else
+    If (I >= 0) And (I + 4 <= Classes^[C].ClsExtra) Then
+    Begin
+      SetClassLongA := MemL[0:Classes^[C].Extra + I];
+      MemL[0:Classes^[C].Extra + I] := V;
     End;
   End;
 End;
@@ -23768,14 +25418,14 @@ Begin
   If W < 0 Then Exit;
   C := Wnds^[W].Cls;
   Case I Of
-    -10 : GetClassLongA := Classes[C].Brush;
-    -12 : GetClassLongA := Classes[C].Cursor;
-    -14 : GetClassLongA := Classes[C].Icon;
-    -24 : GetClassLongA := Classes[C].Proc;
-    -26 : GetClassLongA := Classes[C].Style;
+    -10 : GetClassLongA := Classes^[C].Brush;
+    -12 : GetClassLongA := Classes^[C].Cursor;
+    -14 : GetClassLongA := Classes^[C].Icon;
+    -24 : GetClassLongA := Classes^[C].Proc;
+    -26 : GetClassLongA := Classes^[C].Style;
   Else
-    If (I >= 0) And (I + 4 <= Classes[C].ClsExtra) Then
-      GetClassLongA := MemL[0:Classes[C].Extra + I];
+    If (I >= 0) And (I + 4 <= Classes^[C].ClsExtra) Then
+      GetClassLongA := MemL[0:Classes^[C].Extra + I];
   End;
 End;
 
@@ -23813,9 +25463,13 @@ Begin
   End;
   If (Name > 0) And (Name < $10000) Then Nm := ''
   Else Nm := PStr(Name);
+  { menu de la classe (lpszMenuName) }
+  If ((Style And WS_CHILD) = 0) And (Menu = 0) And
+     (Classes^[C].MenuName <> 0) Then
+    Menu := LoadMenuA(Inst, Classes^[C].MenuName);
   R := CreateW(Ex, C, Nm, Style, X, Y, W, H, P, Menu, Inst, Param);
   If (R >= 0) And Not IsChildW(R) Then
-    KLog('Fenetre ' + HexStr(HwndOf(R), 8) + ' ' + Classes[C].Name + ' "' +
+    KLog('Fenetre ' + HexStr(HwndOf(R), 8) + ' ' + Classes^[C].Name + ' "' +
          Nm + '" ' + IntStr(Wnds^[R].X) + ',' + IntStr(Wnds^[R].Y) + ' ' +
          IntStr(Wnds^[R].W) + 'x' + IntStr(Wnds^[R].H) + ' style ' +
          HexStr(Style, 8));
@@ -24166,6 +25820,7 @@ Begin
   If (Ex And WS_EX_CLIENTEDGE) <> 0 Then B := B + 2;
   T := B;
   If (Style And WS_CAPTION) = WS_CAPTION Then T := T + 19;
+  If Menu Then T := T + 20;
 End;
 
 Function AdjustWindowRectEx(P, Style, Menu, Ex : LongInt) : LongInt;
@@ -24626,7 +26281,7 @@ Begin
   W := WndOf(H);
   GetDC := 0;
   If W < 0 Then Exit;
-  If (Classes[Wnds^[W].Cls].Style And CS_OWNDC) <> 0 Then
+  If (Classes^[Wnds^[W].Cls].Style And CS_OWNDC) <> 0 Then
   Begin
     If (Wnds^[W].OwnDC = 0) Or (DcOf(Wnds^[W].OwnDC) < 0) Then
     Begin
@@ -24668,7 +26323,7 @@ Function KBrushOf(Br : LongInt) : LongInt; Forward;
 Procedure EraseBkgnd(W, Hdc : LongInt);
 Var B, D : LongInt;
 Begin
-  B := KBrushOf(Classes[Wnds^[W].Cls].Brush);
+  B := KBrushOf(Classes^[Wnds^[W].Cls].Brush);
   D := DcOf(Hdc);
   If (B < 0) Or Not DcBegin(D) Then Exit;
   BrushFill(ClipX1, ClipY1, ClipX2, ClipY2, B);
@@ -24795,7 +26450,7 @@ End;
 { ScrollDC : deplacer une zone d'un contexte }
 Function ScrollDC(Hdc, DX, DY, PScroll, PClip, Rgn, PUpd : LongInt)
   : LongInt;
-Var D, Y, A, S : LongInt; R : TRect; Row : LongInt;
+Var D, Y, A, S, PB : LongInt; R : TRect; Row : LongInt;
 Begin
   ScrollDC := 1;
   D := DcOf(Hdc);
@@ -24805,24 +26460,25 @@ Begin
   R.L := Max(R.L, ClipX1); R.T := Max(R.T, ClipY1);
   R.R := Min(R.R, ClipX2 + 1); R.B := Min(R.B, ClipY2 + 1);
   If (R.L >= R.R) Or (R.T >= R.B) Then Exit;
-  Row := KAlloc(R.R - R.L + 16);
+  PB := PxBytes(DS.Bpp);
+  Row := KAlloc((R.R - R.L) * PB + 16);
   If DY > 0 Then
   Begin
     For Y := R.B - 1 - DY DownTo R.T Do
     Begin
-      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX);
-      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX);
-      MoveMem(S, Row, R.R - R.L);
-      MoveMem(Row, A, R.R - R.L - Abs(DX));
+      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX) * PB;
+      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX) * PB;
+      MoveMem(S, Row, (R.R - R.L) * PB);
+      MoveMem(Row, A, (R.R - R.L - Abs(DX)) * PB);
     End;
   End
   Else
     For Y := R.T - DY To R.B - 1 Do
     Begin
-      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX);
-      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX);
-      MoveMem(S, Row, R.R - R.L);
-      MoveMem(Row, A, R.R - R.L - Abs(DX));
+      S := DS.Bits + (Y - DOY) * DS.Pitch + (R.L - DOX) * PB;
+      A := DS.Bits + (Y + DY - DOY) * DS.Pitch + (R.L + DX - DOX) * PB;
+      MoveMem(S, Row, (R.R - R.L) * PB);
+      MoveMem(Row, A, (R.R - R.L - Abs(DX)) * PB);
     End;
   KFree(Row);
   DcDirty(R.L, R.T, R.R, R.B);
@@ -24994,7 +26650,7 @@ Begin
 End;
 
 Function InvertRect(Hdc, P : LongInt) : LongInt;
-Var D, X, Y, A : LongInt; R : TRect;
+Var D, X, Y : LongInt; R : TRect;
 Begin
   InvertRect := 1;
   D := DcOf(Hdc);
@@ -25002,10 +26658,7 @@ Begin
   GetRectAt(P, R);
   For Y := Max(R.T, ClipY1) To Min(R.B - 1, ClipY2) Do
     For X := Max(R.L, ClipX1) To Min(R.R - 1, ClipX2) Do
-    Begin
-      A := DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX);
-      Mem[0:A] := Mem[0:A] Xor 255;
-    End;
+      XorPix(X, Y, TgtMask);
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
@@ -26203,13 +27856,6 @@ Begin
     End;
 End;
 
-Function MenuIdx(H : LongInt) : LongInt;
-Begin
-  If (H >= HMenuBase) And (H < HMenuBase + MaxMenu * 4) And
-     MenuUsed[(H - HMenuBase) Div 4] Then MenuIdx := (H - HMenuBase) Div 4
-  Else MenuIdx := -1;
-End;
-
 Function CreateMenu : LongInt;
 Begin
   CreateMenu := MenuNew;
@@ -26220,26 +27866,34 @@ Begin
   CreatePopupMenu := MenuNew;
 End;
 
-{ N-ieme element d'un menu (par position) ; -1 si absent }
-Function MItemAt(M, Pos0 : LongInt) : LongInt;
-Var I, J, Best, BS, Last : LongInt;
+{ Element de commande Id dans le menu M ou ses sous-menus }
+Function MItemFindR(M, Id, Depth : LongInt) : LongInt;
+Var I, R, S : LongInt;
 Begin
-  MItemAt := -1;
-  Last := -1;
-  For J := 0 To Pos0 Do
-  Begin
-    Best := -1; BS := $7FFFFFFF;
-    For I := 0 To MaxMenuItem - 1 Do
-      If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
-         (MItemsP^[I].Seq > Last)
-         And (MItemsP^[I].Seq < BS) Then
+  MItemFindR := -1;
+  For I := 0 To MaxMenuItem - 1 Do
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+       (MItemsP^[I].Id = Id) Then
+    Begin
+      MItemFindR := I;
+      Exit;
+    End;
+  If Depth >= 6 Then Exit;
+  For I := 0 To MaxMenuItem - 1 Do
+    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
+       ((MItemsP^[I].Flags And MF_POPUP) <> 0) Then
+    Begin
+      S := MenuIdx(MItemsP^[I].Id);
+      If (S >= 0) And (S <> M) Then
       Begin
-        Best := I; BS := MItemsP^[I].Seq;
+        R := MItemFindR(S, Id, Depth + 1);
+        If R >= 0 Then
+        Begin
+          MItemFindR := R;
+          Exit;
+        End;
       End;
-    If Best < 0 Then Exit;
-    Last := BS;
-    MItemAt := Best;
-  End;
+    End;
 End;
 
 Function MItemFind(M, Id, Flags : LongInt) : LongInt;
@@ -26250,20 +27904,14 @@ Begin
     MItemFind := MItemAt(M, Id);
     Exit;
   End;
-  MItemFind := -1;
-  For I := 0 To MaxMenuItem - 1 Do
-    If MItemsP^[I].Used And (MItemsP^[I].Menu = M) And
-       (MItemsP^[I].Id = Id) Then
-    Begin
-      MItemFind := I;
-      Exit;
-    End;
+  MItemFind := MItemFindR(M, Id, 0);
 End;
 
-Function AppendMenuA(H, Flags, Id, Item : LongInt) : LongInt;
+{ Ajouter un element (texte deja lu) au menu H }
+Function MAdd(H, Flags, Id : LongInt; Const T : String) : LongInt;
 Var M, I : LongInt;
 Begin
-  AppendMenuA := 0;
+  MAdd := 0;
   M := MenuIdx(H);
   If M < 0 Then Exit;
   For I := 0 To MaxMenuItem - 1 Do
@@ -26272,12 +27920,19 @@ Begin
       MItemsP^[I].Used := True; MItemsP^[I].Menu := M;
       MItemsP^[I].Flags := Flags; MItemsP^[I].Id := Id;
       Inc(MSeq); MItemsP^[I].Seq := MSeq;
-      If ((Flags And (MF_SEPARATOR Or 4 Or $100)) = 0) And (Item <> 0) Then
-        MItemsP^[I].Text := Copy(PStr(Item), 1, 63)
+      If (Flags And (MF_SEPARATOR Or 4 Or $100)) = 0 Then
+        MItemsP^[I].Text := Copy(T, 1, 63)
       Else MItemsP^[I].Text := '';
-      AppendMenuA := 1;
+      MAdd := 1;
       Exit;
     End;
+End;
+
+Function AppendMenuA(H, Flags, Id, Item : LongInt) : LongInt;
+Begin
+  If ((Flags And (MF_SEPARATOR Or 4 Or $100)) = 0) And (Item <> 0) Then
+    AppendMenuA := MAdd(H, Flags, Id, PStr(Item))
+  Else AppendMenuA := MAdd(H, Flags, Id, '');
 End;
 
 Function InsertMenuA(H, Pos0, Flags, Id, Item : LongInt) : LongInt;
@@ -26317,15 +27972,23 @@ Begin
 End;
 
 Function DestroyMenu(H : LongInt) : LongInt;
-Var M, I : LongInt;
+Var M, I, S : LongInt;
 Begin
   DestroyMenu := 0;
   M := MenuIdx(H);
   If M < 0 Then Exit;
+  MenuUsed[M] := False;
   For I := 0 To MaxMenuItem - 1 Do
     If MItemsP^[I].Used And (MItemsP^[I].Menu = M) Then
+    Begin
       MItemsP^[I].Used := False;
-  MenuUsed[M] := False;
+      { les sous-menus sont detruits avec le menu }
+      If (MItemsP^[I].Flags And MF_POPUP) <> 0 Then
+      Begin
+        S := MItemsP^[I].Id;
+        If MenuIdx(S) >= 0 Then DestroyMenu(S);
+      End;
+    End;
   DestroyMenu := 1;
 End;
 
@@ -26398,6 +28061,20 @@ Begin
                      (Flags And MF_CHECKED);
 End;
 
+{ CheckMenuRadioItem : coche Id parmi First..Last (par commande, ou par
+  position avec MF_BYPOSITION) }
+Function CheckMenuRadioItem(H, First, Last, Id, Flags : LongInt)
+  : LongInt;
+Var K : LongInt;
+Begin
+  CheckMenuRadioItem := 0;
+  If First > Last Then Exit;
+  For K := First To Last Do
+    If K = Id Then CheckMenuItem(H, K, (Flags And $400) Or MF_CHECKED)
+    Else CheckMenuItem(H, K, Flags And $400);
+  CheckMenuRadioItem := 1;
+End;
+
 Function EnableMenuItem(H, Id, Flags : LongInt) : LongInt;
 Var M, I : LongInt;
 Begin
@@ -26427,19 +28104,41 @@ Begin
   If W < 0 Then GetMenu := 0 Else GetMenu := Wnds^[W].Menu;
 End;
 
+{ La barre de menus a pu apparaitre ou disparaitre : cadre, WM_SIZE }
+Procedure MenuBarRecalc(W : LongInt);
+Var T0 : LongInt;
+Begin
+  T0 := Wnds^[W].CT;
+  CalcNc(W);
+  Wnds^[W].NeedNc := True;
+  If Wnds^[W].CT <> T0 Then
+  Begin
+    InvalAll(W, True);
+    SendMsgW(W, WM_SIZE, 0, ((Wnds^[W].CB - Wnds^[W].CT) Shl 16) Or
+             ((Wnds^[W].CR - Wnds^[W].CL) And $FFFF));
+    DirtyWnd(W);
+  End;
+End;
+
 Function SetMenu(H, M : LongInt) : LongInt;
 Var W : LongInt;
 Begin
   W := WndOf(H);
   SetMenu := 0;
-  If W < 0 Then Exit;
+  If (W < 0) Or IsChildW(W) Then Exit;
+  If MBarW = W Then CloseMenus(0);
   Wnds^[W].Menu := M;
-  { la barre de menus n'est pas affichee : pas de changement du cadre }
+  MenuBarRecalc(W);
   SetMenu := 1;
 End;
 
 Function DrawMenuBar(H : LongInt) : LongInt;
+Var W : LongInt;
 Begin
+  W := WndOf(H);
+  DrawMenuBar := 0;
+  If W < 0 Then Exit;
+  MenuBarRecalc(W);
   DrawMenuBar := 1;
 End;
 
@@ -26453,14 +28152,184 @@ Begin
   GetSystemMenu := Wnds^[W].K1;
 End;
 
-Function TrackPopupMenu(H, Flags, X, Y, Res, Hw, P : LongInt) : LongInt;
+{ Choix de l'element K d'un menu de programme : commande de
+  TrackPopupMenu, ou WM_COMMAND a la fenetre proprietaire }
+Procedure W32MenuPick(K : LongInt);
+Var Id : LongInt;
 Begin
-  TrackPopupMenu := 0;
+  If (K < 0) Or (K >= MaxMenuItem) Or Not MItemsP^[K].Used Then Exit;
+  Id := MItemsP^[K].Id And $FFFF;
+  If TrackOn Then
+  Begin
+    TrackRes := Id;
+    Exit;
+  End;
+  If (MenuOwnerW >= 0) And Wnds^[MenuOwnerW].Used Then
+    PostMsgW(MenuOwnerW, WM_COMMAND, Id, 0);
 End;
 
-Function LoadMenuA(Inst, Name : LongInt) : LongInt;
+{ Menu contextuel : affiche le menu H en (X, Y) et attend le choix.
+  TPM_RETURNCMD (100h) : rend la commande ; sinon WM_COMMAND a Hw.
+  TPM_BOTTOMALIGN (20h) : le menu finit en Y ; TPM_RIGHTALIGN (8) et
+  TPM_CENTERALIGN (4) : alignement horizontal. }
+Function TrackPopupMenu(H, Flags, X, Y, Res, Hw, P : LongInt) : LongInt;
+Var M, W, MW : LongInt;
 Begin
-  LoadMenuA := MenuNew;
+  TrackPopupMenu := 0;
+  M := MenuIdx(H);
+  If (M < 0) Or (MItemAt(M, 0) < 0) Then Exit;
+  W := WndOf(Hw);
+  CloseMenus(0);
+  MenuOwnerW := W;
+  OpenMenu(0, mnW32 + M, X, Y, (Flags And $20) <> 0);
+  If MenuDepth = 0 Then Exit;
+  MW := MenuW[0];
+  If (Flags And 8) <> 0 Then
+    MoveW(MW, Max(0, X - Wnds^[MW].W), Wnds^[MW].Y, Wnds^[MW].W,
+          Wnds^[MW].H, True)
+  Else If (Flags And 4) <> 0 Then
+    MoveW(MW, Max(0, X - Wnds^[MW].W Div 2), Wnds^[MW].Y, Wnds^[MW].W,
+          Wnds^[MW].H, True);
+  TrackRes := 0;
+  If CurT = 0 Then
+  Begin
+    { appel depuis le noyau : pas d'attente }
+    TrackPopupMenu := 1;
+    Exit;
+  End;
+  TrackOn := True;
+  While TrackOn And (MenuDepth > 0) Do KYield;
+  TrackOn := False;
+  If (Flags And $100) <> 0 Then TrackPopupMenu := TrackRes
+  Else
+  Begin
+    If (TrackRes <> 0) And (W >= 0) And ((Flags And $80) = 0) Then
+      PostMsgW(W, WM_COMMAND, TrackRes, 0);
+    TrackPopupMenu := 1;
+  End;
+End;
+
+Function TrackPopupMenuEx(H, Flags, X, Y, Hw, Tpm : LongInt) : LongInt;
+Begin
+  TrackPopupMenuEx := TrackPopupMenu(H, Flags, X, Y, 0, Hw, 0);
+End;
+
+{ Chaine UTF-16 d'un modele de menu (avance P apres le zero) }
+Function MTplStr(Var P : LongInt) : String;
+Var S : String; C : LongInt;
+Begin
+  S := '';
+  Repeat
+    C := MemW[0:P];
+    P := P + 2;
+    If C = 0 Then Break;
+    If Length(S) < 63 Then
+      If C < 256 Then S := S + Chr(C) Else S := S + '?';
+  Until False;
+  MTplStr := S;
+End;
+
+{ Elements d'un modele de menu (MENUITEMTEMPLATE ou MENUEX) }
+Procedure MTplItems(H : LongInt; Var P : LongInt; Ex : Boolean;
+                    Depth : LongInt);
+Var F, Id, Sub, Typ, St, Fl, N : LongInt; T : String; Last : Boolean;
+Begin
+  N := 0;
+  Repeat
+    Inc(N);
+    If Ex Then
+    Begin
+      Typ := MemL[0:P]; St := MemL[0:P + 4]; Id := MemL[0:P + 8];
+      F := MemW[0:P + 12];
+      P := P + 14;
+      T := MTplStr(P);
+      P := (P + 3) And Not 3;
+      Last := (F And $80) <> 0;
+      Fl := 0;
+      If (Typ And $800) <> 0 Then Fl := MF_SEPARATOR;
+      If (St And 3) <> 0 Then Fl := Fl Or MF_GRAYED;
+      If (St And 8) <> 0 Then Fl := Fl Or MF_CHECKED;
+      If (F And 1) <> 0 Then
+      Begin
+        P := P + 4;                     { dwHelpId }
+        Sub := MenuNew;
+        If Depth < 6 Then MTplItems(Sub, P, True, Depth + 1);
+        MAdd(H, Fl Or MF_POPUP, Sub, T);
+      End
+      Else MAdd(H, Fl, Id, T);
+    End
+    Else
+    Begin
+      F := MemW[0:P];
+      P := P + 2;
+      Id := 0;
+      If (F And MF_POPUP) = 0 Then
+      Begin
+        Id := MemW[0:P];
+        P := P + 2;
+      End;
+      T := MTplStr(P);
+      Last := (F And $80) <> 0;
+      F := F And $FF7F;
+      If (F And MF_POPUP) <> 0 Then
+      Begin
+        Sub := MenuNew;
+        If Depth < 6 Then MTplItems(Sub, P, False, Depth + 1);
+        MAdd(H, F, Sub, T);
+      End
+      Else If (F = 0) And (Id = 0) And (T = '') Then
+        MAdd(H, MF_SEPARATOR, 0, '')
+      Else MAdd(H, F, Id, T);
+    End;
+  Until Last Or (N > 200);
+End;
+
+Function LoadMenuIndirectA(P : LongInt) : LongInt;
+Var H, Ofs : LongInt;
+Begin
+  H := MenuNew;
+  LoadMenuIndirectA := H;
+  If (H = 0) Or (P = 0) Then Exit;
+  Ofs := MemW[0:P + 2];
+  If MemW[0:P] = 1 Then
+  Begin
+    P := P + 4 + Ofs;
+    MTplItems(H, P, True, 0);
+  End
+  Else
+  Begin
+    P := P + 4 + Ofs;
+    MTplItems(H, P, False, 0);
+  End;
+End;
+
+Function LoadMenuIndirectW(P : LongInt) : LongInt;
+Begin
+  LoadMenuIndirectW := LoadMenuIndirectA(P);
+End;
+
+{ Menu des ressources (RT_MENU) d'un module PE ; vide sinon }
+Function LoadMenuA(Inst, Name : LongInt) : LongInt;
+Var M, R, Sz : LongInt;
+Begin
+  M := AppModule(Inst);
+  R := 0;
+  If (M >= $10000) And (MemW[0:M] = $5A4D) And
+     ((M = AppBase) Or (ModOfBase(M) >= 0)) Then R := ResFind(M, Name, 4);
+  If R = 0 Then LoadMenuA := MenuNew
+  Else LoadMenuA := LoadMenuIndirectA(ResData(M, R, Sz));
+End;
+
+Function LoadMenuW(Inst, Name : LongInt) : LongInt;
+Var S : String; Q : LongInt;
+Begin
+  If (Name >= 0) And (Name < $10000) Then LoadMenuW := LoadMenuA(Inst, Name)
+  Else
+  Begin
+    Q := Name;
+    S := MTplStr(Q) + #0;
+    LoadMenuW := LoadMenuA(Inst, LongInt(@S[1]));
+  End;
 End;
 
 { ------------------------------------------------------------------ }
@@ -26512,7 +28381,7 @@ Begin
       If WP = $73 Then PostMsgW(TopOf(W), WM_CLOSE, 0, 0);
     WM_SETCURSOR :
     Begin
-      C := Classes[Wnds^[W].Cls].Cursor;
+      C := Classes^[Wnds^[W].Cls].Cursor;
       If C <> 0 Then SetCursor(C);
       DefWindowProcA := Ord(C <> 0);
     End;
@@ -26923,11 +28792,17 @@ End;
 
 { Boite de message d'un programme (modale) }
 Function MessageBoxA(H, Text, Cap, Typ : LongInt) : LongInt;
-Var T : String;
+Var T, X, Y : String; I : LongInt;
 Begin
   If Cap = 0 Then T := 'Erreur' Else T := PStr(Cap);
-  KLog('MessageBoxA "' + T + '" : ' + PStr(Text));
-  MessageBoxA := MsgBoxModal(T, PStr(Text), Typ);
+  X := PStr(Text);
+  { fins de ligne du programme : '|' pour WrapText }
+  Y := '';
+  For I := 1 To Length(X) Do
+    If X[I] = #10 Then Y := Y + '|'
+    Else If X[I] <> #13 Then Y := Y + X[I];
+  KLog('MessageBoxA "' + T + '" : ' + Y);
+  MessageBoxA := MsgBoxModal(T, Y, Typ);
 End;
 
 Function MessageBoxExA(H, Text, Cap, Typ, Lang : LongInt) : LongInt;
@@ -26976,6 +28851,7 @@ Begin
       MMTimers[I].Proc := Proc;
       MMTimers[I].User := User;
       MMTimers[I].Flags := Flags;
+      MMTimers[I].PrcId := CurProc;
       timeSetEvent := I + 1;
       Exit;
     End;
@@ -27008,6 +28884,7 @@ Type
     Used : Boolean;
     Paused : Boolean;
     Rate, Cb, Inst, CbType, QN, LastEnd, PauseAt : LongInt;
+    PrcId : LongInt;               { processus qui l'a ouvert }
     { position de lecture : octets ecrits, base (octets, instant) et
       alignement des blocs (waveOutGetPosition) }
     Wr, PB, PT, Blk : LongInt;
@@ -27259,7 +29136,7 @@ End;
   peripherique SbDev (format carte), sinon du silence }
 Procedure DSMixInto(D, N : LongInt); Forward;
 
-Procedure SbFill(H : LongInt);
+Procedure SbFill0(H : LongInt);
 Var D, P, Hdr, Len, B, V, Got, SBy, Fr, K, L, R : LongInt;
 Begin
   D := SbDmaBuf + H * SbHalf;
@@ -27323,6 +29200,20 @@ Begin
   SbQueued := SbQueued + SbHalf;
 End;
 
+{ Remplir une moitie du tampon DMA : les WAVEHDR et les donnees sont
+  lus dans l'espace d'adresses du processus qui a ouvert la carte }
+Procedure SbFill1(H : LongInt);
+Var Old, New : LongInt;
+Begin
+  Old := Cr3Now;
+  New := Old;
+  If (SbDev >= 0) And WaveDevs[SbDev].Used Then
+    New := ProcCr3(WaveDevs[SbDev].PrcId);
+  If New <> Old Then SetCr3(New);
+  SbFill0(H);
+  If New <> Old Then SetCr3(Old);
+End;
+
 { Interruption de la carte : une moitie vient d'etre jouee }
 Procedure SbIsr;
 Var X : LongInt;
@@ -27331,7 +29222,7 @@ Begin
   Inc(SbIrqs);
   If Not SbPlaying Then Exit;
   SbPlayed := SbPlayed + SbHalf;
-  SbFill(SbNext);
+  SbFill1(SbNext);
   SbNext := 1 - SbNext;
 End;
 
@@ -27454,7 +29345,7 @@ Begin
   End;
   SbQueued := 0; SbPlayed := 0; SbCopyK := 0; SbCopyOff := 0;
   SbSilent := 0; SbNext := 0; SbPaused := False;
-  SbFill(0); SbFill(1);
+  SbFill1(0); SbFill1(1);
   SbPlaying := True;
   SbWriteDsp($D1);
   If SbOBits = 16 Then DmaStart(SbDma16) Else DmaStart(SbDma8);
@@ -27616,10 +29507,11 @@ End;
 
 { Prevenir le programme (fenetre, tache, evenement ou fonction) }
 Procedure WaveNotify(I, Msg, P1 : LongInt);
-Var Cb, Inst, H : LongInt;
+Var Cb, Inst, H : LongInt; En : Boolean;
 Begin
   Cb := WaveDevs[I].Cb; Inst := WaveDevs[I].Inst; H := HWaveBase + I;
   If Cb = 0 Then Exit;
+  En := ProcEnter(WaveDevs[I].PrcId);
   Case WaveDevs[I].CbType Of
     $10000 : PostMessageA(Cb, Msg, H, P1);
     $20000 : PostThreadMessageA(Cb, Msg, H, P1);
@@ -27639,6 +29531,7 @@ Begin
         call eax
       end;
   End;
+  If En Then ProcLeave;
 End;
 
 { Tampon K de la file du peripherique I termine }
@@ -27665,13 +29558,15 @@ Function DSAnyPlaying : Boolean; Forward;
 Procedure DSPoll; Forward;
 
 Procedure RunWave;
-Var I : LongInt;
+Var I : LongInt; En : Boolean;
 Begin
   If InWave Then Exit;
   InWave := True;
   For I := 0 To MaxWave - 1 Do
     If WaveDevs[I].Used And Not WaveDevs[I].Paused Then
     Begin
+      { en-tetes WAVEHDR dans la memoire du processus du peripherique }
+      En := ProcEnter(WaveDevs[I].PrcId);
       If I = SbDev Then
       Begin
         { carte son : tampons rendus quand leurs octets sont joues }
@@ -27685,10 +29580,30 @@ Begin
       Else
         While (WaveDevs[I].QN > 0) And (Ticks >= WaveQEnd[I * MaxWaveQ]) Do
           WaveDone(I, 0);
+      If En Then ProcLeave;
     End;
   PlaySoundPoll;
   DSPoll;
   InWave := False;
+End;
+
+{ Fin du processus P : ses peripheriques waveOut sont fermes, sans
+  fonction de rappel }
+Procedure WaveProcExit(P : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To MaxWave - 1 Do
+    If WaveDevs[I].Used And (WaveDevs[I].PrcId = P) Then
+    Begin
+      WaveDevs[I].Cb := 0; WaveDevs[I].CbType := 0;
+      If I = SbDev Then
+      Begin
+        SbStop;
+        SbDev := -1;
+      End;
+      WaveDevs[I].QN := 0;
+      WaveDevs[I].Used := False;
+    End;
 End;
 
 Function waveOutGetNumDevs : LongInt;
@@ -27745,6 +29660,7 @@ Begin
   WaveDevs[I].Cb := Cb;
   WaveDevs[I].Inst := Inst;
   WaveDevs[I].CbType := Flags And $70000;
+  WaveDevs[I].PrcId := CurProc;
   WaveDevs[I].QN := 0;
   WaveDevs[I].LastEnd := Ticks;
   WaveDevs[I].Wr := 0; WaveDevs[I].PB := 0; WaveDevs[I].PT := Ticks;
@@ -28793,7 +30709,7 @@ End;
   la meme facon et leurs exportations sont consultees en premier. }
 
 Const
-  MaxMod = 16;
+  MaxMod = 64;
   SysDllN = 27;
   SysDlls : Array[0..SysDllN - 1] Of String[12] = ('KERNEL32.DLL',
     'USER32.DLL', 'GDI32.DLL', 'WINMM.DLL', 'COMDLG32.DLL', 'SHELL32.DLL',
@@ -28810,17 +30726,20 @@ Type
     Name : String[63];
     Path : String[127];
     IsDll : Boolean;
+    PrcId : LongInt;              { processus qui l'a charge }
   End;
 
+Type
+  TModArr = Array[0..MaxMod - 1] Of TModule;
+  PModArr = ^TModArr;
+
 Var
-  Mods      : Array[0..MaxMod - 1] Of TModule;
+  Mods      : PModArr;         { alloue dans le tas }
   KExpCount, KExpFuncs, KExpNames, KExpOrds, KBase : LongInt;
   StubArea, StubNext, TraceCount, TraceRetStub : LongInt;
   TrRet, TrName : Array[0..MaxThread * 32 - 1] Of LongInt;
   TrDepth : Array[0..MaxThread - 1] Of LongInt;
   TraceSkip : String;
-  AppProcObj : LongInt;
-  AppMainT  : LongInt;
 
 { Table d'exportation du noyau (son image PE) }
 Procedure InitExports;
@@ -29056,7 +30975,8 @@ Begin
   Name := UpStr(BaseName(Name));
   If Pos('.', Name) = 0 Then Name := Name + '.DLL';
   For I := 0 To MaxMod - 1 Do
-    If Mods[I].Used And (Mods[I].Name = Name) Then
+    If Mods^[I].Used And (Mods^[I].Name = Name) And
+       (Mods^[I].PrcId = CurProc) Then
     Begin
       FindModule := I;
       Exit;
@@ -29068,10 +30988,10 @@ Var I : LongInt;
 Begin
   ModOfBase := -1;
   For I := 0 To MaxMod - 1 Do
-    If Mods[I].Used And (Mods[I].Base = B) Then
+    If Mods^[I].Used And (Mods^[I].Base = B) Then
     Begin
       ModOfBase := I;
-      Exit;
+      If Mods^[I].PrcId = CurProc Then Exit;
     End;
 End;
 
@@ -29081,8 +31001,8 @@ Function ModuleExport(M : LongInt; Name : String; Ordinal : LongInt)
 Var Pe, Dir, N, Funcs, Names, Ords, I, B : LongInt;
 Begin
   ModuleExport := 0;
-  If (M < 0) Or Not Mods[M].Used Then Exit;
-  B := Mods[M].Base;
+  If (M < 0) Or Not Mods^[M].Used Then Exit;
+  B := Mods^[M].Base;
   Pe := B + MemL[0:B + $3C];
   Dir := MemL[0:Pe + 24 + 96];
   If Dir = 0 Then Exit;
@@ -29201,6 +31121,44 @@ Begin
 End;
 
 { Charger un EXE ou une DLL ; indice du module ou -1 }
+{ Placer l'image d'un programme a son adresse preferee dans la fenetre
+  des images : en identite si elle est libre, sinon dans des pages du tas
+  mises a cette adresse dans un repertoire de pages propre au processus
+  courant (charge aussitot : le chargeur ecrit a l'adresse de l'image) }
+Function ProcMapImage(Base, Size : LongInt) : Boolean;
+Var P, Pd, Pt, Img, N, I, A, Blk : LongInt;
+Begin
+  ProcMapImage := False;
+  P := CurProc;
+  If (P <= 0) Or Not Procs^[P].Used Then Exit;
+  If (WinProc < 0) Or (WinProc = P) Then
+  Begin
+    WinProc := P; Procs^[P].Pd := 0;
+    ProcMapImage := True;
+    Exit;
+  End;
+  If KPd = 0 Then Exit;
+  N := (ExeTop - $400000) Shr 22;
+  Blk := KAlloc(4096 * (N + 2));
+  Img := KAlloc(Size + 4096);
+  If (Blk = 0) Or (Img = 0) Then Exit;
+  Pd := (Blk + 4095) And Not 4095;
+  Pt := Pd + 4096;
+  MoveMem(KPd, Pd, 4096);
+  FillMem(Pt, N * 4096, 0);
+  For I := 0 To N - 1 Do MemL[0:Pd + (1 + I) * 4] := (Pt + I * 4096) Or 7;
+  Img := (Img + 4095) And Not 4095;
+  For I := 0 To (Size + 4095) Div 4096 - 1 Do
+  Begin
+    A := Base + I * 4096 - $400000;
+    MemL[0:Pt + (A Shr 12) * 4] := (Img + I * 4096) Or 7;
+  End;
+  Procs^[P].Pd := Pd;
+  SetCr3(Pd);
+  KLog('  image privee ' + HexStr(Base, 8) + ' -> ' + HexStr(Img, 8));
+  ProcMapImage := True;
+End;
+
 Function LoadPE(Path : String; IsDll : Boolean) : LongInt;
 Var F, FSize, Pe, NSect, OptSz, Base, ImgSize, HdrSize, Load, I, S, VSize,
     VAddr, RawSize, RawPtr, Delta, Dir, DSize, P, PEnd, Cnt, K, T, Ent,
@@ -29235,8 +31193,10 @@ Begin
   Base := MemL[0:Pe + 24 + 28];
   ImgSize := MemL[0:Pe + 24 + 56];
   HdrSize := MemL[0:Pe + 24 + 60];
-  { adresse de chargement }
-  If Not IsDll And (Base >= $00400000) And (Base + ImgSize <= ExeTop) Then
+  { adresse de chargement : un programme a son adresse preferee, dans
+    la fenetre des images du processus }
+  If Not IsDll And (Base >= $00400000) And (Base + ImgSize <= ExeTop) And
+     ProcMapImage(Base, ImgSize) Then
     Load := Base
   Else
   Begin
@@ -29292,18 +31252,19 @@ Begin
   { module }
   M := -1;
   For I := 0 To MaxMod - 1 Do
-    If Not Mods[I].Used Then
+    If Not Mods^[I].Used Then
     Begin
       M := I;
       Break;
     End;
   If M < 0 Then Exit;
-  Mods[M].Used := True; Mods[M].Base := Load; Mods[M].Size := ImgSize;
-  Mods[M].Entry := MemL[0:Pe + 24 + 16];
-  If Mods[M].Entry <> 0 Then Mods[M].Entry := Load + Mods[M].Entry;
-  Mods[M].Name := UpStr(BaseName(Path));
-  Mods[M].Path := Path;
-  Mods[M].IsDll := IsDll;
+  Mods^[M].Used := True; Mods^[M].Base := Load; Mods^[M].Size := ImgSize;
+  Mods^[M].Entry := MemL[0:Pe + 24 + 16];
+  If Mods^[M].Entry <> 0 Then Mods^[M].Entry := Load + Mods^[M].Entry;
+  Mods^[M].Name := UpStr(BaseName(Path));
+  Mods^[M].Path := Path;
+  Mods^[M].IsDll := IsDll;
+  Mods^[M].PrcId := CurProc;
   { importations }
   Dir := MemL[0:Pe + 24 + 104];
   If Dir <> 0 Then
@@ -29333,12 +31294,12 @@ Begin
       Imp := Imp + 20;
     End;
   End;
-  KLog('  module ' + Mods[M].Name + ' a ' + HexStr(Load, 8) + ' point ' +
-       HexStr(Mods[M].Entry, 8));
+  KLog('  module ' + Mods^[M].Name + ' a ' + HexStr(Load, 8) + ' point ' +
+       HexStr(Mods^[M].Entry, 8));
   { DllMain(hinst, DLL_PROCESS_ATTACH, 0) }
-  If IsDll And (Mods[M].Entry <> 0) Then
+  If IsDll And (Mods^[M].Entry <> 0) Then
   Begin
-    V := Mods[M].Entry;
+    V := Mods^[M].Entry;
     asm
       push 0
       push 1
@@ -29373,7 +31334,7 @@ Begin
   M := FindModule(Nm);
   If M >= 0 Then
   Begin
-    GetModuleHandleA := Mods[M].Base;
+    GetModuleHandleA := Mods^[M].Base;
     Exit;
   End;
   M := 0;
@@ -29392,7 +31353,7 @@ Begin
   Else
   Begin
     M := ModOfBase(H);
-    If M >= 0 Then S := Mods[M].Path
+    If M >= 0 Then S := Mods^[M].Path
     Else If (H >= HDllBase) And (H < HDllBase + SysDllN * $10000) Then
       S := 'C:\WINDOWS\SYSTEM\' + SysDlls[(H - HDllBase) Div $10000]
     Else S := AppPath;
@@ -29410,7 +31371,7 @@ Begin
   Else
   Begin
     M := LoadPE(Nm, True);
-    If M >= 0 Then H := Mods[M].Base;
+    If M >= 0 Then H := Mods^[M].Base;
   End;
   KLog('LoadLibraryA ' + Nm + ' -> ' + HexStr(H, 8));
   If H = 0 Then SetErr(126);
@@ -29667,75 +31628,194 @@ End;
 { Liberer tout ce qui appartient au programme }
 Procedure DosStop; Forward;
 
-Procedure KillApp;
+Procedure WaveProcExit(P : LongInt); Forward;
+Procedure NetProcExit(P : LongInt); Forward;
+
+{ Le processus P utilise-t-il la console ? }
+Function ProcConsole(P : LongInt) : Boolean;
+Begin
+  If P = CurProc Then ProcConsole := AppConsole
+  Else ProcConsole := Procs^[P].Console;
+End;
+
+Function ProcByPid(Pid : LongInt) : LongInt;
 Var I : LongInt;
 Begin
-  KillingApp := True;
-  DosStop;
-  NetAppExit;
-  For I := 0 To MaxWnd - 1 Do
-    If Wnds^[I].Used And (Wnds^[I].Thread > 0) And
-       Threads[Wnds^[I].Thread].IsApp And Not ThrW16[Wnds^[I].Thread] Then
+  ProcByPid := -1;
+  For I := 0 To MaxProc - 1 Do
+    If Procs^[I].Used And (Procs^[I].Pid = Pid) Then
     Begin
-      Wnds^[I].Proc := 0;
-      Wnds^[I].IKind := ikStatic;
-      DestroyW(I);
+      ProcByPid := I;
+      Exit;
     End;
+End;
+
+{ Nouveau processus (sans image) ; -1 si la table est pleine }
+Function ProcNew(Kind : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  ProcNew := -1;
+  For I := 1 To MaxProc - 1 Do
+    If Not Procs^[I].Used Then
+    Begin
+      FillMem(LongInt(@Procs^[I]), SizeOf(TProc), 0);
+      Procs^[I].Used := True;
+      Procs^[I].Kind := Kind;
+      Procs^[I].Pid := NextPid;
+      NextPid := NextPid + 4 * (1 + (Ticks Mod 7));
+      Procs^[I].Parent := Procs^[CurProc].Pid;
+      Procs^[I].Owner := $100 + I;
+      Procs^[I].Obj := -1; Procs^[I].MainT := -1;
+      Procs^[I].ExitCode := 259;
+      Procs^[I].StartT := Ticks;
+      Procs^[I].PrioCls := $20;
+      Procs^[I].Show := 1;
+      Procs^[I].Cwd := CurDirS;
+      Inc(ProcCnt);
+      AppRunning := True;
+      ProcNew := I;
+      Exit;
+    End;
+End;
+
+{ Liberer tout ce qui appartient au processus P (fin du programme, ou
+  TerminateProcess) : fenetres, taches, minuteries, fichiers, objets
+  GDI, modules, classes, sons, sockets, DirectX, memoire }
+Procedure KillProc(P, Code : LongInt);
+Var I, Own, T : LongInt; Me, Cons : Boolean;
+Begin
+  If (P <= 0) Or (P >= MaxProc) Then Exit;
+  If Not Procs^[P].Used Or Procs^[P].Killing Then Exit;
+  Procs^[P].Killing := True;
+  Procs^[P].ExitCode := Code;
+  Own := Procs^[P].Owner;
+  Me := ThrProc[CurT] = P;
+  Cons := ProcConsole(P);
+  KillingApp := True;
+  If P = VmProc Then
+  Begin
+    DosStop;
+    VmProc := -1;
+  End;
+  NetProcExit(P);
+  For I := 0 To MaxWnd - 1 Do
+  Begin
+    T := Wnds^[I].Thread;
+    If Wnds^[I].Used And (T > 0) And (T < MaxThread) Then
+      If ThrProc[T] = P Then
+      Begin
+        Wnds^[I].Proc := 0;
+        Wnds^[I].IKind := ikStatic;
+        DestroyW(I);
+      End;
+  End;
   For I := 1 To MaxThread - 1 Do
-    If Threads[I].Used And Threads[I].IsApp And (I <> CurT) And
-       Not ThrW16[I] Then
-      Threads[I].State := tsDead;
-  For I := 0 To MaxTimer - 1 Do WTimers[I].Used := False;
-  For I := 0 To MaxMMTimer - 1 Do MMTimers[I].Used := False;
+    If Threads[I].Used And (ThrProc[I] = P) Then
+    Begin
+      MutexAbandon(I);
+      If I <> CurT Then Threads[I].State := tsDead;
+    End;
+  KRefProcExit(P);
+  For I := 0 To MaxTimer - 1 Do
+  Begin
+    T := WTimers[I].Thread;
+    If WTimers[I].Used And (T >= 0) And (T < MaxThread) Then
+      If ThrProc[T] = P Then WTimers[I].Used := False;
+  End;
+  For I := 0 To MaxMMTimer - 1 Do
+    If MMTimers[I].Used And (MMTimers[I].PrcId = P) Then
+      MMTimers[I].Used := False;
+  WaveProcExit(P);
   For I := 0 To MaxKObj - 1 Do
     If KObjs^[I].Used And (KObjs^[I].Kind In [koFile, koFind]) And
-       (KObjOwner[I] = 1) Then
-      KObjs^[I].Used := False;
+       (KObjOwner[I] = Own) Then
+    Begin
+      If KObjs^[I].Kind = koFile Then CloseHandle(KHandle(I))
+      Else KObjs^[I].Used := False;
+    End;
   For I := 0 To MaxDC - 1 Do
-    If Dcs[I].Used And (Gdis^[Dcs[I].Gdi].Owner = 1) Then DcFree(I);
+    If Dcs[I].Used And (Gdis^[Dcs[I].Gdi].Owner = Own) Then DcFree(I);
   For I := 0 To MaxGdi - 1 Do
-    If Gdis^[I].Used And (Gdis^[I].Owner = 1) Then Gdis^[I].Used := False;
-  For I := 0 To MaxVBlk - 1 Do VBlks[I].Used := False;
-  For I := 0 To MaxMod - 1 Do Mods[I].Used := False;
+    If Gdis^[I].Used And (Gdis^[I].Owner = Own) Then Gdis^[I].Used := False;
+  For I := 0 To MaxVBlk - 1 Do
+    If VBlks[I].Used And (VBlks[I].Owner = Own) Then VBlks[I].Used := False;
+  For I := 0 To MaxMod - 1 Do
+    If Mods^[I].Used And (Mods^[I].PrcId = P) Then Mods^[I].Used := False;
   For I := 0 To MaxClass - 1 Do
-    If Classes[I].Used And (Classes[I].IKind = ikNone) And
-       ((Classes[I].Inst <= 0) Or (Classes[I].Inst > $FFFF)) Then
-      Classes[I].Used := False;
-  DXAppDone;
-  KFreeOwner(1);
-  StubArea := 0;
+    If Classes^[I].Used And (Classes^[I].IKind = ikNone) And
+       (Classes^[I].PrcId = P) Then
+      Classes^[I].Used := False;
+  If DXProc = P Then
+  Begin
+    DXAppDone;
+    DDShow := False;
+    DXProc := -1;
+  End;
+  If (CaptureWin >= 0) And (Wnds^[CaptureWin].Used = False) Then
+    CaptureWin := -1;
+  { objet processus : signale, code de sortie }
+  I := Procs^[P].Obj;
+  If P = CurProc Then I := AppProcObj;
+  If (I >= 0) And KObjs^[I].Used Then
+  Begin
+    KObjs^[I].F2 := 1;
+    KObjs^[I].F3 := Code;
+  End;
+  { quitter l'espace d'adresses et le contexte du processus avant de
+    liberer son repertoire de pages et son image }
+  If Me Then
+  Begin
+    SetCr3(KPd);
+    ThrProc[CurT] := 0; ThrCurP[CurT] := 0; ThrPxD[CurT] := 0;
+    ThrOwner[CurT] := 0;
+    CurProc := 0;
+    ProcCtxLoad(0);
+  End;
+  If WinProc = P Then WinProc := -1;
   HeapOwner := 0;
-  AppRunning := False;
-  AppBase := 0;
-  DDShow := False;
-  If AppProcObj >= 0 Then KObjs^[AppProcObj].F2 := 1;
-  CaptureWin := -1;
+  KFreeOwner(Own);
+  HeapOwner := ThrOwner[CurT];
+  Procs^[P].Used := False;
+  Dec(ProcCnt);
+  AppRunning := ProcCnt > 0;
   CurHide := 0;
   CursorErase;
   CursorSetShape(0);
-  DefaultPalette;
+  If ProcCnt = 0 Then DefaultPalette;
   MarkAll;
   KillingApp := False;
-  AppConsole := False;
-  { fin du programme : fermer sa console, sauf si l'Invite MS-DOS va
-    reprendre la main (programme lance depuis l'Invite) }
-  If (ConW >= 0) And Not ConKeep And (ChainExec = '') And (ChainRet = '') Then
+  { console : fermee quand plus aucun processus ne l'utilise }
+  If Cons And (ConW >= 0) Then
   Begin
-    I := ConW;
-    ConW := -1;
-    DestroyW(I);
+    T := 0;
+    For I := 1 To MaxProc - 1 Do
+      If Procs^[I].Used And ProcConsole(I) Then Inc(T);
+    If T = 0 Then
+    Begin
+      I := ConW;
+      ConW := -1;
+      DestroyW(I);
+    End;
   End;
-  KLog('Programme termine');
+  KLog('Processus ' + IntStr(Procs^[P].Pid) + ' termine (code ' +
+       IntStr(Code) + ')');
+End;
+
+{ Fin du processus courant (compatibilite) }
+Procedure KillApp;
+Begin
+  KillProc(ThrProc[CurT], 0);
 End;
 
 Procedure ExitProcessK(Code : LongInt);
-Var X : LongInt;
+Var P : LongInt;
 Begin
   KLog('ExitProcess(' + IntStr(Code) + ')');
   If (CurT = 0) Or Not Threads[CurT].IsApp Then Exit;
-  KillApp;
+  P := ThrProc[CurT];
+  If P <= 0 Then Exit;
+  KillProc(P, Code);
   Threads[CurT].State := tsDead;
-  X := 0;
   KSchedule;
   HaltCpu;
 End;
@@ -29745,6 +31825,78 @@ Function IsNeFile(Path : String) : Boolean; Forward;
 Function RunNe(Path, Args : String; Show : LongInt) : Boolean; Forward;
 Function IsDosFile(Path : String) : Boolean; Forward;
 Function RunDos(Path, Args : String) : Boolean; Forward;
+
+{ Lancer le programme Win32 S dans un nouveau processus ; numero du
+  processus, -1 en cas d'echec }
+Function ProcStart(S, Args, Dir : String; Show : LongInt;
+                   Susp : Boolean) : LongInt;
+Var P, M, T, Sub, I : LongInt;
+Begin
+  ProcStart := -1;
+  P := ProcNew(pkWin32);
+  If P < 0 Then
+  Begin
+    KLog('Processus : table pleine');
+    Exit;
+  End;
+  CursorSetShape(1);
+  CursorErase; CursorDraw;
+  T := -1;
+  ProcEnter(P);
+  M := LoadPE(S, False);
+  If M >= 0 Then
+  Begin
+    AppBase := Mods^[M].Base;
+    AppSize := Mods^[M].Size;
+    AppEntry := Mods^[M].Entry;
+    AppPath := S;
+    AppExcFilter := 0;
+    AppErrMode := 0;
+    Sub := MemW[0:AppBase + MemL[0:AppBase + $3C] + 24 + 68];
+    If Args <> '' Then S := S + ' ' + Args;
+    AppCmd := KAlloc(256);
+    PutPStr(AppCmd, S, 256);
+    If Dir <> '' Then CurDirS := Dir Else CurDirS := ParentDir(AppPath);
+    If Length(CurDirS) = 3 Then CurDirS := Copy(CurDirS, 1, 2);
+    I := KObjNew(koProcess);
+    If I >= 0 Then
+    Begin
+      KObjOwner[I] := 0;
+      KObjs^[I].F1 := P;
+      KObjs^[I].F4 := Procs^[P].Pid;
+    End;
+    AppProcObj := I;
+    Procs^[P].Show := Show;
+    KLog('Lancement de ' + S + ' (sous-systeme ' + IntStr(Sub) +
+         ', processus ' + IntStr(Procs^[P].Pid) + ')');
+    { programme console : la console (fenetre Invite MS-DOS) }
+    AppConsole := Sub = 3;
+    If AppConsole Then
+    Begin
+      If ConW < 0 Then ConTitle := '';
+      ConEnsure;
+    End;
+    T := ThreadNew(AppEntry, 0, $100000, True);
+    If (T >= 0) And Susp Then Threads[T].Susp := 1;
+    AppMainT := T;
+  End;
+  ProcLeave;
+  CursorSetShape(0);
+  If (M < 0) Or (T < 0) Then
+  Begin
+    KillProc(P, -1);
+    If M < 0 Then
+      MsgBoxOpen(BaseName(S), L(
+        'Ce fichier n''est pas un programme Windows 32 bits valide.',
+        'This file is not a valid 32-bit Windows program.',
+        'Diese Datei ist kein g'#129'ltiges 32-Bit-Windows-Programm.',
+        'Il file non '#138' un programma Windows a 32 bit valido.',
+        'Este archivo no es un programa de Windows de 32 bits v'#160'lido.'),
+        $10);
+    Exit;
+  End;
+  ProcStart := P;
+End;
 
 Function RunExe(Path, Args : String) : Boolean;
 Var M, T, Sub : LongInt; S : String;
@@ -29758,17 +31910,6 @@ Begin
     RunExe := RunNe(S, Args, 1);
     Exit;
   End;
-  If AppRunning Then
-  Begin
-    MsgBoxOpen('Pasdows', L('Un programme Windows est d'#130'j'#133' en ' +
-               'cours d''ex'#130'cution.',
-               'A Windows program is already running.',
-               'Ein Windows-Programm wird bereits ausgef'#129'hrt.',
-               'Un programma Windows '#138' gi'#133' in esecuzione.',
-               'Ya se est'#160' ejecutando un programa de Windows.'), $30);
-    RunExe := True;
-    Exit;
-  End;
   S := FindModuleFile(Path);
   If S = '' Then Exit;
   { programme MS-DOS : machine virtuelle 8086 }
@@ -29778,55 +31919,7 @@ Begin
     Exit;
   End;
   RunExe := True;
-  CursorSetShape(1);
-  CursorErase; CursorDraw;
-  HeapOwner := 1;
-  AppRunning := True;
-  M := LoadPE(S, False);
-  If M < 0 Then
-  Begin
-    HeapOwner := 0;
-    AppRunning := False;
-    CursorSetShape(0);
-    MsgBoxOpen(BaseName(S), L(
-      'Ce fichier n''est pas un programme Windows 32 bits valide.',
-      'This file is not a valid 32-bit Windows program.',
-      'Diese Datei ist kein g'#129'ltiges 32-Bit-Windows-Programm.',
-      'Il file non '#138' un programma Windows a 32 bit valido.',
-      'Este archivo no es un programa de Windows de 32 bits v'#160'lido.'),
-      $10);
-    Exit;
-  End;
-  AppBase := Mods[M].Base;
-  AppSize := Mods[M].Size;
-  AppEntry := Mods[M].Entry;
-  AppPath := S;
-  AppExcFilter := 0;
-  AppErrMode := 0;
-  Sub := MemW[0:AppBase + MemL[0:AppBase + $3C] + 24 + 68];
-  If Args <> '' Then S := S + ' ' + Args;
-  AppCmd := KAlloc(256);
-  PutPStr(AppCmd, S, 256);
-  CurDirS := ParentDir(AppPath);
-  If Length(CurDirS) = 3 Then CurDirS := Copy(CurDirS, 1, 2);
-  AppProcObj := KObjNew(koProcess);
-  KLog('Lancement de ' + S + ' (sous-systeme ' + IntStr(Sub) + ')');
-  { programme console : la console (fenetre Invite MS-DOS) }
-  AppConsole := Sub = 3;
-  If AppConsole Then
-  Begin
-    If ConW < 0 Then ConTitle := '';
-    ConEnsure;
-  End;
-  T := ThreadNew(AppEntry, 0, $100000, True);
-  If T < 0 Then
-  Begin
-    KillApp;
-    Exit;
-  End;
-  AppMainT := T;
-  HeapOwner := 0;
-  CursorSetShape(0);
+  ProcStart(S, Args, '', 1, False);
 End;
 
 { ------------------------------------------------------------------ }
@@ -29840,7 +31933,7 @@ End;
 
 Function CreateProcessA(PApp, PCmd, PA, TA, Inh, Flags, Env, PDir, SI,
                         PI : LongInt) : LongInt;
-Var S, Prog, Args, F : String; P, I : LongInt; Q : Boolean;
+Var S, Prog, Args, F, D : String; P, I, Sh : LongInt; Q : Boolean;
 Begin
   CreateProcessA := 0;
   S := '';
@@ -29888,14 +31981,54 @@ Begin
     SetErr(ErrFileNotFound);
     Exit;
   End;
-  I := KObjNew(koProcess);
-  If I < 0 Then Exit;
-  KObjOwner[I] := 0;
-  ChainExec := F; ChainArgs := Args; ChainObj := I;
+  { Windows 3.x et MS-DOS : lances a part ; objet processus signale a
+    la fin (machine DOS) ou aussitot (Win16) }
+  If (IsNeFile(F) And Not IsDosFile(F)) Or IsDosFile(F) Then
+  Begin
+    If IsDosFile(F) Then
+    Begin
+      If Not RunDos(F, Args) Or (VmProc < 0) Then Exit;
+      P := VmProc;
+    End
+    Else
+    Begin
+      If Not RunNe(F, Args, 1) Then Exit;
+      I := KObjNew(koProcess);
+      If I < 0 Then Exit;
+      KObjOwner[I] := 0;
+      KObjs^[I].F2 := 1;
+      If PI <> 0 Then
+      Begin
+        MemL[0:PI] := KHandle(I); MemL[0:PI + 4] := KHandle(I);
+        MemL[0:PI + 8] := $200 + I; MemL[0:PI + 12] := $300 + I;
+      End;
+      CreateProcessA := 1;
+      Exit;
+    End;
+  End
+  Else
+  Begin
+    { STARTUPINFO : dwFlags +44 (STARTF_USESHOWWINDOW 1), wShowWindow +48 }
+    Sh := 1;
+    If (SI <> 0) And ((MemL[0:SI + 44] And 1) <> 0) Then Sh := MemW[0:SI + 48];
+    D := '';
+    If PDir <> 0 Then D := PStr(PDir);
+    P := ProcStart(F, Args, D, Sh, (Flags And 4) <> 0);
+    If P < 0 Then
+    Begin
+      SetErr(193);
+      Exit;
+    End;
+  End;
   If PI <> 0 Then
   Begin
-    MemL[0:PI] := KHandle(I); MemL[0:PI + 4] := KHandle(I);
-    MemL[0:PI + 8] := $200 + I; MemL[0:PI + 12] := $300 + I;
+    MemL[0:PI] := KHandle(Procs^[P].Obj);
+    I := Procs^[P].MainT;
+    If (I >= 0) And (Threads[I].KObj >= 0) Then
+      MemL[0:PI + 4] := KHandle(Threads[I].KObj)
+    Else MemL[0:PI + 4] := KHandle(Procs^[P].Obj);
+    MemL[0:PI + 8] := Procs^[P].Pid;
+    If I >= 0 Then MemL[0:PI + 12] := ThreadId(I) Else MemL[0:PI + 12] := 0;
   End;
   CreateProcessA := 1;
 End;
@@ -29903,11 +32036,49 @@ End;
 Function GetExitCodeProcess(H, P : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  GetExitCodeProcess := 0;
+  If H = -1 Then
+  Begin
+    If P <> 0 Then MemL[0:P] := 259;
+    GetExitCodeProcess := 1;
+    Exit;
+  End;
   I := KObjOf(H, koProcess);
+  If I < 0 Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
   If P <> 0 Then
-    If (I >= 0) And (KObjs^[I].F2 = 0) Then MemL[0:P] := 259
-    Else MemL[0:P] := 0;
+    If KObjs^[I].F2 = 0 Then MemL[0:P] := 259 Else MemL[0:P] := KObjs^[I].F3;
   GetExitCodeProcess := 1;
+End;
+
+{ Poignee d'un processus d'apres son identifiant }
+Function OpenProcess(Acc, Inh, Pid : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  OpenProcess := 0;
+  P := ProcByPid(Pid);
+  If (P <= 0) Or (Procs^[P].Obj < 0) Then
+  Begin
+    If P = 0 Then SetErr(5) Else SetErr(87);
+    Exit;
+  End;
+  OpenProcess := KHandle(Procs^[P].Obj);
+End;
+
+{ Identifiant de la tache et du processus d'une fenetre }
+Function GetWindowThreadProcessId(H, PPid : LongInt) : LongInt;
+Var W, T : LongInt;
+Begin
+  GetWindowThreadProcessId := 0;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  T := Wnds^[W].Thread;
+  If (T < 0) Or (T >= MaxThread) Then T := 0;
+  If PPid <> 0 Then MemL[0:PPid] := Procs^[ThrProc[T]].Pid;
+  GetWindowThreadProcessId := ThreadId(T);
 End;
 
 { L'appelant attend le programme demande : passer la main }
@@ -29923,12 +32094,14 @@ End;
 
 { Tache 0 : lancer le programme demande, puis revenir a l'appelant }
 Procedure ChainPoll;
-Var P, A : String;
+Var P, A : String; I : LongInt;
 Begin
   If ConKillReq Then
   Begin
+    { console fermee : fin des processus qui l'utilisent }
     ConKillReq := False;
-    If AppRunning Then KillApp;
+    For I := 1 To MaxProc - 1 Do
+      If Procs^[I].Used And ProcConsole(I) Then KillProc(I, -1);
   End;
   If AppRunning Then Exit;
   If ChainExec <> '' Then
@@ -29966,7 +32139,6 @@ End;
 { ==================================================================== }
 
 Const
-  koMapping = 9;
   MaxView = 32;
 
 Var
@@ -29992,19 +32164,8 @@ Begin
 End;
 
 Function OpenMutexA(Acc, Inh, Name : LongInt) : LongInt;
-Var I : LongInt; S : String;
 Begin
-  OpenMutexA := 0;
-  If Name = 0 Then Exit;
-  S := UpStr(PStr(Name));
-  For I := 0 To MaxKObj - 1 Do
-    If KObjs^[I].Used And (KObjs^[I].Kind = koMutex) And
-       (KObjs^[I].Name = S) Then
-    Begin
-      OpenMutexA := KHandle(I);
-      Exit;
-    End;
-  SetErr(ErrFileNotFound);
+  OpenMutexA := KOpenNamed(Name, koMutex);
 End;
 
 Function GetShortPathNameA(PLong, PShort, N : LongInt) : LongInt;
@@ -30159,19 +32320,48 @@ End;
 
 { Projection de fichiers : la vue est une copie du fichier, recrite a
   UnmapViewOfFile / FlushViewOfFile si elle est modifiable }
+{ Mappage : F1 fichier (-1 : memoire), F2 taille, F3 protection, F4
+  bloc partage (alloue au premier MapViewOfFile, rendu avec l'objet) ;
+  toutes les vues d'un mappage (memes processus ou non) partagent ce
+  bloc, comme la memoire partagee de Windows 95 }
 Function CreateFileMappingA(HFile, Sec, Prot, SzHi, SzLo, Name : LongInt)
   : LongInt;
-Var I, Sz : LongInt;
+Var I, Sz : LongInt; S : String;
 Begin
   CreateFileMappingA := 0;
+  S := '';
+  If Name <> 0 Then S := KNameNorm(Name);
+  I := KNamed(S);
+  If I >= 0 Then
+  Begin
+    If KObjs^[I].Kind <> koMapping Then
+    Begin
+      SetErr(6);
+      Exit;
+    End;
+    KRefAdd(I);
+    SetErr(183);
+    CreateFileMappingA := KHandle(I);
+    Exit;
+  End;
   I := KObjNew(koMapping);
   If I < 0 Then Exit;
+  KObjOwner[I] := 0;
   Sz := SzLo;
   If (Sz = 0) And (HFile <> -1) Then Sz := GetFileSize(HFile, 0);
   KObjs^[I].F1 := HFile;
   KObjs^[I].F2 := Sz;
   KObjs^[I].F3 := Prot;
+  KObjs^[I].F4 := 0;
+  KObjs^[I].Name := S;
+  KRefAdd(I);
+  SetErr(0);
   CreateFileMappingA := KHandle(I);
+End;
+
+Function OpenFileMappingA(Acc, Inh, Name : LongInt) : LongInt;
+Begin
+  OpenFileMappingA := KOpenNamed(Name, koMapping);
 End;
 
 Function ViewFlush(V : LongInt) : LongInt;
@@ -30187,7 +32377,7 @@ Begin
 End;
 
 Function MapViewOfFile(HMap, Acc, OfsHi, OfsLo, N : LongInt) : LongInt;
-Var I, V, A, Got, K : LongInt;
+Var I, V, A, Got, K, Own : LongInt;
 Begin
   MapViewOfFile := 0;
   I := KObjOf(HMap, koMapping);
@@ -30196,19 +32386,27 @@ Begin
   For K := MaxView - 1 DownTo 0 Do
     If ViewAddr[K] = 0 Then V := K;
   If V < 0 Then Exit;
+  If KObjs^[I].F4 = 0 Then
+  Begin
+    { bloc partage : au noyau, rendu avec le mappage }
+    Own := HeapOwner; HeapOwner := 0;
+    A := KAlloc(Max(KObjs^[I].F2, 1) + 16);
+    HeapOwner := Own;
+    If A = 0 Then Exit;
+    FillMem(A, Max(KObjs^[I].F2, 1), 0);
+    If KObjs^[I].F1 <> -1 Then
+    Begin
+      SetFilePointer(KObjs^[I].F1, 0, 0, 0);
+      KReadFile(KObjs^[I].F1, A, KObjs^[I].F2, Got);
+    End;
+    KObjs^[I].F4 := A;
+  End;
+  If OfsLo >= KObjs^[I].F2 Then OfsLo := 0;
   If (N = 0) Or (OfsLo + N > KObjs^[I].F2) Then N := KObjs^[I].F2 - OfsLo;
   If N <= 0 Then N := 1;
-  A := KAlloc(N + 4096);
-  If A = 0 Then Exit;
-  FillMem(A, N, 0);
-  If KObjs^[I].F1 <> -1 Then
-  Begin
-    SetFilePointer(KObjs^[I].F1, OfsLo, 0, 0);
-    KReadFile(KObjs^[I].F1, A, N, Got);
-  End;
-  ViewAddr[V] := A; ViewMap[V] := HMap; ViewOfs[V] := OfsLo;
-  ViewSize[V] := N;
-  MapViewOfFile := A;
+  ViewAddr[V] := KObjs^[I].F4 + OfsLo; ViewMap[V] := HMap;
+  ViewOfs[V] := OfsLo; ViewSize[V] := N;
+  MapViewOfFile := ViewAddr[V];
 End;
 
 Function FlushViewOfFile(A, N : LongInt) : LongInt;
@@ -30228,7 +32426,6 @@ Begin
     If ViewAddr[V] = A Then
     Begin
       ViewFlush(V);
-      KFree(A);
       ViewAddr[V] := 0;
       UnmapViewOfFile := 1;
     End;
@@ -31082,10 +33279,13 @@ End;
   deviennent une vraie poignee, les autres sont partagees }
 Function DuplicateHandle(SP, H, TP, PH, Acc, Inh, Opt : LongInt)
   : LongInt;
-Var R : LongInt;
+Var R, I : LongInt;
 Begin
   R := H;
   If H = -2 Then R := KHandle(Threads[CurT].KObj);
+  I := KObjOf(R, 0);
+  If (I >= 0) And (KObjs^[I].Kind In [koEvent, koSemaphore, koMutex,
+     koMapping]) Then KRefAdd(I);
   If PH <> 0 Then MemL[0:PH] := R;
   DuplicateHandle := 1;
 End;
@@ -31542,6 +33742,691 @@ End;
 Function InitCommonControlsEx(P : LongInt) : LongInt;
 Begin
   InitCommonControlsEx := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Supervision : processus, temps, memoire (Gestionnaire des taches)   }
+{ ------------------------------------------------------------------ }
+
+{ Processus designe par une poignee (-1 : le processus courant) ;
+  -1 si la poignee n'est pas celle d'un processus en cours }
+Function ProcOfH(H : LongInt) : LongInt;
+Var I, P : LongInt;
+Begin
+  ProcOfH := -1;
+  If H = -1 Then
+  Begin
+    ProcOfH := CurProc;
+    Exit;
+  End;
+  I := KObjOf(H, koProcess);
+  If (I < 0) Or (KObjs^[I].F2 <> 0) Then Exit;
+  P := KObjs^[I].F1;
+  If (P > 0) And (P < MaxProc) And Procs^[P].Used Then ProcOfH := P;
+End;
+
+{ Nom de l'image d'un processus }
+Function ProcName(P : LongInt) : String;
+Var S : String;
+Begin
+  If P = 0 Then S := 'System'
+  Else If P = CurProc Then S := BaseName(AppPath)
+  Else S := BaseName(Procs^[P].Path);
+  If S = '' Then S := '?';
+  ProcName := S;
+End;
+
+Function ProcPath(P : LongInt) : String;
+Begin
+  If P = CurProc Then ProcPath := AppPath Else ProcPath := Procs^[P].Path;
+End;
+
+Function ProcThreads(P : LongInt) : LongInt;
+Var I, N : LongInt;
+Begin
+  N := 0;
+  For I := 0 To MaxThread - 1 Do
+    If Threads[I].Used And (Threads[I].State <> tsDead) And
+       (ThrProc[I] = P) Then Inc(N);
+  ProcThreads := N;
+End;
+
+{ Memoire utilisee par un processus : image privee (ou noyau) et blocs
+  du tas qui lui appartiennent }
+Function ProcMem(P : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  If P = 0 Then N := KImgHi - KImgLo + HeapOwnerBytes(0)
+  Else
+  Begin
+    N := HeapOwnerBytes(Procs^[P].Owner);
+    If WinProc = P Then
+    Begin
+      If P = CurProc Then N := N + AppSize Else N := N + Procs^[P].Size;
+    End;
+  End;
+  ProcMem := N;
+End;
+
+{ Poignees ouvertes par un processus (objets du noyau et GDI) }
+Function ProcHandles(P : LongInt) : LongInt;
+Var I, N, O : LongInt;
+Begin
+  N := 0;
+  O := Procs^[P].Owner;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used Then
+      If (KObjPr^[I * 32 + P] > 0) Or ((P > 0) And (KObjOwner[I] = O)) Then
+        Inc(N);
+  For I := 0 To MaxThread - 1 Do
+    If Threads[I].Used And (ThrProc[I] = P) Then Inc(N);
+  ProcHandles := N;
+End;
+
+Function ProcGdi(P : LongInt) : LongInt;
+Var I, N, O : LongInt;
+Begin
+  N := 0;
+  If P = 0 Then O := 0 Else O := Procs^[P].Owner;
+  For I := 0 To MaxGdi - 1 Do
+    If Gdis^[I].Used And (Gdis^[I].Owner = O) Then Inc(N);
+  ProcGdi := N;
+End;
+
+Function ProcUser(P : LongInt) : LongInt;
+Var I, N, T : LongInt;
+Begin
+  N := 0;
+  For I := 0 To MaxWnd - 1 Do
+  Begin
+    T := Wnds^[I].Thread;
+    If Wnds^[I].Used And (T >= 0) And (T < MaxThread) Then
+      If ThrProc[T] = P Then Inc(N);
+  End;
+  ProcUser := N;
+End;
+
+{ FILETIME (unites de 100 ns) d'une duree en millisecondes }
+{ Ms * 10000 sur 64 bits (Ms >= 0) : moitie basse L, haute H }
+Procedure Mul10k(Ms : LongInt; Var L, H : LongInt);
+Var A, B, L1 : LongInt;
+Begin
+  A := (Ms And $FFFF) * 10000;
+  B := ((Ms Shr 16) And $7FFF) * 10000;
+  L1 := (A Shr 16) + (B And $FFFF);
+  L := (A And $FFFF) Or ((L1 And $FFFF) Shl 16);
+  H := (L1 Shr 16) + (B Shr 16);
+End;
+
+{ FILETIME (unites de 100 ns) d'une duree en millisecondes }
+Procedure PutMsFt(A, Ms : LongInt);
+Var L, H : LongInt;
+Begin
+  If A = 0 Then Exit;
+  If Ms < 0 Then Ms := 0;
+  Mul10k(Ms, L, H);
+  MemL[0:A] := L; MemL[0:A + 4] := H;
+End;
+
+Procedure GetSystemTimeAsFileTime(P : LongInt);
+Var St : Array[0..3] Of LongInt;
+Begin
+  GetSystemTime(LongInt(@St));
+  SystemTimeToFileTime(LongInt(@St), P);
+End;
+
+{ Instant (FILETIME) d'un moment exprime en Ticks }
+{ Instant (FILETIME) d'un moment exprime en Ticks }
+Procedure TicksFt(A, T : LongInt);
+Var D, L, H, NL : LongInt;
+Begin
+  If A = 0 Then Exit;
+  GetSystemTimeAsFileTime(A);
+  D := Ticks - T;
+  If D < 0 Then D := 0;
+  Mul10k(D, L, H);
+  NL := MemL[0:A];
+  MemL[0:A] := NL - L;
+  { retenue : NL < L en non signe }
+  If (NL Xor LongInt($80000000)) < (L Xor LongInt($80000000)) Then
+    H := H + 1;
+  MemL[0:A + 4] := MemL[0:A + 4] - H;
+End;
+
+{ GetSystemTimes : repos, noyau (repos compris), utilisateur }
+Function GetSystemTimes(PIdle, PKern, PUser : LongInt) : LongInt;
+Var U, K : LongInt;
+Begin
+  K := Procs^[0].CpuMs;
+  U := BusyMs - K;
+  If U < 0 Then U := 0;
+  PutMsFt(PIdle, IdleMs);
+  PutMsFt(PKern, IdleMs + K);
+  PutMsFt(PUser, U);
+  GetSystemTimes := 1;
+End;
+
+Function GetProcessTimes(H, PCre, PExit, PKern, PUser : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  GetProcessTimes := 0;
+  P := ProcOfH(H);
+  If P < 0 Then
+  Begin
+    SetErr(6);
+    Exit;
+  End;
+  TicksFt(PCre, Procs^[P].StartT);
+  If PExit <> 0 Then
+  Begin
+    MemL[0:PExit] := 0; MemL[0:PExit + 4] := 0;
+  End;
+  If P = 0 Then
+  Begin
+    PutMsFt(PKern, Procs^[0].CpuMs);
+    PutMsFt(PUser, 0);
+  End
+  Else
+  Begin
+    PutMsFt(PKern, 0);
+    PutMsFt(PUser, Procs^[P].CpuMs);
+  End;
+  GetProcessTimes := 1;
+End;
+
+Function GetThreadTimes(H, PCre, PExit, PKern, PUser : LongInt) : LongInt;
+Var T, I : LongInt;
+Begin
+  GetThreadTimes := 0;
+  If H = -2 Then T := CurT
+  Else
+  Begin
+    I := KObjOf(H, koThread);
+    If I < 0 Then Exit;
+    T := KObjs^[I].F1;
+  End;
+  If (T < 0) Or (T >= MaxThread) Then Exit;
+  TicksFt(PCre, 0);
+  If PExit <> 0 Then
+  Begin
+    MemL[0:PExit] := 0; MemL[0:PExit + 4] := 0;
+  End;
+  PutMsFt(PKern, 0);
+  PutMsFt(PUser, ThrCpu[T]);
+  GetThreadTimes := 1;
+End;
+
+{ MEMORYSTATUSEX (64 octets, valeurs 64 bits) }
+Function GlobalMemoryStatusEx(P : LongInt) : LongInt;
+Var F : LongInt;
+Begin
+  F := HeapFreeBytes;
+  FillMem(P + 4, 60, 0);
+  MemL[0:P] := 64;
+  MemL[0:P + 4] := 100 - Trunc(F / (MemTop / 100.0));
+  MemL[0:P + 8] := MemTop;                      { ullTotalPhys }
+  MemL[0:P + 16] := F;                          { ullAvailPhys }
+  MemL[0:P + 24] := MemTop;                     { ullTotalPageFile }
+  MemL[0:P + 32] := F;
+  MemL[0:P + 40] := $7FFE0000;                  { ullTotalVirtual }
+  MemL[0:P + 48] := F;
+  GlobalMemoryStatusEx := 1;
+End;
+
+{ PERFORMANCE_INFORMATION (PSAPI, en pages de 4 Ko) }
+Function GetPerformanceInfo(P, Cb : LongInt) : LongInt;
+Var F, I, N, T, Used : LongInt;
+Begin
+  GetPerformanceInfo := 0;
+  If (P = 0) Or (Cb < 56) Then Exit;
+  F := HeapFreeBytes;
+  Used := MemTop - F;
+  MemL[0:P] := 56;
+  MemL[0:P + 4] := Used Div 4096;                         { CommitTotal }
+  MemL[0:P + 8] := MemTop Div 4096;                       { CommitLimit }
+  If Used > PeakCommit Then PeakCommit := Used;
+  MemL[0:P + 12] := PeakCommit Div 4096;                  { CommitPeak }
+  MemL[0:P + 16] := MemTop Div 4096;                      { PhysicalTotal }
+  MemL[0:P + 20] := F Div 4096;                           { PhysicalAvailable }
+  MemL[0:P + 24] := CacheSlots * 2048 Div 4096;           { SystemCache }
+  MemL[0:P + 28] := (KImgHi - KImgLo + HeapOwnerBytes(0)) Div 4096;
+  MemL[0:P + 32] := HeapOwnerBytes(0) Div 4096;           { KernelPaged }
+  MemL[0:P + 36] := (KImgHi - KImgLo) Div 4096;           { KernelNonpaged }
+  MemL[0:P + 40] := 4096;
+  N := 0; T := 0;
+  For I := 0 To MaxKObj - 1 Do
+    If KObjs^[I].Used Then Inc(N);
+  MemL[0:P + 44] := N + MaxThread;                        { HandleCount }
+  N := 2;
+  For I := 1 To MaxProc - 1 Do
+    If Procs^[I].Used Then Inc(N);
+  MemL[0:P + 48] := N;                                    { ProcessCount }
+  For I := 0 To MaxThread - 1 Do
+    If Threads[I].Used And (Threads[I].State <> tsDead) Then Inc(T);
+  MemL[0:P + 52] := T;                                    { ThreadCount }
+  GetPerformanceInfo := 1;
+End;
+
+{ Identifiants des processus (le premier, 0, est le processus inactif) }
+Function EnumProcesses(PIds, Cb, PNeed : LongInt) : LongInt;
+Var I, N : LongInt;
+Begin
+  N := 0;
+  If Cb >= 4 Then MemL[0:PIds] := 0;
+  N := 1;
+  For I := 0 To MaxProc - 1 Do
+    If Procs^[I].Used And ((N + 1) * 4 <= Cb) Then
+    Begin
+      MemL[0:PIds + N * 4] := Procs^[I].Pid;
+      Inc(N);
+    End;
+  If PNeed <> 0 Then MemL[0:PNeed] := N * 4;
+  EnumProcesses := 1;
+End;
+
+{ PROCESS_MEMORY_COUNTERS (40 octets) }
+Function GetProcessMemoryInfo(H, PMC, Cb : LongInt) : LongInt;
+Var P, M : LongInt;
+Begin
+  GetProcessMemoryInfo := 0;
+  P := ProcOfH(H);
+  If (P < 0) Or (PMC = 0) Or (Cb < 40) Then Exit;
+  M := ProcMem(P);
+  If M > Procs^[P].KrnMs Then Procs^[P].KrnMs := M;     { pic }
+  FillMem(PMC, 40, 0);
+  MemL[0:PMC] := 40;
+  MemL[0:PMC + 4] := M Div 4096;                  { PageFaultCount }
+  MemL[0:PMC + 8] := Procs^[P].KrnMs;             { PeakWorkingSetSize }
+  MemL[0:PMC + 12] := M;                          { WorkingSetSize }
+  MemL[0:PMC + 20] := M Div 8;
+  MemL[0:PMC + 28] := M Div 32;
+  MemL[0:PMC + 32] := M;                          { PagefileUsage }
+  MemL[0:PMC + 36] := Procs^[P].KrnMs;
+  GetProcessMemoryInfo := 1;
+End;
+
+Function EnumProcessModules(H, PMods, Cb, PNeed : LongInt) : LongInt;
+Var P, I, N : LongInt;
+Begin
+  EnumProcessModules := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  N := 0;
+  If P > 0 Then
+  Begin
+    { le programme d'abord, puis ses DLL }
+    For I := 0 To MaxMod - 1 Do
+      If Mods^[I].Used And (Mods^[I].PrcId = P) And Not Mods^[I].IsDll Then
+      Begin
+        If (N + 1) * 4 <= Cb Then MemL[0:PMods + N * 4] := Mods^[I].Base;
+        Inc(N);
+      End;
+    For I := 0 To MaxMod - 1 Do
+      If Mods^[I].Used And (Mods^[I].PrcId = P) And Mods^[I].IsDll Then
+      Begin
+        If (N + 1) * 4 <= Cb Then MemL[0:PMods + N * 4] := Mods^[I].Base;
+        Inc(N);
+      End;
+  End;
+  If PNeed <> 0 Then MemL[0:PNeed] := N * 4;
+  EnumProcessModules := 1;
+End;
+
+{ Nom (ou chemin) d'un module d'un processus ; HMod 0 : le programme }
+Function ProcModName(H, HMod, Buf, N : LongInt; Full : Boolean) : LongInt;
+Var P, I : LongInt; S : String;
+Begin
+  ProcModName := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  S := ProcPath(P);
+  If P = 0 Then S := 'C:\WINDOWS\SYSTEM\VMM32.VXD';
+  If HMod <> 0 Then
+    For I := 0 To MaxMod - 1 Do
+      If Mods^[I].Used And (Mods^[I].PrcId = P) And (Mods^[I].Base = HMod)
+      Then S := Mods^[I].Path;
+  If Not Full Then S := BaseName(S);
+  If P = 0 Then
+  Begin
+    If Full Then S := 'C:\WINDOWS\SYSTEM\VMM32.VXD' Else S := 'System';
+  End;
+  PutPStr(Buf, S, N);
+  ProcModName := Min(Length(S), N - 1);
+End;
+
+Function GetModuleBaseNameA(H, HMod, Buf, N : LongInt) : LongInt;
+Begin
+  GetModuleBaseNameA := ProcModName(H, HMod, Buf, N, False);
+End;
+
+Function GetModuleFileNameExA(H, HMod, Buf, N : LongInt) : LongInt;
+Begin
+  GetModuleFileNameExA := ProcModName(H, HMod, Buf, N, True);
+End;
+
+Function GetProcessImageFileNameA(H, Buf, N : LongInt) : LongInt;
+Begin
+  GetProcessImageFileNameA := ProcModName(H, 0, Buf, N, True);
+End;
+
+Function EmptyWorkingSet(H : LongInt) : LongInt;
+Begin
+  EmptyWorkingSet := 1;
+End;
+
+Function GetProcessHandleCount(H, P : LongInt) : LongInt;
+Var Q : LongInt;
+Begin
+  GetProcessHandleCount := 0;
+  Q := ProcOfH(H);
+  If (Q < 0) Or (P = 0) Then Exit;
+  MemL[0:P] := ProcHandles(Q);
+  GetProcessHandleCount := 1;
+End;
+
+{ Objets GDI (0) ou USER (1) d'un processus }
+Function GetGuiResources(H, Fl : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  GetGuiResources := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  If Fl = 0 Then GetGuiResources := ProcGdi(P)
+  Else GetGuiResources := ProcUser(P);
+End;
+
+Function GetPriorityClass(H : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  P := ProcOfH(H);
+  If P < 0 Then GetPriorityClass := 0
+  Else GetPriorityClass := Procs^[P].PrioCls;
+End;
+
+Function SetPriorityClass(H, C : LongInt) : LongInt;
+Var P : LongInt;
+Begin
+  SetPriorityClass := 0;
+  P := ProcOfH(H);
+  If P < 0 Then Exit;
+  Procs^[P].PrioCls := C;
+  SetPriorityClass := 1;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Toolhelp32 : instantanes des processus, taches et modules            }
+{ ------------------------------------------------------------------ }
+{ Bloc de l'instantane : +0 processus, +4 taches, +8 modules (nombres),
+  +12, +16, +20 positions de lecture, puis PROCESSENTRY32 (296
+  octets), THREADENTRY32 (28) et MODULEENTRY32 (548) }
+
+Function CreateToolhelp32Snapshot(Flags, Pid : LongInt) : LongInt;
+Var I, B, NP, NT, NM, A, P, Q, K, Own : LongInt; S : String;
+Begin
+  CreateToolhelp32Snapshot := -1;
+  Own := HeapOwner;
+  B := KAlloc(64 + (MaxProc + 1) * 296 + MaxThread * 28 + MaxMod * 548);
+  If B = 0 Then Exit;
+  NP := 0; NT := 0; NM := 0;
+  A := B + 64;
+  If (Flags And 2) <> 0 Then
+  Begin
+    { processus inactif, systeme, programmes }
+    For K := -1 To MaxProc - 1 Do
+      If (K < 0) Or Procs^[K].Used Then
+      Begin
+        FillMem(A, 296, 0);
+        MemL[0:A] := 296;
+        If K < 0 Then
+        Begin
+          MemL[0:A + 8] := 0; MemL[0:A + 20] := 1;
+          S := '[System Process]';
+        End
+        Else
+        Begin
+          MemL[0:A + 8] := Procs^[K].Pid;
+          MemL[0:A + 20] := ProcThreads(K);
+          MemL[0:A + 24] := Procs^[K].Parent;
+          S := ProcName(K);
+        End;
+        MemL[0:A + 4] := 1;
+        MemL[0:A + 28] := 8;
+        PutPStr(A + 36, S, 260);
+        A := A + 296;
+        Inc(NP);
+      End;
+  End;
+  MemL[0:B + 0] := NP;
+  If (Flags And 4) <> 0 Then
+    For I := 0 To MaxThread - 1 Do
+      If Threads[I].Used And (Threads[I].State <> tsDead) Then
+      Begin
+        FillMem(A, 28, 0);
+        MemL[0:A] := 28; MemL[0:A + 4] := 1;
+        MemL[0:A + 8] := ThreadId(I);
+        MemL[0:A + 12] := Procs^[ThrProc[I]].Pid;
+        MemL[0:A + 16] := 8;
+        A := A + 28;
+        Inc(NT);
+      End;
+  MemL[0:B + 4] := NT;
+  If (Flags And 8) <> 0 Then
+  Begin
+    If Pid = 0 Then P := CurProc Else P := ProcByPid(Pid);
+    If P > 0 Then
+      For Q := 0 To 1 Do
+        For I := 0 To MaxMod - 1 Do
+          If Mods^[I].Used And (Mods^[I].PrcId = P) And
+             (Mods^[I].IsDll = (Q = 1)) Then
+          Begin
+            FillMem(A, 548, 0);
+            MemL[0:A] := 548; MemL[0:A + 4] := 1;
+            MemL[0:A + 8] := Procs^[P].Pid;
+            MemL[0:A + 12] := 1; MemL[0:A + 16] := 1;
+            MemL[0:A + 20] := Mods^[I].Base; MemL[0:A + 24] := Mods^[I].Size;
+            MemL[0:A + 28] := Mods^[I].Base;
+            PutPStr(A + 32, BaseName(Mods^[I].Path), 256);
+            PutPStr(A + 288, Mods^[I].Path, 260);
+            A := A + 548;
+            Inc(NM);
+          End;
+  End;
+  MemL[0:B + 8] := NM;
+  I := KObjNew(koSnapshot);
+  If I < 0 Then
+  Begin
+    KFree(B);
+    Exit;
+  End;
+  KObjs^[I].F4 := B;
+  HeapOwner := Own;
+  CreateToolhelp32Snapshot := KHandle(I);
+End;
+
+{ Entree suivante de la liste L (0 processus, 1 taches, 2 modules) }
+Function SnapNext(H, P, L : LongInt; First : Boolean) : LongInt;
+Var I, B, N, C, A, Sz : LongInt;
+Begin
+  SnapNext := 0;
+  I := KObjOf(H, koSnapshot);
+  If (I < 0) Or (P = 0) Then Exit;
+  B := KObjs^[I].F4;
+  If First Then MemL[0:B + 12 + L * 4] := 0;
+  C := MemL[0:B + 12 + L * 4];
+  N := MemL[0:B + L * 4];
+  If C >= N Then
+  Begin
+    SetErr(18);                          { ERROR_NO_MORE_FILES }
+    Exit;
+  End;
+  A := B + 64;
+  If L >= 1 Then A := A + MemL[0:B] * 296;
+  If L >= 2 Then A := A + MemL[0:B + 4] * 28;
+  Case L Of
+    0 : Sz := 296;
+    1 : Sz := 28;
+  Else
+    Sz := 548;
+  End;
+  MoveMem(A + C * Sz, P, Min(Sz, Max(MemL[0:P], 28)));
+  MemL[0:B + 12 + L * 4] := C + 1;
+  SnapNext := 1;
+End;
+
+Function Process32First(H, P : LongInt) : LongInt;
+Begin
+  Process32First := SnapNext(H, P, 0, True);
+End;
+
+Function Process32Next(H, P : LongInt) : LongInt;
+Begin
+  Process32Next := SnapNext(H, P, 0, False);
+End;
+
+Function Thread32First(H, P : LongInt) : LongInt;
+Begin
+  Thread32First := SnapNext(H, P, 1, True);
+End;
+
+Function Thread32Next(H, P : LongInt) : LongInt;
+Begin
+  Thread32Next := SnapNext(H, P, 1, False);
+End;
+
+Function Module32First(H, P : LongInt) : LongInt;
+Begin
+  Module32First := SnapNext(H, P, 2, True);
+End;
+
+Function Module32Next(H, P : LongInt) : LongInt;
+Begin
+  Module32Next := SnapNext(H, P, 2, False);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fenetres de premier niveau, utilisateur, ordinateur                  }
+{ ------------------------------------------------------------------ }
+
+Function CallEnum(Proc, H, LP : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  R := 0;
+  asm
+    mov eax,LP
+    push eax
+    mov eax,H
+    push eax
+    mov eax,Proc
+    call eax
+    mov R,eax
+  end;
+  CallEnum := R;
+End;
+
+{ Fenetres de premier niveau, de la plus haute a la plus basse }
+Function EnumWindows(Proc, LP : LongInt) : LongInt;
+Var I, N, W : LongInt; L : Array[0..MaxWnd - 1] Of LongInt;
+Begin
+  EnumWindows := 1;
+  N := 0;
+  For I := ZCnt - 1 DownTo 0 Do
+  Begin
+    L[N] := ZList[I];
+    Inc(N);
+  End;
+  For I := 0 To N - 1 Do
+  Begin
+    W := L[I];
+    If Wnds^[W].Used And Not IsChildW(W) Then
+      If CallEnum(Proc, HwndOf(W), LP) = 0 Then Exit;
+  End;
+End;
+
+Function EnumThreadWindows(Tid, Proc, LP : LongInt) : LongInt;
+Var I, T : LongInt;
+Begin
+  EnumThreadWindows := 1;
+  T := ThreadOfId(Tid);
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And Not IsChildW(I) And (Wnds^[I].Thread = T) Then
+      If CallEnum(Proc, HwndOf(I), LP) = 0 Then Exit;
+End;
+
+{ Une fenetre ne repond plus quand sa file contient des messages non lus
+  depuis plus de 5 secondes }
+Function IsHungAppWindow(H : LongInt) : LongInt;
+Var W, T : LongInt;
+Begin
+  IsHungAppWindow := 0;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  T := Wnds^[W].Thread;
+  If (T <= 0) Or (T >= MaxThread) Then Exit;
+  If (Threads[T].QHead <> Threads[T].QTail) And
+     (Ticks - MsgQ^[T * MaxQueue + Threads[T].QHead].Time > 5000) Then
+    IsHungAppWindow := 1;
+End;
+
+Procedure SwitchToThisWindow(H, AltTab : LongInt);
+Var W : LongInt;
+Begin
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  If Wnds^[W].Min Then RestoreW(W);
+  ActivateW(W);
+End;
+
+{ Fin d'une tache (Gestionnaire des taches) : WM_CLOSE, ou arret du
+  processus si Force }
+Function EndTask(H, Shut, Force : LongInt) : LongInt;
+Var W, T, P : LongInt;
+Begin
+  EndTask := 0;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  T := Wnds^[W].Thread;
+  P := 0;
+  If (T > 0) And (T < MaxThread) Then P := ThrProc[T];
+  If (Force <> 0) And (P > 0) Then
+  Begin
+    If P = ThrProc[CurT] Then ExitProcessK(1) Else KillProc(P, 1);
+  End
+  Else PostMsgW(W, WM_CLOSE, 0, 0);
+  EndTask := 1;
+End;
+
+Function GetUserNameA(Buf, PN : LongInt) : LongInt;
+Var S : String;
+Begin
+  GetUserNameA := 0;
+  If PN = 0 Then Exit;
+  S := L('Utilisateur', 'User', 'Benutzer', 'Utente', 'Usuario');
+  If MemL[0:PN] <= Length(S) Then
+  Begin
+    MemL[0:PN] := Length(S) + 1;
+    SetErr(122);
+    Exit;
+  End;
+  PutPStr(Buf, S, MemL[0:PN]);
+  MemL[0:PN] := Length(S) + 1;
+  GetUserNameA := 1;
+End;
+
+Function GetComputerNameA(Buf, PN : LongInt) : LongInt;
+Var S : String;
+Begin
+  GetComputerNameA := 0;
+  If PN = 0 Then Exit;
+  S := 'PASDOWS';
+  If MemL[0:PN] <= Length(S) Then
+  Begin
+    MemL[0:PN] := Length(S) + 1;
+    SetErr(111);
+    Exit;
+  End;
+  PutPStr(Buf, S, MemL[0:PN]);
+  MemL[0:PN] := Length(S);
+  GetComputerNameA := 1;
 End;
 
 Function MessageBoxIndirectA(P : LongInt) : LongInt;
@@ -35084,6 +37969,7 @@ Begin
   If T < 0 Then Exit;
   ThrW16[T] := True;
   ThrOwner[T] := 16 + T;
+  ThrProc[T] := 0; ThrCurP[T] := 0; ThrCr3[T] := KPd;
   T16Cmd[T] := Args;
   T16Show[T] := Show;
   T16Sp[T] := 0;
@@ -35320,7 +38206,7 @@ Begin
   If Name <> 0 Then N := PStr(Name);
   For I := 0 To MaxWnd - 1 Do
     If Wnds^[I].Used And Not IsChildW(I) And (Wnds^[I].IKind = ikNone) Then
-      If ((C = '') Or (UpStr(Classes[Wnds^[I].Cls].Name) = C)) And
+      If ((C = '') Or (UpStr(Classes^[Wnds^[I].Cls].Name) = C)) And
          ((Name = 0) Or (Wnds^[I].Text = N)) Then
       Begin
         FindWin := HwndOf(I);
@@ -36520,6 +39406,8 @@ Begin
   MemL[0:O + 4] := 1;
   MemL[0:O + 8] := Kind;
   MemL[0:O + 12] := O;
+  { processus qui utilise DirectX (liberation a sa fin) }
+  If CurProc > 0 Then DXProc := CurProc;
   ComNew := O;
 End;
 
@@ -38003,7 +40891,7 @@ End;
 Procedure DXWinPush(S, L, T, R, B : LongInt);
 Var H, Hdc, Bmi, Buf, W, Hh, X, Y, Pitch, SA, I, CL, CT, CR, CB
     : LongInt;
-    Pt : Array[0..1] Of LongInt;
+    Pt : Array[0..1] Of LongInt; TC : Boolean;
 Begin
   L := Max(L, 0); T := Max(T, 0);
   R := Min(R, MemL[0:S + 64]); B := Min(B, MemL[0:S + 68]);
@@ -38018,7 +40906,10 @@ Begin
   End;
   If (L >= R) Or (T >= B) Then Exit;
   W := R - L; Hh := B - T;
-  Pitch := (W + 3) And Not 3;
+  { couleurs vraies : DIB 32 bits (couleurs exactes) ; 256 couleurs :
+    DIB 8 bits dans la palette systeme }
+  TC := (ScrFmt > 8) And (MemL[0:S + 88] > 8);
+  If TC Then Pitch := W * 4 Else Pitch := (W + 3) And Not 3;
   Buf := KAlloc(Pitch * Hh + 16);
   Bmi := KAlloc(40 + 1024);
   If (Buf = 0) Or (Bmi = 0) Then Exit;
@@ -38026,6 +40917,10 @@ Begin
   Begin
     SA := MemL[0:S + 76] + (T + Y) * MemL[0:S + 72];
     If MemL[0:S + 88] = 8 Then MoveMem(SA + L, Buf + Y * Pitch, W)
+    Else If TC Then
+      For X := 0 To W - 1 Do
+        MemL[0:Buf + Y * Pitch + X * 4] := SfToRGB(S, SfGet(S, L + X,
+                                                    T + Y)) And $FFFFFF
     Else
       For X := 0 To W - 1 Do
         Mem[0:Buf + Y * Pitch + X] := DXIdxOf(SfToRGB(S, SfGet(S, L + X,
@@ -38035,6 +40930,11 @@ Begin
   MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -Hh;
   MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
   MemL[0:Bmi + 32] := 256;
+  If TC Then
+  Begin
+    MemW[0:Bmi + 14] := 32;
+    MemL[0:Bmi + 32] := 0;
+  End;
   For I := 0 To 255 Do
     MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
       (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
@@ -46805,16 +49705,23 @@ End;
 { Fenetre : tampon arriere affiche dans la zone cliente (agrandi) }
 Procedure D8ToWnd(S, Hw, PSrc, PDst : LongInt);
 Var Hdc, Bmi, Buf, W, H, X, Y, Pitch, I, A, SL, ST, SR, SB : LongInt;
-    R : Array[0..3] Of LongInt;
+    R : Array[0..3] Of LongInt; TC : Boolean;
 Begin
   W := MemL[0:S + 64]; H := MemL[0:S + 68];
-  Pitch := (W + 3) And Not 3;
+  { couleurs vraies : DIB 32 bits, couleurs exactes }
+  TC := ScrFmt > 8;
+  If TC Then Pitch := W * 4 Else Pitch := (W + 3) And Not 3;
   Buf := KAlloc(Pitch * H + 16);
   Bmi := KAlloc(40 + 1024);
   If (Buf = 0) Or (Bmi = 0) Then Exit;
   For Y := 0 To H - 1 Do
   Begin
     A := MemL[0:S + 76] + Y * MemL[0:S + 72];
+    If TC Then
+      For X := 0 To W - 1 Do
+        MemL[0:Buf + Y * Pitch + X * 4] := SfToRGB(S, SfGet(S, X, Y)) And
+                                           $FFFFFF
+    Else
     For X := 0 To W - 1 Do
       Case MemL[0:S + 272] Of
         2 :
@@ -46833,6 +49740,11 @@ Begin
   MemL[0:Bmi] := 40; MemL[0:Bmi + 4] := W; MemL[0:Bmi + 8] := -H;
   MemW[0:Bmi + 12] := 1; MemW[0:Bmi + 14] := 8;
   MemL[0:Bmi + 32] := 256;
+  If TC Then
+  Begin
+    MemW[0:Bmi + 14] := 32;
+    MemL[0:Bmi + 32] := 0;
+  End;
   For I := 0 To 255 Do
     MemL[0:Bmi + 40 + I * 4] := (SysPal[I * 3] Shl 16) Or
       (SysPal[I * 3 + 1] Shl 8) Or SysPal[I * 3 + 2];
@@ -47490,6 +50402,7 @@ Var
   DnsBusy   : Boolean;
   { sockets (tableaux plats) }
   SkUsed    : Array[0..MaxSock - 1] Of Boolean;
+  SkPrc     : Array[0..MaxSock - 1] Of LongInt;   { processus }
   SkType, SkLPort, SkRIP, SkRPort, SkState, SkErr : Array[0..MaxSock - 1]
     Of LongInt;
   SkRx, SkRxHead, SkRxLen, SkTx, SkTxLen : Array[0..MaxSock - 1] Of LongInt;
@@ -48219,18 +51132,116 @@ Begin
     NkPcnet : PcSend(Src, Len);
     NkE1000 : E1Send(Src, Len);
   End;
+  NicTxB := NicTxB + Len; Inc(NicTxP);
 End;
 
 { Trame recue dans Dst : longueur, 0 si aucune, -1 si rejetee }
 Function NicRecv(Dst : LongInt) : LongInt;
+Var N : LongInt;
 Begin
   Case NicKind Of
-    NkNe2000 : NicRecv := NeRecv(Dst);
-    NkPcnet : NicRecv := PcRecv(Dst);
-    NkE1000 : NicRecv := E1Recv(Dst);
+    NkNe2000 : N := NeRecv(Dst);
+    NkPcnet : N := PcRecv(Dst);
+    NkE1000 : N := E1Recv(Dst);
   Else
-    NicRecv := 0;
+    N := 0;
   End;
+  If N > 0 Then
+  Begin
+    NicRxB := NicRxB + N; Inc(NicRxP);
+  End;
+  NicRecv := N;
+End;
+
+{ Debit nominal de la carte (bits par seconde) }
+Function NicSpeed : LongInt;
+Begin
+  Case NicKind Of
+    NkNe2000 : NicSpeed := 10000000;
+    NkE1000 : NicSpeed := 1000000000;
+  Else
+    If Pos('FAST', NicDesc) > 0 Then NicSpeed := 100000000
+    Else NicSpeed := 10000000;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IPHLPAPI : interfaces (bouclage et carte), compteurs                }
+{ ------------------------------------------------------------------ }
+
+{ MIB_IFROW (860 octets) de l'interface I (1 bouclage, 2 carte) }
+Procedure IfRow(R, I : LongInt);
+Var S : String; K : LongInt;
+Begin
+  FillMem(R, 860, 0);
+  If I = 1 Then S := 'Loopback Interface'
+  Else S := NicDesc;
+  For K := 1 To Length(S) Do MemW[0:R + (K - 1) * 2] := Ord(S[K]);
+  MemL[0:R + 512] := I;
+  If I = 1 Then
+  Begin
+    MemL[0:R + 516] := 24; MemL[0:R + 520] := 1520;
+    MemL[0:R + 524] := 10000000;
+  End
+  Else
+  Begin
+    MemL[0:R + 516] := 6; MemL[0:R + 520] := 1500;
+    MemL[0:R + 524] := NicSpeed;
+    MemL[0:R + 528] := 6;
+    For K := 0 To 5 Do Mem[0:R + 532 + K] := NicMac[K];
+    MemL[0:R + 552] := NicRxB;                { dwInOctets }
+    MemL[0:R + 556] := NicRxP;                { dwInUcastPkts }
+    MemL[0:R + 576] := NicTxB;                { dwOutOctets }
+    MemL[0:R + 580] := NicTxP;                { dwOutUcastPkts }
+  End;
+  MemL[0:R + 540] := 1;                      { dwAdminStatus : actif }
+  MemL[0:R + 544] := 5;                      { dwOperStatus : operationnel }
+  MemL[0:R + 600] := Length(S);              { dwDescrLen, bDescr }
+  For K := 1 To Length(S) Do Mem[0:R + 603 + K] := Ord(S[K]);
+End;
+
+Function IfCount : LongInt;
+Begin
+  If NicBase <> 0 Then IfCount := 2 Else IfCount := 1;
+End;
+
+Function GetNumberOfInterfaces(P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := IfCount;
+  GetNumberOfInterfaces := 0;
+End;
+
+Function GetIfTable(T, PSize, Order : LongInt) : LongInt;
+Var N, I : LongInt;
+Begin
+  N := IfCount;
+  If (PSize = 0) Then
+  Begin
+    GetIfTable := 87;
+    Exit;
+  End;
+  If (T = 0) Or (MemL[0:PSize] < 4 + N * 860) Then
+  Begin
+    MemL[0:PSize] := 4 + N * 860;
+    GetIfTable := 122;                    { ERROR_INSUFFICIENT_BUFFER }
+    Exit;
+  End;
+  MemL[0:T] := N;
+  For I := 1 To N Do IfRow(T + 4 + (I - 1) * 860, I);
+  GetIfTable := 0;
+End;
+
+Function GetIfEntry(R : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := MemL[0:R + 512];
+  If (I < 1) Or (I > IfCount) Then
+  Begin
+    GetIfEntry := 87;
+    Exit;
+  End;
+  IfRow(R, I);
+  GetIfEntry := 0;
 End;
 
 { ------------------------------------------------------------------ }
@@ -49035,6 +52046,7 @@ Begin
     Exit;
   End;
   SkUsed[S] := True;
+  SkPrc[S] := CurProc;
   SkType[S] := Typ;
   SkLPort[S] := 0; SkRIP[S] := 0; SkRPort[S] := 0;
   SkState[S] := tcClosed; SkErr[S] := 0;
@@ -49080,6 +52092,20 @@ Begin
 End;
 
 { Fermer tous les sockets (fin du programme Win32) }
+{ Fin du processus P : ses sockets sont fermes }
+Procedure NetProcExit(P : LongInt);
+Var S : LongInt;
+Begin
+  For S := 0 To MaxSock - 1 Do
+    If SkUsed[S] And (SkPrc[S] = P) Then
+    Begin
+      If (SkType[S] = 1) And Not (SkState[S] In [tcClosed, tcListen,
+         tcTimeWait]) Then TcpSend(S, thRst Or thAck, SkSndNxt[S], 0, 0);
+      SockFree(S);
+    End;
+  DnsBusy := False;
+End;
+
 Procedure NetAppExit;
 Var S : LongInt;
 Begin
@@ -52385,6 +55411,8 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   DirectXSetupSetCallback, DirectXRegisterApplication,
   DirectXRegisterApplicationA, DirectXUnRegisterApplication, D3DMatOf,
   D3DFogOf, D3DClipPoly, D3DShade, D3DLegacy, Direct3DCreate8,
+  GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  TrackPopupMenuEx, LoadMenuW, LoadMenuIndirectA, LoadMenuIndirectW,
   OffsetViewportOrgEx, SetViewportExtEx, SetWindowExtEx, ScaleViewportExtEx,
   ScaleWindowExtEx, GetViewportExtEx, GetWindowExtEx, PtVisible, RectVisible,
   RegisterClassExA, GetClassInfoExA, GetWindowPlacement, SetWindowPlacement,
@@ -52397,7 +55425,21 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   mmioDescend, mmioAscend, mmioCreateChunk, OpenPrinterA, ClosePrinter,
   DocumentPropertiesA, EnumPrintersA, GetFileTitleA, InitCommonControls,
   InitCommonControlsEx,
-  GetEnvironmentStringsW, FreeEnvironmentStringsW, GetLocaleInfoW,
+  GetSystemTimeAsFileTime, GetSystemTimes, GetProcessTimes, GetThreadTimes,
+  GlobalMemoryStatusEx, GetPerformanceInfo, EnumProcesses,
+  GetProcessMemoryInfo, EnumProcessModules, GetModuleBaseNameA,
+  GetModuleFileNameExA, GetProcessImageFileNameA, EmptyWorkingSet,
+  GetProcessHandleCount, GetGuiResources, GetPriorityClass,
+  SetPriorityClass, CreateToolhelp32Snapshot, Process32First, Process32Next,
+  Thread32First, Thread32Next, Module32First, Module32Next, EnumWindows,
+  EnumThreadWindows, IsHungAppWindow, SwitchToThisWindow, EndTask,
+  GetUserNameA, GetComputerNameA, GetNumberOfInterfaces, GetIfTable,
+  GetIfEntry,
+  CheckMenuRadioItem,
+  OpenEventA, OpenSemaphoreA, WaitForSingleObjectEx, WaitForMultipleObjects,
+  WaitForMultipleObjectsEx, MsgWaitForMultipleObjects,
+  MsgWaitForMultipleObjectsEx, SignalObjectAndWait, OpenFileMappingA,
+  OpenProcess, GetWindowThreadProcessId,
   GetStringTypeA, GetStringTypeW, LCMapStringA, LCMapStringW, CompareStringA,
   CompareStringW, GetMapMode, SetMapMode, MessageBoxIndirectA, SetFileTime,
   SetHandleCount, DisableThreadLibraryCalls, ExtEscape, ThunkConnect32,
@@ -53972,13 +57014,13 @@ Begin
   End;
   If (M In [$0D, $0E, $10, $11, $12]) And (VgPlanes = 0) Then
   Begin
-    Own := HeapOwner; HeapOwner := 1;
+    Own := HeapOwner; HeapOwner := VmOwner;
     VgPlanes := KAlloc(4 * 65536);
     HeapOwner := Own;
   End;
   If (VgShadow = 0) Then
   Begin
-    Own := HeapOwner; HeapOwner := 1;
+    Own := HeapOwner; HeapOwner := VmOwner;
     VgShadow := KAlloc(65536);
     HeapOwner := Own;
   End;
@@ -57996,7 +61038,7 @@ Begin
   A := 0;
   If KB > 0 Then
   Begin
-    Own := HeapOwner; HeapOwner := 1;
+    Own := HeapOwner; HeapOwner := VmOwner;
     A := KAlloc(KB * 1024);
     HeapOwner := Own;
     If A = 0 Then Exit;
@@ -58162,7 +61204,7 @@ Begin
         A := 0;
         If N > 0 Then
         Begin
-          B := HeapOwner; HeapOwner := 1;
+          B := HeapOwner; HeapOwner := VmOwner;
           A := KAlloc(N * 1024);
           HeapOwner := B;
         End;
@@ -58234,7 +61276,7 @@ Var Own : LongInt;
 Begin
   If EmsPool = 0 Then
   Begin
-    Own := HeapOwner; HeapOwner := 1;
+    Own := HeapOwner; HeapOwner := VmOwner;
     EmsPoolBlk := KAlloc(EmsPages * 16384 + 4096);
     HeapOwner := Own;
     If EmsPoolBlk <> 0 Then EmsPool := (EmsPoolBlk + 4095) And Not 4095;
@@ -59015,7 +62057,7 @@ Begin
     par le client dans ES ; pile protegee de 8 Ko }
   VmRmStk := VR(fEs);
   If VmRmStk = 0 Then VmRmStk := McbAlloc(256, VmCurPsp, Max);
-  Own := HeapOwner; HeapOwner := 1;
+  Own := HeapOwner; HeapOwner := VmOwner;
   VmPmStkLin := KAlloc(8192);
   HeapOwner := Own;
   If (VmRmStk = 0) Or (VmPmStkLin = 0) Then
@@ -59179,7 +62221,7 @@ Begin
     End;
   If (H < 0) Or (Size <= 0) Or (Size > HeapFreeBytes - 8 * 1048576) Then
     Exit;
-  Own := HeapOwner; HeapOwner := 1;
+  Own := HeapOwner; HeapOwner := VmOwner;
   A := KAlloc(Size + 4096);
   HeapOwner := Own;
   If A = 0 Then Exit;
@@ -60185,7 +63227,7 @@ Begin
   Own := HeapOwner;
   HeapOwner := 0;
   If VmTmp = 0 Then VmTmp := KAlloc(1024);
-  HeapOwner := 1;
+  HeapOwner := VmOwner;
   VmRamBlk := KAlloc($100000 + 4096);
   VmPgBlk := KAlloc(3 * 4096);
   HeapOwner := Own;
@@ -60507,7 +63549,7 @@ End;
 
 { Lancer un programme MS-DOS dans la console }
 Function RunDos(Path, Args : String) : Boolean;
-Var T : LongInt; S : String;
+Var T, P : LongInt; S : String;
 Begin
   RunDos := True;
   KLog('Lancement de ' + Path + ' (MS-DOS)');
@@ -60524,16 +63566,28 @@ Begin
     KRepaint(ConW);
     TaskbarChanged;
   End;
-  AppRunning := True;
+  If VmOn Or (VmProc >= 0) Then
+  Begin
+    MsgBoxOpen(S, L('Un programme MS-DOS est d'#130'j'#133' en cours.',
+      'An MS-DOS program is already running.',
+      'Ein MS-DOS-Programm wird bereits ausgef'#129'hrt.',
+      'Un programma MS-DOS '#138' gi'#133' in esecuzione.',
+      'Ya se est'#160' ejecutando un programa de MS-DOS.'), $30);
+    Exit;
+  End;
+  P := ProcNew(pkDos);
+  If P < 0 Then Exit;
+  ProcEnter(P);
   AppConsole := True;
   AppPath := Path;
   AppBase := 0;
+  VmOwner := Procs^[P].Owner;
+  VmProc := P;
   If Not VmSetup Then
   Begin
-    HeapOwner := 0;
-    KFreeOwner(1);
-    AppRunning := False;
-    AppConsole := False;
+    ProcLeave;
+    VmProc := -1;
+    KillProc(P, -1);
     MsgBoxOpen(S, L('Impossible de creer la machine virtuelle MS-DOS.',
       'Cannot create the MS-DOS virtual machine.',
       'Die virtuelle MS-DOS-Maschine kann nicht erstellt werden.',
@@ -60544,17 +63598,22 @@ Begin
   If Args <> '' Then VmArgs := ' ' + Args Else VmArgs := '';
   VmProg := Path;
   VmOn := True;
-  HeapOwner := 1;
   AppProcObj := KObjNew(koProcess);
-  T := ThreadNew(LongInt(@DosMain), 0, $10000, True);
-  HeapOwner := 0;
-  If T < 0 Then
+  If AppProcObj >= 0 Then
   Begin
-    KillApp;
-    Exit;
+    KObjOwner[AppProcObj] := 0;
+    KObjs^[AppProcObj].F1 := P;
+    KObjs^[AppProcObj].F4 := Procs^[P].Pid;
   End;
+  T := ThreadNew(LongInt(@DosMain), 0, $10000, True);
   VmT := T;
   AppMainT := T;
+  ProcLeave;
+  If T < 0 Then
+  Begin
+    KillProc(P, -1);
+    Exit;
+  End;
 End;
 
 { ==================================================================== }
@@ -61456,6 +64515,10 @@ Begin
   FillMem(LongInt(@OutPal), SizeOf(OutPal), $FF);
   DacAll;
   OutPalChanged := False;
+  { tampon de l'ecran au format de la carte SVGA }
+  ScrFmtSet;
+  SurfFree(Back);
+  SurfNew(Back, ScrW, ScrH);
   SvHwPtr := (SvCaps And SvCapCursor) <> 0;
   SvFull1 := 1; SvFull2 := 2;
   KLog('VMware : carte SVGA II en ' + HexStr(SvPort, 4) + 'h, image ' +
@@ -61816,6 +64879,22 @@ BEGIN
     plus grande est chargee dans le tas (relocalisee), comme une DLL. }
   If MemTop >= $02000000 Then ExeTop := HeapBase Else ExeTop := $00800000;
   HeapInit(ExeTop, MemTop);
+  { processus 0 : le systeme (noyau, bureau, programmes Win16) }
+  I := KAlloc(SizeOf(TProcArr));
+  FillMem(I, SizeOf(TProcArr), 0);
+  Move(I, Procs, 4);
+  I := KAlloc(SizeOf(TClassArr));
+  FillMem(I, SizeOf(TClassArr), 0);
+  Move(I, Classes, 4);
+  I := KAlloc(SizeOf(TModArr));
+  FillMem(I, SizeOf(TModArr), 0);
+  Move(I, Mods, 4);
+  Procs^[0].Used := True; Procs^[0].Kind := pkSystem; Procs^[0].Pid := 4;
+  Procs^[0].Obj := -1; Procs^[0].MainT := 0; Procs^[0].PrioCls := $20;
+  Procs^[0].Path := 'VMM32.VXD';
+  ProcsOk := True;
+  CurProc := 0; ProcCnt := 0; WinProc := -1; VmProc := -1; DXProc := -1;
+  NextPid := 1132;
   I := KAlloc(SizeOf(TMItemArr));
   Move(I, MItemsP, 4);
   I := KAlloc(SizeOf(TGdiArr));
@@ -61829,6 +64908,12 @@ BEGIN
   I := KAlloc(SizeOf(TMsgQArr));
   FillMem(I, SizeOf(TMsgQArr), 0);
   Move(I, MsgQ, 4);
+  I := KAlloc(SizeOf(TWaitArr));
+  FillMem(I, SizeOf(TWaitArr), 0);
+  Move(I, WaitHs, 4);
+  I := KAlloc(SizeOf(TKObjPrArr));
+  FillMem(I, SizeOf(TKObjPrArr), 0);
+  Move(I, KObjPr, 4);
   Case Mem[0:BootInfo + 3] Mod 5 Of
     1 : Language := _English;
     2 : Language := _Germany;
@@ -61846,6 +64931,7 @@ BEGIN
   end;
   InitKeyTables;
   DefaultPalette;
+  ScrFmtSet;
   SurfNew(Back, ScrW, ScrH);
   { VMware SVGA II : la carte remplace le mode VESA (meme taille) }
   SvInit;
@@ -61858,6 +64944,8 @@ BEGIN
   TrayVol := True; MixW0 := -1; AudW := -1; SysW := -1; DevPW := -1;
   FdW := -1; FindW := -1; NoteAskW := -1; NotePend := -1; NoteSel := -1;
   ThreadInit0;
+  { pagination des le depart : repertoire de pages par processus }
+  PagingInit;
   KImgLo := $100000;
   KImgHi := KImgLo + MemL[0:KImgLo + MemL[0:KImgLo + $3C] + 80];
   If KImgHi > $00400000 Then
@@ -61881,6 +64969,8 @@ BEGIN
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
   MenuDepth := 0; DeskSel := -1; TaskbarW := -1; ZTaskW := -1;
+  MenuOwnerW := -1; MBarW := -1; MBarOpen := -1; MBarTogW := -1;
+  MBarTog := -1; TrackOn := False;
   DeskColor := cTeal;
   InitClasses;
   InitGdi;
