@@ -10296,7 +10296,12 @@ End;
 Function EPMatch(Const S : TString) : Boolean;
 Begin
   EPMatch := False;
-  If (EP < EPEnd) And (StrUpperCase(TokenPool[EP].Val) = S) Then
+  { une chaine litterale (')', 'do'...) n est jamais une ponctuation ni
+    un mot reserve : sinon JIs(')') fermait l appel sur la chaine et le
+    corps d un While se retrouvait hors de la boucle }
+  If (EP < EPEnd) And (TokenPool[EP].Kind <> TK_STRING) And
+     (TokenPool[EP].Kind <> TK_CHAR) And
+     (StrUpperCase(TokenPool[EP].Val) = S) Then
   Begin
     Inc(EP);
     EPMatch := True;
