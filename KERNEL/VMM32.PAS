@@ -10888,8 +10888,9 @@ Procedure KObjDrop(I : LongInt);
 Begin
   If (KObjs^[I].Kind = koMapping) And (KObjs^[I].F4 <> 0) Then
   Begin
-    KFree(KObjs^[I].F4);
-    KObjs^[I].F4 := 0;
+    If KObjs^[I].F5 <> 0 Then KFree(KObjs^[I].F5)
+    Else KFree(KObjs^[I].F4);
+    KObjs^[I].F4 := 0; KObjs^[I].F5 := 0;
   End;
   KObjs^[I].Used := False;
   KObjRef[I] := 0;
@@ -11114,6 +11115,7 @@ Type
     DlgEnded : Boolean;
     Cursor   : LongInt;
     HScrollPos, VScrollPos : LongInt;
+    HSMin, HSMax, HSPage, VSMin, VSMax, VSPage : LongInt; { SB_HORZ/VERT }
     FocusChild : LongInt;         { dernier enfant avec le focus + 1 }
   End;
 
@@ -24187,11 +24189,20 @@ Begin
   MemL[0:P + 28] := F;
 End;
 
+Function InView(A : LongInt) : Boolean; Forward;
+
 { VirtualAlloc : blocs alignes sur 4 Ko }
 Function VirtualAlloc(Addr, Size, Typ, Prot : LongInt) : LongInt;
 Var I, O, A : LongInt;
 Begin
   VirtualAlloc := 0;
+  { pages d'une vue de mappage (SEC_RESERVE, engagees par MEM_COMMIT) :
+    deja presentes }
+  If (Addr <> 0) And InView(Addr) Then
+  Begin
+    VirtualAlloc := Addr And Not 4095;
+    Exit;
+  End;
   If Addr <> 0 Then
     For I := 0 To MaxVBlk - 1 Do
       If VBlks[I].Used And (Addr >= VBlks[I].Base) And
@@ -27418,6 +27429,46 @@ End;
 {       +14 bits par point +16 compression +32 couleurs utilisees      }
 { ------------------------------------------------------------------ }
 
+{ En-tete BITMAPCOREHEADER (12 octets, format OS/2 : largeur et hauteur
+  sur 16 bits, couleurs RGBTRIPLE) : copie en BITMAPINFOHEADER avec une
+  table RGBQUAD (ou d'indices de palette, Usage 1), a liberer par
+  l'appelant si elle differe de Bmi ; DibCoreOfs : debut des bits d'une
+  DIB compacte au format OS/2 }
+Function DibCore(Bmi, Usage : LongInt) : LongInt;
+Var N, Bpp, I, A : LongInt;
+Begin
+  DibCore := Bmi;
+  If (Bmi = 0) Or (MemL[0:Bmi] <> 12) Then Exit;
+  Bpp := MemW[0:Bmi + 10];
+  N := 0;
+  If Bpp <= 8 Then N := 1 Shl Bpp;
+  A := KAlloc(40 + 1024);
+  If A = 0 Then Exit;
+  FillMem(A, 40 + 1024, 0);
+  MemL[0:A] := 40;
+  MemL[0:A + 4] := MemW[0:Bmi + 4]; MemL[0:A + 8] := MemW[0:Bmi + 6];
+  MemW[0:A + 12] := 1; MemW[0:A + 14] := Bpp;
+  MemL[0:A + 32] := N;
+  For I := 0 To N - 1 Do
+    If Usage = 1 Then MemW[0:A + 40 + I * 2] := MemW[0:Bmi + 12 + I * 2]
+    Else
+    Begin
+      Mem[0:A + 40 + I * 4] := Mem[0:Bmi + 12 + I * 3];
+      Mem[0:A + 41 + I * 4] := Mem[0:Bmi + 13 + I * 3];
+      Mem[0:A + 42 + I * 4] := Mem[0:Bmi + 14 + I * 3];
+    End;
+  DibCore := A;
+End;
+
+Function DibCoreOfs(Bmi, Usage : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  N := 0;
+  If MemW[0:Bmi + 10] <= 8 Then N := 1 Shl MemW[0:Bmi + 10];
+  If Usage = 1 Then DibCoreOfs := 12 + N * 2
+  Else DibCoreOfs := 12 + N * 3;
+End;
+
 Function DibColors(Bmi : LongInt) : LongInt;
 Var N : LongInt;
 Begin
@@ -27615,11 +27666,11 @@ Begin
   DcDirty(X0, Y0, X1, Y1);
 End;
 
-Function StretchDIBits(Hdc, X, Y, W, H, SX, SY, SW, SH, Bits, Bmi, Usage,
+Function StretchDIBits0(Hdc, X, Y, W, H, SX, SY, SW, SH, Bits, Bmi, Usage,
   Rop : LongInt) : LongInt;
 Var D, BH : LongInt;
 Begin
-  StretchDIBits := SH;
+  StretchDIBits0 := SH;
   D := DcOf(Hdc);
   If Not DcBegin(D) Then Exit;
   BH := Abs(MemL[0:Bmi + 8]);
@@ -27628,16 +27679,38 @@ Begin
   DibToDc(D, X, Y, W, H, SX, SY, SW, SH, Bits, Bmi, Usage, Rop);
 End;
 
-Function SetDIBitsToDevice(Hdc, X, Y, W, H, SX, SY, Start, Lines, Bits, Bmi,
+{ StretchDIBits : en-tete BITMAPCOREHEADER converti }
+Function StretchDIBits(Hdc, X, Y, W, H, SX, SY, SW, SH, Bits, Bmi, Usage, Rop
+  : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := DibCore(Bmi, Usage);
+  StretchDIBits := StretchDIBits0(Hdc, X, Y, W, H, SX, SY, SW, SH, Bits, C,
+    Usage, Rop);
+  If C <> Bmi Then KFree(C);
+End;
+
+Function SetDIBitsToDevice0(Hdc, X, Y, W, H, SX, SY, Start, Lines, Bits, Bmi,
   Usage : LongInt) : LongInt;
 Var D, BH : LongInt;
 Begin
-  SetDIBitsToDevice := Lines;
+  SetDIBitsToDevice0 := Lines;
   D := DcOf(Hdc);
   If Not DcBegin(D) Then Exit;
   BH := Abs(MemL[0:Bmi + 8]);
   If MemL[0:Bmi + 8] > 0 Then SY := BH - SY - H;
   DibToDc(D, X, Y, W, H, SX, SY, W, H, Bits, Bmi, Usage, SRCCOPY);
+End;
+
+{ SetDIBitsToDevice : en-tete BITMAPCOREHEADER converti }
+Function SetDIBitsToDevice(Hdc, X, Y, W, H, SX, SY, Start, Lines, Bits, Bmi,
+  Usage : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := DibCore(Bmi, Usage);
+  SetDIBitsToDevice := SetDIBitsToDevice0(Hdc, X, Y, W, H, SX, SY, Start,
+    Lines, Bits, C, Usage);
+  If C <> Bmi Then KFree(C);
 End;
 
 { Creer un bitmap compatible (8 bits) a partir d'une DIB }
@@ -27715,14 +27788,18 @@ End;
 
 { Creer un bitmap compatible (format de l'ecran) a partir d'une DIB }
 Function CreateDIBitmapK(Bmi, Bits, Usage : LongInt) : LongInt;
-Var B, W, H : LongInt;
+Var B, W, H, C : LongInt;
 Begin
-  W := MemL[0:Bmi + 4]; H := Abs(MemL[0:Bmi + 8]);
-  If Bits = 0 Then Bits := Bmi + MemL[0:Bmi] + DibColors(Bmi) * 4;
-  B := BmpNew(W, H, ScrFmt, False);
+  C := DibCore(Bmi, Usage);
+  If (C <> Bmi) And (Bits = 0) Then Bits := Bmi + DibCoreOfs(Bmi, Usage);
+  W := MemL[0:C + 4]; H := Abs(MemL[0:C + 8]);
+  If Bits = 0 Then Bits := C + MemL[0:C] + DibColors(C) * 4;
+  { en-tete invalide : pas de bitmap geante }
+  If (W <= 0) Or (W > 16384) Or (H > 16384) Then B := -1
+  Else B := BmpNew(W, H, ScrFmt, False);
   CreateDIBitmapK := B;
-  If B < 0 Then Exit;
-  SetDIBitsK(B, 0, H, Bits, Bmi, Usage, -1);
+  If B >= 0 Then SetDIBitsK(B, 0, H, Bits, C, Usage, -1);
+  If C <> Bmi Then KFree(C);
 End;
 
 Function CreateDIBitmap(Hdc, Bih, Init, Bits, Bmi, Usage : LongInt)
@@ -27731,17 +27808,19 @@ Var B : LongInt;
 Begin
   If ((Init And 4) <> 0) And (Bits <> 0) And (Bmi <> 0) Then
     B := CreateDIBitmapK(Bmi, Bits, Usage)
+  Else If (Bih <> 0) And (MemL[0:Bih] = 12) Then
+    B := BmpNew(MemW[0:Bih + 4], MemW[0:Bih + 6], ScrFmt, False)
   Else
     B := BmpNew(MemL[0:Bih + 4], Abs(MemL[0:Bih + 8]), ScrFmt, False);
   CreateDIBitmap := GdiH(B);
 End;
 
 { Section DIB : les bits restent au format de l'application }
-Function CreateDIBSection(Hdc, Bmi, Usage, PBits, HSec, Ofs : LongInt)
+Function CreateDIBSection0(Hdc, Bmi, Usage, PBits, HSec, Ofs : LongInt)
   : LongInt;
 Var B, W, H, Bpp, Pitch : LongInt;
 Begin
-  CreateDIBSection := 0;
+  CreateDIBSection0 := 0;
   W := MemL[0:Bmi + 4]; H := MemL[0:Bmi + 8]; Bpp := MemW[0:Bmi + 14];
   B := GdiNew(goBitmap);
   If B < 0 Then Exit;
@@ -27759,7 +27838,17 @@ Begin
     DibTable(Bmi, Usage, DcOf(Hdc), Gdis^[B].I6);
   End;
   If PBits <> 0 Then MemL[0:PBits] := Gdis^[B].I1;
-  CreateDIBSection := GdiH(B);
+  CreateDIBSection0 := GdiH(B);
+End;
+
+{ CreateDIBSection : en-tete BITMAPCOREHEADER converti }
+Function CreateDIBSection(Hdc, Bmi, Usage, PBits, HSec, Ofs : LongInt) :
+  LongInt;
+Var C : LongInt;
+Begin
+  C := DibCore(Bmi, Usage);
+  CreateDIBSection := CreateDIBSection0(Hdc, C, Usage, PBits, HSec, Ofs);
+  If C <> Bmi Then KFree(C);
 End;
 
 Function SetDIBColorTable(Hdc, Start, N, Rgbq : LongInt) : LongInt;
@@ -28028,11 +28117,21 @@ Begin
   GetDIBits := N;
 End;
 
-Function SetDIBits(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt)
+Function SetDIBits0(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt)
   : LongInt;
 Begin
-  SetDIBits := SetDIBitsK(GdiOf(H, goBitmap), Start, Lines, Bits, Bmi,
+  SetDIBits0 := SetDIBitsK(GdiOf(H, goBitmap), Start, Lines, Bits, Bmi,
                           Usage, DcOf(Hdc));
+End;
+
+{ SetDIBits : en-tete BITMAPCOREHEADER converti }
+Function SetDIBits(Hdc, H, Start, Lines, Bits, Bmi, Usage : LongInt) :
+  LongInt;
+Var C : LongInt;
+Begin
+  C := DibCore(Bmi, Usage);
+  SetDIBits := SetDIBits0(Hdc, H, Start, Lines, Bits, C, Usage);
+  If C <> Bmi Then KFree(C);
 End;
 
 { ------------------------------------------------------------------ }
@@ -29950,8 +30049,17 @@ Var W : LongInt;
 Begin
   SetScrollRange := 1;
   W := WndOf(H);
-  If (W >= 0) And (Bar = 2) And (Wnds^[W].IKind = ikScrollBar) Then
-    Dummy := KWndProc(W, $E6, Mn, Mx);
+  If W < 0 Then Exit;
+  If (Bar = 2) And (Wnds^[W].IKind = ikScrollBar) Then
+    Dummy := KWndProc(W, $E6, Mn, Mx)
+  Else If Bar = 1 Then
+  Begin
+    Wnds^[W].VSMin := Mn; Wnds^[W].VSMax := Mx;
+  End
+  Else If Bar = 0 Then
+  Begin
+    Wnds^[W].HSMin := Mn; Wnds^[W].HSMax := Mx;
+  End;
 End;
 
 Function ShowScrollBar(H, Bar, Show : LongInt) : LongInt;
@@ -34550,6 +34658,13 @@ Begin
   Mods^[M].Path := Path;
   Mods^[M].IsDll := IsDll;
   Mods^[M].PrcId := CurProc;
+  { GetModuleHandle(NULL) des DLL initialisees pendant le chargement du
+    programme (WWINTL32.DLL cherche les exportations de WINWORD.EXE) }
+  If Not IsDll And (CurProc > 0) Then
+  Begin
+    AppBase := Load;
+    AppSize := ImgSize;
+  End;
   { importations (journalisees si le module est dans APITRACEMOD) }
   ImpTrace := (TraceMods = '') Or
               (Pos(' ' + Mods^[M].Name + ' ', TraceMods) > 0);
@@ -36202,6 +36317,16 @@ Begin
   N := KWriteFile(H, ViewAddr[V], ViewSize[V]);
 End;
 
+{ adresse dans une vue de mappage }
+Function InView(A : LongInt) : Boolean;
+Var V : LongInt;
+Begin
+  InView := False;
+  For V := 0 To MaxView - 1 Do
+    If (ViewAddr[V] <> 0) And (A >= ViewAddr[V] And Not 4095) And
+       (A < ViewAddr[V] + ViewSize[V]) Then InView := True;
+End;
+
 Function MapViewOfFile(HMap, Acc, OfsHi, OfsLo, N : LongInt) : LongInt;
 Var I, V, A, Got, K, Own : LongInt;
 Begin
@@ -36214,11 +36339,14 @@ Begin
   If V < 0 Then Exit;
   If KObjs^[I].F4 = 0 Then
   Begin
-    { bloc partage : au noyau, rendu avec le mappage }
+    { bloc partage : au noyau, rendu avec le mappage ; aligne sur 64 Ko
+      comme les vues de Windows (F5 : adresse a liberer) }
     Own := HeapOwner; HeapOwner := 0;
-    A := KAlloc(Max(KObjs^[I].F2, 1) + 16);
+    A := KAlloc(Max(KObjs^[I].F2, 1) + 65536);
     HeapOwner := Own;
     If A = 0 Then Exit;
+    KObjs^[I].F5 := A;
+    A := (A + 65535) And Not 65535;
     FillMem(A, Max(KObjs^[I].F2, 1), 0);
     If KObjs^[I].F1 <> -1 Then
     Begin
@@ -67084,15 +67212,56 @@ Begin
   CoUnmarshalHresult := E_NOTIMPL;
 End;
 
-Function ProgIDFromCLSID(Clsid, PP : LongInt) : LongInt;
+{ valeur par defaut (texte) de la cle HKEY_CLASSES_ROOT\Path, '' sans
+  elle }
+Function ClassesStr(Path : String) : String;
+Var I, V, N, K : LongInt; S : String;
 Begin
-  ProgIDFromCLSID := NoItf(PP, REGDB_CLASSNOTREG);
+  ClassesStr := '';
+  I := RegKeyOf(LongInt($80000000));
+  If I >= 0 Then I := RegWalk(I, Path, False);
+  If I < 0 Then Exit;
+  V := RegVal(I, '');
+  If V < 0 Then Exit;
+  S := '';
+  N := Min(RVSize^[V], 255);
+  K := 0;
+  While (K < N) And (Mem[0:RVData^[V] + K] <> 0) Do
+  Begin
+    S := S + Chr(Mem[0:RVData^[V] + K]);
+    Inc(K);
+  End;
+  ClassesStr := S;
 End;
 
-Function CLSIDFromProgID(P, Clsid : LongInt) : LongInt;
+{ ProgID d'une classe : HKEY_CLASSES_ROOT\CLSID\{...}\ProgID }
+Function ProgIDFromCLSID(Clsid, PP : LongInt) : LongInt;
+Var S : String; P : LongInt;
 Begin
-  If Clsid <> 0 Then FillMem(Clsid, 16, 0);
+  ProgIDFromCLSID := NoItf(PP, REGDB_CLASSNOTREG);
+  If (Clsid = 0) Or (PP = 0) Then Exit;
+  S := ClassesStr('CLSID\' + GuidText(Clsid) + '\ProgID');
+  If S = '' Then Exit;
+  P := CoTaskMemAlloc(Length(S) * 2 + 2);
+  If P = 0 Then Exit;
+  PutWStr(P, S, Length(S) + 1);
+  MemL[0:PP] := P;
+  ProgIDFromCLSID := 0;
+End;
+
+{ classe d'un ProgID : HKEY_CLASSES_ROOT\ProgID\CLSID }
+Function CLSIDFromProgID(P, Clsid : LongInt) : LongInt;
+Var S : String; I : LongInt; W : Array[0..39] Of Word;
+Begin
   CLSIDFromProgID := $800401F3;
+  If Clsid = 0 Then Exit;
+  FillMem(Clsid, 16, 0);
+  If P = 0 Then Exit;
+  S := ClassesStr(WPStr(P) + '\CLSID');
+  If Length(S) <> 38 Then Exit;
+  For I := 0 To 37 Do W[I] := Ord(S[I + 1]);
+  W[38] := 0;
+  If ParseGuidW(LongInt(@W), Clsid) Then CLSIDFromProgID := 0;
 End;
 
 Function OleBuildVersion : LongInt;
@@ -67999,6 +68168,845 @@ Begin
   BindMoniker := NoItf(PP, E_NOTIMPL);
 End;
 
+{ ------------------------------------------------------------------ }
+{ Word 97 et MSO97.DLL : GDI32, USER32 et WINSPOOL                    }
+{ ------------------------------------------------------------------ }
+
+{ Chemins (BeginPath... StrokePath) : non enregistres, les figures
+  sont ignorees }
+Function BeginPath(Hdc : LongInt) : LongInt;
+Begin
+  BeginPath := 1;
+End;
+
+Function EndPath(Hdc : LongInt) : LongInt;
+Begin
+  EndPath := 1;
+End;
+
+Function CloseFigure(Hdc : LongInt) : LongInt;
+Begin
+  CloseFigure := 1;
+End;
+
+Function FillPath(Hdc : LongInt) : LongInt;
+Begin
+  FillPath := 1;
+End;
+
+Function StrokePath(Hdc : LongInt) : LongInt;
+Begin
+  StrokePath := 1;
+End;
+
+Function StrokeAndFillPath(Hdc : LongInt) : LongInt;
+Begin
+  StrokeAndFillPath := 1;
+End;
+
+Function SelectClipPath(Hdc, Mode : LongInt) : LongInt;
+Begin
+  SelectClipPath := 1;
+End;
+
+{ Gestion des couleurs (ICM) : absente, comme un ecran sans profil }
+Function CreateColorSpaceA(P : LongInt) : LongInt;
+Begin
+  CreateColorSpaceA := 1;
+End;
+
+Function DeleteColorSpace(H : LongInt) : LongInt;
+Begin
+  DeleteColorSpace := 1;
+End;
+
+Function GetColorSpace(Hdc : LongInt) : LongInt;
+Begin
+  GetColorSpace := 1;
+End;
+
+Function SetColorSpace(Hdc, H : LongInt) : LongInt;
+Begin
+  SetColorSpace := 1;
+End;
+
+Function SetICMMode(Hdc, M : LongInt) : LongInt;
+Begin
+  SetICMMode := 1;
+End;
+
+{ COLORADJUSTMENT (24 octets) : valeurs par defaut }
+Function GetColorAdjustment(Hdc, P : LongInt) : LongInt;
+Begin
+  GetColorAdjustment := 0;
+  If P = 0 Then Exit;
+  FillMem(P, 24, 0);
+  MemW[0:P] := 24;
+  MemW[0:P + 6] := 10000; MemW[0:P + 8] := 10000; MemW[0:P + 10] := 10000;
+  MemW[0:P + 14] := 10000;
+  GetColorAdjustment := 1;
+End;
+
+Function SetColorAdjustment(Hdc, P : LongInt) : LongInt;
+Begin
+  SetColorAdjustment := 1;
+End;
+
+{ brosse d'un motif DIB : gris clair (le motif n'est pas reproduit) }
+Function CreateDIBPatternBrushPt(P, Usage : LongInt) : LongInt;
+Begin
+  CreateDIBPatternBrushPt := CreateSolidBrush($C0C0C0);
+End;
+
+{ ExtCreatePen : style, epaisseur et couleur du LOGBRUSH }
+Function ExtCreatePen(Style, Width, PLb, N, PSt : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := 0;
+  If PLb <> 0 Then C := MemL[0:PLb + 4];
+  ExtCreatePen := CreatePen(Style And $F, Width, C);
+End;
+
+{ EnumFontFamiliesA : la police du systeme }
+Function EnumFontFamiliesA(Hdc, Face, Proc, Lp : LongInt) : LongInt;
+Begin
+  EnumFontFamiliesA := EnumFontsA(Hdc, Face, Proc, Lp);
+End;
+
+{ EnumFontFamiliesExA : ENUMLOGFONTEX (LOGFONT, nom complet, style,
+  ecriture) et NEWTEXTMETRICEX, une seule police }
+Function EnumFontFamiliesExA(Hdc, PLf, Proc, Lp, Fl : LongInt) : LongInt;
+Var Lf, Tm, R, K : LongInt;
+Begin
+  EnumFontFamiliesExA := 1;
+  If Proc = 0 Then Exit;
+  K := HeapOwner; HeapOwner := 0;
+  Lf := KAlloc(192); Tm := KAlloc(96);
+  HeapOwner := K;
+  If (Lf = 0) Or (Tm = 0) Then Exit;
+  FillMem(Lf, 192, 0); FillMem(Tm, 96, 0);
+  MemL[0:Lf] := 16; MemL[0:Lf + 4] := 8; MemL[0:Lf + 16] := 400;
+  PutPStr(Lf + 28, 'System', 32);
+  PutPStr(Lf + 60, 'System', 64);
+  PutPStr(Lf + 124, 'Normal', 32);
+  PutPStr(Lf + 156, 'Occidental', 32);
+  GetTextMetricsA(Hdc, Tm);
+  R := 0;
+  asm
+    mov eax,Lp
+    push eax
+    push 1
+    mov eax,Tm
+    push eax
+    mov eax,Lf
+    push eax
+    mov eax,Proc
+    call eax
+    mov R,eax
+  end;
+  KFree(Lf); KFree(Tm);
+  EnumFontFamiliesExA := R;
+End;
+
+{ ExcludeClipRect : regions rectangulaires ; retire la bande quand le
+  rectangle couvre toute la largeur ou toute la hauteur du detourage }
+Function ExcludeClipRect(Hdc, L0, T0, R0, B0 : LongInt) : LongInt;
+Var D : LongInt; R : TRect;
+Begin
+  ExcludeClipRect := 0;
+  D := DcOf(Hdc);
+  If D < 0 Then Exit;
+  ExcludeClipRect := 2;
+  If Not Dcs[D].HasClip Then Exit;
+  SetR(R, L0 + Dcs[D].VpX - Dcs[D].WinX, T0 + Dcs[D].VpY - Dcs[D].WinY,
+       R0 + Dcs[D].VpX - Dcs[D].WinX, B0 + Dcs[D].VpY - Dcs[D].WinY);
+  If (R.L <= Dcs[D].ClipR.L) And (R.R >= Dcs[D].ClipR.R) Then
+  Begin
+    If (R.T <= Dcs[D].ClipR.T) And (R.B > Dcs[D].ClipR.T) Then
+      Dcs[D].ClipR.T := Min(R.B, Dcs[D].ClipR.B)
+    Else If (R.B >= Dcs[D].ClipR.B) And (R.T < Dcs[D].ClipR.B) Then
+      Dcs[D].ClipR.B := Max(R.T, Dcs[D].ClipR.T);
+  End
+  Else If (R.T <= Dcs[D].ClipR.T) And (R.B >= Dcs[D].ClipR.B) Then
+  Begin
+    If (R.L <= Dcs[D].ClipR.L) And (R.R > Dcs[D].ClipR.L) Then
+      Dcs[D].ClipR.L := Min(R.R, Dcs[D].ClipR.R)
+    Else If (R.R >= Dcs[D].ClipR.R) And (R.L < Dcs[D].ClipR.R) Then
+      Dcs[D].ClipR.R := Max(R.L, Dcs[D].ClipR.L);
+  End;
+End;
+
+{ ExtSelectClipRgn : RGN_AND (1), RGN_COPY (5) ; les autres modes
+  gardent le detourage }
+Function ExtSelectClipRgn(Hdc, H, Mode : LongInt) : LongInt;
+Var D, I : LongInt; R : TRect;
+Begin
+  ExtSelectClipRgn := 0;
+  D := DcOf(Hdc);
+  If D < 0 Then Exit;
+  If (Mode = 5) Or (H = 0) Then
+  Begin
+    ExtSelectClipRgn := SelectClipRgn(Hdc, H);
+    Exit;
+  End;
+  I := GdiOf(H, goRegion);
+  If I < 0 Then Exit;
+  ExtSelectClipRgn := 2;
+  If Mode = 1 Then
+  Begin
+    SetR(R, Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
+    If Dcs[D].HasClip Then
+    Begin
+      If Not RInter(Dcs[D].ClipR, Dcs[D].ClipR, R) Then
+      Begin
+        SetR(Dcs[D].ClipR, 0, 0, 0, 0);
+        ExtSelectClipRgn := 1;
+      End;
+    End
+    Else Dcs[D].ClipR := R;
+    Dcs[D].HasClip := True;
+  End;
+End;
+
+Function OffsetClipRgn(Hdc, X, Y : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  OffsetClipRgn := 0;
+  D := DcOf(Hdc);
+  If D < 0 Then Exit;
+  OffsetClipRgn := 3;
+  If Not Dcs[D].HasClip Then Exit;
+  Dcs[D].ClipR.L := Dcs[D].ClipR.L + X; Dcs[D].ClipR.R := Dcs[D].ClipR.R + X;
+  Dcs[D].ClipR.T := Dcs[D].ClipR.T + Y; Dcs[D].ClipR.B := Dcs[D].ClipR.B + Y;
+  OffsetClipRgn := 2;
+End;
+
+{ RGNDATA : en-tete (32 octets) et un rectangle }
+Function GetRegionData(H, Size, P : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  GetRegionData := 0;
+  I := GdiOf(H, goRegion);
+  If I < 0 Then Exit;
+  GetRegionData := 48;
+  If (P = 0) Or (Size < 48) Then Exit;
+  FillMem(P, 48, 0);
+  MemL[0:P] := 32; MemL[0:P + 4] := 1;
+  If RgnType(I) = 2 Then
+  Begin
+    MemL[0:P + 8] := 1; MemL[0:P + 12] := 16;
+  End;
+  MemL[0:P + 16] := Gdis^[I].I1; MemL[0:P + 20] := Gdis^[I].I2;
+  MemL[0:P + 24] := Gdis^[I].I3; MemL[0:P + 28] := Gdis^[I].I4;
+  MoveMem(P + 16, P + 32, 16);
+End;
+
+Function RectInRegion(H, P : LongInt) : LongInt;
+Var I : LongInt; A, B, C : TRect;
+Begin
+  RectInRegion := 0;
+  I := GdiOf(H, goRegion);
+  If (I < 0) Or (P = 0) Then Exit;
+  SetR(A, Gdis^[I].I1, Gdis^[I].I2, Gdis^[I].I3, Gdis^[I].I4);
+  GetRectAt(P, B);
+  RectInRegion := Ord(RInter(C, A, B));
+End;
+
+Function GetArcDirection(Hdc : LongInt) : LongInt;
+Begin
+  GetArcDirection := 1;
+End;
+
+Function GetBrushOrgEx(Hdc, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 0; MemL[0:P + 4] := 0;
+  End;
+  GetBrushOrgEx := 1;
+End;
+
+Function GetPolyFillMode(Hdc : LongInt) : LongInt;
+Begin
+  GetPolyFillMode := 1;
+End;
+
+Function GetTextCharacterExtra(Hdc : LongInt) : LongInt;
+Begin
+  GetTextCharacterExtra := 0;
+End;
+
+{ jeu de caracteres de la police : ANSI (les textes des programmes
+  Windows sont convertis vers la police de l'ecran) ; FONTSIGNATURE :
+  latin 1 }
+Function GetTextCharsetInfo(Hdc, PSig, Fl : LongInt) : LongInt;
+Begin
+  If PSig <> 0 Then
+  Begin
+    FillMem(PSig, 24, 0);
+    MemL[0:PSig] := 3;
+    MemL[0:PSig + 16] := 1;
+  End;
+  GetTextCharsetInfo := 0;
+End;
+
+{ polices vectorielles (TrueType) : absentes }
+Function GetFontData(Hdc, Tab, Ofs, Buf, N : LongInt) : LongInt;
+Begin
+  GetFontData := -1;
+End;
+
+Function GetKerningPairsA(Hdc, N, P : LongInt) : LongInt;
+Begin
+  GetKerningPairsA := 0;
+End;
+
+Function GetOutlineTextMetricsA(Hdc, N, P : LongInt) : LongInt;
+Begin
+  GetOutlineTextMetricsA := 0;
+End;
+
+{ GetGlyphOutline : seulement les mesures (GGO_METRICS) d'un caractere
+  de la police 8x16 }
+Function GetGlyphOutlineA(Hdc, Ch, Fmt, PGm, N, Buf, PMat : LongInt)
+  : LongInt;
+Begin
+  GetGlyphOutlineA := -1;
+  If (Fmt <> 0) Or (PGm = 0) Then Exit;
+  MemL[0:PGm] := 8; MemL[0:PGm + 4] := 16;
+  MemL[0:PGm + 8] := 0; MemL[0:PGm + 12] := 12;
+  MemW[0:PGm + 16] := 8; MemW[0:PGm + 18] := 0;
+  GetGlyphOutlineA := 0;
+End;
+
+Function GetGlyphOutlineW(Hdc, Ch, Fmt, PGm, N, Buf, PMat : LongInt)
+  : LongInt;
+Begin
+  GetGlyphOutlineW := GetGlyphOutlineA(Hdc, Ch, Fmt, PGm, N, Buf, PMat);
+End;
+
+{ LineDDA : appelle Proc(x, y, donnee) pour chaque point du segment,
+  sans le dernier }
+Function LineDDA(X1, Y1, X2, Y2, Proc, Lp : LongInt) : LongInt;
+Var DX, DY, SX, SY, E, N, I, X, Y : LongInt;
+Begin
+  LineDDA := 1;
+  If Proc = 0 Then Exit;
+  DX := Abs(X2 - X1); DY := Abs(Y2 - Y1);
+  If X2 >= X1 Then SX := 1 Else SX := -1;
+  If Y2 >= Y1 Then SY := 1 Else SY := -1;
+  X := X1; Y := Y1;
+  N := Max(DX, DY);
+  If DX >= DY Then E := DX Div 2 Else E := DY Div 2;
+  For I := 0 To N - 1 Do
+  Begin
+    asm
+      mov eax,Lp
+      push eax
+      mov eax,Y
+      push eax
+      mov eax,X
+      push eax
+      mov eax,Proc
+      call eax
+    end;
+    If DX >= DY Then
+    Begin
+      X := X + SX;
+      E := E - DY;
+      If E < 0 Then
+      Begin
+        Y := Y + SY;
+        E := E + DX;
+      End;
+    End
+    Else
+    Begin
+      Y := Y + SY;
+      E := E - DX;
+      If E < 0 Then
+      Begin
+        X := X + SX;
+        E := E + DY;
+      End;
+    End;
+  End;
+End;
+
+Function PolylineTo(Hdc, Pts, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  For I := 0 To N - 1 Do
+    LineTo(Hdc, MemL[0:Pts + I * 8], MemL[0:Pts + I * 8 + 4]);
+  PolylineTo := 1;
+End;
+
+{ courbe de Bezier cubique P0 P1 P2 P3 approchee par 16 segments,
+  depuis la position courante (deja en P0) }
+Procedure BezSeg(Hdc, X0, Y0, X1, Y1, X2, Y2, X3, Y3 : LongInt);
+Var I, T, U, X, Y : LongInt;
+Begin
+  For I := 1 To 16 Do
+  Begin
+    T := I; U := 16 - I;
+    X := (U * U * U * X0 + 3 * U * U * T * X1 + 3 * U * T * T * X2 +
+          T * T * T * X3) Div 4096;
+    Y := (U * U * U * Y0 + 3 * U * U * T * Y1 + 3 * U * T * T * Y2 +
+          T * T * T * Y3) Div 4096;
+    LineTo(Hdc, X, Y);
+  End;
+End;
+
+Function PolyBezierTo(Hdc, Pts, N : LongInt) : LongInt;
+Var D, I, X0, Y0 : LongInt;
+Begin
+  PolyBezierTo := 0;
+  D := DcOf(Hdc);
+  If D < 0 Then Exit;
+  I := 0;
+  While I + 3 <= N Do
+  Begin
+    X0 := Dcs[D].PosX; Y0 := Dcs[D].PosY;
+    BezSeg(Hdc, X0, Y0, MemL[0:Pts + I * 8], MemL[0:Pts + I * 8 + 4],
+           MemL[0:Pts + I * 8 + 8], MemL[0:Pts + I * 8 + 12],
+           MemL[0:Pts + I * 8 + 16], MemL[0:Pts + I * 8 + 20]);
+    I := I + 3;
+  End;
+  PolyBezierTo := 1;
+End;
+
+Function PolyBezier(Hdc, Pts, N : LongInt) : LongInt;
+Var D, X, Y : LongInt;
+Begin
+  PolyBezier := 0;
+  D := DcOf(Hdc);
+  If (D < 0) Or (N < 1) Then Exit;
+  X := Dcs[D].PosX; Y := Dcs[D].PosY;
+  MoveToEx(Hdc, MemL[0:Pts], MemL[0:Pts + 4], 0);
+  PolyBezier := PolyBezierTo(Hdc, Pts + 8, N - 1);
+  Dcs[D].PosX := X; Dcs[D].PosY := Y;
+End;
+
+Function ResetDCA(Hdc, Dm : LongInt) : LongInt;
+Begin
+  ResetDCA := Hdc;
+End;
+
+{ WINSPOOL : pas d'imprimante }
+Function DeviceCapabilitiesA(Dev, Port, Cap, Out, Dm : LongInt) : LongInt;
+Begin
+  DeviceCapabilitiesA := 0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ USER32                                                             }
+{ ------------------------------------------------------------------ }
+
+Function ArrangeIconicWindows(H : LongInt) : LongInt;
+Begin
+  ArrangeIconicWindows := 0;
+End;
+
+{ deplacements groupes : appliques aussitot }
+Function BeginDeferWindowPos(N : LongInt) : LongInt;
+Begin
+  BeginDeferWindowPos := $DEF00001;
+End;
+
+Function DeferWindowPos(Hd, H, After, X, Y, CX, CY, Fl : LongInt)
+  : LongInt;
+Begin
+  SetWindowPos(H, After, X, Y, CX, CY, Fl);
+  DeferWindowPos := Hd;
+End;
+
+Function EndDeferWindowPos(Hd : LongInt) : LongInt;
+Begin
+  EndDeferWindowPos := 1;
+End;
+
+Function CallMsgFilterA(P, Code : LongInt) : LongInt;
+Begin
+  CallMsgFilterA := 0;
+End;
+
+Function ChangeMenuA(H, Cmd, S, Id, Fl : LongInt) : LongInt;
+Begin
+  ChangeMenuA := 1;
+End;
+
+Function DrawAnimatedRects(H, Id, PFrom, PTo : LongInt) : LongInt;
+Begin
+  DrawAnimatedRects := 1;
+End;
+
+Function DrawIconEx(Hdc, X, Y, Icon, CX, CY, Step, Br, Fl : LongInt)
+  : LongInt;
+Begin
+  DrawIconEx := DrawIcon(Hdc, X, Y, Icon);
+End;
+
+{ DrawState : texte (DST_TEXT 1, DST_PREFIXTEXT 2), icone (3), bitmap (4)
+  ou dessin du programme (DST_COMPLEX 0) ; DSS_DISABLED (20h) : gris }
+Function DrawStateA(Hdc, Br, Proc, Lp, Wp, X, Y, CX, CY, Fl : LongInt)
+  : LongInt;
+Var Typ, Old, Mdc, Ob, N : LongInt; R : Array[0..3] Of LongInt;
+    Bm : Array[0..5] Of LongInt;
+Begin
+  DrawStateA := 1;
+  Typ := Fl And $F;
+  Old := -1;
+  If (Fl And $20) <> 0 Then Old := SetTextColor(Hdc, $808080);
+  Case Typ Of
+    0 : If Proc <> 0 Then DrawStateA := CallProc5(Proc, Hdc, Lp, Wp, CX, CY);
+    1, 2 :
+      If Lp <> 0 Then
+      Begin
+        N := Wp;
+        If N <= 0 Then N := lstrlenA(Lp);
+        If Typ = 1 Then TextOutA(Hdc, X, Y, Lp, N)
+        Else
+        Begin
+          R[0] := X; R[1] := Y; R[2] := X + Max(CX, 2048);
+          R[3] := Y + Max(CY, 64);
+          DrawTextA(Hdc, Lp, N, LongInt(@R), $800);
+        End;
+      End;
+    3 : DrawIcon(Hdc, X, Y, Lp);
+    4 :
+    Begin
+      Mdc := CreateCompatibleDC(Hdc);
+      If Mdc <> 0 Then
+      Begin
+        Ob := SelectObject(Mdc, Lp);
+        If (CX = 0) Or (CY = 0) Then
+        Begin
+          FillMem(LongInt(@Bm), 24, 0);
+          GetObjectA(Lp, 24, LongInt(@Bm));
+          If CX = 0 Then CX := Bm[1];
+          If CY = 0 Then CY := Bm[2];
+        End;
+        BitBlt(Hdc, X, Y, CX, CY, Mdc, 0, 0, $CC0020);
+        SelectObject(Mdc, Ob);
+        DeleteDC(Mdc);
+      End;
+    End;
+  End;
+  If Old <> -1 Then SetTextColor(Hdc, Old);
+End;
+
+Function DrawStateW(Hdc, Br, Proc, Lp, Wp, X, Y, CX, CY, Fl : LongInt)
+  : LongInt;
+Var B, K : LongInt; S : String;
+Begin
+  If ((Fl And $F) = 1) Or ((Fl And $F) = 2) Then
+  Begin
+    S := WPStr(Lp);
+    If (Wp > 0) And (Wp < Length(S)) Then S := Copy(S, 1, Wp);
+    K := HeapOwner; HeapOwner := 0;
+    B := KAlloc(Length(S) + 1);
+    HeapOwner := K;
+    If B = 0 Then
+    Begin
+      DrawStateW := 0;
+      Exit;
+    End;
+    PutPStr(B, S, 256);
+    DrawStateW := DrawStateA(Hdc, Br, Proc, B, Length(S), X, Y, CX, CY, Fl);
+    KFree(B);
+  End
+  Else DrawStateW := DrawStateA(Hdc, Br, Proc, Lp, Wp, X, Y, CX, CY, Fl);
+End;
+
+Function GrayStringW(Hdc, Br, Proc, Lp, N, X, Y, W, H : LongInt) : LongInt;
+Var B, K : LongInt; S : String;
+Begin
+  If Proc <> 0 Then
+  Begin
+    GrayStringW := GrayStringA(Hdc, Br, Proc, Lp, N, X, Y, W, H);
+    Exit;
+  End;
+  S := WPStr(Lp);
+  If (N > 0) And (N < Length(S)) Then S := Copy(S, 1, N);
+  K := HeapOwner; HeapOwner := 0;
+  B := KAlloc(Length(S) + 1);
+  HeapOwner := K;
+  GrayStringW := 0;
+  If B = 0 Then Exit;
+  PutPStr(B, S, 256);
+  GrayStringW := GrayStringA(Hdc, Br, 0, B, Length(S), X, Y, W, H);
+  KFree(B);
+End;
+
+Function EnableScrollBar(H, Bar, Arrows : LongInt) : LongInt;
+Begin
+  EnableScrollBar := 1;
+End;
+
+{ EnumChildWindows : enfants et descendants de la fenetre, dans l'ordre
+  de creation }
+Function EnumChildWindows(Par, Proc, Lp : LongInt) : LongInt;
+Var I, N, P, W, K : LongInt; L : Array[0..MaxWnd - 1] Of LongInt;
+    Ok : Boolean;
+Begin
+  EnumChildWindows := 1;
+  P := WndOf(Par);
+  If (P < 0) Or (Proc = 0) Then Exit;
+  N := 0;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And (I <> P) Then
+    Begin
+      W := Wnds^[I].Parent;
+      Ok := False;
+      K := 0;
+      While (W >= 0) And (K < 64) And Not Ok Do
+      Begin
+        If W = P Then Ok := True Else W := Wnds^[W].Parent;
+        Inc(K);
+      End;
+      If Ok Then
+      Begin
+        L[N] := I;
+        Inc(N);
+      End;
+    End;
+  For I := 0 To N - 1 Do
+    If Wnds^[L[I]].Used Then
+      If CallEnum(Proc, HwndOf(L[I]), Lp) = 0 Then Exit;
+End;
+
+{ DDE : lParam des messages, sans allocation }
+Function PackDDElParam(Msg, Lo, Hi : LongInt) : LongInt;
+Begin
+  PackDDElParam := (Lo And $FFFF) Or (Hi Shl 16);
+End;
+
+Function UnpackDDElParam(Msg, Lp, PLo, PHi : LongInt) : LongInt;
+Begin
+  If PLo <> 0 Then MemL[0:PLo] := Lp And $FFFF;
+  If PHi <> 0 Then MemL[0:PHi] := (Lp Shr 16) And $FFFF;
+  UnpackDDElParam := 1;
+End;
+
+Function FreeDDElParam(Msg, Lp : LongInt) : LongInt;
+Begin
+  FreeDDElParam := 1;
+End;
+
+Function GetClipboardOwner : LongInt;
+Begin
+  GetClipboardOwner := 0;
+End;
+
+Function GetInputState : LongInt;
+Begin
+  GetInputState := 0;
+End;
+
+Function GetQueueStatus(Fl : LongInt) : LongInt;
+Begin
+  GetQueueStatus := 0;
+End;
+
+Function GetMessageExtraInfo : LongInt;
+Begin
+  GetMessageExtraInfo := 0;
+End;
+
+Function InSendMessage : LongInt;
+Begin
+  InSendMessage := 0;
+End;
+
+{ disposition du clavier : francais }
+Function GetKeyboardLayout(Tid : LongInt) : LongInt;
+Begin
+  GetKeyboardLayout := $040C040C;
+End;
+
+Function GetKeyboardLayoutList(N, P : LongInt) : LongInt;
+Begin
+  If (N > 0) And (P <> 0) Then MemL[0:P] := $040C040C;
+  GetKeyboardLayoutList := 1;
+End;
+
+Function GetMenuItemRect(H, Menu, Item, P : LongInt) : LongInt;
+Begin
+  GetMenuItemRect := 0;
+End;
+
+Function IsMenu(H : LongInt) : LongInt;
+Begin
+  IsMenu := Ord((H <> 0) And (GetMenuItemCount(H) >= 0));
+End;
+
+Function SetMenuDefaultItem(H, Item, ByPos : LongInt) : LongInt;
+Begin
+  SetMenuDefaultItem := 1;
+End;
+
+{ barres de defilement des fenetres : bornes et page (SCROLLINFO) ;
+  barre de controle (SB_CTL 2) : K1 et K2 bornes, K3 position }
+Function GetScrollRange(H, Bar, PMin, PMax : LongInt) : LongInt;
+Var W, A, B : LongInt;
+Begin
+  GetScrollRange := 0;
+  W := WndOf(H);
+  If W < 0 Then Exit;
+  If (Bar = 2) And (Wnds^[W].IKind = ikScrollBar) Then
+  Begin
+    A := Wnds^[W].K1; B := Wnds^[W].K2;
+  End
+  Else If Bar = 1 Then
+  Begin
+    A := Wnds^[W].VSMin; B := Wnds^[W].VSMax;
+  End
+  Else
+  Begin
+    A := Wnds^[W].HSMin; B := Wnds^[W].HSMax;
+  End;
+  If PMin <> 0 Then MemL[0:PMin] := A;
+  If PMax <> 0 Then MemL[0:PMax] := B;
+  GetScrollRange := 1;
+End;
+
+Function GetScrollInfo(H, Bar, P : LongInt) : LongInt;
+Var W, M : LongInt;
+Begin
+  GetScrollInfo := 0;
+  W := WndOf(H);
+  If (W < 0) Or (P = 0) Then Exit;
+  M := MemL[0:P + 4];
+  If (M And 1) <> 0 Then
+    GetScrollRange(H, Bar, P + 8, P + 12);
+  If (M And 2) <> 0 Then
+    If Bar = 1 Then MemL[0:P + 16] := Wnds^[W].VSPage
+    Else If Bar = 0 Then MemL[0:P + 16] := Wnds^[W].HSPage
+    Else MemL[0:P + 16] := 0;
+  If (M And 4) <> 0 Then MemL[0:P + 20] := GetScrollPos(H, Bar);
+  If (M And 16) <> 0 Then MemL[0:P + 24] := GetScrollPos(H, Bar);
+  GetScrollInfo := 1;
+End;
+
+Function SetScrollInfo(H, Bar, P, Redraw : LongInt) : LongInt;
+Var W, M : LongInt;
+Begin
+  SetScrollInfo := 0;
+  W := WndOf(H);
+  If (W < 0) Or (P = 0) Then Exit;
+  M := MemL[0:P + 4];
+  If (M And 1) <> 0 Then
+    SetScrollRange(H, Bar, MemL[0:P + 8], MemL[0:P + 12], Redraw);
+  If (M And 2) <> 0 Then
+    If Bar = 1 Then Wnds^[W].VSPage := MemL[0:P + 16]
+    Else If Bar = 0 Then Wnds^[W].HSPage := MemL[0:P + 16];
+  If (M And 4) <> 0 Then SetScrollPos(H, Bar, MemL[0:P + 20], Redraw);
+  SetScrollInfo := GetScrollPos(H, Bar);
+End;
+
+Function GetWindowRgn(H, Rgn : LongInt) : LongInt;
+Begin
+  GetWindowRgn := 0;
+End;
+
+Function SetWindowRgn(H, Rgn, Redraw : LongInt) : LongInt;
+Begin
+  SetWindowRgn := 1;
+End;
+
+Function LoadCursorFromFileA(P : LongInt) : LongInt;
+Begin
+  LoadCursorFromFileA := LoadCursorA(0, 32512);
+End;
+
+Function OemToCharBuffA(S, D, N : LongInt) : LongInt;
+Begin
+  If (N > 0) And (S <> D) Then MoveMem(S, D, N);
+  OemToCharBuffA := 1;
+End;
+
+Function OpenIcon(H : LongInt) : LongInt;
+Begin
+  ShowWindow(H, 9);
+  OpenIcon := 1;
+End;
+
+Function ScrollWindowEx(H, DX, DY, PS, PC, Rgn, PUpd, Fl : LongInt)
+  : LongInt;
+Begin
+  ScrollWindow(H, DX, DY, PS, PC);
+  If PUpd <> 0 Then GetClientRect(H, PUpd);
+  ScrollWindowEx := 2;
+End;
+
+Function ShowOwnedPopups(H, Show : LongInt) : LongInt;
+Begin
+  ShowOwnedPopups := 1;
+End;
+
+{ SubtractRect : retire P2 de P1 quand il en couvre toute une bande }
+Function SubtractRect(PD, P1, P2 : LongInt) : LongInt;
+Var A, B : TRect;
+Begin
+  GetRectAt(P1, A);
+  GetRectAt(P2, B);
+  If (B.L <= A.L) And (B.R >= A.R) Then
+  Begin
+    If (B.T <= A.T) And (B.B > A.T) Then A.T := Min(B.B, A.B)
+    Else If (B.B >= A.B) And (B.T < A.B) Then A.B := Max(B.T, A.T);
+  End
+  Else If (B.T <= A.T) And (B.B >= A.B) Then
+  Begin
+    If (B.L <= A.L) And (B.R > A.L) Then A.L := Min(B.R, A.R)
+    Else If (B.R >= A.R) And (B.L < A.R) Then A.R := Max(B.L, A.L);
+  End;
+  PutRectAt(PD, A);
+  SubtractRect := Ord((A.R > A.L) And (A.B > A.T));
+End;
+
+Function SwapMouseButton(Sw : LongInt) : LongInt;
+Begin
+  SwapMouseButton := 0;
+End;
+
+Function WaitForInputIdle(H, Ms : LongInt) : LongInt;
+Begin
+  WaitForInputIdle := 0;
+End;
+
+Function WindowFromDC(Hdc : LongInt) : LongInt;
+Var D : LongInt;
+Begin
+  WindowFromDC := 0;
+  D := DcOf(Hdc);
+  If (D >= 0) And (Dcs[D].Wnd >= 0) Then WindowFromDC := HwndOf(Dcs[D].Wnd);
+End;
+
+Procedure keybd_event(Vk, Scan, Fl, Extra : LongInt);
+Begin
+End;
+
+{ WINSPOOL : pas d'imprimante installee }
+Function GetPrinterA(H, Level, P, N, PNeed : LongInt) : LongInt;
+Begin
+  If PNeed <> 0 Then MemL[0:PNeed] := 0;
+  GetPrinterA := 0;
+End;
+
+Function GetPrinterDriverA(H, Env, Level, P, N, PNeed : LongInt) : LongInt;
+Begin
+  If PNeed <> 0 Then MemL[0:PNeed] := 0;
+  GetPrinterDriverA := 0;
+End;
+
+Function EnumJobsA(H, First, Cnt, Level, P, N, PNeed, PRet : LongInt)
+  : LongInt;
+Begin
+  If PNeed <> 0 Then MemL[0:PNeed] := 0;
+  If PRet <> 0 Then MemL[0:PRet] := 0;
+  EnumJobsA := 1;
+End;
+
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
 exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
@@ -68513,6 +69521,27 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   HsClone, CreateStreamOnHGlobal, GetHGlobalFromStream,
   CreateILockBytesOnHGlobal, GetHGlobalFromILockBytes, OleLockRunning,
   OleGetAutoConvert, CoFreeUnusedLibraries, BindMoniker,
+  BeginPath, EndPath, CloseFigure, FillPath, StrokePath, StrokeAndFillPath,
+  SelectClipPath, CreateColorSpaceA, DeleteColorSpace, GetColorSpace,
+  SetColorSpace, SetICMMode, GetColorAdjustment, SetColorAdjustment,
+  CreateDIBPatternBrushPt, ExtCreatePen, EnumFontFamiliesA,
+  EnumFontFamiliesExA, ExcludeClipRect, ExtSelectClipRgn, OffsetClipRgn,
+  GetRegionData, RectInRegion, GetArcDirection, GetBrushOrgEx,
+  GetPolyFillMode, GetTextCharacterExtra, GetTextCharsetInfo, GetFontData,
+  GetKerningPairsA, GetOutlineTextMetricsA, GetGlyphOutlineA,
+  GetGlyphOutlineW, LineDDA, PolylineTo, PolyBezierTo, PolyBezier, ResetDCA,
+  DeviceCapabilitiesA, ArrangeIconicWindows, BeginDeferWindowPos,
+  DeferWindowPos, EndDeferWindowPos, CallMsgFilterA, ChangeMenuA,
+  DrawAnimatedRects, DrawIconEx, DrawStateA, DrawStateW, GrayStringW,
+  EnableScrollBar, EnumChildWindows, PackDDElParam, UnpackDDElParam,
+  FreeDDElParam, GetClipboardOwner, GetInputState, GetQueueStatus,
+  GetMessageExtraInfo, InSendMessage, GetKeyboardLayout,
+  GetKeyboardLayoutList, GetMenuItemRect, IsMenu, SetMenuDefaultItem,
+  GetScrollRange, GetScrollInfo, SetScrollInfo, GetWindowRgn, SetWindowRgn,
+  LoadCursorFromFileA, OemToCharBuffA, OpenIcon, ScrollWindowEx,
+  ShowOwnedPopups, SubtractRect, SwapMouseButton, WaitForInputIdle,
+  WindowFromDC, keybd_event,
+  GetPrinterA, GetPrinterDriverA, EnumJobsA,
   LockResource, SizeofResource, FreeResource;
 
 { ==================================================================== }
