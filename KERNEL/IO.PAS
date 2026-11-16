@@ -7487,16 +7487,48 @@ Begin
   BigCopy := True;
 End;
 
-Procedure EnableA20;
+{ Ligne A20 active ? (0000:04F0 et FFFF:0500 = 1004F0h distincts) }
+Function A20On : Boolean;
+Var B0, B1 : Byte;
 Begin
+  B0 := Mem[0:$4F0]; B1 := Mem[$FFFF:$500];
+  Mem[0:$4F0] := $5A; Mem[$FFFF:$500] := $A5;
+  A20On := Mem[0:$4F0] = $5A;
+  Mem[$FFFF:$500] := B1; Mem[0:$4F0] := B0;
+End;
+
+{ Activer la ligne A20 : BIOS (INT 15h AX=2401h), port 92h, puis
+  controleur du clavier (commande D1h, port de sortie DFh) ; verifiee.
+  Indispensable avant de sauter au noyau (100000h) : VirtualBox avec
+  Hyper-V execute alors le code sans repliement, et un BIOS peut la
+  couper apres INT 15h AH=87h (etat "precedent" rendu) }
+Procedure EnableA20;
+Var I : Integer;
+Begin
+  If A20On Then Exit;
   asm
     mov ax,2401h
     int 15h
+  end;
+  If A20On Then Exit;
+  asm
     in al,92h
     or al,2
     and al,0FEh
     out 92h,al
   end;
+  For I := 1 To 1000 Do
+    If A20On Then Exit;
+  For I := 1 To 30000 Do
+    If (Port[$64] And 2) = 0 Then Break;
+  Port[$64] := $D1;
+  For I := 1 To 30000 Do
+    If (Port[$64] And 2) = 0 Then Break;
+  Port[$60] := $DF;
+  For I := 1 To 30000 Do
+    If (Port[$64] And 2) = 0 Then Break;
+  For I := 1 To 1000 Do
+    If A20On Then Exit;
 End;
 
 { Memoire etendue en Ko (INT 15h E801h, sinon 88h) }
@@ -7820,6 +7852,9 @@ Begin
   MemW[0:VGdtr + 2] := VGdt;
   MemW[0:VGdtr + 4] := 0;
   P := VTramp;
+  { A20 (port 92h) : in al,92h ; or al,2 ; and al,0FEh ; out 92h,al }
+  PutB(P, $E4); PutB(P, $92); PutB(P, $0C); PutB(P, $02);
+  PutB(P, $24); PutB(P, $FE); PutB(P, $E6); PutB(P, $92);
   PutB(P, $66); PutB(P, $B8); PutB(P, $10); PutB(P, $00);
   PutB(P, $8E); PutB(P, $D8);
   PutB(P, $8E); PutB(P, $C0);
@@ -7946,6 +7981,7 @@ Begin
       TextMode;
       Exit;
     End;
+  EnableA20;
   BuildGdt;
   asm
     cli
