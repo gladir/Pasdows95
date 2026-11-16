@@ -10671,6 +10671,8 @@ Begin
   ThreadNew := T;
 End;
 
+Procedure RotDropProc(P : LongInt); Forward;
+
 Procedure KillProc(P, Code : LongInt); Forward;
 Procedure MutexAbandon(T : LongInt); Forward;
 
@@ -35211,6 +35213,7 @@ Begin
     ProcCtxLoad(0);
   End;
   If WinProc = P Then WinProc := -1;
+  RotDropProc(P);
   HeapOwner := 0;
   KFreeOwner(Own);
   HeapOwner := ThrOwner[CurT];
@@ -67334,11 +67337,6 @@ Begin
 End;
 
 { objets en cours d'execution et monikers : aucun }
-Function GetRunningObjectTable(R, PP : LongInt) : LongInt;
-Begin
-  GetRunningObjectTable := NoItf(PP, E_NOTIMPL);
-End;
-
 Function CreateBindCtx(R, PP : LongInt) : LongInt;
 Begin
   CreateBindCtx := NoItf(PP, E_NOTIMPL);
@@ -67347,11 +67345,6 @@ End;
 Function CreateItemMoniker(Delim, Item, PP : LongInt) : LongInt;
 Begin
   CreateItemMoniker := NoItf(PP, E_NOTIMPL);
-End;
-
-Function CreateFileMoniker(Path, PP : LongInt) : LongInt;
-Begin
-  CreateFileMoniker := NoItf(PP, E_NOTIMPL);
 End;
 
 Function CreateGenericComposite(A, B, PP : LongInt) : LongInt;
@@ -69695,6 +69688,422 @@ Begin
   WriteFmtUserTypeStg := 0;
 End;
 
+{ ------------------------------------------------------------------ }
+{ OLE32 : moniker de fichier (IMoniker) et table des objets en cours  }
+{ d'execution (IRunningObjectTable). Moniker : +0 table, +4 compteur, }
+{ +8 chemin (large). Table : entrees (objet, moniker, numero), les    }
+{ deux interfaces gardees jusqu'a Revoke.                            }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxRot = 64;
+
+Var
+  MkVtbl, RotVtbl, RotObj, RotSeq : LongInt;
+  RotUnk, RotMk, RotId, RotPrc : Array[0..MaxRot - 1] Of LongInt;
+
+{ IID de base d'OLE {xxxxxxxx-0000-0000-C000-000000000046} }
+Function OleIidIs(G, N : LongInt) : Boolean;
+Begin
+  OleIidIs := (G <> 0) And (MemL[0:G] = N) And (MemL[0:G + 4] = 0) And
+              (MemL[0:G + 8] = $C0) And (MemL[0:G + 12] = $46000000);
+End;
+
+Function MkNew(Path : LongInt) : LongInt; Forward;
+
+{ IUnknown, IPersist (10Ch), IPersistStream (109h), IMoniker (0Fh) }
+Function MkQueryInterface(This, Iid, PP : LongInt) : LongInt;
+Begin
+  If OleIidIs(Iid, 0) Or OleIidIs(Iid, $0F) Or OleIidIs(Iid, $10C) Or
+     OleIidIs(Iid, $109) Then
+  Begin
+    MemL[0:This + 4] := MemL[0:This + 4] + 1;
+    MemL[0:PP] := This;
+    MkQueryInterface := 0;
+  End
+  Else MkQueryInterface := NoItf(PP, $80004002);
+End;
+
+Function MkAddRef(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] + 1;
+  MkAddRef := MemL[0:This + 4];
+End;
+
+Function MkRelease(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] - 1;
+  MkRelease := MemL[0:This + 4];
+  If MemL[0:This + 4] > 0 Then Exit;
+  If MemL[0:This + 8] <> 0 Then KFree(MemL[0:This + 8]);
+  KFree(This);
+End;
+
+{ CLSID_FileMoniker {00000303-0000-0000-C000-000000000046} }
+Function MkGetClassID(This, P : LongInt) : LongInt;
+Begin
+  MkGetClassID := $80070057;
+  If P = 0 Then Exit;
+  MemL[0:P] := $303; MemL[0:P + 4] := 0;
+  MemL[0:P + 8] := $C0; MemL[0:P + 12] := $46000000;
+  MkGetClassID := 0;
+End;
+
+Function MkIsDirty(This : LongInt) : LongInt;
+Begin
+  MkIsDirty := 1;
+End;
+
+Function MkLoad(This, Stm : LongInt) : LongInt;
+Begin
+  MkLoad := E_NOTIMPL;
+End;
+
+Function MkSave(This, Stm, Clear : LongInt) : LongInt;
+Begin
+  MkSave := E_NOTIMPL;
+End;
+
+Function MkGetSizeMax(This, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then
+  Begin
+    MemL[0:P] := 0; MemL[0:P + 4] := 0;
+  End;
+  MkGetSizeMax := E_NOTIMPL;
+End;
+
+{ liaison a l'objet ou au stockage : non disponible (MK_E_UNAVAILABLE) }
+Function MkBindToObject(This, Bc, Left, Iid, PP : LongInt) : LongInt;
+Begin
+  MkBindToObject := NoItf(PP, $800401E3);
+End;
+
+Function MkBindToStorage(This, Bc, Left, Iid, PP : LongInt) : LongInt;
+Begin
+  MkBindToStorage := NoItf(PP, $800401E3);
+End;
+
+{ Reduce : le moniker lui-meme (MK_S_REDUCED_TO_SELF) }
+Function MkReduce(This, Bc, How, PLeft, PP : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] + 1;
+  If PP <> 0 Then MemL[0:PP] := This;
+  MkReduce := $000401E2;
+End;
+
+Function MkComposeWith(This, Right, OnlyIf, PP : LongInt) : LongInt;
+Begin
+  MkComposeWith := NoItf(PP, E_NOTIMPL);
+End;
+
+Function MkEnum(This, Fwd, PP : LongInt) : LongInt;
+Begin
+  If PP <> 0 Then MemL[0:PP] := 0;
+  MkEnum := 0;
+End;
+
+{ meme chemin (sans distinction de casse) }
+Function MkIsEqual(This, Other : LongInt) : LongInt;
+Begin
+  MkIsEqual := 1;
+  If (Other = 0) Or (MemL[0:Other] <> MkVtbl) Then Exit;
+  If WEqI(MemL[0:This + 8], MemL[0:Other + 8]) Then MkIsEqual := 0;
+End;
+
+Function MkHash(This, P : LongInt) : LongInt;
+Var A, H, C : LongInt;
+Begin
+  H := 0;
+  A := MemL[0:This + 8];
+  If A <> 0 Then
+    While MemW[0:A] <> 0 Do
+    Begin
+      C := MemW[0:A];
+      If (C >= 97) And (C <= 122) Then C := C - 32;
+      H := (H Shl 3) Xor (H Shr 29) Xor C;
+      A := A + 2;
+    End;
+  If P <> 0 Then MemL[0:P] := H;
+  MkHash := 0;
+End;
+
+{ en cours d'execution s'il est inscrit dans la table }
+Function MkIsRunning(This, Bc, Left, NewR : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  MkIsRunning := 1;
+  For I := 0 To MaxRot - 1 Do
+    If (RotId[I] <> 0) And (RotMk[I] <> 0) Then
+      If (RotMk[I] = This) Or (MkIsEqual(This, RotMk[I]) = 0) Then
+        MkIsRunning := 0;
+End;
+
+Function MkGetTimeOfLastChange(This, Bc, Left, P : LongInt) : LongInt;
+Begin
+  MkGetTimeOfLastChange := $800401E3;
+End;
+
+Function MkInverse(This, PP : LongInt) : LongInt;
+Begin
+  MkInverse := NoItf(PP, E_NOTIMPL);
+End;
+
+Function MkCommonPrefixWith(This, Other, PP : LongInt) : LongInt;
+Begin
+  MkCommonPrefixWith := NoItf(PP, $800401EE);
+End;
+
+Function MkRelativePathTo(This, Other, PP : LongInt) : LongInt;
+Begin
+  MkRelativePathTo := NoItf(PP, E_NOTIMPL);
+End;
+
+Function MkGetDisplayName(This, Bc, Left, PP : LongInt) : LongInt;
+Begin
+  MkGetDisplayName := $80070057;
+  If PP = 0 Then Exit;
+  MemL[0:PP] := WDupTask(MemL[0:This + 8]);
+  MkGetDisplayName := 0;
+End;
+
+Function MkParseDisplayName0(This, Bc, Left, Name, PEaten, PP : LongInt)
+  : LongInt;
+Begin
+  If PEaten <> 0 Then MemL[0:PEaten] := 0;
+  MkParseDisplayName0 := NoItf(PP, E_NOTIMPL);
+End;
+
+{ MKSYS_FILEMONIKER (2) }
+Function MkIsSystemMoniker(This, P : LongInt) : LongInt;
+Begin
+  If P <> 0 Then MemL[0:P] := 2;
+  MkIsSystemMoniker := 0;
+End;
+
+Function MkNew(Path : LongInt) : LongInt;
+Var O, V, K, N : LongInt;
+Begin
+  MkNew := 0;
+  If MkVtbl = 0 Then
+  Begin
+    K := HeapOwner; HeapOwner := 0;
+    V := KAlloc(23 * 4);
+    HeapOwner := K;
+    If V = 0 Then Exit;
+    MemL[0:V] := KernelExport('MkQueryInterface');
+    MemL[0:V + 4] := KernelExport('MkAddRef');
+    MemL[0:V + 8] := KernelExport('MkRelease');
+    MemL[0:V + 12] := KernelExport('MkGetClassID');
+    MemL[0:V + 16] := KernelExport('MkIsDirty');
+    MemL[0:V + 20] := KernelExport('MkLoad');
+    MemL[0:V + 24] := KernelExport('MkSave');
+    MemL[0:V + 28] := KernelExport('MkGetSizeMax');
+    MemL[0:V + 32] := KernelExport('MkBindToObject');
+    MemL[0:V + 36] := KernelExport('MkBindToStorage');
+    MemL[0:V + 40] := KernelExport('MkReduce');
+    MemL[0:V + 44] := KernelExport('MkComposeWith');
+    MemL[0:V + 48] := KernelExport('MkEnum');
+    MemL[0:V + 52] := KernelExport('MkIsEqual');
+    MemL[0:V + 56] := KernelExport('MkHash');
+    MemL[0:V + 60] := KernelExport('MkIsRunning');
+    MemL[0:V + 64] := KernelExport('MkGetTimeOfLastChange');
+    MemL[0:V + 68] := KernelExport('MkInverse');
+    MemL[0:V + 72] := KernelExport('MkCommonPrefixWith');
+    MemL[0:V + 76] := KernelExport('MkRelativePathTo');
+    MemL[0:V + 80] := KernelExport('MkGetDisplayName');
+    MemL[0:V + 84] := KernelExport('MkParseDisplayName0');
+    MemL[0:V + 88] := KernelExport('MkIsSystemMoniker');
+    MkVtbl := V;
+  End;
+  O := KAlloc(12);
+  If O = 0 Then Exit;
+  MemL[0:O] := MkVtbl;
+  MemL[0:O + 4] := 1;
+  N := 0;
+  If Path <> 0 Then
+    While MemW[0:Path + N * 2] <> 0 Do Inc(N);
+  MemL[0:O + 8] := KAlloc(N * 2 + 2);
+  If MemL[0:O + 8] <> 0 Then WCopyN(Path, MemL[0:O + 8], N + 1);
+  MkNew := O;
+End;
+
+{ CreateFileMoniker(chemin large, ppmk) }
+Function CreateFileMoniker(Path, PP : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  CreateFileMoniker := $80070057;
+  If PP = 0 Then Exit;
+  O := MkNew(Path);
+  If O = 0 Then
+  Begin
+    CreateFileMoniker := NoItf(PP, $8007000E);
+    Exit;
+  End;
+  MemL[0:PP] := O;
+  CreateFileMoniker := 0;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IRunningObjectTable (objet unique du systeme)                       }
+{ ------------------------------------------------------------------ }
+
+Function RotQueryInterface(This, Iid, PP : LongInt) : LongInt;
+Begin
+  If OleIidIs(Iid, 0) Or OleIidIs(Iid, $10) Then
+  Begin
+    MemL[0:PP] := This;
+    RotQueryInterface := 0;
+  End
+  Else RotQueryInterface := NoItf(PP, $80004002);
+End;
+
+Function RotAddRef(This : LongInt) : LongInt;
+Begin
+  RotAddRef := 1;
+End;
+
+Function RotRelease(This : LongInt) : LongInt;
+Begin
+  RotRelease := 1;
+End;
+
+{ Register(drapeaux, objet, moniker, pdwRegister) }
+Function RotRegister(This, Fl, Unk, Mk, PId : LongInt) : LongInt;
+Var I, R : LongInt;
+Begin
+  RotRegister := $80070057;
+  If (Unk = 0) Or (Mk = 0) Then Exit;
+  R := 0;
+  For I := 0 To MaxRot - 1 Do
+    If (RotId[I] <> 0) And ((RotMk[I] = Mk) Or
+       ((MemL[0:Mk] = MkVtbl) And (MkIsEqual(Mk, RotMk[I]) = 0))) Then
+      R := $000401E7;
+  For I := 0 To MaxRot - 1 Do
+    If RotId[I] = 0 Then
+    Begin
+      RotSeq := RotSeq + 1;
+      RotId[I] := RotSeq; RotUnk[I] := Unk; RotMk[I] := Mk;
+      RotPrc[I] := CurProc;
+      ComCall1(Unk, 1);
+      ComCall1(Mk, 1);
+      If PId <> 0 Then MemL[0:PId] := RotSeq;
+      RotRegister := R;
+      Exit;
+    End;
+  RotRegister := $8007000E;
+End;
+
+Function RotRevoke(This, Id : LongInt) : LongInt;
+Var I, U, M : LongInt;
+Begin
+  RotRevoke := $80070057;
+  For I := 0 To MaxRot - 1 Do
+    If (Id <> 0) And (RotId[I] = Id) Then
+    Begin
+      U := RotUnk[I]; M := RotMk[I];
+      RotId[I] := 0; RotUnk[I] := 0; RotMk[I] := 0;
+      ComCall1(U, 2);
+      ComCall1(M, 2);
+      RotRevoke := 0;
+      Exit;
+    End;
+End;
+
+Function RotFind(Mk : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  RotFind := -1;
+  If Mk = 0 Then Exit;
+  For I := 0 To MaxRot - 1 Do
+    If (RotId[I] <> 0) And ((RotMk[I] = Mk) Or
+       ((MemL[0:Mk] = MkVtbl) And (MkIsEqual(Mk, RotMk[I]) = 0))) Then
+    Begin
+      RotFind := I;
+      Exit;
+    End;
+End;
+
+Function RotIsRunning(This, Mk : LongInt) : LongInt;
+Begin
+  If RotFind(Mk) >= 0 Then RotIsRunning := 0 Else RotIsRunning := 1;
+End;
+
+Function RotGetObject(This, Mk, PP : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  I := RotFind(Mk);
+  If I < 0 Then
+  Begin
+    RotGetObject := NoItf(PP, $800401E3);
+    Exit;
+  End;
+  ComCall1(RotUnk[I], 1);
+  MemL[0:PP] := RotUnk[I];
+  RotGetObject := 0;
+End;
+
+Function RotNoteChangeTime(This, Id, PFt : LongInt) : LongInt;
+Begin
+  RotNoteChangeTime := 0;
+End;
+
+Function RotGetTimeOfLastChange(This, Mk, PFt : LongInt) : LongInt;
+Begin
+  RotGetTimeOfLastChange := $800401E3;
+End;
+
+Function RotEnumRunning(This, PP : LongInt) : LongInt;
+Begin
+  RotEnumRunning := NoItf(PP, E_NOTIMPL);
+End;
+
+Function GetRunningObjectTable(R, PP : LongInt) : LongInt;
+Var V, K : LongInt;
+Begin
+  GetRunningObjectTable := $80070057;
+  If PP = 0 Then Exit;
+  If RotObj = 0 Then
+  Begin
+    K := HeapOwner; HeapOwner := 0;
+    V := KAlloc(10 * 4 + 4);
+    HeapOwner := K;
+    If V = 0 Then
+    Begin
+      GetRunningObjectTable := NoItf(PP, $8007000E);
+      Exit;
+    End;
+    MemL[0:V] := KernelExport('RotQueryInterface');
+    MemL[0:V + 4] := KernelExport('RotAddRef');
+    MemL[0:V + 8] := KernelExport('RotRelease');
+    MemL[0:V + 12] := KernelExport('RotRegister');
+    MemL[0:V + 16] := KernelExport('RotRevoke');
+    MemL[0:V + 20] := KernelExport('RotIsRunning');
+    MemL[0:V + 24] := KernelExport('RotGetObject');
+    MemL[0:V + 28] := KernelExport('RotNoteChangeTime');
+    MemL[0:V + 32] := KernelExport('RotGetTimeOfLastChange');
+    MemL[0:V + 36] := KernelExport('RotEnumRunning');
+    RotVtbl := V;
+    { l'objet : un mot, la table des methodes }
+    MemL[0:V + 40] := V;
+    RotObj := V + 40;
+  End;
+  MemL[0:PP] := RotObj;
+  GetRunningObjectTable := 0;
+End;
+
+{ fin d'un processus : ses inscriptions disparaissent (ses objets sont
+  liberes avec lui) }
+Procedure RotDropProc(P : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To MaxRot - 1 Do
+    If (RotId[I] <> 0) And (RotPrc[I] = P) Then
+    Begin
+      RotId[I] := 0; RotUnk[I] := 0; RotMk[I] := 0;
+    End;
+End;
+
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
 exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
@@ -70235,6 +70644,14 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   SsRevert, SsEnumElements, SsDestroyElement, SsRenameElement,
   SsSetElementTimes, SsSetClass, SsSetStateBits, SsStat, SeQueryInterface,
   SeAddRef, SeRelease, SeNext, SeSkip, SeReset, SeClone,
+  MkQueryInterface, MkAddRef, MkRelease, MkGetClassID, MkIsDirty, MkLoad,
+  MkSave, MkGetSizeMax, MkBindToObject, MkBindToStorage, MkReduce,
+  MkComposeWith, MkEnum, MkIsEqual, MkHash, MkIsRunning,
+  MkGetTimeOfLastChange, MkInverse, MkCommonPrefixWith, MkRelativePathTo,
+  MkGetDisplayName, MkParseDisplayName0, MkIsSystemMoniker,
+  RotQueryInterface, RotAddRef, RotRelease, RotRegister, RotRevoke,
+  RotIsRunning, RotGetObject, RotNoteChangeTime, RotGetTimeOfLastChange,
+  RotEnumRunning,
   LockResource, SizeofResource, FreeResource;
 
 { ==================================================================== }
