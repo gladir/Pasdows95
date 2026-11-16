@@ -2615,12 +2615,13 @@ End;
 
 { Chercher Name (majuscules) dans le repertoire Dir }
 Function DirFind(V, Dir : LongInt; Const Name : String) : Boolean;
-Var Idx : LongInt;
+Var Idx : LongInt; U : String;
 Begin
   DirFind := False;
   Idx := 0;
+  U := UpStr(Name);
   While DirNext(V, Dir, Idx) Do
-    If (UpStr(FfName) = Name) Or (UpStr(FfShort) = Name) Then
+    If (UpStr(FfName) = U) Or (UpStr(FfShort) = U) Then
     Begin
       DirFind := True;
       Exit;
@@ -12942,6 +12943,7 @@ Const
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
   cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
+  cmCalc = 28;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -13681,7 +13683,7 @@ Begin
   End;
   Case M Of
     mnStart : MenuCount := 8;
-    mnPrograms : MenuCount := 5 + ExeCnt;
+    mnPrograms : MenuCount := 6 + ExeCnt;
     mnSettings : MenuCount := 7;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -13772,9 +13774,9 @@ Begin
     mnPrograms :
       If I = 0 Then
       Begin
-        T := L('Explorateur Windows', 'Windows Explorer',
-               'Windows-Explorer', 'Gestione risorse',
-               'Explorador de Windows');
+        T := L('Explorateur Pasdows', 'Pasdows Explorer',
+               'Pasdows-Explorer', 'Esplora risorse Pasdows',
+               'Explorador de Pasdows');
         Cmd := cmExplorer; Icon := icExplorer;
       End
       Else If I = 1 Then
@@ -13790,17 +13792,23 @@ Begin
       End
       Else If I = 3 Then
       Begin
+        T := L('Calculatrice', 'Calculator', 'Rechner', 'Calcolatrice',
+               'Calculadora');
+        Cmd := cmCalc; Icon := icCalc;
+      End
+      Else If I = 4 Then
+      Begin
         T := PromptName;
         Cmd := cmPrompt; Icon := icDos;
       End
-      Else If I = 4 Then
+      Else If I = 5 Then
       Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 5]);
-        Cmd := cmExeBase + I - 5; Icon := icApp;
+        T := BaseName(ExePaths[I - 6]);
+        Cmd := cmExeBase + I - 6; Icon := icApp;
       End;
     mnSettings :
       If I = 0 Then
@@ -14655,36 +14663,37 @@ Begin
   BytesStr := T + L(' octets', ' bytes', ' Byte', ' byte', ' bytes');
 End;
 
-Function ExpEntry(W, I : LongInt; Var Nm : String; Var Fl, Size : LongInt)
-  : Boolean;
+{ Entree I du dossier Path ('' : les lecteurs du Poste de travail) }
+Function ExpEntryP(Const Path : String; I : LongInt; Var Nm : String;
+                   Var Fl, Size : LongInt) : Boolean;
 Var DL, DS, Lba, Tm, V, Idx, K : LongInt; Ok : Boolean;
 Begin
-  ExpEntry := False;
-  If Wnds^[W].KS = '' Then
+  ExpEntryP := False;
+  If Path = '' Then
   Begin
     { lecteurs : C:, D: (CD-ROM), puis les autres volumes FAT }
     Fl := 2; Size := 0;
     If I = 0 Then
     Begin
       If VolN > 0 Then Nm := Trim(VolLab[0] + ' (C:)') Else Nm := '(C:)';
-      ExpEntry := True;
+      ExpEntryP := True;
     End
     Else If I = 1 Then
     Begin
-      Nm := VolLabel + ' (D:)'; ExpEntry := True;
+      Nm := VolLabel + ' (D:)'; ExpEntryP := True;
     End
     Else If I < VolN + 1 Then
     Begin
       V := I - 1;
       Nm := Trim(VolLab[V] + ' (' + Chr(VolLetter[V]) + ':)');
-      ExpEntry := True;
+      ExpEntryP := True;
     End;
     Exit;
   End;
-  If FatVolOf(Wnds^[W].KS) >= 0 Then
+  If FatVolOf(Path) >= 0 Then
   Begin
     { volume FAT : reprendre le parcours precedent si possible }
-    If (ExpCW = W) And (ExpCS = Wnds^[W].KS) And (ExpCI < I) Then
+    If (ExpCW = 1) And (ExpCS = Path) And (ExpCI < I) Then
     Begin
       K := ExpCI; Idx := ExpCIdx;
     End
@@ -14695,7 +14704,7 @@ Begin
     Ok := True;
     While Ok And (K < I) Do
     Begin
-      Ok := FatDirEntry(Wnds^[W].KS, 0, Idx);
+      Ok := FatDirEntry(Path, 0, Idx);
       Inc(K);
     End;
     If Not Ok Then
@@ -14703,14 +14712,20 @@ Begin
       ExpCW := -1;
       Exit;
     End;
-    ExpCW := W; ExpCS := Wnds^[W].KS; ExpCI := I; ExpCIdx := Idx;
+    ExpCW := 1; ExpCS := Path; ExpCI := I; ExpCIdx := Idx;
     Nm := FfName; Size := FfSize;
     If (FfAttr And $10) <> 0 Then Fl := 2 Else Fl := 0;
-    ExpEntry := True;
+    ExpEntryP := True;
     Exit;
   End;
-  If Not ExpDirLba(W, DL, DS) Then Exit;
-  ExpEntry := IsoDirEntry(DL, DS, I, Nm, Lba, Size, Fl, Tm);
+  If Not IsoLookup(Copy(Path, 3, 255), DL, DS, Fl, Tm) Then Exit;
+  ExpEntryP := IsoDirEntry(DL, DS, I, Nm, Lba, Size, Fl, Tm);
+End;
+
+Function ExpEntry(W, I : LongInt; Var Nm : String; Var Fl, Size : LongInt)
+  : Boolean;
+Begin
+  ExpEntry := ExpEntryP(Wnds^[W].KS, I, Nm, Fl, Size);
 End;
 
 Function ExpIcon(Nm : String; Fl : LongInt) : LongInt;
@@ -14727,31 +14742,417 @@ Begin
   Else ExpIcon := icDocs;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Explorateur Pasdows : arbre des dossiers a gauche (fenetre a deux     }
+{ volets ; arbre dans le bloc Extra de la fenetre). Noeuds : Bureau    }
+{ ('*'), Poste de travail (''), lecteurs ('C:'), dossiers ('C:\DIR') ; }
+{ F : 1 deplie, 2 sans sous-dossier                                    }
+{ ------------------------------------------------------------------ }
+
+Const
+  TreeMax = 256;
+  TreeRow = 18;
+
+Type
+  TTNode = Record
+    P : String[79];
+    D, F : Byte;
+  End;
+  TTree = Record
+    N, Top, Sel, Vis : LongInt;
+    Nd : Array[0..TreeMax - 1] Of TTNode;
+  End;
+  PTree = ^TTree;
+
+Function ExpTree(W : LongInt) : PTree;
+Var T : PTree;
+Begin
+  Move(Wnds^[W].Extra, T, 4);
+  ExpTree := T;
+End;
+
+{ Largeur du volet de l'arbre }
+Function ExpTreeW(X1, X2 : LongInt) : LongInt;
+Begin
+  ExpTreeW := Max(110, Min(230, ((X2 - X1) * 2) Div 5));
+End;
+
+Function DriveName(D : Char) : String;
+Var V : LongInt;
+Begin
+  V := FatVolOf(D + ':');
+  If V >= 0 Then DriveName := Trim(VolLab[V] + ' (' + D + ':)')
+  Else If D = 'D' Then DriveName := Trim(VolLabel + ' (D:)')
+  Else DriveName := '(' + D + ':)';
+End;
+
+{ Nom affiche d'un chemin de l'Explorateur }
+Function PathTitle(Const P : String) : String;
+Begin
+  If P = '' Then
+    PathTitle := L('Poste de travail', 'My Computer', 'Arbeitsplatz',
+                   'Risorse del computer', 'Mi PC')
+  Else If P = '*' Then
+    PathTitle := L('Bureau', 'Desktop', 'Desktop', 'Desktop', 'Escritorio')
+  Else If Length(P) = 2 Then PathTitle := DriveName(P[1])
+  Else PathTitle := BaseName(P);
+End;
+
+{ Titre de la fenetre : Explorateur Pasdows - dossier (deux volets) ou
+  nom du dossier (Poste de travail) }
+Procedure ExpTitle(W : LongInt);
+Var S : String;
+Begin
+  If Wnds^[W].Extra <> 0 Then
+    S := L('Explorateur Pasdows', 'Pasdows Explorer', 'Pasdows-Explorer',
+           'Esplora risorse Pasdows', 'Explorador de Pasdows') + ' - ' +
+         PathTitle(Wnds^[W].KS)
+  Else S := PathTitle(Wnds^[W].KS);
+  Wnds^[W].Text := Copy(S, 1, 127);
+  Wnds^[W].NeedNc := True;
+  If TaskbarW >= 0 Then KRepaint(TaskbarW);
+End;
+
+Procedure TreeIns(T : PTree; At : LongInt; Const P : String; D : LongInt);
+Var I : LongInt;
+Begin
+  If T^.N >= TreeMax Then Exit;
+  For I := T^.N - 1 DownTo At Do T^.Nd[I + 1] := T^.Nd[I];
+  T^.Nd[At].P := P; T^.Nd[At].D := D; T^.Nd[At].F := 0;
+  Inc(T^.N);
+  If T^.Sel >= At Then Inc(T^.Sel);
+End;
+
+{ Deplier le noeud I : ses sous-dossiers (par ordre alphabetique) ou,
+  pour le Poste de travail, les lecteurs }
+Procedure TreeExpand(T : PTree; I : LongInt);
+Var K, J, N, M, Fl, Size, D : LongInt; Nm, P : String;
+    Names : Array[0..63] Of String[40]; Tmp : String[40];
+Begin
+  If (T^.Nd[I].F And 3) <> 0 Then Exit;
+  T^.Nd[I].F := T^.Nd[I].F Or 1;
+  P := T^.Nd[I].P;
+  If P = '*' Then Exit;
+  If (P = 'C:') And (VolN = 0) Then
+  Begin
+    { disque virtuel en memoire : pas de parcours }
+    T^.Nd[I].F := 2;
+    Exit;
+  End;
+  N := 0; K := 0;
+  While (N < 64) And ExpEntryP(P, K, Nm, Fl, Size) Do
+  Begin
+    If (Fl And 2) <> 0 Then
+    Begin
+      If P = '' Then Names[N] := ExpDrive(K) + ':'
+      Else Names[N] := Copy(Nm, 1, 40);
+      Inc(N);
+    End;
+    Inc(K);
+  End;
+  If P <> '' Then
+    For J := 1 To N - 1 Do
+    Begin
+      Tmp := Names[J]; K := J - 1;
+      While (K >= 0) And (UpStr(Names[K]) > UpStr(Tmp)) Do
+      Begin
+        Names[K + 1] := Names[K];
+        Dec(K);
+      End;
+      Names[K + 1] := Tmp;
+    End;
+  D := T^.Nd[I].D + 1;
+  M := 0;
+  For J := 0 To N - 1 Do
+    If P = '' Then
+    Begin
+      TreeIns(T, I + 1 + M, Names[J], D);
+      { disque virtuel en memoire : sans dossier a deplier }
+      If (Names[J] = 'C:') And (VolN = 0) Then T^.Nd[I + 1 + M].F := 2;
+      Inc(M);
+    End
+    Else If Length(P) + 1 + Length(Names[J]) <= 79 Then
+    Begin
+      TreeIns(T, I + 1 + M, P + '\' + Names[J], D);
+      Inc(M);
+    End;
+  If M = 0 Then T^.Nd[I].F := 2;
+End;
+
+Procedure TreeCollapse(T : PTree; I : LongInt);
+Var J, K, D : LongInt;
+Begin
+  D := T^.Nd[I].D;
+  J := I + 1;
+  While (J < T^.N) And (T^.Nd[J].D > D) Do Inc(J);
+  K := J - I - 1;
+  If K > 0 Then
+  Begin
+    If (T^.Sel > I) And (T^.Sel < J) Then T^.Sel := I
+    Else If T^.Sel >= J Then T^.Sel := T^.Sel - K;
+    For J := I + 1 To T^.N - 1 - K Do T^.Nd[J] := T^.Nd[J + K];
+    T^.N := T^.N - K;
+  End;
+  T^.Nd[I].F := T^.Nd[I].F And Not 1;
+End;
+
+Function TreeFind(T : PTree; Const P : String) : LongInt;
+Var I, R : LongInt; U : String;
+Begin
+  R := -1; U := UpStr(P);
+  For I := 0 To T^.N - 1 Do
+    If (R < 0) And (UpStr(T^.Nd[I].P) = U) Then R := I;
+  TreeFind := R;
+End;
+
+{ L'arbre suit le dossier affiche : branches depliees, noeud choisi
+  visible }
+Procedure TreeSync(W : LongInt);
+Var T : PTree; P, Cur, Rest, C : String; I, J, K : LongInt;
+Begin
+  If Wnds^[W].Extra = 0 Then Exit;
+  T := ExpTree(W);
+  P := Wnds^[W].KS;
+  I := TreeFind(T, '');
+  If I < 0 Then Exit;
+  If P <> '' Then
+  Begin
+    TreeExpand(T, I);
+    Cur := Copy(P, 1, 2);
+    J := TreeFind(T, Cur);
+    If J >= 0 Then
+    Begin
+      I := J;
+      Rest := Copy(P, 4, 255);
+      While Rest <> '' Do
+      Begin
+        TreeExpand(T, I);
+        K := Pos('\', Rest);
+        If K = 0 Then K := Length(Rest) + 1;
+        C := Copy(Rest, 1, K - 1);
+        Rest := Copy(Rest, K + 1, 255);
+        Cur := Cur + '\' + C;
+        J := TreeFind(T, Cur);
+        If J < 0 Then Rest := ''
+        Else I := J;
+      End;
+    End;
+  End;
+  T^.Sel := I;
+  If T^.Vis < 1 Then T^.Vis := 10;
+  If T^.Sel < T^.Top Then T^.Top := T^.Sel;
+  If T^.Sel >= T^.Top + T^.Vis Then T^.Top := T^.Sel - T^.Vis + 1;
+End;
+
+Procedure TreeInit(W : LongInt);
+Var A : LongInt; T : PTree;
+Begin
+  A := KAlloc(SizeOf(TTree));
+  If A = 0 Then Exit;
+  Wnds^[W].Extra := A;
+  T := ExpTree(W);
+  T^.N := 0; T^.Top := 0; T^.Sel := 0; T^.Vis := 10;
+  TreeIns(T, 0, '*', 0);
+  T^.Nd[0].F := 1;
+  TreeIns(T, 1, '', 1);
+  TreeExpand(T, 1);
+  TreeSync(W);
+End;
+
+{ Le noeud R a-t-il un frere apres lui au niveau D ? (traits) }
+Function TreeNext(T : PTree; R, D : LongInt) : Boolean;
+Var J : LongInt; Res : Boolean;
+Begin
+  Res := False;
+  J := R + 1;
+  While (J < T^.N) And (T^.Nd[J].D > D) Do Inc(J);
+  If (J < T^.N) And (T^.Nd[J].D = D) Then Res := True;
+  TreeNext := Res;
+End;
+
+Procedure DotV(X, Y1, Y2 : LongInt);
+Var Y : LongInt;
+Begin
+  Y := Y1;
+  While Y <= Y2 Do
+  Begin
+    If ((X + Y) And 1) = 0 Then Pix(X, Y, cGray);
+    Inc(Y);
+  End;
+End;
+
+Procedure DotH(X1, X2, Y : LongInt);
+Var X : LongInt;
+Begin
+  For X := X1 To X2 Do
+    If ((X + Y) And 1) = 0 Then Pix(X, Y, cGray);
+End;
+
+Procedure PaintTree(W, X1, Y1, X2, Y2 : LongInt);
+Var T : PTree; Vis, R, Y, D, C, K, Ic, Fg, TY, XR, Dr : LongInt;
+    Nm, P : String; Sb : Boolean;
+Begin
+  T := ExpTree(W);
+  Sunken(X1, Y1, X2, Y2, cWhite);
+  Vis := Max(1, (Y2 - Y1 - 4) Div TreeRow);
+  T^.Vis := Vis;
+  If T^.Top > Max(0, T^.N - Vis) Then T^.Top := Max(0, T^.N - Vis);
+  If T^.Top < 0 Then T^.Top := 0;
+  Sb := T^.N > Vis;
+  XR := X2 - 2;
+  If Sb Then XR := X2 - 19;
+  SetClip(X1 + 2, Y1 + 2, XR, Y2 - 2);
+  For R := T^.Top To Min(T^.N - 1, T^.Top + Vis - 1) Do
+  Begin
+    Y := Y1 + 2 + (R - T^.Top) * TreeRow;
+    D := T^.Nd[R].D;
+    P := T^.Nd[R].P;
+    { traits pointilles des niveaux superieurs, puis vers l'icone }
+    For K := 1 To D - 1 Do
+      If TreeNext(T, R, K) Then
+        DotV(X1 + 4 + K * 16 - 8, Y, Y + TreeRow - 1);
+    C := X1 + 4 + D * 16 - 8;
+    If D >= 1 Then
+    Begin
+      DotV(C, Y, Y + 8);
+      If TreeNext(T, R, D) Then DotV(C, Y + 8, Y + TreeRow - 1);
+      DotH(C, C + 7, Y + 8);
+      If (T^.Nd[R].F And 2) = 0 Then
+      Begin
+        { case + / - }
+        FBar(C - 4, Y + 4, C + 4, Y + 12, cWhite);
+        Box(C - 4, Y + 4, C + 4, Y + 12, cGray);
+        HLine(C - 2, C + 2, Y + 8, cBlack);
+        If (T^.Nd[R].F And 1) = 0 Then VLine(C, Y + 6, Y + 10, cBlack);
+      End;
+    End;
+    If P = '*' Then Ic := icDisplay
+    Else If P = '' Then Ic := icComputer
+    Else If Length(P) = 2 Then
+    Begin
+      Dr := FatVolOf(P);
+      If (P[1] = 'D') And (Dr < 0) Then Ic := icCdrom Else Ic := icHardDisk;
+    End
+    Else Ic := icFolder;
+    PaintIcon(Ic, C + 8, Y + 1, 16);
+    Nm := PathTitle(P);
+    Fg := cBlack;
+    If R = T^.Sel Then
+    Begin
+      FBar(C + 26, Y, C + 29 + TextW(Nm), Y + 16, cNavy);
+      Fg := cWhite;
+    End;
+    OutTxt(C + 28, Y, Nm, Fg);
+  End;
+  SetClip(X1, Y1, X2, Y2);
+  If Sb Then
+  Begin
+    FBar(X2 - 17, Y1 + 2, X2 - 2, Y2 - 2, cSilver);
+    Raised(X2 - 17, Y1 + 2, X2 - 2, Y1 + 17, False);
+    Arrow(X2 - 12, Y1 + 8, 2, cBlack);
+    Raised(X2 - 17, Y2 - 17, X2 - 2, Y2 - 2, False);
+    Arrow(X2 - 12, Y2 - 11, 1, cBlack);
+    TY := Y1 + 18 + (T^.Top * (Y2 - Y1 - 52)) Div Max(1, T^.N - Vis);
+    Raised(X2 - 17, TY, X2 - 2, TY + 16, False);
+  End;
+End;
+
+{ Clic dans l'arbre : case +/- (deplier, replier), defilement ou choix
+  du dossier affiche a droite (double-clic : deplie aussi) }
+Procedure TreeMouse(W, X, Y, X1, Y1, X2, Y2 : LongInt; Dbl : Boolean);
+Var T : PTree; R, D, C : LongInt; P : String;
+Begin
+  T := ExpTree(W);
+  If (T^.N > T^.Vis) And (X >= X2 - 19) Then
+  Begin
+    If Y < Y1 + 18 Then Dec(T^.Top)
+    Else If Y > Y2 - 18 Then Inc(T^.Top)
+    Else If Y < (Y1 + Y2) Div 2 Then T^.Top := T^.Top - T^.Vis
+    Else T^.Top := T^.Top + T^.Vis;
+    If T^.Top > T^.N - T^.Vis Then T^.Top := T^.N - T^.Vis;
+    If T^.Top < 0 Then T^.Top := 0;
+    KRepaint(W);
+    Exit;
+  End;
+  R := T^.Top + (Y - Y1 - 2) Div TreeRow;
+  If (R < 0) Or (R >= T^.N) Then Exit;
+  D := T^.Nd[R].D;
+  C := X1 + 4 + D * 16 - 8;
+  If (D >= 1) And (X >= C - 6) And (X <= C + 6) Then
+  Begin
+    If (T^.Nd[R].F And 1) <> 0 Then TreeCollapse(T, R)
+    Else TreeExpand(T, R);
+    KRepaint(W);
+    Exit;
+  End;
+  If Dbl And (D >= 1) Then
+  Begin
+    If (T^.Nd[R].F And 1) <> 0 Then TreeCollapse(T, R)
+    Else TreeExpand(T, R);
+  End;
+  P := T^.Nd[R].P;
+  If P = '*' Then P := '';
+  If (P = 'C:') And (VolN = 0) Then
+  Begin
+    KRepaint(W);
+    Exit;
+  End;
+  T^.Sel := R;
+  Wnds^[W].KS := P;
+  Wnds^[W].K1 := -1; Wnds^[W].K2 := 0;
+  ExpTitle(W);
+  KRepaint(W);
+End;
+
 Procedure PaintExplorer(W : LongInt);
-Var X1, Y1, X2, Y2, I, X, Y, Fl, Size, Cols, N : LongInt; Nm, S : String;
+Var X1, Y1, X2, Y2, CX, CY, TW, I, X, Y, Fl, Size, Cols, N : LongInt;
+    Nm, S, S2 : String; Tr : Boolean;
 Begin
   KClient(W, X1, Y1, X2, Y2);
-  FBar(X1, Y1, X2, Y1 + 29, cSilver);
-  Raised(X1 + 4, Y1 + 4, X1 + 29, Y1 + 26, False);
-  PaintIcon(icFolder, X1 + 8, Y1 + 7, 16);
-  Arrow(X1 + 13, Y1 + 11, 2, cBlack);
-  Sunken(X1 + 36, Y1 + 4, X2 - 4, Y1 + 26, cWhite);
-  If Wnds^[W].KS = '' Then
-    OutTxt(X1 + 42, Y1 + 7, L('Poste de travail', 'My Computer',
-           'Arbeitsplatz', 'Risorse del computer', 'Mi PC'), cBlack)
-  Else OutTxt(X1 + 42, Y1 + 7, Wnds^[W].KS, cBlack);
-  Y1 := Y1 + 30;
-  Sunken(X1, Y1, X2, Y2 - 22, cWhite);
+  Tr := Wnds^[W].Extra <> 0;
+  TW := 0;
+  If Tr Then
+  Begin
+    { en-tetes "Tous les dossiers" et "Contenu de", arbre a gauche }
+    TW := ExpTreeW(X1, X2);
+    FBar(X1, Y1, X2, Y1 + 21, cSilver);
+    Raised(X1, Y1 + 1, X1 + TW, Y1 + 20, False);
+    OutTxt(X1 + 4, Y1 + 3, Fit(L('Tous les dossiers', 'All Folders',
+           'Alle Ordner', 'Tutte le cartelle', 'Todas las carpetas'),
+           TW - 8), cBlack);
+    Raised(X1 + TW + 3, Y1 + 1, X2, Y1 + 20, False);
+    OutTxt(X1 + TW + 7, Y1 + 3, Fit(L('Contenu de ''', 'Contents of ''',
+           'Inhalt von ''', 'Contenuto di ''', 'Contenido de ''') +
+           PathTitle(Wnds^[W].KS) + '''', X2 - X1 - TW - 14), cBlack);
+    FBar(X1 + TW + 1, Y1 + 22, X1 + TW + 2, Y2 - 22, cSilver);
+    PaintTree(W, X1, Y1 + 22, X1 + TW, Y2 - 22);
+    SetClip(X1, Y1, X2, Y2);
+    CX := X1 + TW + 3; CY := Y1 + 22;
+  End
+  Else
+  Begin
+    FBar(X1, Y1, X2, Y1 + 29, cSilver);
+    Raised(X1 + 4, Y1 + 4, X1 + 29, Y1 + 26, False);
+    PaintIcon(icFolder, X1 + 8, Y1 + 7, 16);
+    Arrow(X1 + 13, Y1 + 11, 2, cBlack);
+    Sunken(X1 + 36, Y1 + 4, X2 - 4, Y1 + 26, cWhite);
+    If Wnds^[W].KS = '' Then
+      OutTxt(X1 + 42, Y1 + 7, PathTitle(''), cBlack)
+    Else OutTxt(X1 + 42, Y1 + 7, Fit(Wnds^[W].KS, X2 - X1 - 50), cBlack);
+    CX := X1; CY := Y1 + 30;
+  End;
+  Sunken(CX, CY, X2, Y2 - 22, cWhite);
+  FBar(X1, Y2 - 21, X2, Y2, cSilver);
   Edge(X1, Y2 - 19, X2, Y2, cGray, cWhite);
   FBar(X1 + 1, Y2 - 18, X2 - 1, Y2 - 1, cSilver);
-  Cols := Max(1, (X2 - X1 - 8) Div 100);
-  SetClip(X1 + 2, Y1 + 2, X2 - 2, Y2 - 24);
-  I := 0; N := 0;
+  Cols := Max(1, (X2 - CX - 8) Div 100);
+  SetClip(CX + 2, CY + 2, X2 - 2, Y2 - 24);
+  I := 0; N := 0; S := '';
   While ExpEntry(W, I, Nm, Fl, Size) Do
   Begin
-    X := X1 + 6 + (I Mod Cols) * 100;
-    Y := Y1 + 6 + (I Div Cols) * 70 - Wnds^[W].K2 * 70;
-    If (Y > Y1 - 70) And (Y < Y2) Then
+    X := CX + 6 + (I Mod Cols) * 100;
+    Y := CY + 6 + (I Div Cols) * 70 - Wnds^[W].K2 * 70;
+    If (Y > CY - 70) And (Y < Y2) Then
     Begin
       PaintIcon(ExpIcon(Nm, Fl), X + 32, Y, 32);
       DrawLabel(X, Y + 34, 96, Nm, I = Wnds^[W].K1, cBlack);
@@ -14773,7 +15174,19 @@ Begin
   If Wnds^[W].K1 < 0 Then
     S := IntStr(N) + ' ' + L('objet(s)', 'object(s)', 'Objekt(e)',
                               'oggetti', 'objeto(s)');
-  OutTxt(X1 + 4, Y2 - 17, Fit(S, X2 - X1 - 8), cBlack);
+  If Tr Then
+  Begin
+    { barre d'etat en deux parties : objets, espace libre du lecteur }
+    OutTxt(X1 + 4, Y2 - 17, Fit(S, TW - 8), cBlack);
+    Edge(X1 + TW + 3, Y2 - 19, X2, Y2, cGray, cWhite);
+    S2 := '';
+    If (Wnds^[W].KS <> '') And VolSpaceSecs(Wnds^[W].KS[1], Fl, Size) Then
+      S2 := L('Espace disque libre : ', 'Disk free space: ',
+              'Freier Speicher: ', 'Spazio libero: ',
+              'Espacio libre: ') + SizeShort(Fl);
+    OutTxt(X1 + TW + 7, Y2 - 17, Fit(S2, X2 - X1 - TW - 14), cBlack);
+  End
+  Else OutTxt(X1 + 4, Y2 - 17, Fit(S, X2 - X1 - 8), cBlack);
 End;
 
 Procedure ExpOpenItem(W, I : LongInt);
@@ -14822,13 +15235,15 @@ Begin
     If (Fl And 2) <> 0 Then Wnds^[W].KS := P
     Else
     Begin
-      E := Copy(Nm, Pos('.', Nm) + 1, 3);
+      E := UpStr(Copy(Nm, Pos('.', Nm) + 1, 3));
       If (E = 'EXE') Or (E = 'COM') Then RunExe(P, '')
       Else NoteOpen(P);
       Exit;
     End;
   End;
   Wnds^[W].K1 := -1; Wnds^[W].K2 := 0;
+  TreeSync(W);
+  ExpTitle(W);
   KRepaint(W);
 End;
 
@@ -14844,27 +15259,44 @@ Begin
     Wnds^[W].KS := Copy(Wnds^[W].KS, 1, P - 1);
   End;
   Wnds^[W].K1 := -1; Wnds^[W].K2 := 0;
+  TreeSync(W);
+  ExpTitle(W);
   KRepaint(W);
 End;
 
 Procedure ExpMouse(W, Msg, X, Y : LongInt);
-Var X1, Y1, X2, Y2, Cols, I, Fl, Size : LongInt; Nm : String;
+Var X1, Y1, X2, Y2, CX, CY, TW, Cols, I, Fl, Size : LongInt; Nm : String;
 Begin
   If (Msg <> WM_LBUTTONDOWN) And (Msg <> WM_LBUTTONDBLCLK) And
      (Msg <> WM_RBUTTONDOWN) Then Exit;
   X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
-  If (Msg <> WM_RBUTTONDOWN) And
-     InRect(X, Y, X1 + 4, Y1 + 4, X1 + 29, Y1 + 26) Then
+  If Wnds^[W].Extra <> 0 Then
   Begin
-    ExpUp(W);
-    Exit;
+    TW := ExpTreeW(X1, X2);
+    If InRect(X, Y, X1, Y1 + 22, X1 + TW, Y2 - 22) Then
+    Begin
+      If Msg <> WM_RBUTTONDOWN Then
+        TreeMouse(W, X, Y, X1, Y1 + 22, X1 + TW, Y2 - 22,
+                  Msg = WM_LBUTTONDBLCLK);
+      Exit;
+    End;
+    CX := X1 + TW + 3; CY := Y1 + 22;
+  End
+  Else
+  Begin
+    If (Msg <> WM_RBUTTONDOWN) And
+       InRect(X, Y, X1 + 4, Y1 + 4, X1 + 29, Y1 + 26) Then
+    Begin
+      ExpUp(W);
+      Exit;
+    End;
+    CX := X1; CY := Y1 + 30;
   End;
-  Y1 := Y1 + 30;
-  Cols := Max(1, (X2 - X1 - 8) Div 100);
-  If (X < X1 + 6) Or (Y < Y1 + 6) Then Exit;
-  I := ((Y - Y1 - 6) Div 70 + Wnds^[W].K2) * Cols + (X - X1 - 6) Div 100;
-  If (X - X1 - 6) Div 100 >= Cols Then Exit;
+  Cols := Max(1, (X2 - CX - 8) Div 100);
+  If (X < CX + 6) Or (Y < CY + 6) Then Exit;
+  I := ((Y - CY - 6) Div 70 + Wnds^[W].K2) * Cols + (X - CX - 6) Div 100;
+  If (X - CX - 6) Div 100 >= Cols Then Exit;
   If Not ExpEntry(W, I, Nm, Fl, Size) Then I := -1;
   If Msg = WM_RBUTTONDOWN Then
   Begin
@@ -19244,22 +19676,30 @@ Begin
     cmIconOpen : If DeskSel >= 0 Then KCommand(DeskCmd[DeskSel]);
     cmComputer, cmExplorer :
     Begin
-      W := KCreate(ikExplorer, '', icComputer, 60 + Ticks Mod 40,
-                   36 + Ticks Mod 30, 440, 320, WS_OVERLAPPED Or WS_CAPTION Or
-                   WS_SYSMENU Or WS_THICKFRAME Or WS_MINIMIZEBOX Or
-                   WS_MAXIMIZEBOX, 0);
+      If Cmd = cmExplorer Then
+        W := KCreate(ikExplorer, '', icExplorer,
+                     Max(0, Min(20 + Ticks Mod 30, ScrW - 620)),
+                     Max(0, Min(16 + Ticks Mod 20, TaskY - 420)),
+                     Min(ScrW, 620), Min(TaskY, 420), WS_OVERLAPPED Or
+                     WS_CAPTION Or
+                     WS_SYSMENU Or WS_THICKFRAME Or WS_MINIMIZEBOX Or
+                     WS_MAXIMIZEBOX, 0)
+      Else
+        W := KCreate(ikExplorer, '', icComputer, 60 + Ticks Mod 40,
+                     36 + Ticks Mod 30, 440, 320, WS_OVERLAPPED Or
+                     WS_CAPTION Or WS_SYSMENU Or WS_THICKFRAME Or
+                     WS_MINIMIZEBOX Or WS_MAXIMIZEBOX, 0);
       If W < 0 Then Exit;
       Wnds^[W].K1 := -1;
-      If Cmd = cmExplorer Then Wnds^[W].KS := 'D:' Else Wnds^[W].KS := '';
+      Wnds^[W].KS := '';
       If Cmd = cmExplorer Then
       Begin
-        Wnds^[W].Text := L('Explorateur', 'Exploring', 'Explorer',
-                          'Esplora', 'Explorando') + ' - ' + VolLabel;
+        { Explorateur Pasdows : arbre a gauche, ouvert sur C: }
+        If VolN > 0 Then Wnds^[W].KS := 'C:' Else Wnds^[W].KS := 'D:';
+        TreeInit(W);
         Wnds^[W].K4 := icExplorer;
-      End
-      Else
-        Wnds^[W].Text := L('Poste de travail', 'My Computer', 'Arbeitsplatz',
-                          'Risorse del computer', 'Mi PC');
+      End;
+      ExpTitle(W);
       ShowW(W, True, True);
     End;
     cmNotepad : NoteOpen('');
@@ -19271,6 +19711,14 @@ Begin
                    'PAINT.EXE wurde nicht gefunden.',
                    'Impossibile trovare PAINT.EXE.',
                    'No se encuentra PAINT.EXE.'), $10);
+    cmCalc :
+      If Not RunExe('CALC.EXE', '') Then
+        MsgBoxOpen(L('Calculatrice', 'Calculator', 'Rechner',
+                   'Calcolatrice', 'Calculadora'), L('CALC.EXE est ' +
+                   'introuvable.', 'CALC.EXE cannot be found.',
+                   'CALC.EXE wurde nicht gefunden.',
+                   'Impossibile trovare CALC.EXE.',
+                   'No se encuentra CALC.EXE.'), $10);
     cmNetwork : NetConfigBox;
     cmReadme : NoteOpen(SysDir + 'LISEZMOI.TXT');
     cmRecycle :
