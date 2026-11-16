@@ -11712,6 +11712,8 @@ End;
 { Invalidation et peinture                                           }
 { ------------------------------------------------------------------ }
 
+Function LbOwner(W : LongInt) : Boolean; Forward;
+
 Procedure InvalW(W : LongInt; R : TRect; Erase : Boolean);
 Var C : TRect;
 Begin
@@ -11720,8 +11722,9 @@ Begin
   If Not RInter(R, R, C) Then Exit;
   RUnion(Wnds^[W].Upd, R);
   If Erase Then Wnds^[W].UpdErase := True;
-  If Wnds^[W].IKind <> ikNone Then Wnds^[TopOf(W)].KNeedPaint := True
-  Else If (Wnds^[W].Thread >= 0) And (Wnds^[W].Thread < MaxThread) Then
+  If Wnds^[W].IKind <> ikNone Then Wnds^[TopOf(W)].KNeedPaint := True;
+  If ((Wnds^[W].IKind = ikNone) Or LbOwner(W)) And
+     (Wnds^[W].Thread >= 0) And (Wnds^[W].Thread < MaxThread) Then
     Threads[Wnds^[W].Thread].PaintReq := True;
 End;
 
@@ -12624,7 +12627,15 @@ Var X, Y : LongInt;
 Begin
   ClientScreenOrg(W, X, Y);
   X := CurX - X; Y := CurY - Y;
-  If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) Then
+  If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) And
+     ((Wnds^[W].Proc <> 0) Or LbOwner(W)) And (Wnds^[W].IKind <> ikDialog)
+  Then
+    { controle sous-classe par le programme ou dessine par lui : le clic
+      passe par sa file de messages (sa procedure, puis CallWindowProc) }
+    QPost(Wnds^[W].Thread, HwndOf(W), Msg, MouseKeys,
+          ((Y And $FFFF) Shl 16) Or (X And $FFFF))
+  Else If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient)
+  Then
   Begin
     If Wnds^[W].IKind <> ikDialog Then
       KWndProc(W, Msg, MouseKeys, ((Y And $FFFF) Shl 16) Or (X And $FFFF));
@@ -13095,8 +13106,9 @@ Begin
   Begin
     Threads[T].PaintReq := False;
     For W := 0 To MaxWnd - 1 Do
-      If Wnds^[W].Used And (Wnds^[W].Thread = T) And (Wnds^[W].IKind = ikNone)
-         And HasUpdate(W) And WndVisible(W) Then
+      If Wnds^[W].Used And (Wnds^[W].Thread = T) And
+         ((Wnds^[W].IKind = ikNone) Or LbOwner(W)) And
+         HasUpdate(W) And WndVisible(W) Then
       Begin
         Threads[T].PaintReq := True;
         If ((Hwnd = 0) Or (HwndOf(W) = Hwnd)) And
@@ -20667,13 +20679,24 @@ Const
   LB_GETCOUNT = $18B;
   CB_ADDSTRING = $143; CB_GETCURSEL = $147; CB_RESETCONTENT = $14B;
   CB_SETCURSEL = $14E;
-  LBItemMax = 128;
+  LBItemMax = 2048;
+  { LISTBOX : styles dessines par le programme, messages }
+  LBS_OWNERDRAWFIXED = $10; LBS_OWNERDRAWVAR = $20; LBS_HASSTRINGS = $40;
+  LBS_MULTIPLESEL = $8; LBS_EXTENDEDSEL = $800;
+  WM_DRAWITEM = $2B; WM_MEASUREITEM = $2C;
 
 Procedure DrawCtl(W : LongInt);
 Var S : TSurf; OX, OY, X1, Y1, X2, Y2, Typ, I, A : LongInt; Clip : TRect;
     T : String; Fg : LongInt;
 Begin
   If Not WndVisible(W) Then Exit;
+  { liste dessinee par le programme : peinte dans sa tache (WM_PAINT) }
+  If LbOwner(W) And (CurT <> Wnds^[W].Thread) Then
+  Begin
+    If (Wnds^[W].Thread > 0) And (Wnds^[W].Thread < MaxThread) Then
+      Threads[Wnds^[W].Thread].PaintReq := True;
+    Exit;
+  End;
   If Not WndTarget(W, False, S, OX, OY, Clip) Then Exit;
   SetR(Wnds^[W].Upd, 0, 0, 0, 0);
   SetTarget(S, 0, 0);
@@ -20788,21 +20811,159 @@ Begin
   DirtyWnd(W);
 End;
 
-Procedure LBAdd(W : LongInt; S : String);
-Var A : LongInt;
+{ Liste (LISTBOX, COMBOBOX) : bloc Extra = chaines (LBItemMax), donnees
+  des elements (LBItemMax), hauteur d'un element, hauteur mesuree,
+  element d'ancrage, puis un octet de selection par element (listes a
+  selection multiple) }
+Function LbExtra(W : LongInt) : LongInt;
+Var H : LongInt;
 Begin
-  If Wnds^[W].Extra = 0 Then Wnds^[W].Extra := KAlloc(LBItemMax * 4);
-  If Wnds^[W].K1 >= LBItemMax Then Exit;
-  A := KAlloc(Length(S) + 1);
-  PutPStr(A, S, 256);
-  MemL[0:Wnds^[W].Extra + Wnds^[W].K1 * 4] := A;
+  If Wnds^[W].Extra = 0 Then
+  Begin
+    Wnds^[W].Extra := KAlloc(LBItemMax * 9 + 16);
+    If Wnds^[W].Extra <> 0 Then FillMem(Wnds^[W].Extra, LBItemMax * 9 + 16, 0);
+  End;
+  LbExtra := Wnds^[W].Extra;
+End;
+
+{ liste a selection multiple (LBS_MULTIPLESEL ou LBS_EXTENDEDSEL) }
+Function LbMulti(W : LongInt) : Boolean;
+Begin
+  LbMulti := (Wnds^[W].IKind = ikListBox) And
+             ((Wnds^[W].Style And (LBS_MULTIPLESEL Or LBS_EXTENDEDSEL))
+              <> 0);
+End;
+
+{ element I choisi : octet de selection, ou element courant }
+Function LbSel(W, I : LongInt) : Boolean;
+Begin
+  If LbMulti(W) Then
+    LbSel := (Wnds^[W].Extra <> 0) And (I >= 0) And (I < Wnds^[W].K1) And
+             (Mem[0:Wnds^[W].Extra + LBItemMax * 8 + 16 + I] <> 0)
+  Else LbSel := (I >= 0) And (I = Wnds^[W].K2);
+End;
+
+{ choisir (On) ou non l'element I, ou tous (I = -1) }
+Procedure LbSetSel(W, I : LongInt; On : Boolean);
+Var A, K : LongInt;
+Begin
+  A := LbExtra(W);
+  If A = 0 Then Exit;
+  For K := 0 To Wnds^[W].K1 - 1 Do
+    If (I = -1) Or (K = I) Then Mem[0:A + LBItemMax * 8 + 16 + K] := Ord(On);
+End;
+
+{ liste dessinee par le programme (WM_DRAWITEM) }
+Function LbOwner(W : LongInt) : Boolean;
+Begin
+  LbOwner := (Wnds^[W].IKind = ikListBox) And
+             ((Wnds^[W].Style And (LBS_OWNERDRAWFIXED Or LBS_OWNERDRAWVAR))
+              <> 0);
+End;
+
+{ elements a chaine (sinon : une valeur du programme) }
+Function LbHasStr(W : LongInt) : Boolean;
+Begin
+  LbHasStr := Not LbOwner(W) Or ((Wnds^[W].Style And LBS_HASSTRINGS) <> 0);
+End;
+
+Function LbData(W, I : LongInt) : LongInt;
+Begin
+  LbData := 0;
+  If (Wnds^[W].Extra <> 0) And (I >= 0) And (I < Wnds^[W].K1) Then
+    LbData := MemL[0:Wnds^[W].Extra + LBItemMax * 4 + I * 4];
+End;
+
+{ hauteur d'un element : 16, ou celle du programme (WM_MEASUREITEM,
+  demande dans sa tache) }
+Function LbItemH(W : LongInt) : LongInt;
+Var A, H, P : LongInt; Mis : Array[0..5] Of LongInt;
+Begin
+  LbItemH := 16;
+  A := LbExtra(W);
+  If A = 0 Then Exit;
+  H := MemL[0:A + LBItemMax * 8];
+  If (MemL[0:A + LBItemMax * 8 + 4] = 0) And LbOwner(W) And
+     (CurT = Wnds^[W].Thread) Then
+  Begin
+    MemL[0:A + LBItemMax * 8 + 4] := 1;
+    P := Wnds^[W].Parent;
+    If P >= 0 Then
+    Begin
+      Mis[0] := 2; Mis[1] := Wnds^[W].Id; Mis[2] := 0;
+      Mis[3] := Wnds^[W].W; Mis[4] := 16; Mis[5] := 0;
+      SendMsgW(P, WM_MEASUREITEM, Wnds^[W].Id, LongInt(@Mis));
+      If (Mis[4] > 0) And (Mis[4] < 256) And (H = 0) Then H := Mis[4];
+    End;
+    MemL[0:A + LBItemMax * 8] := H;
+  End;
+  If H > 0 Then LbItemH := H;
+End;
+
+{ inserer un element a la position I (-1 : a la fin) ; rend sa position }
+Function LBInsert(W, I : LongInt; Const S : String; Data : LongInt)
+  : LongInt;
+Var A, B, K : LongInt;
+Begin
+  LBInsert := -1;
+  A := LbExtra(W);
+  If (A = 0) Or (Wnds^[W].K1 >= LBItemMax) Then Exit;
+  If (I < 0) Or (I > Wnds^[W].K1) Then I := Wnds^[W].K1;
+  B := 0;
+  If LbHasStr(W) Then
+  Begin
+    B := KAlloc(Length(S) + 1);
+    PutPStr(B, S, 256);
+  End;
+  For K := Wnds^[W].K1 DownTo I + 1 Do
+  Begin
+    MemL[0:A + K * 4] := MemL[0:A + (K - 1) * 4];
+    MemL[0:A + LBItemMax * 4 + K * 4] := MemL[0:A + LBItemMax * 4 +
+                                              (K - 1) * 4];
+    Mem[0:A + LBItemMax * 8 + 16 + K] := Mem[0:A + LBItemMax * 8 + 15 + K];
+  End;
+  Mem[0:A + LBItemMax * 8 + 16 + I] := 0;
+  MemL[0:A + I * 4] := B;
+  MemL[0:A + LBItemMax * 4 + I * 4] := Data;
   Inc(Wnds^[W].K1);
+  If (Wnds^[W].K2 >= I) And (Wnds^[W].K2 >= 0) Then Inc(Wnds^[W].K2);
+  LBInsert := I;
+End;
+
+Procedure LBAdd(W : LongInt; S : String);
+Begin
+  LBInsert(W, -1, S, 0);
+End;
+
+Function LBDelete(W, I : LongInt) : LongInt;
+Var A, K : LongInt;
+Begin
+  LBDelete := -1;
+  A := Wnds^[W].Extra;
+  If (A = 0) Or (I < 0) Or (I >= Wnds^[W].K1) Then Exit;
+  If MemL[0:A + I * 4] <> 0 Then KFree(MemL[0:A + I * 4]);
+  For K := I To Wnds^[W].K1 - 2 Do
+  Begin
+    MemL[0:A + K * 4] := MemL[0:A + (K + 1) * 4];
+    MemL[0:A + LBItemMax * 4 + K * 4] := MemL[0:A + LBItemMax * 4 +
+                                              (K + 1) * 4];
+    Mem[0:A + LBItemMax * 8 + 16 + K] := Mem[0:A + LBItemMax * 8 + 17 + K];
+  End;
+  Dec(Wnds^[W].K1);
+  If Wnds^[W].K2 = I Then Wnds^[W].K2 := -1
+  Else If Wnds^[W].K2 > I Then Dec(Wnds^[W].K2);
+  LBDelete := Wnds^[W].K1;
 End;
 
 Procedure LBClear(W : LongInt);
 Var I : LongInt;
 Begin
-  For I := 0 To Wnds^[W].K1 - 1 Do KFree(MemL[0:Wnds^[W].Extra + I * 4]);
+  If Wnds^[W].Extra <> 0 Then
+    For I := 0 To Wnds^[W].K1 - 1 Do
+      If MemL[0:Wnds^[W].Extra + I * 4] <> 0 Then
+        KFree(MemL[0:Wnds^[W].Extra + I * 4]);
+  If Wnds^[W].Extra <> 0 Then
+    FillMem(Wnds^[W].Extra + LBItemMax * 8 + 16, LBItemMax, 0);
   Wnds^[W].K1 := 0; Wnds^[W].K2 := -1;
 End;
 
@@ -21285,7 +21446,7 @@ End;
 
 Function LbRows(W : LongInt) : LongInt;
 Begin
-  LbRows := Max(1, (Wnds^[W].H - 4) Div 16);
+  LbRows := Max(1, (Wnds^[W].H - 4) Div LbItemH(W));
 End;
 
 Function LbOver(W : LongInt) : Boolean;
@@ -21304,6 +21465,68 @@ Begin
   If Wnds^[W].K3 < 0 Then Wnds^[W].K3 := 0;
 End;
 
+Function GetDC(H : LongInt) : LongInt; Forward;
+Function ReleaseDC(H, Hdc : LongInt) : LongInt; Forward;
+
+{ elements d'une liste dessinee par le programme : WM_DRAWITEM au parent
+  (dans la tache du programme), DRAWITEMSTRUCT : type 2 (ODT_LISTBOX),
+  identifiant, element, action 1 (tout), etat (1 choisi, 10h focus),
+  fenetre, contexte, rectangle, donnee }
+Procedure LbItemDraw(W, Hdc, I, R, Act : LongInt);
+Var Dis : Array[0..11] Of LongInt; H : LongInt;
+Begin
+  H := LbItemH(W);
+  Dis[0] := 2; Dis[1] := Wnds^[W].Id; Dis[2] := I;
+  Dis[3] := Act; Dis[4] := 0;
+  If LbSel(W, I) Then Dis[4] := 1;
+  If (I = Wnds^[W].K2) And (FocusWin = W) Then Dis[4] := Dis[4] Or $10;
+  Dis[5] := HwndOf(W); Dis[6] := Hdc;
+  Dis[7] := 2; Dis[8] := 2 + (I - Wnds^[W].K3) * H; Dis[9] := R;
+  Dis[10] := Dis[8] + H;
+  Dis[11] := LbData(W, I);
+  SendMsgW(Wnds^[W].Parent, WM_DRAWITEM, Wnds^[W].Id, LongInt(@Dis));
+End;
+
+Procedure LbOwnerDraw(W, R : LongInt);
+Var I, N, Hdc : LongInt;
+Begin
+  If Wnds^[W].Parent < 0 Then Exit;
+  N := LbRows(W);
+  Hdc := GetDC(HwndOf(W));
+  If Hdc = 0 Then Exit;
+  For I := 0 To N - 1 Do
+    If Wnds^[W].K3 + I < Wnds^[W].K1 Then
+      LbItemDraw(W, Hdc, Wnds^[W].K3 + I, R, 1);
+  ReleaseDC(HwndOf(W), Hdc);
+End;
+
+{ liste dessinee par le programme : comme Windows, prevenir aussitot
+  d'un changement de selection (ODA_SELECT) de l'element Sel, et du
+  deplacement du curseur de Old vers K2 (ODA_FOCUS) }
+Procedure LbChanged(W, Sel, Old : LongInt);
+Var Hdc, R, N : LongInt;
+Begin
+  InvalAll(W, True);
+  If Not LbOwner(W) Or (CurT <> Wnds^[W].Thread) Or
+     (Wnds^[W].Parent < 0) Then Exit;
+  N := LbRows(W);
+  R := Wnds^[W].W - 2;
+  If LbOver(W) Then R := Wnds^[W].W - 18;
+  Hdc := GetDC(HwndOf(W));
+  If Hdc = 0 Then Exit;
+  If (Sel >= Wnds^[W].K3) And (Sel < Wnds^[W].K3 + N) And
+     (Sel < Wnds^[W].K1) Then LbItemDraw(W, Hdc, Sel, R, 2);
+  If Old <> Wnds^[W].K2 Then
+  Begin
+    If (Old >= Wnds^[W].K3) And (Old < Wnds^[W].K3 + N) And
+       (Old < Wnds^[W].K1) Then LbItemDraw(W, Hdc, Old, R, 4);
+    If (Wnds^[W].K2 >= Wnds^[W].K3) And (Wnds^[W].K2 < Wnds^[W].K3 + N)
+       And (Wnds^[W].K2 < Wnds^[W].K1) Then
+      LbItemDraw(W, Hdc, Wnds^[W].K2, R, 4);
+  End;
+  ReleaseDC(HwndOf(W), Hdc);
+End;
+
 Procedure LbDraw(W, X1, Y1, X2, Y2 : LongInt);
 Var A, I, N, R, Th, Tr : LongInt;
 Begin
@@ -21314,9 +21537,14 @@ Begin
   R := X2 - 2;
   If LbOver(W) Then R := X2 - 18;
   ClipX2 := Min(ClipX2, R);
+  If LbOwner(W) Then
+  Begin
+    If CurT = Wnds^[W].Thread Then LbOwnerDraw(W, R - X1);
+  End
+  Else
   For I := 0 To N - 1 Do
     If Wnds^[W].K3 + I < Wnds^[W].K1 Then
-      If Wnds^[W].K3 + I = Wnds^[W].K2 Then
+      If LbSel(W, Wnds^[W].K3 + I) Then
       Begin
         FBar(X1 + 2, Y1 + 2 + I * 16, R, Y1 + 17 + I * 16, cNavy);
         OutTxt(X1 + 4, Y1 + 2 + I * 16,
@@ -21340,6 +21568,39 @@ Begin
   End;
 End;
 
+{ clic (ou deplacement) sur l'element I d'une liste a selection
+  multiple ; WP : touches (4 Maj, 8 Ctrl) }
+Procedure LbClickSel(W, I, WP : LongInt);
+Var A, K, F, L : LongInt;
+Begin
+  A := LbExtra(W);
+  If A = 0 Then Exit;
+  If (Wnds^[W].Style And LBS_EXTENDEDSEL) = 0 Then
+  Begin
+    LbSetSel(W, I, Not LbSel(W, I));
+    Exit;
+  End;
+  If (WP And 8) <> 0 Then LbSetSel(W, I, Not LbSel(W, I))
+  Else If ((WP And 4) <> 0) Then
+  Begin
+    F := MemL[0:A + LBItemMax * 8 + 8];
+    L := I;
+    If F > L Then
+    Begin
+      K := F; F := L; L := K;
+    End;
+    LbSetSel(W, -1, False);
+    For K := F To L Do LbSetSel(W, K, True);
+    Exit;
+  End
+  Else
+  Begin
+    LbSetSel(W, -1, False);
+    LbSetSel(W, I, True);
+  End;
+  MemL[0:A + LBItemMax * 8 + 8] := I;
+End;
+
 Function LbMsg(W, Msg, WP, LP : LongInt; Var R : LongInt) : Boolean;
 Var X, Y, I, N : LongInt;
 Begin
@@ -21360,11 +21621,16 @@ Begin
       End
       Else
       Begin
-        I := Wnds^[W].K3 + (Y - 2) Div 16;
+        I := Wnds^[W].K3 + (Y - 2) Div LbItemH(W);
         If (Y >= 2) And (I >= 0) And (I < Wnds^[W].K1) Then
         Begin
+          N := Wnds^[W].K2;
+          X := Ord(LbSel(W, I));
+          If LbMulti(W) Then LbClickSel(W, I, WP);
           Wnds^[W].K2 := I;
-          InvalAll(W, True);
+          If Not LbMulti(W) And (N <> I) Then LbChanged(W, N, I);
+          If X <> Ord(LbSel(W, I)) Then LbChanged(W, I, N)
+          Else LbChanged(W, -1, N);
           Notify(W, 1);
         End;
       End;
@@ -21373,6 +21639,13 @@ Begin
     WM_KEYDOWN :
     Begin
       I := Wnds^[W].K2;
+      If (WP = $20) And LbMulti(W) And (I >= 0) Then
+      Begin
+        LbSetSel(W, I, Not LbSel(W, I));
+        InvalAll(W, True);
+        Notify(W, 1);
+        Exit;
+      End;
       Case WP Of
         $26 : Dec(I);
         $28 : Inc(I);
@@ -21386,6 +21659,8 @@ Begin
       If I >= Wnds^[W].K1 Then I := Wnds^[W].K1 - 1;
       If I < 0 Then I := 0;
       If Wnds^[W].K1 = 0 Then Exit;
+      If LbMulti(W) And ((Wnds^[W].Style And LBS_EXTENDEDSEL) <> 0) Then
+        LbClickSel(W, I, 0);
       Wnds^[W].K2 := I;
       LbShow(W, I);
       InvalAll(W, True);
@@ -21404,6 +21679,127 @@ Begin
       InvalAll(W, True);
     End;
     $18E : R := Wnds^[W].K3;
+    { LB_SETSEL (WP choisir, LP element ou -1), LB_GETSEL }
+    $185 :
+      If Not LbMulti(W) Then R := -1
+      Else
+      Begin
+        I := Wnds^[W].K2;
+        N := -1;
+        If (LP >= 0) And (LP < Wnds^[W].K1) Then
+          If LbSel(W, LP) <> (WP <> 0) Then N := LP;
+        LbSetSel(W, LP, WP <> 0);
+        If (LP >= 0) And (LP < Wnds^[W].K1) Then Wnds^[W].K2 := LP;
+        LbChanged(W, N, I);
+      End;
+    $187 :
+      If (WP < 0) Or (WP >= Wnds^[W].K1) Then R := -1
+      Else R := Ord(LbSel(W, WP));
+    { LB_GETSELCOUNT, LB_GETSELITEMS }
+    $190, $191 :
+      If Not LbMulti(W) Then R := -1
+      Else
+        For I := 0 To Wnds^[W].K1 - 1 Do
+          If LbSel(W, I) Then
+            If Msg = $190 Then Inc(R)
+            Else If R < WP Then
+            Begin
+              MemL[0:LP + R * 4] := I;
+              Inc(R);
+            End;
+    { LB_SELITEMRANGE (LP : premier, dernier), LB_SELITEMRANGEEX }
+    $19B, $183 :
+      If Not LbMulti(W) Then R := -1
+      Else
+      Begin
+        If Msg = $19B Then
+        Begin
+          X := LP And $FFFF; Y := (LP Shr 16) And $FFFF;
+          N := Ord(WP <> 0);
+        End
+        Else
+        Begin
+          X := WP; Y := LP; N := 1;
+          If X > Y Then
+          Begin
+            X := LP; Y := WP; N := 0;
+          End;
+        End;
+        For I := X To Y Do LbSetSel(W, I, N <> 0);
+        InvalAll(W, True);
+      End;
+    { LB_SETANCHORINDEX, LB_GETANCHORINDEX, LB_SETCARETINDEX,
+      LB_GETCARETINDEX }
+    $19C : If LbExtra(W) <> 0 Then
+             MemL[0:Wnds^[W].Extra + LBItemMax * 8 + 8] := WP;
+    $19D : If LbExtra(W) <> 0 Then
+             R := MemL[0:Wnds^[W].Extra + LBItemMax * 8 + 8];
+    $19E :
+      If (WP >= 0) And (WP < Wnds^[W].K1) Then
+      Begin
+        I := Wnds^[W].K2;
+        Wnds^[W].K2 := WP;
+        LbShow(W, WP);
+        LbChanged(W, -1, I);
+      End
+      Else R := -1;
+    $19F : R := Wnds^[W].K2;
+    { LB_INSERTSTRING, LB_DELETESTRING }
+    $181 :
+    Begin
+      If LbHasStr(W) Then R := LBInsert(W, WP, APStr(LP), 0)
+      Else R := LBInsert(W, WP, '', LP);
+      InvalAll(W, True);
+    End;
+    $182 :
+    Begin
+      R := LBDelete(W, WP);
+      InvalAll(W, True);
+    End;
+    { LB_GETITEMDATA, LB_SETITEMDATA }
+    $199 :
+      If (WP >= 0) And (WP < Wnds^[W].K1) Then R := LbData(W, WP)
+      Else R := -1;
+    $19A :
+      If (WP >= 0) And (WP < Wnds^[W].K1) And (LbExtra(W) <> 0) Then
+        MemL[0:Wnds^[W].Extra + LBItemMax * 4 + WP * 4] := LP
+      Else R := -1;
+    { LB_GETITEMRECT }
+    $198 :
+      If (WP >= 0) And (WP < Wnds^[W].K1) And (LP <> 0) Then
+      Begin
+        MemL[0:LP] := 2;
+        MemL[0:LP + 4] := 2 + (WP - Wnds^[W].K3) * LbItemH(W);
+        MemL[0:LP + 8] := Wnds^[W].W - 2;
+        If LbOver(W) Then MemL[0:LP + 8] := Wnds^[W].W - 18;
+        MemL[0:LP + 12] := MemL[0:LP + 4] + LbItemH(W);
+        R := 1;
+      End
+      Else R := -1;
+    { LB_SETITEMHEIGHT, LB_GETITEMHEIGHT }
+    $1A0 :
+      If LbExtra(W) <> 0 Then
+      Begin
+        MemL[0:Wnds^[W].Extra + LBItemMax * 8] := LP And $FFFF;
+        MemL[0:Wnds^[W].Extra + LBItemMax * 8 + 4] := 1;
+        InvalAll(W, True);
+      End;
+    $1A1 : R := LbItemH(W);
+    { LB_FINDSTRING, LB_FINDSTRINGEXACT (sans chaines : la donnee) }
+    $18F, $1A2 :
+    Begin
+      R := -1;
+      For I := 0 To Wnds^[W].K1 - 1 Do
+        If R < 0 Then
+          If LbHasStr(W) Then
+          Begin
+            If (Msg = $18F) And (Pos(UpStr(APStr(LP)),
+                UpStr(PStr(MemL[0:Wnds^[W].Extra + I * 4]))) = 1) Or
+               (UpStr(APStr(LP)) =
+                UpStr(PStr(MemL[0:Wnds^[W].Extra + I * 4]))) Then R := I;
+          End
+          Else If LbData(W, I) = LP Then R := I;
+    End;
   Else
     LbMsg := False;
   End;
@@ -21547,7 +21943,8 @@ Begin
       End;
     LB_ADDSTRING, CB_ADDSTRING :
     Begin
-      LBAdd(W, APStr(LP));
+      If LbHasStr(W) Then LBAdd(W, APStr(LP))
+      Else LBInsert(W, -1, '', LP);
       KWndProc := Wnds^[W].K1 - 1;
       InvalAll(W, True);
     End;
@@ -21566,15 +21963,25 @@ Begin
     LB_GETTEXT, $148 :
       If (WP >= 0) And (WP < Wnds^[W].K1) Then
       Begin
-        S := PStr(MemL[0:Wnds^[W].Extra + WP * 4]);
-        If AnsiApp Then CvtStr(S, False);
-        PutPStr(LP, S, 256);
-        KWndProc := Length(S);
+        If Not LbHasStr(W) Then
+        Begin
+          { liste sans chaines : la donnee de l'element }
+          MemL[0:LP] := LbData(W, WP);
+          KWndProc := 4;
+        End
+        Else
+        Begin
+          S := PStr(MemL[0:Wnds^[W].Extra + WP * 4]);
+          If AnsiApp Then CvtStr(S, False);
+          PutPStr(LP, S, 256);
+          KWndProc := Length(S);
+        End;
       End
       Else KWndProc := -1;
     LB_GETTEXTLEN, $149 :
       If (WP >= 0) And (WP < Wnds^[W].K1) Then
-        KWndProc := StrLenZ(MemL[0:Wnds^[W].Extra + WP * 4])
+        If Not LbHasStr(W) Then KWndProc := 4
+        Else KWndProc := StrLenZ(MemL[0:Wnds^[W].Extra + WP * 4])
       Else KWndProc := -1;
   End;
   N := 0;
@@ -22598,7 +23005,8 @@ Begin
     { volume FAT d'un disque dur }
     Ob := OrigBase(Name);
     F := FatOpen(Path, Ob, Wr, Disp, E);
-    If ApiTrace Then KLog('Fichier FAT : ' + Path + ' -> ' + IntStr(F));
+    If ApiTrace And (TraceMods = '') Then
+      KLog('Fichier FAT : ' + Path + ' -> ' + IntStr(F));
     If F < 0 Then
     Begin
       SetErr(E);
@@ -22623,7 +23031,8 @@ Begin
     Exit;
   End;
   Ex := PathInfo(Path, Attr, Size, Time, Lba, Ram);
-  If ApiTrace Then KLog('Fichier : ' + Path + ' existe=' + IntStr(Ord(Ex)));
+  If ApiTrace And (TraceMods = '') Then
+    KLog('Fichier : ' + Path + ' existe=' + IntStr(Ord(Ex)));
   If Ex And ((Attr And $10) <> 0) Then
   Begin
     SetErr(ErrAccessDenied);
@@ -29163,14 +29572,63 @@ Begin
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
+{ DrawFrameControl : Typ 1 legende, 2 menu, 3 defilement, 4 bouton ;
+  State : sorte (case 0, radio 1 ou 4, trois etats 8, bouton 10h ;
+  fleches 0 haut, 1 bas, 2 gauche, 3 droite, 5 liste) et drapeaux
+  100h inactif, 200h enfonce, 400h coche, 4000h plat }
 Function DrawFrameControl(Hdc, P, Typ, State : LongInt) : LongInt;
-Var D : LongInt; R : TRect;
+Var D, K, X, Y, Sz, C, I : LongInt; R : TRect; Bg : LongInt;
 Begin
   DrawFrameControl := 1;
   D := DcOf(Hdc);
   If Not DcBegin(D) Then Exit;
   GetRectAt(P, R);
-  Raised(R.L, R.T, R.R - 1, R.B - 1, (State And $200) <> 0);
+  K := State And $FF;
+  If (Typ = 4) And ((K = 0) Or (K = 8)) Then
+  Begin
+    { case a cocher : carre creux, coche noire (grise si inactive ou
+      troisieme etat) }
+    Sz := Min(R.R - R.L, R.B - R.T);
+    If Sz > 13 Then Sz := 13;
+    X := R.L + (R.R - R.L - Sz) Div 2;
+    Y := R.T + (R.B - R.T - Sz) Div 2;
+    If ((State And $300) <> 0) Or (K = 8) And ((State And $400) <> 0) Then
+      Bg := cSilver
+    Else Bg := cWhite;
+    Sunken(X, Y, X + Sz - 1, Y + Sz - 1, Bg);
+    If (State And $400) <> 0 Then
+    Begin
+      If ((State And $100) <> 0) Or (K = 8) Then C := cGray Else C := cBlack;
+      For I := 0 To 2 Do
+      Begin
+        DLine(X + 3, Y + Sz Div 2 - 1 + I, X + 5, Y + Sz Div 2 + 1 + I, C);
+        DLine(X + 5, Y + Sz Div 2 + 1 + I, X + Sz - 4, Y + 3 + I, C);
+      End;
+    End;
+  End
+  Else If (Typ = 4) And ((K = 1) Or (K = 2) Or (K = 4)) Then
+    RadioButton(R.L + (R.R - R.L - 13) Div 2, R.T + (R.B - R.T - 14) Div 2,
+                '', (State And $400) <> 0)
+  Else If Typ = 3 Then
+  Begin
+    { fleches de defilement et de liste deroulante }
+    Raised(R.L, R.T, R.R - 1, R.B - 1, (State And $200) <> 0);
+    If (State And $100) <> 0 Then C := cGray Else C := cBlack;
+    X := (R.L + R.R) Div 2 - 3;
+    Y := (R.T + R.B) Div 2 - 2;
+    Case K Of
+      0 : Arrow(X, Y, 2, C);
+      2 : For I := 0 To 3 Do VLine(X + 4 - I, Y - 1 + I, Y + 5 - I, C);
+      3 : Arrow(X + 2, Y - 1, 0, C);
+    Else
+      Arrow(X, Y, 1, C);
+    End;
+  End
+  Else
+  Begin
+    FBar(R.L, R.T, R.R - 1, R.B - 1, cSilver);
+    Raised(R.L, R.T, R.R - 1, R.B - 1, (State And $200) <> 0);
+  End;
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
@@ -33026,14 +33484,22 @@ Begin
   { classes OLE de base de Windows 95 (inscrites par OLE32 et OLEAUT32
     a l'installation du systeme) : la vraie OLEAUT32 met ces cles a
     jour quand un programme l'inscrit (Office 97) }
-  S := 'CLSID\{00020420-0000-0000-C000-000000000046}';
-  RegSetStrK(0, S, '', 'PSDispatch');
-  RegSetStrK(0, S + '\InprocServer32', '', 'OLEAUT32.DLL');
-  RegSetStrK(0, S + '\InprocServer32', 'ThreadingModel', 'Both');
-  S := 'CLSID\{00020424-0000-0000-C000-000000000046}';
-  RegSetStrK(0, S, '', 'PSAutomation');
-  RegSetStrK(0, S + '\InprocServer32', '', 'OLEAUT32.DLL');
-  RegSetStrK(0, S + '\InprocServer32', 'ThreadingModel', 'Both');
+  { proxys d'OLE Automation : 00020420 PSDispatch, 21 PSEnumVARIANT,
+    22 PSTypeInfo, 23 PSTypeLib, 24 PSAutomation, 25 PSTypeComp }
+  For I := 0 To 5 Do
+  Begin
+    S := 'CLSID\{0002042' + Chr(48 + I) + '-0000-0000-C000-000000000046}';
+    Case I Of
+      0 : RegSetStrK(0, S, '', 'PSDispatch');
+      1 : RegSetStrK(0, S, '', 'PSEnumVARIANT');
+      2 : RegSetStrK(0, S, '', 'PSTypeInfo');
+      3 : RegSetStrK(0, S, '', 'PSTypeLib');
+      4 : RegSetStrK(0, S, '', 'PSAutomation');
+      5 : RegSetStrK(0, S, '', 'PSTypeComp');
+    End;
+    RegSetStrK(0, S + '\InprocServer32', '', 'OLEAUT32.DLL');
+    RegSetStrK(0, S + '\InprocServer32', 'ThreadingModel', 'Both');
+  End;
   S := 'CLSID\{00000320-0000-0000-C000-000000000046}';
   RegSetStrK(0, S, '', 'PSFactoryBuffer');
   RegSetStrK(0, S + '\InprocServer32', '', 'OLE32.DLL');
@@ -33378,6 +33844,10 @@ Var
   KExpCount, KExpFuncs, KExpNames, KExpOrds, KBase : LongInt;
   StubArea, StubNext, TraceCount, TraceRetStub : LongInt;
   TraceMax : LongInt;            { appels journalises au plus }
+  { APITRACEMOD : modules dont les importations sont journalisees
+    (' VBE.DLL FM20.DLL ', vide : tous) ; ImpTrace : module en cours }
+  TraceMods : String;
+  ImpTrace : Boolean;
   TrRet, TrName : Array[0..MaxThread * 32 - 1] Of LongInt;
   TrDepth : Array[0..MaxThread - 1] Of LongInt;
   TraceSkip : String;
@@ -33746,7 +34216,7 @@ Begin
     KLog('  importation absente : ' + Dll + '!' + Name);
     A := MakeStub(Dll, Name);
   End;
-  If ApiTrace Then
+  If ApiTrace And ImpTrace Then
   Begin
     Nm := ' ' + UpStr(Name) + ' ';
     If Pos(Nm, TraceSkip) = 0 Then A := MakeTrace(Dll, Name, A);
@@ -34028,7 +34498,9 @@ Begin
   Mods^[M].Path := Path;
   Mods^[M].IsDll := IsDll;
   Mods^[M].PrcId := CurProc;
-  { importations }
+  { importations (journalisees si le module est dans APITRACEMOD) }
+  ImpTrace := (TraceMods = '') Or
+              (Pos(' ' + Mods^[M].Name + ' ', TraceMods) > 0);
   Dir := MemL[0:Pe + 24 + 104];
   If Dir <> 0 Then
   Begin
@@ -77980,7 +78452,7 @@ Begin
     End;
     For I := 0 To MaxWnd - 1 Do
       If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].IKind <> ikNone) And
-         HasUpdate(I) Then DrawCtl(I);
+         HasUpdate(I) And Not LbOwner(I) Then DrawCtl(I);
     FlushScreen;
     ReapThreads;
     Busy := False;
@@ -78114,6 +78586,16 @@ BEGIN
       If (TrS[TrK] >= '0') And (TrS[TrK] <= '9') Then
         TrJ := TrJ * 10 + Ord(TrS[TrK]) - 48;
     If TrJ > 1000 Then TraceMax := TrJ;
+  End;
+  { APITRACEMOD=VBE.DLL,FM20.DLL : seulement ces modules }
+  TraceMods := '';
+  ImpTrace := True;
+  If EnvFind('APITRACEMOD', TrI) Then
+  Begin
+    TrS := UpStr(PStr(TrI));
+    For TrK := 1 To Length(TrS) Do
+      If TrS[TrK] = ',' Then TrS[TrK] := ' ';
+    TraceMods := ' ' + TrS + ' ';
   End;
   { DRWATCH=adresse (hexadecimal) : ecritures surveillees par DR0 }
   If EnvFind('DRWATCH', TrI) Then
