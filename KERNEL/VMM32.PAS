@@ -8255,7 +8255,7 @@ Const
   icApp      = 25; icHardDisk = 26; icLogo     = 27; icExplorer = 28;
   icQuestion = 29; icSpeaker  = 30; icMute     = 31; icSound    = 32;
   icKeyboard = 33; icMouse    = 34; icNet      = 35; icPort     = 36;
-  icChip     = 37; icDiskCtl  = 38;
+  icChip     = 37; icDiskCtl  = 38; icWeb      = 39;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9447,6 +9447,15 @@ Begin
       IFrame(4, 10, 27, 21, cSilver);
       For I := 0 To 4 Do QD(8 + I * 4, 14, 1, cBlack);
       For I := 0 To 3 Do QD(10 + I * 4, 18, 1, cBlack);
+    End;
+    icWeb :
+    Begin
+      { globe du Navigateur Web : ocean bleu, continents verts }
+      QD(16, 16, 13, cBlue);
+      QR(9, 8, 15, 12, cGreen); QR(8, 12, 13, 15, cGreen);
+      QR(18, 17, 24, 22, cGreen); QR(20, 22, 22, 25, cGreen);
+      QR(5, 18, 8, 20, cGreen); QR(19, 6, 22, 8, cWhite);
+      QC(16, 16, 13, cNavy);
     End;
     icChip :
     Begin
@@ -11093,6 +11102,7 @@ Type
     DlgEnded : Boolean;
     Cursor   : LongInt;
     HScrollPos, VScrollPos : LongInt;
+    FocusChild : LongInt;         { dernier enfant avec le focus + 1 }
   End;
 
   TProp = Record
@@ -11908,6 +11918,9 @@ Begin
   If W = FocusWin Then Exit;
   Old := FocusWin;
   FocusWin := W;
+  { la fenetre de premier niveau retient l'enfant qui avait le focus :
+    il le retrouve quand elle est de nouveau activee (comme Windows) }
+  If (W >= 0) And IsChildW(W) Then Wnds^[TopOf(W)].FocusChild := W + 1;
   If (Old >= 0) And Wnds^[Old].Used Then
     PostMsgW(Old, WM_KILLFOCUS, HwndOf(W), 0);
   If W >= 0 Then PostMsgW(W, WM_SETFOCUS, HwndOf(Old), 0);
@@ -11951,7 +11964,11 @@ Begin
     End
     Else
       Wnds^[W].KNeedPaint := True;
-    SetFocusW(W);
+    Old := Wnds^[W].FocusChild - 1;
+    If (Old >= 0) And Wnds^[Old].Used And IsChildW(Old) And
+       (TopOf(Old) = W) And WndVisible(Old) And Wnds^[Old].Enabled Then
+      SetFocusW(Old)
+    Else SetFocusW(W);
     KActivated(W);
   End;
   TaskbarChanged;
@@ -12579,7 +12596,9 @@ Begin
         LastClickW := -1;
       End
       Else Msg := WM_LBUTTONDOWN;
-      If (W <> FocusWin) And IsChildW(W) And (Wnds^[W].Proc = 0) Then
+      { controle (meme sous-classe par le programme) : il prend le focus }
+      If (W <> FocusWin) And IsChildW(W) And
+         ((Wnds^[W].Proc = 0) Or (Wnds^[W].IKind <> ikNone)) Then
         SetFocusW(W);
     End
     Else Msg := WM_LBUTTONUP;
@@ -12678,7 +12697,10 @@ Begin
     If Not Up Then KKey(-2, WM_KEYDOWN, Vk, Ch);
     Exit;
   End;
-  If Wnds^[W].IKind <> ikNone Then
+  { controle sous-classe par le programme (SetWindowLongA GWL_WNDPROC) :
+    il recoit les touches comme une fenetre du programme }
+  If (Wnds^[W].IKind <> ikNone) And
+     Not ((Wnds^[W].IKind = ikEdit) And (Wnds^[W].Proc <> 0)) Then
   Begin
     If Up Then KKey(W, WM_KEYUP, Vk, Ch) Else KKey(W, WM_KEYDOWN, Vk, Ch);
     Exit;
@@ -12686,7 +12708,9 @@ Begin
   If Alt Or (Vk = $12) Or (Vk = $79) Then
     If Up Then Msg := WM_SYSKEYUP Else Msg := WM_SYSKEYDOWN
   Else If Up Then Msg := WM_KEYUP Else Msg := WM_KEYDOWN;
-  PostMsgW(W, Msg, Vk, Lp);
+  If Wnds^[W].IKind <> ikNone Then
+    QPost(Wnds^[W].Thread, HwndOf(W), Msg, Vk, Lp)
+  Else PostMsgW(W, Msg, Vk, Lp);
 End;
 
 { Traiter les evenements materiels en attente }
@@ -12943,7 +12967,7 @@ Const
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
   cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
-  cmCalc = 28;
+  cmCalc = 28; cmBrowser = 29;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -13683,7 +13707,7 @@ Begin
   End;
   Case M Of
     mnStart : MenuCount := 8;
-    mnPrograms : MenuCount := 6 + ExeCnt;
+    mnPrograms : MenuCount := 7 + ExeCnt;
     mnSettings : MenuCount := 7;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -13798,17 +13822,23 @@ Begin
       End
       Else If I = 4 Then
       Begin
+        T := L('Navigateur Web', 'Web Browser', 'Webbrowser',
+               'Browser Web', 'Navegador Web');
+        Cmd := cmBrowser; Icon := icWeb;
+      End
+      Else If I = 5 Then
+      Begin
         T := PromptName;
         Cmd := cmPrompt; Icon := icDos;
       End
-      Else If I = 5 Then
+      Else If I = 6 Then
       Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 6]);
-        Cmd := cmExeBase + I - 6; Icon := icApp;
+        T := BaseName(ExePaths[I - 7]);
+        Cmd := cmExeBase + I - 7; Icon := icApp;
       End;
     mnSettings :
       If I = 0 Then
@@ -19711,6 +19741,14 @@ Begin
                    'PAINT.EXE wurde nicht gefunden.',
                    'Impossibile trovare PAINT.EXE.',
                    'No se encuentra PAINT.EXE.'), $10);
+    cmBrowser :
+      If Not RunExe('BROWSER.EXE', '') Then
+        MsgBoxOpen(L('Navigateur Web', 'Web Browser', 'Webbrowser',
+                   'Browser Web', 'Navegador Web'), L('BROWSER.EXE est ' +
+                   'introuvable.', 'BROWSER.EXE cannot be found.',
+                   'BROWSER.EXE wurde nicht gefunden.',
+                   'Impossibile trovare BROWSER.EXE.',
+                   'No se encuentra BROWSER.EXE.'), $10);
     cmCalc :
       If Not RunExe('CALC.EXE', '') Then
         MsgBoxOpen(L('Calculatrice', 'Calculator', 'Rechner',
@@ -20284,7 +20322,13 @@ Begin
       PostMsgW(Wnds^[K].Parent, WM_COMMAND, Wnds^[K].Id And $FFFF, 0);
     End
     Else If (Ch <> 0) And (Wnds^[W].IKind = ikEdit) Then
+    Begin
+      If (KeyState[$11] And $80) <> 0 Then
+        If (VK >= $41) And (VK <= $5A) Then Ch := VK - $40;
       KWndProc(W, WM_CHAR, Ch, 0);
+    End
+    Else If Wnds^[W].IKind In [ikEdit, ikListBox] Then
+      KWndProc(W, WM_KEYDOWN, VK, 0);
     Exit;
   End;
   Case Wnds^[W].IKind Of
@@ -20527,12 +20571,17 @@ Begin
         WrapClipY := $7FFFFFFF;
       End
       Else
-      OutTxt(X1 + 4, Y1 + (Wnds^[W].H - 16) Div 2, Fit(T, Wnds^[W].W - 8),
-             cBlack);
+      Begin
+        EdDraw(W, X1, Y1, X2, Y2);
+        DirtyWnd(W);
+        Exit;
+      End;
       If W = FocusWin Then
         VLine(X1 + 4 + TextW(T), Y1 + 3, Y2 - 3, cBlack);
     End;
-    ikListBox, ikComboBox :
+    ikListBox :
+      LbDraw(W, X1, Y1, X2, Y2);
+    ikComboBox :
     Begin
       Sunken(X1, Y1, X2, Y2, cWhite);
       A := Wnds^[W].Extra;
@@ -20548,11 +20597,7 @@ Begin
             OutTxt(X1 + 4, Y1 + 2 + I * 16, PStr(MemL[0:A + I * 4]), cBlack);
         End;
     End;
-    ikScrollBar :
-    Begin
-      FBar(X1, Y1, X2, Y2, cSilver);
-      Dither(X1, Y1, X2, Y2, cWhite, 0);
-    End;
+    ikScrollBar : SbDraw(W, X1, Y1, X2, Y2);
     ikDialog, ikMdiClient :
       FBar(X1, Y1, X2, Y2, cSilver);
   End;
@@ -20584,6 +20629,602 @@ Begin
              (Wnds^[W].Id And $FFFF), HwndOf(W));
 End;
 
+{ ------------------------------------------------------------------ }
+{ Champ de saisie d'une ligne (EDIT) : K1 position du curseur, K2      }
+{ ancre de la selection + 1 (0 : aucune), K3 premier caractere        }
+{ affiche, K4 longueur maximale (0 : 255)                             }
+{ ------------------------------------------------------------------ }
+
+Function EdText(W : LongInt) : String;
+Begin
+  If Wnds^[W].LongTxt <> 0 Then EdText := PStr(Wnds^[W].LongTxt)
+  Else EdText := Wnds^[W].Text;
+End;
+
+Procedure EdSet(W : LongInt; Const S : String);
+Var T : String;
+Begin
+  T := S + #0;
+  WndSetTextZ(W, LongInt(@T[1]));
+End;
+
+Function EdLimit(W : LongInt) : LongInt;
+Begin
+  If (Wnds^[W].K4 <= 0) Or (Wnds^[W].K4 > 255) Then EdLimit := 255
+  Else EdLimit := Wnds^[W].K4;
+End;
+
+{ selection [A, B[ ; faux si vide }
+Function EdSel(W : LongInt; Var A, B : LongInt) : Boolean;
+Begin
+  A := Wnds^[W].K1; B := A;
+  If Wnds^[W].K2 > 0 Then
+  Begin
+    A := Min(Wnds^[W].K2 - 1, Wnds^[W].K1);
+    B := Max(Wnds^[W].K2 - 1, Wnds^[W].K1);
+  End;
+  EdSel := B > A;
+End;
+
+Procedure EdClamp(W : LongInt);
+Var L : LongInt;
+Begin
+  L := Length(EdText(W));
+  If Wnds^[W].K1 < 0 Then Wnds^[W].K1 := 0;
+  If Wnds^[W].K1 > L Then Wnds^[W].K1 := L;
+  If Wnds^[W].K2 > L + 1 Then Wnds^[W].K2 := L + 1;
+  If Wnds^[W].K2 = Wnds^[W].K1 + 1 Then Wnds^[W].K2 := 0;
+End;
+
+{ remplace la selection par S (insertion au curseur sans selection) }
+Procedure EdReplace(W : LongInt; Const S : String);
+Var T, U : String; A, B, N : LongInt;
+Begin
+  T := EdText(W);
+  Dummy := Ord(EdSel(W, A, B));
+  U := S;
+  N := EdLimit(W) - (Length(T) - (B - A));
+  If N < 0 Then N := 0;
+  If Length(U) > N Then U := Copy(U, 1, N);
+  T := Copy(T, 1, A) + U + Copy(T, B + 1, 255);
+  EdSet(W, T);
+  Wnds^[W].K1 := A + Length(U);
+  Wnds^[W].K2 := 0;
+  Notify(W, $300);
+End;
+
+Procedure EdCopy(W : LongInt);
+Var A, B, Own : LongInt; T : String;
+Begin
+  If Not EdSel(W, A, B) Then Exit;
+  If (Wnds^[W].Style And $20) <> 0 Then Exit;
+  T := Copy(EdText(W), A + 1, B - A);
+  If ClipBuf <> 0 Then KFree(ClipBuf);
+  Own := HeapOwner; HeapOwner := 0;
+  ClipBuf := KAlloc(Length(T) + 1);
+  HeapOwner := Own;
+  ClipLen := 0;
+  If ClipBuf = 0 Then Exit;
+  PutPStr(ClipBuf, T, Length(T) + 1);
+  ClipLen := Length(T);
+End;
+
+Procedure EdPaste(W : LongInt);
+Var T : String; I : LongInt;
+Begin
+  If (ClipBuf = 0) Or (ClipLen <= 0) Then Exit;
+  T := '';
+  I := 0;
+  While (I < ClipLen) And (I < 255) And (Mem[0:ClipBuf + I] <> 13) And
+        (Mem[0:ClipBuf + I] <> 10) Do
+  Begin
+    If Mem[0:ClipBuf + I] >= 32 Then T := T + Chr(Mem[0:ClipBuf + I]);
+    Inc(I);
+  End;
+  EdReplace(W, T);
+End;
+
+{ touche (WM_KEYDOWN) : deplacements, Maj : selection, Suppr }
+Procedure EdKey(W, VK : LongInt);
+Var Sh : Boolean; A, B : LongInt; T : String;
+Begin
+  Sh := (KeyState[$10] And $80) <> 0;
+  T := EdText(W);
+  If VK = $2E Then
+  Begin
+    If Not EdSel(W, A, B) Then
+    Begin
+      If Wnds^[W].K1 >= Length(T) Then Exit;
+      Wnds^[W].K2 := Wnds^[W].K1 + 2;
+    End;
+    EdReplace(W, '');
+    InvalAll(W, True);
+    Exit;
+  End;
+  If Not (VK In [$23, $24, $25, $27]) Then Exit;
+  If Sh Then
+  Begin
+    If Wnds^[W].K2 = 0 Then Wnds^[W].K2 := Wnds^[W].K1 + 1;
+  End
+  Else If EdSel(W, A, B) And (VK In [$25, $27]) Then
+  Begin
+    If VK = $25 Then Wnds^[W].K1 := A Else Wnds^[W].K1 := B;
+    Wnds^[W].K2 := 0;
+    InvalAll(W, True);
+    Exit;
+  End
+  Else Wnds^[W].K2 := 0;
+  Case VK Of
+    $25 : Dec(Wnds^[W].K1);
+    $27 : Inc(Wnds^[W].K1);
+    $24 : Wnds^[W].K1 := 0;
+    $23 : Wnds^[W].K1 := Length(T);
+  End;
+  EdClamp(W);
+  InvalAll(W, True);
+End;
+
+Procedure EdChar(W, Ch : LongInt);
+Var A, B : LongInt;
+Begin
+  Case Ch Of
+    1 :
+    Begin
+      Wnds^[W].K2 := 1; Wnds^[W].K1 := Length(EdText(W));
+      EdClamp(W);
+    End;
+    3 : EdCopy(W);
+    22 : EdPaste(W);
+    24 :
+    Begin
+      EdCopy(W);
+      If EdSel(W, A, B) Then EdReplace(W, '');
+    End;
+    8 :
+    Begin
+      If Not EdSel(W, A, B) Then
+      Begin
+        If Wnds^[W].K1 = 0 Then Exit;
+        Wnds^[W].K2 := Wnds^[W].K1;
+      End;
+      EdReplace(W, '');
+    End;
+  Else
+    If Ch >= 32 Then EdReplace(W, Chr(Ch And 255)) Else Exit;
+  End;
+  InvalAll(W, True);
+End;
+
+{ caractere sous la position X (client) }
+Function EdHit(W, X : LongInt) : LongInt;
+Begin
+  If X < 4 Then X := 4;
+  EdHit := Wnds^[W].K3 + (X - 4 + 4) Div 8;
+End;
+
+{ messages propres au champ d'une ligne ; vrai si traite }
+Function EdMsg(W, Msg, WP, LP : LongInt; Var R : LongInt) : Boolean;
+Var A, B, X : LongInt;
+Begin
+  EdMsg := True;
+  R := 0;
+  X := LP And $FFFF;
+  If X >= 32768 Then X := X - 65536;
+  Case Msg Of
+    WM_KEYDOWN : EdKey(W, WP);
+    WM_CHAR : EdChar(W, WP);
+    WM_SETFOCUS, WM_KILLFOCUS : InvalAll(W, True);
+    WM_LBUTTONDOWN :
+    Begin
+      Wnds^[W].K1 := EdHit(W, X);
+      EdClamp(W);
+      Wnds^[W].K2 := Wnds^[W].K1 + 1;
+      CaptureWin := W;
+      InvalAll(W, True);
+    End;
+    WM_MOUSEMOVE :
+      If CaptureWin = W Then
+      Begin
+        Wnds^[W].K1 := EdHit(W, X);
+        If X > Wnds^[W].W - 4 Then Inc(Wnds^[W].K1);
+        EdClamp(W);
+        InvalAll(W, True);
+      End;
+    WM_LBUTTONUP :
+    Begin
+      If CaptureWin = W Then CaptureWin := -1;
+      EdClamp(W);
+      InvalAll(W, True);
+    End;
+    WM_LBUTTONDBLCLK :
+    Begin
+      Wnds^[W].K2 := 1; Wnds^[W].K1 := Length(EdText(W));
+      EdClamp(W);
+      InvalAll(W, True);
+    End;
+    WM_SETTEXT :
+    Begin
+      WndSetTextZ(W, LP);
+      Wnds^[W].K1 := Length(EdText(W)); Wnds^[W].K2 := 0;
+      Wnds^[W].K3 := 0;
+      R := 1;
+      InvalAll(W, True);
+    End;
+    $B0 :
+    Begin
+      Dummy := Ord(EdSel(W, A, B));
+      If WP <> 0 Then MemL[0:WP] := A;
+      If LP <> 0 Then MemL[0:LP] := B;
+      R := A Or (B Shl 16);
+    End;
+    $B1 :
+    Begin
+      A := WP; B := LP;
+      If (B < 0) Or (B > Length(EdText(W))) Then B := Length(EdText(W));
+      If A < 0 Then
+      Begin
+        Wnds^[W].K2 := 0;
+        Wnds^[W].K1 := B;
+      End
+      Else
+      Begin
+        Wnds^[W].K2 := A + 1;
+        Wnds^[W].K1 := B;
+      End;
+      EdClamp(W);
+      InvalAll(W, True);
+    End;
+    $C2 :
+    Begin
+      If LP <> 0 Then EdReplace(W, PStr(LP));
+      InvalAll(W, True);
+    End;
+    $C5 : Wnds^[W].K4 := WP;
+  Else
+    EdMsg := False;
+  End;
+End;
+
+{ dessin : texte defilant, selection (si le champ a le focus), curseur }
+Procedure EdDraw(W, X1, Y1, X2, Y2 : LongInt);
+Var T, V : String; Vis, A, B, I, Y, C : LongInt; Foc, Sel : Boolean;
+Begin
+  If Wnds^[W].Enabled Then Sunken(X1, Y1, X2, Y2, cWhite)
+  Else Sunken(X1, Y1, X2, Y2, cSilver);
+  T := EdText(W);
+  If (Wnds^[W].Style And $20) <> 0 Then
+    For I := 1 To Length(T) Do T[I] := '*';
+  EdClamp(W);
+  Vis := (Wnds^[W].W - 8) Div 8;
+  If Vis < 1 Then Vis := 1;
+  If Wnds^[W].K1 < Wnds^[W].K3 Then Wnds^[W].K3 := Wnds^[W].K1;
+  If Wnds^[W].K1 > Wnds^[W].K3 + Vis - 1 Then
+    Wnds^[W].K3 := Wnds^[W].K1 - Vis + 1;
+  If Wnds^[W].K3 > Max(0, Length(T) - Vis + 1) Then
+    Wnds^[W].K3 := Max(0, Length(T) - Vis + 1);
+  If Wnds^[W].K3 < 0 Then Wnds^[W].K3 := 0;
+  V := Copy(T, Wnds^[W].K3 + 1, Vis);
+  Y := Y1 + (Wnds^[W].H - 16) Div 2;
+  Foc := W = FocusWin;
+  Sel := Foc And EdSel(W, A, B);
+  If Wnds^[W].Enabled Then C := cBlack Else C := cGray;
+  For I := 1 To Length(V) Do
+    If Sel And (Wnds^[W].K3 + I - 1 >= A) And (Wnds^[W].K3 + I - 1 < B)
+    Then
+    Begin
+      FBar(X1 + 4 + (I - 1) * 8, Y, X1 + 11 + (I - 1) * 8, Y + 15, cNavy);
+      DrawChar(X1 + 4 + (I - 1) * 8, Y, V[I], cWhite);
+    End
+    Else DrawChar(X1 + 4 + (I - 1) * 8, Y, V[I], C);
+  If Foc Then
+    VLine(X1 + 4 + (Wnds^[W].K1 - Wnds^[W].K3) * 8, Y1 + 3, Y2 - 3,
+          cBlack);
+End;
+
+{ ------------------------------------------------------------------ }
+{ Barre de defilement (SCROLLBAR, SBS_VERT = 1) : K1 minimum, K2      }
+{ maximum, K3 position, K4 glissement du curseur (0 : aucun, sinon    }
+{ decalage + 1) ; HScrollPos : position pendant le glissement         }
+{ ------------------------------------------------------------------ }
+
+Function SbVert(W : LongInt) : Boolean;
+Begin
+  SbVert := (Wnds^[W].Style And 1) <> 0;
+End;
+
+{ longueur (le long de la barre) et epaisseur }
+Procedure SbDims(W : LongInt; Var L, T : LongInt);
+Begin
+  If SbVert(W) Then
+  Begin
+    L := Wnds^[W].H; T := Wnds^[W].W;
+  End
+  Else
+  Begin
+    L := Wnds^[W].W; T := Wnds^[W].H;
+  End;
+  If T > L Div 2 Then T := L Div 2;
+  If T < 1 Then T := 1;
+End;
+
+Function SbActive(W : LongInt) : Boolean;
+Begin
+  SbActive := Wnds^[W].Enabled And (Wnds^[W].K2 > Wnds^[W].K1);
+End;
+
+{ debut du curseur (le long de la barre) pour la position P }
+Function SbThumb(W, P : LongInt) : LongInt;
+Var L, T, Tr : LongInt;
+Begin
+  SbDims(W, L, T);
+  Tr := L - 3 * T;
+  If (Tr <= 0) Or (Wnds^[W].K2 <= Wnds^[W].K1) Then SbThumb := T
+  Else SbThumb := T + ((P - Wnds^[W].K1) * Tr) Div
+                      (Wnds^[W].K2 - Wnds^[W].K1);
+End;
+
+Procedure SbArrow(X1, Y1, X2, Y2, Dir : LongInt; C : LongInt);
+Var Cx, Cy, I : LongInt;
+Begin
+  Raised(X1, Y1, X2, Y2, False);
+  Cx := (X1 + X2) Div 2; Cy := (Y1 + Y2) Div 2;
+  For I := 0 To 3 Do
+    Case Dir Of
+      0 : HLine(Cx - I, Cx + I, Cy - 2 + I, C);
+      1 : HLine(Cx - I, Cx + I, Cy + 1 - I, C);
+      2 : VLine(Cx - 2 + I, Cy - I, Cy + I, C);
+    Else
+      VLine(Cx + 1 - I, Cy - I, Cy + I, C);
+    End;
+End;
+
+Procedure SbDraw(W, X1, Y1, X2, Y2 : LongInt);
+Var L, T, P, Th, C : LongInt;
+Begin
+  SbDims(W, L, T);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  Dither(X1, Y1, X2, Y2, cWhite, 0);
+  If SbActive(W) Then C := cBlack Else C := cGray;
+  If Wnds^[W].K4 > 0 Then P := Wnds^[W].HScrollPos Else P := Wnds^[W].K3;
+  Th := SbThumb(W, P);
+  If SbVert(W) Then
+  Begin
+    SbArrow(X1, Y1, X2, Y1 + T - 1, 0, C);
+    SbArrow(X1, Y2 - T + 1, X2, Y2, 1, C);
+    If SbActive(W) Then Raised(X1, Y1 + Th, X2, Y1 + Th + T - 1, False);
+  End
+  Else
+  Begin
+    SbArrow(X1, Y1, X1 + T - 1, Y2, 2, C);
+    SbArrow(X2 - T + 1, Y1, X2, Y2, 3, C);
+    If SbActive(W) Then Raised(X1 + Th, Y1, X1 + Th + T - 1, Y2, False);
+  End;
+End;
+
+{ WM_VSCROLL / WM_HSCROLL au parent }
+Procedure SbSend(W, Code, P : LongInt);
+Var M : LongInt;
+Begin
+  If Wnds^[W].Parent < 0 Then Exit;
+  If SbVert(W) Then M := WM_VSCROLL Else M := WM_HSCROLL;
+  PostMsgW(Wnds^[W].Parent, M, (Code And $FFFF) Or ((P And $FFFF) Shl 16),
+           HwndOf(W));
+End;
+
+Function SbMsg(W, Msg, WP, LP : LongInt; Var R : LongInt) : Boolean;
+Var L, T, X, Y, A, Th, P : LongInt;
+Begin
+  SbMsg := True;
+  R := 0;
+  X := LP And $FFFF; If X >= 32768 Then X := X - 65536;
+  Y := (LP Shr 16) And $FFFF; If Y >= 32768 Then Y := Y - 65536;
+  If SbVert(W) Then A := Y Else A := X;
+  SbDims(W, L, T);
+  Case Msg Of
+    WM_LBUTTONDOWN, WM_LBUTTONDBLCLK :
+      If SbActive(W) Then
+      Begin
+        Th := SbThumb(W, Wnds^[W].K3);
+        If A < T Then SbSend(W, 0, 0)
+        Else If A >= L - T Then SbSend(W, 1, 0)
+        Else If A < Th Then SbSend(W, 2, 0)
+        Else If A >= Th + T Then SbSend(W, 3, 0)
+        Else
+        Begin
+          Wnds^[W].K4 := A - Th + 1;
+          Wnds^[W].HScrollPos := Wnds^[W].K3;
+          CaptureWin := W;
+          InvalAll(W, True);
+        End;
+      End;
+    WM_MOUSEMOVE :
+      If (Wnds^[W].K4 > 0) And (CaptureWin = W) Then
+      Begin
+        P := A - (Wnds^[W].K4 - 1) - T;
+        If L - 3 * T > 0 Then
+          P := Wnds^[W].K1 + (P * (Wnds^[W].K2 - Wnds^[W].K1) +
+               (L - 3 * T) Div 2) Div (L - 3 * T)
+        Else P := Wnds^[W].K1;
+        If P < Wnds^[W].K1 Then P := Wnds^[W].K1;
+        If P > Wnds^[W].K2 Then P := Wnds^[W].K2;
+        If P <> Wnds^[W].HScrollPos Then
+        Begin
+          Wnds^[W].HScrollPos := P;
+          InvalAll(W, True);
+          SbSend(W, 5, P);
+        End;
+      End;
+    WM_LBUTTONUP :
+    Begin
+      If Wnds^[W].K4 > 0 Then
+      Begin
+        Wnds^[W].K4 := 0;
+        Wnds^[W].K3 := Wnds^[W].HScrollPos;
+        SbSend(W, 4, Wnds^[W].K3);
+        InvalAll(W, True);
+      End;
+      If CaptureWin = W Then CaptureWin := -1;
+      SbSend(W, 8, 0);
+    End;
+    $E0 :
+    Begin
+      R := Wnds^[W].K3;
+      P := WP;
+      If P > Wnds^[W].K2 Then P := Wnds^[W].K2;
+      If P < Wnds^[W].K1 Then P := Wnds^[W].K1;
+      Wnds^[W].K3 := P;
+      If LP <> 0 Then InvalAll(W, True);
+    End;
+    $E1 : R := Wnds^[W].K3;
+    $E2, $E6 :
+    Begin
+      Wnds^[W].K1 := WP; Wnds^[W].K2 := LP;
+      If Wnds^[W].K3 > LP Then Wnds^[W].K3 := LP;
+      If Wnds^[W].K3 < WP Then Wnds^[W].K3 := WP;
+      If (Msg = $E6) Or (LP <> WP) Then InvalAll(W, True);
+      R := 1;
+    End;
+    $E3 :
+    Begin
+      If WP <> 0 Then MemL[0:WP] := Wnds^[W].K1;
+      If LP <> 0 Then MemL[0:LP] := Wnds^[W].K2;
+    End;
+  Else
+    SbMsg := False;
+  End;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Liste (LISTBOX) : K1 nombre d'elements, K2 selection, K3 premier    }
+{ element visible ; barre de defilement interne si elle deborde       }
+{ ------------------------------------------------------------------ }
+
+Function LbRows(W : LongInt) : LongInt;
+Begin
+  LbRows := Max(1, (Wnds^[W].H - 4) Div 16);
+End;
+
+Function LbOver(W : LongInt) : Boolean;
+Begin
+  LbOver := (Wnds^[W].IKind = ikListBox) And (Wnds^[W].K1 > LbRows(W));
+End;
+
+Procedure LbShow(W, I : LongInt);
+Var N : LongInt;
+Begin
+  N := LbRows(W);
+  If I < Wnds^[W].K3 Then Wnds^[W].K3 := I;
+  If I >= Wnds^[W].K3 + N Then Wnds^[W].K3 := I - N + 1;
+  If Wnds^[W].K3 > Max(0, Wnds^[W].K1 - N) Then
+    Wnds^[W].K3 := Max(0, Wnds^[W].K1 - N);
+  If Wnds^[W].K3 < 0 Then Wnds^[W].K3 := 0;
+End;
+
+Procedure LbDraw(W, X1, Y1, X2, Y2 : LongInt);
+Var A, I, N, R, Th, Tr : LongInt;
+Begin
+  Sunken(X1, Y1, X2, Y2, cWhite);
+  A := Wnds^[W].Extra;
+  N := LbRows(W);
+  LbShow(W, Wnds^[W].K3);
+  R := X2 - 2;
+  If LbOver(W) Then R := X2 - 18;
+  ClipX2 := Min(ClipX2, R);
+  For I := 0 To N - 1 Do
+    If Wnds^[W].K3 + I < Wnds^[W].K1 Then
+      If Wnds^[W].K3 + I = Wnds^[W].K2 Then
+      Begin
+        FBar(X1 + 2, Y1 + 2 + I * 16, R, Y1 + 17 + I * 16, cNavy);
+        OutTxt(X1 + 4, Y1 + 2 + I * 16,
+               PStr(MemL[0:A + (Wnds^[W].K3 + I) * 4]), cWhite);
+      End
+      Else
+        OutTxt(X1 + 4, Y1 + 2 + I * 16,
+               PStr(MemL[0:A + (Wnds^[W].K3 + I) * 4]), cBlack);
+  ClipX2 := X2;
+  If Not LbOver(W) Then Exit;
+  { barre de defilement verticale, comme Windows 95 }
+  FBar(X2 - 17, Y1 + 2, X2 - 2, Y2 - 2, cSilver);
+  Dither(X2 - 17, Y1 + 2, X2 - 2, Y2 - 2, cWhite, 0);
+  SbArrow(X2 - 17, Y1 + 2, X2 - 2, Y1 + 17, 0, cBlack);
+  SbArrow(X2 - 17, Y2 - 17, X2 - 2, Y2 - 2, 1, cBlack);
+  Tr := (Y2 - Y1 - 4) - 48;
+  If Tr > 0 Then
+  Begin
+    Th := Y1 + 18 + (Wnds^[W].K3 * Tr) Div Max(1, Wnds^[W].K1 - N);
+    Raised(X2 - 17, Th, X2 - 2, Th + 15, False);
+  End;
+End;
+
+Function LbMsg(W, Msg, WP, LP : LongInt; Var R : LongInt) : Boolean;
+Var X, Y, I, N : LongInt;
+Begin
+  LbMsg := True;
+  R := 0;
+  X := LP And $FFFF; Y := (LP Shr 16) And $FFFF;
+  N := LbRows(W);
+  Case Msg Of
+    WM_LBUTTONDOWN :
+      If LbOver(W) And (X >= Wnds^[W].W - 18) Then
+      Begin
+        If Y < 18 Then Dec(Wnds^[W].K3)
+        Else If Y >= Wnds^[W].H - 18 Then Inc(Wnds^[W].K3)
+        Else If Y < Wnds^[W].H Div 2 Then Wnds^[W].K3 := Wnds^[W].K3 - N
+        Else Wnds^[W].K3 := Wnds^[W].K3 + N;
+        LbShow(W, Wnds^[W].K3);
+        InvalAll(W, True);
+      End
+      Else
+      Begin
+        I := Wnds^[W].K3 + (Y - 2) Div 16;
+        If (Y >= 2) And (I >= 0) And (I < Wnds^[W].K1) Then
+        Begin
+          Wnds^[W].K2 := I;
+          InvalAll(W, True);
+          Notify(W, 1);
+        End;
+      End;
+    WM_LBUTTONDBLCLK :
+      If Not (LbOver(W) And (X >= Wnds^[W].W - 18)) Then Notify(W, 2);
+    WM_KEYDOWN :
+    Begin
+      I := Wnds^[W].K2;
+      Case WP Of
+        $26 : Dec(I);
+        $28 : Inc(I);
+        $21 : I := I - N;
+        $22 : I := I + N;
+        $24 : I := 0;
+        $23 : I := Wnds^[W].K1 - 1;
+      Else
+        Exit;
+      End;
+      If I >= Wnds^[W].K1 Then I := Wnds^[W].K1 - 1;
+      If I < 0 Then I := 0;
+      If Wnds^[W].K1 = 0 Then Exit;
+      Wnds^[W].K2 := I;
+      LbShow(W, I);
+      InvalAll(W, True);
+      Notify(W, 1);
+    End;
+    LB_SETCURSEL :
+    Begin
+      Wnds^[W].K2 := WP;
+      If WP >= 0 Then LbShow(W, WP);
+      InvalAll(W, True);
+    End;
+    $197 :
+    Begin
+      Wnds^[W].K3 := WP;
+      LbShow(W, WP);
+      InvalAll(W, True);
+    End;
+    $18E : R := Wnds^[W].K3;
+  Else
+    LbMsg := False;
+  End;
+End;
+
 { Procedure des controles et des fenetres internes }
 Function KWndProc(W, Msg, WP, LP : LongInt) : LongInt;
 Var Typ, I, N : LongInt; S : String;
@@ -20613,6 +21254,25 @@ Begin
       Exit;
     End;
   End;
+  { controles : champ d'une ligne, barre de defilement, liste }
+  If (Wnds^[W].IKind = ikEdit) And ((Wnds^[W].Style And 4) = 0) Then
+    If EdMsg(W, Msg, WP, LP, N) Then
+    Begin
+      KWndProc := N;
+      Exit;
+    End;
+  If Wnds^[W].IKind = ikScrollBar Then
+    If SbMsg(W, Msg, WP, LP, N) Then
+    Begin
+      KWndProc := N;
+      Exit;
+    End;
+  If Wnds^[W].IKind = ikListBox Then
+    If LbMsg(W, Msg, WP, LP, N) Then
+    Begin
+      KWndProc := N;
+      Exit;
+    End;
   Case Msg Of
     WM_NCCREATE : KWndProc := 1;
     WM_CREATE :
@@ -23231,7 +23891,7 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
-{ Fichiers .INI (lecture ; les ecritures sont ignorees)              }
+{ Fichiers .INI (lecture et ecriture)                                }
 { ------------------------------------------------------------------ }
 
 Function IniPath(F : String) : String;
@@ -23244,12 +23904,30 @@ Begin
   IniPath := F;
 End;
 
+{ Fichier .INI ou ecrire : le CD-ROM (D:) est en lecture seule, le
+  fichier va alors sur C: (disque en memoire au demarrage du CD) }
+Function IniWrPath(F : String) : String;
+Begin
+  F := IniPath(F);
+  If UpStr(Copy(F, 1, 2)) = 'D:' Then F := 'C:' + BaseName(F);
+  IniWrPath := F;
+End;
+
+{ Contenu du fichier (la copie modifiee d'abord) ; adresse ou 0 }
+Function IniLoad(F : String; Var Size : LongInt) : LongInt;
+Var A : LongInt;
+Begin
+  A := LoadWholeFile(IniWrPath(F), Size);
+  If A = 0 Then A := LoadWholeFile(IniPath(F), Size);
+  IniLoad := A;
+End;
+
 { Valeur Key de la section Sect du fichier F ; False si absente }
 Function IniGet(F, Sect, Key : String; Var V : String) : Boolean;
 Var A, Size, P : LongInt; Line, Cur : String; C : LongInt; InSect : Boolean;
 Begin
   IniGet := False;
-  A := LoadWholeFile(IniPath(F), Size);
+  A := IniLoad(F, Size);
   If A = 0 Then Exit;
   Sect := UpStr(Sect); Key := UpStr(Key);
   InSect := False; Line := '';
@@ -23287,7 +23965,7 @@ Begin
   IniEnum := 0;
   If N < 2 Then Exit;
   Mem[0:Buf] := 0; Mem[0:Buf + 1] := 0;
-  A := LoadWholeFile(IniPath(F), Size);
+  A := IniLoad(F, Size);
   If A = 0 Then Exit;
   Sect := UpStr(Sect);
   InSect := False; Line := ''; O := 0;
@@ -23367,9 +24045,97 @@ Begin
   WriteProfileStringA := 1;
 End;
 
-Function WritePrivateProfileStringA(App, Key, V, F : LongInt) : LongInt;
+{ Ecriture d'une valeur : Key = '' supprime la section, Del supprime la
+  cle ; le fichier est reecrit en entier }
+Function IniPut(F, Sect, Key, V : String; Del : Boolean) : Boolean;
+Var A, Size, P, C, T, K, H, Own : LongInt; Line, Cur : String;
+    InSect, Found, Done : Boolean;
+
+  Procedure Out(Const S : String);
+  Var J : LongInt;
+  Begin
+    For J := 1 To Length(S) Do
+    Begin
+      Mem[0:T + K] := Ord(S[J]); Inc(K);
+    End;
+    Mem[0:T + K] := 13; Mem[0:T + K + 1] := 10; K := K + 2;
+  End;
+
 Begin
-  WritePrivateProfileStringA := 1;
+  IniPut := False;
+  A := IniLoad(F, Size);
+  If A = 0 Then Size := 0;
+  Own := HeapOwner; HeapOwner := 0;
+  T := KAlloc(Size * 2 + Length(Sect) + Length(Key) + Length(V) + 64);
+  HeapOwner := Own;
+  If T = 0 Then
+  Begin
+    If A <> 0 Then KFree(A);
+    Exit;
+  End;
+  K := 0; InSect := False; Found := False; Done := False; Line := '';
+  For P := 0 To Size Do
+  Begin
+    If P < Size Then C := Mem[0:A + P] Else C := 10;
+    If C = 13 Then Continue;
+    If C = 10 Then
+    Begin
+      If (P = Size) And (Line = '') Then Break;
+      Cur := Trim(Line);
+      If (Length(Cur) > 1) And (Cur[1] = '[') Then
+      Begin
+        If InSect And Not Done And (Key <> '') And Not Del Then
+        Begin
+          Out(Key + '=' + V);
+          Done := True;
+        End;
+        InSect := UpStr(Trim(Copy(Cur, 2, Pos(']', Cur) - 2))) =
+                  UpStr(Sect);
+        If InSect Then Found := True;
+        If Not (InSect And (Key = '')) Then Out(Line);
+      End
+      Else If InSect And (Key = '') Then
+      Else If InSect And (Pos('=', Cur) > 0) And
+              (UpStr(Trim(Copy(Cur, 1, Pos('=', Cur) - 1))) = UpStr(Key))
+      Then
+      Begin
+        If Not Del And Not Done Then Out(Key + '=' + V);
+        Done := True;
+      End
+      Else Out(Line);
+      Line := '';
+    End
+    Else If Length(Line) < 250 Then Line := Line + Chr(C);
+  End;
+  If (Key <> '') And Not Del And Not Done Then
+  Begin
+    If Not Found Then Out('[' + Sect + ']');
+    Out(Key + '=' + V);
+  End;
+  If A <> 0 Then KFree(A);
+  H := KOpenFile(IniWrPath(F), True, 2);
+  If H <> INVALID_HANDLE Then
+  Begin
+    IniPut := KWriteFile(H, T, K) = K;
+    CloseHandle(H);
+  End;
+  KFree(T);
+End;
+
+Function WritePrivateProfileStringA(App, Key, V, F : LongInt) : LongInt;
+Var Fn : String;
+Begin
+  WritePrivateProfileStringA := 0;
+  If (App = 0) Or (F = 0) Then Exit;
+  Fn := PStr(F);
+  If Key = 0 Then
+    WritePrivateProfileStringA := Ord(IniPut(Fn, PStr(App), '', '', True))
+  Else If V = 0 Then
+    WritePrivateProfileStringA := Ord(IniPut(Fn, PStr(App), PStr(Key), '',
+                                             True))
+  Else
+    WritePrivateProfileStringA := Ord(IniPut(Fn, PStr(App), PStr(Key),
+                                             PStr(V), False));
 End;
 
 { ------------------------------------------------------------------ }
@@ -25623,10 +26389,47 @@ End;
 { Texte (police 8x16)                                                }
 { ------------------------------------------------------------------ }
 
-Procedure TextAt(D, X, Y, Str, N, Opt, PRect : LongInt);
-Var I, C, Bg, W, A : LongInt; R : TRect;
+{ Taille des caracteres de la police du DC : 8x16, ou agrandie (12x24,
+  16x32) pour une police demandee de 20 points ou plus (CreateFontA) }
+Procedure FontDims(D : LongInt; Var Cw, Chh : LongInt);
+Var H : LongInt;
 Begin
-  W := N * 8;
+  Cw := 8; Chh := 16;
+  If (D < 0) Or (Dcs[D].Font < 0) Then Exit;
+  If Gdis^[Dcs[D].Font].Kind <> goFont Then Exit;
+  H := Abs(Gdis^[Dcs[D].Font].I1);
+  If H >= 28 Then
+  Begin
+    Cw := 16; Chh := 32;
+  End
+  Else If H >= 20 Then
+  Begin
+    Cw := 12; Chh := 24;
+  End;
+End;
+
+{ Caractere agrandi : la police 8x16 etiree (plus proche voisin) }
+Procedure DrawCharS(X, Y : LongInt; Ch : Char; C, Cw, Chh : LongInt);
+Var R, CX, B, F : LongInt;
+Begin
+  If (X > ClipX2) Or (X + Cw - 1 < ClipX1) Or (Y > ClipY2) Or
+     (Y + Chh - 1 < ClipY1) Then Exit;
+  F := FontAddr + Ord(Ch) * 16;
+  For R := 0 To Chh - 1 Do
+  Begin
+    B := Mem[0:F + (R * 16) Div Chh];
+    If B <> 0 Then
+      For CX := 0 To Cw - 1 Do
+        If (B And ($80 Shr ((CX * 8) Div Cw))) <> 0 Then
+          Pix(X + CX, Y + R, C);
+  End;
+End;
+
+Procedure TextAt(D, X, Y, Str, N, Opt, PRect : LongInt);
+Var I, C, Bg, W, A, Cw, Chh : LongInt; R : TRect;
+Begin
+  FontDims(D, Cw, Chh);
+  W := N * Cw;
   A := Dcs[D].TextAlign;
   If (A And 1) <> 0 Then
   Begin
@@ -25652,9 +26455,13 @@ Begin
     ClipX2 := Min(ClipX2, R.R - 1); ClipY2 := Min(ClipY2, R.B - 1);
   End;
   If (Dcs[D].BkMode = 2) And ((Opt And 2) = 0) Then
-    FBar(X, Y, X + W - 1, Y + 15, Bg);
-  For I := 0 To N - 1 Do DrawChar(X + I * 8, Y, Chr(Mem[0:Str + I]), C);
-  DcDirty(X, Y, X + W, Y + 16);
+    FBar(X, Y, X + W - 1, Y + Chh - 1, Bg);
+  If Cw = 8 Then
+    For I := 0 To N - 1 Do DrawChar(X + I * 8, Y, Chr(Mem[0:Str + I]), C)
+  Else
+    For I := 0 To N - 1 Do
+      DrawCharS(X + I * Cw, Y, Chr(Mem[0:Str + I]), C, Cw, Chh);
+  DcDirty(X, Y, X + W, Y + Chh);
 End;
 
 Function TextOutA(Hdc, X, Y, Str, N : LongInt) : LongInt;
@@ -25674,8 +26481,10 @@ Begin
 End;
 
 Function GetTextExtentPointA(Hdc, Str, N, P : LongInt) : LongInt;
+Var Cw, Chh : LongInt;
 Begin
-  MemL[0:P] := N * 8; MemL[0:P + 4] := 16;
+  FontDims(DcOf(Hdc), Cw, Chh);
+  MemL[0:P] := N * Cw; MemL[0:P + 4] := Chh;
   GetTextExtentPointA := 1;
 End;
 
@@ -28434,6 +29243,11 @@ Begin
   SetScrollPos := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
+  If (Bar = 2) And (Wnds^[W].IKind = ikScrollBar) Then
+  Begin
+    SetScrollPos := KWndProc(W, $E0, Pos0, 1);
+    Exit;
+  End;
   If Bar = 1 Then
   Begin
     SetScrollPos := Wnds^[W].VScrollPos; Wnds^[W].VScrollPos := Pos0;
@@ -28450,13 +29264,19 @@ Begin
   GetScrollPos := 0;
   W := WndOf(H);
   If W < 0 Then Exit;
-  If Bar = 1 Then GetScrollPos := Wnds^[W].VScrollPos
+  If (Bar = 2) And (Wnds^[W].IKind = ikScrollBar) Then
+    GetScrollPos := Wnds^[W].K3
+  Else If Bar = 1 Then GetScrollPos := Wnds^[W].VScrollPos
   Else GetScrollPos := Wnds^[W].HScrollPos;
 End;
 
 Function SetScrollRange(H, Bar, Mn, Mx, Redraw : LongInt) : LongInt;
+Var W : LongInt;
 Begin
   SetScrollRange := 1;
+  W := WndOf(H);
+  If (W >= 0) And (Bar = 2) And (Wnds^[W].IKind = ikScrollBar) Then
+    Dummy := KWndProc(W, $E6, Mn, Mx);
 End;
 
 Function ShowScrollBar(H, Bar, Show : LongInt) : LongInt;
@@ -29862,7 +30682,18 @@ Begin
     WM_MOUSEACTIVATE : DefWindowProcA := 1;
     WM_NCHITTEST : DefWindowProcA := 1;
     WM_ACTIVATE :
-      If (WP And $FFFF) <> 0 Then SetFocusW(W);
+      { message poste apres l'activation : un enfant qui a deja recu le
+        focus (SetFocus apres ShowWindow) le garde ; sinon le dernier
+        enfant qui l'avait, sinon la fenetre }
+      If (WP And $FFFF) <> 0 Then
+      Begin
+        C := Wnds^[W].FocusChild - 1;
+        If (FocusWin >= 0) And Wnds^[FocusWin].Used And
+           IsChildW(FocusWin) And (TopOf(FocusWin) = W) Then
+        Else If (C >= 0) And Wnds^[C].Used And IsChildW(C) And
+                (TopOf(C) = W) And WndVisible(C) Then SetFocusW(C)
+        Else SetFocusW(W);
+      End;
     WM_CTLCOLORMSGBOX..WM_CTLCOLORSTATIC :
     Begin
       SetBkColor(WP, $C0C0C0);
@@ -60822,6 +61653,8 @@ Type
     HdrLen : LongInt;
     IB : Array[0..HtIBSize - 1] Of Byte;
     IPos, IEnd : LongInt;
+    Verb : String[15];                 { HttpOpenRequestA }
+    NoRedir : Boolean;                 { INTERNET_FLAG_NO_AUTO_REDIRECT }
   End;
 
   PHtReq = ^HtReq;
@@ -60947,10 +61780,71 @@ Begin
   R.Conn := -1;
 End;
 
-{ envoie la requete GET et lit les en-tetes ; suit les redirections }
-Function HtGet(Var R : HtReq; Const Agent : String; Extra : TlPtr;
-  ExtraLen : LongInt) : Boolean;
-Var Https : Boolean; Host : String; Port, Path, Hops, I, C, O, L,
+Var
+  InetPxHost : String;       { proxy (InternetOpenA, type PROXY) }
+  InetPxPort : LongInt;
+
+{ Connexion au serveur : directe, ou par le proxy HTTP (requete en
+  adresse absolue ; pour https://, tunnel CONNECT puis TLS de bout en
+  bout) ; rend le numero de connexion ou -1 }
+Function HtConnect(Const Host : String; Port : LongInt; Https : Boolean)
+  : LongInt;
+Var I, K, C, Lf, St : LongInt; Q : String; B : Array[0..255] Of Byte;
+    Ok : Boolean;
+Begin
+  If InetPxHost = '' Then
+  Begin
+    HtConnect := TlOpen(Host, Port, Https);
+    Exit;
+  End;
+  If Not Https Then
+  Begin
+    HtConnect := TlOpen(InetPxHost, InetPxPort, False);
+    Exit;
+  End;
+  HtConnect := -1;
+  I := TlOpen(InetPxHost, InetPxPort, False);
+  If I < 0 Then Exit;
+  Q := 'CONNECT ' + Host + ':' + IntStr(Port) + ' HTTP/1.1'#13#10'Host: ' +
+       Host + ':' + IntStr(Port) + #13#10#13#10;
+  For K := 1 To Length(Q) Do B[K - 1] := Ord(Q[K]);
+  If Not TlWrite(TlC[I]^, TlPtr(@B[0]), Length(Q)) Then
+  Begin
+    TlClose(I); Exit;
+  End;
+  { reponse du proxy : ligne d'etat et en-tetes, octet par octet }
+  Lf := 0; St := 0; K := 0; Ok := True;
+  Repeat
+    If TlRead(TlC[I]^, TlPtr(@B[0]), 1) <> 1 Then
+    Begin
+      Ok := False; Break;
+    End;
+    C := B[0];
+    If (K = 1) And (C >= 48) And (C <= 57) Then St := St * 10 + C - 48
+    Else If (K = 0) And (C = 32) Then K := 1
+    Else If (K = 1) And (St > 0) Then K := 2;
+    If C = 10 Then Inc(Lf) Else If C <> 13 Then Lf := 0;
+  Until Lf = 2;
+  If Not Ok Or (St <> 200) Then
+  Begin
+    TlErr := 'le proxy refuse le tunnel (' + IntStr(St) + ')';
+    TlClose(I); Exit;
+  End;
+  TlC[I]^.Tls := True;
+  If Not TlHandshake(TlC[I]^, Host) Then
+  Begin
+    TlClose(I); Exit;
+  End;
+  HtConnect := I;
+End;
+
+{ envoie la requete (Verb, en-tetes Extra, corps Body) et lit les
+  en-tetes de la reponse ; suit les redirections si Follow (303, 301 et
+  302 : la redirection se fait en GET, sans corps) }
+Function HtSend(Var R : HtReq; Const Agent, Verb0 : String; Extra : TlPtr;
+  ExtraLen : LongInt; Body : TlPtr; BodyLen : LongInt; Follow : Boolean)
+  : Boolean;
+Var Https : Boolean; Host, Verb : String; Port, Path, Hops, I, C, O, L,
     K : LongInt; Q : Array[0..HtMaxUrl + 1023] Of Byte; N : LongInt;
     Base : Array[0..HtMaxUrl - 1] Of Byte; BLen : LongInt;
 
@@ -60962,18 +61856,29 @@ Var Https : Boolean; Host : String; Port, Path, Hops, I, C, O, L,
   End;
 
 Begin
-  HtGet := False;
+  HtSend := False;
   Hops := 0;
+  Verb := Verb0;
   While True Do
   Begin
     If Not HtSplit(R, Https, Host, Port, Path) Then Exit;
-    R.Conn := TlOpen(Host, Port, Https);
+    R.Conn := HtConnect(Host, Port, Https);
     If R.Conn < 0 Then Exit;
     N := 0;
-    S('GET ');
-    If Path >= R.UrlLen Then S('/');
-    For I := Path To R.UrlLen - 1 Do
-      If N < HtMaxUrl Then Begin Q[N] := R.Url[I]; Inc(N); End;
+    S(Verb + ' ');
+    If (InetPxHost <> '') And Not Https Then
+    Begin
+      { proxy HTTP : adresse absolue }
+      For I := 0 To R.UrlLen - 1 Do
+        If N < HtMaxUrl Then Begin Q[N] := R.Url[I]; Inc(N); End;
+      If Path >= R.UrlLen Then S('/');
+    End
+    Else
+    Begin
+      If Path >= R.UrlLen Then S('/');
+      For I := Path To R.UrlLen - 1 Do
+        If N < HtMaxUrl Then Begin Q[N] := R.Url[I]; Inc(N); End;
+    End;
     S(' HTTP/1.1'#13#10'Host: ' + Host);
     If ((Port <> 443) And Https) Or ((Port <> 80) And Not Https) Then
     Begin
@@ -60981,6 +61886,7 @@ Begin
     End;
     S(#13#10'User-Agent: ' + Agent + #13#10'Accept: */*'#13#10 +
       'Accept-Encoding: identity'#13#10'Connection: close'#13#10);
+    If BodyLen > 0 Then S('Content-Length: ' + IntStr(BodyLen) + #13#10);
     For I := 0 To ExtraLen - 1 Do
       If N < HtMaxUrl + 1000 Then Begin Q[N] := TlGet(Extra + I); Inc(N);
       End;
@@ -60990,6 +61896,11 @@ Begin
     Begin
       HtCloseConn(R); Exit;
     End;
+    If BodyLen > 0 Then
+      If Not TlWrite(TlC[R.Conn]^, Body, BodyLen) Then
+      Begin
+        HtCloseConn(R); Exit;
+      End;
     { en-tetes de la reponse }
     R.IPos := 0; R.IEnd := 0; R.HdrLen := 0;
     K := 0;
@@ -61015,12 +61926,16 @@ Begin
       R.Status := R.Status * 10 + R.Hdr[I] - 48; Inc(I);
     End;
     { redirection }
-    If ((R.Status = 301) Or (R.Status = 302) Or (R.Status = 303) Or
-        (R.Status = 307) Or (R.Status = 308)) And (Hops < 10) And
-       HtHeader(R, 'Location', O, L) Then
+    If Follow And ((R.Status = 301) Or (R.Status = 302) Or
+       (R.Status = 303) Or (R.Status = 307) Or (R.Status = 308)) And
+       (Hops < 10) And HtHeader(R, 'Location', O, L) Then
     Begin
       HtCloseConn(R);
       Inc(Hops);
+      If (R.Status <> 307) And (R.Status <> 308) Then
+      Begin
+        Verb := 'GET'; BodyLen := 0;
+      End;
       If (L > 0) And (R.Hdr[O] = Ord('/')) Then
       Begin
         { chemin absolu : meme schema et meme serveur }
@@ -61049,9 +61964,20 @@ Begin
       If (HtLow(R.Hdr[I]) = Ord('c')) And (HtLow(R.Hdr[I + 1]) = Ord('h'))
          And (HtLow(R.Hdr[I + 6]) = Ord('d')) Then R.Chunked := True;
   If R.Chunked Then R.CLen := -1;
+  { reponse sans corps : HEAD, 204, 304 }
+  If (Verb = 'HEAD') Or (R.Status = 204) Or (R.Status = 304) Then
+  Begin
+    R.CLen := 0; R.Left := 0; R.Chunked := False;
+  End;
   R.ChunkLeft := 0;
   R.Done := False;
-  HtGet := True;
+  HtSend := True;
+End;
+
+Function HtGet(Var R : HtReq; Const Agent : String; Extra : TlPtr;
+  ExtraLen : LongInt) : Boolean;
+Begin
+  HtGet := HtSend(R, Agent, 'GET', Extra, ExtraLen, 0, 0, True);
 End;
 
 { lit au plus N octets du corps ; 0 a la fin }
@@ -61153,9 +62079,34 @@ End;
 
 Function InternetOpenA(Agent, Access, Proxy, Bypass, Flags : LongInt)
   : LongInt;
+Var P : String; K : LongInt;
 Begin
   InetAgent := 'Pasdows/4.0';
   If Agent <> 0 Then InetAgent := PStr(Agent);
+  { INTERNET_OPEN_TYPE_PROXY : "hote:port" (ou "http=hote:port") }
+  InetPxHost := ''; InetPxPort := 0;
+  If (Access = 3) And (Proxy <> 0) Then
+  Begin
+    P := PStr(Proxy);
+    K := Pos('=', P);
+    If K > 0 Then P := Copy(P, K + 1, 255);
+    K := Pos(' ', P);
+    If K > 0 Then P := Copy(P, 1, K - 1);
+    K := Pos(';', P);
+    If K > 0 Then P := Copy(P, 1, K - 1);
+    If Copy(P, 1, 7) = 'http://' Then Delete(P, 1, 7);
+    K := Pos(':', P);
+    If K > 1 Then
+    Begin
+      InetPxHost := Copy(P, 1, K - 1);
+      Val(Copy(P, K + 1, 6), InetPxPort, K);
+      If (K <> 0) Or (InetPxPort <= 0) Then InetPxHost := '';
+    End
+    Else If P <> '' Then
+    Begin
+      InetPxHost := P; InetPxPort := 80;
+    End;
+  End;
   InternetOpenA := InetSession;
 End;
 
@@ -61187,7 +62138,8 @@ Begin
   S := PStr(Url);
   KLog('WININET : GET ' + Copy(S, 1, 120));
   TlErr := '';
-  If Not HtGet(HtR[I]^, InetAgent, Hdr, HdrLen) Then
+  If Not HtSend(HtR[I]^, InetAgent, 'GET', Hdr, HdrLen, 0, 0,
+                (Flags And $00200000) = 0) Then
   Begin
     KLog('WININET : ' + TlErr);
     SetErr(12029);                        { ERROR_INTERNET_CANNOT_CONNECT }
@@ -61197,6 +62149,127 @@ Begin
   KLog('WININET : HTTP ' + IntStr(HtR[I]^.Status) + ', ' +
        IntStr(HtR[I]^.CLen) + ' octets');
   InternetOpenUrlA := InetReqBase + I;
+End;
+
+{ InternetConnectA : serveur et port d'une session (sans connexion :
+  elle est ouverte par HttpSendRequestA) }
+Const
+  InetConnBase = $00CC0200;
+  InetMaxConn = 8;
+
+Var
+  InetCHost : Array[0..InetMaxConn - 1] Of String[127];
+  InetCPort : Array[0..InetMaxConn - 1] Of LongInt;
+  InetCUsed : Array[0..InetMaxConn - 1] Of Boolean;
+
+Function InternetConnectA(H, Server, Port, User, Pass, Service, Flags,
+  Ctx : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  InternetConnectA := 0;
+  If Server = 0 Then Begin SetErr(87); Exit; End;
+  I := 0;
+  While (I < InetMaxConn) And InetCUsed[I] Do Inc(I);
+  If I >= InetMaxConn Then Begin SetErr(12004); Exit; End;
+  InetCUsed[I] := True;
+  InetCHost[I] := Copy(PStr(Server), 1, 127);
+  InetCPort[I] := Port;
+  InternetConnectA := InetConnBase + I;
+End;
+
+{ HttpOpenRequestA : requete (verbe, objet ; INTERNET_FLAG_SECURE 800000h,
+  INTERNET_FLAG_NO_AUTO_REDIRECT 200000h), envoyee par HttpSendRequestA }
+Function HttpOpenRequestA(H, Verb, Obj, Ver, Refer, Accept, Flags,
+  Ctx : LongInt) : LongInt;
+Var C, I, P : LongInt; U : String; Sec : Boolean;
+
+  Procedure Put(Const T : String);
+  Var J : LongInt;
+  Begin
+    For J := 1 To Length(T) Do
+      If HtR[I]^.UrlLen < HtMaxUrl Then
+      Begin
+        HtR[I]^.Url[HtR[I]^.UrlLen] := Ord(T[J]);
+        Inc(HtR[I]^.UrlLen);
+      End;
+  End;
+
+Begin
+  HttpOpenRequestA := 0;
+  C := H - InetConnBase;
+  If (C < 0) Or (C >= InetMaxConn) Or Not InetCUsed[C] Then
+  Begin
+    SetErr(6); Exit;
+  End;
+  HtAlloc;
+  I := 0;
+  While (I < TlMaxConn) And HtR[I]^.Used Do Inc(I);
+  If I >= TlMaxConn Then Begin SetErr(12004); Exit; End;
+  P := InetCPort[C];
+  Sec := ((Flags And $00800000) <> 0) Or (P = 443);
+  If P = 0 Then
+    If Sec Then P := 443 Else P := 80;
+  HtR[I]^.UrlLen := 0;
+  If Sec Then Put('https://') Else Put('http://');
+  Put(InetCHost[C]);
+  If (Sec And (P <> 443)) Or (Not Sec And (P <> 80)) Then
+    Put(':' + IntStr(P));
+  If Obj <> 0 Then
+  Begin
+    P := 0;
+    If Mem[0:Obj] <> Ord('/') Then Put('/');
+    While (Mem[0:Obj + P] <> 0) And (HtR[I]^.UrlLen < HtMaxUrl) Do
+    Begin
+      HtR[I]^.Url[HtR[I]^.UrlLen] := Mem[0:Obj + P];
+      Inc(HtR[I]^.UrlLen); Inc(P);
+    End;
+  End
+  Else Put('/');
+  U := 'GET';
+  If Verb <> 0 Then U := Copy(PStr(Verb), 1, 15);
+  If U = '' Then U := 'GET';
+  HtR[I]^.Verb := U;
+  HtR[I]^.NoRedir := (Flags And $00200000) <> 0;
+  HtR[I]^.Conn := -1; HtR[I]^.Status := 0; HtR[I]^.HdrLen := 0;
+  HtR[I]^.Done := True; HtR[I]^.IPos := 0; HtR[I]^.IEnd := 0;
+  HtR[I]^.Used := True;
+  HttpOpenRequestA := InetReqBase + I;
+End;
+
+{ HttpSendRequestA : connexion (TLS pour https://), en-tetes, corps
+  (POST), puis lecture des en-tetes de la reponse }
+Function HttpSendRequestA(H, Hdr, HdrLen, Opt, OptLen : LongInt)
+  : LongInt;
+Var I : LongInt; S : String;
+Begin
+  HttpSendRequestA := 0;
+  I := InetSlot(H);
+  If I < 0 Then Begin SetErr(6); Exit; End;
+  HtCloseConn(HtR[I]^);
+  If Hdr = 0 Then HdrLen := 0
+  Else If HdrLen < 0 Then
+  Begin
+    HdrLen := 0;
+    While Mem[0:Hdr + HdrLen] <> 0 Do Inc(HdrLen);
+  End;
+  If Opt = 0 Then OptLen := 0;
+  S := '';
+  For I := 0 To 119 Do
+    If I < HtR[InetSlot(H)]^.UrlLen Then
+      S := S + Chr(HtR[InetSlot(H)]^.Url[I]);
+  I := InetSlot(H);
+  KLog('WININET : ' + HtR[I]^.Verb + ' ' + S);
+  TlErr := '';
+  If Not HtSend(HtR[I]^, InetAgent, HtR[I]^.Verb, Hdr, HdrLen, Opt, OptLen,
+                Not HtR[I]^.NoRedir) Then
+  Begin
+    KLog('WININET : ' + TlErr);
+    HtR[I]^.Done := True;
+    SetErr(12029);
+    Exit;
+  End;
+  KLog('WININET : HTTP ' + IntStr(HtR[I]^.Status));
+  HttpSendRequestA := 1;
 End;
 
 Function InternetReadFile(H, Buf, N, PRead : LongInt) : LongInt;
@@ -61235,6 +62308,8 @@ End;
 Function InternetCloseHandle(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  If (H >= InetConnBase) And (H < InetConnBase + InetMaxConn) Then
+    InetCUsed[H - InetConnBase] := False;
   I := InetSlot(H);
   If I >= 0 Then
   Begin
@@ -61885,7 +62960,8 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   SysAllocStringLen, SysAllocString, SysFreeString, SysStringLen,
   InternetOpenA, InternetOpenUrlA, InternetReadFile, InternetSetOptionA,
   InternetCloseHandle, HttpQueryInfoA, InternetGetConnectedState,
-  InternetQueryDataAvailable,
+  InternetQueryDataAvailable, InternetConnectA, HttpOpenRequestA,
+  HttpSendRequestA,
   OleInitialize, OleUninitialize, ICClose,
   ICGetDisplayFormat, ICOpen, ICLocate, RegOpenKeyExA, RegOpenKeyA,
   RegCreateKeyA, RegCloseKey, RegQueryValueExA, RegSetValueExA,

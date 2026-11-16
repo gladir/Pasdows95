@@ -2559,12 +2559,12 @@ Begin
   E := Copy(N, Length(N) - 3, 4);
   If (N = 'PASDOWS.WAV') And Not CompSnd Then Exit;
   If (N = 'LISEZMOI.TXT') And Not CompDoc Then Exit;
-  { COMMAND.EXE, Paint et la Calculatrice (accessoires), le
-    Gestionnaire des taches et l'Outil de diagnostic DirectX sont
-    toujours installes }
+  { COMMAND.EXE, Paint, la Calculatrice et le Navigateur Web
+    (accessoires), le Gestionnaire des taches et l'Outil de diagnostic
+    DirectX sont toujours installes }
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
      (N <> 'CALC.EXE') And (N <> 'TASKMGR.EXE') And (N <> 'DXDIAG.EXE') And
-     Not CompEx Then
+     (N <> 'BROWSER.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;
