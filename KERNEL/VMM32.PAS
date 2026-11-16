@@ -16415,8 +16415,11 @@ Begin
       OutTxt(X1 + 12, Y1 + 68, L('Ouvrir :', 'Open:', #153'ffnen:', 'Apri:',
              'Abrir:'), cBlack);
       Sunken(X1 + 84, Y1 + 64, X2 - 12, Y1 + 87, cWhite);
-      OutTxt(X1 + 89, Y1 + 68, Wnds^[W].KS, cBlack);
-      VLine(X1 + 89 + TextW(Wnds^[W].KS), Y1 + 67, Y1 + 83, cBlack);
+      { fin de la commande si elle depasse la zone }
+      T := Wnds^[W].KS;
+      While (T <> '') And (TextW(T) > X2 - X1 - 104) Do Delete(T, 1, 1);
+      OutTxt(X1 + 89, Y1 + 68, T, cBlack);
+      VLine(X1 + 89 + TextW(T), Y1 + 67, Y1 + 83, cBlack);
       N := 2;
     End;
     ikShutdown :
@@ -20533,7 +20536,7 @@ Begin
         Delete(Wnds^[W].KS, Length(Wnds^[W].KS), 1);
         KRepaint(W);
       End
-      Else If (Ch >= 32) And (Length(Wnds^[W].KS) < 30) Then
+      Else If (Ch >= 32) And (Length(Wnds^[W].KS) < 250) Then
       Begin
         Wnds^[W].KS := Wnds^[W].KS + Chr(Ch);
         KRepaint(W);
@@ -34351,6 +34354,49 @@ Begin
   ProcMapImage := True;
 End;
 
+Function PagingInit : Boolean; Forward;
+
+{ Placer l'image d'un programme a une adresse haute, au-dessus de la
+  memoire (WINWORD.EXE et EXCEL.EXE : 30000000h, sans relocalisations) :
+  pages du tas mises a cette adresse par des tables de pages de 4 Ko dans
+  un repertoire de pages propre au processus (copie de celui du noyau,
+  qui ne projette rien d'utile a ces adresses) }
+Function ProcMapHigh(Base, Size : LongInt) : Boolean;
+Var P, Pd, Pt, Img, I, A, Blk, First, Last : LongInt;
+Begin
+  ProcMapHigh := False;
+  P := CurProc;
+  If (P <= 0) Or Not Procs^[P].Used Or (Procs^[P].Pd <> 0) Then Exit;
+  If (Base And 4095) <> 0 Then Exit;
+  If Not PagingInit Then Exit;
+  First := Base Shr 22;
+  Last := (Base + Size - 1) Shr 22;
+  Blk := KAlloc(4096 * (Last - First + 3));
+  Img := KAlloc(Size + 4096);
+  If (Blk = 0) Or (Img = 0) Then
+  Begin
+    If Blk <> 0 Then KFree(Blk);
+    If Img <> 0 Then KFree(Img);
+    Exit;
+  End;
+  Pd := (Blk + 4095) And Not 4095;
+  Pt := Pd + 4096;
+  MoveMem(KPd, Pd, 4096);
+  FillMem(Pt, (Last - First + 1) * 4096, 0);
+  For I := First To Last Do
+    MemL[0:Pd + I * 4] := (Pt + (I - First) * 4096) Or 7;
+  Img := (Img + 4095) And Not 4095;
+  For I := 0 To (Size + 4095) Div 4096 - 1 Do
+  Begin
+    A := Base + I * 4096 - (First Shl 22);
+    MemL[0:Pt + (A Shr 12) * 4] := (Img + I * 4096) Or 7;
+  End;
+  Procs^[P].Pd := Pd;
+  SetCr3(Pd);
+  KLog('  image haute ' + HexStr(Base, 8) + ' -> ' + HexStr(Img, 8));
+  ProcMapHigh := True;
+End;
+
 { Correctifs de compatibilite du code d'un programme (comme les
   correctifs d'application de Windows). Les programmes Win32 tournent ici
   en anneau 0 : une interruption empile sur la pile du programme, juste
@@ -34405,6 +34451,9 @@ Begin
   End;
   Path := FindModuleFile(Path);
   If Path = '' Then Exit;
+  { les DLL d'un programme sont cherchees d'abord dans son dossier, des
+    la resolution de ses importations }
+  If Not IsDll And (CurProc > 0) Then AppPath := Path;
   F := LoadWholeFile(Path, FSize);
   If F = 0 Then Exit;
   KLog('Chargement de ' + Path + ' (' + IntStr(FSize) + ' octets)');
@@ -34429,6 +34478,9 @@ Begin
     la fenetre des images du processus }
   If Not IsDll And (Base >= $00400000) And (Base + ImgSize <= ExeTop) And
      ProcMapImage(Base, ImgSize) Then
+    Load := Base
+  Else If Not IsDll And (Base >= MemTop) And (Base >= ExeTop) And
+     (Base + ImgSize > Base) And ProcMapHigh(Base, ImgSize) Then
     Load := Base
   Else
   Begin
