@@ -148,7 +148,8 @@ Var
   SerialOk   : Boolean;
   LogOn      : Boolean;
   ApiTrace   : Boolean;          { journal des appels d API (serie) }
-  TrI : LongInt;
+  TrI, TrJ : LongInt;
+  TrS : String;
   PreemptOn  : Boolean;          { preemption des taches Win32 }
   SliceStart : LongInt;          { debut de la tranche de temps }
   KImgLo, KImgHi : LongInt;      { image du noyau (jamais preemptee) }
@@ -687,6 +688,37 @@ End;
 Procedure KFault(Vec, Frame : LongInt); Forward;
 Procedure GlDumpRing; Forward;
 
+Var
+  DrWatch, DrHits : LongInt;     { point d'arret de donnees (DRWATCH) }
+
+{ #DB du point d'arret de donnees DR0 : ecriture de sa propre adresse a
+  l'adresse surveillee (diagnostic des piles corrompues) }
+Procedure DbgTrap(F : LongInt);
+Var D6, V, I : LongInt; S : String;
+Begin
+  asm
+    db 0Fh,21h,0F0h
+    mov D6,eax
+    xor eax,eax
+    db 0Fh,23h,0F0h
+  end;
+  If (D6 And 1) = 0 Then Exit;
+  V := MemL[0:DrWatch];
+  If (V <> DrWatch) Or (DrHits >= 4) Then Exit;
+  Inc(DrHits);
+  S := 'DRWATCH ' + HexStr(DrWatch, 8) + ' ecrit par EIP=' +
+       HexStr(MemL[0:F + 44], 8) + ' EAX=' + HexStr(MemL[0:F + 40], 8) +
+       ' ECX=' + HexStr(MemL[0:F + 36], 8) + ' EDX=' +
+       HexStr(MemL[0:F + 32], 8) + ' EBX=' + HexStr(MemL[0:F + 28], 8) +
+       ' EBP=' + HexStr(MemL[0:F + 20], 8) + ' ESI=' +
+       HexStr(MemL[0:F + 16], 8) + ' EDI=' + HexStr(MemL[0:F + 12], 8) +
+       ' ESP=' + HexStr(F + 56, 8);
+  KLog(S);
+  S := 'DRWATCH pile :';
+  For I := 0 To 15 Do S := S + ' ' + HexStr(MemL[0:F + 56 + I * 4], 8);
+  KLog(S);
+End;
+
 Procedure Trap(Vec : LongInt);
 Var F : LongInt;
 Begin
@@ -694,6 +726,11 @@ Begin
     mov eax,[ebp]
     mov F,eax
   end;
+  If (Vec = 1) And (DrWatch <> 0) Then
+  Begin
+    DbgTrap(F);
+    Exit;
+  End;
   KFault(Vec, F);
 End;
 
@@ -12673,11 +12710,51 @@ Begin
   End;
 End;
 
+Var
+  DIInHook : Boolean;        { DIHook en cours (pas de reentree) }
+  AbsLX, AbsLY : LongInt;    { derniere position absolue (-1 : aucune) }
+  WarpUntil : LongInt;       { un programme replace le curseur (SetCursorPos) }
+  LastPI : LongInt;          { dernier passage de ProcessInput }
+
+{ Position absolue (AX, AY) de la souris de l'hote -> deplacement :
+  DirectInput recoit toujours le mouvement de l'hote ; le curseur suit la
+  position absolue, sauf quand le programme le replace lui-meme (jeux
+  qui recentrent le curseur a chaque image) : il avance alors du
+  deplacement seulement }
+Procedure AbsMouse(AX, AY : LongInt; Var NX, NY : LongInt;
+                   Var Moved : Boolean);
+Var Dx, Dy : LongInt;
+Begin
+  If AbsLX < 0 Then
+  Begin
+    AbsLX := CurX; AbsLY := CurY;
+  End;
+  Dx := AX - AbsLX; Dy := AY - AbsLY;
+  AbsLX := AX; AbsLY := AY;
+  If (Dx = 0) And (Dy = 0) Then Exit;
+  DIMX := DIMX + Dx; DIMY := DIMY + Dy;
+  If Ticks - WarpUntil < 0 Then
+  Begin
+    NX := Max(0, Min(ScrW - 1, CurX + Dx));
+    NY := Max(0, Min(ScrH - 1, CurY + Dy));
+  End
+  Else
+  Begin
+    NX := AX; NY := AY;
+  End;
+  If (NX <> CurX) Or (NY <> CurY) Then
+  Begin
+    CursorMoveTo(NX, NY);
+    Moved := True;
+  End;
+End;
+
 Procedure DIHook; Forward;
 
 Procedure ProcessInput;
 Var B, Dx, Dy, Bt, NX, NY, AX, AY, N : LongInt; Moved : Boolean;
 Begin
+  LastPI := Ticks;
   While KbHead <> KbTail Do
   Begin
     B := KbQ[KbHead];
@@ -12699,13 +12776,7 @@ Begin
     If VbAbs And ((MouHead <> MouTail) Or (Ticks - VbPosAt >= 0)) Then
     Begin
       VbPosAt := Ticks + 15;
-      If VbMousePos(AX, AY) And ((AX <> CurX) Or (AY <> CurY)) Then
-      Begin
-        DIMX := DIMX + AX - CurX; DIMY := DIMY + AY - CurY;
-        NX := AX; NY := AY;
-        CursorMoveTo(NX, NY);
-        Moved := True;
-      End;
+      If VbMousePos(AX, AY) Then AbsMouse(AX, AY, NX, NY, Moved);
     End;
   End;
   { VMware : souris absolue (vmmouse) ; les paquets PS/2 ne font que
@@ -12717,16 +12788,14 @@ Begin
     N := VmmCount;
     While (N >= 4) And VmmOn Do
     Begin
-      AX := CurX; AY := CurY;
+      If AbsLX < 0 Then
+      Begin
+        AbsLX := CurX; AbsLY := CurY;
+      End;
+      AX := AbsLX; AY := AbsLY;
       VmmPacket(AX, AY, Bt);
       N := N - 4;
-      If (AX <> CurX) Or (AY <> CurY) Then
-      Begin
-        DIMX := DIMX + AX - CurX; DIMY := DIMY + AY - CurY;
-        NX := AX; NY := AY;
-        CursorMoveTo(NX, NY);
-        Moved := True;
-      End;
+      AbsMouse(AX, AY, NX, NY, Moved);
       DIMBtn := Bt;
       MouseSetBtn(Bt, Moved);
     End;
@@ -26351,9 +26420,25 @@ Begin
   GetMessageA := Ord(M.Msg <> WM_QUIT);
 End;
 
+{ Entrees materielles lues depuis la tache d'un programme : le code du
+  noyau n'est pas preemptible, et un jeu qui dessine (OpenGL, Direct3D)
+  y passe presque tout son temps ; la tache du systeme ne lirait alors
+  la souris qu'entre deux images }
+Procedure InputPoll;
+Var Own : LongInt;
+Begin
+  If DIInHook Or (CurT <= 0) Or (Ticks - LastPI < 15) Then Exit;
+  DIInHook := True;
+  Own := HeapOwner; HeapOwner := 0;     { memoire du systeme }
+  ProcessInput;
+  HeapOwner := Own;
+  DIInHook := False;
+End;
+
 Function PeekMessageA(P, H, MinM, MaxM, Remove : LongInt) : LongInt;
 Var M : TMsgRec;
 Begin
+  InputPoll;
   If (Remove And 2) = 0 Then KYield;
   If KPeekMsg(CurT, M, H, MinM, MaxM, (Remove And 1) <> 0) Then
   Begin
@@ -27072,12 +27157,14 @@ End;
 
 Function GetCursorPos(P : LongInt) : LongInt;
 Begin
+  InputPoll;
   MemL[0:P] := CurX; MemL[0:P + 4] := CurY;
   GetCursorPos := 1;
 End;
 
 Function SetCursorPos(X, Y : LongInt) : LongInt;
 Begin
+  WarpUntil := Ticks + 3000;
   CursorMoveTo(Max(0, Min(ScrW - 1, X)), Max(0, Min(ScrH - 1, Y)));
   SetCursorPos := 1;
 End;
@@ -31395,6 +31482,46 @@ Begin
   ProcMapImage := True;
 End;
 
+{ Correctifs de compatibilite du code d'un programme (comme les
+  correctifs d'application de Windows). Les programmes Win32 tournent ici
+  en anneau 0 : une interruption empile sur la pile du programme, juste
+  sous ESP. Sous Windows (anneau 3), elle utilise la pile du noyau, ce
+  qui cache certains bogues. Ainsi la conversion flottant -> entier de la
+  bibliotheque CodeWarrior (Oni) commence par "add esp,0F4h" au lieu de
+  "add esp,-0Ch" : ESP remonte de 244 octets au-dessus de son cadre, et
+  l'horloge ecrasait les variables et l'adresse de retour de l'appelant.
+  Le code est corrige en "add esp,-0Ch" (meme longueur). }
+Procedure PeCompat(Load, Pe : LongInt);
+Var S, I, A, E, N : LongInt;
+Begin
+  N := 0;
+  S := Pe + 24 + MemW[0:Pe + 20];
+  For I := 0 To MemW[0:Pe + 6] - 1 Do
+  Begin
+    If (MemL[0:S + 36] And $20000020) <> 0 Then
+    Begin
+      A := Load + MemL[0:S + 12];
+      E := A + MemL[0:S + 8] - 14;
+      While A <= E Do
+      Begin
+        If (MemL[0:A] = LongInt($81EC8B55)) And
+           (MemL[0:A + 4] = $0000F4C4) And
+           (MemL[0:A + 8] = LongInt($7DD99B00)) And
+           (MemW[0:A + 12] = $9BFE) Then
+        Begin
+          MemW[0:A + 6] := $FFFF; Mem[0:A + 8] := $FF;
+          Inc(N);
+        End;
+        Inc(A);
+      End;
+    End;
+    S := S + 40;
+  End;
+  If N > 0 Then
+    KLog('  correctif de compatibilite : add esp,0F4h (' + IntStr(N) +
+         ' fois)');
+End;
+
 Function LoadPE(Path : String; IsDll : Boolean) : LongInt;
 Var F, FSize, Pe, NSect, OptSz, Base, ImgSize, HdrSize, Load, I, S, VSize,
     VAddr, RawSize, RawPtr, Delta, Dir, DSize, P, PEnd, Cnt, K, T, Ent,
@@ -31485,6 +31612,7 @@ Begin
     End;
     MemL[0:Pe + 24 + 28] := Load;
   End;
+  PeCompat(Load, Pe);
   { module }
   M := -1;
   For I := 0 To MaxMod - 1 Do
@@ -44064,8 +44192,19 @@ End;
 
 { Nouvelles entrees (appelee par ProcessInput et par les methodes) }
 Procedure DIHook;
-Var I, J, D, Dx, Dy, Bt, F, S, Old, K, V : LongInt; Ev : Boolean;
+Var I, J, D, Dx, Dy, Bt, F, S, Old, K, V, Own : LongInt; Ev : Boolean;
 Begin
+  { entrees materielles en attente : traitees ici aussi, car la tache du
+    systeme (tache 0) peut ne pas tourner pendant qu'un jeu dessine
+    (ProcessInput rappelle DIHook : pas de nouvel appel) }
+  If Not DIInHook Then
+  Begin
+    DIInHook := True;
+    Own := HeapOwner; HeapOwner := 0;
+    ProcessInput;
+    HeapOwner := Own;
+    DIInHook := False;
+  End;
   F := IntOff;
   Dx := DIMX; Dy := DIMY; Bt := DIMBtn;
   DIMX := 0; DIMY := 0;
@@ -46188,6 +46327,8 @@ Begin
   If YEnd > ClipB - 1 Then YEnd := ClipB - 1;
   For Y := YBeg To YEnd Do
   Begin
+    { souris et clavier pendant un long rendu (noyau non preemptible) }
+    If Ticks - LastPI >= 15 Then InputPoll;
     { intersections des aretes avec la ligne Y }
     XL := 1E30; XR := -1E30;
     For K := 0 To 2 Do
@@ -48087,6 +48228,7 @@ Function SwapBuffers(Hdc : LongInt) : LongInt;
 Var H : LongInt;
 Begin
   SwapBuffers := 1;
+  InputPoll;
   If (GcA = 0) Or (Gc^.RT = 0) Then Exit;
   Move(Gc^.D3, D3G, 4);
   If GlBmi = 0 Then GlBmi := KAllocSys(64);
@@ -70655,6 +70797,7 @@ BEGIN
     KLog('ATTENTION : image du noyau au-dela de 00400000h (programmes Win32)');
   CursorSetShape(0);
   CurX := ScrW Div 2; CurY := ScrH Div 2;
+  AbsLX := -1; AbsLY := -1; WarpUntil := 0;
   BootStep(1);
   AtaInit;
   CdInit;
@@ -70669,6 +70812,25 @@ BEGIN
   LoadEnvironment;
   { variable APITRACE de AUTOEXEC.BAT : journal des appels d'API }
   ApiTrace := EnvFind('APITRACE', TrI);
+  { DRWATCH=adresse (hexadecimal) : ecritures surveillees par DR0 }
+  If EnvFind('DRWATCH', TrI) Then
+  Begin
+    TrS := PStr(TrI);
+    DrWatch := 0;
+    For TrJ := 1 To Length(TrS) Do
+      If Pos(UpCase(TrS[TrJ]), '0123456789ABCDEF') > 0 Then
+        DrWatch := DrWatch * 16 + Pos(UpCase(TrS[TrJ]),
+                                      '0123456789ABCDEF') - 1;
+    TrJ := DrWatch And Not 3;
+    DrWatch := TrJ;
+    asm
+      mov eax,TrJ
+      db 0Fh,23h,0C0h
+      mov eax,851970
+      db 0Fh,23h,0F8h
+    end;
+    KLog('DRWATCH ' + HexStr(DrWatch, 8));
+  End;
   InitInput;
   ActiveWin := -1; FocusWin := -1; CaptureWin := -1;
   DragWin := -1; PressWin := -1; LastClickW := -1;
