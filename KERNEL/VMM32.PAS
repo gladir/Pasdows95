@@ -15675,6 +15675,34 @@ Begin
   End;
 End;
 
+{ Ligne de la boite Executer : programme (entre guillemets s'il contient
+  des espaces) puis ses arguments ; la ligne entiere est d'abord essayee
+  comme nom de programme (C:\Program Files\...\X.EXE sans guillemets) }
+Function FindModuleFile(Name : String) : String; Forward;
+
+Function RunLine(S : String) : Boolean;
+Var P : LongInt; Prog, Args : String;
+Begin
+  RunLine := True;
+  If (S[1] <> '"') And (FindModuleFile(S) <> '') Then
+    If RunExe(S, '') Then Exit;
+  If S[1] = '"' Then
+  Begin
+    P := Pos('"', Copy(S, 2, 255));
+    If P = 0 Then P := Length(S);
+    Prog := Copy(S, 2, P - 1);
+    Args := Trim(Copy(S, P + 2, 255));
+  End
+  Else
+  Begin
+    P := Pos(' ', S);
+    If P = 0 Then P := Length(S) + 1;
+    Prog := Copy(S, 1, P - 1);
+    Args := Trim(Copy(S, P + 1, 255));
+  End;
+  RunLine := RunExe(Prog, Args);
+End;
+
 Procedure DialogAction(W, B : LongInt);
 Var S : String; K : LongInt;
 Begin
@@ -15684,7 +15712,7 @@ Begin
     S := Trim(Wnds^[W].KS);
     DestroyW(W);
     If (B = 0) And (S <> '') Then
-      If Not NetRunCmd(S) And Not RunExe(S, '') Then
+      If Not NetRunCmd(S) And Not RunLine(S) Then
         MsgBoxOpen(L('Ex'#130'cuter', 'Run', 'Ausf'#129'hren', 'Esegui',
           'Ejecutar'),
           L('Impossible de trouver '#174' ', 'Cannot find "', '"',
@@ -31404,6 +31432,32 @@ Begin
 End;
 
 { Chercher un fichier de module : chemin donne, D:\, C:\WINDOWS }
+{ Fichier programme Name dans le dossier D (termine par \) ; '' si
+  absent. Sans extension : NOM.EXE, NOM.COM, puis NOM }
+Function FindInDir(Const D, Name : String) : String;
+Var Attr, Size, Time, Lba, Ram : LongInt; B, S, R : String;
+Begin
+  R := '';
+  B := UpStr(BaseName(Name));
+  If Pos('.', B) = 0 Then
+  Begin
+    S := D + B + '.EXE';
+    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
+    If R = '' Then
+    Begin
+      S := D + B + '.COM';
+      If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
+    End;
+  End;
+  If R = '' Then
+  Begin
+    S := D + B;
+    If PathInfo(S, Attr, Size, Time, Lba, Ram) And
+       ((Attr And $10) = 0) Then R := S;
+  End;
+  FindInDir := R;
+End;
+
 Function FindModuleFile(Name : String) : String;
 Var Attr, Size, Time, Lba, Ram : LongInt; S, R : String;
 Begin
@@ -31430,16 +31484,11 @@ Begin
          ((Attr And $10) = 0) Then R := S;
     End;
   End;
-  If R = '' Then
-  Begin
-    S := SysDir + UpStr(BaseName(Name));
-    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
-  End;
-  If R = '' Then
-  Begin
-    S := 'D:\' + UpStr(BaseName(Name));
-    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
-  End;
+  { dossier systeme, racine de C:, puis CD-ROM (D:) ; sans extension :
+    NOM.EXE puis NOM.COM ("dxdiag" dans la boite Executer) }
+  If R = '' Then R := FindInDir(SysDir, Name);
+  If (R = '') And (SysDir <> 'C:\') Then R := FindInDir('C:\', Name);
+  If (R = '') And (SysDir <> 'D:\') Then R := FindInDir('D:\', Name);
   FindModuleFile := R;
 End;
 
