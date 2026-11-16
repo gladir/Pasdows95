@@ -1108,6 +1108,7 @@ Var
   CacheNext : LongInt;
   RootLba, RootSize : LongInt;
   VolLabel  : String[32];
+  CdVolBlocks : LongInt;            { taille du volume ISO (2 Ko) }
   KObjs     : PKObjArr;       { alloue dans le tas (place sous 4 Mo) }
   KObjOwner : Array[0..MaxKObj - 1] Of LongInt;
   { references des objets de synchronisation et des mappages : total et
@@ -1403,9 +1404,11 @@ Begin
   RootLba := MemL[0:BootInfo + 4];
   RootSize := MemL[0:BootInfo + 8];
   VolLabel := '';
+  CdVolBlocks := 0;
   A := CdSector(16);
   If A <> 0 Then
   Begin
+    CdVolBlocks := GetD(A + 80);
     RootLba := GetD(A + 158);
     RootSize := GetD(A + 166);
     For K := 0 To 31 Do VolLabel := VolLabel + Chr(Mem[0:A + 40 + K]);
@@ -11036,7 +11039,7 @@ Const
   ikAbout = 5; ikRun = 6; ikShutdown = 7; ikHelp = 8; ikWelcome = 9;
   ikNotepad = 10; ikConsole = 11; ikDisplay = 12; ikDateTime = 13;
   ikVolPop = 14; ikMixer = 15; ikAudio = 16; ikSysProps = 17;
-  ikDevProps = 18; ikFileDlg = 19; ikFind = 28;
+  ikDevProps = 18; ikFileDlg = 19; ikFind = 28; ikVolProps = 29;
   ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
   ikMdiClient = 27;
@@ -12938,6 +12941,7 @@ Const
   cmDisplay = 14; cmAlign = 15; cmArrName = 16; cmArrType = 17;
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
   cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
+  cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -12955,7 +12959,7 @@ Const
   mnDesk = 5; mnArrange = 6; mnColors = 7; mnIcon = 8;
   mnMonths = 9; mnTz = 10; mnVolCtx = 11;
   mnNFile = 12; mnNEdit = 13; mnNSearch = 14; mnNHelp = 15;
-  mnFdDrives = 16; mnFdTypes = 17; mnTaskCtx = 18;
+  mnFdDrives = 16; mnFdTypes = 17; mnTaskCtx = 18; mnDrvCtx = 19;
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -13682,6 +13686,7 @@ Begin
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
     mnTaskCtx : MenuCount := 2;
+    mnDrvCtx : MenuCount := 5;
     mnNFile : MenuCount := 9;
     mnNEdit : MenuCount := 10;
     mnNSearch : MenuCount := 2;
@@ -14039,6 +14044,24 @@ Begin
         If (DeskSel >= 0) And (DeskCmd[DeskSel] = cmComputer) Then
           Cmd := cmSysProps
         Else Cmd := cmGray;
+      End;
+    mnDrvCtx :
+      If I = 0 Then
+      Begin
+        T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
+        Cmd := cmDrvOpen;
+      End
+      Else If I = 2 Then
+      Begin
+        T := L('Formater...', 'Format...', 'Formatieren...', 'Formatta...',
+               'Formatear...');
+        Cmd := cmGray;
+      End
+      Else If I = 4 Then
+      Begin
+        T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+               'Propriet'#133, 'Propiedades');
+        Cmd := cmDrvProps;
       End;
     mnDocs :
       If DocFile(I, T) Then
@@ -14556,6 +14579,81 @@ End;
 Var
   ExpCW, ExpCI, ExpCIdx : LongInt;      { parcours FAT en cours }
   ExpCS : String[127];
+  ExpCtxW, ExpCtxI : LongInt;           { lecteur du menu contextuel }
+
+{ Lettre du lecteur I de la liste du Poste de travail }
+Function ExpDrive(I : LongInt) : Char;
+Begin
+  If I <= 0 Then ExpDrive := 'C'
+  Else If I = 1 Then ExpDrive := 'D'
+  Else ExpDrive := Chr(VolLetter[I - 1]);
+End;
+
+{ Espace libre et capacite d'un lecteur, en secteurs de 512 octets }
+Function VolSpaceSecs(D : Char; Var FreeS, TotS : LongInt) : Boolean;
+Var V, Fr, Tot, Spc : LongInt;
+Begin
+  FreeS := 0; TotS := 0;
+  V := FatVolOf(D + ':');
+  If V >= 0 Then
+  Begin
+    FatSpace(V, Fr, Tot, Spc);
+    FreeS := Fr * Spc; TotS := Tot * Spc;
+  End
+  Else If D = 'C' Then
+  Begin
+    { disque virtuel en memoire }
+    FreeS := HeapFreeBytes Div 512; TotS := MemTop Div 512;
+  End
+  Else If D = 'D' Then TotS := CdVolBlocks * 4;
+  If FreeS > TotS Then FreeS := TotS;
+  VolSpaceSecs := TotS > 0;
+End;
+
+{ Taille courte : Ko, Mo ou Go (deux decimales) }
+Function SizeShort(Secs : LongInt) : String;
+Var G : LongInt; S : String;
+Begin
+  If Secs < 2048 Then
+    S := IntStr(Secs Div 2) + L(' Ko', ' KB', ' KB', ' KB', ' KB')
+  Else If Secs < 2097152 Then
+    S := IntStr(Secs Div 2048) + L(' Mo', ' MB', ' MB', ' MB', ' MB')
+  Else
+  Begin
+    G := Round(Secs / 20971.52);
+    S := IntStr(G Mod 100);
+    If Length(S) < 2 Then S := '0' + S;
+    S := IntStr(G Div 100) + L(',', '.', ',', ',', ',') + S +
+         L(' Go', ' GB', ' GB', ' GB', ' GB');
+  End;
+  SizeShort := S;
+End;
+
+{ Nombre d'octets de Secs secteurs, avec separateur des milliers (au-dela
+  de 2 Go : calcul en deux parties de six chiffres) }
+Function BytesStr(Secs : LongInt) : String;
+Var A, Lo, Hi, I : LongInt; R, T, Sep : String;
+Begin
+  A := Secs Div 1000000;
+  Lo := (Secs Mod 1000000) * 512;
+  Hi := A * 512 + Lo Div 1000000;
+  Lo := Lo Mod 1000000;
+  If Hi > 0 Then
+  Begin
+    T := IntStr(Lo);
+    While Length(T) < 6 Do T := '0' + T;
+    R := IntStr(Hi) + T;
+  End
+  Else R := IntStr(Lo);
+  Sep := L(' ', ',', '.', '.', '.');
+  T := '';
+  For I := 1 To Length(R) Do
+  Begin
+    T := T + R[I];
+    If ((Length(R) - I) Mod 3 = 0) And (I < Length(R)) Then T := T + Sep;
+  End;
+  BytesStr := T + L(' octets', ' bytes', ' Byte', ' byte', ' bytes');
+End;
 
 Function ExpEntry(W, I : LongInt; Var Nm : String; Var Fl, Size : LongInt)
   : Boolean;
@@ -14663,6 +14761,11 @@ Begin
       S := Nm;
       If (Fl And 2) = 0 Then S := S + ' : ' + IntStr(Size) + ' ' +
          L('octets', 'bytes', 'Byte', 'byte', 'bytes');
+      If (Wnds^[W].KS = '') And VolSpaceSecs(ExpDrive(I), Fl, Size) Then
+        S := L('Espace libre : ', 'Free Space: ', 'Freier Speicher: ',
+               'Spazio libero: ', 'Espacio libre: ') + SizeShort(Fl) +
+             L(', capacit'#130' : ', ', Capacity: ', ', Kapazit'#132't: ',
+               ', capacit'#133': ', ', capacidad: ') + SizeShort(Size);
     End;
     Inc(I); Inc(N);
   End;
@@ -14747,10 +14850,12 @@ End;
 Procedure ExpMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, Cols, I, Fl, Size : LongInt; Nm : String;
 Begin
-  If (Msg <> WM_LBUTTONDOWN) And (Msg <> WM_LBUTTONDBLCLK) Then Exit;
+  If (Msg <> WM_LBUTTONDOWN) And (Msg <> WM_LBUTTONDBLCLK) And
+     (Msg <> WM_RBUTTONDOWN) Then Exit;
   X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
   KClient(W, X1, Y1, X2, Y2);
-  If InRect(X, Y, X1 + 4, Y1 + 4, X1 + 29, Y1 + 26) Then
+  If (Msg <> WM_RBUTTONDOWN) And
+     InRect(X, Y, X1 + 4, Y1 + 4, X1 + 29, Y1 + 26) Then
   Begin
     ExpUp(W);
     Exit;
@@ -14761,6 +14866,22 @@ Begin
   I := ((Y - Y1 - 6) Div 70 + Wnds^[W].K2) * Cols + (X - X1 - 6) Div 100;
   If (X - X1 - 6) Div 100 >= Cols Then Exit;
   If Not ExpEntry(W, I, Nm, Fl, Size) Then I := -1;
+  If Msg = WM_RBUTTONDOWN Then
+  Begin
+    { menu contextuel d'un lecteur : Ouvrir, Formater, Proprietes }
+    If I <> Wnds^[W].K1 Then
+    Begin
+      Wnds^[W].K1 := I;
+      KRepaint(W);
+    End;
+    If (I >= 0) And (Wnds^[W].KS = '') Then
+    Begin
+      ExpCtxW := W; ExpCtxI := I;
+      CloseMenus(0);
+      OpenMenu(0, mnDrvCtx, X, Y, False);
+    End;
+    Exit;
+  End;
   If (Msg = WM_LBUTTONDBLCLK) And (I >= 0) Then ExpOpenItem(W, I)
   Else If I <> Wnds^[W].K1 Then
   Begin
@@ -15675,6 +15796,34 @@ Begin
   End;
 End;
 
+{ Ligne de la boite Executer : programme (entre guillemets s'il contient
+  des espaces) puis ses arguments ; la ligne entiere est d'abord essayee
+  comme nom de programme (C:\Program Files\...\X.EXE sans guillemets) }
+Function FindModuleFile(Name : String) : String; Forward;
+
+Function RunLine(S : String) : Boolean;
+Var P : LongInt; Prog, Args : String;
+Begin
+  RunLine := True;
+  If (S[1] <> '"') And (FindModuleFile(S) <> '') Then
+    If RunExe(S, '') Then Exit;
+  If S[1] = '"' Then
+  Begin
+    P := Pos('"', Copy(S, 2, 255));
+    If P = 0 Then P := Length(S);
+    Prog := Copy(S, 2, P - 1);
+    Args := Trim(Copy(S, P + 2, 255));
+  End
+  Else
+  Begin
+    P := Pos(' ', S);
+    If P = 0 Then P := Length(S) + 1;
+    Prog := Copy(S, 1, P - 1);
+    Args := Trim(Copy(S, P + 1, 255));
+  End;
+  RunLine := RunExe(Prog, Args);
+End;
+
 Procedure DialogAction(W, B : LongInt);
 Var S : String; K : LongInt;
 Begin
@@ -15684,7 +15833,7 @@ Begin
     S := Trim(Wnds^[W].KS);
     DestroyW(W);
     If (B = 0) And (S <> '') Then
-      If Not NetRunCmd(S) And Not RunExe(S, '') Then
+      If Not NetRunCmd(S) And Not RunLine(S) Then
         MsgBoxOpen(L('Ex'#130'cuter', 'Run', 'Ausf'#129'hren', 'Esegui',
           'Ejecutar'),
           L('Impossible de trouver '#174' ', 'Cannot find "', '"',
@@ -17267,7 +17416,7 @@ Var
   CatOpen : Array[0..DevCats - 1] Of Boolean;
   RowN : LongInt;
   RowKind, RowIdx : Array[0..MaxRow - 1] Of LongInt;
-  SysW, DevPW : LongInt;
+  SysW, DevPW, VpW : LongInt;
   PciDispName, PciIdeName, PciNetName : String[63];
   PciNetIrq : LongInt;
   DmClickR, DmClickT : LongInt;          { double-clic dans l'arbre }
@@ -17824,7 +17973,7 @@ Begin
   Y1 := CY2 - 78; Y2 := Y1 + 22;
 End;
 
-Procedure TabStrip(W, N, Sel : LongInt; Const T0, T1 : String);
+Procedure TabStrip(W, N, Sel : LongInt; Const T0, T1, T2 : String);
 Var X1, Y1, X2, Y2, I, A, B, Y : LongInt; T : String;
 Begin
   KClient(W, X1, Y1, X2, Y2);
@@ -17833,7 +17982,7 @@ Begin
   A := X1 + 6;
   For I := 0 To N - 1 Do
   Begin
-    If I = 0 Then T := T0 Else T := T1;
+    If I = 0 Then T := T0 Else If I = 1 Then T := T1 Else T := T2;
     B := A + TextW(T) + 20;
     Y := Y1 + 6;
     If I = Sel Then
@@ -17850,7 +17999,8 @@ Begin
   End;
 End;
 
-Function TabHit(W, N, X, Y : LongInt; Const T0, T1 : String) : LongInt;
+Function TabHit(W, N, X, Y : LongInt; Const T0, T1, T2 : String)
+  : LongInt;
 Var X1, Y1, X2, Y2, I, A, B : LongInt; T : String;
 Begin
   TabHit := -1;
@@ -17858,7 +18008,7 @@ Begin
   A := X1 + 6;
   For I := 0 To N - 1 Do
   Begin
-    If I = 0 Then T := T0 Else T := T1;
+    If I = 0 Then T := T0 Else If I = 1 Then T := T1 Else T := T2;
     B := A + TextW(T) + 20;
     If InRect(X, Y, A, Y1 + 4, B, Y1 + 26) Then TabHit := I;
     A := B + 2;
@@ -17884,7 +18034,7 @@ Var X1, Y1, X2, Y2, I, R, Y, X, Vis, LX1, LY1, LX2, LY2, Ic, Fg, BX1, BY1,
 Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
-  TabStrip(W, 2, Wnds^[W].K1, SysTab0, SysTab1);
+  TabStrip(W, 2, Wnds^[W].K1, SysTab0, SysTab1, '');
   If Wnds^[W].K1 = 0 Then
   Begin
     PaintIcon(icComputer, X1 + 40, Y1 + 70, 64);
@@ -18099,6 +18249,430 @@ Begin
   End;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Proprietes d'un lecteur (clic droit dans le Poste de travail)        }
+{   K1 onglet (General, Outils, Partage), K2 lettre, K3 : 1 saisie    }
+{   du nom active, 2 nom modifie ; KS nom du volume en saisie          }
+{ ------------------------------------------------------------------ }
+
+Function VolSetLabel(V : LongInt; Lab : String) : Boolean; Forward;
+
+Function VpTab(I : LongInt) : String;
+Begin
+  Case I Of
+    0 : VpTab := L('G'#130'n'#130'ral', 'General', 'Allgemein', 'Generale',
+                   'General');
+    1 : VpTab := L('Outils', 'Tools', 'Extras', 'Strumenti',
+                   'Herramientas');
+  Else
+    VpTab := L('Partage', 'Sharing', 'Freigabe', 'Condivisione',
+               'Compartir');
+  End;
+End;
+
+{ Nom du volume modifiable : volume FAT, NTFS ou HPFS en ecriture }
+Function VpWritable(D : Char) : Boolean;
+Var V : LongInt; Ok : Boolean;
+Begin
+  V := FatVolOf(D + ':');
+  Ok := V >= 0;
+  If Ok And (VolType[V] = NtfsT) Then Ok := NvRO[V] = 0;
+  If Ok And (VolType[V] = HpfsT) Then Ok := HvRO[V] = 0;
+  VpWritable := Ok;
+End;
+
+Function VpFs(D : Char) : String;
+Var V : LongInt;
+Begin
+  V := FatVolOf(D + ':');
+  If V >= 0 Then
+  Begin
+    If VolType[V] = 32 Then VpFs := 'FAT32'
+    Else If VolType[V] = NtfsT Then VpFs := 'NTFS'
+    Else If VolType[V] = HpfsT Then VpFs := 'HPFS'
+    Else VpFs := 'FAT';
+  End
+  Else If D = 'D' Then VpFs := 'CDFS'
+  Else VpFs := 'FAT';
+End;
+
+Function VpLabel(D : Char) : String;
+Var V : LongInt;
+Begin
+  V := FatVolOf(D + ':');
+  If V >= 0 Then VpLabel := VolLab[V]
+  Else If D = 'D' Then VpLabel := VolLabel
+  Else VpLabel := 'PASDOWS';
+End;
+
+Procedure VolPropsOpen(D : Char);
+Var Ic : LongInt;
+Begin
+  If (VpW >= 0) And Wnds^[VpW].Used And (Wnds^[VpW].IKind = ikVolProps)
+  Then DestroyW(VpW);
+  If (D = 'D') And (FatVolOf('D:') < 0) Then Ic := icCdrom
+  Else Ic := icHardDisk;
+  VpW := KCreate(ikVolProps, L('Propri'#130't'#130's de (', 'Properties of (',
+                 'Eigenschaften von (', 'Propriet'#133' di (',
+                 'Propiedades de (') + D + ':)', Ic,
+                 Max(0, (ScrW - 420) Div 2), Max(0, (TaskY - 440) Div 2),
+                 420, 440, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                 WS_EX_DLGMODALFRAME);
+  If VpW < 0 Then Exit;
+  Wnds^[VpW].K1 := 0; Wnds^[VpW].K2 := Ord(D); Wnds^[VpW].K3 := 0;
+  Wnds^[VpW].KS := VpLabel(D);
+  ShowW(VpW, True, True);
+End;
+
+{ Angle de (X, Y) dans [0, 2 pi[, sens trigonometrique (arc tangente
+  approchee a 0,005 radian pres) }
+Function VpAng(X, Y : Double) : Double;
+Var AX, AY, Z, T : Double;
+Begin
+  AX := Abs(X); AY := Abs(Y);
+  If AX + AY < 0.000001 Then
+  Begin
+    VpAng := 0;
+    Exit;
+  End;
+  If AX >= AY Then
+  Begin
+    Z := AY / AX;
+    T := Z * (0.7853981634 + 0.273 * (1 - Z));
+  End
+  Else
+  Begin
+    Z := AX / AY;
+    T := 1.5707963268 - Z * (0.7853981634 + 0.273 * (1 - Z));
+  End;
+  If X < 0 Then T := 3.1415926536 - T;
+  If Y < 0 Then T := 6.2831853072 - T;
+  VpAng := T;
+End;
+
+{ Camembert en relief : ellipse de rayons A et B, epaisseur Dp ; part
+  libre (Pm pour mille, magenta) puis part utilisee (bleu) }
+Procedure VpPie(CX, CY, A, B, Dp, Pm : LongInt);
+Var X, Y, H, K, C : LongInt; Th : Double;
+Begin
+  Th := Pm * 0.0062831853072;
+  For X := -A To A Do
+  Begin
+    H := (B * ISqrt(A * A - X * X)) Div A;
+    If VpAng(X, -H * A / B) < Th Then C := cPurple Else C := cNavy;
+    For K := 1 To Dp Do Pix(CX + X, CY + H + K, C);
+    Pix(CX + X, CY + H + Dp + 1, cBlack);
+  End;
+  VLine(CX - A - 1, CY, CY + Dp, cBlack);
+  VLine(CX + A + 1, CY, CY + Dp, cBlack);
+  For Y := -B To B Do
+  Begin
+    H := (A * ISqrt(B * B - Y * Y)) Div B;
+    For X := -H To H Do
+    Begin
+      If VpAng(X, -Y * A / B) < Th Then C := cFuchsia Else C := cBlue;
+      Pix(CX + X, CY + Y, C);
+    End;
+    Pix(CX - H - 1, CY + Y, cBlack);
+    Pix(CX + H + 1, CY + Y, cBlack);
+  End;
+End;
+
+{ Champ du nom du volume (onglet General) }
+Procedure VpEdit(W : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 130; Y1 := CY1 + 42; X2 := CX2 - 24; Y2 := CY1 + 62;
+End;
+
+{ Ligne d'espace : carre de couleur, libelle, octets, taille courte }
+Procedure VpRow(X1, X2, Y, C : LongInt; Const T : String; Secs : LongInt);
+Var B : String;
+Begin
+  If C >= 0 Then
+  Begin
+    FBar(X1 + 20, Y + 2, X1 + 32, Y + 14, C);
+    Box(X1 + 20, Y + 2, X1 + 32, Y + 14, cBlack);
+  End;
+  OutTxt(X1 + 40, Y, T, cBlack);
+  B := BytesStr(Secs);
+  OutTxt(X1 + 330 - TextW(B), Y, B, cBlack);
+  B := SizeShort(Secs);
+  OutTxt(X2 - 18 - TextW(B), Y, B, cBlack);
+End;
+
+Procedure PaintVolProps(W : LongInt);
+Var X1, Y1, X2, Y2, EX1, EY1, EX2, EY2, Fr, Tot, Pm, I, BX1, BY1, BX2,
+    BY2, CY : LongInt; D : Char; T : String; Wr : Boolean;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  TabStrip(W, 3, Wnds^[W].K1, VpTab(0), VpTab(1), VpTab(2));
+  D := Chr(Wnds^[W].K2);
+  Case Wnds^[W].K1 Of
+    0 :
+    Begin
+      If (D = 'D') And (FatVolOf('D:') < 0) Then
+        PaintIcon(icCdrom, X1 + 22, Y1 + 38, 32)
+      Else PaintIcon(icHardDisk, X1 + 22, Y1 + 38, 32);
+      Wr := VpWritable(D);
+      OutTxt(X1 + 70, Y1 + 45, L('Nom :', 'Label:', 'Bezeichnung:',
+             'Etichetta:', 'Etiqueta:'), cBlack);
+      VpEdit(W, EX1, EY1, EX2, EY2);
+      If Wr Then Sunken(EX1, EY1, EX2, EY2, cWhite)
+      Else Sunken(EX1, EY1, EX2, EY2, cSilver);
+      OutTxt(EX1 + 4, EY1 + 3, Wnds^[W].KS, cBlack);
+      If (Wnds^[W].K3 And 1) <> 0 Then
+        VLine(EX1 + 5 + TextW(Wnds^[W].KS), EY1 + 3, EY2 - 3, cBlack);
+      OutTxt(X1 + 70, Y1 + 74, L('Type :', 'Type:', 'Typ:', 'Tipo:',
+             'Tipo:'), cBlack);
+      If (D = 'D') And (FatVolOf('D:') < 0) Then
+        T := L('Disque CD-ROM', 'CD-ROM Disc', 'CD-ROM', 'Disco CD-ROM',
+               'Disco CD-ROM')
+      Else If FatVolOf(D + ':') < 0 Then
+        T := L('Disque virtuel', 'RAM Disk', 'RAM-Laufwerk',
+               'Disco virtuale', 'Disco virtual')
+      Else T := L('Disque local', 'Local Disk', 'Lokaler Datentr'#132'ger',
+                  'Disco locale', 'Disco local');
+      OutTxt(X1 + 130, Y1 + 74, T + ' (' + VpFs(D) + ')', cBlack);
+      HLine(X1 + 16, X2 - 16, Y1 + 98, cGray);
+      HLine(X1 + 16, X2 - 16, Y1 + 99, cWhite);
+      VolSpaceSecs(D, Fr, Tot);
+      VpRow(X1, X2, Y1 + 110, cBlue, L('Espace utilis'#130' :', 'Used space:',
+            'Belegt:', 'Spazio usato:', 'Espacio usado:'), Tot - Fr);
+      VpRow(X1, X2, Y1 + 132, cFuchsia, L('Espace libre :', 'Free space:',
+            'Frei:', 'Spazio libero:', 'Espacio libre:'), Fr);
+      HLine(X1 + 16, X2 - 16, Y1 + 158, cGray);
+      HLine(X1 + 16, X2 - 16, Y1 + 159, cWhite);
+      VpRow(X1, X2, Y1 + 168, -1, L('Capacit'#130' :', 'Capacity:',
+            'Kapazit'#132't:', 'Capacit'#133':', 'Capacidad:'), Tot);
+      If Tot > 0 Then Pm := Round(Fr / Tot * 1000) Else Pm := 0;
+      CY := Y1 + 236;
+      VpPie((X1 + X2) Div 2, CY, 74, 30, 12, Pm);
+      OutCenter(X1, X2, CY + 50, L('Lecteur ', 'Drive ', 'Laufwerk ',
+                'Unit'#133' ', 'Unidad ') + D, cBlack);
+    End;
+    1 :
+    Begin
+      GroupBox(X1 + 16, Y1 + 40, X2 - 16, Y1 + 120, L('V'#130'rification ' +
+               'des erreurs', 'Error-checking status', 'Fehler'#129'berpr'#129 +
+               'fung', 'Controllo errori', 'Comprobaci'#162'n de errores'));
+      WrapText(X1 + 60, Y1 + 58, X2 - X1 - 90, L('Aucune v'#130'rification ' +
+               'n''a encore '#130't'#130' effectu'#130'e sur ce lecteur.',
+               'Pasdows has no record of when you last checked this drive ' +
+               'for errors.', 'Das Laufwerk wurde noch nicht gepr'#129'ft.',
+               'L''unit'#133' non '#138' mai stata controllata.',
+               'Esta unidad no se ha comprobado.'), cBlack, True);
+      GroupBox(X1 + 16, Y1 + 130, X2 - 16, Y1 + 210, L(''#144'tat de la ' +
+               'sauvegarde', 'Backup status', 'Sicherung',
+               'Backup', 'Copia de seguridad'));
+      WrapText(X1 + 60, Y1 + 148, X2 - X1 - 90, L('Aucune sauvegarde ' +
+               'n''a encore '#130't'#130' faite sur ce lecteur.',
+               'Pasdows has no record of when you last backed up this ' +
+               'drive.', 'Keine Sicherung vorhanden.',
+               'Nessun backup.', 'No hay copia de seguridad.'), cBlack,
+               True);
+      GroupBox(X1 + 16, Y1 + 220, X2 - 16, Y1 + 300, L(''#144'tat de la ' +
+               'd'#130'fragmentation', 'Defragmentation status',
+               'Defragmentierung', 'Deframmentazione',
+               'Desfragmentaci'#162'n'));
+      WrapText(X1 + 60, Y1 + 238, X2 - X1 - 90, L('Aucune d'#130'fragment' +
+               'ation n''a encore '#130't'#130' faite sur ce lecteur.',
+               'Pasdows has no record of when you last defragmented this ' +
+               'drive.', 'Noch nicht defragmentiert.',
+               'Mai deframmentata.', 'Nunca desfragmentada.'), cBlack, True);
+      For I := 0 To 2 Do
+      Begin
+        BX2 := X2 - 26; BX1 := BX2 - 224;
+        BY1 := Y1 + 90 + I * 90; BY2 := BY1 + 22;
+        Case I Of
+          0 : T := L('V'#130'rifier maintenant...', 'Check Now...',
+                     'Jetzt pr'#129'fen...', 'Controlla ora...',
+                     'Comprobar ahora...');
+          1 : T := L('Sauvegarder maintenant...', 'Backup Now...',
+                     'Jetzt sichern...', 'Backup ora...',
+                     'Copiar ahora...');
+        Else
+          T := L('D'#130'fragmenter maintenant...', 'Defragment Now...',
+                 'Jetzt defragmentieren...', 'Deframmenta ora...',
+                 'Desfragmentar ahora...');
+        End;
+        Raised(BX1, BY1, BX2, BY2, False);
+        OutCenter(BX1 + 1, BX2 + 1, BY1 + 4, T, cWhite);
+        OutCenter(BX1, BX2, BY1 + 3, T, cGray);
+      End;
+    End;
+  Else
+    Begin
+      RadioButton(X1 + 24, Y1 + 46, L('Non partag'#130, 'Not Shared',
+                  'Nicht freigegeben', 'Non condiviso', 'No compartido'),
+                  True);
+      RadioButton(X1 + 24, Y1 + 70, L('Partag'#130' en tant que :',
+                  'Shared As:', 'Freigegeben als:', 'Condiviso come:',
+                  'Compartido como:'), False);
+      WrapText(X1 + 24, Y1 + 104, X2 - X1 - 48, L('Le partage de ' +
+               'fichiers et d''imprimantes n''est pas install'#130' : ' +
+               'ce lecteur ne peut pas '#136'tre partag'#130' sur le ' +
+               'r'#130'seau.', 'File and printer sharing is not ' +
+               'installed: this drive cannot be shared on the network.',
+               'Datei- und Druckerfreigabe ist nicht installiert.',
+               'Condivisione file non installata.',
+               'Compartir archivos no est'#160' instalado.'), cGray, True);
+    End;
+  End;
+  For I := 0 To 2 Do
+  Begin
+    DlgBtnRect(W, I, 3, BX1, BY1, BX2, BY2);
+    If I = 0 Then T := TxtOk
+    Else If I = 1 Then T := TxtCancel
+    Else T := L('Appliquer', 'Apply', #154'bernehmen', 'Applica',
+                'Aplicar');
+    If (I = 2) And ((Wnds^[W].K3 And 2) = 0) Then
+    Begin
+      Raised(BX1, BY1, BX2, BY2, False);
+      OutCenter(BX1 + 1, BX2 + 1, BY1 + 4, T, cWhite);
+      OutCenter(BX1, BX2, BY1 + 3, T, cGray);
+    End
+    Else
+      PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+                 I = 0);
+  End;
+End;
+
+{ Ecrire le nouveau nom ; False (message affiche) en cas d'echec }
+Function VpApply(W : LongInt) : Boolean;
+Var V, I : LongInt; Ok : Boolean;
+Begin
+  Ok := True;
+  If (Wnds^[W].K3 And 2) <> 0 Then
+  Begin
+    V := FatVolOf(Chr(Wnds^[W].K2) + ':');
+    Ok := (V >= 0) And VolSetLabel(V, Wnds^[W].KS);
+    If Ok Then
+    Begin
+      Wnds^[W].K3 := Wnds^[W].K3 And Not 2;
+      Wnds^[W].KS := VolLab[V];
+      For I := 0 To MaxWnd - 1 Do
+        If Wnds^[I].Used And (Wnds^[I].IKind = ikExplorer) Then KRepaint(I);
+    End
+    Else
+      MsgBoxOpen(VpTab(0), L('Impossible de changer le nom du volume.',
+                 'Cannot change the volume label.',
+                 'Die Bezeichnung kann nicht ge'#132'ndert werden.',
+                 'Impossibile cambiare l''etichetta.',
+                 'No se puede cambiar la etiqueta.'), $10);
+  End;
+  VpApply := Ok;
+End;
+
+Procedure VpClose(W : LongInt);
+Begin
+  DestroyW(W);
+  If VpW = W Then VpW := -1;
+End;
+
+Procedure VolPropsMouse(W, Msg, X, Y : LongInt);
+Var I, BX1, BY1, BX2, BY2 : LongInt;
+Begin
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  If Msg = WM_LBUTTONDBLCLK Then Msg := WM_LBUTTONDOWN;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    I := TabHit(W, 3, X, Y, VpTab(0), VpTab(1), VpTab(2));
+    If I >= 0 Then
+    Begin
+      Wnds^[W].K1 := I;
+      Wnds^[W].K3 := Wnds^[W].K3 And Not 1;
+      KRepaint(W);
+      Exit;
+    End;
+    If Wnds^[W].K1 = 0 Then
+    Begin
+      VpEdit(W, BX1, BY1, BX2, BY2);
+      If InRect(X, Y, BX1, BY1, BX2, BY2) And
+         VpWritable(Chr(Wnds^[W].K2)) Then
+      Begin
+        Wnds^[W].K3 := Wnds^[W].K3 Or 1;
+        KRepaint(W);
+        Exit;
+      End;
+    End;
+  End;
+  For I := 0 To 2 Do
+  Begin
+    DlgBtnRect(W, I, 3, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If (I = 2) And ((Wnds^[W].K3 And 2) = 0) Then Exit;
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        If I = 1 Then VpClose(W)
+        Else If VpApply(W) Then
+        Begin
+          If I = 0 Then VpClose(W) Else KRepaint(W);
+        End
+        Else KRepaint(W);
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure VolPropsKey(W, VK, Ch : LongInt);
+Var D : Char; C : Char;
+Begin
+  If VK = $1B Then
+  Begin
+    VpClose(W);
+    Exit;
+  End;
+  If VK = $0D Then
+  Begin
+    If VpApply(W) Then VpClose(W);
+    Exit;
+  End;
+  If (Wnds^[W].K1 <> 0) Or ((Wnds^[W].K3 And 1) = 0) Then Exit;
+  D := Chr(Wnds^[W].K2);
+  If VK = 8 Then
+  Begin
+    If Wnds^[W].KS <> '' Then
+    Begin
+      Delete(Wnds^[W].KS, Length(Wnds^[W].KS), 1);
+      Wnds^[W].K3 := Wnds^[W].K3 Or 2;
+      KRepaint(W);
+    End;
+    Exit;
+  End;
+  If (Ch < 32) Or (Ch > 255) Or (Length(Wnds^[W].KS) >= 11) Then Exit;
+  C := Chr(Ch);
+  { FAT : majuscules, sans les caracteres interdits des noms courts }
+  If (VpFs(D) = 'FAT') Or (VpFs(D) = 'FAT32') Then
+  Begin
+    C := UpCase(C);
+    If Pos(C, '*?./\|,;:+=<>[]"') > 0 Then Exit;
+  End;
+  Wnds^[W].KS := Wnds^[W].KS + C;
+  Wnds^[W].K3 := Wnds^[W].K3 Or 2;
+  KRepaint(W);
+End;
+
 { Ligne R : deplier/replier une categorie, ouvrir un peripherique }
 Procedure DmActivate(W, R : LongInt);
 Begin
@@ -18119,7 +18693,7 @@ Begin
   If Dbl Then Msg := WM_LBUTTONDOWN;
   If Msg = WM_LBUTTONDOWN Then
   Begin
-    I := TabHit(W, 2, X, Y, SysTab0, SysTab1);
+    I := TabHit(W, 2, X, Y, SysTab0, SysTab1, '');
     If I >= 0 Then
     Begin
       Wnds^[W].K1 := I;
@@ -18658,6 +19232,11 @@ Begin
            (Wnds^[I].IKind <> ikTaskbar) And (Wnds^[I].IKind <> ikMenu) And
            ((Wnds^[I].Style And WS_CAPTION) = WS_CAPTION) Then MinimizeW(I);
     cmSysProps : SysOpen;
+    cmDrvOpen :
+      If (ExpCtxW >= 0) And Wnds^[ExpCtxW].Used And
+         (Wnds^[ExpCtxW].IKind = ikExplorer) Then
+        ExpOpenItem(ExpCtxW, ExpCtxI);
+    cmDrvProps : VolPropsOpen(ExpDrive(ExpCtxI));
     cmAudioProps : AudioOpen;
     cmAlign : MarkAll;
     cmArrName : DeskArrange(False);
@@ -18820,6 +19399,7 @@ Begin
     ikMixer : MixerMouse(W, Msg, X, Y);
     ikAudio : AudioMouse(W, Msg, X, Y);
     ikSysProps : SysPropsMouse(W, Msg, X, Y);
+    ikVolProps : VolPropsMouse(W, Msg, X, Y);
     ikNotepad : NoteMouse(W, Msg, X, Y);
     ikFileDlg : FileDlgMouse(W, Msg, X, Y);
     ikFind : FindMouse(W, Msg, X, Y);
@@ -19290,6 +19870,7 @@ Begin
     ikDisplay : DisplayKey(W, VK);
     ikDateTime : DateTimeKey(W, VK);
     ikSysProps : SysPropsKey(W, VK);
+    ikVolProps : VolPropsKey(W, VK, Ch);
     ikFileDlg : FileDlgKey(W, VK, Ch);
     ikFind : FindKey(W, VK, Ch);
     ikDevProps : If (VK = $0D) Or (VK = $1B) Then
@@ -19344,6 +19925,7 @@ Begin
     ikMixer : PaintMixer(W);
     ikAudio : PaintAudio(W);
     ikSysProps : PaintSysProps(W);
+    ikVolProps : PaintVolProps(W);
     ikFileDlg : PaintFileDlg(W);
     ikFind : PaintFind(W);
     ikDevProps : PaintDevProps(W);
@@ -21398,6 +21980,141 @@ Begin
     If PFs <> 0 Then PutPStr(PFs, 'CDFS', FsSize);
   End;
   GetVolumeInformationA := 1;
+End;
+
+{ Changer le nom (etiquette) du volume V. FAT : secteur d'amorce (et sa
+  copie en FAT32) et entree de la racine (attribut 08h) ; NTFS : attribut
+  $VOLUME_NAME de $Volume ; HPFS : secteur d'amorce }
+Function VolSetLabel(V : LongInt; Lab : String) : Boolean;
+Var A, B, K, Sec, Fat32, Free0, I, R, P : LongInt; S, T : String;
+    Done : Boolean;
+Begin
+  VolSetLabel := False;
+  If (V < 0) Or (V >= VolN) Then Exit;
+  Lab := Trim(Copy(Lab, 1, 11));
+  If VolType[V] = NtfsT Then
+  Begin
+    If NvRO[V] <> 0 Then Exit;
+    R := KAlloc(4096);
+    If R = 0 Then Exit;
+    If NtReadRec(V, 3, R) Then
+    Begin
+      P := NtAttr(V, R, $60, '');
+      If P = 0 Then P := NtAddRes(V, R, $60, '', Length(Lab) * 2)
+      Else If NtResSetLen(V, R, P, Length(Lab) * 2) Then
+        P := NtAttr(V, R, $60, '')
+      Else P := 0;
+      If P <> 0 Then
+      Begin
+        For I := 1 To Length(Lab) Do
+          MemW[0:NtResVal(P) + (I - 1) * 2] := Ord(Lab[I]);
+        If NtWriteRec(V, 3, R) Then
+        Begin
+          VolLab[V] := Lab;
+          VolSetLabel := True;
+        End;
+      End;
+    End;
+    KFree(R);
+    Exit;
+  End;
+  S := UpStr(Lab);
+  While Length(S) < 11 Do S := S + ' ';
+  If VolType[V] = HpfsT Then
+  Begin
+    If HvRO[V] <> 0 Then Exit;
+    A := KAlloc(512);
+    If A = 0 Then Exit;
+    If HpRd(V, 0, 1, A) Then
+    Begin
+      For I := 0 To 10 Do Mem[0:A + 43 + I] := Ord(S[I + 1]);
+      If HpWr(V, 0, 1, A) Then
+      Begin
+        VolLab[V] := Trim(S);
+        VolSetLabel := True;
+      End;
+    End;
+    KFree(A);
+    Exit;
+  End;
+  { FAT12, FAT16, FAT32 : secteur d'amorce (signature etendue 29h) }
+  Fat32 := Ord(VolType[V] = 32);
+  If Lab = '' Then T := 'NO NAME    ' Else T := S;
+  A := VSec(V, 0);
+  If FatIoErr Then
+  Begin
+    FatIoErr := False;
+    Exit;
+  End;
+  If Mem[0:A + 38 + 28 * Fat32] = $29 Then
+  Begin
+    For I := 0 To 10 Do Mem[0:A + 43 + 28 * Fat32 + I] := Ord(T[I + 1]);
+    VPut(V, 0);
+    K := MemW[0:A + 50];
+    If (Fat32 = 1) And (K > 0) And (K < VolRsvd[V]) Then
+    Begin
+      B := VSec(V, K);
+      If (MemW[0:B + 510] = $AA55) And (Mem[0:B + 66] = $29) Then
+      Begin
+        For I := 0 To 10 Do Mem[0:B + 71 + I] := Ord(T[I + 1]);
+        VPut(V, K);
+      End;
+    End;
+  End;
+  { entree d'etiquette de la racine : modifiee, effacee ou creee }
+  Free0 := -1; K := 0; Done := False;
+  Repeat
+    A := DirEnt(V, RootOf(V), K, Sec, False);
+    If A = 0 Then Break;
+    If Mem[0:A] = 0 Then Break;
+    If Mem[0:A] = $E5 Then
+    Begin
+      If Free0 < 0 Then Free0 := K;
+    End
+    Else If (Mem[0:A + 11] And $1F) = 8 Then
+    Begin
+      If Lab = '' Then Mem[0:A] := $E5
+      Else For I := 0 To 10 Do Mem[0:A + I] := Ord(S[I + 1]);
+      MemL[0:A + 22] := DosNow;
+      VPut(V, Sec);
+      Done := True;
+      Break;
+    End;
+    Inc(K);
+  Until K > 65535;
+  If Not Done And (Lab <> '') Then
+  Begin
+    If Free0 < 0 Then Free0 := K;
+    A := DirEnt(V, RootOf(V), Free0, Sec, True);
+    If A = 0 Then Exit;
+    FillMem(A, 32, 0);
+    For I := 0 To 10 Do Mem[0:A + I] := Ord(S[I + 1]);
+    Mem[0:A + 11] := 8;
+    MemL[0:A + 22] := DosNow;
+    VPut(V, Sec);
+  End;
+  If FatIoErr Then
+  Begin
+    FatIoErr := False;
+    Exit;
+  End;
+  VolLab[V] := Trim(S);
+  VolSetLabel := True;
+End;
+
+Function SetVolumeLabelA(PRoot, PName : LongInt) : LongInt;
+Var D, N : String; V : LongInt;
+Begin
+  If PRoot <> 0 Then D := UpStr(PStr(PRoot)) Else D := CurDirS;
+  N := '';
+  If PName <> 0 Then N := PStr(PName);
+  V := FatVolOf(Copy(D, 1, 1) + ':');
+  If (V >= 0) And VolSetLabel(V, N) Then SetVolumeLabelA := 1
+  Else
+  Begin
+    SetErr(5);
+    SetVolumeLabelA := 0;
+  End;
 End;
 
 { Recherche : F1 position, F2 0 = CD, 1 = disque virtuel ; Name chemin
@@ -31404,6 +32121,32 @@ Begin
 End;
 
 { Chercher un fichier de module : chemin donne, D:\, C:\WINDOWS }
+{ Fichier programme Name dans le dossier D (termine par \) ; '' si
+  absent. Sans extension : NOM.EXE, NOM.COM, puis NOM }
+Function FindInDir(Const D, Name : String) : String;
+Var Attr, Size, Time, Lba, Ram : LongInt; B, S, R : String;
+Begin
+  R := '';
+  B := UpStr(BaseName(Name));
+  If Pos('.', B) = 0 Then
+  Begin
+    S := D + B + '.EXE';
+    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
+    If R = '' Then
+    Begin
+      S := D + B + '.COM';
+      If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
+    End;
+  End;
+  If R = '' Then
+  Begin
+    S := D + B;
+    If PathInfo(S, Attr, Size, Time, Lba, Ram) And
+       ((Attr And $10) = 0) Then R := S;
+  End;
+  FindInDir := R;
+End;
+
 Function FindModuleFile(Name : String) : String;
 Var Attr, Size, Time, Lba, Ram : LongInt; S, R : String;
 Begin
@@ -31430,16 +32173,11 @@ Begin
          ((Attr And $10) = 0) Then R := S;
     End;
   End;
-  If R = '' Then
-  Begin
-    S := SysDir + UpStr(BaseName(Name));
-    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
-  End;
-  If R = '' Then
-  Begin
-    S := 'D:\' + UpStr(BaseName(Name));
-    If PathInfo(S, Attr, Size, Time, Lba, Ram) Then R := S;
-  End;
+  { dossier systeme, racine de C:, puis CD-ROM (D:) ; sans extension :
+    NOM.EXE puis NOM.COM ("dxdiag" dans la boite Executer) }
+  If R = '' Then R := FindInDir(SysDir, Name);
+  If (R = '') And (SysDir <> 'C:\') Then R := FindInDir('C:\', Name);
+  If (R = '') And (SysDir <> 'D:\') Then R := FindInDir('D:\', Name);
   FindModuleFile := R;
 End;
 
@@ -60590,6 +61328,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   GetFullPathNameA, GetCurrentDirectoryA, SetCurrentDirectoryA,
   GetDiskFreeSpaceA, GetDriveTypeA, GetLogicalDrives, GetWindowsDirectoryA,
   GetSystemDirectoryA, GetTempPathA, GetVolumeInformationA, FindFirstFileA,
+  SetVolumeLabelA,
   FindNextFileA, FindClose, _lopen, _lcreat, _lclose, _lread, _hread, _lwrite,
   _hwrite, _llseek, OpenFile, GetProcessHeap, HeapCreate, HeapDestroy,
   HeapAlloc, HeapFree, HeapReAlloc, HeapSize, GlobalAlloc, GlobalLock,
@@ -70418,6 +71157,7 @@ Begin
   KClass[ikFileDlg] := ClassAdd('#FileDlg', 0, ikFileDlg, 0);
   KClass[ikFind] := ClassAdd('#Find', 0, ikFind, 0);
   KClass[ikDevProps] := ClassAdd('#DevProps', 0, ikDevProps, 0);
+  KClass[ikVolProps] := ClassAdd('#VolProps', 0, ikVolProps, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
@@ -70786,7 +71526,7 @@ BEGIN
   TzLoad;
   PsDev := -1;
   SndInit;
-  TrayVol := True; MixW0 := -1; AudW := -1; SysW := -1; DevPW := -1;
+  TrayVol := True; MixW0 := -1; AudW := -1; SysW := -1; DevPW := -1; VpW := -1;
   FdW := -1; FindW := -1; NoteAskW := -1; NotePend := -1; NoteSel := -1;
   ThreadInit0;
   { pagination des le depart : repertoire de pages par processus }
