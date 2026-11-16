@@ -8110,7 +8110,7 @@ End;
 { ============================================================ }
 
 Const
-  MAX_PROC  = {$IFDEF FPC}4096{$ELSE}32{$ENDIF};  { max procedures/fonctions }
+  MAX_PROC  = {$IFDEF FPC}16384{$ELSE}32{$ENDIF};  { max procedures/fonctions }
   MAX_LOCAL = {$IFDEF FPC}256{$ELSE}16{$ENDIF};     { max variables locales par proc }
   MAX_PARAM = {$IFDEF FPC}64{$ELSE}8{$ENDIF};      { max parametres par proc }
 
