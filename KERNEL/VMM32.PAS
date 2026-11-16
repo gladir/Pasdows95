@@ -10510,7 +10510,11 @@ Begin
   end;
   HeapOwner := ThrOwner[CurT];
   A := LongInt(@FpuArea) + CurT * 112;
+  { FNCLEX : une exception x87 laissee en attente par une tache arretee
+    (faute #MF d'un programme) ne doit pas se declencher ici, dans le
+    noyau (FRSTOR attend les exceptions en attente) }
   asm
+    db 219,226
     mov eax,A
     frstor [eax]
   end;
@@ -10607,7 +10611,7 @@ Begin
     End;
   If T < 0 Then Exit;
   If StackSz < 65536 Then StackSz := 65536;
-  If StackSz > 4194304 Then StackSz := 4194304;
+  If StackSz > 16777216 Then StackSz := 16777216;
   { pile et TIB au noyau : liberes par ReapThreads seulement. Rendus
     par KFreeOwner a la fin du programme, ils pouvaient etre realloues
     (memoire du programme suivant) puis liberes une seconde fois par
@@ -21401,7 +21405,20 @@ Procedure KillApp; Forward;
 Procedure KFault(Vec, Frame : LongInt);
 Var Eip, Err, V, X : LongInt; Nm, S : String;
 Begin
+  { exception x87 en attente : effacee (FNCLEX), sinon la prochaine
+    instruction du coprocesseur la redeclencherait dans le noyau }
+  asm
+    db 219,226
+  end;
   V := Vec And 255;
+  { erreur du coprocesseur (#MF, 16) detectee dans le noyau (FRSTOR,
+    FNSAVE...) : elle vient d'un programme, le noyau continue }
+  If (V = 16) And (MemL[0:Frame + 44] < $400000) Then
+  Begin
+    KLog('Exception x87 en attente effacee (EIP=' +
+         HexStr(MemL[0:Frame + 44], 8) + ')');
+    Exit;
+  End;
   If Vec >= 256 Then
   Begin
     Err := MemL[0:Frame + 44];
@@ -21418,6 +21435,7 @@ Begin
     13 : Nm := 'Protection generale';
     14 : Nm := 'Faute de page';
     3 : Nm := 'Point d''arret';
+    16 : Nm := 'Erreur du coprocesseur (virgule flottante)';
   Else
     Nm := 'Exception ' + IntStr(V);
   End;
@@ -21475,6 +21493,9 @@ Begin
       'Este programa ha efectuado una operaci'#162'n no v'#160'lida y se ' +
       'apagar'#160'.') + '|' + S, $10);
     KillApp;
+    asm
+      fninit
+    end;
     { reprendre la tache 0 (le cadre de la faute est abandonne) }
     Threads[CurT].State := tsDead;
     X := 0;
@@ -34212,7 +34233,7 @@ Function RunDos(Path, Args : String) : Boolean; Forward;
   processus, -1 en cas d'echec }
 Function ProcStart(S, Args, Dir : String; Show : LongInt;
                    Susp : Boolean) : LongInt;
-Var P, M, T, Sub, I : LongInt;
+Var P, M, T, Sub, I, Stk : LongInt;
 Begin
   ProcStart := -1;
   P := ProcNew(pkWin32);
@@ -34235,6 +34256,11 @@ Begin
     AppExcFilter := 0;
     AppErrMode := 0;
     Sub := MemW[0:AppBase + MemL[0:AppBase + $3C] + 24 + 68];
+    { pile du fil principal : SizeOfStackReserve de l'en-tete PE (1 a
+      16 Mo), entierement allouee car elle n'a pas de page de garde }
+    Stk := MemL[0:AppBase + MemL[0:AppBase + $3C] + 24 + 72];
+    If Stk < $100000 Then Stk := $100000;
+    If Stk > $1000000 Then Stk := $1000000;
     If Args <> '' Then S := S + ' ' + Args;
     AppCmd := KAlloc(256);
     PutPStr(AppCmd, S, 256);
@@ -34258,7 +34284,7 @@ Begin
       If ConW < 0 Then ConTitle := '';
       ConEnsure;
     End;
-    T := ThreadNew(AppEntry, 0, $100000, True);
+    T := ThreadNew(AppEntry, 0, Stk, True);
     If (T >= 0) And Susp Then Threads[T].Susp := 1;
     AppMainT := T;
   End;
