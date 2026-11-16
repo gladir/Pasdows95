@@ -261,6 +261,7 @@ Var
   AsmNative  : Boolean;
   BcHashReady : Boolean;      { tables de hachage des labels a initialiser }
   ImageBaseDir : LongInt;     { directive IMAGEBASE (0 = base par defaut) }
+  StackResDir : LongInt;      { directive M en Win32 : pile du fil principal (0 = 1 Mo) }
   PEImgBase  : LongInt;
   AsmBlockSeq: LongInt;
 
@@ -2461,6 +2462,10 @@ Begin
   End
   Else If (Dir = 'M') And D16Selected Then
     D16MDirective(Arg)
+  Else If Dir = 'M' Then
+    { Win32 : taille de la pile du fil principal ; les valeurs de Turbo
+      Pascal (16 Ko...) sont ignorees, le minimum reste 1 Mo }
+    StackResDir := ParseImageBase(Arg)
   Else If Dir = 'IMAGEBASE' Then
     ImageBaseDir := ParseImageBase(Arg)
   Else If (Dir = 'I') Or (Dir = 'INCLUDE') Then
@@ -23944,10 +23949,13 @@ Begin
   ParseExpr(PI);
   WantCharLit := False;
 
-  { Stocker la limite dans une variable data temporaire }
-  LimLabel := LabelGen;
-  DataAddDWord(LimLabel, 0);  { Allouer la variable temporaire pour la limite }
-  EmitInstr('MOV DWORD PTR [' + LimLabel + '],EAX');
+  { La limite est gardee sur la pile ([ESP] pendant toute la boucle, le
+    corps laissant la pile equilibree), comme le selecteur d un Case. Une
+    variable statique etait ecrasee par la meme boucle d un appel
+    recursif (ou d un autre fil) : au retour, la boucle externe allait
+    jusqu a la limite de l appel interne. }
+  LimLabel := '';
+  EmitInstr('PUSH EAX');
 
   { Generer les labels de boucle }
   LblTest := LabelGen;
@@ -23966,7 +23974,7 @@ Begin
 
   { Test : CMP variable, limite }
   GenLoadVar(PI, VarName);
-  EmitInstr('CMP EAX,DWORD PTR [' + LimLabel + ']');
+  EmitInstr('CMP EAX,DWORD PTR [ESP]');
   If IsDownTo Then
     EmitInstr('JL ' + LblEnd)
   Else
@@ -23989,7 +23997,7 @@ Begin
   { Fin de boucle quand la variable a atteint la limite AVANT de l incrementer : }
   { un compteur Word ou Byte (For J := N DownTo 0, For B := 0 To 255) ne deborde pas }
   GenLoadVar(PI, VarName);
-  EmitInstr('CMP EAX,DWORD PTR [' + LimLabel + ']');
+  EmitInstr('CMP EAX,DWORD PTR [ESP]');
   EmitInstr('JE ' + LblEnd);
   If IsDownTo Then
     EmitInstr('DEC EAX')
@@ -23999,12 +24007,12 @@ Begin
   EmitInstr('JMP ' + LblBody);
 
   EmitLabel(LblEnd);
+  { retirer la limite (toutes les sorties passent par LblEnd : fin,
+    Break ; Exit restaure ESP depuis EBP) }
+  EmitInstr('ADD ESP,4');
 
   { Depiler le contexte de boucle }
   LoopPop;
-
-  { Ajouter la variable limite dans le segment de donnees }
-  DataAddDWord(LimLabel, 0);
 End;
 
 { ------------------------------------------------------------ }
@@ -32935,7 +32943,7 @@ Begin
   EmitInstr('RET');
 
   { ------ _TPRT_FIXLEN : EDI = chaine Pascal dont la partie ASCIIZ a change : }
-  {        recalcule l octet de longueur (max 255)                              }
+  {        recalcule l octet de longueur (max 254 : NUL dans les 256 octets)   }
   EmitBlankLine;
   EmitLabel(TP_RT_PFX + 'FIXLEN');
   EmitInstr('PUSHAD');
@@ -32946,9 +32954,9 @@ Begin
   EmitInstr('CMP BYTE PTR [EDX+ECX],0');
   EmitInstr('JE ' + TP_RT_PFX + 'FXL_D');
   EmitInstr('INC ECX');
-  EmitInstr('CMP ECX,255');
+  EmitInstr('CMP ECX,254');
   EmitInstr('JB ' + TP_RT_PFX + 'FXL_L');
-  EmitInstr('MOV BYTE PTR [EDI+256],0');
+  EmitInstr('MOV BYTE PTR [EDI+255],0');
   EmitLabel(TP_RT_PFX + 'FXL_D');
   EmitInstr('MOV BYTE PTR [EDI],CL');
   EmitInstr('POPAD');
@@ -33261,10 +33269,13 @@ Begin
   EmitInstr('INC ESI');
   EmitInstr('JMP ' + TP_RT_PFX + 'SASG_C');
   EmitLabel(TP_RT_PFX + 'SASG_D');
-  { ECX = longueur, tronquer a 255 max }
-  EmitInstr('CMP ECX,255');
+  { ECX = longueur, tronquee a 254 : octet de longueur + 254 caracteres +
+    NUL terminal = 256 octets, la taille d une variable String. A 255, le
+    NUL tombait sur l octet qui suit la variable (cadre de pile, champ
+    suivant d un enregistrement...) }
+  EmitInstr('CMP ECX,254');
   EmitInstr('JLE ' + TP_RT_PFX + 'SASG_OK');
-  EmitInstr('MOV ECX,255');
+  EmitInstr('MOV ECX,254');
   EmitLabel(TP_RT_PFX + 'SASG_OK');
   { Stocker longueur dans EDI[0] }
   EmitInstr('MOV BYTE PTR [EDI],CL');
@@ -33416,9 +33427,9 @@ Begin
   EmitInstr('SHL EAX,8');
   EmitInstr('MOV EDI,OFFSET STRRING');
   EmitInstr('ADD EDI,EAX');
-  EmitInstr('CMP ECX,255');
+  EmitInstr('CMP ECX,254');
   EmitInstr('JBE ' + TP_RT_PFX + 'CA2S_OK');
-  EmitInstr('MOV ECX,255');
+  EmitInstr('MOV ECX,254');
   EmitLabel(TP_RT_PFX + 'CA2S_OK');
   EmitInstr('MOV EAX,EDI');
   EmitInstr('MOV BYTE PTR [EDI],CL');
@@ -33608,8 +33619,15 @@ Begin
   { Utilise STRBUF2 comme buffer temporaire                     }
   EmitBlankLine;
   EmitLabel(TP_RT_PFX + 'INSERT');
+  { EDI = partie ASCIIZ de la chaine destination (apres l octet de
+    longueur), ESI = chaine inseree (ASCIIZ), EBX = position (1..).
+    Le resultat est borne a 254 caracteres + NUL : il reste dans les 256
+    octets de la variable (FIXLEN recalcule ensuite la longueur). }
   EmitInstr('PUSHAD');
   EmitInstr('DEC EBX');
+  EmitInstr('JNS ' + TP_RT_PFX + 'INS_B0');
+  EmitInstr('XOR EBX,EBX');
+  EmitLabel(TP_RT_PFX + 'INS_B0');
   { Copier destination dans STRBUF2 }
   EmitInstr('PUSH ESI');
   EmitInstr('PUSH EDI');
@@ -33618,36 +33636,49 @@ Begin
   EmitInstr('CALL ' + TP_RT_PFX + 'STRASSIGN_PCHAR');
   EmitInstr('POP EDI');
   EmitInstr('POP ESI');
-  { EDI = debut du buffer destination }
-  { Copier les EBX premiers caracteres de STRBUF2 dans EDI }
+  { EDX = place restante (254 caracteres) }
+  EmitInstr('MOV EDX,254');
+  { Copier les EBX premiers caracteres de STRBUF2 (pas au-dela du NUL) }
   EmitInstr('PUSH ESI');
-  EmitInstr('PUSH EBX');
   EmitInstr('LEA ESI,[STRBUF2]');
   EmitInstr('MOV ECX,EBX');
+  EmitLabel(TP_RT_PFX + 'INS_P1');
   EmitInstr('TEST ECX,ECX');
   EmitInstr('JZ ' + TP_RT_PFX + 'INS_P2');
-  EmitLabel(TP_RT_PFX + 'INS_P1');
+  EmitInstr('CMP BYTE PTR [ESI],0');
+  EmitInstr('JE ' + TP_RT_PFX + 'INS_P2');
+  EmitInstr('TEST EDX,EDX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'INS_P2');
   EmitInstr('MOVSB');
+  EmitInstr('DEC EDX');
   EmitInstr('DEC ECX');
-  EmitInstr('JNZ ' + TP_RT_PFX + 'INS_P1');
+  EmitInstr('JMP ' + TP_RT_PFX + 'INS_P1');
   EmitLabel(TP_RT_PFX + 'INS_P2');
-  { Copier la source (ESI original) dans EDI }
-  EmitInstr('POP EBX');
+  { EBX = position reelle de reprise dans STRBUF2 }
+  EmitInstr('MOV EBX,ESI');
   EmitInstr('POP ESI');
+  { Copier la chaine inseree }
   EmitLabel(TP_RT_PFX + 'INS_S1');
   EmitInstr('CMP BYTE PTR [ESI],0');
   EmitInstr('JE ' + TP_RT_PFX + 'INS_S2');
+  EmitInstr('TEST EDX,EDX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'INS_S2');
   EmitInstr('MOVSB');
+  EmitInstr('DEC EDX');
   EmitInstr('JMP ' + TP_RT_PFX + 'INS_S1');
   EmitLabel(TP_RT_PFX + 'INS_S2');
-  { Copier le reste de STRBUF2 a partir de la position EBX }
-  EmitInstr('LEA ESI,[STRBUF2]');
-  EmitInstr('ADD ESI,EBX');
+  { Copier le reste de STRBUF2 }
+  EmitInstr('MOV ESI,EBX');
   EmitLabel(TP_RT_PFX + 'INS_R1');
-  EmitInstr('LODSB');
-  EmitInstr('STOSB');
-  EmitInstr('TEST AL,AL');
-  EmitInstr('JNZ ' + TP_RT_PFX + 'INS_R1');
+  EmitInstr('CMP BYTE PTR [ESI],0');
+  EmitInstr('JE ' + TP_RT_PFX + 'INS_R2');
+  EmitInstr('TEST EDX,EDX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'INS_R2');
+  EmitInstr('MOVSB');
+  EmitInstr('DEC EDX');
+  EmitInstr('JMP ' + TP_RT_PFX + 'INS_R1');
+  EmitLabel(TP_RT_PFX + 'INS_R2');
+  EmitInstr('MOV BYTE PTR [EDI],0');
   EmitInstr('POPAD');
   EmitInstr('RET');
 
@@ -34900,7 +34931,7 @@ Begin
   EmitInstr('JZ ' + TP_RT_PFX + 'FF_CE');
   EmitInstr('STOSB');
   EmitInstr('INC ECX');
-  EmitInstr('CMP ECX,255');
+  EmitInstr('CMP ECX,254');
   EmitInstr('JB ' + TP_RT_PFX + 'FF_CP');
   EmitLabel(TP_RT_PFX + 'FF_CE');
   EmitInstr('MOV BYTE PTR [EDI],0');        { terminateur NUL }
@@ -34987,7 +35018,7 @@ Begin
   EmitInstr('JZ ' + TP_RT_PFX + 'FN_CE');
   EmitInstr('STOSB');
   EmitInstr('INC ECX');
-  EmitInstr('CMP ECX,255');
+  EmitInstr('CMP ECX,254');
   EmitInstr('JB ' + TP_RT_PFX + 'FN_CP');
   EmitLabel(TP_RT_PFX + 'FN_CE');
   EmitInstr('MOV BYTE PTR [EDI],0');        { terminateur NUL }
@@ -37686,9 +37717,9 @@ Begin
   { Longueur }
   EmitInstr('PUSH ESI');
   EmitInstr('CALL lstrlenA');
-  EmitInstr('CMP EAX,255');
+  EmitInstr('CMP EAX,254');
   EmitInstr('JBE ' + TP_RT_PFX + 'PA_OK');
-  EmitInstr('MOV EAX,255');                  { tronquer a 255 }
+  EmitInstr('MOV EAX,254');                  { tronquer a 254 (+ NUL) }
   EmitLabel(TP_RT_PFX + 'PA_OK');
   EmitInstr('LEA EDI,[STR_PASBUF]');
   EmitInstr('MOV BYTE PTR [EDI],AL');        { octet de longueur }
@@ -46953,7 +46984,8 @@ Begin
   Else If AppTypeGui Then PEWrW(2)          { Subsystem = WINDOWS_GUI }
   Else PEWrW(3);   { Subsystem = NATIVE (noyau) / CONSOLE }
   PEWrW(0);             { DllCharacteristics }
-  PEWrD($100000);       { SizeOfStackReserve }
+  If StackResDir > $100000 Then PEWrD(StackResDir)  { SizeOfStackReserve }
+  Else PEWrD($100000);
   PEWrD($1000);         { SizeOfStackCommit }
   PEWrD($100000);       { SizeOfHeapReserve }
   PEWrD($1000);         { SizeOfHeapCommit }

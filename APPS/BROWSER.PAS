@@ -13,6 +13,7 @@ Program BROWSER;
 
 {$APPTYPE GUI}
 {$R-,S-,I-}
+{$M 8388608}
 
 { Compilation : WPC -CW32 APPS\BROWSER.PAS BROWSER.EXE
 
@@ -662,6 +663,29 @@ Begin
   Else
     Dummy := WritePrivateProfileStringA(LongInt(@A), LongInt(@K),
                                         LongInt(@B), LongInt(@F));
+End;
+
+{ pile du fil principal : 8 Mo (directive M), sans page de garde. Les fonctions
+  recursives (analyse et execution du JavaScript, mise en page, styles)
+  s'arretent avant qu'il ne reste moins de 512 Ko : une page tres
+  imbriquee (code JavaScript minifie de Google...) donne une erreur de
+  script ou une page tronquee, jamais un debordement de pile. }
+Const
+  STACK_SIZE = 8388608;
+  STACK_MARGIN = 524288;
+Var
+  StackLim : LongInt;
+
+Procedure StackInit;
+Var P : LongInt;
+Begin
+  StackLim := LongInt(@P) - (STACK_SIZE - STACK_MARGIN);
+End;
+
+Function StackLow : Boolean;
+Var P : LongInt;
+Begin
+  StackLow := LongInt(@P) < StackLim;
 End;
 
 { memoire privee du processus (DosAllocMem d'OS/2) : 0 si refusee }
@@ -1395,10 +1419,26 @@ Begin
     ErrorPage(Url, 'Le serveur a repondu : erreur ' + IStr(FStatus) + '.');
 End;
 
+{ coprocesseur : toutes les exceptions masquees (mot de controle 027Fh,
+  celui de Windows, double precision). Le runtime de WPC demasque les
+  exceptions d'operation non valide, de division par zero et de
+  depassement (1332h, comme FPC) ; or le JavaScript calcule en IEEE 754
+  (Infinity, NaN, 1e300 * 1e300) et une page Web ne doit jamais arreter
+  le navigateur. }
+Procedure FpuQuiet;
+Begin
+  asm
+    push 639;
+    fldcw word ptr [esp];
+    pop eax;
+  end;
+End;
+
 { fil de chargement (CreateThread) : FTarget 0 : document (SrcBuf),
   1 : image ou ressource (ImgBuf) }
 Function FetchThread(Arg : LongInt) : LongInt; stdcall;
 Begin
+  FpuQuiet;
   If FTarget = 0 Then
   Begin
     FBuf := SrcBuf; FCap := SRC_MAX;
@@ -2940,7 +2980,7 @@ End;
 Procedure CollectStyles(N : PNode);
 Var C : PNode;
 Begin
-  If N = Nil Then Exit;
+  If (N = Nil) Or StackLow Then Exit;
   C := N^.First;
   While C <> Nil Do
   Begin
@@ -3053,7 +3093,7 @@ End;
 Procedure ScanDoc(N : PNode; Form : LongInt);
 Var C : PNode; T, K : LongInt; S : String;
 Begin
-  If N = Nil Then Exit;
+  If (N = Nil) Or StackLow Then Exit;
   C := N^.First;
   While C <> Nil Do
   Begin
@@ -3700,6 +3740,7 @@ Procedure MeasureFlow(N : PNode; Var St : TSt);
 Var C : PNode; S2 : TSt; D, W, H, I, J, Cw, Len, SMin, SMax, SLine, Ind, K, ET, ER, EB, EL : LongInt;
     HasT, HasB : Boolean;
 Begin
+  If StackLow Then Exit;
   C := N^.First;
   While C <> Nil Do
   Begin
@@ -4513,7 +4554,7 @@ End;
 Procedure FlowChildren(N : PNode; Var St : TSt);
 Var C : PNode;
 Begin
-  If N = Nil Then Exit;
+  If (N = Nil) Or StackLow Then Exit;
   C := N^.First;
   While C <> Nil Do
   Begin
@@ -7206,6 +7247,12 @@ End;
 Function JParseUnary : PJN;
 Var N : PJN; Op : String;
 Begin
+  If StackLow Then JsError('SyntaxError: expression trop imbriqu' + Chr(130) + 'e');
+  If JsErr Then
+  Begin
+    JParseUnary := Nil;
+    Exit;
+  End;
   If JIs('!') Or JIs('-') Or JIs('+') Or JIs('~') Then
   Begin
     Op := JTokS;
@@ -7416,6 +7463,7 @@ Function JParseStatement : PJN;
 Var N, E, Last, C : PJN;
 Begin
   N := Nil;
+  If StackLow Then JsError('SyntaxError: instructions trop imbriqu' + Chr(130) + 'es');
   If JsErr Then
   Begin
     JParseStatement := Nil;
@@ -7723,6 +7771,7 @@ Begin
   If (JsSteps > JS_BUDGET) And Not JsKill Then
     JsAbort('Erreur : script trop long (plus de ' + IStr(JS_BUDGET) + ' operations), arrete');
   If ArFull And Not JsKill Then JsAbort('Erreur : memoire de la page epuisee');
+  If StackLow And Not JsKill Then JsAbort('InternalError: too much recursion');
   JsStep := Not JsKill;
 End;
 
@@ -16312,6 +16361,8 @@ Var
   StartUrl : String;
 
 BEGIN
+  FpuQuiet;
+  StackInit;
   TraceOn := 0;
   Inst := GetModuleHandleA(0);
   MainWnd := 0;
