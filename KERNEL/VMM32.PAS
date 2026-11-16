@@ -28594,10 +28594,12 @@ Begin
           GetWindow := HwndOf(Wnds^[W].Owner);
     5 :
     Begin
-      Best := -1; BS := -1;
+      { premier enfant cree (le haut de l'ordre Z, comme Windows : les
+        controles d'un dialogue dans l'ordre du modele) }
+      Best := -1; BS := $7FFFFFFF;
       For I := 0 To MaxWnd - 1 Do
         If Wnds^[I].Used And IsChildW(I) And ((Wnds^[I].Parent = W) Or
-           ((H = HDesktop) And (W < 0))) And (Wnds^[I].Seq > BS) Then
+           ((H = HDesktop) And (W < 0))) And (Wnds^[I].Seq < BS) Then
         Begin
           Best := I; BS := Wnds^[I].Seq;
         End;
@@ -28625,16 +28627,20 @@ Begin
           End;
         Exit;
       End;
-      { freres : ordre de creation (le plus recent en premier) }
+      { freres dans l'ordre de creation : GW_HWNDFIRST (0) le premier,
+        GW_HWNDLAST (1) le dernier, GW_HWNDNEXT (2) le suivant,
+        GW_HWNDPREV (3) le precedent }
       Best := -1;
-      If Cmd = 2 Then BS := -1 Else BS := $7FFFFFFF;
+      If (Cmd = 1) Or (Cmd = 3) Then BS := -1 Else BS := $7FFFFFFF;
       For I := 0 To MaxWnd - 1 Do
         If Wnds^[I].Used And IsChildW(I) And
-           (Wnds^[I].Parent = Wnds^[W].Parent) And (I <> W) Then
-          If ((Cmd = 2) And (Wnds^[I].Seq < Wnds^[W].Seq) And
-              (Wnds^[I].Seq > BS)) Or
-             ((Cmd = 3) And (Wnds^[I].Seq > Wnds^[W].Seq) And
-              (Wnds^[I].Seq < BS)) Then
+           (Wnds^[I].Parent = Wnds^[W].Parent) Then
+          If ((Cmd = 0) And (Wnds^[I].Seq < BS)) Or
+             ((Cmd = 1) And (Wnds^[I].Seq > BS)) Or
+             ((Cmd = 2) And (Wnds^[I].Seq > Wnds^[W].Seq) And
+              (Wnds^[I].Seq < BS)) Or
+             ((Cmd = 3) And (Wnds^[I].Seq < Wnds^[W].Seq) And
+              (Wnds^[I].Seq > BS)) Then
           Begin
             Best := I; BS := Wnds^[I].Seq;
           End;
@@ -29959,6 +29965,16 @@ Begin
   End;
 End;
 
+{ LOGFONTA (60 octets) des elements de Windows 95 : MS Sans Serif 8
+  points (hauteur -11), gras pour les titres }
+Procedure SysLogFont(P, Weight : LongInt);
+Begin
+  FillMem(P, 60, 0);
+  MemL[0:P] := -11;
+  MemL[0:P + 16] := Weight;
+  PutPStr(P + 28, 'MS Sans Serif', 32);
+End;
+
 Function SystemParametersInfoA(Act, Param, PV, WinIni : LongInt) : LongInt;
 Var R : TRect;
 Begin
@@ -29969,6 +29985,24 @@ Begin
       SetR(R, 0, 0, ScrW, TaskY);
       PutRectAt(PV, R);
     End;
+    { SPI_GETICONTITLELOGFONT }
+    31 : If PV <> 0 Then SysLogFont(PV, 400);
+    { SPI_GETNONCLIENTMETRICS : NONCLIENTMETRICSA (340 octets) }
+    41 :
+      If PV <> 0 Then
+      Begin
+        FillMem(PV, 340, 0);
+        MemL[0:PV] := 340;
+        MemL[0:PV + 4] := 1; MemL[0:PV + 8] := 16; MemL[0:PV + 12] := 16;
+        MemL[0:PV + 16] := 18; MemL[0:PV + 20] := 18;
+        SysLogFont(PV + 24, 700);
+        MemL[0:PV + 84] := 12; MemL[0:PV + 88] := 14;
+        SysLogFont(PV + 92, 700);
+        MemL[0:PV + 152] := 18; MemL[0:PV + 156] := 18;
+        SysLogFont(PV + 160, 400);
+        SysLogFont(PV + 220, 400);
+        SysLogFont(PV + 280, 400);
+      End;
   Else
     If PV <> 0 Then
       If (Act And 1) = 0 Then MemL[0:PV] := 0;
@@ -31668,6 +31702,7 @@ Begin
     Else CC := ClassFind(ClsN);
     TA := A;
     A := SzOrOrd(A, S, Ord0);
+    If S <> '' Then KLog('  dialogue "' + Title + '" : ' + Copy(S, 1, 70));
     P := MemW[0:A];
     A := A + 2 + P;
     If CC < 0 Then CC := KClass[ikStatic];
@@ -35262,6 +35297,9 @@ Begin
     Stk := MemL[0:AppBase + MemL[0:AppBase + $3C] + 24 + 72];
     If Stk < $100000 Then Stk := $100000;
     If Stk > $1000000 Then Stk := $1000000;
+    { chemin du programme entre guillemets s'il contient des espaces,
+      comme Windows (Word prenait la suite du chemin pour un document) }
+    If (Pos(' ', S) > 0) And (S[1] <> '"') Then S := '"' + S + '"';
     If Args <> '' Then S := S + ' ' + Args;
     AppCmd := KAlloc(256);
     PutPStr(AppCmd, S, 256);
@@ -66612,9 +66650,35 @@ Begin
   DialogBoxParamW := DialogBoxParamA(Inst, WRes(Name, B), Parent, Proc, Lp);
 End;
 
+{ LOGFONTW (92 octets) }
+Procedure SysLogFontW(P, Weight : LongInt);
+Begin
+  FillMem(P, 92, 0);
+  MemL[0:P] := -11;
+  MemL[0:P + 16] := Weight;
+  PutWStr(P + 28, 'MS Sans Serif', 32);
+End;
+
 Function SystemParametersInfoW(Act, Param, PV, WinIni : LongInt) : LongInt;
 Begin
-  SystemParametersInfoW := SystemParametersInfoA(Act, Param, PV, WinIni);
+  SystemParametersInfoW := 1;
+  If (Act = 31) And (PV <> 0) Then SysLogFontW(PV, 400)
+  Else If (Act = 41) And (PV <> 0) Then
+  Begin
+    { NONCLIENTMETRICSW (500 octets) }
+    FillMem(PV, 500, 0);
+    MemL[0:PV] := 500;
+    MemL[0:PV + 4] := 1; MemL[0:PV + 8] := 16; MemL[0:PV + 12] := 16;
+    MemL[0:PV + 16] := 18; MemL[0:PV + 20] := 18;
+    SysLogFontW(PV + 24, 700);
+    MemL[0:PV + 116] := 12; MemL[0:PV + 120] := 14;
+    SysLogFontW(PV + 124, 700);
+    MemL[0:PV + 216] := 18; MemL[0:PV + 220] := 18;
+    SysLogFontW(PV + 224, 400);
+    SysLogFontW(PV + 316, 400);
+    SysLogFontW(PV + 408, 400);
+  End
+  Else SystemParametersInfoW := SystemParametersInfoA(Act, Param, PV, WinIni);
 End;
 
 Function MapVirtualKeyW(Code, Typ : LongInt) : LongInt;
@@ -67320,11 +67384,6 @@ Begin
 End;
 
 { stockage structure (fichiers composes) : non disponible }
-Function StgCreateDocfile(Name, Mode, R, PP : LongInt) : LongInt;
-Begin
-  StgCreateDocfile := NoItf(PP, STG_INVALIDFUNC);
-End;
-
 Function StgOpenStorage(Name, Prio, Mode, Excl, R, PP : LongInt) : LongInt;
 Begin
   StgOpenStorage := NoItf(PP, $80030002);
@@ -67333,11 +67392,6 @@ End;
 Function StgIsStorageFile(Name : LongInt) : LongInt;
 Begin
   StgIsStorageFile := 1;
-End;
-
-Function StgCreateDocfileOnILockBytes(Lb, Mode, R, PP : LongInt) : LongInt;
-Begin
-  StgCreateDocfileOnILockBytes := NoItf(PP, STG_INVALIDFUNC);
 End;
 
 Function StgOpenStorageOnILockBytes(Lb, Prio, Mode, Excl, R, PP : LongInt)
@@ -67349,33 +67403,6 @@ End;
 Function StgSetTimes(Name, C, A, M : LongInt) : LongInt;
 Begin
   StgSetTimes := STG_INVALIDFUNC;
-End;
-
-Function ReadClassStg(Stg, Clsid : LongInt) : LongInt;
-Begin
-  If Clsid <> 0 Then FillMem(Clsid, 16, 0);
-  ReadClassStg := STG_INVALIDFUNC;
-End;
-
-Function WriteClassStg(Stg, Clsid : LongInt) : LongInt;
-Begin
-  WriteClassStg := STG_INVALIDFUNC;
-End;
-
-Function ReadClassStm(Stm, Clsid : LongInt) : LongInt;
-Begin
-  If Clsid <> 0 Then FillMem(Clsid, 16, 0);
-  ReadClassStm := STG_INVALIDFUNC;
-End;
-
-Function WriteClassStm(Stm, Clsid : LongInt) : LongInt;
-Begin
-  WriteClassStm := STG_INVALIDFUNC;
-End;
-
-Function WriteFmtUserTypeStg(Stg, Cf, PUser : LongInt) : LongInt;
-Begin
-  WriteFmtUserTypeStg := STG_INVALIDFUNC;
 End;
 
 Function ReadFmtUserTypeStg(Stg, PCf, PUser : LongInt) : LongInt;
@@ -69007,6 +69034,667 @@ Begin
   EnumJobsA := 1;
 End;
 
+{ ------------------------------------------------------------------ }
+{ OLE32 : stockage structure en memoire (IStorage)                    }
+{ Stockage : +0 table des methodes, +4 compteur, +8 premier element,  }
+{ +12 CLSID (16 octets), +28 bits d'etat, +32 nom (large), +36 mode.  }
+{ Element : +0 suivant, +4 type (1 stockage, 2 flux), +8 objet (une   }
+{ reference gardee), +12 nom large (31 caracteres au plus).          }
+{ Un flux est un IStream sur HGLOBAL (Hs*), rouvert au debut par      }
+{ OpenStream ; le contenu reste en memoire (pas encore de fichier     }
+{ compose sur le disque).                                            }
+{ ------------------------------------------------------------------ }
+
+Var
+  SsVtbl, SeVtbl : LongInt;
+
+{ appels de methodes COM (stdcall, This en premier) }
+Function ComCall1(O, Idx : LongInt) : LongInt;
+Var P, R : LongInt;
+Begin
+  P := MemL[0:MemL[0:O] + Idx * 4];
+  asm
+    mov eax,O
+    push eax
+    mov eax,P
+    call eax
+    mov R,eax
+  end;
+  ComCall1 := R;
+End;
+
+Function ComCall2(O, Idx, A1 : LongInt) : LongInt;
+Var P, R : LongInt;
+Begin
+  P := MemL[0:MemL[0:O] + Idx * 4];
+  asm
+    mov eax,A1
+    push eax
+    mov eax,O
+    push eax
+    mov eax,P
+    call eax
+    mov R,eax
+  end;
+  ComCall2 := R;
+End;
+
+Function ComCall4(O, Idx, A1, A2, A3 : LongInt) : LongInt;
+Var P, R : LongInt;
+Begin
+  P := MemL[0:MemL[0:O] + Idx * 4];
+  asm
+    mov eax,A3
+    push eax
+    mov eax,A2
+    push eax
+    mov eax,A1
+    push eax
+    mov eax,O
+    push eax
+    mov eax,P
+    call eax
+    mov R,eax
+  end;
+  ComCall4 := R;
+End;
+
+Function ComCall6(O, Idx, A1, A2, A3, A4, A5 : LongInt) : LongInt;
+Var P, R : LongInt;
+Begin
+  P := MemL[0:MemL[0:O] + Idx * 4];
+  asm
+    mov eax,A5
+    push eax
+    mov eax,A4
+    push eax
+    mov eax,A3
+    push eax
+    mov eax,A2
+    push eax
+    mov eax,A1
+    push eax
+    mov eax,O
+    push eax
+    mov eax,P
+    call eax
+    mov R,eax
+  end;
+  ComCall6 := R;
+End;
+
+{ noms des elements : comparaison sans distinction de casse }
+Function WEqI(A, B : LongInt) : Boolean;
+Var X, Y : LongInt;
+Begin
+  WEqI := False;
+  If (A = 0) Or (B = 0) Then Exit;
+  Repeat
+    X := MemW[0:A]; Y := MemW[0:B];
+    If (X >= 97) And (X <= 122) Then X := X - 32;
+    If (Y >= 97) And (Y <= 122) Then Y := Y - 32;
+    If X <> Y Then Exit;
+    A := A + 2; B := B + 2;
+  Until X = 0;
+  WEqI := True;
+End;
+
+{ copie d'un nom large (Max caracteres, nul compris) }
+Procedure WCopyN(S, D, Max : LongInt);
+Var I : LongInt;
+Begin
+  I := 0;
+  While (S <> 0) And (I < Max - 1) And (MemW[0:S + I * 2] <> 0) Do
+  Begin
+    MemW[0:D + I * 2] := MemW[0:S + I * 2];
+    Inc(I);
+  End;
+  MemW[0:D + I * 2] := 0;
+End;
+
+{ nom large alloue par CoTaskMemAlloc (STATSTG) }
+Function WDupTask(S : LongInt) : LongInt;
+Var N, P : LongInt;
+Begin
+  N := 0;
+  If S <> 0 Then
+    While MemW[0:S + N * 2] <> 0 Do Inc(N);
+  P := CoTaskMemAlloc(N * 2 + 2);
+  If P <> 0 Then WCopyN(S, P, N + 1);
+  WDupTask := P;
+End;
+
+Function SsFind(This, Name : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  E := MemL[0:This + 8];
+  While (E <> 0) And Not WEqI(E + 12, Name) Do E := MemL[0:E];
+  SsFind := E;
+End;
+
+Procedure SsAdd(This, Name, Typ, Obj : LongInt);
+Var E, L : LongInt;
+Begin
+  E := KAlloc(80);
+  If E = 0 Then Exit;
+  FillMem(E, 80, 0);
+  MemL[0:E + 4] := Typ; MemL[0:E + 8] := Obj;
+  WCopyN(Name, E + 12, 32);
+  { a la fin : l'ordre de creation est garde }
+  L := MemL[0:This + 8];
+  If L = 0 Then MemL[0:This + 8] := E
+  Else
+  Begin
+    While MemL[0:L] <> 0 Do L := MemL[0:L];
+    MemL[0:L] := E;
+  End;
+End;
+
+Procedure SsUnlink(This, E : LongInt);
+Var L : LongInt;
+Begin
+  If MemL[0:This + 8] = E Then MemL[0:This + 8] := MemL[0:E]
+  Else
+  Begin
+    L := MemL[0:This + 8];
+    While (L <> 0) And (MemL[0:L] <> E) Do L := MemL[0:L];
+    If L <> 0 Then MemL[0:L] := MemL[0:E];
+  End;
+  If MemL[0:E + 8] <> 0 Then ComCall1(MemL[0:E + 8], 2);
+  KFree(E);
+End;
+
+Function SsNew : LongInt; Forward;
+
+Function SsQueryInterface(This, Iid, PP : LongInt) : LongInt;
+Begin
+  If (Iid <> 0) And (MemL[0:Iid + 4] = 0) And (MemL[0:Iid + 8] = $C0) And
+     (MemL[0:Iid + 12] = $46000000) And
+     ((MemL[0:Iid] = 0) Or (MemL[0:Iid] = $0B)) Then
+  Begin
+    MemL[0:This + 4] := MemL[0:This + 4] + 1;
+    MemL[0:PP] := This;
+    SsQueryInterface := 0;
+  End
+  Else SsQueryInterface := NoItf(PP, $80004002);
+End;
+
+Function SsAddRef(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] + 1;
+  SsAddRef := MemL[0:This + 4];
+End;
+
+Function SsRelease(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] - 1;
+  SsRelease := MemL[0:This + 4];
+  If MemL[0:This + 4] > 0 Then Exit;
+  While MemL[0:This + 8] <> 0 Do SsUnlink(This, MemL[0:This + 8]);
+  If MemL[0:This + 32] <> 0 Then KFree(MemL[0:This + 32]);
+  KFree(This);
+End;
+
+{ CreateStream(nom, mode, 0, 0, ppstm) : STGM_CREATE (1000h) remplace }
+Function SsCreateStream(This, Name, Mode, R1, R2, PP : LongInt) : LongInt;
+Var E, S : LongInt;
+Begin
+  SsCreateStream := $80030009;
+  If (Name = 0) Or (PP = 0) Then Exit;
+  E := SsFind(This, Name);
+  If E <> 0 Then
+  Begin
+    If (Mode And $1000) = 0 Then
+    Begin
+      SsCreateStream := NoItf(PP, $80030050);
+      Exit;
+    End;
+    SsUnlink(This, E);
+  End;
+  S := 0;
+  If CreateStreamOnHGlobal(0, 1, LongInt(@S)) <> 0 Then
+  Begin
+    SsCreateStream := NoItf(PP, $80030008);
+    Exit;
+  End;
+  SsAdd(This, Name, 2, S);
+  MemL[0:S + 4] := MemL[0:S + 4] + 1;
+  MemL[0:PP] := S;
+  SsCreateStream := 0;
+End;
+
+{ OpenStream(nom, 0, mode, 0, ppstm) : le flux, au debut }
+Function SsOpenStream(This, Name, R1, Mode, R2, PP : LongInt) : LongInt;
+Var E, S : LongInt;
+Begin
+  E := SsFind(This, Name);
+  If (E = 0) Or (MemL[0:E + 4] <> 2) Then
+  Begin
+    SsOpenStream := NoItf(PP, $80030002);
+    Exit;
+  End;
+  S := MemL[0:E + 8];
+  MemL[0:S + 4] := MemL[0:S + 4] + 1;
+  MemL[0:S + 16] := 0;
+  MemL[0:PP] := S;
+  SsOpenStream := 0;
+End;
+
+Function SsCreateStorage(This, Name, Mode, R1, R2, PP : LongInt) : LongInt;
+Var E, S : LongInt;
+Begin
+  SsCreateStorage := $80030009;
+  If (Name = 0) Or (PP = 0) Then Exit;
+  E := SsFind(This, Name);
+  If E <> 0 Then
+  Begin
+    If (Mode And $1000) = 0 Then
+    Begin
+      SsCreateStorage := NoItf(PP, $80030050);
+      Exit;
+    End;
+    SsUnlink(This, E);
+  End;
+  S := SsNew;
+  If S = 0 Then
+  Begin
+    SsCreateStorage := NoItf(PP, $80030008);
+    Exit;
+  End;
+  MemL[0:S + 36] := Mode;
+  SsAdd(This, Name, 1, S);
+  MemL[0:S + 4] := MemL[0:S + 4] + 1;
+  MemL[0:PP] := S;
+  SsCreateStorage := 0;
+End;
+
+Function SsOpenStorage(This, Name, Prio, Mode, Snb, R, PP : LongInt)
+  : LongInt;
+Var E, S : LongInt;
+Begin
+  E := SsFind(This, Name);
+  If (E = 0) Or (MemL[0:E + 4] <> 1) Then
+  Begin
+    SsOpenStorage := NoItf(PP, $80030002);
+    Exit;
+  End;
+  S := MemL[0:E + 8];
+  MemL[0:S + 4] := MemL[0:S + 4] + 1;
+  MemL[0:PP] := S;
+  SsOpenStorage := 0;
+End;
+
+{ copier l'element E dans le stockage Dst (n'importe quel IStorage) sous
+  le nom Nm }
+Function SsCopyTo(This, Ciid, Rgiid, Snb, Dst : LongInt) : LongInt;
+  Forward;
+
+Function SsCopyElem(E, Dst, Nm : LongInt) : LongInt;
+Var O, N, W : LongInt;
+Begin
+  O := MemL[0:E + 8];
+  N := 0;
+  If MemL[0:E + 4] = 2 Then
+  Begin
+    SsCopyElem := ComCall6(Dst, 3, Nm, $1012, 0, 0, LongInt(@N));
+    If N = 0 Then Exit;
+    W := 0;
+    If MemL[0:O + 12] > 0 Then
+      ComCall4(N, 4, MemL[0:O + 8], MemL[0:O + 12], LongInt(@W));
+    ComCall1(N, 2);
+  End
+  Else
+  Begin
+    SsCopyElem := ComCall6(Dst, 5, Nm, $1012, 0, 0, LongInt(@N));
+    If N = 0 Then Exit;
+    SsCopyTo(O, 0, 0, 0, N);
+    ComCall1(N, 2);
+  End;
+  SsCopyElem := 0;
+End;
+
+Function SsCopyTo(This, Ciid, Rgiid, Snb, Dst : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  SsCopyTo := $80030009;
+  If Dst = 0 Then Exit;
+  E := MemL[0:This + 8];
+  While E <> 0 Do
+  Begin
+    SsCopyElem(E, Dst, E + 12);
+    E := MemL[0:E];
+  End;
+  ComCall2(Dst, 15, This + 12);
+  SsCopyTo := 0;
+End;
+
+{ MoveElementTo(nom, destination, nouveau nom, 0 deplacer / 1 copier) }
+Function SsMoveElementTo(This, Name, Dst, NewName, Fl : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  E := SsFind(This, Name);
+  If E = 0 Then
+  Begin
+    SsMoveElementTo := $80030002;
+    Exit;
+  End;
+  SsMoveElementTo := SsCopyElem(E, Dst, NewName);
+  If Fl = 0 Then SsUnlink(This, E);
+End;
+
+Function SsCommit(This, Fl : LongInt) : LongInt;
+Begin
+  SsCommit := 0;
+End;
+
+Function SsRevert(This : LongInt) : LongInt;
+Begin
+  SsRevert := 0;
+End;
+
+Function SeNew(Stg : LongInt) : LongInt; Forward;
+
+Function SsEnumElements(This, R1, R2, R3, PP : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  O := SeNew(This);
+  If O = 0 Then
+  Begin
+    SsEnumElements := NoItf(PP, $80030008);
+    Exit;
+  End;
+  MemL[0:PP] := O;
+  SsEnumElements := 0;
+End;
+
+Function SsDestroyElement(This, Name : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  E := SsFind(This, Name);
+  SsDestroyElement := $80030002;
+  If E = 0 Then Exit;
+  SsUnlink(This, E);
+  SsDestroyElement := 0;
+End;
+
+Function SsRenameElement(This, Old, New0 : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  SsRenameElement := $80030050;
+  If SsFind(This, New0) <> 0 Then Exit;
+  E := SsFind(This, Old);
+  SsRenameElement := $80030002;
+  If E = 0 Then Exit;
+  WCopyN(New0, E + 12, 32);
+  SsRenameElement := 0;
+End;
+
+Function SsSetElementTimes(This, Name, C, A, M : LongInt) : LongInt;
+Begin
+  SsSetElementTimes := 0;
+End;
+
+Function SsSetClass(This, Clsid : LongInt) : LongInt;
+Begin
+  If Clsid <> 0 Then MoveMem(Clsid, This + 12, 16);
+  SsSetClass := 0;
+End;
+
+Function SsSetStateBits(This, Bits, Mask : LongInt) : LongInt;
+Begin
+  MemL[0:This + 28] := (MemL[0:This + 28] And Not Mask) Or (Bits And Mask);
+  SsSetStateBits := 0;
+End;
+
+{ STATSTG (72 octets) : nom (sauf STATFLAG_NONAME 1), type 1, mode,
+  CLSID, bits d'etat }
+Function SsStat(This, P, Fl : LongInt) : LongInt;
+Begin
+  FillMem(P, 72, 0);
+  If (Fl And 1) = 0 Then MemL[0:P] := WDupTask(MemL[0:This + 32]);
+  MemL[0:P + 4] := 1;
+  MemL[0:P + 40] := MemL[0:This + 36];
+  MoveMem(This + 12, P + 48, 16);
+  MemL[0:P + 64] := MemL[0:This + 28];
+  SsStat := 0;
+End;
+
+Function SsNew : LongInt;
+Var O, V, K : LongInt;
+Begin
+  SsNew := 0;
+  If SsVtbl = 0 Then
+  Begin
+    K := HeapOwner; HeapOwner := 0;
+    V := KAlloc(18 * 4);
+    HeapOwner := K;
+    If V = 0 Then Exit;
+    MemL[0:V] := KernelExport('SsQueryInterface');
+    MemL[0:V + 4] := KernelExport('SsAddRef');
+    MemL[0:V + 8] := KernelExport('SsRelease');
+    MemL[0:V + 12] := KernelExport('SsCreateStream');
+    MemL[0:V + 16] := KernelExport('SsOpenStream');
+    MemL[0:V + 20] := KernelExport('SsCreateStorage');
+    MemL[0:V + 24] := KernelExport('SsOpenStorage');
+    MemL[0:V + 28] := KernelExport('SsCopyTo');
+    MemL[0:V + 32] := KernelExport('SsMoveElementTo');
+    MemL[0:V + 36] := KernelExport('SsCommit');
+    MemL[0:V + 40] := KernelExport('SsRevert');
+    MemL[0:V + 44] := KernelExport('SsEnumElements');
+    MemL[0:V + 48] := KernelExport('SsDestroyElement');
+    MemL[0:V + 52] := KernelExport('SsRenameElement');
+    MemL[0:V + 56] := KernelExport('SsSetElementTimes');
+    MemL[0:V + 60] := KernelExport('SsSetClass');
+    MemL[0:V + 64] := KernelExport('SsSetStateBits');
+    MemL[0:V + 68] := KernelExport('SsStat');
+    SsVtbl := V;
+  End;
+  O := KAlloc(40);
+  If O = 0 Then Exit;
+  FillMem(O, 40, 0);
+  MemL[0:O] := SsVtbl;
+  MemL[0:O + 4] := 1;
+  SsNew := O;
+End;
+
+{ ------------------------------------------------------------------ }
+{ IEnumSTATSTG : +0 table, +4 compteur, +8 stockage, +12 element      }
+{ ------------------------------------------------------------------ }
+
+Function SeQueryInterface(This, Iid, PP : LongInt) : LongInt;
+Begin
+  If (Iid <> 0) And (MemL[0:Iid + 4] = 0) And (MemL[0:Iid + 8] = $C0) And
+     (MemL[0:Iid + 12] = $46000000) And
+     ((MemL[0:Iid] = 0) Or (MemL[0:Iid] = $0D)) Then
+  Begin
+    MemL[0:This + 4] := MemL[0:This + 4] + 1;
+    MemL[0:PP] := This;
+    SeQueryInterface := 0;
+  End
+  Else SeQueryInterface := NoItf(PP, $80004002);
+End;
+
+Function SeAddRef(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] + 1;
+  SeAddRef := MemL[0:This + 4];
+End;
+
+Function SeRelease(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 4] := MemL[0:This + 4] - 1;
+  SeRelease := MemL[0:This + 4];
+  If MemL[0:This + 4] > 0 Then Exit;
+  SsRelease(MemL[0:This + 8]);
+  KFree(This);
+End;
+
+Function SeNext(This, Celt, Rg, PFetched : LongInt) : LongInt;
+Var N, E, P, O : LongInt;
+Begin
+  N := 0;
+  E := MemL[0:This + 12];
+  While (N < Celt) And (E <> 0) Do
+  Begin
+    P := Rg + N * 72;
+    FillMem(P, 72, 0);
+    MemL[0:P] := WDupTask(E + 12);
+    MemL[0:P + 4] := MemL[0:E + 4];
+    O := MemL[0:E + 8];
+    If MemL[0:E + 4] = 2 Then MemL[0:P + 8] := MemL[0:O + 12]
+    Else
+    Begin
+      MoveMem(O + 12, P + 48, 16);
+      MemL[0:P + 64] := MemL[0:O + 28];
+    End;
+    Inc(N);
+    E := MemL[0:E];
+  End;
+  MemL[0:This + 12] := E;
+  If PFetched <> 0 Then MemL[0:PFetched] := N;
+  If N = Celt Then SeNext := 0 Else SeNext := 1;
+End;
+
+Function SeSkip(This, Celt : LongInt) : LongInt;
+Var E : LongInt;
+Begin
+  E := MemL[0:This + 12];
+  While (Celt > 0) And (E <> 0) Do
+  Begin
+    E := MemL[0:E];
+    Dec(Celt);
+  End;
+  MemL[0:This + 12] := E;
+  If Celt = 0 Then SeSkip := 0 Else SeSkip := 1;
+End;
+
+Function SeReset(This : LongInt) : LongInt;
+Begin
+  MemL[0:This + 12] := MemL[0:MemL[0:This + 8] + 8];
+  SeReset := 0;
+End;
+
+Function SeClone(This, PP : LongInt) : LongInt;
+Var O : LongInt;
+Begin
+  O := SeNew(MemL[0:This + 8]);
+  If O = 0 Then
+  Begin
+    SeClone := NoItf(PP, $80030008);
+    Exit;
+  End;
+  MemL[0:O + 12] := MemL[0:This + 12];
+  MemL[0:PP] := O;
+  SeClone := 0;
+End;
+
+Function SeNew(Stg : LongInt) : LongInt;
+Var O, V, K : LongInt;
+Begin
+  SeNew := 0;
+  If SeVtbl = 0 Then
+  Begin
+    K := HeapOwner; HeapOwner := 0;
+    V := KAlloc(7 * 4);
+    HeapOwner := K;
+    If V = 0 Then Exit;
+    MemL[0:V] := KernelExport('SeQueryInterface');
+    MemL[0:V + 4] := KernelExport('SeAddRef');
+    MemL[0:V + 8] := KernelExport('SeRelease');
+    MemL[0:V + 12] := KernelExport('SeNext');
+    MemL[0:V + 16] := KernelExport('SeSkip');
+    MemL[0:V + 20] := KernelExport('SeReset');
+    MemL[0:V + 24] := KernelExport('SeClone');
+    SeVtbl := V;
+  End;
+  O := KAlloc(16);
+  If O = 0 Then Exit;
+  MemL[0:O] := SeVtbl;
+  MemL[0:O + 4] := 1;
+  MemL[0:O + 8] := Stg;
+  MemL[0:O + 12] := MemL[0:Stg + 8];
+  MemL[0:Stg + 4] := MemL[0:Stg + 4] + 1;
+  SeNew := O;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Fonctions de stockage d'OLE32                                       }
+{ ------------------------------------------------------------------ }
+
+{ StgCreateDocfile : stockage en memoire (fichier temporaire si Name est
+  nul) ; son nom est garde pour Stat }
+Function StgCreateDocfile(Name, Mode, R, PP : LongInt) : LongInt;
+Var S, N : LongInt;
+Begin
+  StgCreateDocfile := $80030009;
+  If PP = 0 Then Exit;
+  S := SsNew;
+  If S = 0 Then
+  Begin
+    StgCreateDocfile := NoItf(PP, $80030008);
+    Exit;
+  End;
+  MemL[0:S + 36] := Mode;
+  If Name <> 0 Then
+  Begin
+    N := 0;
+    While MemW[0:Name + N * 2] <> 0 Do Inc(N);
+    MemL[0:S + 32] := KAlloc(N * 2 + 2);
+    If MemL[0:S + 32] <> 0 Then WCopyN(Name, MemL[0:S + 32], N + 1);
+  End;
+  MemL[0:PP] := S;
+  StgCreateDocfile := 0;
+End;
+
+Function StgCreateDocfileOnILockBytes(Lb, Mode, R, PP : LongInt) : LongInt;
+Begin
+  StgCreateDocfileOnILockBytes := StgCreateDocfile(0, Mode, R, PP);
+End;
+
+{ CLSID d'un stockage (IStorage::Stat) ou d'un flux (16 premiers octets) }
+Function ReadClassStg(Stg, Clsid : LongInt) : LongInt;
+Var St : Array[0..17] Of LongInt;
+Begin
+  ReadClassStg := $80030009;
+  If (Stg = 0) Or (Clsid = 0) Then Exit;
+  FillMem(Clsid, 16, 0);
+  ReadClassStg := ComCall4(Stg, 17, LongInt(@St), 1, 0);
+  MoveMem(LongInt(@St) + 48, Clsid, 16);
+End;
+
+Function WriteClassStg(Stg, Clsid : LongInt) : LongInt;
+Begin
+  WriteClassStg := $80030009;
+  If Stg = 0 Then Exit;
+  WriteClassStg := ComCall2(Stg, 15, Clsid);
+End;
+
+Function ReadClassStm(Stm, Clsid : LongInt) : LongInt;
+Var N, R : LongInt;
+Begin
+  ReadClassStm := $80030009;
+  If (Stm = 0) Or (Clsid = 0) Then Exit;
+  N := 0;
+  R := ComCall4(Stm, 3, Clsid, 16, LongInt(@N));
+  If (R = 0) And (N < 16) Then R := $8003001E;
+  ReadClassStm := R;
+End;
+
+Function WriteClassStm(Stm, Clsid : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  WriteClassStm := $80030009;
+  If (Stm = 0) Or (Clsid = 0) Then Exit;
+  N := 0;
+  WriteClassStm := ComCall4(Stm, 4, Clsid, 16, LongInt(@N));
+End;
+
+{ format et type d'utilisateur (flux \1CompObj) : non enregistres }
+Function WriteFmtUserTypeStg(Stg, Cf, PUser : LongInt) : LongInt;
+Begin
+  WriteFmtUserTypeStg := 0;
+End;
+
 { Fonctions Win32 exportees par VMM32.VXD (thunks stdcall) }
 
 exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
@@ -69542,6 +70230,11 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   ShowOwnedPopups, SubtractRect, SwapMouseButton, WaitForInputIdle,
   WindowFromDC, keybd_event,
   GetPrinterA, GetPrinterDriverA, EnumJobsA,
+  SsQueryInterface, SsAddRef, SsRelease, SsCreateStream, SsOpenStream,
+  SsCreateStorage, SsOpenStorage, SsCopyTo, SsMoveElementTo, SsCommit,
+  SsRevert, SsEnumElements, SsDestroyElement, SsRenameElement,
+  SsSetElementTimes, SsSetClass, SsSetStateBits, SsStat, SeQueryInterface,
+  SeAddRef, SeRelease, SeNext, SeSkip, SeReset, SeClone,
   LockResource, SizeofResource, FreeResource;
 
 { ==================================================================== }
