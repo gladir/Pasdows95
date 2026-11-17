@@ -1886,7 +1886,7 @@ Const
   FdBuf = $98000;
 
 Var
-  FdOk : Boolean;            { lecteur present }
+  FdPresent : Boolean;       { lecteur present }
   FdV : LongInt;             { volume de A: (-1 : aucun) }
   FdMounted : Boolean;       { disquette lisible dans le lecteur }
   FdIrqF : Boolean;
@@ -2635,7 +2635,7 @@ Function FatVolOf(Const Path : String) : LongInt;
 Var V, R : LongInt;
 Begin
   R := -1;
-  If FdOk And (Length(Path) >= 2) And (Path[1] = 'A') Then FdCheck;
+  If FdPresent And (Length(Path) >= 2) And (Path[1] = 'A') Then FdCheck;
   If Length(Path) >= 2 Then
     For V := 0 To VolN - 1 Do
       If (Ord(Path[1]) = VolLetter[V]) And ((V <> FdV) Or FdMounted) Then
@@ -7593,9 +7593,9 @@ Begin
   End;
   { lecteur de disquettes A: (CMOS 10h, quartet haut) }
   I := CmosRead($10) Shr 4;
-  FdOk := (I > 0) And (I < 6);
+  FdPresent := (I > 0) And (I < 6);
   FdV := -1; FdMounted := False;
-  If FdOk Then
+  If FdPresent Then
   Begin
     SetGate($56, LongInt(@IrqFloppy));
     Port[$21] := Port[$21] And Not $40;
@@ -23645,7 +23645,7 @@ Function GetLogicalDrives : LongInt;
 Var V, R : LongInt;
 Begin
   R := 12;
-  If FdOk Then R := R Or 1;
+  If FdPresent Then R := R Or 1;
   For V := 0 To VolN - 1 Do
     If VolLetter[V] >= 65 Then R := R Or (1 Shl (VolLetter[V] - 65));
   GetLogicalDrives := R;
@@ -35067,7 +35067,6 @@ End;
 { Liberer tout ce qui appartient au programme }
 Procedure DosStop; Forward;
 
-Procedure WaveProcExit(P : LongInt); Forward;
 Procedure NetProcExit(P : LongInt); Forward;
 
 { Le processus P utilise-t-il la console ? }
@@ -40579,13 +40578,6 @@ Procedure Rect32To16(P32, P16 : LongInt);
 Var K : LongInt;
 Begin
   For K := 0 To 3 Do MemW[0:P16 + K * 2] := MemL[0:P32 + K * 4] And $FFFF;
-End;
-
-Function SX16(V : LongInt) : LongInt;
-Begin
-  V := V And $FFFF;
-  If V >= $8000 Then V := V - $10000;
-  SX16 := V;
 End;
 
 Function StrToStack(Ss : LongInt; Var Sp : LongInt; P : LongInt)
@@ -52045,8 +52037,6 @@ Procedure GlSetI(V : Double);
 Begin
 End;
 
-Procedure glEnd; Forward;
-
 Procedure GlRectQ(X1, Y1, X2, Y2 : Double);
 Begin
   If Not GlOk Or (Gc^.InBeg <> 0) Then Exit;
@@ -55591,7 +55581,7 @@ End;
 { +120 liste (16)                                                    }
 { ------------------------------------------------------------------ }
 
-Procedure VPApply(VP : LongInt);
+Procedure D3VpApply(VP : LongInt);
 Begin
   If VP = 0 Then Exit;
   D3G^.VX := MemL[0:VP + 64]; D3G^.VY := MemL[0:VP + 68];
@@ -55706,7 +55696,7 @@ End;
 Procedure VPChanged(C : LongInt);
 Begin
   If (MemL[0:C + 108] <> 0) And DevSel(MemL[0:C + 108]) Then
-    If D3G^.VPCur = C Then VPApply(C);
+    If D3G^.VPCur = C Then D3VpApply(C);
 End;
 
 Function VP_SetViewport(T, P : LongInt) : LongInt;
@@ -55777,7 +55767,7 @@ Begin
   VP_Transform := DDERR_INVALIDPARAMS;
   If (D = 0) Or (MemL[0:C + 108] = 0) Or Not DevSel(MemL[0:C + 108]) Then
     Exit;
-  VPApply(C);
+  D3VpApply(C);
   D3DMats;
   Src := MemL[0:D + 4]; SS := MemL[0:D + 8];
   Dst := MemL[0:D + 12]; DS := MemL[0:D + 16];
@@ -55834,7 +55824,7 @@ Begin
   C := Cor(T);
   VP_Clear2 := DD_OK;
   If (MemL[0:C + 108] = 0) Or Not DevSel(MemL[0:C + 108]) Then Exit;
-  VPApply(C);
+  D3VpApply(C);
   D3DClear(N, Rects, Fl, Color, Z);
 End;
 
@@ -56100,7 +56090,7 @@ Begin
   If D3G^.VPCur <> 0 Then
   Begin
     MemL[0:D3G^.VPCur + 108] := Cor(T);
-    VPApply(D3G^.VPCur);
+    D3VpApply(D3G^.VPCur);
   End;
   DV_SetCurVP := DD_OK;
 End;
@@ -56660,7 +56650,7 @@ Begin
   If Not DevSel(Cor(T)) Then Exit;
   If D3G^.Ver <= 3 Then
   Begin
-    If D3G^.VPCur <> 0 Then VPApply(D3G^.VPCur);
+    If D3G^.VPCur <> 0 Then D3VpApply(D3G^.VPCur);
     D3DLegacySync;
   End;
   DVBase := 0;
@@ -59038,7 +59028,7 @@ Begin
   NeReset := True;
 End;
 
-Procedure NeInit;
+Procedure NicInit;
 Var B, I : LongInt;
 Begin
   B := NicBase;
@@ -59102,7 +59092,7 @@ Begin
   End
   Else If Not NeReset(NicBase) Then NicBase := 0;
   If NicBase = 0 Then Exit;
-  NeInit;
+  NicInit;
   NeProbe := True;
 End;
 
@@ -70938,14 +70928,6 @@ End;
 { Pagination et souches d'entree / de sortie / de faute               }
 { ------------------------------------------------------------------ }
 
-Procedure SetCr3(V : LongInt);
-Begin
-  asm
-    mov eax,V
-    mov cr3,eax
-  end;
-End;
-
 Function GetCr3 : LongInt;
 Var V : LongInt;
 Begin
@@ -72752,9 +72734,9 @@ End;
 { BIOS : horloge, systeme, disques, imprimante                       }
 { ------------------------------------------------------------------ }
 
-Function Bcd(V : LongInt) : LongInt;
+Function ToBcd(V : LongInt) : LongInt;
 Begin
-  Bcd := ((V Div 10) Shl 4) Or (V Mod 10);
+  ToBcd := ((V Div 10) Shl 4) Or (V Mod 10);
 End;
 
 Procedure VmInt1A;
@@ -72773,14 +72755,14 @@ Begin
     $02 :
     Begin
       ReadRtc;
-      VS(fEcx, (Bcd(RtcHour) Shl 8) Or Bcd(RtcMin));
-      VS(fEdx, Bcd(RtcSec) Shl 8);
+      VS(fEcx, (ToBcd(RtcHour) Shl 8) Or ToBcd(RtcMin));
+      VS(fEdx, ToBcd(RtcSec) Shl 8);
     End;
     $04 :
     Begin
       ReadRtc;
-      VS(fEcx, (Bcd(RtcYear Div 100) Shl 8) Or Bcd(RtcYear Mod 100));
-      VS(fEdx, (Bcd(RtcMonth) Shl 8) Or Bcd(RtcDay));
+      VS(fEcx, (ToBcd(RtcYear Div 100) Shl 8) Or ToBcd(RtcYear Mod 100));
+      VS(fEdx, (ToBcd(RtcMonth) Shl 8) Or ToBcd(RtcDay));
     End;
     $03, $05, $06, $07 : ;
   Else

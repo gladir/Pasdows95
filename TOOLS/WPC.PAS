@@ -1208,6 +1208,16 @@ Var
   SymTab      : Array[0..MAX_SYM - 1] Of TSymRec;
   SymCount    : Integer;
 
+  { Identificateurs redeclares (comme l erreur 4 de Turbo Pascal,
+    Duplicate identifier) : controles pendant l analyse des types et des
+    donnees globales (RedeclOn), pour les symboles du programme
+    (index >= RedeclFrom ; les noms predefinis peuvent etre redefinis),
+    puis entre routines et symboles globaux (CheckRedeclared) }
+  RedeclOn      : Boolean;
+  RedeclFrom    : Integer;
+  RedeclCnt     : Integer;
+  RedeclName    : Array[0..63] Of String[63];
+
   { Gestion des portees }
   CurScopeLevel : Integer;   { niveau de scope courant (0 = global)    }
   CurScopeId    : Integer;   { id du scope courant                     }
@@ -3488,6 +3498,19 @@ Begin
   SymFindInUnit := -1;
 End;
 
+{ Noter un identificateur redeclare (une seule fois par nom) }
+Procedure RedeclNote(Const Up : TString);
+Var I : Integer;
+Begin
+  For I := 0 To RedeclCnt - 1 Do
+    If RedeclName[I] = Up Then Exit;
+  If RedeclCnt <= High(RedeclName) Then
+  Begin
+    RedeclName[RedeclCnt] := Up;
+    Inc(RedeclCnt);
+  End;
+End;
+
 { ------------------------------------------------------------ }
 { SymAdd : ajouter un symbole dans la table                    }
 { Retourne l index du symbole ajoute, ou -1 si erreur          }
@@ -3534,10 +3557,15 @@ Begin
     Else If (SymTab[Dup].Kind = SK_TYPE) And
             (Kind In [SK_PROC, SK_FUNC, SK_VAR]) Then
     Begin
-      { On laisse passer, le nouveau symbole sera ajoute }
+      { On laisse passer, le nouveau symbole sera ajoute ; une variable
+        globale du nom d un type du programme est une erreur }
+      If RedeclOn And (CurScopeLevel = 0) And (Dup >= RedeclFrom) Then
+        RedeclNote(Up);
     End
     Else
     Begin
+      If RedeclOn And (CurScopeLevel = 0) And (Dup >= RedeclFrom) Then
+        RedeclNote(Up);
       WarnMsg('symbole deja defini dans ce scope: ' + Up);
       SymAdd := Dup;
       Exit;
@@ -61380,9 +61408,84 @@ Begin
             ' ecrites en Pascal, ', Missing, ' non disponibles)');
 End;
 
+{ ------------------------------------------------------------ }
+{ CheckRedeclared : identificateurs declares deux fois dans une }
+{ meme portee (Turbo Pascal : Duplicate identifier). Doublons   }
+{ notes pendant l analyse des donnees globales, routines de     }
+{ meme nom dans une meme portee (une declaration FORWARD et sa  }
+{ definition ne font qu une entree), routine globale du nom     }
+{ d une constante, d une variable ou d un type global du        }
+{ programme (symboles RedeclFrom..DataEnd - 1). Arret si besoin.}
+{ ------------------------------------------------------------ }
+
+{ lignes des declarations probables de Up : apres PROCEDURE ou
+  FUNCTION, ou en tete de declaration (apres ; , VAR CONST TYPE)
+  suivi de : , ou = }
+Function RedeclLines(Const Up : TString) : TString;
+Var I, N : LongInt; R : TString; Ok : Boolean;
+Begin
+  R := ''; N := 0;
+  For I := 1 To TokenCount - 2 Do
+    If (N < 6) And ((TokenPool[I].Kind = TK_IDENT) Or
+       (TokenPool[I].Kind = TK_KEYWORD)) And
+       (StrUpperCase(TokenPool[I].Val) = Up) Then
+    Begin
+      Ok := TokIsKw(I - 1, 'PROCEDURE') Or TokIsKw(I - 1, 'FUNCTION');
+      If Not Ok And (TokIsPunct(I - 1, ';') Or TokIsPunct(I - 1, ',') Or
+         TokIsKw(I - 1, 'VAR') Or TokIsKw(I - 1, 'CONST') Or
+         TokIsKw(I - 1, 'TYPE')) Then
+        Ok := TokIsPunct(I + 1, ':') Or TokIsPunct(I + 1, ',') Or
+              TokIsOp(I + 1, '=') Or TokIsPunct(I + 1, '=');
+      If Ok Then
+      Begin
+        If R <> '' Then R := R + ', ';
+        R := R + IntToStr_(TokenPool[I].Line);
+        Inc(N);
+      End;
+    End;
+  RedeclLines := R;
+End;
+
+Procedure CheckRedeclared(DataEnd : Integer);
+Var I, J : LongInt; Nm : TString;
+Begin
+  { routines de meme nom dans une meme portee }
+  For I := 0 To ProcCount - 1 Do
+  Begin
+    Nm := ProcTab^[I]^.Name;
+    If Nm <> '' Then
+      For J := 0 To I - 1 Do
+        If (ProcTab^[J]^.Name = Nm) And
+           (ProcTab^[J]^.ParentIdx = ProcTab^[I]^.ParentIdx) Then
+        Begin
+          RedeclNote(Nm);
+          Break;
+        End;
+  End;
+  { routine globale et constante, variable ou type global }
+  For J := RedeclFrom To DataEnd - 1 Do
+    If (SymTab[J].ScopeLevel = 0) And (SymTab[J].UnitName = '') And
+       (SymTab[J].Kind In [SK_CONST, SK_VAR, SK_TYPE]) Then
+    Begin
+      Nm := SymTab[J].Name;
+      For I := 0 To ProcCount - 1 Do
+        If (ProcTab^[I]^.ParentIdx < 0) And (ProcTab^[I]^.Name = Nm) Then
+        Begin
+          RedeclNote(Nm);
+          Break;
+        End;
+    End;
+  If RedeclCnt = 0 Then Exit;
+  For I := 0 To RedeclCnt - 1 Do
+    WriteLn('WPC: erreur : identificateur deja declare : ', RedeclName[I],
+            ' (lignes ', RedeclLines(RedeclName[I]), ')');
+  FatalError(IntToStr_(RedeclCnt) + ' identificateur(s) redeclare(s)');
+End;
+
 Procedure Run;
 Var
   I : Integer;
+  DataSymEnd : Integer;
 Begin
   ShowBanner;
 
@@ -61499,10 +61602,13 @@ Begin
 
   { Analyser les declarations TYPE (TODO 15) }
   MarkVariantCases;
+  RedeclFrom := SymCount; RedeclCnt := 0; RedeclOn := True;
   ParseTypeDecls;
 
   { Analyser les declarations globales VAR et CONST (TODO 08) }
   ParseDataDecls;
+  RedeclOn := False;
+  DataSymEnd := SymCount;
 
   If Opts.Verbose Then
     WriteLn('  Apres ParseDataDecls: Donnees=', DataCount,
@@ -61510,6 +61616,7 @@ Begin
 
   { Analyser les declarations PROCEDURE et FUNCTION (TODO 09) }
   ParseProcDecls;
+  CheckRedeclared(DataSymEnd);
   If IsLibrary Then Os2ResolveExports;
 
   If Opts.Verbose Then
