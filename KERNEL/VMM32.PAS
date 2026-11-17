@@ -11119,6 +11119,7 @@ Type
     HScrollPos, VScrollPos : LongInt;
     HSMin, HSMax, HSPage, VSMin, VSMax, VSPage : LongInt; { SB_HORZ/VERT }
     FocusChild : LongInt;         { dernier enfant avec le focus + 1 }
+    Icon     : LongInt;           { statique SS_ICON : son icone }
   End;
 
   TProp = Record
@@ -11717,6 +11718,8 @@ End;
 { ------------------------------------------------------------------ }
 
 Function LbOwner(W : LongInt) : Boolean; Forward;
+Function CtlOwner(W : LongInt) : Boolean; Forward;
+Function DlgPaints(W : LongInt) : Boolean; Forward;
 
 Procedure InvalW(W : LongInt; R : TRect; Erase : Boolean);
 Var C : TRect;
@@ -11727,7 +11730,7 @@ Begin
   RUnion(Wnds^[W].Upd, R);
   If Erase Then Wnds^[W].UpdErase := True;
   If Wnds^[W].IKind <> ikNone Then Wnds^[TopOf(W)].KNeedPaint := True;
-  If ((Wnds^[W].IKind = ikNone) Or LbOwner(W)) And
+  If ((Wnds^[W].IKind = ikNone) Or CtlOwner(W)) And
      (Wnds^[W].Thread >= 0) And (Wnds^[W].Thread < MaxThread) Then
     Threads[Wnds^[W].Thread].PaintReq := True;
 End;
@@ -12136,7 +12139,7 @@ Const
     124, 43, 43, 43, 43, 43, 43, 43, 43, 43, 45, 43, 43, 43, 43, 43, 43,
     43, 43, 45, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 63, 63,
     63, 63, 63, 63, 223, 63, 63, 63, 63, 181, 63, 63, 63, 63, 63, 63, 63,
-    63, 63, 63, 177, 63, 63, 63, 63, 247, 63, 176, 63, 183, 63, 63, 178,
+    63, 63, 63, 177, 63, 63, 63, 63, 247, 63, 176, 149, 183, 63, 63, 178,
     63, 160);
 
 { Vrai si le processus courant est un programme Windows ANSI : une
@@ -12322,6 +12325,23 @@ Begin
   WrapZ := N;
 End;
 
+{ Largeur visible d'un controle statique : sa largeur, limitee au bord
+  droit de son parent (les panneaux de l'installation d'Office placent
+  des textes qui depassent : avec la police MS Sans Serif ils tiennent) }
+Function StaticVisW(W : LongInt) : LongInt;
+Var VW, P, PW : LongInt;
+Begin
+  VW := Wnds^[W].W;
+  P := Wnds^[W].Parent;
+  If IsChildW(W) And (P >= 0) Then
+  Begin
+    PW := Wnds^[P].CR - Wnds^[P].CL;
+    If (PW > 0) And (Wnds^[W].X + VW > PW) And (PW - Wnds^[W].X >= 16) Then
+      VW := PW - Wnds^[W].X;
+  End;
+  StaticVisW := VW;
+End;
+
 { Pas du texte d'un controle statique : 8, ou 7 et 6 si ses lignes ne
   tiennent pas dans sa hauteur }
 Function StaticPitch(W : LongInt; T : String) : LongInt;
@@ -12334,14 +12354,14 @@ Begin
   Begin
     TxtPitch := P;
     If Wnds^[W].LongTxt <> 0 Then
-      N := WrapZ(0, 0, Wnds^[W].W, Wnds^[W].LongTxt, 0, False)
+      N := WrapZ(0, 0, StaticVisW(W), Wnds^[W].LongTxt, 0, False)
     Else If (Pos(#10, T) > 0) Or (Pos(#13, T) > 0) Then
     Begin
       T := T + #0;
-      N := WrapZ(0, 0, Wnds^[W].W, LongInt(@T[1]), 0, False);
+      N := WrapZ(0, 0, StaticVisW(W), LongInt(@T[1]), 0, False);
       Delete(T, Length(T), 1);
     End
-    Else N := WrapText(0, 0, Wnds^[W].W, T, 0, False);
+    Else N := WrapText(0, 0, StaticVisW(W), T, 0, False);
     If N <= Rows Then
     Begin
       If P < 8 Then StaticPitch := P;
@@ -12632,7 +12652,7 @@ Begin
   ClientScreenOrg(W, X, Y);
   X := CurX - X; Y := CurY - Y;
   If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) And
-     ((Wnds^[W].Proc <> 0) Or LbOwner(W)) And (Wnds^[W].IKind <> ikDialog)
+     ((Wnds^[W].Proc <> 0) Or CtlOwner(W)) And (Wnds^[W].IKind <> ikDialog)
   Then
     { controle sous-classe par le programme ou dessine par lui : le clic
       passe par sa file de messages (sa procedure, puis CallWindowProc) }
@@ -13111,7 +13131,7 @@ Begin
     Threads[T].PaintReq := False;
     For W := 0 To MaxWnd - 1 Do
       If Wnds^[W].Used And (Wnds^[W].Thread = T) And
-         ((Wnds^[W].IKind = ikNone) Or LbOwner(W)) And
+         ((Wnds^[W].IKind = ikNone) Or CtlOwner(W) Or DlgPaints(W)) And
          HasUpdate(W) And WndVisible(W) Then
       Begin
         Threads[T].PaintReq := True;
@@ -20596,6 +20616,16 @@ Begin
     programme recevraient WM_PAINT en continu (la boucle PeekMessage du
     programme d'installation d'Office ne se vidait jamais) }
   Wnds^[W].KNeedPaint := False;
+  { la procedure du dialogue peint ensuite par-dessus le fond (WM_PAINT
+    dans sa tache), puis les controles sont redessines (EndPaint) }
+  If DlgPaints(W) Then
+  Begin
+    SetR(Wnds^[W].Upd, 0, 0, Wnds^[W].CR - Wnds^[W].CL,
+         Wnds^[W].CB - Wnds^[W].CT);
+    Wnds^[W].UpdErase := False;
+    If (Wnds^[W].Thread > 0) And (Wnds^[W].Thread < MaxThread) Then
+      Threads[Wnds^[W].Thread].PaintReq := True;
+  End;
 End;
 
 { Dessiner une fenetre interne de premier niveau }
@@ -20678,7 +20708,7 @@ End;
 
 Const
   BS_TYPEMASK = $F; BS_CHECKBOX = 2; BS_AUTOCHECKBOX = 3; BS_RADIOBUTTON = 4;
-  BS_3STATE = 5; BS_GROUPBOX = 7; BS_AUTORADIOBUTTON = 9;
+  BS_3STATE = 5; BS_GROUPBOX = 7; BS_AUTORADIOBUTTON = 9; BS_OWNERDRAW = $B;
   BM_GETCHECK = $F0; BM_SETCHECK = $F1; BM_GETSTATE = $F2;
   BN_CLICKED = 0;
   LB_ADDSTRING = $180; LB_RESETCONTENT = $184; LB_SETCURSEL = $186;
@@ -20692,13 +20722,17 @@ Const
   LBS_MULTIPLESEL = $8; LBS_EXTENDEDSEL = $800;
   WM_DRAWITEM = $2B; WM_MEASUREITEM = $2C;
 
+Procedure IconPaint(H, X, Y, CW, CH : LongInt; Gdi : Boolean); Forward;
+Procedure BtnOwnerDraw(W : LongInt); Forward;
+
 Procedure DrawCtl(W : LongInt);
 Var S : TSurf; OX, OY, X1, Y1, X2, Y2, Typ, I, A : LongInt; Clip : TRect;
     T : String; Fg : LongInt;
 Begin
   If Not WndVisible(W) Then Exit;
-  { liste dessinee par le programme : peinte dans sa tache (WM_PAINT) }
-  If LbOwner(W) And (CurT <> Wnds^[W].Thread) Then
+  { liste ou bouton dessines par le programme : peints dans sa tache
+    (WM_PAINT) }
+  If CtlOwner(W) And (CurT <> Wnds^[W].Thread) Then
   Begin
     If (Wnds^[W].Thread > 0) And (Wnds^[W].Thread < MaxThread) Then
       Threads[Wnds^[W].Thread].PaintReq := True;
@@ -20739,6 +20773,13 @@ Begin
         FBar(X1, Y1, X2, Y2, cSilver);
         RadioButton(X1, (Y1 + Y2) Div 2 - 7, T, Wnds^[W].K1 <> 0);
       End
+      Else If Typ = BS_OWNERDRAW Then
+      Begin
+        { dans la tache du programme (voir plus haut) }
+        BtnOwnerDraw(W);
+        DirtyWnd(W);
+        Exit;
+      End
       Else
         PushButton(X1, Y1, X2, Y2, T, Wnds^[W].K2 <> 0,
                    (Wnds^[W].Style And 1) <> 0);
@@ -20748,21 +20789,25 @@ Begin
       Typ := Wnds^[W].Style And $1F;
       If (Typ = 7) Or (Typ = 8) Or (Typ = 9) Then
         Edge(X1, Y1, X2, Y2, cGray, cWhite)
-      Else If Typ = 3 Then PaintIcon(icApp, X1, Y1, 32)
+      Else If Typ = 3 Then
+      Begin
+        FBar(X1, Y1, X2, Y2, cSilver);
+        IconPaint(Wnds^[W].Icon, X1, Y1, 0, 0, False);
+      End
       Else
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
         TxtPitch := StaticPitch(W, T);
         If Wnds^[W].LongTxt <> 0 Then
-          WrapZ(X1, Y1, Wnds^[W].W, Wnds^[W].LongTxt, Fg, True)
+          WrapZ(X1, Y1, StaticVisW(W), Wnds^[W].LongTxt, Fg, True)
         Else If (Pos(#10, T) > 0) Or (Pos(#13, T) > 0) Then
         Begin
           T := T + #0;
-          WrapZ(X1, Y1, Wnds^[W].W, LongInt(@T[1]), Fg, True);
+          WrapZ(X1, Y1, StaticVisW(W), LongInt(@T[1]), Fg, True);
         End
         Else If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2,
                                       Y1, Wnds^[W].W, T, Fg, True)
-        Else WrapText(X1, Y1, Wnds^[W].W, T, Fg, True);
+        Else WrapText(X1, Y1, StaticVisW(W), T, Fg, True);
         TxtPitch := 0;
       End;
     End;
@@ -20866,6 +20911,20 @@ Begin
   LbOwner := (Wnds^[W].IKind = ikListBox) And
              ((Wnds^[W].Style And (LBS_OWNERDRAWFIXED Or LBS_OWNERDRAWVAR))
               <> 0);
+End;
+
+{ controle dessine par le programme : liste ou bouton BS_OWNERDRAW }
+Function CtlOwner(W : LongInt) : Boolean;
+Begin
+  CtlOwner := LbOwner(W) Or ((Wnds^[W].IKind = ikButton) And
+              ((Wnds^[W].Style And BS_TYPEMASK) = BS_OWNERDRAW));
+End;
+
+{ boite de dialogue d'un programme : sa procedure recoit WM_PAINT apres
+  le fond (panneaux de l'installation d'Office, logos...) }
+Function DlgPaints(W : LongInt) : Boolean;
+Begin
+  DlgPaints := (Wnds^[W].IKind = ikDialog) And (Wnds^[W].DlgProc <> 0);
 End;
 
 { elements a chaine (sinon : une valeur du programme) }
@@ -21507,6 +21566,26 @@ Begin
   ReleaseDC(HwndOf(W), Hdc);
 End;
 
+{ bouton BS_OWNERDRAW : WM_DRAWITEM au parent (ODT_BUTTON 4, action
+  ODA_DRAWENTIRE, etat 1 enfonce, 4 inactif, 10h focus) }
+Procedure BtnOwnerDraw(W : LongInt);
+Var Dis : Array[0..11] Of LongInt; Hdc : LongInt;
+Begin
+  If Wnds^[W].Parent < 0 Then Exit;
+  Hdc := GetDC(HwndOf(W));
+  If Hdc = 0 Then Exit;
+  Dis[0] := 4; Dis[1] := Wnds^[W].Id; Dis[2] := 0; Dis[3] := 1;
+  Dis[4] := 0;
+  If Wnds^[W].K2 <> 0 Then Dis[4] := 1;
+  If Not Wnds^[W].Enabled Then Dis[4] := Dis[4] Or 4;
+  If FocusWin = W Then Dis[4] := Dis[4] Or $10;
+  Dis[5] := HwndOf(W); Dis[6] := Hdc;
+  Dis[7] := 0; Dis[8] := 0; Dis[9] := Wnds^[W].W; Dis[10] := Wnds^[W].H;
+  Dis[11] := 0;
+  SendMsgW(Wnds^[W].Parent, WM_DRAWITEM, Wnds^[W].Id, LongInt(@Dis));
+  ReleaseDC(HwndOf(W), Hdc);
+End;
+
 { liste dessinee par le programme : comme Windows, prevenir aussitot
   d'un changement de selection (ODA_SELECT) de l'element Sel, et du
   deplacement du curseur de Old vers K2 (ODA_FOCUS) }
@@ -21835,9 +21914,11 @@ Begin
       PostMsgW(W, WM_COMMAND, IDCANCEL, 0);
       Exit;
     End;
+    { WM_PAINT non traite : le fond est deja peint par le noyau (le
+      redemander repeindrait sans fin) }
     If Msg = WM_PAINT Then
     Begin
-      Wnds^[W].KNeedPaint := True;
+      SetR(Wnds^[W].Upd, 0, 0, 0, 0);
       Exit;
     End;
   End;
@@ -21891,6 +21972,14 @@ Begin
     WM_SETFONT : Wnds^[W].Font := WP;
     WM_GETFONT : KWndProc := Wnds^[W].Font;
     WM_ENABLE : InvalAll(W, True);
+    { STM_SETICON, STM_GETICON, STM_SETIMAGE, STM_GETIMAGE }
+    $170, $172 :
+    Begin
+      KWndProc := Wnds^[W].Icon;
+      If Msg = $170 Then Wnds^[W].Icon := WP Else Wnds^[W].Icon := LP;
+      InvalAll(W, True);
+    End;
+    $171, $173 : KWndProc := Wnds^[W].Icon;
     BM_GETCHECK : KWndProc := Wnds^[W].K1;
     BM_SETCHECK :
     Begin
@@ -29356,13 +29445,25 @@ Begin
 End;
 
 Function EndPaint(H, P : LongInt) : LongInt;
-Var D : LongInt;
+Var D, W, I : LongInt;
 Begin
   D := DcOf(MemL[0:P]);
   If D >= 0 Then Dcs[D].HasPaint := False;
   ReleaseDC(H, MemL[0:P]);
-  DirtyWnd(WndOf(H));
+  W := WndOf(H);
+  DirtyWnd(W);
   EndPaint := 1;
+  { dialogue peint par sa procedure : ses controles par-dessus, sans
+    redemander le fond du dialogue }
+  If (W >= 0) And DlgPaints(W) Then
+    For I := 0 To MaxWnd - 1 Do
+      If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = W) Then
+      Begin
+        SetR(Wnds^[I].Upd, 0, 0, 30000, 30000);
+        If CtlOwner(I) And (Wnds^[I].Thread > 0) And
+           (Wnds^[I].Thread < MaxThread) Then
+          Threads[Wnds^[I].Thread].PaintReq := True;
+      End;
 End;
 
 Function InvalidateRect(H, P, Erase : LongInt) : LongInt;
@@ -29756,14 +29857,145 @@ Begin
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
+{ ------------------------------------------------------------------ }
+{ Icones des programmes : image d'une ressource RT_ICON (en-tete      }
+{ BITMAPINFOHEADER, hauteur double : points puis masque ET). Poignee : }
+{ IconBase + indice ; les icones du systeme (LoadIcon(0, IDI_...))     }
+{ gardent l'icone generique.                                           }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxIcon = 256;
+  IconBase = $0001C000;
+
+Var
+  IconBmi : Array[0..MaxIcon - 1] Of LongInt;
+  IconCnt : LongInt;
+
+{ nouvelle icone d'apres une image RT_ICON ; 0 si l'en-tete n'en est pas
+  une }
+Function IconNew(Bmi : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  IconNew := 0;
+  If (Bmi = 0) Or (MemL[0:Bmi] <> 40) Then Exit;
+  If (MemL[0:Bmi + 4] <= 0) Or (MemL[0:Bmi + 4] > 256) Or
+     (MemL[0:Bmi + 8] <= 0) Or (MemL[0:Bmi + 8] > 512) Then Exit;
+  { la meme image : la meme poignee }
+  For I := 0 To IconCnt - 1 Do
+    If IconBmi[I] = Bmi Then
+    Begin
+      IconNew := IconBase + I;
+      Exit;
+    End;
+  If IconCnt >= MaxIcon Then Exit;
+  IconBmi[IconCnt] := Bmi;
+  IconNew := IconBase + IconCnt;
+  Inc(IconCnt);
+End;
+
+Function IconOf(H : LongInt) : LongInt;
+Begin
+  IconOf := -1;
+  If (H >= IconBase) And (H < IconBase + IconCnt) Then
+    IconOf := H - IconBase;
+End;
+
+{ largeur et hauteur d'une icone (32 pour les icones du systeme) }
+Procedure IconSize(H : LongInt; Var W, Hh : LongInt);
+Var I : LongInt;
+Begin
+  W := 32; Hh := 32;
+  I := IconOf(H);
+  If I < 0 Then Exit;
+  W := MemL[0:IconBmi[I] + 4];
+  Hh := MemL[0:IconBmi[I] + 8] Div 2;
+End;
+
+{ dessiner l'icone H en (X, Y), a la taille CW x CH (0 : la sienne), dans
+  la cible courante (DcBegin ou dessin d'un controle) : points ou le
+  masque ET vaut 0, plus proche voisin pour la mise a l'echelle ; Gdi :
+  couleurs du DC (GColor), sinon de l'ecran }
+Procedure IconPaint(H, X, Y, CW, CH : LongInt; Gdi : Boolean);
+Var I, A, W, Hh, Bpp, N, Tab, Bits, Msk, P, PM, DX, DY, SX, SY, R, V,
+    Q : LongInt;
+Begin
+  I := IconOf(H);
+  If I < 0 Then
+  Begin
+    { icones du systeme (LoadIcon(0, IDI_...)) : IDI_HAND, IDI_QUESTION,
+      IDI_EXCLAMATION, IDI_ASTERISK ; l'icone d'application sinon }
+    Case H Of
+      $7F01 : PaintIcon(icError, X, Y, 32);
+      $7F02 : PaintIcon(icQuestion, X, Y, 32);
+      $7F03 : PaintIcon(icWarn, X, Y, 32);
+      $7F04 : PaintIcon(icInfo, X, Y, 32);
+    Else
+      PaintIcon(icApp, X, Y, 32);
+    End;
+    Exit;
+  End;
+  A := IconBmi[I];
+  W := MemL[0:A + 4]; Hh := MemL[0:A + 8] Div 2; Bpp := MemW[0:A + 14];
+  If CW <= 0 Then CW := W;
+  If CH <= 0 Then CH := Hh;
+  N := MemL[0:A + 32];
+  If (N = 0) And (Bpp <= 8) Then N := 1 Shl Bpp;
+  If Bpp > 8 Then N := 0;
+  Tab := A + MemL[0:A];
+  Bits := Tab + N * 4;
+  P := ((W * Bpp + 31) Div 32) * 4;
+  PM := ((W + 31) Div 32) * 4;
+  Msk := Bits + P * Hh;
+  For DY := 0 To CH - 1 Do
+  Begin
+    SY := (DY * Hh) Div CH;
+    R := Hh - 1 - SY;
+    For DX := 0 To CW - 1 Do
+    Begin
+      SX := (DX * W) Div CW;
+      If (Mem[0:Msk + R * PM + SX Shr 3] And ($80 Shr (SX And 7))) = 0 Then
+      Begin
+        Case Bpp Of
+          1 : V := (Mem[0:Bits + R * P + SX Shr 3] Shr (7 - SX And 7)) And 1;
+          4 : V := (Mem[0:Bits + R * P + SX Shr 1] Shr
+                    (4 * (1 - SX And 1))) And 15;
+          8 : V := Mem[0:Bits + R * P + SX];
+        Else
+          V := -1;
+        End;
+        If V >= 0 Then
+        Begin
+          Q := Tab + V * 4;
+          V := Mem[0:Q + 2] Or (Mem[0:Q + 1] Shl 8) Or (Mem[0:Q] Shl 16);
+        End
+        Else If Bpp = 24 Then
+        Begin
+          Q := Bits + R * P + SX * 3;
+          V := Mem[0:Q + 2] Or (Mem[0:Q + 1] Shl 8) Or (Mem[0:Q] Shl 16);
+        End
+        Else If Bpp = 32 Then
+        Begin
+          Q := Bits + R * P + SX * 4;
+          V := Mem[0:Q + 2] Or (Mem[0:Q + 1] Shl 8) Or (Mem[0:Q] Shl 16);
+        End
+        Else V := 0;
+        If Gdi Then Pix(X + DX, Y + DY, GColor(V))
+        Else Pix(X + DX, Y + DY, DirOf(V));
+      End;
+    End;
+  End;
+End;
+
 Function DrawIcon(Hdc, X, Y, Icon : LongInt) : LongInt;
-Var D : LongInt;
+Var D, W, H : LongInt;
 Begin
   DrawIcon := 1;
   D := DcOf(Hdc);
   If Not DcBegin(D) Then Exit;
-  PaintIcon(icApp, X, Y, 32);
-  DcDirty(X, Y, X + 32, Y + 32);
+  IconSize(Icon, W, H);
+  IconPaint(Icon, X, Y, 0, 0, True);
+  DcDirty(X, Y, X + W, Y + H);
 End;
 
 Function DrawFocusRect(Hdc, P : LongInt) : LongInt;
@@ -29774,8 +30006,8 @@ End;
 { DrawTextA : DT_CENTER 1, DT_RIGHT 2, DT_VCENTER 4, DT_BOTTOM 8,
   DT_WORDBREAK 10h, DT_SINGLELINE 20h, DT_CALCRECT 400h }
 Function DrawTextA(Hdc, Str, N, P, Fmt : LongInt) : LongInt;
-Var D, Cols, Lines, I, X, Y, Bg, C : LongInt; R : TRect; S, Ln, Wd : String;
-    LnArr : Array[0..15] Of String[80];
+Var D, Cols, Lines, I, X, Y, Bg, C, Pt, CW : LongInt; R : TRect;
+    S, Ln, Wd : String; LnArr : Array[0..15] Of String[80];
 Begin
   DrawTextA := 16;
   D := DcOf(Hdc);
@@ -29787,41 +30019,61 @@ Begin
   I := Pos('&', S);
   If I > 0 Then Delete(S, I, 1);
   GetRectAt(P, R);
-  Cols := Max(1, (R.R - R.L) Div 8);
-  Lines := 0;
-  If (Fmt And $10) <> 0 Then
+  { dans une fenetre : pas au-dela de sa zone cliente (les rectangles
+    des programmes sont prevus pour MS Sans Serif, plus etroite que la
+    police 8x16 : panneaux de l'installation d'Office) }
+  If ((Fmt And $400) = 0) And (Dcs[D].Wnd >= 0) And Dcs[D].Client Then
   Begin
+    CW := Wnds^[Dcs[D].Wnd].CR - Wnds^[Dcs[D].Wnd].CL;
+    If (R.R > CW) And (R.L < CW - 16) Then R.R := CW;
+  End;
+  { lignes : sauts de ligne respectes hors DT_SINGLELINE, coupure aux
+    mots avec DT_WORDBREAK ; texte resserre (7 puis 6 points par
+    caractere) si une ligne depasse la largeur (sans DT_WORDBREAK) ou si
+    les lignes depassent la hauteur du rectangle (avec) }
+  Pt := 9;
+  Repeat
+    Dec(Pt);
+    Cols := Max(1, (R.R - R.L) Div Pt);
+    Lines := 0; C := 0;
     Ln := ''; Wd := '';
     For I := 1 To Length(S) + 1 Do
-      If (I > Length(S)) Or (S[I] = ' ') Or (S[I] = #13) Or (S[I] = #10) Then
+      If (I > Length(S)) Or (S[I] = #10) Or
+         ((S[I] = ' ') And ((Fmt And $10) <> 0)) Then
       Begin
-        If (Length(Ln) + Length(Wd) + 1 > Cols) And (Ln <> '') Then
+        If (Fmt And $10) = 0 Then
+        Begin
+          If Ln = '' Then Ln := Wd Else Ln := Ln + ' ' + Wd;
+        End
+        Else If (Length(Ln) + Length(Wd) + 1 > Cols) And (Ln <> '') Then
         Begin
           If Lines < 16 Then LnArr[Lines] := Ln;
+          C := Max(C, Length(Ln));
           Inc(Lines);
           Ln := Wd;
         End
         Else If Ln = '' Then Ln := Wd Else Ln := Ln + ' ' + Wd;
         Wd := '';
-        If (I <= Length(S)) And (S[I] = #10) Then
+        If (I > Length(S)) Or ((S[I] = #10) And ((Fmt And $20) = 0)) Then
         Begin
-          If Lines < 16 Then LnArr[Lines] := Ln;
-          Inc(Lines);
+          If (I <= Length(S)) Or (Ln <> '') Or (Lines = 0) Then
+          Begin
+            If Lines < 16 Then LnArr[Lines] := Ln;
+            C := Max(C, Length(Ln));
+            Inc(Lines);
+          End;
           Ln := '';
         End;
       End
-      Else If S[I] <> #13 Then Wd := Wd + S[I];
-    If Ln <> '' Then
-    Begin
-      If Lines < 16 Then LnArr[Lines] := Ln;
-      Inc(Lines);
-    End;
-  End
-  Else
-  Begin
-    LnArr[0] := S;
-    Lines := 1;
-  End;
+      Else If (S[I] <> #13) And Not ((S[I] = #10) And ((Fmt And $20) <> 0))
+      Then
+      Begin
+        { un mot plus long que la ligne (sans DT_WORDBREAK : la ligne) }
+        Wd := Wd + S[I];
+      End;
+  Until (Pt <= 6) Or ((Fmt And $400) <> 0) Or
+        (((Fmt And $10) <> 0) And (Lines * 16 <= R.B - R.T)) Or
+        (((Fmt And $10) = 0) And (C * Pt <= R.R - R.L));
   If Lines > 16 Then Lines := 16;
   If (Fmt And $400) <> 0 Then
   Begin
@@ -29843,6 +30095,7 @@ Begin
     ClipX1 := Max(ClipX1, R.L); ClipY1 := Max(ClipY1, R.T);
     ClipX2 := Min(ClipX2, R.R - 1); ClipY2 := Min(ClipY2, R.B - 1);
   End;
+  If Pt < 8 Then TxtPitch := Pt;
   For I := 0 To Lines - 1 Do
   Begin
     X := R.L;
@@ -29853,6 +30106,7 @@ Begin
     OutTxt(X, Y, LnArr[I], C);
     Y := Y + 16;
   End;
+  TxtPitch := 0;
   DcDirty(R.L, R.T, R.R, R.B);
   DrawTextA := Lines * 16;
 End;
@@ -30895,9 +31149,38 @@ Begin
   ClipCursor := 1;
 End;
 
+{ LoadIcon : groupe RT_GROUP_ICON (14) du module, entree 32 x 32 la plus
+  riche en couleurs (sinon la plus grande), image RT_ICON (3) ; icone du
+  systeme (generique) pour Inst = 0 ou sans ressource }
 Function LoadIconA(Inst, Name : LongInt) : LongInt;
+Var M, E, A, N, I, Best, Sc, BS, Size, W, Id : LongInt;
 Begin
   LoadIconA := $7000 + (Name And $FFF);
+  If Inst = 0 Then Exit;
+  M := AppModule(Inst);
+  If M = 0 Then Exit;
+  E := ResFind(M, Name, 14);
+  If E = 0 Then Exit;
+  A := ResData(M, E, Size);
+  N := MemW[0:A + 4];
+  Best := -1; BS := -1;
+  For I := 0 To N - 1 Do
+  Begin
+    W := Mem[0:A + 6 + I * 14];
+    If W = 0 Then W := 256;
+    Sc := MemW[0:A + 6 + I * 14 + 6];
+    If W = 32 Then Sc := Sc + 10000 Else Sc := Sc + W * 10;
+    If Sc > BS Then
+    Begin
+      BS := Sc; Best := I;
+    End;
+  End;
+  If Best < 0 Then Exit;
+  Id := MemW[0:A + 6 + Best * 14 + 12];
+  E := ResFind(M, Id, 3);
+  If E = 0 Then Exit;
+  I := IconNew(ResData(M, E, Size));
+  If I <> 0 Then LoadIconA := I;
 End;
 
 Function DestroyIcon(H : LongInt) : LongInt;
@@ -31610,7 +31893,7 @@ End;
 Function DlgCreate(Inst, T, Parent, Proc, Lp : LongInt) : LongInt;
 Var Ex, Style, N, X, Y, CX, CY, A, I, Ord0, Cls, W, C, B, TT, Id,
     IStyle, IEx, Focus, CC : LongInt; Ext : Boolean; S, Title, ClsN : String;
-    P, TA : LongInt;
+    P, TA : LongInt; IcoN : String;
 Begin
   DlgCreate := -1;
   Ext := MemL[0:T] = LongInt($FFFF0001);
@@ -31716,6 +31999,15 @@ Begin
         WndSetTextW(C, TA);
       If (IStyle And WS_VISIBLE) <> 0 Then Wnds^[C].Visible := True;
       If (IStyle And WS_DISABLED) <> 0 Then Wnds^[C].Enabled := False;
+      { statique SS_ICON : l'icone nommee (ou numerotee) du modele }
+      If (CC = KClass[ikStatic]) And ((IStyle And $1F) = 3) Then
+        If MemW[0:TA] = $FFFF Then
+          Wnds^[C].Icon := LoadIconA(Inst, MemW[0:TA + 2])
+        Else If S <> '' Then
+        Begin
+          IcoN := S + #0;
+          Wnds^[C].Icon := LoadIconA(Inst, LongInt(@IcoN[1]));
+        End;
       If (Focus < 0) And ((IStyle And $10000) <> 0) Then Focus := C;
     End;
   End;
@@ -67651,14 +67943,18 @@ Begin
 End;
 
 Function CreateIconFromResource(Bits, N, Icon, Ver : LongInt) : LongInt;
+Var H : LongInt;
 Begin
-  CreateIconFromResource := LoadIconA(0, 32512);
+  H := 0;
+  If Icon <> 0 Then H := IconNew(Bits);
+  If H = 0 Then H := LoadIconA(0, 32512);
+  CreateIconFromResource := H;
 End;
 
 Function CreateIconFromResourceEx(Bits, N, Icon, Ver, CX, CY, Fl
   : LongInt) : LongInt;
 Begin
-  CreateIconFromResourceEx := LoadIconA(0, 32512);
+  CreateIconFromResourceEx := CreateIconFromResource(Bits, N, Icon, Ver);
 End;
 
 { metafichiers (WMF et EMF) : non geres ; un appel echoue proprement }
@@ -68652,8 +68948,18 @@ End;
 
 Function DrawIconEx(Hdc, X, Y, Icon, CX, CY, Step, Br, Fl : LongInt)
   : LongInt;
+Var D : LongInt;
 Begin
-  DrawIconEx := DrawIcon(Hdc, X, Y, Icon);
+  DrawIconEx := 1;
+  If (CX = 0) And (CY = 0) Then
+  Begin
+    DrawIconEx := DrawIcon(Hdc, X, Y, Icon);
+    Exit;
+  End;
+  D := DcOf(Hdc);
+  If Not DcBegin(D) Then Exit;
+  IconPaint(Icon, X, Y, CX, CY, True);
+  DcDirty(X, Y, X + CX, Y + CY);
 End;
 
 { DrawState : texte (DST_TEXT 1, DST_PREFIXTEXT 2), icone (3), bitmap (4)
@@ -80625,7 +80931,7 @@ Begin
     End;
     For I := 0 To MaxWnd - 1 Do
       If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].IKind <> ikNone) And
-         HasUpdate(I) And Not LbOwner(I) Then DrawCtl(I);
+         HasUpdate(I) And Not CtlOwner(I) Then DrawCtl(I);
     FlushScreen;
     ReapThreads;
     Busy := False;
