@@ -42,6 +42,15 @@ echo "== IO.SYS (WPC -CW95IO)"
 
 echo "== VMM32.VXD (WPC -CVMM32)"
 "$W/wpc" -CVMM32 "$HERE/VMM32.PAS" "$W/cd/VMM32.VXD"
+# L'image du noyau (chargee en 100000h) doit finir sous 400000h, adresse
+# ou se chargent les programmes Win32 : sinon le premier programme ecrase
+# la fin du noyau (table d'exportation).
+PE=$(od -An -tu4 -j 60 -N 4 "$W/cd/VMM32.VXD" | tr -d ' ')
+SZ=$(od -An -tu4 -j $((PE + 80)) -N 4 "$W/cd/VMM32.VXD" | tr -d ' ')
+if [ "$SZ" -gt $((0x300000)) ]; then
+  echo "ERREUR : VMM32.VXD occupe $SZ octets en memoire (3 Mo au plus)"
+  exit 1
+fi
 
 echo "== Programmes systeme et exemples Win32 (WPC -CW32)"
 for P in "$ROOT"/SYSTEM/*.PAS "$ROOT"/EXAMPLES/*.PAS; do
