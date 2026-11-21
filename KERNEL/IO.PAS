@@ -134,7 +134,7 @@ Const
   ConMaxR = 25;
   CanW    = 256;
   CanH    = 160;
-  CdMax   = 48;
+  CdMax   = 200;
   EnvMax  = 24;
 
   { Curseur de la souris (fleche) : X = noir, W = blanc }
@@ -917,6 +917,10 @@ Begin
             If ((A And $10) <> 0) And (Nm = Sub) Then
               FatDir := LongInt(MemW[DirSeg:Ofs + 26]) +
                         LongInt(MemW[DirSeg:Ofs + 20]) * 65536;
+            { table pleine : VMM32.VXD prend la derniere place (sans
+              lui, Pasdows ne demarre pas) }
+            If (CdCount >= CdMax) And (Nm = 'VMM32.VXD') Then
+              CdCount := CdMax - 1;
             If CdCount < CdMax Then
             Begin
               CdFiles[CdCount].Name := Copy(Nm, 1, 12);
