@@ -50,7 +50,8 @@ Program INSTALL;
   Carte memoire (mode reel) :
     00000h-07BFFh  vecteurs, BIOS, pile (0000:7C00 vers le bas)
     07C00h-....    INSTALL.SYS (code, puis donnees et BSS)
-    50000h-5FFFFh  NTFS : les 64 enregistrements de la MFT
+    40000h-4FFFFh  NTFS : enregistrements 64 a 127 de la MFT
+    50000h-5FFFFh  NTFS : enregistrements 0 a 63 de la MFT
     60000h-67FFFh  tampon de copie (32 Ko)
     70000h-77FFFh  secteurs de FAT et de repertoires, dnodes et
                    bitmaps HPFS (32 Ko)
@@ -70,6 +71,9 @@ Const
   SecSeg    = $8100;
   ValSeg    = $8140;
   MftSeg    = $5000;
+  MftSeg2   = $4000;
+  NtRecs    = 128;                 { enregistrements de la MFT }
+  NtIxMax   = 4;                   { blocs INDX de C:\WINDOWS }
   CdMax     = 128;
   MinMb     = 40;                    { FAT32 : au moins 65525 grappes }
   { systemes de fichiers : FAT16, FAT32 (defaut), NTFS ; taille
@@ -653,12 +657,18 @@ Var
   NtFT        : Array[0..3] Of Word;
   RBase, RPos, RId : Word;
   KN          : Integer;
-  KRec, KSeq, KPar, KPSeq, KAll, KSiz, KFl : Array[0..39] Of LongInt;
-  KNm         : Array[0..39] Of String[12];
+  KRec, KSeq, KPar, KPSeq, KAll, KSiz, KFl : Array[0..103] Of LongInt;
+  KNm         : Array[0..103] Of String[12];
+  KOrd        : Array[0..103] Of Integer;
+  { index en plusieurs blocs : debut de chaque bloc dans KOrd, nombre
+    de blocs ; le separateur entre deux blocs est KOrd[KBlk[B + 1] - 1] }
+  KBlk        : Array[0..NtIxMax] Of Integer;
+  KNB         : Integer;
+  RSeg        : Word;
   NfN         : Integer;
-  NfName      : Array[0..35] Of String[12];
-  NfRoot      : Array[0..35] Of Boolean;
-  NfRec, NfLcn, NfClus, NfSize, NfFl : Array[0..35] Of LongInt;
+  NfName      : Array[0..99] Of String[12];
+  NfRoot      : Array[0..99] Of Boolean;
+  NfRec, NfLcn, NfClus, NfSize, NfFl : Array[0..99] Of LongInt;
 
 { ================================================================== }
 { Utilitaires (repris d'IO.SYS)                                      }
@@ -2566,7 +2576,9 @@ Begin
     (accessoires), le Gestionnaire des taches, l'Outil de diagnostic
     DirectX, Ajout/Suppression de programmes, l'Aide de Windows, le
     Lecteur MP3, la Table de caracteres, FreeCell, le Lecteur CD,
-    Imaging, le Carnet d'adresses et Rechercher sont toujours
+    Imaging, le Carnet d'adresses, Rechercher, les Echecs, le
+    Solitaire et les outils systeme (Defragmenteur, Nettoyage de disque,
+    Informations systeme, Planificateur de taches) sont toujours
     installes ; le morceau d'exemple suit les sons du systeme }
   If (N = 'AURORE.MP3') And Not CompSnd Then Exit;
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
@@ -2575,7 +2587,10 @@ Begin
      (N <> 'WINHLP32.EXE') And (N <> 'MP3PLAY.EXE') And
      (N <> 'FREECELL.EXE') And (N <> 'CHARMAP.EXE') And
      (N <> 'CDPLAYER.EXE') And (N <> 'IMAGING.EXE') And
-     (N <> 'WAB.EXE') And (N <> 'FINDFILE.EXE') And Not CompEx Then
+     (N <> 'WAB.EXE') And (N <> 'FINDFILE.EXE') And
+     (N <> 'ECHECS.EXE') And (N <> 'SOL.EXE') And (N <> 'DEFRAG.EXE') And
+     (N <> 'CLEANMGR.EXE') And (N <> 'MSINFO32.EXE') And
+     (N <> 'MSTASK.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;
@@ -3679,11 +3694,12 @@ End;
 { ================================================================== }
 
 { Clusters de 4 Ko, enregistrements de 1 Ko, blocs d'index de 4 Ko.
-  Disposition : $Boot (clusters 0-1), $MFT (64 enregistrements), bitmap
+  Disposition : $Boot (clusters 0-1), $MFT (128 enregistrements), bitmap
   de la MFT, $LogFile (rempli de FFh), $AttrDef, $UpCase, $Secure:$SDS,
   $Bitmap, blocs d'index de la racine et de C:\WINDOWS, fichiers ;
   $MFTMirr au milieu du volume, copie du secteur d'amorce au dernier
-  secteur. Les 64 enregistrements sont construits en MftSeg puis ecrits
+  secteur. Les 128 enregistrements sont construits en MftSeg et MftSeg2
+  puis ecrits
   en une fois (avec les correctifs de secteurs). }
 
 { FILETIME (4 mots) = A * M + C }
@@ -3734,14 +3750,16 @@ End;
 Procedure RInit(N : LongInt; Seq, Flags, Links : Word);
 Var I : Word;
 Begin
-  RBase := Word(N) * 1024;
-  For I := 0 To 511 Do MemW[MftSeg:RBase + I * 2] := 0;
-  PutL(MftSeg, RBase, $454C4946);
-  PutW(MftSeg, RBase + 4, $30); PutW(MftSeg, RBase + 6, 3);
-  PutW(MftSeg, RBase + $10, Seq); PutW(MftSeg, RBase + $12, Links);
-  PutW(MftSeg, RBase + $14, $38); PutW(MftSeg, RBase + $16, Flags);
-  PutL(MftSeg, RBase + $1C, 1024);
-  PutL(MftSeg, RBase + $2C, N);
+  { enregistrements 0-63 en MftSeg, 64-127 en MftSeg2 }
+  If N < 64 Then RSeg := MftSeg Else RSeg := MftSeg2;
+  RBase := Word(N And 63) * 1024;
+  For I := 0 To 511 Do MemW[RSeg:RBase + I * 2] := 0;
+  PutL(RSeg, RBase, $454C4946);
+  PutW(RSeg, RBase + 4, $30); PutW(RSeg, RBase + 6, 3);
+  PutW(RSeg, RBase + $10, Seq); PutW(RSeg, RBase + $12, Links);
+  PutW(RSeg, RBase + $14, $38); PutW(RSeg, RBase + $16, Flags);
+  PutL(RSeg, RBase + $1C, 1024);
+  PutL(RSeg, RBase + $2C, N);
   RPos := $38; RId := 0;
 End;
 
@@ -3750,13 +3768,13 @@ Procedure RHdr(Typ : LongInt; Const Nm : String; Len : Word;
 Var I : Integer; P : Word;
 Begin
   P := RBase + RPos;
-  PutL(MftSeg, P, Typ); PutL(MftSeg, P + 4, Len);
-  Mem[MftSeg:P + 8] := Ord(NonRes);
-  Mem[MftSeg:P + 9] := Length(Nm);
-  PutW(MftSeg, P + 10, HdrLen);
-  PutW(MftSeg, P + 14, RId);
+  PutL(RSeg, P, Typ); PutL(RSeg, P + 4, Len);
+  Mem[RSeg:P + 8] := Ord(NonRes);
+  Mem[RSeg:P + 9] := Length(Nm);
+  PutW(RSeg, P + 10, HdrLen);
+  PutW(RSeg, P + 14, RId);
   For I := 1 To Length(Nm) Do
-    PutW(MftSeg, P + HdrLen + (I - 1) * 2, Ord(Nm[I]));
+    PutW(RSeg, P + HdrLen + (I - 1) * 2, Ord(Nm[I]));
 End;
 
 { Attribut resident : valeur en ValSeg:0000 (VLen octets) }
@@ -3767,11 +3785,11 @@ Begin
   Len := (VO + VLen + 7) And $FFF8;
   RHdr(Typ, Nm, Len, False, $18);
   P := RBase + RPos;
-  PutL(MftSeg, P + $10, VLen); PutW(MftSeg, P + $14, VO);
-  Mem[MftSeg:P + $16] := Ix;
+  PutL(RSeg, P + $10, VLen); PutW(RSeg, P + $14, VO);
+  Mem[RSeg:P + $16] := Ix;
   { (VLen = 0 : pas de copie ; VLen - 1 deborderait en Word) }
   If VLen > 0 Then
-    For I := 0 To VLen - 1 Do Mem[MftSeg:P + VO + I] := Mem[ValSeg:I];
+    For I := 0 To VLen - 1 Do Mem[RSeg:P + VO + I] := Mem[ValSeg:I];
   RPos := RPos + Len; Inc(RId);
 End;
 
@@ -3787,24 +3805,24 @@ Begin
   Len := (RO + 1 + NL + NO + 1 + 7) And $FFF8;
   RHdr(Typ, Nm, Len, True, $40);
   P := RBase + RPos;
-  PutL(MftSeg, P + $18, Clus - 1);
-  PutW(MftSeg, P + $20, RO);
-  PutL(MftSeg, P + $28, AllocLo); PutL(MftSeg, P + $2C, AllocHi);
-  PutL(MftSeg, P + $30, SizeLo); PutL(MftSeg, P + $34, SizeHi);
-  PutL(MftSeg, P + $38, SizeLo); PutL(MftSeg, P + $3C, SizeHi);
+  PutL(RSeg, P + $18, Clus - 1);
+  PutW(RSeg, P + $20, RO);
+  PutL(RSeg, P + $28, AllocLo); PutL(RSeg, P + $2C, AllocHi);
+  PutL(RSeg, P + $30, SizeLo); PutL(RSeg, P + $34, SizeHi);
+  PutL(RSeg, P + $38, SizeLo); PutL(RSeg, P + $3C, SizeHi);
   Q := P + RO;
-  Mem[MftSeg:Q] := NL Or (NO Shl 4);
-  For K := 0 To NL - 1 Do Mem[MftSeg:Q + 1 + K] := (Clus Shr (8 * K)) And $FF;
+  Mem[RSeg:Q] := NL Or (NO Shl 4);
+  For K := 0 To NL - 1 Do Mem[RSeg:Q + 1 + K] := (Clus Shr (8 * K)) And $FF;
   For K := 0 To NO - 1 Do
-    Mem[MftSeg:Q + 1 + NL + K] := (Lcn Shr (8 * K)) And $FF;
+    Mem[RSeg:Q + 1 + NL + K] := (Lcn Shr (8 * K)) And $FF;
   RPos := RPos + Len; Inc(RId);
 End;
 
 Procedure RDone;
 Begin
-  PutL(MftSeg, RBase + RPos, -1); PutL(MftSeg, RBase + RPos + 4, 0);
-  PutL(MftSeg, RBase + $18, RPos + 8);
-  PutW(MftSeg, RBase + $28, RId);
+  PutL(RSeg, RBase + RPos, -1); PutL(RSeg, RBase + RPos + 4, 0);
+  PutL(RSeg, RBase + $18, RPos + 8);
+  PutW(RSeg, RBase + $28, RId);
 End;
 
 { $STANDARD_INFORMATION en ValSeg ; longueur }
@@ -3839,7 +3857,7 @@ End;
 Procedure KAdd(Rec, Seq, Parent, PSeq, AllocLo, SizeLo, Fl : LongInt;
                Const Nm : String);
 Begin
-  If KN > 39 Then Exit;
+  If KN > 103 Then Exit;
   KRec[KN] := Rec; KSeq[KN] := Seq; KPar[KN] := Parent; KPSeq[KN] := PSeq;
   KAll[KN] := AllocLo; KSiz[KN] := SizeLo; KFl[KN] := Fl; KNm[KN] := Nm;
   Inc(KN);
@@ -3873,47 +3891,111 @@ Begin
   If UpStr(Nm) = Nm Then NsOf := 3 Else NsOf := 1;
 End;
 
-{ Entrees triees de K* en Sg:Ofs (avec l'entree de fin) ; longueur }
-Function KPut(Sg, Ofs : Word) : Word;
-Var Ord0 : Array[0..39] Of Integer; I, J, T, K : Integer; P, KL, L : Word;
+{ Trier K* (KOrd) }
+Procedure KSort;
+Var I, J, T : Integer;
 Begin
-  For I := 0 To KN - 1 Do Ord0[I] := I;
+  For I := 0 To KN - 1 Do KOrd[I] := I;
   For I := 1 To KN - 1 Do
   Begin
     J := I;
-    While (J > 0) And KLess(Ord0[J], Ord0[J - 1]) Do
+    While (J > 0) And KLess(KOrd[J], KOrd[J - 1]) Do
     Begin
-      T := Ord0[J]; Ord0[J] := Ord0[J - 1]; Ord0[J - 1] := T;
+      T := KOrd[J]; KOrd[J] := KOrd[J - 1]; KOrd[J - 1] := T;
       Dec(J);
     End;
   End;
-  P := Ofs;
-  For I := 0 To KN - 1 Do
-  Begin
-    K := Ord0[I];
-    KL := VFn(Sg, P + 16, KPar[K], KPSeq[K], KAll[K], KSiz[K], KFl[K],
-              KNm[K], NsOf(KNm[K]));
-    L := (16 + KL + 7) And $FFF8;
-    PutL(Sg, P, KRec[K]); PutW(Sg, P + 4, 0); PutW(Sg, P + 6, KSeq[K]);
-    PutW(Sg, P + 8, L); PutW(Sg, P + 10, KL); PutL(Sg, P + 12, 0);
-    P := P + L;
-  End;
-  For I := 0 To 7 Do MemW[Sg:P + I * 2] := 0;
-  PutW(Sg, P + 8, 16); PutL(Sg, P + 12, 2);
-  KPut := P + 16 - Ofs;
 End;
 
-{ $INDEX_ROOT d'un grand index (entree de fin -> bloc 0) en ValSeg }
+{ Entree d'index de K en Sg:P (Sub : avec le bloc fils Vcn) ; longueur }
+Function KEnt(Sg, P : Word; K : Integer; Sub : Boolean; Vcn : LongInt)
+  : Word;
+Var KL, L : Word;
+Begin
+  KL := VFn(Sg, P + 16, KPar[K], KPSeq[K], KAll[K], KSiz[K], KFl[K],
+            KNm[K], NsOf(KNm[K]));
+  L := (16 + KL + 7) And $FFF8;
+  PutL(Sg, P, KRec[K]); PutW(Sg, P + 4, 0); PutW(Sg, P + 6, KSeq[K]);
+  PutL(Sg, P + 12, 0);
+  If Sub Then
+  Begin
+    PutL(Sg, P + L, Vcn); PutL(Sg, P + L + 4, 0);
+    L := L + 8;
+    Mem[Sg:P + 12] := 1;
+  End;
+  PutW(Sg, P + 8, L); PutW(Sg, P + 10, KL);
+  KEnt := L;
+End;
+
+Function KEntLen(K : Integer) : Word;
+Begin
+  KEntLen := (16 + $42 + Length(KNm[K]) * 2 + 7) And $FFF8;
+End;
+
+{ Repartir les entrees triees en blocs INDX de 4 Ko (4032 octets
+  d'entrees avec la fin) : KBlk, KNB }
+Procedure KSplit;
+Var I : Integer; Sz : Word;
+Begin
+  KSort;
+  KNB := 1; KBlk[0] := 0; Sz := 16;
+  I := 0;
+  While I < KN Do
+  Begin
+    If (Sz + KEntLen(KOrd[I]) > 4032) And (KNB < NtIxMax) And
+       (I < KN - 1) Then
+    Begin
+      { KOrd[I] monte dans la racine ; le bloc suivant commence apres }
+      KBlk[KNB] := I + 1;
+      Inc(KNB);
+      Sz := 16;
+    End
+    Else Sz := Sz + KEntLen(KOrd[I]);
+    Inc(I);
+  End;
+  KBlk[KNB] := KN + 1;
+End;
+
+{ Entrees du bloc B (avec l'entree de fin) en Sg:Ofs ; longueur }
+Function KPutBlk(Sg, Ofs : Word; B : Integer) : Word;
+Var I, Last : Integer; P : Word;
+Begin
+  P := Ofs;
+  Last := KBlk[B + 1] - 2;
+  If Last > KN - 1 Then Last := KN - 1;
+  For I := KBlk[B] To Last Do P := P + KEnt(Sg, P, KOrd[I], False, 0);
+  For I := 0 To 7 Do MemW[Sg:P + I * 2] := 0;
+  PutW(Sg, P + 8, 16); PutL(Sg, P + 12, 2);
+  KPutBlk := P + 16 - Ofs;
+End;
+
+{ Entrees triees de K* en Sg:Ofs (avec l'entree de fin) ; longueur }
+Function KPut(Sg, Ofs : Word) : Word;
+Begin
+  KSort;
+  KNB := 1; KBlk[0] := 0; KBlk[1] := KN + 1;
+  KPut := KPutBlk(Sg, Ofs, 0);
+End;
+
+{ $INDEX_ROOT d'un grand index en ValSeg : les separateurs des blocs
+  (KSplit) puis l'entree de fin vers le dernier bloc ; longueur }
 Function VBigRoot : Word;
-Var I : Integer;
+Var I : Integer; P : Word;
 Begin
   For I := 0 To 27 Do MemW[ValSeg:I * 2] := 0;
   PutL(ValSeg, 0, $30); PutL(ValSeg, 4, 1); PutL(ValSeg, 8, 4096);
   Mem[ValSeg:12] := 1;
-  PutL(ValSeg, $10, $10); PutL(ValSeg, $14, $28); PutL(ValSeg, $18, $28);
+  P := $20;
+  For I := 1 To KNB - 1 Do
+    P := P + KEnt(ValSeg, P, KOrd[KBlk[I] - 1], True, I - 1);
+  For I := 0 To 11 Do MemW[ValSeg:P + I * 2] := 0;
+  PutW(ValSeg, P + 8, 24); PutL(ValSeg, P + 12, 3);
+  PutL(ValSeg, P + 16, KNB - 1);
+  P := P + 24;
+  PutL(ValSeg, $10, $10); PutL(ValSeg, $14, P - $10);
+  PutL(ValSeg, $18, P - $10);
   Mem[ValSeg:$1C] := 1;
-  PutW(ValSeg, $28, 24); PutL(ValSeg, $2C, 3); PutL(ValSeg, $30, 0);
-  VBigRoot := $38;
+  VBigRoot := P;
 End;
 
 { Correctifs de secteurs du bloc Sg:Ofs de Size octets }
@@ -3929,14 +4011,16 @@ Begin
   End;
 End;
 
-{ Bloc INDX (VCN 0) des entrees K* en FatBufSeg, ecrit au cluster Lcn }
-Function WriteIndx(Lcn : LongInt) : Boolean;
+{ Bloc INDX B (VCN B, KSplit) en FatBufSeg, ecrit au cluster Lcn + B }
+Function WriteIndx(Lcn : LongInt; B : Integer) : Boolean;
 Var I : Integer; L : Word;
 Begin
   For I := 0 To 2047 Do MemW[FatBufSeg:I * 2] := 0;
   PutL(FatBufSeg, 0, $58444E49);
   PutW(FatBufSeg, 4, $28); PutW(FatBufSeg, 6, 9);
-  L := KPut(FatBufSeg, $40);
+  PutL(FatBufSeg, $10, B);
+  L := KPutBlk(FatBufSeg, $40, B);
+  Lcn := Lcn + B;
   PutL(FatBufSeg, $18, $28); PutL(FatBufSeg, $1C, $28 + L);
   PutL(FatBufSeg, $20, 4096 - $18);
   Protect(FatBufSeg, 0, 4096);
@@ -4076,8 +4160,8 @@ Function NtCopy(Idx : Integer; Const Nm : String; InRoot : Boolean;
 Var Lcn, Clus, Size, Rem, K, Bytes : LongInt; N : Integer;
 Begin
   NtCopy := False;
-  { enregistrements 28 a 63 de la MFT }
-  If NfN > 35 Then
+  { enregistrements 28 a NtRecs - 1 de la MFT }
+  If NfN > NtRecs - 29 Then
   Begin
     TooMany;
     Exit;
@@ -4140,14 +4224,14 @@ Begin
   End;
   NtNow;
   NtNext := 2;
-  NtMftL := NtAlloc(16); NtMBmpL := NtAlloc(1);
+  NtMftL := NtAlloc(NtRecs Div 4); NtMBmpL := NtAlloc(1);
   If PartSecs Div 2048 <= 1024 Then NtLogN := 512 Else NtLogN := 1024;
   NtLogL := NtAlloc(NtLogN);
   NtAdL := NtAlloc(1); NtUpL := NtAlloc(32);
   NtSdsN := (262144 + 256 + 4095) Div 4096; NtSdsL := NtAlloc(NtSdsN);
   NtBmpLen := ((NtC + 7) Div 8 + 7) And Not 7;
   NtBmpN := (NtBmpLen + 4095) Div 4096; NtBmpL := NtAlloc(NtBmpN);
-  NtRootIx := NtAlloc(1); NtWinIx := NtAlloc(1);
+  NtRootIx := NtAlloc(1); NtWinIx := NtAlloc(NtIxMax);
   NtMirr := NtC Div 2;
   NfN := 0;
   SetStatus(L('Formatage de C: (NTFS)...', 'Formatting C: (NTFS)...',
@@ -4203,9 +4287,11 @@ Begin
   PutL(CopySeg, $18, $10 + Ln); Mem[CopySeg:$1C] := 0;
   K := $20 + Ln;
   KN := 0;
-  SysRec(0, 1, '$MFT', 6, $100, 1, 65536, 65536);
-  RNonRes($80, '', NtMftL, 16, 65536, 0, 65536, 0);
-  RNonRes($B0, '', NtMBmpL, 1, 4096, 0, 8, 0);
+  SysRec(0, 1, '$MFT', 6, $100, 1, NtRecs * LongInt(1024),
+         NtRecs * LongInt(1024));
+  RNonRes($80, '', NtMftL, NtRecs Div 4, NtRecs * LongInt(1024), 0,
+          NtRecs * LongInt(1024), 0);
+  RNonRes($B0, '', NtMBmpL, 1, 4096, 0, NtRecs Div 8, 0);
   RDone;
   SysRec(1, 1, '$MFTMirr', 6, $100, 1, 4096, 4096);
   RNonRes($80, '', NtMirr, 1, 4096, 0, 4096, 0);
@@ -4295,7 +4381,9 @@ Begin
     If NfRoot[I] Then
       KAdd(NfRec[I], 1, 5, 5, NfClus[I] * 4096, NfSize[I], NfFl[I],
            NfName[I]);
-  If Not WriteIndx(NtRootIx) Then Exit;
+  KSplit;
+  KNB := 1; KBlk[1] := KN + 1;
+  If Not WriteIndx(NtRootIx, 0) Then Exit;
   RInit(5, 5, 3, 1);
   RRes($10, '', VSi($26, $101, True), 0);
   RRes($30, '', VFn(ValSeg, 0, 5, 5, 0, 0, $10000026, '.', 3), 1);
@@ -4311,14 +4399,17 @@ Begin
     If Not NfRoot[I] Then
       KAdd(NfRec[I], 1, 27, 1, NfClus[I] * 4096, NfSize[I], NfFl[I],
            NfName[I]);
-  If Not WriteIndx(NtWinIx) Then Exit;
+  KSplit;
+  For I := 0 To KNB - 1 Do
+    If Not WriteIndx(NtWinIx, I) Then Exit;
   RInit(27, 1, 3, 1);
   RRes($10, '', VSi(0, 0, False), 0);
   RRes($30, '', VFn(ValSeg, 0, 5, 5, 0, 0, $10000000, 'WINDOWS', 3), 1);
   RRes($90, '$I30', VBigRoot, 0);
-  RNonRes($A0, '$I30', NtWinIx, 1, 4096, 0, 4096, 0);
+  RNonRes($A0, '$I30', NtWinIx, KNB, KNB * LongInt(4096), 0,
+          KNB * LongInt(4096), 0);
   For I := 0 To 3 Do MemW[ValSeg:I * 2] := 0;
-  Mem[ValSeg:0] := 1;
+  Mem[ValSeg:0] := (1 Shl KNB) - 1;
   RRes($B0, '$I30', 8, 0);
   RDone;
   { fichiers }
@@ -4339,15 +4430,19 @@ Begin
     RDone;
   End;
   { enregistrements libres }
-  For N := 28 + NfN To 63 Do
+  For N := 28 + NfN To NtRecs - 1 Do
   Begin
     RInit(N, 1, 0, 0);
     RDone;
   End;
-  { correctifs et ecriture : MFT (64 Ko) et miroir (4 enregistrements) }
+  { correctifs et ecriture : MFT (128 Ko) et miroir (4 enregistrements) }
   For N := 0 To 63 Do Protect(MftSeg, Word(N) * 1024, 1024);
+  For N := 0 To 63 Do Protect(MftSeg2, Word(N) * 1024, 1024);
   If Not HdIo(Drv, True, PartLba + NtMftL * 8, MftSeg, 64) Then Exit;
   If Not HdIo(Drv, True, PartLba + NtMftL * 8 + 64, MftSeg + $800, 64)
+  Then Exit;
+  If Not HdIo(Drv, True, PartLba + NtMftL * 8 + 128, MftSeg2, 64) Then Exit;
+  If Not HdIo(Drv, True, PartLba + NtMftL * 8 + 192, MftSeg2 + $800, 64)
   Then Exit;
   If Not HdIo(Drv, True, PartLba + NtMirr * 8, MftSeg, 8) Then Exit;
   { bitmap de la MFT : 0-15, 24 et suivants }

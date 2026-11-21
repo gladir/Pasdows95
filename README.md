@@ -26,6 +26,9 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>APPS/WINHLP32.PAS</b></td><td><b>Aide de Windows</b> (WINHLP32.EXE, compilé par <b>WPC -CW32</b>) : visionneuse des fichiers d'aide <b>.HLP</b> de Windows 3.1 et 4.0, voir la section <a href="#aide">Aide de Windows</a>.</td></tr>
 	<tr><td><b>APPS/FREECELL.PAS</b></td><td><b>FreeCell</b> (FREECELL.EXE, compilé par <b>WPC -CW32</b>) : le jeu FREECELL.PAS du projet <a href="https://github.com/gladir/OS2-0">OS2-0</a> converti des API d'OS/2 (PMWIN, PMGPI) aux API de Windows (USER32, GDI32), voir la section <a href="#freecell">FreeCell</a>.</td></tr>
 	<tr><td><b>APPS/CHARMAP.PAS</b></td><td><b>Table de caractères</b> comme celle de Windows 95 (CHARMAP.EXE, compilé par <b>WPC -CW32</b>), voir la section <a href="#charmap">Table de caractères</a>.</td></tr>
+	<tr><td><b>APPS/ECHECS.PAS</b></td><td><b>Échecs</b> (ECHECS.EXE) porté d'OS2-0, voir la section <a href="#echecs">Échecs</a>.</td></tr>
+	<tr><td><b>APPS/SOL.PAS</b></td><td><b>Solitaire</b> (SOL.EXE), voir la section <a href="#solitaire">Solitaire</a>.</td></tr>
+	<tr><td><b>APPS/DEFRAG.PAS</b>, <b>CLEANMGR.PAS</b>, <b>MSINFO32.PAS</b>, <b>MSTASK.PAS</b></td><td><b>Défragmenteur de disque</b>, <b>Nettoyage de disque</b>, <b>Informations système</b> et <b>Tâches planifiées</b>, voir la section <a href="#outils-systeme">Outils système</a>.</td></tr>
 	<tr><td><b>APPS/CDPLAYER.PAS</b></td><td><b>Lecteur CD</b> (CDPLAYER.EXE, compilé par <b>WPC -CW32</b>) par MCI cdaudio, voir la section <a href="#lecteurcd">Lecteur CD</a>.</td></tr>
 	<tr><td><b>APPS/FINDFILE.PAS</b></td><td><b>Rechercher</b> (FINDFILE.EXE) : fichiers ou dossiers, et ordinateur (/C), voir la section <a href="#rechercher">Rechercher</a>.</td></tr>
 	<tr><td><b>APPS/IMAGING.PAS</b></td><td><b>Imaging</b> (IMAGING.EXE) : visionneuse TIFF (plusieurs pages), BMP, GIF, PNG et JPEG, voir la section <a href="#imaging">Imaging</a>.</td></tr>
@@ -181,23 +184,24 @@ La liste est relue toutes les deux secondes : un logiciel installé ou supprimé
 
 <h2 id="accessoires">Menu Démarrer : Accessoires</h2>
 
-Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Accessoires</b>, suivi de l'Explorateur Pasdows et de l'Invite MS-DOS ; viennent ensuite les autres programmes du dossier du système. Les programmes de Pasdows déjà présents dans les menus (Calculatrice, Navigateur Web, Lecteur MP3, Lecteur CD, FreeCell, Table de caractères, Carnet d'adresses, Imaging, Rechercher, Aide, Ajout/Suppression de programmes, Gestionnaire des tâches, programmes d'essai) n'y sont plus répétés, ni sur le bureau.
+Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Accessoires</b>, suivi de l'Explorateur Pasdows et de l'Invite MS-DOS ; viennent ensuite les autres programmes du dossier du système. Les programmes de Pasdows déjà présents dans les menus (Calculatrice, Navigateur Web, Lecteur MP3, Lecteur CD, Échecs, FreeCell, Solitaire, outils système, Table de caractères, Carnet d'adresses, Imaging, Rechercher, Aide, Ajout/Suppression de programmes, Gestionnaire des tâches, programmes d'essai) n'y sont plus répétés, ni sur le bureau.
 
 <ul>
 	<li><b>Accessoires</b> : les groupes <b>Jeux</b>, <b>Multimédia</b>, <b>Outils Internet</b> et <b>Outils système</b>, puis Bloc-notes, Calculatrice, <b>Carnet d'adresses</b>, <b>Imaging</b>, Paint et <b>Table de caractères</b> ;</li>
-	<li><b>Jeux</b> : <b>FreeCell</b> ;</li>
+	<li><b>Jeux</b> : <b>Échecs</b>, <b>FreeCell</b> et <b>Solitaire</b> ;</li>
 	<li><b>Multimédia</b> : <b>Lecteur CD</b>, <b>Lecteur MP3</b>, Contrôle du volume, puis les programmes DirectX installés : Outil de diagnostic DirectX (DXDIAG), DDTEST, D3DTEST, D3D8TEST et GLTEST ;</li>
 	<li><b>Outils Internet</b> : Navigateur Web, puis NETTEST et HTTPGET s'ils sont installés ;</li>
-	<li><b>Outils système</b> : ScanDisk (vérification du disque C:), Gestionnaire des tâches, puis FATTEST, PROCTEST et HELLO s'ils sont installés.</li>
+	<li><b>Outils système</b> : <b>Défragmenteur de disque</b>, Gestionnaire des tâches, <b>Informations système</b>, <b>Nettoyage de disque</b>, ScanDisk (vérification du disque C:), <b>Tâches planifiées</b>, puis FATTEST, PROCTEST et HELLO s'ils sont installés.</li>
 </ul>
 
-Le menu Démarrer a aussi <b>Rechercher</b>, avec <i>Fichiers ou dossiers...</i> et <i>Ordinateur...</i> (voir <a href="#rechercher">Rechercher</a>). Chaque programme a son icône : cartes à jouer pour FreeCell, bloc-notes à spirale, disque compact, carnet, image, loupe, grille de caractères... Un sous-menu qui n'a plus de place à droite de l'écran s'ouvre à gauche de son menu, comme sous Windows. <i>Exécuter</i> reconnaît aussi « notepad » (et « notepad fichier »).
+Le bureau a une icône <b>Navigateur Web</b> (à côté de Paint). Le menu Démarrer a aussi <b>Rechercher</b>, avec <i>Fichiers ou dossiers...</i> et <i>Ordinateur...</i> (voir <a href="#rechercher">Rechercher</a>). Chaque programme a son icône : cartes à jouer pour FreeCell, bloc-notes à spirale, disque compact, carnet, image, loupe, grille de caractères... Un sous-menu qui n'a plus de place à droite de l'écran s'ouvre à gauche de son menu, comme sous Windows. <i>Exécuter</i> reconnaît aussi « notepad » (et « notepad fichier »).
 
 Dans les fenêtres des programmes (et les boîtes de dialogue), <b>Tab</b> et <b>Maj+Tab</b> passent d'un contrôle à l'autre (ceux qui ont WS_TABSTOP, dans l'ordre de création) ; <b>ShellExecute</b> ouvre un dossier dans l'Explorateur et un document selon son extension (Aide pour .HLP, Lecteur MP3, Imaging pour les images, sinon le Bloc-notes), comme un double clic dans l'Explorateur.
 
 <table>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_ACCESSOIRES.png" width="400" alt="Démarrer, Programmes, Accessoires, Jeux"><br><i>Démarrer, Programmes, Accessoires, Jeux, FreeCell</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_MULTIMEDIA.png" width="400" alt="Démarrer, Programmes, Accessoires, Multimédia"><br><i>Accessoires, Multimédia : Lecteur CD, Lecteur MP3, DirectX</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CHARMAP.png" width="400" alt="Table de caractères"><br><i>Table de caractères : caractère agrandi, frappe Alt+0233</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_RECHERCHER.png" width="400" alt="Démarrer, Rechercher"><br><i>Démarrer, Rechercher</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_OUTILS_SYSTEME.png" width="400" alt="Accessoires, Outils système"><br><i>Accessoires, Outils système</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_JEUX.png" width="400" alt="Accessoires, Jeux"><br><i>Accessoires, Jeux : Échecs, FreeCell, Solitaire ; bureau : Navigateur Web</i></td></tr>
 </table>
 
 <h2 id="rechercher">Rechercher</h2>
@@ -239,6 +243,38 @@ Dans les fenêtres des programmes (et les boîtes de dialogue), <b>Tab</b> et <b
 <h2 id="charmap">Table de caractères</h2>
 
 <b>APPS/CHARMAP.PAS</b> (CHARMAP.EXE, <i>Démarrer, Programmes, Accessoires, Table de caractères</i>) reprend la Table de caractères de Windows 95 : la grille montre les 224 caractères affichables du jeu de Windows (codes 32 à 255, page de codes ANSI) en 32 colonnes. Un clic choisit un caractère et l'agrandit tant que le bouton reste enfoncé ; les flèches déplacent le choix. Un double clic, <b>Entrée</b> ou <b>Sélectionner</b> l'ajoutent à la zone <i>Caractères à copier</i>, que <b>Copier</b> met dans le presse-papiers (à coller dans le Bloc-notes par Ctrl+V ou Maj+Inser). La barre d'état donne la frappe qui produit le caractère : la touche, ou Alt et le code sur le pavé numérique (Alt+0233 pour é). Sous Pasdows, qui affiche les programmes de WPC avec la police de l'écran, les caractères sont convertis pour l'affichage et le presse-papiers ; sous Windows, ils sont passés tels quels.
+
+<h2 id="echecs">Échecs</h2>
+
+<b>APPS/ECHECS.PAS</b> (ECHECS.EXE, <i>Démarrer, Programmes, Accessoires, Jeux, Échecs</i>) est le jeu d'échecs du Presentation Manager d'<a href="https://github.com/gladir/OS2-0">OS2-0</a> porté pour les API de Windows. Le moteur est inchangé : toutes les règles (roque, prise en passant, promotion, échec et mat, pat, 50 coups, matériel insuffisant), recherche alpha-bêta à profondeur 1, 2 ou 3 selon le niveau, suivie d'une recherche des prises ; l'ordinateur joue les noirs, les blancs (<i>Jouer avec les noirs</i>) ou personne (<i>Deux joueurs</i>) ; notation française des coups (Cg1-f3, O-O, +, #), annulation (Ctrl+Z), F2. Le portage remplace WinCreateStdWindow, les menus de PM, GpiBox, GpiLine, WinDrawText et WinFillRect par CreateWindowEx, CreateMenu, RoundRect, LineTo, TextOut et FillRect ; les coordonnées de PM (origine en bas à gauche) sont retournées et le dessin se fait dans une image en mémoire.
+
+<h2 id="solitaire">Solitaire</h2>
+
+<b>APPS/SOL.PAS</b> (SOL.EXE, <i>Démarrer, Programmes, Accessoires, Jeux, Solitaire</i>), écrit pour Pasdows, est le Klondike du Solitaire de Windows 95 :
+<ul>
+	<li>sept colonnes, la pioche, le talon et quatre piles de couleur ; cartes dessinées par le programme (symboles vectoriels, figures, six dos au choix : <i>Jeu, Dos des cartes</i>) ;</li>
+	<li>glisser-déposer d'une carte ou d'une suite, clic sur la pioche (tirer une ou trois cartes, la retourner quand elle est vide), clic sur une carte cachée pour la retourner, double clic ou clic droit : vers les piles de couleur ;</li>
+	<li><i>Jeu, Options</i> : tirer une ou trois cartes, score standard (talon → colonne +5, pile de couleur +10, carte retournée +5, pioche recommencée −100 ou −20), Vegas (la partie coûte 52 $, 5 $ par carte, un ou trois passages, score cumulé) ou aucun, partie chronométrée (−2 toutes les 10 secondes, prime de fin), barre d'état ; <i>Annuler</i> (Ctrl+Z), <i>Distribuer</i> (F2) ;</li>
+	<li>partie gagnée : les cartes s'envolent des piles et rebondissent, comme sous Windows (Alt+Maj+2 la gagne aussitôt, comme le raccourci du Solitaire de Windows).</li>
+</ul>
+
+<h2 id="outils-systeme">Outils système</h2>
+
+<ul>
+	<li><b>Défragmenteur de disque</b> (<b>APPS/DEFRAG.PAS</b>, DEFRAG.EXE, ou <i>DEFRAG C:</i>) : choix du lecteur, analyse (pourcentage de fragmentation, fichiers fragmentés), <i>Démarrer</i>, <i>Pause</i>, <i>Arrêter</i>, <i>Paramètres</i> (défragmentation complète, fichiers seulement ou espace libre seulement) et la carte des clusters (optimisés, non optimisés, non déplaçables, espace libre, lecture, écriture) mise à jour en direct. Il utilise les commandes de défragmentation de Windows NT, ajoutées au noyau pour les volumes FAT12/16/32 : <b>CreateFile("\\.\C:")</b> et <b>DeviceIoControl</b> FSCTL_GET_VOLUME_BITMAP, FSCTL_GET_RETRIEVAL_POINTERS et FSCTL_MOVE_FILE (le noyau copie les clusters, refait la chaîne de la FAT, met à jour l'entrée du répertoire et les fichiers ouverts, puis libère les anciens clusters). Les dossiers et les fichiers système (IO.SYS) ne sont pas déplacés. Vérifié : fichiers fragmentés regroupés avec leur contenu intact, fsck sans erreur ;</li>
+	<li><b>Nettoyage de disque</b> (<b>APPS/CLEANMGR.PAS</b>, CLEANMGR.EXE) : espace occupé par les fichiers temporaires (\WINDOWS\TEMP, \TEMP), les fichiers temporaires d'installation (~*.*, *.TMP), les anciens fichiers de ScanDisk (FOUND.nnn\*.CHK), les sauvegardes (*.BAK, *.OLD, *.SAV), les journaux (*.LOG) et la Corbeille ; cases à cocher, description, espace total libéré, <i>Afficher les fichiers</i> (Explorateur), suppression avec confirmation et barre de progression ;</li>
+	<li><b>Informations système</b> (<b>APPS/MSINFO32.PAS</b>, MSINFO32.EXE) : résumé système (système, processeur, mémoire, dossiers, affichage, DirectX, durée de fonctionnement), ressources matérielles (IRQ, DMA, E/S, mémoire de chaque périphérique : le noyau publie la liste du Gestionnaire de périphériques dans <i>HKEY_LOCAL_MACHINE\Enum\Pasdows</i>), composants (multimédia, affichage, réseau, stockage, ports, périphériques), tâches en cours et modules chargés (Toolhelp32), variables d'environnement ; rapport texte, copie, menu <i>Outils</i> ;</li>
+	<li><b>Tâches planifiées</b> (<b>APPS/MSTASK.PAS</b>, MSTASK.EXE) : liste des tâches (planification, prochaine et dernière exécution, état), <i>Ajouter une tâche planifiée</i>, propriétés (ligne de commande, Parcourir, une seule fois, chaque jour, certains jours de la semaine, au démarrage, activée), Supprimer, Exécuter, <i>Avancé, Suspendre</i>. L'agent (<i>MSTASK /AGENT</i>, sans fenêtre, une seule instance) lance les tâches dues ; il est inscrit dans <i>HKLM\Software\Microsoft\Windows\CurrentVersion\Run</i>, clé que le noyau lance maintenant au démarrage de Pasdows (RegFlushKey écrit le registre sur le disque).</li>
+</ul>
+
+L'installation NTFS accepte maintenant ces fichiers : la MFT a 128 enregistrements et l'index de C:\WINDOWS est un arbre B à plusieurs blocs (vérifié avec ntfs-3g et au démarrage de Pasdows).
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/ECHECS.png" width="400" alt="Échecs"><br><i>Échecs : coups en notation française</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/SOLITAIRE.png" width="400" alt="Solitaire"><br><i>Solitaire</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/SOLITAIRE_VICTOIRE.png" width="400" alt="Solitaire gagné"><br><i>Solitaire : partie gagnée, les cartes rebondissent</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/DEFRAG.png" width="400" alt="Défragmenteur de disque"><br><i>Défragmenteur de disque : regroupement de l'espace libre</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/NETTOYAGE.png" width="400" alt="Nettoyage de disque"><br><i>Nettoyage de disque</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MSINFO.png" width="400" alt="Informations système"><br><i>Informations système : IRQ</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/TACHES_PLANIFIEES.png" width="400" alt="Tâches planifiées"><br><i>Tâches planifiées</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/BUREAU_NAVIGATEUR.png" width="400" alt="Bureau"><br><i>Bureau : icône Navigateur Web</i></td></tr>
+</table>
 
 <h2 id="freecell">FreeCell</h2>
 
