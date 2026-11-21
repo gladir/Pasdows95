@@ -131,6 +131,29 @@ Le nouveau nom est écrit sur le disque, comme le fait la commande LABEL et l'AP
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/EXPLORATEUR.png" width="400" alt="Explorateur Pasdows : arbre des dossiers à gauche"><br><i>Explorateur Pasdows : arbre des dossiers et contenu de C:\Program Files\Accessoires</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_PROGRAMMES.png" width="400" alt="Menu Démarrer, Programmes"><br><i>Démarrer, Programmes : Explorateur Pasdows, Calculatrice et Navigateur Web</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_LECTEUR.png" width="400" alt="Menu contextuel d'un lecteur"><br><i>Clic droit sur un lecteur du Poste de travail</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/PROPRIETES_LECTEUR.png" width="400" alt="Propriétés du lecteur C:"><br><i>Propriétés de (C:) : espace utilisé, libre et camembert</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PROPRIETES_LECTEUR_NOM.png" width="400" alt="Changement du nom du volume"><br><i>Nouveau nom du volume (Appliquer devient actif)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/POSTE_TRAVAIL_NOM.png" width="400" alt="Poste de travail après le changement de nom"><br><i>Le Poste de travail affiche aussitôt le nouveau nom</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/ARBRE_MENU.png" width="400" alt="Menu contextuel de l'arbre"><br><i>Clic droit sur un lecteur de l'arbre : Ouvrir, Explorer, Propriétés</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/SCANDISK.png" width="400" alt="ScanDisk"><br><i>Outils, Vérifier maintenant... : ScanDisk</i></td></tr>
+</table>
+
+<h2 id="aide">Aide de Windows</h2>
+
+<b>APPS/WINHLP32.PAS</b> (WINHLP32.EXE) lit et affiche les fichiers d'aide <b>.HLP</b> de Windows 3.1 et 4.0 : ceux des accessoires de Windows 95, d'Office 97 (Word, Excel, ODBC, Outlook...) et des autres programmes. Elle s'ouvre par un double-clic sur un fichier .HLP dans l'Explorateur, par <i>Exécuter</i> (« WINHLP32 fichier.hlp ») et par l'API <b>WinHelp</b> des programmes : HELP_CONTEXT (numéro de rubrique), HELP_KEY et HELP_PARTIALKEY (mot-clé), HELP_CONTEXTPOPUP, HELP_CONTEXTMENU et HELP_WM_HELP (aide « Qu'est-ce que c'est ? » : la fenêtre contextuelle seule), HELP_FINDER et HELP_CONTENTS, HELP_QUIT. Un fichier sans chemin est cherché dans le dossier du fichier courant, C:\WINDOWS\HELP, C:\WINDOWS, C:\WINDOWS\SYSTEM et dans la clé <i>HKLM\Software\Microsoft\Windows\Help</i>, où les programmes inscrivent le dossier de leurs fichiers d'aide.
+
+Le format WinHelp est décodé entièrement en Pascal (la visionneuse de DEVENV.PAS, dans DEV-COOLS, qui lit le format de HC.PAS, en a donné l'organisation) :
+
+<ul>
+	<li>conteneur : en-tête, répertoire des fichiers internes en arbre B, |SYSTEM (titre, rubrique de sommaire, compression) ;</li>
+	<li>|TOPIC : blocs de 4 Ko compressés en <b>LZ77</b>, gardés décompressés dans un petit cache ; enregistrements TOPICLINK (en-têtes de rubrique, paragraphes, tableaux) suivis par leurs pointeurs ; textes compressés par <b>phrases</b> (|Phrases de WinHelp 3.1, ou compression de Hall |PhrIndex et |PhrImage de WinHelp 4) ;</li>
+	<li>mise en forme : polices de |FONT (taille, gras, souligné, couleur), retraits, espacements, tabulations, alignement, <b>tableaux</b>, <b>zone non défilante</b> (titre de la rubrique au-dessus d'un trait) ; images <b>|bmN</b> (SHG et MRB : DIB et DDB de 1 à 24 bits, compressions RLE et LZ77) avec leurs zones sensibles ;</li>
+	<li>liens : sauts (verts soulignés) et <b>fenêtres contextuelles</b> (pointillés, fenêtre jaune pâle) par |CONTEXT (valeur de hachage des noms de contexte), liens vers d'autres fichiers d'aide, macros JumpId, PopupId, JumpContext, JumpKeyword, KLink et ALink (mots-clés), Contents, Finder, Back, Next, Prev, ExecFile... ;</li>
+	<li><b>Rubriques d'aide</b> : onglets <i>Sommaire</i> (fichier .CNT avec ses livres ouverts ou fermés et :Include), <i>Index</i> (|KWBTREE et |KWDATA : l'entrée suit les lettres tapées ; plusieurs rubriques : liste <i>Rubriques trouvées</i>) et <i>Rechercher</i> (le texte cherché dans toutes les rubriques) ;</li>
+	<li>boutons <i>Rubriques d'aide</i>, <i>Précédent</i> (historique, même entre fichiers), <b>&lt;&lt;</b> et <b>&gt;&gt;</b> (séquences de lecture) ; menus <i>Fichier</i> (Ouvrir), <i>Édition</i> (Copier le texte de la rubrique), <i>Options</i> (taille du texte) et <i>?</i>.</li>
+</ul>
+
+Les textes ANSI sont convertis pour la police de l'écran. Le format de Windows 3.0 (rare) n'est pas pris en charge. Avant d'écrire la visionneuse, un prototype a décodé sans erreur les 95 fichiers d'aide disponibles (Office 97, accessoires de Windows 95, jeux).
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/AIDE_INDEX.png" width="400" alt="Rubriques d'aide, onglet Index"><br><i>Rubriques d'aide : l'Index suit les lettres tapées</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/AIDE_POPUP.png" width="400" alt="Fenêtre contextuelle"><br><i>Rubrique avec zone non défilante et fenêtre contextuelle</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/AIDE_RECHERCHER.png" width="400" alt="Onglet Rechercher"><br><i>Onglet Rechercher : le mot dans toutes les rubriques</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/AIDE_OFFICE.png" width="400" alt="Aide d'Office 97"><br><i>Aide d'Office 97 : images et liens vers d'autres fichiers d'aide</i></td></tr>
 </table>
 
 <h2 id="appwiz">Ajout/Suppression de programmes</h2>
@@ -356,6 +379,10 @@ La fenêtre de l'<b>Invite MS-DOS</b> (console Win32 de 80 x 25 caractères) gar
 	<li>Un <b>clic droit</b> dans la fenêtre ouvre le menu <i>Modifier</i> : <b>Marquer</b> (sélection à la souris, Entrée copie, Échap annule), <b>Copier</b>, <b>Coller</b> (le texte du presse-papiers est tapé dans la console), <b>Sélectionner tout</b> et <b>Enregistrer le contenu...</b> (boîte <i>Enregistrer sous</i> : les lignes retenues puis l'écran, dans un fichier texte). On sélectionne aussi directement en faisant glisser la souris ; la sélection, un rectangle de caractères, est copiée sans les espaces de fin de ligne.</li>
 	<li><b>Propriétés</b> : le <b>nombre de lignes retenues</b> (de 25 à 32 000 ; les dernières lignes sont gardées quand on le change) et le <b>journal</b> : case <i>Enregistrer aussi les lignes dans le fichier</i> et nom du fichier (C:\WINDOWS\CONSOLE.LOG par défaut) ; chaque ligne qui sort de l'écran y est ajoutée (écriture par blocs, et à la fermeture de la console).</li>
 </ul>
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/INVITE_MENU.png" width="400" alt="Invite MS-DOS : sélection et menu Modifier"><br><i>Lignes retenues, sélection et menu Modifier</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/BLOC_NOTES_ETAT.png" width="400" alt="Bloc-notes : barre d'état"><br><i>Bloc-notes : barre d'état et mode Refrappe</i></td></tr>
+</table>
 
 <h2 id="dos">Programmes MS-DOS</h2>
 
