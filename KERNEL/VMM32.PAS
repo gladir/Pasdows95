@@ -8920,9 +8920,298 @@ Begin
         PutRaw(DS.Bits + (Y - DOY) * DS.Pitch + (X - DOX) * B, C, DS.Bpp);
 End;
 
+{ Police des boites de dialogue 6x13 (cellule de MS Sans Serif 8 points
+  de Windows 95 : unites de base 6 x 13). Glyphes de la police X11
+  misc-fixed 6x13 (domaine public : "Public domain font. Share and
+  enjoy."), dans l'ordre de la page de code 437 ; 9Eh : (R), 9Fh : (TM),
+  A9h : (C). 13 octets par caractere, points dans les 6 bits forts. }
+Const
+  SmallFont : Array[0..3327] Of Byte = (
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $78, $84, $CC, $84, $B4, $84, $CC, $B4, $84, $78, $00, $00, $00,
+    $78, $FC, $B4, $FC, $CC, $FC, $B4, $CC, $78, $00, $00, $00, $00, $00,
+    $00, $50, $F8, $F8, $F8, $70, $20, $20, $00, $00, $00, $00, $00, $00,
+    $20, $70, $70, $F8, $70, $70, $20, $00, $00, $00, $00, $20, $70, $20,
+    $A8, $F8, $F8, $A8, $20, $70, $00, $00, $00, $00, $00, $20, $20, $70,
+    $70, $F8, $F8, $20, $70, $00, $00, $00, $00, $00, $00, $70, $F8, $F8,
+    $F8, $70, $00, $00, $00, $00, $FC, $FC, $FC, $FC, $FC, $CC, $84, $84,
+    $CC, $FC, $FC, $FC, $FC, $00, $00, $00, $00, $30, $48, $84, $84, $48,
+    $30, $00, $00, $00, $FC, $FC, $FC, $FC, $CC, $B4, $78, $78, $B4, $CC,
+    $FC, $FC, $FC, $00, $00, $00, $00, $1C, $0C, $74, $88, $88, $88, $70,
+    $00, $00, $00, $00, $00, $70, $88, $88, $88, $70, $20, $70, $20, $00,
+    $00, $00, $00, $10, $18, $14, $10, $10, $10, $70, $F0, $60, $00, $00,
+    $00, $00, $40, $60, $50, $48, $48, $C8, $C8, $18, $18, $00, $00, $00,
+    $00, $20, $20, $88, $20, $50, $20, $88, $20, $20, $00, $00, $00, $00,
+    $00, $00, $C0, $F0, $FC, $F0, $C0, $00, $00, $00, $00, $00, $00, $00,
+    $00, $0C, $3C, $FC, $3C, $0C, $00, $00, $00, $00, $00, $00, $20, $70,
+    $A8, $20, $20, $20, $A8, $70, $20, $00, $00, $00, $00, $50, $50, $50,
+    $50, $50, $50, $50, $00, $50, $00, $00, $00, $00, $78, $E8, $E8, $E8,
+    $E8, $68, $28, $28, $28, $00, $00, $00, $30, $48, $40, $30, $48, $48,
+    $30, $08, $48, $30, $00, $00, $00, $00, $00, $00, $FC, $FC, $FC, $FC,
+    $FC, $00, $00, $00, $00, $00, $00, $20, $70, $A8, $20, $20, $A8, $70,
+    $20, $F8, $00, $00, $00, $00, $20, $70, $A8, $20, $20, $20, $20, $20,
+    $20, $00, $00, $00, $00, $20, $20, $20, $20, $20, $20, $A8, $70, $20,
+    $00, $00, $00, $00, $00, $00, $00, $20, $10, $F8, $10, $20, $00, $00,
+    $00, $00, $00, $00, $00, $00, $20, $40, $F8, $40, $20, $00, $00, $00,
+    $00, $00, $00, $00, $00, $80, $80, $80, $80, $80, $F8, $00, $00, $00,
+    $00, $00, $00, $00, $00, $48, $FC, $48, $00, $00, $00, $00, $00, $00,
+    $20, $20, $20, $70, $70, $70, $F8, $F8, $F8, $00, $00, $00, $00, $F8,
+    $F8, $F8, $70, $70, $70, $20, $20, $20, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $20, $20, $20,
+    $20, $20, $20, $20, $00, $20, $00, $00, $00, $00, $50, $50, $50, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $50, $50, $F8, $50,
+    $F8, $50, $50, $00, $00, $00, $00, $00, $20, $78, $A0, $A0, $70, $28,
+    $28, $F0, $20, $00, $00, $00, $00, $48, $A8, $50, $10, $20, $40, $50,
+    $A8, $90, $00, $00, $00, $00, $00, $40, $A0, $A0, $40, $A0, $98, $90,
+    $68, $00, $00, $00, $00, $20, $20, $20, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $10, $20, $20, $40, $40, $40, $40, $40, $20, $20, $10,
+    $00, $00, $40, $20, $20, $10, $10, $10, $10, $10, $20, $20, $40, $00,
+    $00, $00, $20, $A8, $70, $A8, $20, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $20, $20, $F8, $20, $20, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $30, $20, $40, $00, $00, $00, $00,
+    $00, $00, $00, $F8, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $20, $70, $20, $00, $00, $00, $08, $08, $10,
+    $10, $20, $40, $40, $80, $80, $00, $00, $00, $00, $20, $50, $88, $88,
+    $88, $88, $88, $50, $20, $00, $00, $00, $00, $20, $60, $A0, $20, $20,
+    $20, $20, $20, $F8, $00, $00, $00, $00, $70, $88, $88, $08, $10, $20,
+    $40, $80, $F8, $00, $00, $00, $00, $F8, $08, $10, $20, $70, $08, $08,
+    $88, $70, $00, $00, $00, $00, $10, $10, $30, $50, $50, $90, $F8, $10,
+    $10, $00, $00, $00, $00, $F8, $80, $80, $B0, $C8, $08, $08, $88, $70,
+    $00, $00, $00, $00, $70, $88, $80, $80, $F0, $88, $88, $88, $70, $00,
+    $00, $00, $00, $F8, $08, $10, $10, $20, $20, $40, $40, $40, $00, $00,
+    $00, $00, $70, $88, $88, $88, $70, $88, $88, $88, $70, $00, $00, $00,
+    $00, $70, $88, $88, $88, $78, $08, $08, $88, $70, $00, $00, $00, $00,
+    $00, $00, $20, $70, $20, $00, $00, $20, $70, $20, $00, $00, $00, $00,
+    $00, $20, $70, $20, $00, $00, $30, $20, $40, $00, $00, $00, $08, $10,
+    $20, $40, $80, $40, $20, $10, $08, $00, $00, $00, $00, $00, $00, $00,
+    $F8, $00, $00, $F8, $00, $00, $00, $00, $00, $00, $80, $40, $20, $10,
+    $08, $10, $20, $40, $80, $00, $00, $00, $00, $70, $88, $88, $08, $10,
+    $20, $20, $00, $20, $00, $00, $00, $00, $70, $88, $88, $98, $A8, $A8,
+    $B0, $80, $78, $00, $00, $00, $00, $20, $50, $88, $88, $88, $F8, $88,
+    $88, $88, $00, $00, $00, $00, $F0, $48, $48, $48, $70, $48, $48, $48,
+    $F0, $00, $00, $00, $00, $70, $88, $80, $80, $80, $80, $80, $88, $70,
+    $00, $00, $00, $00, $F0, $48, $48, $48, $48, $48, $48, $48, $F0, $00,
+    $00, $00, $00, $F8, $80, $80, $80, $F0, $80, $80, $80, $F8, $00, $00,
+    $00, $00, $F8, $80, $80, $80, $F0, $80, $80, $80, $80, $00, $00, $00,
+    $00, $70, $88, $80, $80, $80, $98, $88, $88, $70, $00, $00, $00, $00,
+    $88, $88, $88, $88, $F8, $88, $88, $88, $88, $00, $00, $00, $00, $70,
+    $20, $20, $20, $20, $20, $20, $20, $70, $00, $00, $00, $00, $38, $10,
+    $10, $10, $10, $10, $10, $90, $60, $00, $00, $00, $00, $88, $88, $90,
+    $A0, $C0, $A0, $90, $88, $88, $00, $00, $00, $00, $80, $80, $80, $80,
+    $80, $80, $80, $80, $F8, $00, $00, $00, $00, $88, $88, $D8, $A8, $A8,
+    $88, $88, $88, $88, $00, $00, $00, $00, $88, $C8, $C8, $A8, $A8, $98,
+    $98, $88, $88, $00, $00, $00, $00, $70, $88, $88, $88, $88, $88, $88,
+    $88, $70, $00, $00, $00, $00, $F0, $88, $88, $88, $F0, $80, $80, $80,
+    $80, $00, $00, $00, $00, $70, $88, $88, $88, $88, $88, $88, $A8, $70,
+    $08, $00, $00, $00, $F0, $88, $88, $88, $F0, $A0, $90, $88, $88, $00,
+    $00, $00, $00, $70, $88, $80, $80, $70, $08, $08, $88, $70, $00, $00,
+    $00, $00, $F8, $20, $20, $20, $20, $20, $20, $20, $20, $00, $00, $00,
+    $00, $88, $88, $88, $88, $88, $88, $88, $88, $70, $00, $00, $00, $00,
+    $88, $88, $88, $88, $50, $50, $50, $20, $20, $00, $00, $00, $00, $88,
+    $88, $88, $88, $A8, $A8, $A8, $A8, $50, $00, $00, $00, $00, $88, $88,
+    $50, $50, $20, $50, $50, $88, $88, $00, $00, $00, $00, $88, $88, $50,
+    $50, $20, $20, $20, $20, $20, $00, $00, $00, $00, $F8, $08, $10, $10,
+    $20, $40, $40, $80, $F8, $00, $00, $00, $70, $40, $40, $40, $40, $40,
+    $40, $40, $40, $40, $70, $00, $00, $00, $80, $80, $40, $40, $20, $10,
+    $10, $08, $08, $00, $00, $00, $70, $10, $10, $10, $10, $10, $10, $10,
+    $10, $10, $70, $00, $00, $00, $20, $50, $88, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $F8, $00, $00, $20, $10, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $70, $08, $78, $88, $98, $68, $00, $00,
+    $00, $00, $80, $80, $80, $F0, $88, $88, $88, $88, $F0, $00, $00, $00,
+    $00, $00, $00, $00, $70, $88, $80, $80, $88, $70, $00, $00, $00, $00,
+    $08, $08, $08, $78, $88, $88, $88, $88, $78, $00, $00, $00, $00, $00,
+    $00, $00, $70, $88, $F8, $80, $88, $70, $00, $00, $00, $00, $30, $48,
+    $40, $40, $F0, $40, $40, $40, $40, $00, $00, $00, $00, $00, $00, $00,
+    $70, $88, $88, $88, $78, $08, $88, $70, $00, $00, $80, $80, $80, $B0,
+    $C8, $88, $88, $88, $88, $00, $00, $00, $00, $00, $20, $00, $60, $20,
+    $20, $20, $20, $70, $00, $00, $00, $00, $00, $10, $00, $30, $10, $10,
+    $10, $10, $90, $90, $60, $00, $00, $80, $80, $80, $90, $A0, $C0, $A0,
+    $90, $88, $00, $00, $00, $00, $60, $20, $20, $20, $20, $20, $20, $20,
+    $70, $00, $00, $00, $00, $00, $00, $00, $D0, $A8, $A8, $A8, $A8, $88,
+    $00, $00, $00, $00, $00, $00, $00, $B0, $C8, $88, $88, $88, $88, $00,
+    $00, $00, $00, $00, $00, $00, $70, $88, $88, $88, $88, $70, $00, $00,
+    $00, $00, $00, $00, $00, $F0, $88, $88, $88, $F0, $80, $80, $80, $00,
+    $00, $00, $00, $00, $78, $88, $88, $88, $78, $08, $08, $08, $00, $00,
+    $00, $00, $00, $B0, $C8, $80, $80, $80, $80, $00, $00, $00, $00, $00,
+    $00, $00, $70, $88, $60, $10, $88, $70, $00, $00, $00, $00, $00, $40,
+    $40, $F0, $40, $40, $40, $48, $30, $00, $00, $00, $00, $00, $00, $00,
+    $88, $88, $88, $88, $98, $68, $00, $00, $00, $00, $00, $00, $00, $88,
+    $88, $88, $50, $50, $20, $00, $00, $00, $00, $00, $00, $00, $88, $88,
+    $A8, $A8, $A8, $50, $00, $00, $00, $00, $00, $00, $00, $88, $50, $20,
+    $20, $50, $88, $00, $00, $00, $00, $00, $00, $00, $88, $88, $88, $98,
+    $68, $08, $88, $70, $00, $00, $00, $00, $00, $F8, $10, $20, $40, $80,
+    $F8, $00, $00, $00, $18, $20, $20, $20, $20, $C0, $20, $20, $20, $20,
+    $18, $00, $00, $00, $20, $20, $20, $20, $20, $20, $20, $20, $20, $00,
+    $00, $00, $C0, $20, $20, $20, $20, $18, $20, $20, $20, $20, $C0, $00,
+    $00, $00, $48, $A8, $90, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $20, $20, $50, $50, $88, $88, $88, $88, $F8, $00, $00, $00, $00,
+    $70, $88, $80, $80, $80, $80, $80, $88, $70, $20, $40, $00, $00, $50,
+    $50, $00, $88, $88, $88, $88, $98, $68, $00, $00, $00, $00, $10, $20,
+    $00, $70, $88, $F8, $80, $88, $70, $00, $00, $00, $00, $30, $48, $00,
+    $70, $08, $78, $88, $98, $68, $00, $00, $00, $00, $50, $50, $00, $70,
+    $08, $78, $88, $98, $68, $00, $00, $00, $00, $40, $20, $00, $70, $08,
+    $78, $88, $98, $68, $00, $00, $00, $30, $48, $30, $00, $70, $08, $78,
+    $88, $98, $68, $00, $00, $00, $00, $00, $00, $00, $70, $88, $80, $80,
+    $88, $70, $20, $40, $00, $00, $30, $48, $00, $70, $88, $F8, $80, $88,
+    $70, $00, $00, $00, $00, $50, $50, $00, $70, $88, $F8, $80, $88, $70,
+    $00, $00, $00, $00, $40, $20, $00, $70, $88, $F8, $80, $88, $70, $00,
+    $00, $00, $00, $50, $50, $00, $60, $20, $20, $20, $20, $70, $00, $00,
+    $00, $00, $30, $48, $00, $60, $20, $20, $20, $20, $70, $00, $00, $00,
+    $00, $40, $20, $00, $60, $20, $20, $20, $20, $70, $00, $00, $00, $50,
+    $50, $00, $20, $50, $88, $88, $F8, $88, $88, $00, $00, $00, $20, $50,
+    $20, $20, $50, $88, $88, $F8, $88, $88, $00, $00, $00, $10, $20, $00,
+    $F8, $80, $80, $F0, $80, $80, $F8, $00, $00, $00, $00, $00, $00, $00,
+    $70, $28, $70, $A0, $A8, $50, $00, $00, $00, $00, $58, $A0, $A0, $A0,
+    $B0, $E0, $A0, $A0, $B8, $00, $00, $00, $00, $30, $48, $00, $70, $88,
+    $88, $88, $88, $70, $00, $00, $00, $00, $50, $50, $00, $70, $88, $88,
+    $88, $88, $70, $00, $00, $00, $00, $40, $20, $00, $70, $88, $88, $88,
+    $88, $70, $00, $00, $00, $00, $30, $48, $00, $88, $88, $88, $88, $98,
+    $68, $00, $00, $00, $00, $40, $20, $00, $88, $88, $88, $88, $98, $68,
+    $00, $00, $00, $00, $50, $50, $00, $88, $88, $88, $98, $68, $08, $88,
+    $70, $00, $50, $50, $00, $70, $88, $88, $88, $88, $88, $70, $00, $00,
+    $00, $50, $50, $00, $88, $88, $88, $88, $88, $88, $70, $00, $00, $00,
+    $00, $20, $70, $A8, $A0, $A0, $A8, $70, $20, $00, $00, $00, $00, $00,
+    $30, $48, $40, $40, $E0, $40, $40, $48, $B0, $00, $00, $00, $00, $88,
+    $88, $50, $50, $F8, $20, $F8, $20, $20, $00, $00, $00, $70, $88, $E8,
+    $D8, $D8, $E8, $D8, $88, $70, $00, $00, $00, $00, $00, $F4, $5C, $54,
+    $54, $00, $00, $00, $00, $00, $00, $00, $00, $00, $10, $20, $00, $70,
+    $08, $78, $88, $98, $68, $00, $00, $00, $00, $10, $20, $00, $60, $20,
+    $20, $20, $20, $70, $00, $00, $00, $00, $10, $20, $00, $70, $88, $88,
+    $88, $88, $70, $00, $00, $00, $00, $10, $20, $00, $88, $88, $88, $88,
+    $98, $68, $00, $00, $00, $00, $28, $50, $00, $B0, $C8, $88, $88, $88,
+    $88, $00, $00, $00, $28, $50, $00, $88, $88, $C8, $A8, $98, $88, $88,
+    $00, $00, $00, $00, $70, $08, $78, $88, $78, $00, $F8, $00, $00, $00,
+    $00, $00, $00, $70, $88, $88, $88, $70, $00, $F8, $00, $00, $00, $00,
+    $00, $00, $20, $00, $20, $20, $40, $80, $88, $88, $70, $00, $00, $00,
+    $70, $88, $A8, $D8, $C8, $D8, $A8, $88, $70, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $F8, $08, $08, $00, $00, $00, $00, $00, $40, $C0,
+    $40, $40, $E0, $10, $28, $08, $10, $38, $00, $00, $00, $40, $C0, $40,
+    $40, $E0, $08, $18, $28, $38, $08, $00, $00, $00, $00, $20, $00, $20,
+    $20, $20, $20, $20, $20, $20, $00, $00, $00, $00, $00, $00, $28, $50,
+    $A0, $A0, $50, $28, $00, $00, $00, $00, $00, $00, $00, $A0, $50, $28,
+    $28, $50, $A0, $00, $00, $00, $A8, $00, $54, $00, $A8, $00, $54, $00,
+    $A8, $00, $54, $00, $A8, $A8, $54, $A8, $54, $A8, $54, $A8, $54, $A8,
+    $54, $A8, $54, $A8, $54, $FC, $A8, $FC, $54, $FC, $A8, $FC, $54, $FC,
+    $A8, $FC, $54, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20,
+    $20, $20, $20, $20, $20, $20, $20, $20, $E0, $20, $20, $20, $20, $20,
+    $20, $20, $20, $20, $20, $20, $E0, $20, $E0, $20, $20, $20, $20, $20,
+    $50, $50, $50, $50, $50, $50, $D0, $50, $50, $50, $50, $50, $50, $00,
+    $00, $00, $00, $00, $00, $F0, $50, $50, $50, $50, $50, $50, $00, $00,
+    $00, $00, $00, $E0, $20, $E0, $20, $20, $20, $20, $20, $50, $50, $50,
+    $50, $50, $D0, $10, $D0, $50, $50, $50, $50, $50, $50, $50, $50, $50,
+    $50, $50, $50, $50, $50, $50, $50, $50, $50, $00, $00, $00, $00, $00,
+    $F0, $10, $D0, $50, $50, $50, $50, $50, $50, $50, $50, $50, $50, $D0,
+    $10, $F0, $00, $00, $00, $00, $00, $50, $50, $50, $50, $50, $50, $F0,
+    $00, $00, $00, $00, $00, $00, $20, $20, $20, $20, $20, $E0, $20, $E0,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $E0, $20, $20,
+    $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $3C, $00, $00, $00,
+    $00, $00, $00, $20, $20, $20, $20, $20, $20, $FC, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $FC, $20, $20, $20, $20, $20,
+    $20, $20, $20, $20, $20, $20, $20, $3C, $20, $20, $20, $20, $20, $20,
+    $00, $00, $00, $00, $00, $00, $FC, $00, $00, $00, $00, $00, $00, $20,
+    $20, $20, $20, $20, $20, $FC, $20, $20, $20, $20, $20, $20, $20, $20,
+    $20, $20, $20, $3C, $20, $3C, $20, $20, $20, $20, $20, $50, $50, $50,
+    $50, $50, $50, $5C, $50, $50, $50, $50, $50, $50, $50, $50, $50, $50,
+    $50, $5C, $40, $7C, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $7C, $40, $5C, $50, $50, $50, $50, $50, $50, $50, $50, $50, $50, $DC,
+    $00, $FC, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $FC, $00,
+    $DC, $50, $50, $50, $50, $50, $50, $50, $50, $50, $50, $5C, $40, $5C,
+    $50, $50, $50, $50, $50, $00, $00, $00, $00, $00, $FC, $00, $FC, $00,
+    $00, $00, $00, $00, $50, $50, $50, $50, $50, $DC, $00, $DC, $50, $50,
+    $50, $50, $50, $20, $20, $20, $20, $20, $FC, $00, $FC, $00, $00, $00,
+    $00, $00, $50, $50, $50, $50, $50, $50, $FC, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $FC, $00, $FC, $20, $20, $20, $20, $20,
+    $00, $00, $00, $00, $00, $00, $FC, $50, $50, $50, $50, $50, $50, $50,
+    $50, $50, $50, $50, $50, $7C, $00, $00, $00, $00, $00, $00, $20, $20,
+    $20, $20, $20, $3C, $20, $3C, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $3C, $20, $3C, $20, $20, $20, $20, $20, $00, $00, $00, $00,
+    $00, $00, $7C, $50, $50, $50, $50, $50, $50, $50, $50, $50, $50, $50,
+    $50, $FC, $50, $50, $50, $50, $50, $50, $20, $20, $20, $20, $20, $FC,
+    $20, $FC, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $E0,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $3C, $20,
+    $20, $20, $20, $20, $20, $FC, $FC, $FC, $FC, $FC, $FC, $FC, $FC, $FC,
+    $FC, $FC, $FC, $FC, $00, $00, $00, $00, $00, $00, $FC, $FC, $FC, $FC,
+    $FC, $FC, $FC, $E0, $E0, $E0, $E0, $E0, $E0, $E0, $E0, $E0, $E0, $E0,
+    $E0, $E0, $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C,
+    $1C, $FC, $FC, $FC, $FC, $FC, $FC, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $70, $88, $88, $88, $98, $68, $00, $00, $00,
+    $00, $60, $90, $90, $A0, $A0, $90, $88, $88, $B0, $00, $00, $00, $00,
+    $F8, $80, $80, $80, $80, $80, $80, $80, $80, $00, $00, $00, $00, $00,
+    $00, $00, $F8, $50, $50, $50, $50, $50, $00, $00, $00, $00, $F8, $80,
+    $40, $20, $10, $20, $40, $80, $F8, $00, $00, $00, $00, $00, $00, $00,
+    $78, $90, $88, $88, $88, $70, $00, $00, $00, $00, $00, $00, $00, $88,
+    $88, $88, $88, $98, $E8, $80, $80, $00, $00, $00, $00, $00, $F8, $20,
+    $20, $20, $20, $10, $00, $00, $00, $00, $20, $70, $A8, $A8, $A8, $A8,
+    $70, $20, $20, $00, $00, $00, $00, $70, $88, $88, $88, $F8, $88, $88,
+    $88, $70, $00, $00, $00, $00, $70, $88, $88, $88, $88, $88, $50, $50,
+    $D8, $00, $00, $00, $00, $70, $88, $40, $70, $88, $88, $88, $88, $70,
+    $00, $00, $00, $00, $00, $00, $00, $50, $A8, $A8, $50, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $B0, $A8, $A8, $A8, $A8, $70, $20, $20,
+    $00, $00, $00, $00, $00, $70, $88, $60, $80, $88, $70, $00, $00, $00,
+    $00, $00, $00, $00, $70, $88, $88, $88, $88, $88, $00, $00, $00, $00,
+    $00, $00, $00, $F8, $00, $F8, $00, $F8, $00, $00, $00, $00, $00, $00,
+    $20, $20, $F8, $20, $20, $00, $F8, $00, $00, $00, $00, $00, $00, $C0,
+    $30, $08, $30, $C0, $00, $F8, $00, $00, $00, $00, $00, $00, $18, $60,
+    $80, $60, $18, $00, $F8, $00, $00, $00, $10, $28, $20, $20, $20, $20,
+    $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20, $20,
+    $20, $20, $20, $20, $A0, $40, $00, $00, $00, $20, $20, $00, $F8, $00,
+    $20, $20, $00, $00, $00, $00, $00, $00, $00, $48, $A8, $90, $48, $A8,
+    $90, $00, $00, $00, $00, $00, $30, $48, $48, $30, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $20, $70, $20, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $30, $00, $00, $00, $00, $00,
+    $00, $00, $04, $04, $04, $08, $08, $08, $10, $90, $90, $60, $60, $20,
+    $00, $C0, $A0, $A0, $A0, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $40, $A0, $20, $40, $E0, $00, $00, $00, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $F8, $F8, $F8, $F8, $F8, $00, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $00, $00, $00, $00);
+
+{ glyphes 8x16 de (R), (TM) et (C) aux places 9Eh, 9Fh et A9h }
+Const
+  ExtraGlyph : Array[0..47] Of Byte = (
+    $00, $00, $38, $44, $74, $6C, $6C, $74, $6C, $44, $38, $00, $00, $00,
+    $00, $00, $00, $00, $00, $7A, $2E, $2A, $2A, $00, $00, $00, $00, $00,
+    $00, $00, $00, $00, $00, $00, $38, $44, $54, $6C, $64, $6C, $54, $44,
+    $38, $00, $00, $00, $00, $00);
+
+{ Texte des boites de dialogue (TxtSmall) : police 6x13 ; sinon 8x16 }
+Var
+  TxtSmall : Boolean;
+
+Function TxtCW : LongInt;
+Begin
+  If TxtSmall Then TxtCW := 6 Else TxtCW := 8;
+End;
+
+Function TxtCH : LongInt;
+Begin
+  If TxtSmall Then TxtCH := 13 Else TxtCH := 16;
+End;
+
+Procedure DrawSmall(X, Y : LongInt; Ch : Char; C : LongInt);
+Var R, CX, B, F : LongInt;
+Begin
+  If (X > ClipX2) Or (X + 5 < ClipX1) Or (Y > ClipY2) Or
+     (Y + 12 < ClipY1) Then Exit;
+  F := Ord(Ch);
+  F := LongInt(@SmallFont[0]) + F * 13;
+  For R := 0 To 12 Do
+  Begin
+    B := Mem[0:F + R];
+    If B <> 0 Then
+      For CX := 0 To 5 Do
+        If (B And ($80 Shr CX)) <> 0 Then Pix(X + CX, Y + R, C);
+  End;
+End;
+
 Procedure DrawChar(X, Y : LongInt; Ch : Char; C : LongInt);
 Var R, CX, B, F, A, V, PB : LongInt;
 Begin
+  If TxtSmall Then
+  Begin
+    DrawSmall(X, Y, Ch, C);
+    Exit;
+  End;
   If (X > ClipX2) Or (X + 7 < ClipX1) Or (Y > ClipY2) Or
      (Y + 15 < ClipY1) Then Exit;
   F := FontAddr + Ord(Ch) * 16;
@@ -9028,7 +9317,7 @@ Procedure OutTxt(X, Y : LongInt; Const S : String; C : LongInt);
 Var K, P : LongInt;
 Begin
   P := TxtPitch;
-  If P = 0 Then P := 8;
+  If P = 0 Then P := TxtCW;
   For K := 1 To Length(S) Do
   Begin
     If S[K] <> ' ' Then DrawChar(X, Y, S[K], C);
@@ -9044,7 +9333,7 @@ End;
 
 Function TextW(Const S : String) : LongInt;
 Begin
-  TextW := Length(S) * 8;
+  TextW := Length(S) * TxtCW;
 End;
 
 { Texte centre entre X1 et X2 }
@@ -9057,7 +9346,7 @@ End;
 Function Fit(Const S : String; MaxW : LongInt) : String;
 Var N : LongInt;
 Begin
-  N := MaxW Div 8;
+  N := MaxW Div TxtCW;
   If N < 0 Then N := 0;
   If Length(S) <= N Then Fit := S
   Else If N > 3 Then Fit := Copy(S, 1, N - 3) + '...'
@@ -9093,11 +9382,12 @@ Var
 
 Function WrapText(X, Y, W : LongInt; Const S : String; C : LongInt;
                   Draw : Boolean) : LongInt;
-Var Cols, I, N, Last : LongInt; Line, Word0 : String;
+Var Cols, I, N, Last, LH : LongInt; Line, Word0 : String;
 Begin
+  LH := TxtCH;
   If WrapClipY = 0 Then WrapClipY := $7FFFFFFF;
   If Draw And (Y >= WrapClipY) Then Draw := False;
-  If TxtPitch > 0 Then Cols := W Div TxtPitch Else Cols := W Div 8;
+  If TxtPitch > 0 Then Cols := W Div TxtPitch Else Cols := W Div TxtCW;
   N := 0; Line := ''; Word0 := '';
   I := 1;
   While I <= Length(S) + 1 Do
@@ -9108,8 +9398,8 @@ Begin
       Begin
         If Line <> '' Then
         Begin
-          If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
-            OutTxt(X, Y + N * 16, Line, C);
+          If Draw And (Y + N * LH + LH <= WrapClipY) Then
+            OutTxt(X, Y + N * LH, Line, C);
           Inc(N);
         End;
         Line := Word0;
@@ -9119,8 +9409,8 @@ Begin
       Word0 := '';
       If (I <= Length(S)) And (S[I] = '|') Then
       Begin
-        If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
-          OutTxt(X, Y + N * 16, Line, C);
+        If Draw And (Y + N * LH + LH <= WrapClipY) Then
+          OutTxt(X, Y + N * LH, Line, C);
         Inc(N);
         Line := '';
       End;
@@ -9131,8 +9421,8 @@ Begin
   End;
   If Line <> '' Then
   Begin
-    If Draw And (Y + N * 16 + 16 <= WrapClipY) Then
-      OutTxt(X, Y + N * 16, Line, C);
+    If Draw And (Y + N * LH + LH <= WrapClipY) Then
+      OutTxt(X, Y + N * LH, Line, C);
     Inc(N);
   End;
   Last := N;
@@ -9182,14 +9472,18 @@ Begin
   Edge(X1 + 1, Y1 + 1, X2 - 1, Y2 - 1, cWhite, cGray);
   If Title <> '' Then
   Begin
-    FBar(X1 + 6, Y1 - 7, X1 + 9 + TextW(Title), Y1 + 8, cSilver);
-    OutTxt(X1 + 8, Y1 - 7, Title, cBlack);
+    FBar(X1 + 6, Y1 - TxtCH Div 2 + 1, X1 + 9 + TextW(Title),
+         Y1 + TxtCH Div 2, cSilver);
+    OutTxt(X1 + 8, Y1 - TxtCH Div 2 + 1, Title, cBlack);
   End;
 End;
 
+Var
+  PbOff : Boolean;      { bouton desactive : libelle grise en relief }
+
 Procedure PushButton(X1, Y1, X2, Y2 : LongInt; Const S : String;
                      Pressed, Def : Boolean);
-Var D : LongInt;
+Var D, K, C : LongInt;
 Begin
   If Def Then
   Begin
@@ -9199,7 +9493,26 @@ Begin
   Else
     Raised(X1, Y1, X2, Y2, Pressed);
   If Pressed Then D := 1 Else D := 0;
-  OutCenter(X1 + D, X2 + D, (Y1 + Y2 - 15) Div 2 + D, S, cBlack);
+  { desactive : texte blanc decale, puis gris (comme Windows 95) }
+  For K := Ord(PbOff) DownTo 0 Do
+  Begin
+    If Not PbOff Then C := cBlack
+    Else If K = 1 Then C := cWhite
+    Else C := cGray;
+    { libelle trop long : resserre (au plus 2 points) }
+    If (TxtPitch = 0) And (Length(S) > 0) And
+       (TextW(S) > X2 - X1 - 4) Then
+    Begin
+      TxtPitch := Max(TxtCW - 2 + Ord(TxtSmall),
+                      (X2 - X1 - 4) Div Length(S));
+      OutTxt(X1 + D + K + (X2 - X1 + 1 - TxtPitch * Length(S)) Div 2,
+             (Y1 + Y2 - TxtCH + 1) Div 2 + D + K, S, C);
+      TxtPitch := 0;
+    End
+    Else
+      OutCenter(X1 + D + K, X2 + D + K, (Y1 + Y2 - TxtCH + 1) Div 2 + D + K,
+                S, C);
+  End;
 End;
 
 Procedure RadioButton(X, Y : LongInt; Const S : String; On : Boolean);
@@ -9209,7 +9522,7 @@ Begin
   HLine(X + 3, X + 9, Y + 13, cWhite);
   VLine(X + 12, Y + 4, Y + 10, cWhite);
   If On Then Disc(X + 6, Y + 7, 2, cBlack);
-  OutTxt(X + 18, Y, S, cBlack);
+  OutTxt(X + 18, Y + (16 - TxtCH) Div 2, S, cBlack);
 End;
 
 { Petit triangle (fleche) : Dir 0 droite, 1 bas, 2 haut }
@@ -11119,6 +11432,7 @@ Type
     HScrollPos, VScrollPos : LongInt;
     HSMin, HSMax, HSPage, VSMin, VSMax, VSPage : LongInt; { SB_HORZ/VERT }
     FocusChild : LongInt;         { dernier enfant avec le focus + 1 }
+    Icon     : LongInt;           { statique SS_ICON : son icone }
   End;
 
   TProp = Record
@@ -11717,6 +12031,9 @@ End;
 { ------------------------------------------------------------------ }
 
 Function LbOwner(W : LongInt) : Boolean; Forward;
+Function CtlSmall(W : LongInt) : Boolean; Forward;
+Function CtlOwner(W : LongInt) : Boolean; Forward;
+Function DlgPaints(W : LongInt) : Boolean; Forward;
 
 Procedure InvalW(W : LongInt; R : TRect; Erase : Boolean);
 Var C : TRect;
@@ -11727,7 +12044,7 @@ Begin
   RUnion(Wnds^[W].Upd, R);
   If Erase Then Wnds^[W].UpdErase := True;
   If Wnds^[W].IKind <> ikNone Then Wnds^[TopOf(W)].KNeedPaint := True;
-  If ((Wnds^[W].IKind = ikNone) Or LbOwner(W)) And
+  If ((Wnds^[W].IKind = ikNone) Or CtlOwner(W)) And
      (Wnds^[W].Thread >= 0) And (Wnds^[W].Thread < MaxThread) Then
     Threads[Wnds^[W].Thread].PaintReq := True;
 End;
@@ -12119,25 +12436,24 @@ End;
   (WM_GETTEXT). }
 Const
   AnsiOem : Array[128..255] Of Byte = (
-    69, 63, 44, 159, 34, 46, 197, 206, 94, 63, 83, 60, 79, 63, 90, 63, 63,
-    39, 39, 34, 34, 249, 45, 45, 126, 84, 115, 62, 111, 63, 122, 89, 255,
-    173, 155, 156, 63, 157, 124, 21, 34, 99, 166, 174, 170, 45, 114, 196,
-    248, 241, 253, 51, 39, 230, 20, 250, 44, 49, 167, 175, 172, 171, 63,
-    168, 65, 65, 65, 65, 142, 143, 146, 128, 69, 144, 69, 69, 73, 73, 73,
-    73, 68, 165, 79, 79, 79, 79, 153, 120, 79, 85, 85, 85, 154, 89, 63, 225,
-    133, 160, 131, 97, 132, 134, 145, 135, 138, 130, 136, 137, 141, 161,
-    140, 139, 63, 164, 149, 162, 147, 111, 148, 246, 111, 151, 163, 150,
-    129, 121, 63, 152);
+    69, 63, 44, 102, 34, 46, 197, 206, 94, 63, 83, 60, 79, 63, 90, 63, 63,
+    39, 39, 34, 34, 249, 45, 45, 126, 159, 115, 62, 111, 63, 122, 89, 255,
+    173, 155, 156, 63, 157, 124, 21, 34, 169, 166, 174, 170, 45, 158, 196,
+    248, 241, 253, 51, 39, 230, 20, 250, 44, 49, 167, 175, 172, 171, 63, 168,
+    65, 65, 65, 65, 142, 143, 146, 128, 69, 144, 69, 69, 73, 73, 73, 73, 68,
+    165, 79, 79, 79, 79, 153, 120, 79, 85, 85, 85, 154, 89, 63, 225, 133,
+    160, 131, 97, 132, 134, 145, 135, 138, 130, 136, 137, 141, 161, 140, 139,
+    63, 164, 149, 162, 147, 111, 148, 246, 111, 151, 163, 150, 129, 121, 63,
+    152);
   OemAnsi : Array[128..255] Of Byte = (
     199, 252, 233, 226, 228, 224, 229, 231, 234, 235, 232, 239, 238, 236,
     196, 197, 201, 230, 198, 244, 246, 242, 251, 249, 255, 214, 220, 162,
-    163, 165, 63, 131, 225, 237, 243, 250, 241, 209, 170, 186, 191, 63,
+    163, 165, 174, 153, 225, 237, 243, 250, 241, 209, 170, 186, 191, 169,
     172, 189, 188, 161, 171, 187, 63, 63, 63, 124, 43, 43, 43, 43, 43, 43,
-    124, 43, 43, 43, 43, 43, 43, 43, 43, 43, 45, 43, 43, 43, 43, 43, 43,
-    43, 43, 45, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 63, 63,
-    63, 63, 63, 63, 223, 63, 63, 63, 63, 181, 63, 63, 63, 63, 63, 63, 63,
-    63, 63, 63, 177, 63, 63, 63, 63, 247, 63, 176, 63, 183, 63, 63, 178,
-    63, 160);
+    124, 43, 43, 43, 43, 43, 43, 43, 43, 43, 45, 43, 43, 43, 43, 43, 43, 43,
+    43, 45, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 63, 63, 63,
+    63, 63, 63, 223, 63, 63, 63, 63, 181, 63, 63, 63, 63, 63, 63, 63, 63, 63,
+    63, 177, 63, 63, 63, 63, 247, 63, 176, 149, 183, 63, 63, 178, 63, 160);
 
 { Vrai si le processus courant est un programme Windows ANSI : une
   image de WPC a l'horodatage 0 et l'editeur de liens 1.0 }
@@ -12209,7 +12525,7 @@ Begin
       $20AC : C := 69;
       $0152 : C := 79;
       $0153 : C := 111;
-      $2122 : C := 84;
+      $2122 : C := $9F;
     Else C := 63;
     End;
   UniOem := Chr(C);
@@ -12298,7 +12614,7 @@ Begin
     If (Ch = 0) Or ((Ch = 32) And (Length(S) >= 240)) Or
        (Length(S) >= 250) Then
     Begin
-      If S <> '' Then N := N + WrapText(X, Y + N * 16, Wd, S, C, Draw);
+      If S <> '' Then N := N + WrapText(X, Y + N * TxtCH, Wd, S, C, Draw);
       S := '';
       If Ch = 0 Then Break;
       If Ch = 32 Then
@@ -12312,7 +12628,7 @@ Begin
       S := S + '|';
       If Length(S) >= 150 Then
       Begin
-        N := N + WrapText(X, Y + N * 16, Wd, S, C, Draw);
+        N := N + WrapText(X, Y + N * TxtCH, Wd, S, C, Draw);
         S := '';
       End;
     End
@@ -12322,35 +12638,52 @@ Begin
   WrapZ := N;
 End;
 
+{ Largeur visible d'un controle statique : sa largeur, limitee au bord
+  droit de son parent (les panneaux de l'installation d'Office placent
+  des textes qui depassent : avec la police MS Sans Serif ils tiennent) }
+Function StaticVisW(W : LongInt) : LongInt;
+Var VW, P, PW : LongInt;
+Begin
+  VW := Wnds^[W].W;
+  P := Wnds^[W].Parent;
+  If IsChildW(W) And (P >= 0) Then
+  Begin
+    PW := Wnds^[P].CR - Wnds^[P].CL;
+    If (PW > 0) And (Wnds^[W].X + VW > PW) And (PW - Wnds^[W].X >= 16) Then
+      VW := PW - Wnds^[W].X;
+  End;
+  StaticVisW := VW;
+End;
+
 { Pas du texte d'un controle statique : 8, ou 7 et 6 si ses lignes ne
   tiennent pas dans sa hauteur }
 Function StaticPitch(W : LongInt; T : String) : LongInt;
 Var P, N, Rows : LongInt;
 Begin
   StaticPitch := 0;
-  Rows := Wnds^[W].H Div 16;
+  Rows := Wnds^[W].H Div TxtCH;
   If Rows < 1 Then Rows := 1;
-  For P := 8 DownTo 6 Do
+  For P := TxtCW DownTo TxtCW - 2 + Ord(TxtSmall) Do
   Begin
     TxtPitch := P;
     If Wnds^[W].LongTxt <> 0 Then
-      N := WrapZ(0, 0, Wnds^[W].W, Wnds^[W].LongTxt, 0, False)
+      N := WrapZ(0, 0, StaticVisW(W), Wnds^[W].LongTxt, 0, False)
     Else If (Pos(#10, T) > 0) Or (Pos(#13, T) > 0) Then
     Begin
       T := T + #0;
-      N := WrapZ(0, 0, Wnds^[W].W, LongInt(@T[1]), 0, False);
+      N := WrapZ(0, 0, StaticVisW(W), LongInt(@T[1]), 0, False);
       Delete(T, Length(T), 1);
     End
-    Else N := WrapText(0, 0, Wnds^[W].W, T, 0, False);
+    Else N := WrapText(0, 0, StaticVisW(W), T, 0, False);
     If N <= Rows Then
     Begin
-      If P < 8 Then StaticPitch := P;
+      If P < TxtCW Then StaticPitch := P;
       TxtPitch := 0;
       Exit;
     End;
   End;
   TxtPitch := 0;
-  StaticPitch := 7;
+  StaticPitch := TxtCW - 1;
 End;
 
 { Creer une fenetre ; indice ou -1. Param : CREATESTRUCT.lpCreateParams }
@@ -12632,7 +12965,7 @@ Begin
   ClientScreenOrg(W, X, Y);
   X := CurX - X; Y := CurY - Y;
   If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) And
-     ((Wnds^[W].Proc <> 0) Or LbOwner(W)) And (Wnds^[W].IKind <> ikDialog)
+     ((Wnds^[W].Proc <> 0) Or CtlOwner(W)) And (Wnds^[W].IKind <> ikDialog)
   Then
     { controle sous-classe par le programme ou dessine par lui : le clic
       passe par sa file de messages (sa procedure, puis CallWindowProc) }
@@ -13111,7 +13444,7 @@ Begin
     Threads[T].PaintReq := False;
     For W := 0 To MaxWnd - 1 Do
       If Wnds^[W].Used And (Wnds^[W].Thread = T) And
-         ((Wnds^[W].IKind = ikNone) Or LbOwner(W)) And
+         ((Wnds^[W].IKind = ikNone) Or CtlOwner(W) Or DlgPaints(W)) And
          HasUpdate(W) And WndVisible(W) Then
       Begin
         Threads[T].PaintReq := True;
@@ -13164,6 +13497,7 @@ Const
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
   cmNSelAll = 40; cmNTime = 41; cmNFind = 42; cmNFindNext = 43;
   cmNAbout = 44;
+  cmAddRemove = 45;                  { Ajout/Suppression de programmes }
   cmFdDrive = 600;                   { + lettre (0 = A) : boite Fichier }
   cmFdType = 640;                    { + type de fichier }
   cmGray = 99;                       { element de menu grise }
@@ -13899,7 +14233,7 @@ Begin
   Case M Of
     mnStart : MenuCount := 8;
     mnPrograms : MenuCount := 7 + ExeCnt;
-    mnSettings : MenuCount := 7;
+    mnSettings : MenuCount := 8;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
     mnTaskCtx : MenuCount := 2;
@@ -14057,14 +14391,22 @@ Begin
                'Sistema...');
         Cmd := cmSysProps; Icon := icSystem;
       End
-      Else If I = 5 Then
+      Else If I = 4 Then
+      Begin
+        T := L('Ajout/Suppression de programmes...',
+               'Add/Remove Programs...', 'Software...',
+               'Installazione applicazioni...',
+               'Agregar o quitar programas...');
+        Cmd := cmAddRemove; Icon := icSettings;
+      End
+      Else If I = 6 Then
       Begin
         T := L('Mode sans '#130'chec (16 couleurs)', 'Safe mode (16 colors)',
                'Abgesicherter Modus', 'Modalit'#133' provvisoria',
                'Modo a prueba de fallos');
         Cmd := cmSafeMode; Icon := icDisplay;
       End
-      Else If I = 6 Then
+      Else If I = 7 Then
       Begin
         T := L('Mode MS-DOS', 'MS-DOS mode', 'MS-DOS-Modus',
                'Modalit'#133' MS-DOS', 'Modo MS-DOS');
@@ -16458,6 +16800,32 @@ End;
   comme nom de programme (C:\Program Files\...\X.EXE sans guillemets) }
 Function FindModuleFile(Name : String) : String; Forward;
 
+{ Fin du nom du programme d'une ligne de commande sans guillemets
+  (position de l'espace qui le suit) : comme Windows, chaque espace est
+  essaye (C:\Program Files\Dossier\Prog.exe /x : C:\Program, puis
+  C:\Program Files\Dossier...) jusqu'a un programme existant ; sinon
+  le premier mot. }
+Function CmdProgEnd(Const S : String) : LongInt;
+Var P, I : LongInt; F : String;
+Begin
+  P := Pos(' ', S);
+  If P = 0 Then P := Length(S) + 1;
+  I := P;
+  While I <= Length(S) Do
+  Begin
+    F := Copy(S, 1, I - 1);
+    If (Pos('\', F) > 0) And ((FindModuleFile(F) <> '') Or
+       (FindModuleFile(F + '.EXE') <> '')) Then
+    Begin
+      P := I;
+      Break;
+    End;
+    Inc(I);
+    While (I <= Length(S)) And (S[I] <> ' ') Do Inc(I);
+  End;
+  CmdProgEnd := P;
+End;
+
 Function RunLine(S : String) : Boolean;
 Var P : LongInt; Prog, Args : String;
 Begin
@@ -16473,8 +16841,7 @@ Begin
   End
   Else
   Begin
-    P := Pos(' ', S);
-    If P = 0 Then P := Length(S) + 1;
+    P := CmdProgEnd(S);
     Prog := Copy(S, 1, P - 1);
     Args := Trim(Copy(S, P + 1, 255));
   End;
@@ -19884,6 +20251,7 @@ Begin
     cmDateTime : DtOpen;
     cmMixer : MixerOpen;
     cmTaskMgr : RunExe('TASKMGR.EXE', '');
+    cmAddRemove : RunExe('APPWIZ.EXE', '');
     cmMinAll :
       For I := 0 To MaxWnd - 1 Do
         If Wnds^[I].Used And Wnds^[I].Visible And Not IsChildW(I) And
@@ -20596,6 +20964,16 @@ Begin
     programme recevraient WM_PAINT en continu (la boucle PeekMessage du
     programme d'installation d'Office ne se vidait jamais) }
   Wnds^[W].KNeedPaint := False;
+  { la procedure du dialogue peint ensuite par-dessus le fond (WM_PAINT
+    dans sa tache), puis les controles sont redessines (EndPaint) }
+  If DlgPaints(W) Then
+  Begin
+    SetR(Wnds^[W].Upd, 0, 0, Wnds^[W].CR - Wnds^[W].CL,
+         Wnds^[W].CB - Wnds^[W].CT);
+    Wnds^[W].UpdErase := False;
+    If (Wnds^[W].Thread > 0) And (Wnds^[W].Thread < MaxThread) Then
+      Threads[Wnds^[W].Thread].PaintReq := True;
+  End;
 End;
 
 { Dessiner une fenetre interne de premier niveau }
@@ -20678,7 +21056,7 @@ End;
 
 Const
   BS_TYPEMASK = $F; BS_CHECKBOX = 2; BS_AUTOCHECKBOX = 3; BS_RADIOBUTTON = 4;
-  BS_3STATE = 5; BS_GROUPBOX = 7; BS_AUTORADIOBUTTON = 9;
+  BS_3STATE = 5; BS_GROUPBOX = 7; BS_AUTORADIOBUTTON = 9; BS_OWNERDRAW = $B;
   BM_GETCHECK = $F0; BM_SETCHECK = $F1; BM_GETSTATE = $F2;
   BN_CLICKED = 0;
   LB_ADDSTRING = $180; LB_RESETCONTENT = $184; LB_SETCURSEL = $186;
@@ -20692,13 +21070,17 @@ Const
   LBS_MULTIPLESEL = $8; LBS_EXTENDEDSEL = $800;
   WM_DRAWITEM = $2B; WM_MEASUREITEM = $2C;
 
-Procedure DrawCtl(W : LongInt);
-Var S : TSurf; OX, OY, X1, Y1, X2, Y2, Typ, I, A : LongInt; Clip : TRect;
+Procedure IconPaint(H, X, Y, CW, CH : LongInt; Gdi : Boolean); Forward;
+Procedure BtnOwnerDraw(W : LongInt); Forward;
+
+Procedure DrawCtl0(W : LongInt);
+Var S : TSurf; OX, OY, X1, Y1, X2, Y2, Typ, I, A, H : LongInt; Clip : TRect;
     T : String; Fg : LongInt;
 Begin
   If Not WndVisible(W) Then Exit;
-  { liste dessinee par le programme : peinte dans sa tache (WM_PAINT) }
-  If LbOwner(W) And (CurT <> Wnds^[W].Thread) Then
+  { liste ou bouton dessines par le programme : peints dans sa tache
+    (WM_PAINT) }
+  If CtlOwner(W) And (CurT <> Wnds^[W].Thread) Then
   Begin
     If (Wnds^[W].Thread > 0) And (Wnds^[W].Thread < MaxThread) Then
       Threads[Wnds^[W].Thread].PaintReq := True;
@@ -20732,37 +21114,52 @@ Begin
           For I := 0 To 2 Do
             DLine(X1 + 5, (Y1 + Y2) Div 2 + 1 + I, X1 + 9,
                   (Y1 + Y2) Div 2 - 3 + I, cBlack);
-        OutTxt(X1 + 18, (Y1 + Y2) Div 2 - 8, T, Fg);
+        OutTxt(X1 + 18, (Y1 + Y2) Div 2 - TxtCH Div 2, T, Fg);
       End
       Else If (Typ = BS_RADIOBUTTON) Or (Typ = BS_AUTORADIOBUTTON) Then
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
         RadioButton(X1, (Y1 + Y2) Div 2 - 7, T, Wnds^[W].K1 <> 0);
       End
+      Else If Typ = BS_OWNERDRAW Then
+      Begin
+        { dans la tache du programme (voir plus haut) }
+        BtnOwnerDraw(W);
+        DirtyWnd(W);
+        Exit;
+      End
       Else
+      Begin
+        PbOff := Not Wnds^[W].Enabled;
         PushButton(X1, Y1, X2, Y2, T, Wnds^[W].K2 <> 0,
                    (Wnds^[W].Style And 1) <> 0);
+        PbOff := False;
+      End;
     End;
     ikStatic :
     Begin
       Typ := Wnds^[W].Style And $1F;
       If (Typ = 7) Or (Typ = 8) Or (Typ = 9) Then
         Edge(X1, Y1, X2, Y2, cGray, cWhite)
-      Else If Typ = 3 Then PaintIcon(icApp, X1, Y1, 32)
+      Else If Typ = 3 Then
+      Begin
+        FBar(X1, Y1, X2, Y2, cSilver);
+        IconPaint(Wnds^[W].Icon, X1, Y1, 0, 0, False);
+      End
       Else
       Begin
         FBar(X1, Y1, X2, Y2, cSilver);
         TxtPitch := StaticPitch(W, T);
         If Wnds^[W].LongTxt <> 0 Then
-          WrapZ(X1, Y1, Wnds^[W].W, Wnds^[W].LongTxt, Fg, True)
+          WrapZ(X1, Y1, StaticVisW(W), Wnds^[W].LongTxt, Fg, True)
         Else If (Pos(#10, T) > 0) Or (Pos(#13, T) > 0) Then
         Begin
           T := T + #0;
-          WrapZ(X1, Y1, Wnds^[W].W, LongInt(@T[1]), Fg, True);
+          WrapZ(X1, Y1, StaticVisW(W), LongInt(@T[1]), Fg, True);
         End
         Else If Typ = 1 Then WrapText(X1 + (Wnds^[W].W - TextW(T)) Div 2,
                                       Y1, Wnds^[W].W, T, Fg, True)
-        Else WrapText(X1, Y1, Wnds^[W].W, T, Fg, True);
+        Else WrapText(X1, Y1, StaticVisW(W), T, Fg, True);
         TxtPitch := 0;
       End;
     End;
@@ -20799,16 +21196,17 @@ Begin
     Begin
       Sunken(X1, Y1, X2, Y2, cWhite);
       A := Wnds^[W].Extra;
+      H := TxtCH;
       For I := 0 To Wnds^[W].K1 - 1 Do
-        If Y1 + 2 + I * 16 < Y2 - 16 Then
+        If Y1 + 2 + I * H < Y2 - H Then
         Begin
           If I = Wnds^[W].K2 Then
           Begin
-            FBar(X1 + 2, Y1 + 2 + I * 16, X2 - 2, Y1 + 17 + I * 16, cNavy);
-            OutTxt(X1 + 4, Y1 + 2 + I * 16, PStr(MemL[0:A + I * 4]), cWhite);
+            FBar(X1 + 2, Y1 + 2 + I * H, X2 - 2, Y1 + 1 + (I + 1) * H, cNavy);
+            OutTxt(X1 + 4, Y1 + 2 + I * H, PStr(MemL[0:A + I * 4]), cWhite);
           End
           Else
-            OutTxt(X1 + 4, Y1 + 2 + I * 16, PStr(MemL[0:A + I * 4]), cBlack);
+            OutTxt(X1 + 4, Y1 + 2 + I * H, PStr(MemL[0:A + I * 4]), cBlack);
         End;
     End;
     ikScrollBar : SbDraw(W, X1, Y1, X2, Y2);
@@ -20816,6 +21214,17 @@ Begin
       FBar(X1, Y1, X2, Y2, cSilver);
   End;
   DirtyWnd(W);
+End;
+
+{ Dessiner un controle : ceux des boites de dialogue (et ceux qui ont
+  recu une petite police par WM_SETFONT) avec la police 6x13 }
+Procedure DrawCtl(W : LongInt);
+Var Sm : Boolean;
+Begin
+  Sm := TxtSmall;
+  TxtSmall := CtlSmall(W);
+  DrawCtl0(W);
+  TxtSmall := Sm;
 End;
 
 { Liste (LISTBOX, COMBOBOX) : bloc Extra = chaines (LBItemMax), donnees
@@ -20868,6 +21277,20 @@ Begin
               <> 0);
 End;
 
+{ controle dessine par le programme : liste ou bouton BS_OWNERDRAW }
+Function CtlOwner(W : LongInt) : Boolean;
+Begin
+  CtlOwner := LbOwner(W) Or ((Wnds^[W].IKind = ikButton) And
+              ((Wnds^[W].Style And BS_TYPEMASK) = BS_OWNERDRAW));
+End;
+
+{ boite de dialogue d'un programme : sa procedure recoit WM_PAINT apres
+  le fond (panneaux de l'installation d'Office, logos...) }
+Function DlgPaints(W : LongInt) : Boolean;
+Begin
+  DlgPaints := (Wnds^[W].IKind = ikDialog) And (Wnds^[W].DlgProc <> 0);
+End;
+
 { elements a chaine (sinon : une valeur du programme) }
 Function LbHasStr(W : LongInt) : Boolean;
 Begin
@@ -20886,7 +21309,7 @@ End;
 Function LbItemH(W : LongInt) : LongInt;
 Var A, H, P : LongInt; Mis : Array[0..5] Of LongInt;
 Begin
-  LbItemH := 16;
+  If CtlSmall(W) Then LbItemH := 13 Else LbItemH := 16;
   A := LbExtra(W);
   If A = 0 Then Exit;
   H := MemL[0:A + LBItemMax * 8];
@@ -20899,6 +21322,7 @@ Begin
     Begin
       Mis[0] := 2; Mis[1] := Wnds^[W].Id; Mis[2] := 0;
       Mis[3] := Wnds^[W].W; Mis[4] := 16; Mis[5] := 0;
+      If CtlSmall(W) Then Mis[4] := 13;
       SendMsgW(P, WM_MEASUREITEM, Wnds^[W].Id, LongInt(@Mis));
       If (Mis[4] > 0) And (Mis[4] < 256) And (H = 0) Then H := Mis[4];
     End;
@@ -21151,7 +21575,8 @@ End;
 Function EdHit(W, X : LongInt) : LongInt;
 Begin
   If X < 4 Then X := 4;
-  EdHit := Wnds^[W].K3 + (X - 4 + 4) Div 8;
+  If CtlSmall(W) Then EdHit := Wnds^[W].K3 + (X - 4 + 3) Div 6
+  Else EdHit := Wnds^[W].K3 + (X - 4 + 4) Div 8;
 End;
 
 { messages propres au champ d'une ligne ; vrai si traite }
@@ -21247,7 +21672,7 @@ Begin
   If (Wnds^[W].Style And $20) <> 0 Then
     For I := 1 To Length(T) Do T[I] := '*';
   EdClamp(W);
-  Vis := (Wnds^[W].W - 8) Div 8;
+  Vis := (Wnds^[W].W - 8) Div TxtCW;
   If Vis < 1 Then Vis := 1;
   If Wnds^[W].K1 < Wnds^[W].K3 Then Wnds^[W].K3 := Wnds^[W].K1;
   If Wnds^[W].K1 > Wnds^[W].K3 + Vis - 1 Then
@@ -21256,7 +21681,7 @@ Begin
     Wnds^[W].K3 := Max(0, Length(T) - Vis + 1);
   If Wnds^[W].K3 < 0 Then Wnds^[W].K3 := 0;
   V := Copy(T, Wnds^[W].K3 + 1, Vis);
-  Y := Y1 + (Wnds^[W].H - 16) Div 2;
+  Y := Y1 + (Wnds^[W].H - TxtCH) Div 2;
   Foc := W = FocusWin;
   Sel := Foc And EdSel(W, A, B);
   If Wnds^[W].Enabled Then C := cBlack Else C := cGray;
@@ -21264,12 +21689,13 @@ Begin
     If Sel And (Wnds^[W].K3 + I - 1 >= A) And (Wnds^[W].K3 + I - 1 < B)
     Then
     Begin
-      FBar(X1 + 4 + (I - 1) * 8, Y, X1 + 11 + (I - 1) * 8, Y + 15, cNavy);
-      DrawChar(X1 + 4 + (I - 1) * 8, Y, V[I], cWhite);
+      FBar(X1 + 4 + (I - 1) * TxtCW, Y, X1 + 3 + I * TxtCW, Y + TxtCH - 1,
+           cNavy);
+      DrawChar(X1 + 4 + (I - 1) * TxtCW, Y, V[I], cWhite);
     End
-    Else DrawChar(X1 + 4 + (I - 1) * 8, Y, V[I], C);
+    Else DrawChar(X1 + 4 + (I - 1) * TxtCW, Y, V[I], C);
   If Foc Then
-    VLine(X1 + 4 + (Wnds^[W].K1 - Wnds^[W].K3) * 8, Y1 + 3, Y2 - 3,
+    VLine(X1 + 4 + (Wnds^[W].K1 - Wnds^[W].K3) * TxtCW, Y1 + 3, Y2 - 3,
           cBlack);
 End;
 
@@ -21507,6 +21933,26 @@ Begin
   ReleaseDC(HwndOf(W), Hdc);
 End;
 
+{ bouton BS_OWNERDRAW : WM_DRAWITEM au parent (ODT_BUTTON 4, action
+  ODA_DRAWENTIRE, etat 1 enfonce, 4 inactif, 10h focus) }
+Procedure BtnOwnerDraw(W : LongInt);
+Var Dis : Array[0..11] Of LongInt; Hdc : LongInt;
+Begin
+  If Wnds^[W].Parent < 0 Then Exit;
+  Hdc := GetDC(HwndOf(W));
+  If Hdc = 0 Then Exit;
+  Dis[0] := 4; Dis[1] := Wnds^[W].Id; Dis[2] := 0; Dis[3] := 1;
+  Dis[4] := 0;
+  If Wnds^[W].K2 <> 0 Then Dis[4] := 1;
+  If Not Wnds^[W].Enabled Then Dis[4] := Dis[4] Or 4;
+  If FocusWin = W Then Dis[4] := Dis[4] Or $10;
+  Dis[5] := HwndOf(W); Dis[6] := Hdc;
+  Dis[7] := 0; Dis[8] := 0; Dis[9] := Wnds^[W].W; Dis[10] := Wnds^[W].H;
+  Dis[11] := 0;
+  SendMsgW(Wnds^[W].Parent, WM_DRAWITEM, Wnds^[W].Id, LongInt(@Dis));
+  ReleaseDC(HwndOf(W), Hdc);
+End;
+
 { liste dessinee par le programme : comme Windows, prevenir aussitot
   d'un changement de selection (ODA_SELECT) de l'element Sel, et du
   deplacement du curseur de Old vers K2 (ODA_FOCUS) }
@@ -21544,6 +21990,7 @@ Begin
   R := X2 - 2;
   If LbOver(W) Then R := X2 - 18;
   ClipX2 := Min(ClipX2, R);
+  Th := LbItemH(W);
   If LbOwner(W) Then
   Begin
     If CurT = Wnds^[W].Thread Then LbOwnerDraw(W, R - X1);
@@ -21553,12 +22000,12 @@ Begin
     If Wnds^[W].K3 + I < Wnds^[W].K1 Then
       If LbSel(W, Wnds^[W].K3 + I) Then
       Begin
-        FBar(X1 + 2, Y1 + 2 + I * 16, R, Y1 + 17 + I * 16, cNavy);
-        OutTxt(X1 + 4, Y1 + 2 + I * 16,
+        FBar(X1 + 2, Y1 + 2 + I * Th, R, Y1 + 1 + (I + 1) * Th, cNavy);
+        OutTxt(X1 + 4, Y1 + 2 + I * Th,
                PStr(MemL[0:A + (Wnds^[W].K3 + I) * 4]), cWhite);
       End
       Else
-        OutTxt(X1 + 4, Y1 + 2 + I * 16,
+        OutTxt(X1 + 4, Y1 + 2 + I * Th,
                PStr(MemL[0:A + (Wnds^[W].K3 + I) * 4]), cBlack);
   ClipX2 := X2;
   If Not LbOver(W) Then Exit;
@@ -21835,9 +22282,11 @@ Begin
       PostMsgW(W, WM_COMMAND, IDCANCEL, 0);
       Exit;
     End;
+    { WM_PAINT non traite : le fond est deja peint par le noyau (le
+      redemander repeindrait sans fin) }
     If Msg = WM_PAINT Then
     Begin
-      Wnds^[W].KNeedPaint := True;
+      SetR(Wnds^[W].Upd, 0, 0, 0, 0);
       Exit;
     End;
   End;
@@ -21891,6 +22340,14 @@ Begin
     WM_SETFONT : Wnds^[W].Font := WP;
     WM_GETFONT : KWndProc := Wnds^[W].Font;
     WM_ENABLE : InvalAll(W, True);
+    { STM_SETICON, STM_GETICON, STM_SETIMAGE, STM_GETIMAGE }
+    $170, $172 :
+    Begin
+      KWndProc := Wnds^[W].Icon;
+      If Msg = $170 Then Wnds^[W].Icon := WP Else Wnds^[W].Icon := LP;
+      InvalAll(W, True);
+    End;
+    $171, $173 : KWndProc := Wnds^[W].Icon;
     BM_GETCHECK : KWndProc := Wnds^[W].K1;
     BM_SETCHECK :
     Begin
@@ -25359,6 +25816,29 @@ Begin
   GdiOf := I;
 End;
 
+{ petite police (hauteur de 1 a 13 points : MS Sans Serif 8, Tahoma 8,
+  Times New Roman 10...) : rendue avec la police 6x13 }
+Function HFontSmall(H : LongInt) : Boolean;
+Var I : LongInt;
+Begin
+  HFontSmall := False;
+  I := GdiOf(H, goFont);
+  If I < 0 Then Exit;
+  HFontSmall := (Abs(Gdis^[I].I1) >= 1) And (Abs(Gdis^[I].I1) <= 13);
+End;
+
+{ controle d'une boite de dialogue (modele DLGTEMPLATE), ou qui a recu
+  une petite police }
+Function CtlSmall(W : LongInt) : Boolean;
+Var T : LongInt;
+Begin
+  CtlSmall := False;
+  If (W < 0) Or Not Wnds^[W].Used Then Exit;
+  T := TopOf(W);
+  If (T >= 0) And (Wnds^[T].IKind = ikDialog) Then CtlSmall := True
+  Else If Wnds^[W].Font <> 0 Then CtlSmall := HFontSmall(Wnds^[W].Font);
+End;
+
 Function DcOf(H : LongInt) : LongInt;
 Var I : LongInt;
 Begin
@@ -27033,7 +27513,12 @@ Begin
   If (D < 0) Or (Dcs[D].Font < 0) Then Exit;
   If Gdis^[Dcs[D].Font].Kind <> goFont Then Exit;
   H := Abs(Gdis^[Dcs[D].Font].I1);
-  If H >= 28 Then
+  { petite police (MS Sans Serif 8...) : la police 6x13 }
+  If (H >= 1) And (H <= 13) Then
+  Begin
+    Cw := 6; Chh := 13;
+  End
+  Else If H >= 28 Then
   Begin
     Cw := 16; Chh := 32;
   End
@@ -27072,8 +27557,8 @@ Begin
   End;
   If (A And 6) = 6 Then X := X - W Div 2
   Else If (A And 2) <> 0 Then X := X - W;
-  If (A And 24) = 24 Then Y := Y - 12
-  Else If (A And 8) <> 0 Then Y := Y - 16;
+  If (A And 24) = 24 Then Y := Y - (Chh * 3) Div 4
+  Else If (A And 8) <> 0 Then Y := Y - Chh;
   If (A And 1) <> 0 Then Dcs[D].PosX := X + W;
   C := GColor(Dcs[D].TextColor);
   Bg := GColor(Dcs[D].BkColor);
@@ -27096,7 +27581,8 @@ Begin
   Begin
     Ch := Mem[0:Str + I];
     If An And (Ch >= 128) Then Ch := AnsiOem[Ch];
-    If Cw = 8 Then DrawChar(X + I * 8, Y, Chr(Ch), C)
+    If (Cw = 8) And (Chh = 16) Then DrawChar(X + I * 8, Y, Chr(Ch), C)
+    Else If (Cw = 6) And (Chh = 13) Then DrawSmall(X + I * 6, Y, Chr(Ch), C)
     Else DrawCharS(X + I * Cw, Y, Chr(Ch), C, Cw, Chh);
   End;
   DcDirty(X, Y, X + W, Y + Chh);
@@ -27133,10 +27619,13 @@ End;
 
 { TEXTMETRIC (56 octets) }
 Function GetTextMetricsA(Hdc, P : LongInt) : LongInt;
+Var Cw, Chh : LongInt;
 Begin
+  FontDims(DcOf(Hdc), Cw, Chh);
   FillMem(P, 56, 0);
-  MemL[0:P] := 16; MemL[0:P + 4] := 12; MemL[0:P + 8] := 4;
-  MemL[0:P + 20] := 8; MemL[0:P + 24] := 8; MemL[0:P + 28] := 400;
+  MemL[0:P] := Chh; MemL[0:P + 4] := (Chh * 3) Div 4;
+  MemL[0:P + 8] := Chh - (Chh * 3) Div 4;
+  MemL[0:P + 20] := Cw; MemL[0:P + 24] := Cw; MemL[0:P + 28] := 400;
   MemL[0:P + 36] := 96; MemL[0:P + 40] := 96;
   Mem[0:P + 44] := 32; Mem[0:P + 45] := 255; Mem[0:P + 46] := Ord('?');
   Mem[0:P + 47] := 32; Mem[0:P + 51] := $30;
@@ -29356,13 +29845,34 @@ Begin
 End;
 
 Function EndPaint(H, P : LongInt) : LongInt;
-Var D : LongInt;
+Var D, W, I : LongInt;
 Begin
   D := DcOf(MemL[0:P]);
   If D >= 0 Then Dcs[D].HasPaint := False;
   ReleaseDC(H, MemL[0:P]);
-  DirtyWnd(WndOf(H));
+  W := WndOf(H);
+  DirtyWnd(W);
   EndPaint := 1;
+  { dialogue peint par sa procedure : ses controles par-dessus, sans
+    redemander le fond du dialogue }
+  If (W >= 0) And DlgPaints(W) Then
+    For I := 0 To MaxWnd - 1 Do
+      If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = W) Then
+      Begin
+        SetR(Wnds^[I].Upd, 0, 0, 30000, 30000);
+        If CtlOwner(I) And (Wnds^[I].Thread > 0) And
+           (Wnds^[I].Thread < MaxThread) Then
+          Threads[Wnds^[I].Thread].PaintReq := True;
+      End;
+  { fenetre d'un programme (fond peint par sa classe ou sa procedure) :
+    comme sous Windows, ses controles internes sont redessines apres
+    elle (sinon le fond les effacait : textes statiques, cadres et
+    boutons absents tant qu'ils ne changeaient pas) }
+  If (W >= 0) And (Wnds^[W].IKind = ikNone) Then
+    For I := 0 To MaxWnd - 1 Do
+      If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = W) And
+         (Wnds^[I].IKind <> ikNone) And Not CtlOwner(I) Then
+        SetR(Wnds^[I].Upd, 0, 0, 30000, 30000);
 End;
 
 Function InvalidateRect(H, P, Erase : LongInt) : LongInt;
@@ -29756,14 +30266,145 @@ Begin
   DcDirty(R.L, R.T, R.R, R.B);
 End;
 
+{ ------------------------------------------------------------------ }
+{ Icones des programmes : image d'une ressource RT_ICON (en-tete      }
+{ BITMAPINFOHEADER, hauteur double : points puis masque ET). Poignee : }
+{ IconBase + indice ; les icones du systeme (LoadIcon(0, IDI_...))     }
+{ gardent l'icone generique.                                           }
+{ ------------------------------------------------------------------ }
+
+Const
+  MaxIcon = 256;
+  IconBase = $0001C000;
+
+Var
+  IconBmi : Array[0..MaxIcon - 1] Of LongInt;
+  IconCnt : LongInt;
+
+{ nouvelle icone d'apres une image RT_ICON ; 0 si l'en-tete n'en est pas
+  une }
+Function IconNew(Bmi : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  IconNew := 0;
+  If (Bmi = 0) Or (MemL[0:Bmi] <> 40) Then Exit;
+  If (MemL[0:Bmi + 4] <= 0) Or (MemL[0:Bmi + 4] > 256) Or
+     (MemL[0:Bmi + 8] <= 0) Or (MemL[0:Bmi + 8] > 512) Then Exit;
+  { la meme image : la meme poignee }
+  For I := 0 To IconCnt - 1 Do
+    If IconBmi[I] = Bmi Then
+    Begin
+      IconNew := IconBase + I;
+      Exit;
+    End;
+  If IconCnt >= MaxIcon Then Exit;
+  IconBmi[IconCnt] := Bmi;
+  IconNew := IconBase + IconCnt;
+  Inc(IconCnt);
+End;
+
+Function IconOf(H : LongInt) : LongInt;
+Begin
+  IconOf := -1;
+  If (H >= IconBase) And (H < IconBase + IconCnt) Then
+    IconOf := H - IconBase;
+End;
+
+{ largeur et hauteur d'une icone (32 pour les icones du systeme) }
+Procedure IconSize(H : LongInt; Var W, Hh : LongInt);
+Var I : LongInt;
+Begin
+  W := 32; Hh := 32;
+  I := IconOf(H);
+  If I < 0 Then Exit;
+  W := MemL[0:IconBmi[I] + 4];
+  Hh := MemL[0:IconBmi[I] + 8] Div 2;
+End;
+
+{ dessiner l'icone H en (X, Y), a la taille CW x CH (0 : la sienne), dans
+  la cible courante (DcBegin ou dessin d'un controle) : points ou le
+  masque ET vaut 0, plus proche voisin pour la mise a l'echelle ; Gdi :
+  couleurs du DC (GColor), sinon de l'ecran }
+Procedure IconPaint(H, X, Y, CW, CH : LongInt; Gdi : Boolean);
+Var I, A, W, Hh, Bpp, N, Tab, Bits, Msk, P, PM, DX, DY, SX, SY, R, V,
+    Q : LongInt;
+Begin
+  I := IconOf(H);
+  If I < 0 Then
+  Begin
+    { icones du systeme (LoadIcon(0, IDI_...)) : IDI_HAND, IDI_QUESTION,
+      IDI_EXCLAMATION, IDI_ASTERISK ; l'icone d'application sinon }
+    Case H Of
+      $7F01 : PaintIcon(icError, X, Y, 32);
+      $7F02 : PaintIcon(icQuestion, X, Y, 32);
+      $7F03 : PaintIcon(icWarn, X, Y, 32);
+      $7F04 : PaintIcon(icInfo, X, Y, 32);
+    Else
+      PaintIcon(icApp, X, Y, 32);
+    End;
+    Exit;
+  End;
+  A := IconBmi[I];
+  W := MemL[0:A + 4]; Hh := MemL[0:A + 8] Div 2; Bpp := MemW[0:A + 14];
+  If CW <= 0 Then CW := W;
+  If CH <= 0 Then CH := Hh;
+  N := MemL[0:A + 32];
+  If (N = 0) And (Bpp <= 8) Then N := 1 Shl Bpp;
+  If Bpp > 8 Then N := 0;
+  Tab := A + MemL[0:A];
+  Bits := Tab + N * 4;
+  P := ((W * Bpp + 31) Div 32) * 4;
+  PM := ((W + 31) Div 32) * 4;
+  Msk := Bits + P * Hh;
+  For DY := 0 To CH - 1 Do
+  Begin
+    SY := (DY * Hh) Div CH;
+    R := Hh - 1 - SY;
+    For DX := 0 To CW - 1 Do
+    Begin
+      SX := (DX * W) Div CW;
+      If (Mem[0:Msk + R * PM + SX Shr 3] And ($80 Shr (SX And 7))) = 0 Then
+      Begin
+        Case Bpp Of
+          1 : V := (Mem[0:Bits + R * P + SX Shr 3] Shr (7 - SX And 7)) And 1;
+          4 : V := (Mem[0:Bits + R * P + SX Shr 1] Shr
+                    (4 * (1 - SX And 1))) And 15;
+          8 : V := Mem[0:Bits + R * P + SX];
+        Else
+          V := -1;
+        End;
+        If V >= 0 Then
+        Begin
+          Q := Tab + V * 4;
+          V := Mem[0:Q + 2] Or (Mem[0:Q + 1] Shl 8) Or (Mem[0:Q] Shl 16);
+        End
+        Else If Bpp = 24 Then
+        Begin
+          Q := Bits + R * P + SX * 3;
+          V := Mem[0:Q + 2] Or (Mem[0:Q + 1] Shl 8) Or (Mem[0:Q] Shl 16);
+        End
+        Else If Bpp = 32 Then
+        Begin
+          Q := Bits + R * P + SX * 4;
+          V := Mem[0:Q + 2] Or (Mem[0:Q + 1] Shl 8) Or (Mem[0:Q] Shl 16);
+        End
+        Else V := 0;
+        If Gdi Then Pix(X + DX, Y + DY, GColor(V))
+        Else Pix(X + DX, Y + DY, DirOf(V));
+      End;
+    End;
+  End;
+End;
+
 Function DrawIcon(Hdc, X, Y, Icon : LongInt) : LongInt;
-Var D : LongInt;
+Var D, W, H : LongInt;
 Begin
   DrawIcon := 1;
   D := DcOf(Hdc);
   If Not DcBegin(D) Then Exit;
-  PaintIcon(icApp, X, Y, 32);
-  DcDirty(X, Y, X + 32, Y + 32);
+  IconSize(Icon, W, H);
+  IconPaint(Icon, X, Y, 0, 0, True);
+  DcDirty(X, Y, X + W, Y + H);
 End;
 
 Function DrawFocusRect(Hdc, P : LongInt) : LongInt;
@@ -29773,11 +30414,11 @@ End;
 
 { DrawTextA : DT_CENTER 1, DT_RIGHT 2, DT_VCENTER 4, DT_BOTTOM 8,
   DT_WORDBREAK 10h, DT_SINGLELINE 20h, DT_CALCRECT 400h }
-Function DrawTextA(Hdc, Str, N, P, Fmt : LongInt) : LongInt;
-Var D, Cols, Lines, I, X, Y, Bg, C : LongInt; R : TRect; S, Ln, Wd : String;
-    LnArr : Array[0..15] Of String[80];
+Function DrawTextA0(Hdc, Str, N, P, Fmt : LongInt) : LongInt;
+Var D, Cols, Lines, I, X, Y, Bg, C, Pt, CW : LongInt; R : TRect;
+    S, Ln, Wd : String; LnArr : Array[0..15] Of String[80];
 Begin
-  DrawTextA := 16;
+  DrawTextA0 := 16;
   D := DcOf(Hdc);
   If D < 0 Then Exit;
   If N = -1 Then N := StrLenZ(Str);
@@ -29787,55 +30428,75 @@ Begin
   I := Pos('&', S);
   If I > 0 Then Delete(S, I, 1);
   GetRectAt(P, R);
-  Cols := Max(1, (R.R - R.L) Div 8);
-  Lines := 0;
-  If (Fmt And $10) <> 0 Then
+  { dans une fenetre : pas au-dela de sa zone cliente (les rectangles
+    des programmes sont prevus pour MS Sans Serif, plus etroite que la
+    police 8x16 : panneaux de l'installation d'Office) }
+  If ((Fmt And $400) = 0) And (Dcs[D].Wnd >= 0) And Dcs[D].Client Then
   Begin
+    CW := Wnds^[Dcs[D].Wnd].CR - Wnds^[Dcs[D].Wnd].CL;
+    If (R.R > CW) And (R.L < CW - 16) Then R.R := CW;
+  End;
+  { lignes : sauts de ligne respectes hors DT_SINGLELINE, coupure aux
+    mots avec DT_WORDBREAK ; texte resserre (7 puis 6 points par
+    caractere) si une ligne depasse la largeur (sans DT_WORDBREAK) ou si
+    les lignes depassent la hauteur du rectangle (avec) }
+  Pt := TxtCW + 1;
+  Repeat
+    Dec(Pt);
+    Cols := Max(1, (R.R - R.L) Div Pt);
+    Lines := 0; C := 0;
     Ln := ''; Wd := '';
     For I := 1 To Length(S) + 1 Do
-      If (I > Length(S)) Or (S[I] = ' ') Or (S[I] = #13) Or (S[I] = #10) Then
+      If (I > Length(S)) Or (S[I] = #10) Or
+         ((S[I] = ' ') And ((Fmt And $10) <> 0)) Then
       Begin
-        If (Length(Ln) + Length(Wd) + 1 > Cols) And (Ln <> '') Then
+        If (Fmt And $10) = 0 Then
+        Begin
+          If Ln = '' Then Ln := Wd Else Ln := Ln + ' ' + Wd;
+        End
+        Else If (Length(Ln) + Length(Wd) + 1 > Cols) And (Ln <> '') Then
         Begin
           If Lines < 16 Then LnArr[Lines] := Ln;
+          C := Max(C, Length(Ln));
           Inc(Lines);
           Ln := Wd;
         End
         Else If Ln = '' Then Ln := Wd Else Ln := Ln + ' ' + Wd;
         Wd := '';
-        If (I <= Length(S)) And (S[I] = #10) Then
+        If (I > Length(S)) Or ((S[I] = #10) And ((Fmt And $20) = 0)) Then
         Begin
-          If Lines < 16 Then LnArr[Lines] := Ln;
-          Inc(Lines);
+          If (I <= Length(S)) Or (Ln <> '') Or (Lines = 0) Then
+          Begin
+            If Lines < 16 Then LnArr[Lines] := Ln;
+            C := Max(C, Length(Ln));
+            Inc(Lines);
+          End;
           Ln := '';
         End;
       End
-      Else If S[I] <> #13 Then Wd := Wd + S[I];
-    If Ln <> '' Then
-    Begin
-      If Lines < 16 Then LnArr[Lines] := Ln;
-      Inc(Lines);
-    End;
-  End
-  Else
-  Begin
-    LnArr[0] := S;
-    Lines := 1;
-  End;
+      Else If (S[I] <> #13) And Not ((S[I] = #10) And ((Fmt And $20) <> 0))
+      Then
+      Begin
+        { un mot plus long que la ligne (sans DT_WORDBREAK : la ligne) }
+        Wd := Wd + S[I];
+      End;
+  Until (Pt <= TxtCW - 2 + Ord(TxtSmall)) Or ((Fmt And $400) <> 0) Or
+        (((Fmt And $10) <> 0) And (Lines * TxtCH <= R.B - R.T)) Or
+        (((Fmt And $10) = 0) And (C * Pt <= R.R - R.L));
   If Lines > 16 Then Lines := 16;
   If (Fmt And $400) <> 0 Then
   Begin
     C := 0;
     For I := 0 To Lines - 1 Do C := Max(C, Length(LnArr[I]));
-    R.R := R.L + C * 8; R.B := R.T + Lines * 16;
+    R.R := R.L + C * TxtCW; R.B := R.T + Lines * TxtCH;
     PutRectAt(P, R);
-    DrawTextA := Lines * 16;
+    DrawTextA0 := Lines * TxtCH;
     Exit;
   End;
   If Not DcBegin(D) Then Exit;
   Y := R.T;
-  If (Fmt And $24) = $24 Then Y := (R.T + R.B - 16) Div 2
-  Else If (Fmt And $28) = $28 Then Y := R.B - 16;
+  If (Fmt And $24) = $24 Then Y := (R.T + R.B - TxtCH) Div 2
+  Else If (Fmt And $28) = $28 Then Y := R.B - TxtCH;
   C := GColor(Dcs[D].TextColor);
   Bg := GColor(Dcs[D].BkColor);
   If (Fmt And $100) = 0 Then
@@ -29843,18 +30504,31 @@ Begin
     ClipX1 := Max(ClipX1, R.L); ClipY1 := Max(ClipY1, R.T);
     ClipX2 := Min(ClipX2, R.R - 1); ClipY2 := Min(ClipY2, R.B - 1);
   End;
+  If Pt < TxtCW Then TxtPitch := Pt;
   For I := 0 To Lines - 1 Do
   Begin
     X := R.L;
     If (Fmt And 1) <> 0 Then X := (R.L + R.R - TextW(LnArr[I])) Div 2
     Else If (Fmt And 2) <> 0 Then X := R.R - TextW(LnArr[I]);
     If Dcs[D].BkMode = 2 Then
-      FBar(X, Y, X + TextW(LnArr[I]) - 1, Y + 15, Bg);
+      FBar(X, Y, X + TextW(LnArr[I]) - 1, Y + TxtCH - 1, Bg);
     OutTxt(X, Y, LnArr[I], C);
-    Y := Y + 16;
+    Y := Y + TxtCH;
   End;
+  TxtPitch := 0;
   DcDirty(R.L, R.T, R.R, R.B);
-  DrawTextA := Lines * 16;
+  DrawTextA0 := Lines * TxtCH;
+End;
+
+{ DrawTextA : petite police du DC (MS Sans Serif 8...) en 6x13 }
+Function DrawTextA(Hdc, Str, N, P, Fmt : LongInt) : LongInt;
+Var Sm : Boolean; Cw, Chh : LongInt;
+Begin
+  Sm := TxtSmall;
+  FontDims(DcOf(Hdc), Cw, Chh);
+  TxtSmall := (Cw = 6) And (Chh = 13);
+  DrawTextA := DrawTextA0(Hdc, Str, N, P, Fmt);
+  TxtSmall := Sm;
 End;
 
 Function GrayStringA(Hdc, Br, Proc, Lp, N, X, Y, W, H : LongInt) : LongInt;
@@ -30895,9 +31569,38 @@ Begin
   ClipCursor := 1;
 End;
 
+{ LoadIcon : groupe RT_GROUP_ICON (14) du module, entree 32 x 32 la plus
+  riche en couleurs (sinon la plus grande), image RT_ICON (3) ; icone du
+  systeme (generique) pour Inst = 0 ou sans ressource }
 Function LoadIconA(Inst, Name : LongInt) : LongInt;
+Var M, E, A, N, I, Best, Sc, BS, Size, W, Id : LongInt;
 Begin
   LoadIconA := $7000 + (Name And $FFF);
+  If Inst = 0 Then Exit;
+  M := AppModule(Inst);
+  If M = 0 Then Exit;
+  E := ResFind(M, Name, 14);
+  If E = 0 Then Exit;
+  A := ResData(M, E, Size);
+  N := MemW[0:A + 4];
+  Best := -1; BS := -1;
+  For I := 0 To N - 1 Do
+  Begin
+    W := Mem[0:A + 6 + I * 14];
+    If W = 0 Then W := 256;
+    Sc := MemW[0:A + 6 + I * 14 + 6];
+    If W = 32 Then Sc := Sc + 10000 Else Sc := Sc + W * 10;
+    If Sc > BS Then
+    Begin
+      BS := Sc; Best := I;
+    End;
+  End;
+  If Best < 0 Then Exit;
+  Id := MemW[0:A + 6 + Best * 14 + 12];
+  E := ResFind(M, Id, 3);
+  If E = 0 Then Exit;
+  I := IconNew(ResData(M, E, Size));
+  If I <> 0 Then LoadIconA := I;
 End;
 
 Function DestroyIcon(H : LongInt) : LongInt;
@@ -31555,6 +32258,19 @@ End;
 { Boites de dialogue (modeles DLGTEMPLATE et DLGTEMPLATEEX)          }
 { ------------------------------------------------------------------ }
 
+{ unites de dialogue -> points (base 6 x 13 : 1,5 et 1,625 point) }
+Function DluX(V : LongInt) : LongInt;
+Begin
+  If V >= 0 Then DluX := (V * 6 + 2) Div 4
+  Else DluX := -((-V * 6 + 2) Div 4);
+End;
+
+Function DluY(V : LongInt) : LongInt;
+Begin
+  If V >= 0 Then DluY := (V * 13 + 4) Div 8
+  Else DluY := -((-V * 13 + 4) Div 8);
+End;
+
 { Element sz_Or_Ord : chaine ou ordinal ; rend l'adresse suivante }
 Function Sx16(V : LongInt) : LongInt;
 Begin
@@ -31610,7 +32326,7 @@ End;
 Function DlgCreate(Inst, T, Parent, Proc, Lp : LongInt) : LongInt;
 Var Ex, Style, N, X, Y, CX, CY, A, I, Ord0, Cls, W, C, B, TT, Id,
     IStyle, IEx, Focus, CC : LongInt; Ext : Boolean; S, Title, ClsN : String;
-    P, TA : LongInt;
+    P, TA, DFont : LongInt; IcoN : String;
 Begin
   DlgCreate := -1;
   Ext := MemL[0:T] = LongInt($FFFF0001);
@@ -31643,7 +32359,7 @@ Begin
     If C >= 0 Then Cls := C;
   End;
   NcSize(Style, Ex, False, B, TT);
-  CX := CX * 2 + 2 * B; CY := CY * 2 + TT + B;
+  CX := DluX(CX) + 2 * B; CY := DluY(CY) + TT + B;
   If ((Style And $800) <> 0) Or (Parent = 0) Then
   Begin
     X := (ScrW - CX) Div 2; Y := (TaskY - CY) Div 2;
@@ -31654,11 +32370,11 @@ Begin
     If W >= 0 Then
     Begin
       ClientScreenOrg(W, I, C);
-      X := X * 2 + I; Y := Y * 2 + C;
+      X := DluX(X) + I; Y := DluY(Y) + C;
     End
     Else
     Begin
-      X := X * 2; Y := Y * 2;
+      X := DluX(X); Y := DluY(Y);
     End;
   End;
   W := CreateW(Ex, Cls, Title, (Style And Not WS_VISIBLE) And
@@ -31709,16 +32425,35 @@ Begin
     A := A + 2 + P;
     If CC < 0 Then CC := KClass[ikStatic];
     C := CreateW(IEx, CC, S, (IStyle Or WS_CHILD) And Not WS_VISIBLE,
-                 X * 2, Y * 2, CX * 2, CY * 2, W, Id, Inst, 0);
+                 DluX(X), DluY(Y), DluX(X + CX) - DluX(X),
+                 DluY(Y + CY) - DluY(Y), W, Id, Inst, 0);
     If C >= 0 Then
     Begin
       If (Length(S) >= 127) And (MemW[0:TA] <> $FFFF) Then
         WndSetTextW(C, TA);
       If (IStyle And WS_VISIBLE) <> 0 Then Wnds^[C].Visible := True;
       If (IStyle And WS_DISABLED) <> 0 Then Wnds^[C].Enabled := False;
+      { statique SS_ICON : l'icone nommee (ou numerotee) du modele }
+      If (CC = KClass[ikStatic]) And ((IStyle And $1F) = 3) Then
+        If MemW[0:TA] = $FFFF Then
+          Wnds^[C].Icon := LoadIconA(Inst, MemW[0:TA + 2])
+        Else If S <> '' Then
+        Begin
+          IcoN := S + #0;
+          Wnds^[C].Icon := LoadIconA(Inst, LongInt(@IcoN[1]));
+        End;
       If (Focus < 0) And ((IStyle And $10000) <> 0) Then Focus := C;
     End;
   End;
+  { police du dialogue (MS Sans Serif 8, rendue en 6x13) : WM_GETFONT
+    du dialogue et de ses controles }
+  IcoN := 'MS Sans Serif'#0;
+  DFont := CreateFontA(-11, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0,
+                       LongInt(@IcoN[1]));
+  Wnds^[W].Font := DFont;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And (Wnds^[I].Parent = W) And (Wnds^[I].Font = 0) Then
+      Wnds^[I].Font := DFont;
   If Proc <> 0 Then
     If CallProc(Proc, HwndOf(W), WM_INITDIALOG, HwndOf(Focus), Lp) <> 0 Then
       If Focus >= 0 Then SetFocusW(Focus);
@@ -31931,14 +32666,17 @@ End;
 
 Function MapDialogRect(H, P : LongInt) : LongInt;
 Begin
-  MemL[0:P] := MemL[0:P] * 2; MemL[0:P + 4] := MemL[0:P + 4] * 2;
-  MemL[0:P + 8] := MemL[0:P + 8] * 2; MemL[0:P + 12] := MemL[0:P + 12] * 2;
+  MemL[0:P] := DluX(MemL[0:P]); MemL[0:P + 4] := DluY(MemL[0:P + 4]);
+  MemL[0:P + 8] := DluX(MemL[0:P + 8]);
+  MemL[0:P + 12] := DluY(MemL[0:P + 12]);
   MapDialogRect := 1;
 End;
 
+{ unites de base des dialogues : la cellule de MS Sans Serif 8 (6 x 13),
+  comme Windows 95 en petites polices }
 Function GetDialogBaseUnits : LongInt;
 Begin
-  GetDialogBaseUnits := (16 Shl 16) Or 8;
+  GetDialogBaseUnits := (13 Shl 16) Or 6;
 End;
 
 { Boite de message d'un programme (modale) }
@@ -35415,8 +36153,7 @@ Begin
     End
     Else
     Begin
-      P := Pos(' ', S);
-      If P = 0 Then P := Length(S) + 1;
+      P := CmdProgEnd(S);
       Prog := Copy(S, 1, P - 1);
       Args := Copy(S, P + 1, 255);
     End;
@@ -36186,6 +36923,55 @@ Begin
   If ((Flags And 1) <> 0) And (GetFileAttributesA(PDst) <> -1) Then
     DeleteFileA(PDst);
   MoveFileExA := MoveFileA(PSrc, PDst);
+End;
+
+{ WININIT.INI au demarrage, comme WININIT.EXE de Windows 95 : chaque
+  ligne de la section [rename] remplace un fichier qui etait en service
+  (DEST=SOURCE) ou le supprime (NUL=FICHIER) ; les programmes
+  d'installation et de desinstallation s'en servent (l'amorce d'Office
+  y inscrit son dossier temporaire). Le fichier devient WININIT.BAK. }
+Procedure WinInitRun;
+Var F, Size, I, P, N : LongInt; Ch : Char; InRen : Boolean;
+    Ln, L, R, Z1, Z2 : String;
+Begin
+  If UpStr(SysDir) <> 'C:\WINDOWS\' Then Exit;
+  F := LoadWholeFile('C:\WINDOWS\WININIT.INI', Size);
+  If F = 0 Then Exit;
+  InRen := False; N := 0; I := 0; Ln := '';
+  While I <= Size Do
+  Begin
+    If I < Size Then Ch := Chr(Mem[0:F + I]) Else Ch := #10;
+    Inc(I);
+    If (Ch = #13) Or (Ch = #10) Then
+    Begin
+      Ln := Trim(Ln);
+      If (Ln <> '') And (Ln[1] = '[') Then InRen := UpStr(Ln) = '[RENAME]'
+      Else If InRen And (Ln <> '') And (Ln[1] <> ';') Then
+      Begin
+        P := Pos('=', Ln);
+        If P > 1 Then
+        Begin
+          L := Trim(Copy(Ln, 1, P - 1));
+          R := Trim(Copy(Ln, P + 1, 255));
+          Z1 := L + #0; Z2 := R + #0;
+          If UpStr(L) = 'NUL' Then DeleteFileA(LongInt(@Z2[1]))
+          Else
+          Begin
+            DeleteFileA(LongInt(@Z1[1]));
+            MoveFileA(LongInt(@Z2[1]), LongInt(@Z1[1]));
+          End;
+          Inc(N);
+        End;
+      End;
+      Ln := '';
+    End
+    Else If Length(Ln) < 255 Then Ln := Ln + Ch;
+  End;
+  KFree(F);
+  Z1 := 'C:\WINDOWS\WININIT.BAK'#0; Z2 := 'C:\WINDOWS\WININIT.INI'#0;
+  DeleteFileA(LongInt(@Z1[1]));
+  MoveFileA(LongInt(@Z2[1]), LongInt(@Z1[1]));
+  KLog('WININIT.INI : ' + IntStr(N) + ' operation(s)');
 End;
 
 Function GetTempFileNameA(PPath, PPre, Uniq, Buf : LongInt) : LongInt;
@@ -39415,11 +40201,17 @@ Const
   SelGateCb = $4B;
   W16CbOfs = $FFF0;        { souche de retour des rappels }
 
+Type
+  TLdtArr = Array[0..LdtMax - 1] Of LongInt;
+  PLdtArr = ^TLdtArr;
+
 Var
   Ldt : Array[0..LdtMax * 2 - 1] Of LongInt;
   LdtUsed : Array[0..LdtMax - 1] Of Boolean;
-  { blocs globaux : taille, nombre de tuiles, adresse, proprietaire }
-  GSize, GTiles, GLin, GOwner, GLock : Array[0..LdtMax - 1] Of LongInt;
+  { blocs globaux : taille, nombre de tuiles, adresse, proprietaire ;
+    tables dans le tas (InitW16) : l'image du noyau doit rester sous
+    400000h, adresse des programmes Win32 }
+  GSize, GTiles, GLin, GOwner, GLock : PLdtArr;
   Tss : Array[0..31] Of LongInt;
   W16ThunkSel, W16ThunkLin : LongInt;
   EnterStub, ApiGateStub, CbGateStub : LongInt;
@@ -39505,8 +40297,8 @@ Begin
       For K := I - N + 1 To I Do
       Begin
         LdtUsed[K] := True;
-        GSize[K] := 0; GTiles[K] := 0; GLin[K] := 0; GLock[K] := 0;
-        GOwner[K] := HeapOwner;
+        GSize^[K] := 0; GTiles^[K] := 0; GLin^[K] := 0; GLock^[K] := 0;
+        GOwner^[K] := HeapOwner;
         Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
       End;
       SelAlloc := ((I - N + 1) Shl 3) Or 7;
@@ -39525,7 +40317,7 @@ Begin
     Begin
       LdtUsed[K] := False;
       Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
-      GSize[K] := 0; GTiles[K] := 0;
+      GSize^[K] := 0; GTiles^[K] := 0;
     End;
 End;
 
@@ -39573,7 +40365,7 @@ Begin
   I := Sel Shr 3;
   If Code Then Acc := $FA Else Acc := $F2;
   GDescs(I, Lin, Size, Tiles, Acc);
-  GSize[I] := Size; GTiles[I] := Tiles; GLin[I] := Lin;
+  GSize^[I] := Size; GTiles^[I] := Tiles; GLin^[I] := Lin;
   GAlloc16 := Sel;
 End;
 
@@ -39583,7 +40375,7 @@ Begin
   GIdx := -1;
   If Not SelValid(H) Then Exit;
   I := (H Shr 3) And $1FFF;
-  If GTiles[I] > 0 Then GIdx := I;
+  If GTiles^[I] > 0 Then GIdx := I;
 End;
 
 Procedure GFree16(H : LongInt);
@@ -39591,8 +40383,8 @@ Var I : LongInt;
 Begin
   I := GIdx(H);
   If I < 0 Then Exit;
-  KFree(GLin[I]);
-  SelFree(H, GTiles[I]);
+  KFree(GLin^[I]);
+  SelFree(H, GTiles^[I]);
 End;
 
 Function GReAlloc16(H, Size : LongInt) : LongInt;
@@ -39607,13 +40399,13 @@ Begin
   Lin := KAlloc(Size);
   If Lin = 0 Then Exit;
   FillMem(Lin, Size, 0);
-  MoveMem(GLin[I], Lin, Min(Size, GSize[I]));
-  KFree(GLin[I]);
+  MoveMem(GLin^[I], Lin, Min(Size, GSize^[I]));
+  KFree(GLin^[I]);
   Acc := (Ldt[I * 2 + 1] Shr 8) And $FF;
-  If Tiles <= GTiles[I] Then
+  If Tiles <= GTiles^[I] Then
   Begin
-    If Tiles < GTiles[I] Then
-      SelFree(((I + Tiles) Shl 3) Or 7, GTiles[I] - Tiles);
+    If Tiles < GTiles^[I] Then
+      SelFree(((I + Tiles) Shl 3) Or 7, GTiles^[I] - Tiles);
     Sel := H;
     J := I;
   End
@@ -39621,11 +40413,11 @@ Begin
   Begin
     Sel := SelAlloc(Tiles);
     If Sel = 0 Then Exit;
-    SelFree(H, GTiles[I]);
+    SelFree(H, GTiles^[I]);
     J := Sel Shr 3;
   End;
   GDescs(J, Lin, Size, Tiles, Acc);
-  GSize[J] := Size; GTiles[J] := Tiles; GLin[J] := Lin;
+  GSize^[J] := Size; GTiles^[J] := Tiles; GLin^[J] := Lin;
   GReAlloc16 := Sel;
 End;
 
@@ -39634,12 +40426,12 @@ Procedure GFreeOwner(Own : LongInt);
 Var I : LongInt;
 Begin
   For I := 1 To LdtMax - 1 Do
-    If LdtUsed[I] And (GOwner[I] = Own) Then
+    If LdtUsed[I] And (GOwner^[I] = Own) Then
     Begin
-      If GTiles[I] > 0 Then KFree(GLin[I]);
+      If GTiles^[I] > 0 Then KFree(GLin^[I]);
       LdtUsed[I] := False;
       Ldt[I * 2] := 0; Ldt[I * 2 + 1] := 0;
-      GTiles[I] := 0;
+      GTiles^[I] := 0;
     End;
 End;
 
@@ -39887,6 +40679,13 @@ End;
 Procedure InitW16;
 Var B, I, A : LongInt;
 Begin
+  A := HeapOwner; HeapOwner := 0;
+  GSize := PLdtArr(KAlloc(LdtMax * 4));
+  GTiles := PLdtArr(KAlloc(LdtMax * 4));
+  GLin := PLdtArr(KAlloc(LdtMax * 4));
+  GOwner := PLdtArr(KAlloc(LdtMax * 4));
+  GLock := PLdtArr(KAlloc(LdtMax * 4));
+  HeapOwner := A;
   { TSS : pile de l'anneau 0 (SS0 = 10h), pas de table d'E/S }
   FillMem(LongInt(@Tss), 128, 0);
   TssBase := LongInt(@Tss);
@@ -39916,7 +40715,7 @@ Begin
   { segment des souches 16 bits (une souche de 16 octets par API) }
   W16ThunkSel := GAlloc16($10000, True);
   W16ThunkLin := SelBase(W16ThunkSel);
-  GOwner[W16ThunkSel Shr 3] := 0;
+  GOwner^[W16ThunkSel Shr 3] := 0;
   A := W16ThunkLin + W16CbOfs;
   PutB(A, $9A); PutB(A, 0); PutB(A, 0);             { call far 4Bh:0 }
   PutB(A, SelGateCb); PutB(A, 0);
@@ -41897,7 +42696,7 @@ Begin
     1020 :
     Begin
       K := GIdx(A(1));
-      If K >= 0 Then SetDXAX(GSize[K]);
+      If K >= 0 Then SetDXAX(GSize^[K]);
     End;
     1021 : SetDXAX(MakeFar(A(1), A(1)));
     1022 : SetAX(0);
@@ -42016,7 +42815,14 @@ Begin
       SetRegW(12, S);
       SetRegW(16, 0);
       SetRegW(4, T16Psp[CurT]);
-      SetRegW(28, $81);
+      { ES:BX : ligne de commande, sans les espaces du debut (comme
+        Windows : l'amorce d'Office teste lpCmdLine[0] = '/' pour
+        Acme.exe /w Off97Pro.STF) }
+      P := SelBase(T16Psp[CurT]) + $81;
+      N := 0;
+      While (N < 126) And ((Mem[0:P + N] = 32) Or (Mem[0:P + N] = 9)) Do
+        Inc(N);
+      SetRegW(28, $81 + N);
       If T16Show[CurT] = 0 Then T16Show[CurT] := 1;
       SetRegW(32, T16Show[CurT]);
     End;
@@ -42380,7 +43186,9 @@ End;
 Procedure W16Init2;
 Var P, N : LongInt;
 Begin
-  W16Trace := False;
+  { SET W16TRACE=1 (AUTOEXEC.BAT) : journal des appels INT 21h des
+    programmes Windows 3.x }
+  W16Trace := EnvFind('W16TRACE', P);
   WinIni := 'C:\WINDOWS\WIN.INI';
   WinDirZ := 'C:\WINDOWS';
   SysDirZ := 'C:\WINDOWS\SYSTEM';
@@ -42388,7 +43196,7 @@ Begin
   N := 0;
   While (MemW[0:P + N] <> 0) And (N < 4000) Do Inc(N);
   W16Env := GAlloc16(N + 64, False);
-  GOwner[W16Env Shr 3] := 0;
+  GOwner^[W16Env Shr 3] := 0;
   MoveMem(P, SelBase(W16Env), N + 2);
   SetGate($21, LongInt(@Int21Gate));
   SetGate($2F, LongInt(@Int2FGate));
@@ -67651,14 +68459,18 @@ Begin
 End;
 
 Function CreateIconFromResource(Bits, N, Icon, Ver : LongInt) : LongInt;
+Var H : LongInt;
 Begin
-  CreateIconFromResource := LoadIconA(0, 32512);
+  H := 0;
+  If Icon <> 0 Then H := IconNew(Bits);
+  If H = 0 Then H := LoadIconA(0, 32512);
+  CreateIconFromResource := H;
 End;
 
 Function CreateIconFromResourceEx(Bits, N, Icon, Ver, CX, CY, Fl
   : LongInt) : LongInt;
 Begin
-  CreateIconFromResourceEx := LoadIconA(0, 32512);
+  CreateIconFromResourceEx := CreateIconFromResource(Bits, N, Icon, Ver);
 End;
 
 { metafichiers (WMF et EMF) : non geres ; un appel echoue proprement }
@@ -68652,8 +69464,18 @@ End;
 
 Function DrawIconEx(Hdc, X, Y, Icon, CX, CY, Step, Br, Fl : LongInt)
   : LongInt;
+Var D : LongInt;
 Begin
-  DrawIconEx := DrawIcon(Hdc, X, Y, Icon);
+  DrawIconEx := 1;
+  If (CX = 0) And (CY = 0) Then
+  Begin
+    DrawIconEx := DrawIcon(Hdc, X, Y, Icon);
+    Exit;
+  End;
+  D := DcOf(Hdc);
+  If Not DcBegin(D) Then Exit;
+  IconPaint(Icon, X, Y, CX, CY, True);
+  DcDirty(X, Y, X + CX, Y + CY);
 End;
 
 { DrawState : texte (DST_TEXT 1, DST_PREFIXTEXT 2), icone (3), bitmap (4)
@@ -77568,7 +78390,7 @@ Begin
   If S = 0 Then Exit;
   For I := 0 To N - 1 Do
   Begin
-    GOwner[(S Shr 3) + I] := DpOwner;
+    GOwner^[(S Shr 3) + I] := DpOwner;
     VmDescSet((S Shr 3) + I, Base + I * $10000, Limit, Acc);
   End;
 End;
@@ -77577,7 +78399,7 @@ Function VmSelOwn(S : LongInt) : Boolean;
 Var I : LongInt;
 Begin
   I := VmDescI(S);
-  VmSelOwn := (I > 0) And (GOwner[I] = DpOwner);
+  VmSelOwn := (I > 0) And (GOwner^[I] = DpOwner);
 End;
 
 { Adresse (noyau) d'une adresse lineaire du client : le premier Mo est
@@ -77869,7 +78691,7 @@ Var I : LongInt;
 Begin
   If Not VmDpmi Then Exit;
   For I := 1 To LdtMax - 1 Do
-    If LdtUsed[I] And (GOwner[I] = DpOwner) Then SelFree((I Shl 3) Or 7, 1);
+    If LdtUsed[I] And (GOwner^[I] = DpOwner) Then SelFree((I Shl 3) Or 7, 1);
   For I := 0 To 63 Do
     If VmMbBlk[I] <> 0 Then
     Begin
@@ -80625,7 +81447,7 @@ Begin
     End;
     For I := 0 To MaxWnd - 1 Do
       If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].IKind <> ikNone) And
-         HasUpdate(I) And Not LbOwner(I) Then DrawCtl(I);
+         HasUpdate(I) And Not CtlOwner(I) Then DrawCtl(I);
     FlushScreen;
     ReapThreads;
     Busy := False;
@@ -80641,6 +81463,9 @@ BEGIN
   SerialInit;
   LogOn := True;
   KLog('VMM32.VXD : Pasdows 95 ' + KVersion);
+  { (R), (TM) et (C) dans la police de l'ecran (places 9Eh, 9Fh, A9h) }
+  MoveMem(LongInt(@ExtraGlyph[0]), FontAddr + $9E * 16, 32);
+  MoveMem(LongInt(@ExtraGlyph[32]), FontAddr + $A9 * 16, 16);
   InitGdt;
   InitPic;
   InitIdt;
@@ -80803,6 +81628,7 @@ BEGIN
   If ApiTrace Then TraceInit;
   RegInit;
   RegLoad;
+  WinInitRun;
   BootStep(5);
   InitW16;
   InitW16Apis;
