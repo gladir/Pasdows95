@@ -70,7 +70,7 @@ Const
   SecSeg    = $8100;
   ValSeg    = $8140;
   MftSeg    = $5000;
-  CdMax     = 48;
+  CdMax     = 128;
   MinMb     = 40;                    { FAT32 : au moins 65525 grappes }
   { systemes de fichiers : FAT16, FAT32 (defaut), NTFS ; taille
     minimale et maximale (Mo) }
@@ -628,9 +628,12 @@ Var
   PartLba, PartSecs : LongInt;
   Spc         : Integer;
   FatSz, FatLba, DataLba, NextClus, TotClus : LongInt;
-  EndClus     : Array[0..63] Of LongInt;
+  EndClus     : Array[0..255] Of LongInt;
   EndCnt      : Integer;
-  RootEnt, WinEnt : Array[0..23] Of TDirEnt;
+  { racine : 2 Ko (63 entrees et l'etiquette) ; C:\WINDOWS : 4 Ko
+    (128 entrees dont . et ..) }
+  RootEnt     : Array[0..47] Of TDirEnt;
+  WinEnt      : Array[0..125] Of TDirEnt;
   RootN, WinN : Integer;
   DosDate, DosTime : Word;
   DoneBytes, TotalBytes : LongInt;
@@ -653,9 +656,9 @@ Var
   KRec, KSeq, KPar, KPSeq, KAll, KSiz, KFl : Array[0..39] Of LongInt;
   KNm         : Array[0..39] Of String[12];
   NfN         : Integer;
-  NfName      : Array[0..31] Of String[12];
-  NfRoot      : Array[0..31] Of Boolean;
-  NfRec, NfLcn, NfClus, NfSize, NfFl : Array[0..31] Of LongInt;
+  NfName      : Array[0..35] Of String[12];
+  NfRoot      : Array[0..35] Of Boolean;
+  NfRec, NfLcn, NfClus, NfSize, NfFl : Array[0..35] Of LongInt;
 
 { ================================================================== }
 { Utilitaires (repris d'IO.SYS)                                      }
@@ -3207,7 +3210,7 @@ Begin
   K := (N + LongInt(Spc) * 512 - 1) Div (LongInt(Spc) * 512);
   AllocBytes := NextClus;
   NextClus := NextClus + K;
-  If EndCnt < 64 Then
+  If EndCnt < 256 Then
   Begin
     EndClus[EndCnt] := NextClus - 1;
     Inc(EndCnt);
@@ -3393,19 +3396,39 @@ Begin
   Name83 := B + E;
 End;
 
+{ plus de place dans un repertoire ou dans la MFT : l'installation
+  echoue au lieu d'oublier des fichiers (VMM32.VXD...) }
+Procedure TooMany;
+Begin
+  If InstErr = '' Then
+    InstErr := L('Trop de fichiers pour le r'#130'pertoire C:\WINDOWS.',
+                 'Too many files for the C:\WINDOWS folder.',
+                 'Zu viele Dateien f'#129'r C:\WINDOWS.',
+                 'Troppi file per la cartella C:\WINDOWS.',
+                 'Demasiados archivos para C:\WINDOWS.');
+End;
+
 Procedure AddEnt(InRoot : Boolean; Const N : String; A : Byte;
                  C, Sz : LongInt);
 Begin
   If InRoot Then
   Begin
-    If RootN > 23 Then Exit;
+    If RootN > 47 Then
+    Begin
+      TooMany;
+      Exit;
+    End;
     RootEnt[RootN].Name := Name83(N); RootEnt[RootN].Attr := A;
     RootEnt[RootN].Clus := C; RootEnt[RootN].Size := Sz;
     Inc(RootN);
   End
   Else
   Begin
-    If WinN > 23 Then Exit;
+    If WinN > 125 Then
+    Begin
+      TooMany;
+      Exit;
+    End;
     WinEnt[WinN].Name := Name83(N); WinEnt[WinN].Attr := A;
     WinEnt[WinN].Clus := C; WinEnt[WinN].Size := Sz;
     Inc(WinN);
@@ -4053,7 +4076,12 @@ Function NtCopy(Idx : Integer; Const Nm : String; InRoot : Boolean;
 Var Lcn, Clus, Size, Rem, K, Bytes : LongInt; N : Integer;
 Begin
   NtCopy := False;
-  If NfN > 31 Then Exit;
+  { enregistrements 28 a 63 de la MFT }
+  If NfN > 35 Then
+  Begin
+    TooMany;
+    Exit;
+  End;
   If Idx >= 0 Then Size := CdFiles[Idx].Size Else Size := GenLen;
   Clus := (Size + 4095) Div 4096;
   Lcn := NtAlloc(Clus);
@@ -5122,7 +5150,7 @@ Begin
     N := CdFiles[I].Name;
     If Not CdFiles[I].Dir And WantFile(N) And (N <> 'IO.SYS') And
        (N <> 'COMMAND.EXE') Then
-      If Not CopyCdFile(I, False, $20) Then
+      If Not CopyCdFile(I, False, $20) Or (InstErr <> '') Then
       Begin
         If InstErr = '' Then InstErr := DiskErr;
         Exit;
