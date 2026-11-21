@@ -26,6 +26,10 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>APPS/WINHLP32.PAS</b></td><td><b>Aide de Windows</b> (WINHLP32.EXE, compilé par <b>WPC -CW32</b>) : visionneuse des fichiers d'aide <b>.HLP</b> de Windows 3.1 et 4.0, voir la section <a href="#aide">Aide de Windows</a>.</td></tr>
 	<tr><td><b>APPS/FREECELL.PAS</b></td><td><b>FreeCell</b> (FREECELL.EXE, compilé par <b>WPC -CW32</b>) : le jeu FREECELL.PAS du projet <a href="https://github.com/gladir/OS2-0">OS2-0</a> converti des API d'OS/2 (PMWIN, PMGPI) aux API de Windows (USER32, GDI32), voir la section <a href="#freecell">FreeCell</a>.</td></tr>
 	<tr><td><b>APPS/CHARMAP.PAS</b></td><td><b>Table de caractères</b> comme celle de Windows 95 (CHARMAP.EXE, compilé par <b>WPC -CW32</b>), voir la section <a href="#charmap">Table de caractères</a>.</td></tr>
+	<tr><td><b>APPS/CDPLAYER.PAS</b></td><td><b>Lecteur CD</b> (CDPLAYER.EXE, compilé par <b>WPC -CW32</b>) par MCI cdaudio, voir la section <a href="#lecteurcd">Lecteur CD</a>.</td></tr>
+	<tr><td><b>APPS/FINDFILE.PAS</b></td><td><b>Rechercher</b> (FINDFILE.EXE) : fichiers ou dossiers, et ordinateur (/C), voir la section <a href="#rechercher">Rechercher</a>.</td></tr>
+	<tr><td><b>APPS/IMAGING.PAS</b></td><td><b>Imaging</b> (IMAGING.EXE) : visionneuse TIFF (plusieurs pages), BMP, GIF, PNG et JPEG, voir la section <a href="#imaging">Imaging</a>.</td></tr>
+	<tr><td><b>APPS/WAB.PAS</b></td><td><b>Carnet d'adresses</b> (WAB.EXE), voir la section <a href="#carnet">Carnet d'adresses</a>.</td></tr>
 	<tr><td><b>APPS/MP3PLAY.PAS</b></td><td><b>Lecteur MP3</b> (MP3PLAY.EXE, compilé par <b>WPC -CW32</b>) : le lecteur MP3PLAY.PAS du projet <a href="https://github.com/gladir/OS2-0">OS2-0</a> converti des API d'OS/2 (MDM, PMWIN, PMGPI, DOSCALLS) aux API de Windows (WINMM, USER32, GDI32, KERNEL32), voir la section <a href="#mp3">Lecteur MP3</a>.</td></tr>
 	<tr><td><b>EXAMPLES/HTTPGET.PAS</b></td><td>Exemple Win32 en mode console (HTTPGET.EXE) : télécharge une adresse <b>http://</b> ou <b>https://</b> avec WININET (<i>HTTPGET url [fichier]</i>), voir la section <a href="#https">HTTPS</a>.</td></tr>
 	<tr><td><b>EXAMPLES/HELLO.PAS</b></td><td>Exemple de programme Windows 95 (Win32, unité Graph) compilé par <b>WPC -CW32</b> en HELLO.EXE.</td></tr>
@@ -177,19 +181,59 @@ La liste est relue toutes les deux secondes : un logiciel installé ou supprimé
 
 <h2 id="accessoires">Menu Démarrer : Accessoires</h2>
 
-Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Accessoires</b>, suivi de l'Explorateur Pasdows et de l'Invite MS-DOS ; viennent ensuite les autres programmes du dossier du système. Les programmes de Pasdows déjà présents dans les menus (Calculatrice, Navigateur Web, Lecteur MP3, FreeCell, Table de caractères, Aide, Ajout/Suppression de programmes, Gestionnaire des tâches) n'y sont plus répétés, ni sur le bureau.
+Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Accessoires</b>, suivi de l'Explorateur Pasdows et de l'Invite MS-DOS ; viennent ensuite les autres programmes du dossier du système. Les programmes de Pasdows déjà présents dans les menus (Calculatrice, Navigateur Web, Lecteur MP3, Lecteur CD, FreeCell, Table de caractères, Carnet d'adresses, Imaging, Rechercher, Aide, Ajout/Suppression de programmes, Gestionnaire des tâches, programmes d'essai) n'y sont plus répétés, ni sur le bureau.
 
 <ul>
-	<li><b>Accessoires</b> : les groupes <b>Jeux</b>, <b>Multimédia</b> et <b>Outils Internet</b>, puis Bloc-notes, Calculatrice, Paint et <b>Table de caractères</b> ;</li>
+	<li><b>Accessoires</b> : les groupes <b>Jeux</b>, <b>Multimédia</b>, <b>Outils Internet</b> et <b>Outils système</b>, puis Bloc-notes, Calculatrice, <b>Carnet d'adresses</b>, <b>Imaging</b>, Paint et <b>Table de caractères</b> ;</li>
 	<li><b>Jeux</b> : <b>FreeCell</b> ;</li>
-	<li><b>Multimédia</b> : <b>Lecteur MP3</b> et Contrôle du volume ;</li>
-	<li><b>Outils Internet</b> : Navigateur Web.</li>
+	<li><b>Multimédia</b> : <b>Lecteur CD</b>, <b>Lecteur MP3</b>, Contrôle du volume, puis les programmes DirectX installés : Outil de diagnostic DirectX (DXDIAG), DDTEST, D3DTEST, D3D8TEST et GLTEST ;</li>
+	<li><b>Outils Internet</b> : Navigateur Web, puis NETTEST et HTTPGET s'ils sont installés ;</li>
+	<li><b>Outils système</b> : ScanDisk (vérification du disque C:), Gestionnaire des tâches, puis FATTEST, PROCTEST et HELLO s'ils sont installés.</li>
 </ul>
 
-Un sous-menu qui n'a plus de place à droite de l'écran s'ouvre à gauche de son menu, comme sous Windows. <i>Exécuter</i> reconnaît aussi « notepad » (et « notepad fichier »).
+Le menu Démarrer a aussi <b>Rechercher</b>, avec <i>Fichiers ou dossiers...</i> et <i>Ordinateur...</i> (voir <a href="#rechercher">Rechercher</a>). Chaque programme a son icône : cartes à jouer pour FreeCell, bloc-notes à spirale, disque compact, carnet, image, loupe, grille de caractères... Un sous-menu qui n'a plus de place à droite de l'écran s'ouvre à gauche de son menu, comme sous Windows. <i>Exécuter</i> reconnaît aussi « notepad » (et « notepad fichier »).
+
+Dans les fenêtres des programmes (et les boîtes de dialogue), <b>Tab</b> et <b>Maj+Tab</b> passent d'un contrôle à l'autre (ceux qui ont WS_TABSTOP, dans l'ordre de création) ; <b>ShellExecute</b> ouvre un dossier dans l'Explorateur et un document selon son extension (Aide pour .HLP, Lecteur MP3, Imaging pour les images, sinon le Bloc-notes), comme un double clic dans l'Explorateur.
 
 <table>
-	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_ACCESSOIRES.png" width="400" alt="Démarrer, Programmes, Accessoires, Jeux"><br><i>Démarrer, Programmes, Accessoires, Jeux, FreeCell</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CHARMAP.png" width="400" alt="Table de caractères"><br><i>Table de caractères : caractère agrandi, frappe Alt+0233</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_ACCESSOIRES.png" width="400" alt="Démarrer, Programmes, Accessoires, Jeux"><br><i>Démarrer, Programmes, Accessoires, Jeux, FreeCell</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_MULTIMEDIA.png" width="400" alt="Démarrer, Programmes, Accessoires, Multimédia"><br><i>Accessoires, Multimédia : Lecteur CD, Lecteur MP3, DirectX</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CHARMAP.png" width="400" alt="Table de caractères"><br><i>Table de caractères : caractère agrandi, frappe Alt+0233</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_RECHERCHER.png" width="400" alt="Démarrer, Rechercher"><br><i>Démarrer, Rechercher</i></td></tr>
+</table>
+
+<h2 id="rechercher">Rechercher</h2>
+
+<b>APPS/FINDFILE.PAS</b> (FINDFILE.EXE, <i>Démarrer, Rechercher, Fichiers ou dossiers...</i>) reprend la boîte <i>Rechercher : Tous les fichiers</i> de Windows 95 :
+<ul>
+	<li><b>Nommé</b> : un ou plusieurs modèles (<b>*</b> et <b>?</b>) séparés par ; ou , ; sans joker, le nom doit contenir le texte (« note » trouve NOTE.TXT et BLOCNOTE.EXE) ;</li>
+	<li><b>Contenant le texte</b> : le contenu des fichiers est lu par morceaux (sans tenir compte de la casse, sauf <i>Options, Respecter la casse</i>) ;</li>
+	<li><b>Rechercher dans</b> : un ou plusieurs dossiers séparés par ; ; <i>Parcourir...</i> propose les lecteurs, C:\WINDOWS et « tous les disques durs » ; <b>Inclure les sous-dossiers</b> ;</li>
+	<li>la recherche avance par petits morceaux (la fenêtre reste utilisable, la barre d'état montre le dossier parcouru), <b>Arrêter</b> ou Échap l'interrompent, <b>Nouvelle recherche</b> vide les champs ;</li>
+	<li>résultats : Nom, Dans le dossier, Taille, Type, Modifié, triés en cliquant sur l'en-tête ; double clic ou Entrée ouvrent l'élément (ShellExecute), le clic droit donne Ouvrir, Ouvrir le dossier contenant et Copier le chemin ; <i>Fichier, Enregistrer les résultats</i> écrit C:\RECHERCH.TXT.</li>
+</ul>
+<i>Démarrer, Rechercher, Ordinateur...</i> lance <b>FINDFILE /C</b> : le nom est résolu par <b>gethostbyname</b> (DNS de la pile TCP/IP de Pasdows) et le poste lui-même par GetComputerName ; la liste donne le nom, l'emplacement et l'adresse IP.
+
+<h2 id="carnet">Carnet d'adresses</h2>
+
+<b>APPS/WAB.PAS</b> (WAB.EXE, <i>Démarrer, Programmes, Accessoires, Carnet d'adresses</i>) : liste des contacts (Nom, Adresse de messagerie, téléphones au bureau et au domicile) triée par nom, prénom ou adresse (<i>Affichage</i>) ; la zone « Tapez le nom ou sélectionnez-le dans la liste » choisit le premier contact qui commence ainsi. <b>Nouveau contact</b> (Ctrl+N), <b>Propriétés</b> (double clic ou Entrée) et <b>Supprimer</b> (Suppr) ; la fiche a le prénom, le nom, l'adresse de messagerie, les téléphones (domicile, bureau, mobile), l'adresse, la ville, le code postal, le pays, la société, la fonction et des remarques. <i>Fichier, Importer</i> et <i>Exporter</i> lisent et écrivent un fichier texte <b>CSV</b> (entête, guillemets ; virgule ou point-virgule à l'importation, entêtes français ou anglais reconnus) ; <i>Edition, Copier</i> met la fiche en texte dans le presse-papiers. Le carnet est gardé dans <b>CARNET.WAB</b> (un contact par ligne, champs séparés par des tabulations) dans le dossier du programme.
+
+<h2 id="imaging">Imaging</h2>
+
+<b>APPS/IMAGING.PAS</b> (IMAGING.EXE, <i>Démarrer, Programmes, Accessoires, Imaging</i>, ou double clic sur une image dans l'Explorateur) est la visionneuse d'images de Windows 95 :
+<ul>
+	<li>formats : <b>TIFF</b> (non compressé, PackBits, LZW avec ou sans prédicteur ; 1, 4 et 8 bits gris ou palette, 24 et 32 bits ; <b>plusieurs pages</b>), BMP, GIF, PNG et JPEG (décodeurs du Navigateur Web) ;</li>
+	<li>barre d'outils : Ouvrir, Zoom +, Zoom -, Ajuster, 100 %, Pivoter G, Pivoter D, &lt; Page, Page &gt; ; menus <i>Zoom</i> (avant, arrière, ajuster à la fenêtre ou à la largeur, taille réelle, 25 à 400 %), <i>Image</i> (pivoter à gauche, à droite, de 180 degrés, miroir) et <i>Page</i> (première, précédente, suivante, dernière) ;</li>
+	<li>barres de défilement et flèches quand l'image dépasse la fenêtre ; barre d'état : page, zoom, dimensions et format ;</li>
+	<li><i>Fichier, Enregistrer sous</i> : BMP 24 bits ; <i>Propriétés</i> : format, taille du fichier, dimensions, nombre de pages.</li>
+</ul>
+
+<h2 id="lecteurcd">Lecteur CD</h2>
+
+<b>APPS/CDPLAYER.PAS</b> (CDPLAYER.EXE, <i>Démarrer, Programmes, Accessoires, Multimédia, Lecteur CD</i>) : afficheur à sept segments (temps écoulé ou restant de la piste ou du disque, menu <i>Affichage</i>), boutons Lecture, Pause, Arrêt, piste précédente, retour et avance rapides, piste suivante et Éjecter, champs Artiste, Titre et Piste (un clic sur Piste donne la liste des pistes), <i>Options</i> : ordre aléatoire, lecture continue et Intro (10 secondes de chaque piste). Il passe par <b>MCI</b> : le noyau a maintenant le périphérique <b>cdaudio</b> de WINMM (<b>mciSendString</b> : open, close, play from/to, stop, pause, resume, seek, set time format ms/msf/tmsf, set door open/closed, status mode, media present, number of tracks, current track, length, position, type track ; <b>mciSendCommand</b> : MCI_OPEN, PLAY, SEEK, STOP, PAUSE, RESUME, SET, STATUS et MM_MCINOTIFY). La table des matières est lue par la commande ATAPI READ TOC ; la musique est lue <i>numériquement</i> (READ CD, secteurs CD-DA de 2352 octets) et jouée par la carte son (Sound Blaster, AC'97, HD Audio ou ES1370), comme le « CD digital audio » de Windows. QEMU n'émule pas les CD audio (seulement la piste de données) : un CD de données montre « Disque de données ».
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/RECHERCHER.png" width="400" alt="Rechercher : Tous les fichiers"><br><i>Rechercher : *.TXT contenant « pasdows »</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CARNET_ADRESSES.png" width="400" alt="Carnet d'adresses"><br><i>Carnet d'adresses</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CARNET_FICHE.png" width="400" alt="Fiche d'un contact"><br><i>Carnet d'adresses : nouveau contact (Tab d'un champ à l'autre)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/IMAGING.png" width="400" alt="Imaging"><br><i>Imaging : image JPEG ajustée à la fenêtre</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/LECTEUR_CD.png" width="400" alt="Lecteur CD"><br><i>Lecteur CD (ici avec le CD de données de Pasdows)</i></td><td></td></tr>
 </table>
 
 <h2 id="charmap">Table de caractères</h2>

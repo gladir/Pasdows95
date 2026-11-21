@@ -8258,6 +8258,8 @@ Const
   icQuestion = 29; icSpeaker  = 30; icMute     = 31; icSound    = 32;
   icKeyboard = 33; icMouse    = 34; icNet      = 35; icPort     = 36;
   icChip     = 37; icDiskCtl  = 38; icWeb      = 39;
+  icCards    = 40; icAddress  = 41; icImaging  = 42; icCdPlayer = 43;
+  icFind     = 44; icScanDisk = 45; icDxDiag   = 46; icCharMap  = 47;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9697,15 +9699,114 @@ Begin
       QR(6, 18, 12, 19, cSilver);
       QR(14, 18, 16, 19, cWhite);
     End;
-    icNotepad, icText :
+    icText :
     Begin
       IconPage;
       For I := 0 To 4 Do QR(9, 10 + I * 4, 22, 10 + I * 4, cGray);
-      If Id = icNotepad Then
+    End;
+    icNotepad :
+    Begin
+      { bloc-notes a spirale : couverture bleue, anneaux, page lignee }
+      IFrame(5, 5, 27, 30, cWhite);
+      QR(26, 7, 27, 30, cSilver);
+      IFrame(5, 4, 27, 9, cBlue);
+      QR(6, 5, 26, 5, cAqua);
+      For I := 0 To 4 Do
       Begin
-        QR(6, 2, 25, 5, cNavy);
-        For I := 0 To 4 Do QR(8 + I * 4, 1, 8 + I * 4, 4, cSilver);
+        QR(8 + I * 4, 1, 9 + I * 4, 7, cBlack);
+        QR(8 + I * 4, 1, 8 + I * 4, 3, cWhite);
       End;
+      For I := 0 To 4 Do QR(8, 13 + I * 4, 23, 13 + I * 4, cBlue);
+      QR(10, 11, 10, 28, cRed);
+    End;
+    icCards :
+    Begin
+      { deux cartes : un dos bleu, un as de coeur }
+      IFrame(3, 2, 18, 23, cNavy);
+      QR(5, 4, 16, 21, cBlue);
+      For I := 0 To 3 Do QL(5, 6 + I * 4, 16, 17 + I * 4 - 11, cAqua);
+      IFrame(12, 8, 28, 30, cWhite);
+      QD(17, 16, 3, cRed); QD(23, 16, 3, cRed);
+      For I := 0 To 6 Do QR(14 + I, 17 + I, 26 - I, 17 + I, cRed);
+      QR(14, 10, 15, 12, cRed);
+    End;
+    icAddress :
+    Begin
+      { carnet : couverture, dos, onglets et personne }
+      IFrame(5, 3, 26, 29, cNavy);
+      QR(6, 4, 9, 28, cBlue);
+      For I := 0 To 2 Do QR(27, 6 + I * 7, 29, 10 + I * 7, cRed + I);
+      QR(27, 13, 29, 17, cYellow); QR(27, 20, 29, 24, cLime);
+      QD(18, 13, 3, cYellow);
+      QR(13, 18, 23, 24, cYellow);
+      QB(12, 7, 24, 26, cAqua);
+    End;
+    icImaging :
+    Begin
+      { image encadree : ciel, soleil, collines }
+      IFrame(2, 5, 29, 27, cSilver);
+      QR(5, 8, 26, 24, cAqua);
+      QD(21, 12, 3, cYellow);
+      For I := 0 To 7 Do QR(5 + I, 24 - I, 19 - I, 24 - I, cGreen);
+      QR(14, 19, 26, 24, cGreen);
+      QB(5, 8, 26, 24, cGray);
+    End;
+    icCdPlayer :
+    Begin
+      QD(14, 15, 12, cSilver);
+      QC(14, 15, 12, cGray);
+      QC(14, 15, 8, cAqua);
+      QD(14, 15, 3, cWhite);
+      QC(14, 15, 3, cGray);
+      For I := 0 To 8 Do
+        QR(20, 18 + I, 20 + Min(I, 8 - I) * 2, 18 + I, cLime);
+      QL(20, 18, 28, 22, cBlack); QL(28, 22, 20, 26, cBlack);
+      QR(20, 18, 20, 26, cBlack);
+    End;
+    icFind :
+    Begin
+      IconPage;
+      For I := 0 To 3 Do QR(9, 10 + I * 4, 18, 10 + I * 4, cGray);
+      QD(17, 17, 7, cAqua);
+      QC(17, 17, 7, cBlack);
+      QR(14, 13, 16, 15, cWhite);
+      QL(22, 22, 29, 29, cBlack); QL(23, 22, 30, 29, cBlack);
+      QL(22, 23, 29, 30, cBlack);
+    End;
+    icScanDisk :
+    Begin
+      IFrame(2, 17, 25, 27, cSilver);
+      QR(3, 18, 24, 18, cWhite);
+      QR(5, 23, 11, 24, cGray);
+      QR(20, 23, 22, 24, cLime);
+      QD(20, 10, 7, cAqua);
+      QC(20, 10, 7, cBlack);
+      QL(16, 11, 19, 14, cGreen); QL(19, 14, 25, 6, cGreen);
+      QL(16, 12, 19, 15, cGreen); QL(19, 15, 25, 7, cGreen);
+    End;
+    icCharMap :
+    Begin
+      { grille de caracteres, une case choisie }
+      IFrame(3, 5, 27, 29, cWhite);
+      For I := 1 To 3 Do
+      Begin
+        QR(3 + I * 6, 6, 3 + I * 6, 28, cGray);
+        QR(4, 5 + I * 6, 26, 5 + I * 6, cGray);
+      End;
+      For I := 0 To 15 Do
+        If I <> 6 Then
+          QR(5 + (I Mod 4) * 6, 7 + (I Div 4) * 6,
+             7 + (I Mod 4) * 6, 9 + (I Div 4) * 6 - (I Mod 2), cBlack);
+      QR(16, 12, 20, 16, cNavy);
+      QR(17, 13, 19, 15, cWhite);
+      QR(18, 13, 18, 13, cNavy);
+    End;
+    icDxDiag :
+    Begin
+      IconMonitor(cNavy);
+      IFrame(2, 25, 29, 29, cSilver);
+      QL(10, 7, 21, 15, cYellow); QL(11, 7, 22, 15, cYellow);
+      QL(21, 7, 10, 15, cYellow); QL(22, 7, 11, 15, cYellow);
     End;
     icCalc :
     Begin
@@ -13568,7 +13669,9 @@ Const
   cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
   cmCalc = 28; cmBrowser = 29; cmMp3Play = 59; cmFreeCell = 60;
-  cmCharMap = 61;
+  cmCharMap = 61; cmCdPlayer = 62; cmWab = 63; cmImaging = 64;
+  cmFindFiles = 65; cmFindComp = 66; cmScanDisk = 67;
+  cmKnownBase = 900;                 { + programme connu (KnownExe) }
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -13596,7 +13699,7 @@ Const
   mnConSys = 21; mnConEdit = 22;  { menus de l'Invite MS-DOS }
   mnSysGen = 23;                  { menu systeme (icone du titre) }
   mnAccess = 24; mnGames = 25;    { Programmes, Accessoires, Jeux... }
-  mnMedia = 26; mnInet = 27;
+  mnMedia = 26; mnInet = 27; mnTools = 28; mnFind = 29;
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -13703,6 +13806,15 @@ Var
   ExePaths  : Array[0..15] Of String[63];
   ExeCnt    : LongInt;
   NoteBuf   : LongInt;
+
+{ Lancer un programme du systeme ; sinon : introuvable }
+Procedure RunSys(Const Exe, Args, Title : String);
+Begin
+  If Not RunExe(Exe, Args) Then
+    MsgBoxOpen(Title, Exe + L(' est introuvable.', ' cannot be found.',
+               ' wurde nicht gefunden.', ' non trovato.', ' no se encuentra.'),
+               $10);
+End;
 
 Procedure KCommand(Cmd : LongInt); Forward;
 Procedure NetConfigBox; Forward;
@@ -13824,20 +13936,127 @@ Begin
   SysEntry := True;
 End;
 
+{ Programmes d'essai et outils du CD-ROM, ranges dans les groupes des
+  Accessoires (M Multimedia, I Outils Internet, S Outils systeme) s'ils
+  sont dans le dossier du systeme }
+Const
+  KnownN = 10;
+  KnownExe : Array[0..KnownN - 1] Of String[12] = ('DXDIAG.EXE',
+    'DDTEST.EXE', 'D3DTEST.EXE', 'D3D8TEST.EXE', 'GLTEST.EXE',
+    'NETTEST.EXE', 'HTTPGET.EXE', 'FATTEST.EXE', 'PROCTEST.EXE',
+    'HELLO.EXE');
+  KnownGrp : Array[0..KnownN - 1] Of Char = ('M', 'M', 'M', 'M', 'M', 'I',
+    'I', 'S', 'S', 'S');
+
+Var
+  KnownHere : Array[0..KnownN - 1] Of Boolean;
+
+Function KnownTitle(K : LongInt) : String;
+Begin
+  Case K Of
+    0 : KnownTitle := L('Outil de diagnostic DirectX', 'DirectX Diagnostic ' +
+                        'Tool', 'DirectX-Diagnoseprogramm',
+                        'Strumento di diagnostica DirectX',
+                        'Herramienta de diagn'#162'stico de DirectX');
+    1 : KnownTitle := L('Essai DirectDraw (DDTEST)', 'DirectDraw Test ' +
+                        '(DDTEST)', 'DirectDraw-Test (DDTEST)',
+                        'Prova DirectDraw (DDTEST)',
+                        'Prueba DirectDraw (DDTEST)');
+    2 : KnownTitle := L('Essai Direct3D (D3DTEST)', 'Direct3D Test ' +
+                        '(D3DTEST)', 'Direct3D-Test (D3DTEST)',
+                        'Prova Direct3D (D3DTEST)',
+                        'Prueba Direct3D (D3DTEST)');
+    3 : KnownTitle := L('Essai Direct3D 8 (D3D8TEST)', 'Direct3D 8 Test ' +
+                        '(D3D8TEST)', 'Direct3D-8-Test (D3D8TEST)',
+                        'Prova Direct3D 8 (D3D8TEST)',
+                        'Prueba Direct3D 8 (D3D8TEST)');
+    4 : KnownTitle := L('Essai OpenGL (GLTEST)', 'OpenGL Test (GLTEST)',
+                        'OpenGL-Test (GLTEST)', 'Prova OpenGL (GLTEST)',
+                        'Prueba OpenGL (GLTEST)');
+    5 : KnownTitle := L('Essai du r'#130'seau (NETTEST)', 'Network Test ' +
+                        '(NETTEST)', 'Netzwerktest (NETTEST)',
+                        'Prova della rete (NETTEST)',
+                        'Prueba de red (NETTEST)');
+    6 : KnownTitle := L('T'#130'l'#130'chargement HTTP (HTTPGET)',
+                        'HTTP Download (HTTPGET)', 'HTTP-Download (HTTPGET)',
+                        'Scaricamento HTTP (HTTPGET)',
+                        'Descarga HTTP (HTTPGET)');
+    7 : KnownTitle := L('Essai des syst'#138'mes de fichiers (FATTEST)',
+                        'File System Test (FATTEST)',
+                        'Dateisystemtest (FATTEST)',
+                        'Prova dei file system (FATTEST)',
+                        'Prueba de archivos (FATTEST)');
+    8 : KnownTitle := L('Essai des processus (PROCTEST)', 'Process Test ' +
+                        '(PROCTEST)', 'Prozesstest (PROCTEST)',
+                        'Prova dei processi (PROCTEST)',
+                        'Prueba de procesos (PROCTEST)');
+  Else
+    KnownTitle := L('Bonjour (HELLO)', 'Hello (HELLO)', 'Hallo (HELLO)',
+                    'Ciao (HELLO)', 'Hola (HELLO)');
+  End;
+End;
+
+Function KnownIcon(K : LongInt) : LongInt;
+Begin
+  Case K Of
+    0 : KnownIcon := icDxDiag;
+    1, 2, 3, 4 : KnownIcon := icDisplay;
+    5 : KnownIcon := icNet;
+    6 : KnownIcon := icWeb;
+    7 : KnownIcon := icHardDisk;
+    8 : KnownIcon := icChip;
+  Else
+    KnownIcon := icApp;
+  End;
+End;
+
+{ Nombre de programmes connus presents du groupe G ; K-ieme d'entre eux }
+Function KnownCount(G : Char) : LongInt;
+Var K, N : LongInt;
+Begin
+  N := 0;
+  For K := 0 To KnownN - 1 Do
+    If KnownHere[K] And (KnownGrp[K] = G) Then Inc(N);
+  KnownCount := N;
+End;
+
+Function KnownAt(G : Char; I : LongInt) : LongInt;
+Var K : LongInt;
+Begin
+  KnownAt := 0;
+  For K := 0 To KnownN - 1 Do
+    If KnownHere[K] And (KnownGrp[K] = G) Then
+    Begin
+      If I = 0 Then
+      Begin
+        KnownAt := K;
+        Exit;
+      End;
+      Dec(I);
+    End;
+End;
+
 { programmes du systeme deja dans les menus (Accessoires, Parametres,
   barre des taches) : ni sur le bureau, ni en fin de Programmes }
 Function MenuApp(Const Nm : String) : Boolean;
+Var K : LongInt;
 Begin
   MenuApp := (Nm = 'COMMAND.EXE') Or (Nm = 'PAINT.EXE') Or
     (Nm = 'CALC.EXE') Or (Nm = 'BROWSER.EXE') Or (Nm = 'MP3PLAY.EXE') Or
     (Nm = 'FREECELL.EXE') Or (Nm = 'CHARMAP.EXE') Or
-    (Nm = 'WINHLP32.EXE') Or (Nm = 'APPWIZ.EXE') Or (Nm = 'TASKMGR.EXE');
+    (Nm = 'WINHLP32.EXE') Or (Nm = 'APPWIZ.EXE') Or (Nm = 'TASKMGR.EXE') Or
+    (Nm = 'WAB.EXE') Or (Nm = 'IMAGING.EXE') Or (Nm = 'CDPLAYER.EXE') Or
+    (Nm = 'FINDFILE.EXE');
+  For K := 0 To KnownN - 1 Do
+    If Nm = KnownExe[K] Then MenuApp := True;
 End;
 
 Procedure DeskBuild;
 Var I, Lba, Size, Fl, Tm : LongInt; Nm : String; Dir : Boolean;
 Begin
   DeskCnt := 0; ExeCnt := 0;
+  For I := 0 To KnownN - 1 Do
+    KnownHere[I] := PathInfo(SysDir + KnownExe[I], Fl, Size, Tm, Lba, Lba);
   DeskAdd(L('Poste de travail', 'My Computer', 'Arbeitsplatz',
             'Risorse del computer', 'Mi PC'), icComputer, cmComputer, '');
   DeskAdd(L('Corbeille', 'Recycle Bin', 'Papierkorb', 'Cestino',
@@ -13856,7 +14075,7 @@ Begin
        Not MenuApp(Nm) And (ExeCnt < 16) Then
     Begin
       ExePaths[ExeCnt] := SysDir + Nm;
-      DeskAdd(Copy(Nm, 1, Length(Nm) - 4), icApp, cmExeBase + ExeCnt,
+      DeskAdd(Copy(Nm, 1, Length(Nm) - 4), ExeIcon(Nm), cmExeBase + ExeCnt,
               SysDir + Nm);
       Inc(ExeCnt);
     End;
@@ -14337,12 +14556,14 @@ Begin
     Exit;
   End;
   Case M Of
-    mnStart : MenuCount := 8;
+    mnStart : MenuCount := 9;
+    mnFind : MenuCount := 2;
+    mnTools : MenuCount := 2 + KnownCount('S');
     mnPrograms : MenuCount := 4 + ExeCnt;
-    mnAccess : MenuCount := 7;
+    mnAccess : MenuCount := 10;
     mnGames : MenuCount := 1;
-    mnMedia : MenuCount := 2;
-    mnInet : MenuCount := 1;
+    mnMedia : MenuCount := 3 + KnownCount('M');
+    mnInet : MenuCount := 1 + KnownCount('I');
     mnSettings : MenuCount := 8;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -14415,20 +14636,24 @@ Begin
               Sub := mnSettings; Icon := icSettings;
             End;
         3 : Begin
+              T := L('Rechercher', 'Find', 'Suchen', 'Trova', 'Buscar');
+              Sub := mnFind; Icon := icFind;
+            End;
+        4 : Begin
               T := L('Aide', 'Help', 'Hilfe', 'Guida', 'Ayuda');
               Cmd := cmHelp; Icon := icHelp;
             End;
-        4 : Begin
+        5 : Begin
               T := L('Ex'#130'cuter...', 'Run...', 'Ausf'#129'hren...',
                      'Esegui...', 'Ejecutar...');
               Cmd := cmRun; Icon := icRun;
             End;
-        5 : Begin
+        6 : Begin
               T := L('A propos...', 'About...', 'Info...',
                      'Informazioni...', 'Acerca de...');
               Cmd := cmAbout; Icon := icInfo;
             End;
-        7 : Begin
+        8 : Begin
               T := L('Arr'#136'ter...', 'Shut Down...', 'Beenden...',
                      'Chiudi sessione...', 'Apagar el sistema...');
               Cmd := cmShutdown; Icon := icShutdown;
@@ -14460,7 +14685,7 @@ Begin
       Else
       Begin
         T := BaseName(ExePaths[I - 4]);
-        Cmd := cmExeBase + I - 4; Icon := icApp;
+        Cmd := cmExeBase + I - 4; Icon := ExeIcon(T);
       End;
     { Programmes, Accessoires : groupes, puis programmes (comme Windows) }
     mnAccess :
@@ -14480,49 +14705,111 @@ Begin
               Sub := mnInet; Icon := icPrograms;
             End;
         3 : Begin
+              T := L('Outils syst'#138'me', 'System Tools', 'Systemprogramme',
+                     'Utilit'#133' di sistema', 'Herramientas del sistema');
+              Sub := mnTools; Icon := icPrograms;
+            End;
+        4 : Begin
               T := L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
                      'Bloc de notas');
               Cmd := cmNotepad; Icon := icNotepad;
             End;
-        4 : Begin
+        5 : Begin
               T := L('Calculatrice', 'Calculator', 'Rechner', 'Calcolatrice',
                      'Calculadora');
               Cmd := cmCalc; Icon := icCalc;
             End;
-        5 : Begin
+        6 : Begin
+              T := L('Carnet d''adresses', 'Address Book', 'Adressbuch',
+                     'Rubrica', 'Libreta de direcciones');
+              Cmd := cmWab; Icon := icAddress;
+            End;
+        7 : Begin
+              T := 'Imaging';
+              Cmd := cmImaging; Icon := icImaging;
+            End;
+        8 : Begin
               T := 'Paint';
               Cmd := cmPaint; Icon := icPaint;
             End;
-        6 : Begin
+        9 : Begin
               T := L('Table de caract'#138'res', 'Character Map',
                      'Zeichentabelle', 'Mappa caratteri',
                      'Mapa de caracteres');
-              Cmd := cmCharMap; Icon := icText;
+              Cmd := cmCharMap; Icon := icCharMap;
             End;
       End;
     mnGames :
       Begin
         T := 'FreeCell';
-        Cmd := cmFreeCell; Icon := icApp;
+        Cmd := cmFreeCell; Icon := icCards;
       End;
     mnMedia :
       If I = 0 Then
+      Begin
+        T := L('Lecteur CD', 'CD Player', 'CD-Wiedergabe', 'Lettore CD',
+               'Reproductor de CD');
+        Cmd := cmCdPlayer; Icon := icCdPlayer;
+      End
+      Else If I = 1 Then
       Begin
         T := L('Lecteur MP3', 'MP3 Player', 'MP3-Player', 'Lettore MP3',
                'Reproductor MP3');
         Cmd := cmMp3Play; Icon := icSound;
       End
-      Else
+      Else If I = 2 Then
       Begin
         T := L('Contr'#147'le du volume', 'Volume Control', 'Lautst'#132'rke',
                'Controllo volume', 'Control de volumen');
         Cmd := cmMixer; Icon := icSpeaker;
+      End
+      Else
+      Begin
+        K := KnownAt('M', I - 3);
+        T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnInet :
+      If I = 0 Then
       Begin
         T := L('Navigateur Web', 'Web Browser', 'Webbrowser',
                'Browser Web', 'Navegador Web');
         Cmd := cmBrowser; Icon := icWeb;
+      End
+      Else
+      Begin
+        K := KnownAt('I', I - 1);
+        T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
+      End;
+    mnTools :
+      If I = 0 Then
+      Begin
+        T := 'ScanDisk';
+        Cmd := cmScanDisk; Icon := icScanDisk;
+      End
+      Else If I = 1 Then
+      Begin
+        T := L('Gestionnaire des t'#131'ches', 'Task Manager',
+               'Task-Manager', 'Task Manager', 'Administrador de tareas');
+        Cmd := cmTaskMgr; Icon := icChip;
+      End
+      Else
+      Begin
+        K := KnownAt('S', I - 2);
+        T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
+      End;
+    mnFind :
+      If I = 0 Then
+      Begin
+        T := L('Fichiers ou dossiers...', 'Files or Folders...',
+               'Dateien/Ordner...', 'File o cartelle...',
+               'Archivos o carpetas...');
+        Cmd := cmFindFiles; Icon := icFind;
+      End
+      Else
+      Begin
+        T := L('Ordinateur...', 'Computer...', 'Computer...', 'Computer...',
+               'PC...');
+        Cmd := cmFindComp; Icon := icComputer;
       End;
     mnSettings :
       If I = 0 Then
@@ -15593,6 +15880,27 @@ Begin
   ExpEntry := ExpEntryP(Wnds^[W].KS, I, Nm, Fl, Size);
 End;
 
+{ Icone d'un programme du systeme (nom du fichier .EXE) }
+Function ExeIcon(Nm : String) : LongInt;
+Begin
+  Nm := UpStr(Nm);
+  If Nm = 'FREECELL.EXE' Then ExeIcon := icCards
+  Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
+  Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
+  Else If Nm = 'CALC.EXE' Then ExeIcon := icCalc
+  Else If Nm = 'PAINT.EXE' Then ExeIcon := icPaint
+  Else If Nm = 'BROWSER.EXE' Then ExeIcon := icWeb
+  Else If Nm = 'WAB.EXE' Then ExeIcon := icAddress
+  Else If Nm = 'IMAGING.EXE' Then ExeIcon := icImaging
+  Else If Nm = 'FINDFILE.EXE' Then ExeIcon := icFind
+  Else If Nm = 'WINHLP32.EXE' Then ExeIcon := icHelp
+  Else If Nm = 'DXDIAG.EXE' Then ExeIcon := icDxDiag
+  Else If Nm = 'TASKMGR.EXE' Then ExeIcon := icChip
+  Else If Nm = 'CHARMAP.EXE' Then ExeIcon := icCharMap
+  Else If Nm = 'COMMAND.EXE' Then ExeIcon := icDos
+  Else ExeIcon := icApp;
+End;
+
 Function ExpIcon(Nm : String; Fl : LongInt) : LongInt;
 Var E : String;
 Begin
@@ -15601,7 +15909,8 @@ Begin
   Else If (Pos(':)', Nm) > 0) And (Nm[Length(Nm)] = ')') Then
     ExpIcon := icHardDisk
   Else If (Fl And 2) <> 0 Then ExpIcon := icFolder
-  Else If (E = 'EXE') Or (E = 'COM') Then ExpIcon := icApp
+  Else If E = 'EXE' Then ExpIcon := ExeIcon(Nm)
+  Else If E = 'COM' Then ExpIcon := icApp
   Else If (E = 'TXT') Or (E = 'BAT') Or (E = 'INI') Or (E = 'SYS') Then
     ExpIcon := icText
   Else ExpIcon := icDocs;
@@ -16107,6 +16416,10 @@ Begin
       { musique et listes de lecture : Lecteur MP3 (MP3PLAY.EXE) }
       Else If (E = 'MP3') Or (E = 'M3U') Then
         RunExe('MP3PLAY.EXE', '"' + P + '"')
+      { images : Imaging (IMAGING.EXE) }
+      Else If (E = 'BMP') Or (E = 'GIF') Or (E = 'PNG') Or (E = 'JPG') Or
+              (E = 'JPE') Or (E = 'TIF') Then
+        RunExe('IMAGING.EXE', '"' + P + '"')
       Else NoteOpen(P);
       Exit;
     End;
@@ -21394,6 +21707,18 @@ Begin
                    'BROWSER.EXE wurde nicht gefunden.',
                    'Impossibile trovare BROWSER.EXE.',
                    'No se encuentra BROWSER.EXE.'), $10);
+    cmCdPlayer : RunSys('CDPLAYER.EXE', '', L('Lecteur CD', 'CD Player',
+                        'CD-Wiedergabe', 'Lettore CD', 'Reproductor de CD'));
+    cmWab : RunSys('WAB.EXE', '', L('Carnet d''adresses', 'Address Book',
+                   'Adressbuch', 'Rubrica', 'Libreta de direcciones'));
+    cmImaging : RunSys('IMAGING.EXE', '', 'Imaging');
+    cmFindFiles : RunSys('FINDFILE.EXE', '', L('Rechercher', 'Find',
+                         'Suchen', 'Trova', 'Buscar'));
+    cmFindComp : RunSys('FINDFILE.EXE', '/C', L('Rechercher', 'Find',
+                        'Suchen', 'Trova', 'Buscar'));
+    cmScanDisk : ScanDiskOpen('C');
+    cmKnownBase .. cmKnownBase + KnownN - 1 :
+      RunSys(KnownExe[Cmd - cmKnownBase], '', KnownTitle(Cmd - cmKnownBase));
     cmFreeCell :
       If Not RunExe('FREECELL.EXE', '') Then
         MsgBoxOpen('FreeCell', L('FREECELL.EXE est introuvable.',
@@ -22526,6 +22851,30 @@ Begin
       End;
 End;
 
+{ Tab / Maj+Tab : controle suivant (precedent) du meme parent qui a
+  WS_TABSTOP, dans l'ordre de creation, comme le gestionnaire de
+  dialogues de Windows }
+Function TabNextOf(W : LongInt; Back : Boolean) : LongInt;
+Var I, K, P : LongInt;
+Begin
+  TabNextOf := -1;
+  P := Wnds^[W].Parent;
+  For K := 1 To MaxWnd - 1 Do
+  Begin
+    If Back Then I := (W - K + MaxWnd) Mod MaxWnd
+    Else I := (W + K) Mod MaxWnd;
+    If Wnds^[I].Used And IsChildW(I) And (Wnds^[I].Parent = P) And
+       Wnds^[I].Visible And Wnds^[I].Enabled And
+       ((Wnds^[I].Style And $10000) <> 0) And
+       (Wnds^[I].IKind >= ikButton) And
+       (Wnds^[I].IKind <= ikMdiClient) Then
+    Begin
+      TabNextOf := I;
+      Exit;
+    End;
+  End;
+End;
+
 Procedure KKey(W, Msg, VK, Ch : LongInt);
 Var I, K : LongInt;
 Begin
@@ -22586,7 +22935,19 @@ Begin
   If (Wnds^[W].IKind >= ikButton) And (Wnds^[W].IKind <= ikMdiClient) Then
   Begin
     I := TopOf(W);
-    If (VK = $0D) And (Wnds^[I].IKind = ikDialog) Then
+    If (VK = 9) And ((Wnds^[W].IKind <> ikEdit) Or
+       ((Wnds^[W].Style And 4) = 0)) And
+       (Wnds^[I].IKind In [ikNone, ikDialog]) Then
+    Begin
+      K := TabNextOf(W, (KeyState[$10] And $80) <> 0);
+      If K >= 0 Then
+      Begin
+        SetFocusW(K);
+        { zone de saisie : tout son texte selectionne }
+        If Wnds^[K].IKind = ikEdit Then KWndProc(K, $B1, 0, -1);
+      End;
+    End
+    Else If (VK = $0D) And (Wnds^[I].IKind = ikDialog) Then
       PostMsgW(I, WM_COMMAND, IDOK, 0)
     Else If (VK = $1B) And (Wnds^[I].IKind = ikDialog) Then
       PostMsgW(I, WM_COMMAND, IDCANCEL, 0)
@@ -36764,16 +37125,667 @@ Begin
   DefDriverProc := 0;
 End;
 
-Function mciSendCommandA(Id, Msg, Flags, P : LongInt) : LongInt;
+{ ------------------------------------------------------------------ }
+{ MCI cdaudio : CD audio du lecteur ATAPI                             }
+{ ------------------------------------------------------------------ }
+{ Comme le pilote MCICDA de Windows : table des pistes (READ TOC),
+  lecture, pause, arret, position, ejection (START STOP UNIT). Les
+  machines virtuelles (VirtualBox, QEMU, VMware) ne relient pas la
+  sortie analogique du lecteur a la carte son : la musique est lue en
+  numerique (READ CD, secteurs CD-DA de 2352 octets, 44,1 kHz stereo 16
+  bits) et jouee par waveOut, par la tache 0 (CdaPoll). Interfaces :
+  mciSendStringA ("open cdaudio", "status cdaudio number of tracks",
+  "play cdaudio from 2 to 3", "set cdaudio door open"...) et
+  mciSendCommandA (MCI_OPEN, MCI_PLAY, MCI_STATUS, MCI_SET...) avec
+  MM_MCINOTIFY en fin de lecture. Formats de temps : millisecondes, MSF
+  et TMSF. }
+
+Const
+  CdaMaxTrk = 99;
+  CdaChunk = 4;                        { secteurs par lecture }
+  CdaNBuf = 6;
+  CdaId = 1;                           { identificateur MCI }
+  MciErrDev = 263; MciErrCmd = 261; MciErrReady = 276;
+  MciErrParam = 273; MciErrRange = 282;
+
+Var
+  CdaOpen, CdaTocOk : Boolean;
+  CdaAlias : String[31];
+  CdaFmt, CdaN, CdaFirst : LongInt;
+  CdaLba : Array[0..CdaMaxTrk + 1] Of LongInt;   { debut (et fin N+1) }
+  CdaCtl : Array[0..CdaMaxTrk + 1] Of Byte;      { 4 : piste de donnees }
+  CdaMode, CdaPos, CdaEnd, CdaStart, CdaPlayed, CdaDev : LongInt;
+  CdaHdr, CdaBuf, CdaSec : Array[0..CdaNBuf - 1] Of LongInt;
+  CdaBusy : Array[0..CdaNBuf - 1] Of Boolean;
+  CdaNotify, CdaErr : LongInt;
+  CdaPkt : Array[0..11] Of Byte;
+
+{ Commande ATAPI de CdaPkt, donnees lues vers Dst (Max octets au plus) ;
+  octets lus, -1 : erreur }
+Function AtaPacket(Dst, Max0 : LongInt) : LongInt;
+Var St, Cnt, Got, W, B, I, X : LongInt;
 Begin
-  mciSendCommandA := 263;
+  AtaPacket := -1;
+  If Not AtaFound Then Exit;
+  AtaSelect;
+  If AtaWaitBusy < 0 Then Exit;
+  Port[AtaBase + 1] := 0;
+  Port[AtaBase + 4] := $FE; Port[AtaBase + 5] := $FF;
+  Port[AtaBase + 7] := $A0;
+  AtaDelay;
+  St := AtaWaitBusy;
+  If (St < 0) Or ((St And 8) = 0) Then Exit;
+  For I := 0 To 5 Do
+    PortW[AtaBase] := CdaPkt[I * 2] Or (CdaPkt[I * 2 + 1] Shl 8);
+  Got := 0;
+  Repeat
+    AtaDelay;
+    St := AtaWaitBusy;
+    If (St < 0) Or ((St And 1) <> 0) Then Exit;
+    If (St And 8) = 0 Then Break;
+    Cnt := Port[AtaBase + 4] Or (Port[AtaBase + 5] Shl 8);
+    If Cnt <= 0 Then Break;
+    W := Min(Cnt, Max0 - Got) And Not 1;
+    If W > 0 Then
+    Begin
+      B := Dst + Got;
+      asm
+        push edi
+        mov edi,B
+        mov ecx,W
+        shr ecx,1
+        mov edx,AtaBase
+        cld
+        rep insw
+        pop edi
+      end;
+    End;
+    For I := 1 To (Cnt - W + 1) Div 2 Do X := PortW[AtaBase];
+    Got := Got + W;
+  Until False;
+  AtaPacket := Got;
+End;
+
+Procedure CdaCmd(C0, C1 : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 11 Do CdaPkt[I] := 0;
+  CdaPkt[0] := C0; CdaPkt[1] := C1;
+End;
+
+{ Table des pistes (READ TOC, adresses LBA) }
+Function CdaReadToc : Boolean;
+Var B, N, I, K, T, Own : LongInt;
+Begin
+  CdaReadToc := False;
+  CdaTocOk := False; CdaN := 0;
+  Own := HeapOwner; HeapOwner := 0;
+  B := KAlloc(812);
+  HeapOwner := Own;
+  If B = 0 Then Exit;
+  CdaCmd($43, 0);
+  CdaPkt[6] := 1; CdaPkt[7] := 3; CdaPkt[8] := $24;
+  N := AtaPacket(B, 804);
+  If N >= 12 Then
+  Begin
+    CdaFirst := Mem[0:B + 2];
+    K := (N - 4) Div 8;
+    For I := 0 To K - 1 Do
+    Begin
+      T := Mem[0:B + 4 + I * 8 + 2];
+      If T = $AA Then T := CdaN + 1
+      Else If (T >= 1) And (T <= CdaMaxTrk) Then CdaN := Max(CdaN, T)
+      Else Continue;
+      If T > CdaMaxTrk + 1 Then Continue;
+      CdaCtl[T] := Mem[0:B + 4 + I * 8 + 1] And 15;
+      CdaLba[T] := (Mem[0:B + 8 + I * 8] Shl 24) Or
+        (Mem[0:B + 9 + I * 8] Shl 16) Or (Mem[0:B + 10 + I * 8] Shl 8) Or
+        Mem[0:B + 11 + I * 8];
+    End;
+    CdaTocOk := CdaN > 0;
+  End;
+  KFree(B);
+  If CdaTocOk Then
+    KLog('CD audio : ' + IntStr(CdaN) + ' pistes, fin en ' +
+         IntStr(CdaLba[CdaN + 1]));
+  CdaReadToc := CdaTocOk;
+End;
+
+Function CdaReady : Boolean;
+Begin
+  CdaCmd($00, 0);
+  CdaReady := AtaPacket(0, 0) >= 0;
+End;
+
+{ Piste de la position Lba }
+Function CdaTrackOf(Lba : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  T := 1;
+  While (T < CdaN) And (Lba >= CdaLba[T + 1]) Do Inc(T);
+  CdaTrackOf := T;
+End;
+
+Procedure CdaCloseDev;
+Var K : LongInt;
+Begin
+  If CdaDev < 0 Then Exit;
+  waveOutReset(HWaveBase + CdaDev);
+  For K := 0 To CdaNBuf - 1 Do
+  Begin
+    If CdaBusy[K] Then
+      waveOutUnprepareHeader(HWaveBase + CdaDev, CdaHdr[K], 32);
+    CdaBusy[K] := False;
+  End;
+  waveOutClose(HWaveBase + CdaDev);
+  CdaDev := -1;
+End;
+
+Procedure CdaStop;
+Begin
+  CdaCloseDev;
+  If CdaMode <> 0 Then CdaStart := CdaStart + CdaPlayed;
+  CdaPlayed := 0;
+  CdaMode := 0;
+End;
+
+{ Position jouee (LBA) }
+Function CdaWhere : LongInt;
+Begin
+  If CdaMode = 0 Then CdaWhere := CdaStart
+  Else CdaWhere := CdaStart + CdaPlayed;
+End;
+
+Procedure CdaPlay(A, B : LongInt);
+Begin
+  CdaStop;
+  CdaStart := A; CdaPos := A; CdaEnd := B; CdaPlayed := 0;
+  CdaErr := 0;
+  CdaMode := 1;
+End;
+
+{ Tache 0 : tampons rendus, lecture des secteurs suivants }
+Procedure CdaPoll;
+Var K, N, H, Own, Fmt : LongInt; Fm : Array[0..4] Of LongInt;
+Begin
+  If CdaMode <> 1 Then Exit;
+  If CdaDev < 0 Then
+  Begin
+    Fm[0] := 1 Or (2 Shl 16); Fm[1] := 44100; Fm[2] := 176400;
+    Fm[3] := 4 Or (16 Shl 16); Fm[4] := 0;
+    H := 0;
+    If waveOutOpen(LongInt(@H), 0, LongInt(@Fm), 0, 0, 0) <> 0 Then
+    Begin
+      CdaMode := 0;
+      Exit;
+    End;
+    CdaDev := H - HWaveBase;
+    For K := 0 To CdaNBuf - 1 Do
+    Begin
+      If CdaBuf[K] = 0 Then
+      Begin
+        Own := HeapOwner; HeapOwner := 0;
+        CdaBuf[K] := KAlloc(CdaChunk * 2352);
+        CdaHdr[K] := KAlloc(32);
+        HeapOwner := Own;
+      End;
+      CdaBusy[K] := False;
+    End;
+  End;
+  For K := 0 To CdaNBuf - 1 Do
+    If CdaBusy[K] And ((MemL[0:CdaHdr[K] + 16] And 1) <> 0) Then
+    Begin
+      waveOutUnprepareHeader(HWaveBase + CdaDev, CdaHdr[K], 32);
+      CdaPlayed := CdaPlayed + CdaSec[K];
+      CdaBusy[K] := False;
+    End;
+  For K := 0 To CdaNBuf - 1 Do
+    If Not CdaBusy[K] And (CdaPos < CdaEnd) And (CdaBuf[K] <> 0) Then
+    Begin
+      N := Min(CdaChunk, CdaEnd - CdaPos);
+      { READ CD : secteurs CD-DA (type 1), donnees seules }
+      CdaCmd($BE, 4);
+      CdaPkt[2] := (CdaPos Shr 24) And 255;
+      CdaPkt[3] := (CdaPos Shr 16) And 255;
+      CdaPkt[4] := (CdaPos Shr 8) And 255; CdaPkt[5] := CdaPos And 255;
+      CdaPkt[8] := N; CdaPkt[9] := $10;
+      If AtaPacket(CdaBuf[K], N * 2352) <> N * 2352 Then
+      Begin
+        { lecteur sans extraction numerique : silence (la position
+          avance quand meme) }
+        FillMem(CdaBuf[K], N * 2352, 0);
+        If CdaErr = 0 Then KLog('CD audio : READ CD refuse en ' +
+                                IntStr(CdaPos));
+        Inc(CdaErr);
+      End;
+      FillMem(CdaHdr[K], 32, 0);
+      MemL[0:CdaHdr[K]] := CdaBuf[K];
+      MemL[0:CdaHdr[K] + 4] := N * 2352;
+      waveOutPrepareHeader(HWaveBase + CdaDev, CdaHdr[K], 32);
+      waveOutWrite(HWaveBase + CdaDev, CdaHdr[K], 32);
+      CdaSec[K] := N;
+      CdaBusy[K] := True;
+      CdaPos := CdaPos + N;
+    End;
+  N := 0;
+  For K := 0 To CdaNBuf - 1 Do If CdaBusy[K] Then Inc(N);
+  If (N = 0) And (CdaPos >= CdaEnd) Then
+  Begin
+    CdaStop;
+    CdaStart := CdaEnd;
+    { MM_MCINOTIFY, MCI_NOTIFY_SUCCESSFUL }
+    If CdaNotify <> 0 Then PostMessageA(CdaNotify, $3B9, 1, CdaId);
+    CdaNotify := 0;
+  End;
+End;
+
+{ Valeurs de temps : Lba (absolu) <-> format courant }
+Function CdaToFmt(Lba : LongInt; Rel : Boolean) : LongInt;
+Var T, F, M, S : LongInt;
+Begin
+  Case CdaFmt Of
+    0 : CdaToFmt := ((Lba - CdaLba[CdaFirst]) * 40) Div 3;   { ms }
+    2 : Begin
+          F := Lba + 150;
+          M := F Div 4500; S := (F Div 75) Mod 60;
+          CdaToFmt := M Or (S Shl 8) Or ((F Mod 75) Shl 16);
+        End;
+  Else
+    Begin
+      T := CdaTrackOf(Lba);
+      F := Lba - CdaLba[T];
+      M := F Div 4500; S := (F Div 75) Mod 60;
+      CdaToFmt := T Or (M Shl 8) Or (S Shl 16) Or ((F Mod 75) Shl 24);
+    End;
+  End;
+End;
+
+Function CdaFromFmt(V : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  Case CdaFmt Of
+    0 : CdaFromFmt := CdaLba[CdaFirst] + (V * 3) Div 40;
+    2 : CdaFromFmt := (V And 255) * 4500 + ((V Shr 8) And 255) * 75 +
+                      ((V Shr 16) And 255) - 150;
+  Else
+    Begin
+      T := Max(1, Min(CdaN, V And 255));
+      CdaFromFmt := CdaLba[T] + ((V Shr 8) And 255) * 4500 +
+                    ((V Shr 16) And 255) * 75 + ((V Shr 24) And 255);
+    End;
+  End;
+End;
+
+{ Duree (secteurs) de la piste T, ou du disque (T = 0) }
+Function CdaLen(T : LongInt) : LongInt;
+Begin
+  If T = 0 Then CdaLen := CdaLba[CdaN + 1] - CdaLba[CdaFirst]
+  Else CdaLen := CdaLba[T + 1] - CdaLba[T];
+End;
+
+Function CdaLenFmt(T : LongInt) : LongInt;
+Var F : LongInt;
+Begin
+  F := CdaLen(T);
+  If CdaFmt = 0 Then CdaLenFmt := (F * 40) Div 3
+  Else CdaLenFmt := (F Div 4500) Or (((F Div 75) Mod 60) Shl 8) Or
+                    ((F Mod 75) Shl 16);
+End;
+
+Function CdaModeV : LongInt;
+Begin
+  If Not CdaReady Then CdaModeV := 530             { porte ouverte }
+  Else Case CdaMode Of
+    1 : CdaModeV := 526;
+    2 : CdaModeV := 529;
+  Else
+    CdaModeV := 525;
+  End;
+End;
+
+{ Ouvrir le peripherique (table des pistes) }
+Function CdaOpenDev : LongInt;
+Begin
+  CdaOpen := True;
+  CdaFmt := 2;                         { MSF, comme MCICDA }
+  CdaReadToc;
+  CdaOpenDev := 0;
+End;
+
+Procedure CdaDoor(Open0 : Boolean);
+Begin
+  CdaStop;
+  CdaCmd($1B, 0);
+  If Open0 Then CdaPkt[4] := 2 Else CdaPkt[4] := 3;
+  AtaPacket(0, 0);
+  CdaTocOk := False;
+  For CdaN := 0 To CacheSlots - 1 Do CacheLba[CdaN] := -1;
+  CdaN := 0;
+End;
+
+{ Lecture : de A a B (format courant ; -1 : debut ou fin) }
+Function CdaPlayFmt(A, B : LongInt; HasA, HasB : Boolean) : LongInt;
+Var L0, L1 : LongInt;
+Begin
+  CdaPlayFmt := MciErrReady;
+  If Not CdaTocOk Then CdaReadToc;
+  If Not CdaTocOk Then Exit;
+  If HasA Then L0 := CdaFromFmt(A)
+  Else If CdaMode = 2 Then L0 := CdaWhere
+  Else L0 := CdaStart;
+  If (L0 < CdaLba[CdaFirst]) Or (L0 >= CdaLba[CdaN + 1]) Then
+    L0 := CdaLba[CdaFirst];
+  If HasB Then L1 := CdaFromFmt(B) Else L1 := CdaLba[CdaN + 1];
+  If (CdaFmt = 10) And HasB And (((B Shr 8) And $FFFFFF) = 0) Then
+    L1 := CdaLba[Max(1, Min(CdaN, B And 255))];
+  If L1 > CdaLba[CdaN + 1] Then L1 := CdaLba[CdaN + 1];
+  If L1 <= L0 Then
+  Begin
+    CdaPlayFmt := MciErrRange;
+    Exit;
+  End;
+  CdaPlay(L0, L1);
+  CdaPlayFmt := 0;
+End;
+
+{ ------------------------------- mciSendStringA ------------------- }
+
+Function LoStr(S : String) : String;
+Var I : LongInt;
+Begin
+  For I := 1 To Length(S) Do
+    If (S[I] >= 'A') And (S[I] <= 'Z') Then S[I] := Chr(Ord(S[I]) + 32);
+  LoStr := S;
+End;
+
+Function MciWord(Var S : String) : String;
+Var P : LongInt; W : String;
+Begin
+  S := Trim(S);
+  P := Pos(' ', S);
+  If P = 0 Then P := Length(S) + 1;
+  W := Copy(S, 1, P - 1);
+  S := Trim(Copy(S, P + 1, 255));
+  MciWord := LoStr(W);
+End;
+
+Function MciNum(Const S : String) : LongInt;
+Var I, V : LongInt;
+Begin
+  V := 0;
+  For I := 1 To Length(S) Do
+    If (S[I] >= '0') And (S[I] <= '9') Then V := V * 10 + Ord(S[I]) - 48;
+  MciNum := V;
+End;
+
+{ "3", "3:01:20", "00:02:30" selon le format de temps }
+Function MciTime(Const S : String) : LongInt;
+Var P : Array[0..3] Of LongInt; N, I, V : LongInt;
+Begin
+  N := 0; V := 0;
+  For I := 0 To 3 Do P[I] := 0;
+  For I := 1 To Length(S) + 1 Do
+    If (I > Length(S)) Or (S[I] = ':') Then
+    Begin
+      If N <= 3 Then P[N] := V;
+      Inc(N); V := 0;
+    End
+    Else If (S[I] >= '0') And (S[I] <= '9') Then V := V * 10 + Ord(S[I]) - 48;
+  If CdaFmt = 0 Then MciTime := P[0]
+  Else MciTime := P[0] Or (P[1] Shl 8) Or (P[2] Shl 16) Or (P[3] Shl 24);
+End;
+
+Function Two(V : LongInt) : String;
+Begin
+  Two := Chr(48 + (V Div 10) Mod 10) + Chr(48 + V Mod 10);
+End;
+
+{ Valeur de temps en texte (format courant) }
+Function MciTimeStr(V : LongInt; Tmsf : Boolean) : String;
+Begin
+  If CdaFmt = 0 Then MciTimeStr := IntStr(V)
+  Else If Tmsf Then
+    MciTimeStr := Two(V And 255) + ':' + Two((V Shr 8) And 255) + ':' +
+      Two((V Shr 16) And 255) + ':' + Two((V Shr 24) And 255)
+  Else
+    MciTimeStr := Two(V And 255) + ':' + Two((V Shr 8) And 255) + ':' +
+      Two((V Shr 16) And 255);
 End;
 
 Function mciSendStringA(Cmd, Ret, N, Cb : LongInt) : LongInt;
+Var S, C, D, W, R, A0, B0 : String; E, T, V : LongInt; HasA, HasB : Boolean;
 Begin
-  KLog('mciSendStringA : ' + PStr(Cmd));
+  S := PStr(Cmd);
+  KLog('mciSendStringA : ' + S);
   If (Ret <> 0) And (N > 0) Then Mem[0:Ret] := 0;
-  mciSendStringA := 263;
+  mciSendStringA := 0;
+  C := MciWord(S); D := MciWord(S);
+  R := ''; E := 0;
+  If (D <> 'cdaudio') And Not ((CdaAlias <> '') And (D = CdaAlias)) And
+     Not ((C = 'close') And (D = 'all')) Then
+  Begin
+    { seul le CD audio est un peripherique MCI de Pasdows }
+    If C = 'open' Then mciSendStringA := MciErrDev
+    Else mciSendStringA := MciErrDev;
+    Exit;
+  End;
+  If Pos(' notify', ' ' + S) > 0 Then CdaNotify := Cb;
+  If C = 'open' Then
+  Begin
+    CdaAlias := '';
+    W := MciWord(S);
+    While W <> '' Do
+    Begin
+      If W = 'alias' Then CdaAlias := MciWord(S);
+      W := MciWord(S);
+    End;
+    E := CdaOpenDev;
+    R := IntStr(CdaId);
+  End
+  Else If Not CdaOpen Then E := 262                   { pas ouvert }
+  Else If C = 'close' Then
+  Begin
+    CdaStop; CdaOpen := False; CdaAlias := '';
+  End
+  Else If C = 'set' Then
+  Begin
+    W := MciWord(S);
+    If W = 'time' Then
+    Begin
+      W := MciWord(S); W := MciWord(S);
+      If W = 'tmsf' Then CdaFmt := 10
+      Else If W = 'msf' Then CdaFmt := 2
+      Else CdaFmt := 0;
+    End
+    Else If W = 'door' Then CdaDoor(MciWord(S) = 'open')
+    Else If W <> 'audio' Then E := MciErrParam;
+  End
+  Else If C = 'play' Then
+  Begin
+    HasA := False; HasB := False; A0 := ''; B0 := '';
+    W := MciWord(S);
+    While W <> '' Do
+    Begin
+      If W = 'from' Then Begin A0 := MciWord(S); HasA := True; End
+      Else If W = 'to' Then Begin B0 := MciWord(S); HasB := True; End;
+      W := MciWord(S);
+    End;
+    E := CdaPlayFmt(MciTime(A0), MciTime(B0), HasA, HasB);
+  End
+  Else If C = 'stop' Then CdaStop
+  Else If C = 'pause' Then
+  Begin
+    If CdaMode = 1 Then
+    Begin
+      V := CdaWhere;
+      CdaStop;
+      CdaStart := V; CdaMode := 2;
+    End;
+  End
+  Else If C = 'resume' Then
+  Begin
+    If CdaMode = 2 Then E := CdaPlayFmt(0, 0, False, False);
+  End
+  Else If C = 'seek' Then
+  Begin
+    W := MciWord(S); W := MciWord(S);
+    CdaStop;
+    If Not CdaTocOk Then CdaReadToc;
+    If W = 'start' Then CdaStart := CdaLba[CdaFirst]
+    Else If W = 'end' Then CdaStart := CdaLba[CdaN + 1]
+    Else CdaStart := CdaFromFmt(MciTime(W));
+  End
+  Else If C = 'status' Then
+  Begin
+    W := MciWord(S);
+    If (W <> 'mode') And (W <> 'media') And Not CdaTocOk Then CdaReadToc;
+    If W = 'mode' Then
+      Case CdaModeV Of
+        526 : R := 'playing';
+        529 : R := 'paused';
+        530 : R := 'open';
+      Else
+        R := 'stopped';
+      End
+    Else If W = 'media' Then
+    Begin
+      If CdaReady Then R := 'true' Else R := 'false';
+    End
+    Else If W = 'ready' Then
+    Begin
+      If CdaTocOk Then R := 'true' Else R := 'false';
+    End
+    Else If Not CdaTocOk Then E := MciErrReady
+    Else If W = 'number' Then R := IntStr(CdaN)
+    Else If W = 'current' Then R := IntStr(CdaTrackOf(CdaWhere))
+    Else If W = 'time' Then
+      Case CdaFmt Of
+        0 : R := 'milliseconds';
+        2 : R := 'msf';
+      Else R := 'tmsf';
+      End
+    Else If W = 'length' Then
+    Begin
+      T := 0;
+      If MciWord(S) = 'track' Then T := MciNum(MciWord(S));
+      If (T < 0) Or (T > CdaN) Then E := MciErrRange
+      Else R := MciTimeStr(CdaLenFmt(T), False);
+    End
+    Else If W = 'position' Then
+    Begin
+      If MciWord(S) = 'track' Then
+      Begin
+        T := Max(1, Min(CdaN, MciNum(MciWord(S))));
+        R := MciTimeStr(CdaToFmt(CdaLba[T], False), CdaFmt = 10);
+      End
+      Else R := MciTimeStr(CdaToFmt(CdaWhere, False), CdaFmt = 10);
+    End
+    Else If W = 'type' Then
+    Begin
+      W := MciWord(S);
+      T := Max(1, Min(CdaN, MciNum(MciWord(S))));
+      If (CdaCtl[T] And 4) <> 0 Then R := 'other' Else R := 'audio';
+    End
+    Else E := MciErrParam;
+  End
+  Else If C = 'info' Then R := 'Pasdows CD Audio'
+  Else E := MciErrCmd;
+  If (E = 0) And (Ret <> 0) And (N > 0) Then PutPStr(Ret, R, N);
+  mciSendStringA := E;
+End;
+
+{ ------------------------------- mciSendCommandA ------------------ }
+
+Function mciSendCommandA(Id, Msg, Flags, P : LongInt) : LongInt;
+Var E, T, V : LongInt; S : String;
+Begin
+  E := 0;
+  If (Flags And 1) <> 0 Then
+    If P <> 0 Then CdaNotify := MemL[0:P] And $FFFF;     { MCI_NOTIFY }
+  Case Msg Of
+    $803 :                                               { MCI_OPEN }
+      Begin
+        S := '';
+        If (P <> 0) And ((Flags And $2000) <> 0) Then    { MCI_OPEN_TYPE }
+        Begin
+          If (Flags And $1000) <> 0 Then                 { _TYPE_ID }
+          Begin
+            If (MemL[0:P + 8] And $FFFF) = 516 Then S := 'cdaudio';
+          End
+          Else S := LoStr(PStr(MemL[0:P + 8]));
+        End;
+        If S <> 'cdaudio' Then E := MciErrDev
+        Else
+        Begin
+          CdaOpenDev;
+          MemL[0:P + 4] := CdaId;
+        End;
+      End;
+    $804 : Begin CdaStop; CdaOpen := False; End;         { MCI_CLOSE }
+    $806 :                                               { MCI_PLAY }
+      If P = 0 Then E := CdaPlayFmt(0, 0, False, False)
+      Else E := CdaPlayFmt(MemL[0:P + 4], MemL[0:P + 8],
+                           (Flags And 4) <> 0, (Flags And 8) <> 0);
+    $807 :                                               { MCI_SEEK }
+      Begin
+        CdaStop;
+        If Not CdaTocOk Then CdaReadToc;
+        If (Flags And $100) <> 0 Then CdaStart := CdaLba[CdaFirst]
+        Else If (Flags And $200) <> 0 Then CdaStart := CdaLba[CdaN + 1]
+        Else If P <> 0 Then CdaStart := CdaFromFmt(MemL[0:P + 4]);
+      End;
+    $808 : CdaStop;                                      { MCI_STOP }
+    $809 :                                               { MCI_PAUSE }
+      If CdaMode = 1 Then
+      Begin
+        V := CdaWhere; CdaStop; CdaStart := V; CdaMode := 2;
+      End;
+    $855 :                                               { MCI_RESUME }
+      If CdaMode = 2 Then E := CdaPlayFmt(0, 0, False, False);
+    $80D :                                               { MCI_SET }
+      Begin
+        If ((Flags And $400) <> 0) And (P <> 0) Then CdaFmt := MemL[0:P + 4];
+        If (Flags And $100) <> 0 Then CdaDoor(True);
+        If (Flags And $200) <> 0 Then CdaDoor(False);
+      End;
+    $814 :                                               { MCI_STATUS }
+      If P = 0 Then E := MciErrParam
+      Else
+      Begin
+        V := 0;
+        T := 0;
+        If (Flags And $10) <> 0 Then T := MemL[0:P + 12];   { MCI_TRACK }
+        If Not CdaTocOk And (MemL[0:P + 8] <> 4) And
+           (MemL[0:P + 8] <> 5) Then CdaReadToc;
+        Case MemL[0:P + 8] Of
+          1 : If (T >= 0) And (T <= CdaN) Then V := CdaLenFmt(T);
+          2 : If T > 0 Then V := CdaToFmt(CdaLba[Min(T, CdaN)], False)
+              Else V := CdaToFmt(CdaWhere, False);
+          3 : V := CdaN;
+          4 : V := CdaModeV;
+          5 : V := Ord(CdaReady);
+          6 : V := CdaFmt;
+          7 : V := Ord(CdaTocOk);
+          8 : V := CdaTrackOf(CdaWhere);
+          $4001 : If (CdaCtl[Max(1, Min(CdaN, T))] And 4) <> 0 Then V := 1089
+                  Else V := 1088;
+        Else
+          E := MciErrParam;
+        End;
+        If (E = 0) And Not CdaTocOk And (MemL[0:P + 8] <> 4) And
+           (MemL[0:P + 8] <> 5) Then E := MciErrReady;
+        MemL[0:P + 4] := V;
+      End;
+  Else
+    E := MciErrCmd;
+  End;
+  If (E = 0) And ((Flags And 1) <> 0) And (Msg <> $806) And (CdaNotify <> 0)
+  Then
+  Begin
+    PostMessageA(CdaNotify, $3B9, 1, CdaId);
+    CdaNotify := 0;
+  End;
+  mciSendCommandA := E;
 End;
 
 Function mciGetErrorStringA(E, Buf, N : LongInt) : LongInt;
@@ -36815,7 +37827,7 @@ Begin
     If PStr(MemL[0:P + 44]) <> '' Then D := FullPath(PStr(MemL[0:P + 44]));
   N := '';
   If MemL[0:P + 28] <> 0 Then N := PStr(MemL[0:P + 28]);
-  If Pos('', N) > 0 Then
+  If Pos('\', N) > 0 Then
   Begin
     D := ParentDir(FullPath(N));
     N := BaseName(N);
@@ -36828,7 +37840,7 @@ Begin
   If MemL[0:P + 36] <> 0 Then
     PutPStr(MemL[0:P + 36], BaseName(F), MemL[0:P + 40]);
   I := Length(F);
-  While (I > 0) And (F[I] <> '') Do Dec(I);
+  While (I > 0) And (F[I] <> '\') Do Dec(I);
   MemW[0:P + 56] := I;
   K := Length(F);
   While (K > I) And (F[K] <> '.') Do Dec(K);
@@ -36868,10 +37880,38 @@ Begin
   FindExecutableA := 31;
 End;
 
+{ programme, dossier (Explorateur) ou document selon son extension,
+  comme un double clic dans l'Explorateur }
 Function ShellExecuteA(H, Op, F, Prm, D, Show : LongInt) : LongInt;
+Var P, E : String; A, Sz, Tm, Lb, Rm : LongInt; Ok, Doc : Boolean;
 Begin
-  If RunExe(PStr(F), PStr(Prm)) Then ShellExecuteA := 33
-  Else ShellExecuteA := 2;
+  ShellExecuteA := 33;
+  P := PStr(F);
+  E := UpStr(Copy(P, Length(P) - 3, 4));
+  A := 0;
+  Ok := PathInfo(P, A, Sz, Tm, Lb, Rm);
+  Doc := Ok And ((A And $10) <> 0);
+  If (E <> '.EXE') And (E <> '.COM') And (E <> '.BAT') And
+     (Pos('.', E) > 0) Then Doc := True;
+  If Doc Then
+  Begin
+    If Not Ok Then
+    Begin
+      ShellExecuteA := 2;
+      Exit;
+    End;
+    If (A And $10) <> 0 Then ExpWindowAt(P, False)
+    Else If E = '.HLP' Then RunExe('WINHLP32.EXE', '"' + P + '"')
+    Else If (E = '.MP3') Or (E = '.M3U') Then
+      RunExe('MP3PLAY.EXE', '"' + P + '"')
+    Else If (E = '.BMP') Or (E = '.GIF') Or (E = '.PNG') Or
+            (E = '.JPG') Or (E = '.TIF') Or (E = 'TIFF') Or
+            (E = 'JPEG') Then
+      RunExe('IMAGING.EXE', '"' + P + '"')
+    Else NoteOpen(P);
+    Exit;
+  End;
+  If Not RunExe(P, PStr(Prm)) Then ShellExecuteA := 2;
 End;
 
 { OLE32 }
@@ -84274,6 +85314,7 @@ Begin
     NetPoll;
     RunMMTimers;
     RunWave;
+    CdaPoll;
     KPaintAll;
     If SdW >= 0 Then ScanStep;
     { registre modifie par un programme termine : sur le disque }
@@ -84398,6 +85439,7 @@ BEGIN
   BootShow;
   DispiDetect;
   DispW := -1; RebootAskW := -1; DtW := -1; MbLongW := -1; MbLongP := 0;
+  CdaDev := -1; CdaMode := 0; CdaOpen := False; CdaFmt := 2;
   MbPendP := 0;
   TzLoad;
   PsDev := -1;
