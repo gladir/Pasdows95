@@ -19949,7 +19949,7 @@ Begin
     If (At And $10) <> 0 Then
     Begin
       Inc(SdDirs);
-      SdDirB := SdDirB + VolSpc[SdV] * 512;
+      SdDirB := SdDirB + VolSpc[SdV];
       If ClusOk(SdV, Cl) And Not SdBit(Cl) Then
       Begin
         SdChain(Cl, 0, True, False);
@@ -19967,12 +19967,12 @@ Begin
       If (At And 6) <> 0 Then
       Begin
         Inc(SdHid);
-        SdHidB := SdHidB + Sz;
+        SdHidB := SdHidB + (Sz Shr 9) + Ord((Sz And 511) <> 0);
       End
       Else
       Begin
         Inc(SdFiles);
-        SdFileB := SdFileB + Sz;
+        SdFileB := SdFileB + (Sz Shr 9) + Ord((Sz And 511) <> 0);
       End;
       SdChain(Cl, Sz, False, (Wnds^[SdW].K3 And 2) <> 0);
     End;
@@ -20168,46 +20168,45 @@ Begin
   SdBytes := BytesStr((B + 511) Div 512);
 End;
 
-{ Resultats (comme ScanDisk de Windows 95) }
+{ Resultats (comme ScanDisk de Windows 95 ; tailles courtes, la boite
+  de message tient 255 caracteres) }
 Procedure SdResults;
-Var S, P : String; D : Char; Bpc, Tot : LongInt;
+Var S, P : String; D : Char; Bpc, Tot, Spc : LongInt;
 Begin
   D := Chr(Wnds^[SdW].K2);
   Bpc := VolSpc[SdV] * 512;
+  Spc := VolSpc[SdV];
   Tot := SdLost + SdCross + SdBadChain + SdSize + SdFatDiff + SdReadErr;
   If Tot = 0 Then
-    P := L('ScanDisk n''a trouv'#130' aucune erreur sur ce lecteur.',
-           'ScanDisk did not find any errors on this drive.',
-           'ScanDisk hat keine Fehler gefunden.',
-           'ScanDisk non ha trovato errori.',
-           'ScanDisk no encontr'#162' errores.')
+    P := L('Aucune erreur trouv'#130'e.', 'No errors found.',
+           'Keine Fehler gefunden.', 'Nessun errore trovato.',
+           'No se encontraron errores.')
   Else
   Begin
-    P := L('Erreurs trouv'#130'es : ', 'Errors found: ', 'Fehler: ',
-           'Errori: ', 'Errores: ');
+    P := '';
     If SdLost > 0 Then
-      P := P + IntStr(SdLost) + L(' fragment(s) perdu(s), ',
-           ' lost fragment(s), ', ' verlorene Fragmente, ',
-           ' frammenti persi, ', ' fragmentos perdidos, ');
+      P := P + IntStr(SdLost) + L(' fragments perdus, ', ' lost fragments, ',
+           ' verlorene Fragmente, ', ' frammenti persi, ',
+           ' fragmentos perdidos, ');
     If SdCross > 0 Then
-      P := P + IntStr(SdCross) + L(' cha'#140'ne(s) crois'#130'e(s), ',
-           ' cross-linked chain(s), ', ' Querverbindungen, ',
-           ' catene incrociate, ', ' cadenas cruzadas, ');
+      P := P + IntStr(SdCross) + L(' cha'#140'nes crois'#130'es, ',
+           ' cross-linked, ', ' Querverbindungen, ', ' catene incrociate, ',
+           ' cadenas cruzadas, ');
     If SdBadChain > 0 Then
-      P := P + IntStr(SdBadChain) + L(' cha'#140'ne(s) invalide(s), ',
-           ' invalid chain(s), ', ' ung'#129'ltige Ketten, ',
+      P := P + IntStr(SdBadChain) + L(' cha'#140'nes invalides, ',
+           ' invalid chains, ', ' ung'#129'ltige Ketten, ',
            ' catene non valide, ', ' cadenas no v'#160'lidas, ');
     If SdSize > 0 Then
-      P := P + IntStr(SdSize) + L(' taille(s) incorrecte(s), ',
-           ' incorrect size(s), ', ' falsche Gr'#148#225'en, ',
-           ' dimensioni errate, ', ' tama'#164'os incorrectos, ');
+      P := P + IntStr(SdSize) + L(' tailles fausses, ', ' bad sizes, ',
+           ' falsche Gr'#148#225'en, ', ' dimensioni errate, ',
+           ' tama'#164'os err'#162'neos, ');
     If SdFatDiff > 0 Then
-      P := P + IntStr(SdFatDiff) + L(' secteur(s) de FAT diff'#130'rent(s), ',
-           ' mismatched FAT sector(s), ', ' abweichende FAT-Sektoren, ',
-           ' settori FAT diversi, ', ' sectores FAT distintos, ');
+      P := P + IntStr(SdFatDiff) + L(' secteurs de FAT diff'#130'rents, ',
+           ' FAT mismatches, ', ' FAT-Abweichungen, ', ' settori FAT, ',
+           ' sectores FAT, ');
     If SdReadErr > 0 Then
-      P := P + IntStr(SdReadErr) + L(' erreur(s) de lecture, ',
-           ' read error(s), ', ' Lesefehler, ', ' errori di lettura, ',
+      P := P + IntStr(SdReadErr) + L(' erreurs de lecture, ',
+           ' read errors, ', ' Lesefehler, ', ' errori di lettura, ',
            ' errores de lectura, ');
     P := Copy(P, 1, Length(P) - 2) + '.';
     If SdFixed > 0 Then
@@ -20215,33 +20214,25 @@ Begin
                  ' Corretti: ', ' Corregidos: ') + IntStr(SdFixed) + '.';
   End;
   S := P + '||' +
-       SdBytes(VolClus[SdV] * Bpc) + L(' d''espace disque total',
-       ' total disk space', ' Speicherplatz gesamt',
-       ' di spazio totale', ' de espacio total') + '|' +
-       SdBytes(SdHidB) + L(' dans ', ' in ', ' in ', ' in ', ' en ') +
-       IntStr(SdHid) + L(' fichiers cach'#130's', ' hidden files',
-       ' versteckten Dateien', ' file nascosti', ' archivos ocultos') +
-       '|' + SdBytes(SdDirB) + L(' dans ', ' in ', ' in ', ' in ', ' en ') +
-       IntStr(SdDirs) + L(' dossiers', ' folders', ' Ordnern', ' cartelle',
-       ' carpetas') + '|' + SdBytes(SdFileB) + L(' dans ', ' in ', ' in ',
-       ' in ', ' en ') + IntStr(SdFiles) + L(' fichiers utilisateur',
-       ' user files', ' Benutzerdateien', ' file utente',
-       ' archivos de usuario') + '|' + SdBytes(SdBadC * Bpc) +
-       L(' dans des secteurs d'#130'fectueux', ' in bad sectors',
-       ' in fehlerhaften Sektoren', ' in settori danneggiati',
-       ' en sectores defectuosos') + '|' +
-       SdBytes(VolFree[SdV] * Bpc) + L(' disponibles', ' available',
-       ' verf'#129'gbar', ' disponibili', ' disponibles') + '||' +
-       IntStr(Bpc) + L(' octets par unit'#130' d''allocation',
-       ' bytes in each allocation unit', ' Bytes je Zuordnungseinheit',
-       ' byte per unit'#133' di allocazione',
-       ' bytes por unidad de asignaci'#162'n') + '|' +
-       IntStr(VolClus[SdV]) + L(' unit'#130's d''allocation au total',
-       ' total allocation units', ' Zuordnungseinheiten insgesamt',
-       ' unit'#133' di allocazione totali', ' unidades en total') + '|' +
-       IntStr(VolFree[SdV]) + L(' unit'#130's d''allocation disponibles',
-       ' available allocation units', ' verf'#129'gbare Einheiten',
-       ' unit'#133' disponibili', ' unidades disponibles');
+       SizeShort(VolClus[SdV] * Spc) + L(' d''espace disque total',
+       ' total disk space', ' gesamt', ' totali', ' en total') + '|' +
+       SizeShort(SdHidB) + L(' dans ', ' in ', ' in ',
+       ' in ', ' en ') + IntStr(SdHid) + L(' fichiers cach'#130's',
+       ' hidden files', ' versteckten Dateien', ' file nascosti',
+       ' archivos ocultos') + '|' +
+       SizeShort(SdDirB) + L(' dans ', ' in ', ' in ',
+       ' in ', ' en ') + IntStr(SdDirs) + L(' dossiers', ' folders',
+       ' Ordnern', ' cartelle', ' carpetas') + '|' +
+       SizeShort(SdFileB) + L(' dans ', ' in ', ' in ',
+       ' in ', ' en ') + IntStr(SdFiles) + L(' fichiers', ' files',
+       ' Dateien', ' file', ' archivos') + '|' +
+       SizeShort(SdBadC * Spc) + L(' d'#130'fectueux', ' in bad sectors',
+       ' fehlerhaft', ' danneggiati', ' defectuosos') + '|' +
+       SizeShort(VolFree[SdV] * Spc) + L(' disponibles', ' available',
+       ' frei', ' disponibili', ' disponibles') + '||' +
+       IntStr(VolClus[SdV]) + L(' unit'#130's de ', ' units of ',
+       ' Einheiten zu ', ' unit'#133' da ', ' unidades de ') +
+       IntStr(Bpc) + L(' octets', ' bytes', ' Bytes', ' byte', ' bytes');
   ReadRtc;
   If (D >= 'A') And (D <= 'Z') Then
     SdChecked[Ord(D) - 65] := Pad2(RtcDay) + '/' + Pad2(RtcMonth) + '/' +
@@ -21748,7 +21739,7 @@ Begin
   If SX + ConSbW - 1 > X2 Then Exit;
   FBar(SX, Y1, X2, Y2, cSilver);
   Raised(SX, Y1, X2, Y1 + 15, False);
-  Arrow(SX + 4, Y1 + 6, 0, cBlack);
+  Arrow(SX + 4, Y1 + 5, 2, cBlack);
   Raised(SX, Y2 - 15, X2, Y2, False);
   Arrow(SX + 4, Y2 - 9, 1, cBlack);
   N := ConHistN;
@@ -22057,8 +22048,8 @@ Begin
   ConPropW := KCreate(ikConProps, L('Propri'#130't'#130's de ', 'Properties ' +
                       'of ', 'Eigenschaften von ', 'Propriet'#133' di ',
                       'Propiedades de ') + PromptName, icDos,
-                      Max(0, (ScrW - 400) Div 2), Max(0, (TaskY - 260) Div 2),
-                      400, 260, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                      Max(0, (ScrW - 470) Div 2), Max(0, (TaskY - 260) Div 2),
+                      470, 260, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
                       WS_EX_DLGMODALFRAME);
   If ConPropW < 0 Then Exit;
   { K1 champ actif (1 lignes, 2 fichier), K2 journal, KS lignes ; le
@@ -22143,9 +22134,8 @@ Begin
   OutTxt(X1 + 24, Y1 + 37, L('Nombre de lignes retenues :',
          'Lines kept:', 'Gespeicherte Zeilen:', 'Righe conservate:',
          'L'#161'neas guardadas:'), cBlack);
-  OutTxt(X1 + 24, Y1 + 60, L('(25 '#133' 32000 ; '#133' revoir avec la ' +
-         'barre de d'#130'filement)', '(25 to 32000; see them with the ' +
-         'scroll bar)', '(25 bis 32000)', '(da 25 a 32000)',
+  OutTxt(X1 + 24, Y1 + 60, L('(de 25 '#133' 32000, barre de d'#130'filement)',
+         '(25 to 32000, scroll bar)', '(25 bis 32000)', '(da 25 a 32000)',
          '(de 25 a 32000)'), cGray);
   GroupBox(X1 + 12, Y1 + 96, X2 - 12, Y1 + 176, L('Journal', 'Log',
            'Protokoll', 'Registro', 'Registro'));
