@@ -2561,12 +2561,14 @@ Begin
   If (N = 'LISEZMOI.TXT') And Not CompDoc Then Exit;
   { COMMAND.EXE, Paint, la Calculatrice et le Navigateur Web
     (accessoires), le Gestionnaire des taches, l'Outil de diagnostic
-    DirectX, Ajout/Suppression de programmes et l'Aide de Windows sont
-    toujours installes }
+    DirectX, Ajout/Suppression de programmes, l'Aide de Windows et le
+    Lecteur MP3 sont toujours installes ; le morceau d'exemple suit les
+    sons du systeme }
+  If (N = 'AURORE.MP3') And Not CompSnd Then Exit;
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
      (N <> 'CALC.EXE') And (N <> 'TASKMGR.EXE') And (N <> 'DXDIAG.EXE') And
      (N <> 'BROWSER.EXE') And (N <> 'APPWIZ.EXE') And
-     (N <> 'WINHLP32.EXE') And Not CompEx Then
+     (N <> 'WINHLP32.EXE') And (N <> 'MP3PLAY.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;

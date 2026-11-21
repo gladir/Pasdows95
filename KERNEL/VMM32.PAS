@@ -13521,7 +13521,7 @@ Const
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
   cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
-  cmCalc = 28; cmBrowser = 29;
+  cmCalc = 28; cmBrowser = 29; cmMp3Play = 59;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -14280,7 +14280,7 @@ Begin
   End;
   Case M Of
     mnStart : MenuCount := 8;
-    mnPrograms : MenuCount := 7 + ExeCnt;
+    mnPrograms : MenuCount := 8 + ExeCnt;
     mnSettings : MenuCount := 8;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -14405,17 +14405,23 @@ Begin
       End
       Else If I = 5 Then
       Begin
+        T := L('Lecteur MP3', 'MP3 Player', 'MP3-Player', 'Lettore MP3',
+               'Reproductor MP3');
+        Cmd := cmMp3Play; Icon := icSound;
+      End
+      Else If I = 6 Then
+      Begin
         T := PromptName;
         Cmd := cmPrompt; Icon := icDos;
       End
-      Else If I = 6 Then
+      Else If I = 7 Then
       Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 7]);
-        Cmd := cmExeBase + I - 7; Icon := icApp;
+        T := BaseName(ExePaths[I - 8]);
+        Cmd := cmExeBase + I - 8; Icon := icApp;
       End;
     mnSettings :
       If I = 0 Then
@@ -15955,6 +15961,9 @@ Begin
       If (E = 'EXE') Or (E = 'COM') Then RunExe(P, '')
       { fichier d'aide : Aide de Windows (WINHLP32.EXE) }
       Else If E = 'HLP' Then RunExe('WINHLP32.EXE', '"' + P + '"')
+      { musique et listes de lecture : Lecteur MP3 (MP3PLAY.EXE) }
+      Else If (E = 'MP3') Or (E = 'M3U') Then
+        RunExe('MP3PLAY.EXE', '"' + P + '"')
       Else NoteOpen(P);
       Exit;
     End;
@@ -21234,6 +21243,14 @@ Begin
                    'BROWSER.EXE wurde nicht gefunden.',
                    'Impossibile trovare BROWSER.EXE.',
                    'No se encuentra BROWSER.EXE.'), $10);
+    cmMp3Play :
+      If Not RunExe('MP3PLAY.EXE', '') Then
+        MsgBoxOpen(L('Lecteur MP3', 'MP3 Player', 'MP3-Player',
+                   'Lettore MP3', 'Reproductor MP3'), L('MP3PLAY.EXE est ' +
+                   'introuvable.', 'MP3PLAY.EXE cannot be found.',
+                   'MP3PLAY.EXE wurde nicht gefunden.',
+                   'Impossibile trovare MP3PLAY.EXE.',
+                   'No se encuentra MP3PLAY.EXE.'), $10);
     cmCalc :
       If Not RunExe('CALC.EXE', '') Then
         MsgBoxOpen(L('Calculatrice', 'Calculator', 'Rechner',
@@ -34404,6 +34421,17 @@ Var
   MidiOpen : Boolean;
 
 Const
+  SynMax = 24;
+
+Var
+  SynNote, SynChan, SynPhase, SynStep : Array[0..SynMax - 1] Of LongInt;
+  SynAmp, SynDec, SynWave, SynAge, SynRel : Array[0..SynMax - 1] Of LongInt;
+  SynSine : Array[0..255] Of LongInt;            { -32767..32767 }
+  SynFreq : Array[0..127] Of LongInt;            { Hz x 16 }
+  SynCount, SynAgeC, SynNoise : LongInt;
+  SynOk : Boolean;
+
+Const
   skSb = 1; skAc97 = 2; skHda = 3; skEs = 4;
   HdaMaxDac = 8;
   PcmNCh = 32;                     { blocs du tampon (cartes PCI) }
@@ -34625,6 +34653,8 @@ End;
 { Remplir la moitie H du tampon DMA avec la suite des tampons du
   peripherique SbDev (format carte), sinon du silence }
 Procedure DSMixInto(D, N : LongInt); Forward;
+Procedure SynMixInto(D, N : LongInt); Forward;
+Function SynBusy : Boolean; Forward;
 
 Procedure SbFill0(Ofs, N : LongInt);
 Var D, P, Hdr, Len, B, Got, SBy, OBy, K, Fr, L, R, Q : LongInt;
@@ -34706,6 +34736,7 @@ Begin
   End;
   If Got = 0 Then SbSilent := SbSilent + N Else SbSilent := 0;
   DSMixInto(D, N);
+  SynMixInto(D, N);
   SbQueued := SbQueued + N;
 End;
 
@@ -35409,7 +35440,7 @@ Procedure SndInit;
 Var V, B, I, Hi, Lo : LongInt; Bl, T : String;
 Begin
   SbOk := False; Sb16 := False; SbDev := -1; SbPlaying := False;
-  SndKind := 0; PcmMem := 0;
+  SndKind := 0; PcmMem := 0; SynOk := False;
   For I := 0 To MixLines - 1 Do
   Begin
     MixVolL[I] := 192; MixVolR[I] := 192; MixMute[I] := False;
@@ -35707,6 +35738,216 @@ Begin
   End;
 End;
 
+{ ----------------------- MIDI logiciel (sans OPL) ----------------- }
+{ Cartes sans synthetiseur FM (AC'97, HD Audio, ES1370) : comme le
+  synthetiseur logiciel de Windows, les notes sont calculees par le
+  noyau et mixees dans le flux PCM de la carte (comme DirectSound).
+  24 voix ; forme d'onde et enveloppe selon la famille d'instruments
+  General MIDI (piano, orgue, cordes, cuivres...) ; percussions (canal
+  10) : bruit ou sinusoide grave a decroissance rapide. Calcul en
+  entiers seulement : le mixage a lieu dans l'interruption. }
+
+Procedure SynInit;
+Var I : LongInt; F : Double;
+Begin
+  For I := 0 To 255 Do SynSine[I] := Round(32767 * Sin(I * 2 * Pi / 256));
+  F := 8.1757989156 * 16;                         { note 0 (do -1) }
+  For I := 0 To 127 Do
+  Begin
+    SynFreq[I] := Round(F);
+    F := F * 1.0594630943593;
+  End;
+  For I := 0 To SynMax - 1 Do SynAmp[I] := 0;
+  SynCount := 0; SynAgeC := 0; SynNoise := 12345;
+  SynOk := True;
+End;
+
+Function SynBusy : Boolean;
+Begin
+  SynBusy := SynOk And (SynCount > 0);
+End;
+
+{ forme d'onde (0 sinus, 1 triangle, 2 carre, 3 dent de scie, 4 bruit)
+  et decroissance (1/65536 par bloc de 16 trames) de l'instrument }
+Procedure SynPatch(Ch, N : LongInt; Var W, Dc : LongInt);
+Begin
+  If Ch = 9 Then
+  Begin
+    { percussions : grosse caisse et toms graves en sinusoide }
+    If (N = 35) Or (N = 36) Or (N = 41) Or (N = 43) Or (N = 45) Then
+    Begin
+      W := 0; Dc := 400;
+    End
+    Else
+    Begin
+      W := 4;
+      If (N = 42) Or (N = 44) Then Dc := 1500 Else Dc := 700;
+    End;
+    Exit;
+  End;
+  Case MidiProg[Ch] Div 8 Of
+    0 : Begin W := 1; Dc := 55; End;              { piano }
+    1 : Begin W := 0; Dc := 130; End;             { percussions chrom. }
+    2 : Begin W := 2; Dc := 0; End;               { orgue }
+    3 : Begin W := 3; Dc := 80; End;              { guitare }
+    4 : Begin W := 1; Dc := 40; End;              { basse }
+    5, 6 : Begin W := 3; Dc := 0; End;            { cordes, ensembles }
+    7, 8 : Begin W := 2; Dc := 10; End;           { cuivres, anches }
+    9 : Begin W := 0; Dc := 0; End;               { flutes }
+    10 : Begin W := 2; Dc := 0; End;              { synthe solo }
+  Else
+    Begin W := 1; Dc := 20; End;
+  End;
+End;
+
+Procedure SynNoteOff(Ch, N : LongInt);
+Var V, F : LongInt;
+Begin
+  F := IntOff;
+  For V := 0 To SynMax - 1 Do
+    If (SynAmp[V] > 0) And (SynNote[V] = N) And (SynChan[V] = Ch) And
+       (SynRel[V] = 0) Then
+    Begin
+      SynRel[V] := 1;
+      If SynDec[V] < 1500 Then SynDec[V] := 1500;
+    End;
+  IntRestore(F);
+End;
+
+Procedure DSCardStart; Forward;
+
+Procedure SynNoteOn(Ch, N, Vel : LongInt);
+Var V, K, F, W, Dc, St, R : LongInt;
+Begin
+  If Vel = 0 Then
+  Begin
+    SynNoteOff(Ch, N);
+    Exit;
+  End;
+  If Not SbPlaying Then DSCardStart;
+  R := SbORate;
+  If R <= 0 Then R := 22050;
+  If Ch = 9 Then
+  Begin
+    If (N = 35) Or (N = 36) Then K := 33 Else K := N - 12;
+  End
+  Else K := N;
+  If (K < 0) Or (SynFreq[K] > R * 7) Then Exit;   { au-dela de Nyquist }
+  St := SynFreq[K] * (268435456 Div R);
+  SynPatch(Ch, N, W, Dc);
+  F := IntOff;
+  V := -1;
+  For K := 0 To SynMax - 1 Do
+    If (V < 0) And (SynAmp[K] <= 0) Then V := K;
+  If V < 0 Then
+  Begin
+    V := 0;
+    For K := 1 To SynMax - 1 Do
+      If SynAge[K] < SynAge[V] Then V := K;
+  End
+  Else Inc(SynCount);
+  Inc(SynAgeC);
+  SynNote[V] := N; SynChan[V] := Ch; SynPhase[V] := 0; SynStep[V] := St;
+  SynWave[V] := W; SynDec[V] := Dc; SynRel[V] := 0; SynAge[V] := SynAgeC;
+  SynAmp[V] := Vel * 400;                         { jusqu'a 50800 }
+  IntRestore(F);
+End;
+
+Procedure SynAllOff;
+Var V, F : LongInt;
+Begin
+  F := IntOff;
+  For V := 0 To SynMax - 1 Do SynAmp[V] := 0;
+  SynCount := 0;
+  IntRestore(F);
+End;
+
+{ Mixer les voix dans N octets du tampon D (format de la carte) }
+Procedure SynMixInto(D, N : LongInt);
+Var Bpf, Fr, I, V, S, A, P, X, Q, Gl, Gr, Vol : LongInt;
+Begin
+  If Not SynOk Or (SynCount <= 0) Then Exit;
+  Bpf := (SbOBits Div 8) * SbOChans;
+  If Bpf <= 0 Then Exit;
+  Fr := N Div Bpf;
+  If MixMute[2] Or MixMute[0] Then Vol := 0
+  Else Vol := MixVolL[2];
+  For I := 0 To Fr - 1 Do
+  Begin
+    S := 0;
+    For V := 0 To SynMax - 1 Do
+    Begin
+      A := SynAmp[V];
+      If A > 0 Then
+      Begin
+        P := SynPhase[V];
+        X := (P Shr 24) And 255;
+        Case SynWave[V] Of
+          0 : Q := SynSine[X];
+          1 : If X < 128 Then Q := X * 512 - 32767
+              Else Q := 32767 - (X - 128) * 512;
+          2 : If X < 128 Then Q := 16000 Else Q := -16000;
+          3 : Q := (X - 128) * 200;
+        Else
+          Begin
+            SynNoise := SynNoise * 1103515245 + 12345;
+            Q := ((SynNoise Shr 16) And $7FFF) - 16384;
+          End;
+        End;
+        S := S + (Q * (A Shr 4)) Div 4096;
+        SynPhase[V] := P + SynStep[V];
+        { enveloppe : tous les 16 trames }
+        If (I And 15) = 0 Then
+        Begin
+          A := A - (A Div 65536) * SynDec[V] - ((A Mod 65536) * SynDec[V])
+               Div 65536 - 1;
+          If A < 64 Then
+          Begin
+            A := 0;
+            Dec(SynCount);
+          End;
+          SynAmp[V] := A;
+        End;
+      End;
+    End;
+    S := (S Div 4) * Vol Div 255;
+    If S > 32767 Then S := 32767;
+    If S < -32767 Then S := -32767;
+    Q := D + I * Bpf;
+    If SbOBits = 16 Then
+    Begin
+      Gl := MemW[0:Q]; If Gl >= 32768 Then Gl := Gl - 65536;
+      Gl := Gl + S;
+      If Gl > 32767 Then Gl := 32767;
+      If Gl < -32768 Then Gl := -32768;
+      MemW[0:Q] := Gl And $FFFF;
+      If SbOChans = 2 Then
+      Begin
+        Gr := MemW[0:Q + 2]; If Gr >= 32768 Then Gr := Gr - 65536;
+        Gr := Gr + S;
+        If Gr > 32767 Then Gr := 32767;
+        If Gr < -32768 Then Gr := -32768;
+        MemW[0:Q + 2] := Gr And $FFFF;
+      End;
+    End
+    Else
+    Begin
+      Gl := Mem[0:Q] + S Div 256;
+      If Gl > 255 Then Gl := 255;
+      If Gl < 0 Then Gl := 0;
+      Mem[0:Q] := Gl;
+      If SbOChans = 2 Then
+      Begin
+        Gr := Mem[0:Q + 1] + S Div 256;
+        If Gr > 255 Then Gr := 255;
+        If Gr < 0 Then Gr := 0;
+        Mem[0:Q + 1] := Gr;
+      End;
+    End;
+  End;
+  If SynCount < 0 Then SynCount := 0;
+End;
+
 Function WaveOf(H : LongInt) : LongInt;
 Begin
   WaveOf := -1;
@@ -35784,6 +36025,7 @@ Begin
               (SbPlayed >= WaveQEnd[I * MaxWaveQ]) Do
           WaveDone(I, 0);
         If SbPlaying And (WaveDevs[I].QN = 0) And (SbSilent >= SbDmaLen) And
+           Not SynBusy And
            Not DSAnyPlaying Then
           SbStop;
       End
@@ -36054,9 +36296,15 @@ End;
 
 Const HMidi = $9800;
 
+{ toutes les notes : OPL ou synthetiseur logiciel }
+Procedure MidiAllOff;
+Begin
+  If OplOk Then OplAllOff Else If SynOk Then SynAllOff;
+End;
+
 Function midiOutGetNumDevs : LongInt;
 Begin
-  midiOutGetNumDevs := Ord(OplOk);
+  midiOutGetNumDevs := Ord(OplOk Or SbOk);
 End;
 
 { MIDIOUTCAPSA : +0 fabricant, +2 produit, +4 version, +8 nom (32),
@@ -36065,14 +36313,26 @@ End;
 Function midiOutGetDevCapsA(Id, P, N : LongInt) : LongInt;
 Begin
   midiOutGetDevCapsA := 2;
-  If Not OplOk Or (P = 0) Or (N < 52) Then Exit;
+  If Not (OplOk Or SbOk) Or (P = 0) Or (N < 52) Then Exit;
   FillMem(P, 52, 0);
   MemW[0:P] := 1; MemW[0:P + 2] := 2;
   MemL[0:P + 4] := $0400;
-  PutPStr(P + 8, L('Synth'#130'tiseur FM (OPL2)', 'FM Synthesizer (OPL2)',
-          'FM-Synthesizer (OPL2)', 'Sintetizzatore FM (OPL2)',
-          'Sintetizador FM (OPL2)'), 32);
-  MemW[0:P + 40] := 4; MemW[0:P + 42] := 9; MemW[0:P + 44] := 9;
+  If OplOk Then
+  Begin
+    PutPStr(P + 8, L('Synth'#130'tiseur FM (OPL2)', 'FM Synthesizer (OPL2)',
+            'FM-Synthesizer (OPL2)', 'Sintetizzatore FM (OPL2)',
+            'Sintetizador FM (OPL2)'), 32);
+    MemW[0:P + 40] := 4; MemW[0:P + 42] := 9; MemW[0:P + 44] := 9;
+  End
+  Else
+  Begin
+    { MOD_SWSYNTH : synthetiseur logiciel du noyau }
+    PutPStr(P + 8, L('Synth'#130'tiseur logiciel', 'Software Synthesizer',
+            'Software-Synthesizer', 'Sintetizzatore software',
+            'Sintetizador de software'), 32);
+    MemW[0:P + 40] := 7; MemW[0:P + 42] := SynMax;
+    MemW[0:P + 44] := SynMax;
+  End;
   MemW[0:P + 46] := $FFFF; MemL[0:P + 48] := 1;
   midiOutGetDevCapsA := 0;
 End;
@@ -36081,7 +36341,8 @@ Function midiOutOpen(PH, Id, Cb, Inst, Flags : LongInt) : LongInt;
 Var I : LongInt;
 Begin
   midiOutOpen := 2;
-  If Not OplOk Then Exit;
+  If Not (OplOk Or SbOk) Then Exit;
+  If Not OplOk And Not SynOk Then SynInit;
   If MidiOpen Then
   Begin
     midiOutOpen := 4;
@@ -36089,14 +36350,14 @@ Begin
   End;
   MidiOpen := True;
   For I := 0 To 15 Do MidiProg[I] := 0;
-  OplAllOff;
+  MidiAllOff;
   If PH <> 0 Then MemL[0:PH] := HMidi;
   midiOutOpen := 0;
 End;
 
 Function midiOutClose(H : LongInt) : LongInt;
 Begin
-  If MidiOpen Then OplAllOff;
+  If MidiOpen Then MidiAllOff;
   MidiOpen := False;
   midiOutClose := 0;
 End;
@@ -36109,17 +36370,17 @@ Begin
   St := M And $F0; Ch := M And 15;
   D1 := (M Shr 8) And $7F; D2 := (M Shr 16) And $7F;
   Case St Of
-    $80 : OplNoteOff(Ch, D1);
-    $90 : OplNoteOn(Ch, D1, D2);
+    $80 : If OplOk Then OplNoteOff(Ch, D1) Else SynNoteOff(Ch, D1);
+    $90 : If OplOk Then OplNoteOn(Ch, D1, D2) Else SynNoteOn(Ch, D1, D2);
     $C0 : MidiProg[Ch] := D1;
-    $B0 : If (D1 = 123) Or (D1 = 120) Then OplAllOff;
+    $B0 : If (D1 = 123) Or (D1 = 120) Then MidiAllOff;
   End;
   midiOutShortMsg := 0;
 End;
 
 Function midiOutReset(H : LongInt) : LongInt;
 Begin
-  If MidiOpen Then OplAllOff;
+  If MidiOpen Then MidiAllOff;
   midiOutReset := 0;
 End;
 
@@ -49135,6 +49396,7 @@ Begin
   Else DSLastT := Ticks;
   DSFire;
   If DSOwn And SbPlaying And (SbDev < 0) And (SbSilent >= 2 * SbDmaLen) And
+     Not SynBusy And
      Not DSAnyPlaying Then SbStop;
 End;
 
