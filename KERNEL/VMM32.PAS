@@ -9431,6 +9431,52 @@ Begin
   WrapText := Last;
 End;
 
+{ Comme WrapText, pour un long texte (N octets en P, '|' : fin de
+  ligne), au-dela des 255 caracteres d'une chaine }
+Function WrapLong(X, Y, W, P, Len, C : LongInt; Draw : Boolean) : LongInt;
+Var Cols, I, N, LH : LongInt; Line, Word0 : String; Ch : Char;
+Begin
+  LH := TxtCH;
+  If WrapClipY = 0 Then WrapClipY := $7FFFFFFF;
+  If TxtPitch > 0 Then Cols := W Div TxtPitch Else Cols := W Div TxtCW;
+  N := 0; Line := ''; Word0 := '';
+  For I := 0 To Len Do
+  Begin
+    If I < Len Then Ch := Chr(Mem[0:P + I]) Else Ch := ' ';
+    If (Ch = ' ') Or (Ch = '|') Then
+    Begin
+      If Length(Line) + Length(Word0) + 1 > Cols Then
+      Begin
+        If Line <> '' Then
+        Begin
+          If Draw And (Y + N * LH + LH <= WrapClipY) Then
+            OutTxt(X, Y + N * LH, Line, C);
+          Inc(N);
+        End;
+        Line := Word0;
+      End
+      Else If Line = '' Then Line := Word0
+      Else Line := Line + ' ' + Word0;
+      Word0 := '';
+      If Ch = '|' Then
+      Begin
+        If Draw And (Y + N * LH + LH <= WrapClipY) Then
+          OutTxt(X, Y + N * LH, Line, C);
+        Inc(N);
+        Line := '';
+      End;
+    End
+    Else If Length(Word0) < 200 Then Word0 := Word0 + Ch;
+  End;
+  If Line <> '' Then
+  Begin
+    If Draw And (Y + N * LH + LH <= WrapClipY) Then
+      OutTxt(X, Y + N * LH, Line, C);
+    Inc(N);
+  End;
+  WrapLong := N;
+End;
+
 { ------------------------------------------------------------------ }
 { Reliefs de Windows 95                                              }
 { ------------------------------------------------------------------ }
@@ -13521,7 +13567,8 @@ Const
   cmIconOpen = 18; cmDateTime = 19; cmMixer = 20; cmAudioProps = 21;
   cmSysProps = 22; cmPaint = 23; cmTaskMgr = 24; cmMinAll = 25;
   cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
-  cmCalc = 28; cmBrowser = 29; cmMp3Play = 59;
+  cmCalc = 28; cmBrowser = 29; cmMp3Play = 59; cmFreeCell = 60;
+  cmCharMap = 61;
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
   cmNUndo = 35; cmNCut = 36; cmNCopy = 37; cmNPaste = 38; cmNDel = 39;
@@ -13548,6 +13595,8 @@ Const
   mnTreeCtx = 20;                 { element de l'arbre de l'Explorateur }
   mnConSys = 21; mnConEdit = 22;  { menus de l'Invite MS-DOS }
   mnSysGen = 23;                  { menu systeme (icone du titre) }
+  mnAccess = 24; mnGames = 25;    { Programmes, Accessoires, Jeux... }
+  mnMedia = 26; mnInet = 27;
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -13775,6 +13824,16 @@ Begin
   SysEntry := True;
 End;
 
+{ programmes du systeme deja dans les menus (Accessoires, Parametres,
+  barre des taches) : ni sur le bureau, ni en fin de Programmes }
+Function MenuApp(Const Nm : String) : Boolean;
+Begin
+  MenuApp := (Nm = 'COMMAND.EXE') Or (Nm = 'PAINT.EXE') Or
+    (Nm = 'CALC.EXE') Or (Nm = 'BROWSER.EXE') Or (Nm = 'MP3PLAY.EXE') Or
+    (Nm = 'FREECELL.EXE') Or (Nm = 'CHARMAP.EXE') Or
+    (Nm = 'WINHLP32.EXE') Or (Nm = 'APPWIZ.EXE') Or (Nm = 'TASKMGR.EXE');
+End;
+
 Procedure DeskBuild;
 Var I, Lba, Size, Fl, Tm : LongInt; Nm : String; Dir : Boolean;
 Begin
@@ -13794,8 +13853,7 @@ Begin
   While SysEntry(I, Nm, Dir) Do
   Begin
     If Not Dir And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
-       (Nm <> 'COMMAND.EXE') And (Nm <> 'PAINT.EXE') And
-       (ExeCnt < 16) Then
+       Not MenuApp(Nm) And (ExeCnt < 16) Then
     Begin
       ExePaths[ExeCnt] := SysDir + Nm;
       DeskAdd(Copy(Nm, 1, Length(Nm) - 4), icApp, cmExeBase + ExeCnt,
@@ -14280,7 +14338,11 @@ Begin
   End;
   Case M Of
     mnStart : MenuCount := 8;
-    mnPrograms : MenuCount := 8 + ExeCnt;
+    mnPrograms : MenuCount := 4 + ExeCnt;
+    mnAccess : MenuCount := 7;
+    mnGames : MenuCount := 1;
+    mnMedia : MenuCount := 2;
+    mnInet : MenuCount := 1;
     mnSettings : MenuCount := 8;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -14375,53 +14437,92 @@ Begin
     mnPrograms :
       If I = 0 Then
       Begin
+        T := L('Accessoires', 'Accessories', 'Zubeh'#148'r', 'Accessori',
+               'Accesorios');
+        Sub := mnAccess; Icon := icPrograms;
+      End
+      Else If I = 1 Then
+      Begin
         T := L('Explorateur Pasdows', 'Pasdows Explorer',
                'Pasdows-Explorer', 'Esplora risorse Pasdows',
                'Explorador de Pasdows');
         Cmd := cmExplorer; Icon := icExplorer;
       End
-      Else If I = 1 Then
-      Begin
-        T := L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
-               'Bloc de notas');
-        Cmd := cmNotepad; Icon := icNotepad;
-      End
       Else If I = 2 Then
-      Begin
-        T := 'Paint';
-        Cmd := cmPaint; Icon := icPaint;
-      End
-      Else If I = 3 Then
-      Begin
-        T := L('Calculatrice', 'Calculator', 'Rechner', 'Calcolatrice',
-               'Calculadora');
-        Cmd := cmCalc; Icon := icCalc;
-      End
-      Else If I = 4 Then
-      Begin
-        T := L('Navigateur Web', 'Web Browser', 'Webbrowser',
-               'Browser Web', 'Navegador Web');
-        Cmd := cmBrowser; Icon := icWeb;
-      End
-      Else If I = 5 Then
-      Begin
-        T := L('Lecteur MP3', 'MP3 Player', 'MP3-Player', 'Lettore MP3',
-               'Reproductor MP3');
-        Cmd := cmMp3Play; Icon := icSound;
-      End
-      Else If I = 6 Then
       Begin
         T := PromptName;
         Cmd := cmPrompt; Icon := icDos;
       End
-      Else If I = 7 Then
+      Else If I = 3 Then
       Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 8]);
-        Cmd := cmExeBase + I - 8; Icon := icApp;
+        T := BaseName(ExePaths[I - 4]);
+        Cmd := cmExeBase + I - 4; Icon := icApp;
+      End;
+    { Programmes, Accessoires : groupes, puis programmes (comme Windows) }
+    mnAccess :
+      Case I Of
+        0 : Begin
+              T := L('Jeux', 'Games', 'Spiele', 'Giochi', 'Juegos');
+              Sub := mnGames; Icon := icPrograms;
+            End;
+        1 : Begin
+              T := L('Multim'#130'dia', 'Multimedia', 'Multimedia',
+                     'Multimedia', 'Multimedia');
+              Sub := mnMedia; Icon := icPrograms;
+            End;
+        2 : Begin
+              T := L('Outils Internet', 'Internet Tools', 'Internet-Tools',
+                     'Strumenti Internet', 'Herramientas de Internet');
+              Sub := mnInet; Icon := icPrograms;
+            End;
+        3 : Begin
+              T := L('Bloc-notes', 'Notepad', 'Editor', 'Blocco note',
+                     'Bloc de notas');
+              Cmd := cmNotepad; Icon := icNotepad;
+            End;
+        4 : Begin
+              T := L('Calculatrice', 'Calculator', 'Rechner', 'Calcolatrice',
+                     'Calculadora');
+              Cmd := cmCalc; Icon := icCalc;
+            End;
+        5 : Begin
+              T := 'Paint';
+              Cmd := cmPaint; Icon := icPaint;
+            End;
+        6 : Begin
+              T := L('Table de caract'#138'res', 'Character Map',
+                     'Zeichentabelle', 'Mappa caratteri',
+                     'Mapa de caracteres');
+              Cmd := cmCharMap; Icon := icText;
+            End;
+      End;
+    mnGames :
+      Begin
+        T := 'FreeCell';
+        Cmd := cmFreeCell; Icon := icApp;
+      End;
+    mnMedia :
+      If I = 0 Then
+      Begin
+        T := L('Lecteur MP3', 'MP3 Player', 'MP3-Player', 'Lettore MP3',
+               'Reproductor MP3');
+        Cmd := cmMp3Play; Icon := icSound;
+      End
+      Else
+      Begin
+        T := L('Contr'#147'le du volume', 'Volume Control', 'Lautst'#132'rke',
+               'Controllo volume', 'Control de volumen');
+        Cmd := cmMixer; Icon := icSpeaker;
+      End;
+    mnInet :
+      Begin
+        T := L('Navigateur Web', 'Web Browser', 'Webbrowser',
+               'Browser Web', 'Navegador Web');
+        Cmd := cmBrowser; Icon := icWeb;
       End;
     mnSettings :
       If I = 0 Then
@@ -14833,7 +14934,14 @@ Begin
   If Up Then Y := Y - HH;
   If Y + HH > TaskY Then Y := TaskY - HH;
   If Y < 0 Then Y := 0;
-  If X + WW > ScrW Then X := ScrW - WW;
+  If X + WW > ScrW Then
+  Begin
+    { sous-menu sans place a droite : a gauche de son menu (Windows) }
+    If (Lv > 0) And (MenuW[Lv - 1] >= 0) Then
+      X := Wnds^[MenuW[Lv - 1]].X - WW + 3
+    Else X := ScrW - WW;
+    If X < 0 Then X := 0;
+  End;
   MenuW[Lv] := KCreate(ikMenu, '', 0, X, Y, WW, HH, WS_POPUP,
                        WS_EX_TOPMOST Or WS_EX_TOOLWINDOW);
   If MenuW[Lv] < 0 Then Exit;
@@ -15110,11 +15218,19 @@ Begin
   Y2 := CY2 - 10; Y1 := Y2 - 22;
 End;
 
+{ Texte long (plus de 255 caracteres) d'une boite de message :
+  MbLongP octets en MbLongN, pour la boite MbLongW }
+Var
+  MbLongW, MbLongP, MbLongN : LongInt;
+  MbPendP, MbPendN : LongInt;          { texte long de la prochaine boite }
+
 { Boite de message : K1 resultat (0 tant qu'elle est ouverte),
   K2 type MB_*, K3 icone, KS texte }
 Function MsgBoxOpen(Title, Text : String; Typ : LongInt) : LongInt;
-Var W, N, Ic, WW : LongInt;
+Var W, N, Ic, WW, Lg : LongInt;
 Begin
+  Lg := MbPendP;
+  MbPendP := 0;
   Case Typ And $F0 Of
     $10 : Ic := icError;
     $20 : Ic := icQuestion;
@@ -15124,13 +15240,29 @@ Begin
     Ic := 0;
   End;
   SetTarget(Back, 0, 0);
-  N := WrapText(0, 0, 320, Text, 0, False);
-  If N < 2 Then N := 2;
   WW := 420;
+  If Lg <> 0 Then
+  Begin
+    { long texte : boite plus large, hauteur selon l'ecran }
+    WW := Min(ScrW - 20, 560);
+    N := WrapLong(0, 0, WW - 100, Lg, MbPendN, 0, False);
+    N := Min(N, (TaskY - 130) Div 16);
+  End
+  Else N := WrapText(0, 0, 320, Text, 0, False);
+  If N < 2 Then N := 2;
   W := KCreate(ikMsgBox, Title, icLogo, (ScrW - WW) Div 2,
                (TaskY - (110 + N * 16)) Div 2, WW, 110 + N * 16,
                WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
                WS_EX_DLGMODALFRAME Or WS_EX_TOPMOST);
+  If Lg <> 0 Then
+  Begin
+    If W >= 0 Then
+    Begin
+      If MbLongW >= 0 Then KFree(MbLongP);
+      MbLongW := W; MbLongP := Lg; MbLongN := MbPendN;
+    End
+    Else KFree(Lg);
+  End;
   If W >= 0 Then
   Begin
     Wnds^[W].KS := Text;
@@ -15152,7 +15284,13 @@ Begin
     PaintIcon(Wnds^[W].K3, X1 + 14, Y1 + 14, 32);
     TX := X1 + 62;
   End;
-  WrapText(TX, Y1 + 18, X2 - TX - 10, Wnds^[W].KS, cBlack, True);
+  If (W = MbLongW) And (MbLongP <> 0) Then
+  Begin
+    WrapClipY := Y2 - 40;
+    WrapLong(TX, Y1 + 18, X2 - TX - 10, MbLongP, MbLongN, cBlack, True);
+    WrapClipY := 0;
+  End
+  Else WrapText(TX, Y1 + 18, X2 - TX - 10, Wnds^[W].KS, cBlack, True);
   For I := 0 To MbCount(Wnds^[W].K2) - 1 Do
   Begin
     MbBtnRect(W, I, BX1, BY1, BX2, BY2);
@@ -15274,6 +15412,11 @@ Begin
   End;
   While Not Wnds^[W].DlgEnded Do KYield;
   R := Wnds^[W].K1;
+  If W = MbLongW Then
+  Begin
+    KFree(MbLongP);
+    MbLongW := -1; MbLongP := 0;
+  End;
   DestroyW(W);
   MsgBoxModal := R;
 End;
@@ -17092,6 +17235,14 @@ Begin
     P := CmdProgEnd(S);
     Prog := Copy(S, 1, P - 1);
     Args := Trim(Copy(S, P + 1, 255));
+  End;
+  { Bloc-notes (integre au noyau), comme NOTEPAD.EXE de Windows }
+  If (UpStr(Prog) = 'NOTEPAD') Or (UpStr(Prog) = 'NOTEPAD.EXE') Then
+  Begin
+    If (Length(Args) > 1) And (Args[1] = '"') Then
+      Args := Copy(Args, 2, Length(Args) - 2);
+    NoteOpen(Args);
+    Exit;
   End;
   RunLine := RunExe(Prog, Args);
 End;
@@ -21243,6 +21394,22 @@ Begin
                    'BROWSER.EXE wurde nicht gefunden.',
                    'Impossibile trovare BROWSER.EXE.',
                    'No se encuentra BROWSER.EXE.'), $10);
+    cmFreeCell :
+      If Not RunExe('FREECELL.EXE', '') Then
+        MsgBoxOpen('FreeCell', L('FREECELL.EXE est introuvable.',
+                   'FREECELL.EXE cannot be found.',
+                   'FREECELL.EXE wurde nicht gefunden.',
+                   'Impossibile trovare FREECELL.EXE.',
+                   'No se encuentra FREECELL.EXE.'), $10);
+    cmCharMap :
+      If Not RunExe('CHARMAP.EXE', '') Then
+        MsgBoxOpen(L('Table de caract'#138'res', 'Character Map',
+                   'Zeichentabelle', 'Mappa caratteri', 'Mapa de caracteres'),
+                   L('CHARMAP.EXE est introuvable.',
+                   'CHARMAP.EXE cannot be found.',
+                   'CHARMAP.EXE wurde nicht gefunden.',
+                   'Impossibile trovare CHARMAP.EXE.',
+                   'No se encuentra CHARMAP.EXE.'), $10);
     cmMp3Play :
       If Not RunExe('MP3PLAY.EXE', '') Then
         MsgBoxOpen(L('Lecteur MP3', 'MP3 Player', 'MP3-Player',
@@ -28943,9 +29110,48 @@ Begin
   DcDirty(L0, T0, R0, B0);
 End;
 
+{ Rectangle aux coins arrondis : quarts d'ellipse de W x H points }
 Function RoundRect(Hdc, L0, T0, R0, B0, W, H : LongInt) : LongInt;
+Var D, C, RX, RY, Y, Yr, In0, PIn, A, B : LongInt; Ok : Boolean;
 Begin
-  RoundRect := Rectangle(Hdc, L0, T0, R0, B0);
+  RoundRect := 1;
+  RX := Min(W Div 2, (R0 - L0) Div 2); RY := Min(H Div 2, (B0 - T0) Div 2);
+  If (RX < 1) Or (RY < 1) Then
+  Begin
+    RoundRect := Rectangle(Hdc, L0, T0, R0, B0);
+    Exit;
+  End;
+  D := DcOf(Hdc);
+  If Not DcBegin(D) Then Exit;
+  Ok := PenColor(D, C);
+  PIn := -1;
+  For Y := T0 To B0 - 1 Do
+  Begin
+    { retrait du bord dans les coins }
+    If Y < T0 + RY Then Yr := T0 + RY - Y
+    Else If Y > B0 - 1 - RY Then Yr := Y - (B0 - 1 - RY)
+    Else Yr := 0;
+    If Yr > 0 Then
+      In0 := RX - ISqrt(RX * RX - MulDiv(RX * RX, Yr * Yr, RY * RY))
+    Else In0 := 0;
+    BrushFill(L0 + In0, Y, R0 - 1 - In0, Y, Dcs[D].Brush);
+    If Ok Then
+    Begin
+      If (Y = T0) Or (Y = B0 - 1) Then HLine(L0 + In0, R0 - 1 - In0, Y, C)
+      Else
+      Begin
+        Pix(L0 + In0, Y, C); Pix(R0 - 1 - In0, Y, C);
+        If (PIn >= 0) And (Abs(In0 - PIn) > 1) Then
+        Begin
+          A := Min(In0, PIn); B := Max(In0, PIn);
+          HLine(L0 + A, L0 + B, Y, C);
+          HLine(R0 - 1 - B, R0 - 1 - A, Y, C);
+        End;
+      End;
+    End;
+    PIn := In0;
+  End;
+  DcDirty(L0, T0, R0, B0);
 End;
 
 Function Ellipse(Hdc, L0, T0, R0, B0 : LongInt) : LongInt;
@@ -34272,9 +34478,40 @@ End;
 
 { Boite de message d'un programme (modale) }
 Function MessageBoxA(H, Text, Cap, Typ : LongInt) : LongInt;
-Var T, X, Y : String; I : LongInt;
+Var T, X, Y : String; I, N, P, Q, Ho, B : LongInt; An : Boolean;
 Begin
   If Cap = 0 Then T := 'Erreur' Else T := APStr(Cap);
+  { long texte : copie dans le tas du noyau ('|' : fin de ligne) }
+  N := 0;
+  If Text <> 0 Then
+    While (N < 8192) And (Mem[0:Text + N] <> 0) Do Inc(N);
+  If N > 255 Then
+  Begin
+    Ho := HeapOwner; HeapOwner := 0;
+    P := KAlloc(N + 1);
+    HeapOwner := Ho;
+    If P <> 0 Then
+    Begin
+      An := AnsiApp;
+      Q := 0;
+      For I := 0 To N - 1 Do
+      Begin
+        B := Mem[0:Text + I];
+        If B = 10 Then B := Ord('|');
+        If B <> 13 Then
+        Begin
+          If An And (B >= 128) Then B := AnsiOem[B];
+          Mem[0:P + Q] := B;
+          Inc(Q);
+        End;
+      End;
+      MbPendN := Q;
+      MbPendP := P;
+      KLog('MessageBoxA "' + T + '" : (' + IntStr(Q) + ' caracteres)');
+      MessageBoxA := MsgBoxModal(T, '', Typ);
+      Exit;
+    End;
+  End;
   X := APStr(Text);
   { fins de ligne du programme : '|' pour WrapText }
   Y := '';
@@ -84160,7 +84397,8 @@ BEGIN
   SvInit;
   BootShow;
   DispiDetect;
-  DispW := -1; RebootAskW := -1; DtW := -1;
+  DispW := -1; RebootAskW := -1; DtW := -1; MbLongW := -1; MbLongP := 0;
+  MbPendP := 0;
   TzLoad;
   PsDev := -1;
   SndInit;
