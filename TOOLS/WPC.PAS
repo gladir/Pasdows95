@@ -3320,6 +3320,91 @@ Begin
   TokenCount := J;
 End;
 
+{ ---- TokenPoolFoldStrings : 'abc' + 'def' -> 'abcdef' ---- }
+{ Comme Turbo Pascal, une somme de constantes chaines est une constante :  }
+{ on fusionne LIT + LIT (TK_STRING ou TK_CHAR) en un seul litteral quand    }
+{ le premier commence un terme (apres '(' ',' '[' ':=' '=' '<>' '<' '>'     }
+{ '<=' '>=' '+' ou en debut) et que le second n est pas suivi d un          }
+{ operateur plus prioritaire, d un indice ou d un '.' ; et que le resultat  }
+{ tient dans 255 caracteres, sans #0 (un litteral avec #0 est une chaine   }
+{ Pascal : S + 'x' + #0 doit garder son #0). Chaque concatenation coutait un }
+{ appel de la routine de concatenation et une chaine temporaire.            }
+Function FoldLit(Const T : TToken) : Boolean;
+Begin
+  FoldLit := (T.Kind = TK_STRING) Or (T.Kind = TK_CHAR);
+End;
+
+Function FoldPrevOk(J : Integer) : Boolean;
+Var V : TString;
+Begin
+  If J < 0 Then
+  Begin
+    FoldPrevOk := True;
+    Exit;
+  End;
+  V := TokenPool[J].Val;
+  If TokenPool[J].Kind = TK_PUNCT Then
+    FoldPrevOk := (V = '(') Or (V = ',') Or (V = '[')
+  Else If TokenPool[J].Kind = TK_OP Then
+    FoldPrevOk := (V = ':=') Or (V = '=') Or (V = '<>') Or (V = '<') Or
+                  (V = '>') Or (V = '<=') Or (V = '>=') Or (V = '+')
+  Else
+    FoldPrevOk := False;
+End;
+
+Function FoldNextOk(I : Integer) : Boolean;
+Var V : TString;
+Begin
+  FoldNextOk := True;
+  If I >= TokenCount Then Exit;
+  V := StrUpperCase(TokenPool[I].Val);
+  If (TokenPool[I].Kind = TK_OP) Or (TokenPool[I].Kind = TK_PUNCT) Or
+     (TokenPool[I].Kind = TK_KEYWORD) Then
+    If (V = '*') Or (V = '/') Or (V = '[') Or (V = '.') Or (V = '^') Or
+       (V = 'DIV') Or (V = 'MOD') Or (V = 'AND') Or (V = 'SHL') Or
+       (V = 'SHR') Or (V = 'AS') Then
+      FoldNextOk := False;
+End;
+
+Procedure TokenPoolFoldStrings;
+Var
+  I, J : Integer;
+  S : TString;
+Begin
+  I := 0;
+  J := 0;
+  While I < TokenCount Do
+  Begin
+    If FoldLit(TokenPool[I]) And (J >= 2) And
+       (TokenPool[J - 1].Kind = TK_OP) And (TokenPool[J - 1].Val = '+') And
+       FoldLit(TokenPool[J - 2]) And FoldPrevOk(J - 3) And
+       FoldNextOk(I + 1) And
+       (Length(TokenPool[J - 2].Val) + Length(TokenPool[I].Val) <= MAX_STR) And
+       (Pos(#0, TokenPool[J - 2].Val) = 0) And (Pos(#0, TokenPool[I].Val) = 0) And
+       (TokHPlus[J - 2] = TokHPlus[I]) Then
+    Begin
+      S := TokenPool[J - 2].Val + TokenPool[I].Val;
+      TokenPool[J - 2].Val := S;
+      { comme le lexeur : TK_STRING, code du caractere s il est seul }
+      TokenPool[J - 2].Kind := TK_STRING;
+      If Length(S) = 1 Then TokenPool[J - 2].IntVal := Ord(S[1])
+      Else TokenPool[J - 2].IntVal := 0;
+      Dec(J);
+      Inc(I);
+      Continue;
+    End;
+    If J <> I Then
+    Begin
+      TokenPool[J] := TokenPool[I];
+      TokHPlus[J] := TokHPlus[I];
+      TokIsTry[J] := TokIsTry[I];
+    End;
+    Inc(J);
+    Inc(I);
+  End;
+  TokenCount := J;
+End;
+
 { ---- TokenPoolStripUnitQualifiers : System.Move, Dos.GetDate, Crt.ClrScr ... ---- }
 { Le prefixe d unite (System, Dos, Crt, Strings, Printer, Graph) suivi de '.' est  }
 { retire devant un identificateur : les sous-programmes de ces unites sont integres. }
@@ -5200,8 +5285,11 @@ End;
 { EmitRaw : ecrire une ligne brute dans le fichier de sortie   }
 { ------------------------------------------------------------ }
 
+Procedure EmitFlush; Forward;
+
 Procedure EmitRaw(Const S : TString);
 Begin
+  EmitFlush;
   If OutFOpen Then
     WriteLn(OutF, S);
 End;
@@ -5244,6 +5332,7 @@ End;
 
 Procedure EmitLabel(Const Lbl : TString);
 Begin
+  EmitFlush;
   If OutFOpen Then
     WriteLn(OutF, Lbl, ':');
   If BcActive Then
@@ -5259,7 +5348,7 @@ End;
 { EmitInstr : ecrire une instruction avec 8 espaces d indent   }
 { ------------------------------------------------------------ }
 
-Procedure EmitInstr(Const S : TString);
+Procedure EmitInstrNow(Const S : TString);
 Var
   BcLenBefore : LongInt;
 Begin
@@ -5304,6 +5393,108 @@ Begin
         WriteLn('  [asm] instruction non assemblee : ', S);
     End;
   End;
+End;
+
+{ ------------------------------------------------------------ }
+{ Fenetre d optimisation (x86 32 bits), sur les instructions emises :    }
+{  - un litteral chaine copie dans l anneau STRRING s emettait            }
+{    LEA EAX,[lit] / MOV ESI,EAX / CALL STRRET (13 octets) ; STRRET rend  }
+{    son resultat dans EAX : MOV ESI,OFFSET lit / CALL STRRET (10) ;      }
+{  - l adresse d une variable ou d une constante passee en argument :     }
+{    LEA EAX,[x] / PUSH EAX (7 octets), suivie d une instruction qui      }
+{    remplace EAX sans le lire (MOV EAX,...) : PUSH OFFSET x (5).         }
+{ Les instructions retenues sont emises (EmitFlush) des que la suite      }
+{ differe, ou avant une etiquette, une mesure de la longueur du code ou   }
+{ la fin de la generation.                                               }
+{ ------------------------------------------------------------ }
+
+Var
+  PeepN   : Integer;     { 0 ; 1 LEA ; 2 LEA, MOV ESI,EAX ; 3 LEA, PUSH EAX }
+  PeepLea : TString;     { LEA EAX,[x] }
+
+Procedure EmitFlush;
+Var N : Integer; L : TString;
+Begin
+  If PeepN = 0 Then Exit;
+  N := PeepN; L := PeepLea;
+  PeepN := 0;
+  EmitInstrNow(L);
+  If N = 2 Then EmitInstrNow('MOV ESI,EAX');
+  If N = 3 Then EmitInstrNow('PUSH EAX');
+End;
+
+Function PeepOn : Boolean;
+Begin
+  PeepOn := BcActive And (Not Opts.Dos16Mode) And
+    ((Opts.DestTarget = DEST_W32) Or (Opts.DestTarget = DEST_WIN32) Or
+     (Opts.DestTarget = DEST_OS2KRNL));
+End;
+
+{ LEA EAX,[nom] (etiquette simple, sans registre ni deplacement) }
+Function PeepLeaLabel(Const S : TString) : Boolean;
+Var I : Integer; C : Char;
+Begin
+  PeepLeaLabel := False;
+  If (Length(S) < 11) Or (Copy(S, 1, 9) <> 'LEA EAX,[') Or
+     (S[Length(S)] <> ']') Then Exit;
+  For I := 10 To Length(S) - 1 Do
+  Begin
+    C := S[I];
+    If Not (((C >= 'A') And (C <= 'Z')) Or ((C >= 'a') And (C <= 'z')) Or
+            ((C >= '0') And (C <= '9')) Or (C = '_')) Then Exit;
+  End;
+  PeepLeaLabel := True;
+End;
+
+Procedure EmitInstr(Const S : TString);
+Var Lb : TString;
+Begin
+  If PeepN > 0 Then
+  Begin
+    Lb := Copy(PeepLea, 10, Length(PeepLea) - 10);
+    If PeepN = 2 Then
+    Begin
+      If S = 'CALL ' + TP_RT_PFX + 'STRRET' Then
+      Begin
+        PeepN := 0;
+        EmitInstrNow('MOV ESI,OFFSET ' + Lb);
+        EmitInstrNow(S);
+        Exit;
+      End;
+    End
+    Else If PeepN = 3 Then
+    Begin
+      If (Copy(S, 1, 8) = 'MOV EAX,') And
+         (Pos('EAX', Copy(S, 9, Length(S))) = 0) Then
+      Begin
+        PeepN := 0;
+        EmitInstrNow('PUSH OFFSET ' + Lb);
+        EmitInstrNow(S);
+        Exit;
+      End;
+    End
+    Else
+    Begin
+      If (S = 'MOV ESI,EAX') And (Copy(Lb, 1, Length(TP_STR_PFX)) = TP_STR_PFX)
+      Then
+      Begin
+        PeepN := 2;
+        Exit;
+      End;
+      If S = 'PUSH EAX' Then
+      Begin
+        PeepN := 3;
+        Exit;
+      End;
+    End;
+    EmitFlush;
+  End;
+  If PeepOn And PeepLeaLabel(S) Then
+  Begin
+    PeepN := 1; PeepLea := S;
+    Exit;
+  End;
+  EmitInstrNow(S);
 End;
 
 { ------------------------------------------------------------ }
@@ -39569,6 +39760,7 @@ End;
 { --- Emission d octets dans BcCode --- }
 Procedure BcEmitB(B: Byte);
 Begin
+  EmitFlush;
   If BcCodeLen < BC_MAX_CODE Then
   Begin BcCode[BcCodeLen] := B; Inc(BcCodeLen); End;
 End;
@@ -40336,6 +40528,7 @@ End;
 { --- Assembleur principal --- }
 Function BcGetCodeLen : LongInt;
 Begin
+  EmitFlush;
   BcGetCodeLen := BcCodeLen;
 End;
 
@@ -61555,6 +61748,8 @@ Begin
   TokenPoolMergeCaretChars;
   { System.Move, Dos.GetDate ... : retirer le prefixe d unite }
   TokenPoolStripUnitQualifiers;
+  { 'abc' + 'def' : une seule constante }
+  TokenPoolFoldStrings;
 
   { Enregistrer toutes les chaines dans le pool de donnees }
   TokenPoolRegisterStrings;
@@ -61733,6 +61928,7 @@ Begin
         WriteLn('  ASM genere : ', ReplaceExt(Opts.OutFile, '.asm'));
     End;
 
+    EmitFlush;
     BcActive := False;
   End;
 
