@@ -8364,7 +8364,7 @@ Const
   icFind     = 44; icScanDisk = 45; icDxDiag   = 46; icCharMap  = 47;
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
-  icAppWiz   = 56; icRdp      = 57;
+  icAppWiz   = 56; icRdp      = 57; icFtp      = 58;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9887,6 +9887,15 @@ Begin
       QR(8, 26, 14, 28, cGray);
       QL(20, 18, 26, 18, cRed); QL(26, 18, 26, 22, cRed);
       QL(23, 21, 26, 18, cRed);
+    End;
+    icFtp :
+    Begin
+      { client FTP : dossier, fleches d'envoi et de telechargement }
+      IconFolder(cYellow);
+      QR(9, 12, 11, 25, cGreen); QL(6, 15, 10, 11, cGreen);
+      QL(14, 15, 10, 11, cGreen);
+      QR(20, 11, 22, 24, cBlue); QL(17, 21, 21, 25, cBlue);
+      QL(25, 21, 21, 25, cBlue);
     End;
     icNetDrv :
     Begin
@@ -13901,7 +13910,7 @@ Const
   cmNewFolder = 74; cmNewText = 75; cmNewBmp = 76; cmNewHtml = 77;
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
-  cmMstsc = 86;
+  cmMstsc = 86; cmFtp = 93;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -14314,7 +14323,8 @@ Begin
     (Nm = 'WAB.EXE') Or (Nm = 'IMAGING.EXE') Or (Nm = 'CDPLAYER.EXE') Or
     (Nm = 'FINDFILE.EXE') Or (Nm = 'ECHECS.EXE') Or (Nm = 'SOL.EXE') Or
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
-    (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE');
+    (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE') Or
+    (Nm = 'FTPCLI.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -14887,7 +14897,7 @@ Begin
     mnComm : MenuCount := 1;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
-    mnInet : MenuCount := 1 + KnownCount('I');
+    mnInet : MenuCount := 2 + KnownCount('I');
     mnSettings : MenuCount := 10;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -15131,9 +15141,15 @@ Begin
                'Browser Web', 'Navegador Web');
         Cmd := cmBrowser; Icon := icWeb;
       End
+      Else If I = 1 Then
+      Begin
+        T := L('Client FTP', 'FTP Client', 'FTP-Client', 'Client FTP',
+               'Cliente FTP');
+        Cmd := cmFtp; Icon := icFtp;
+      End
       Else
       Begin
-        K := KnownAt('I', I - 1);
+        K := KnownAt('I', I - 2);
         T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnTools :
@@ -16563,6 +16579,7 @@ Begin
   Else If Nm = 'MSTASK.EXE' Then ExeIcon := icTaskSch
   Else If Nm = 'CONTROL.EXE' Then ExeIcon := icControl
   Else If Nm = 'MSTSC.EXE' Then ExeIcon := icRdp
+  Else If Nm = 'FTPCLI.EXE' Then ExeIcon := icFtp
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
@@ -22450,6 +22467,7 @@ Begin
     cmDiscDrv : WNetDlgOpen(True);
     cmControl : RunExe('CONTROL.EXE', '');
     cmMstsc : RunExe('MSTSC.EXE', '');
+    cmFtp : RunExe('FTPCLI.EXE', '');
     cmNetDisc :
       If CtxNetDrv <> #0 Then
       Begin

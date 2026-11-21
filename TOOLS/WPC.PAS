@@ -34018,6 +34018,26 @@ Begin
   EmitLabel(TP_RT_PFX + 'DELETE');
   EmitInstr('PUSHAD');
   EmitInstr('DEC EBX');
+  { comme Turbo Pascal : rien si Pos < 1, Pos > Length ou Len <= 0 ;
+    Len est borne aux caracteres restants (sinon la copie partait
+    au-dela du zero final) }
+  EmitInstr('JS ' + TP_RT_PFX + 'DEL_X');
+  EmitInstr('TEST ECX,ECX');
+  EmitInstr('JLE ' + TP_RT_PFX + 'DEL_X');
+  EmitInstr('MOV EDX,ESI');
+  EmitLabel(TP_RT_PFX + 'DEL_N');
+  EmitInstr('CMP BYTE PTR [EDX],0');
+  EmitInstr('JE ' + TP_RT_PFX + 'DEL_N2');
+  EmitInstr('INC EDX');
+  EmitInstr('JMP ' + TP_RT_PFX + 'DEL_N');
+  EmitLabel(TP_RT_PFX + 'DEL_N2');
+  EmitInstr('SUB EDX,ESI');
+  EmitInstr('SUB EDX,EBX');
+  EmitInstr('JLE ' + TP_RT_PFX + 'DEL_X');
+  EmitInstr('CMP ECX,EDX');
+  EmitInstr('JLE ' + TP_RT_PFX + 'DEL_OK');
+  EmitInstr('MOV ECX,EDX');
+  EmitLabel(TP_RT_PFX + 'DEL_OK');
   { EDI = debut zone a supprimer, ESI = debut zone apres }
   EmitInstr('MOV EDI,ESI');
   EmitInstr('ADD EDI,EBX');
@@ -34028,6 +34048,7 @@ Begin
   EmitInstr('STOSB');
   EmitInstr('TEST AL,AL');
   EmitInstr('JNZ ' + TP_RT_PFX + 'DEL_L');
+  EmitLabel(TP_RT_PFX + 'DEL_X');
   EmitInstr('POPAD');
   EmitInstr('RET');
 

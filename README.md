@@ -34,6 +34,7 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>APPS/IMAGING.PAS</b></td><td><b>Imaging</b> (IMAGING.EXE) : visionneuse TIFF (plusieurs pages), BMP, GIF, PNG et JPEG, voir la section <a href="#imaging">Imaging</a>.</td></tr>
 	<tr><td><b>APPS/WAB.PAS</b></td><td><b>Carnet d'adresses</b> (WAB.EXE), voir la section <a href="#carnet">Carnet d'adresses</a>.</td></tr>
 	<tr><td><b>APPS/MSTSC.PAS</b></td><td><b>Connexion Bureau à distance</b> (MSTSC.EXE, compilé par <b>WPC -CW32</b>) : client RDP avec TLS et NLA (CredSSP), voir la section <a href="#rdp">Connexion Bureau à distance</a>.</td></tr>
+	<tr><td><b>APPS/FTPCLI.PAS</b></td><td><b>Client FTP</b> (FTPCLI.EXE, compilé par <b>WPC -CW32</b>) : client FTP et SFTP (SSH-2) dans le genre de FileZilla, avec gestionnaire de sites en XML, voir la section <a href="#ftp">Client FTP</a>.</td></tr>
 	<tr><td><b>APPS/CONTROL.PAS</b></td><td><b>Panneau de configuration</b> (CONTROL.EXE) : applets désignées par leur fichier .CPL, boîtes Souris, Clavier et Paramètres régionaux, voir la section <a href="#panneau">Panneau de configuration</a>.</td></tr>
 	<tr><td><b>APPS/MP3PLAY.PAS</b></td><td><b>Lecteur MP3</b> (MP3PLAY.EXE, compilé par <b>WPC -CW32</b>) : le lecteur MP3PLAY.PAS du projet <a href="https://github.com/gladir/OS2-0">OS2-0</a> converti des API d'OS/2 (MDM, PMWIN, PMGPI, DOSCALLS) aux API de Windows (WINMM, USER32, GDI32, KERNEL32), voir la section <a href="#mp3">Lecteur MP3</a>.</td></tr>
 	<tr><td><b>EXAMPLES/HTTPGET.PAS</b></td><td>Exemple Win32 en mode console (HTTPGET.EXE) : télécharge une adresse <b>http://</b> ou <b>https://</b> avec WININET (<i>HTTPGET url [fichier]</i>), voir la section <a href="#https">HTTPS</a>.</td></tr>
@@ -208,7 +209,7 @@ Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Ac
 	<li><b>Communications</b> : <b>Connexion Bureau à distance</b> (voir la section <a href="#rdp">Connexion Bureau à distance</a>) ;</li>
 	<li><b>Jeux</b> : <b>Échecs</b>, <b>FreeCell</b> et <b>Solitaire</b> ;</li>
 	<li><b>Multimédia</b> : <b>Lecteur CD</b>, <b>Lecteur MP3</b>, Contrôle du volume, puis les programmes DirectX installés : Outil de diagnostic DirectX (DXDIAG), DDTEST, D3DTEST, D3D8TEST et GLTEST ;</li>
-	<li><b>Outils Internet</b> : Navigateur Web, puis NETTEST et HTTPGET s'ils sont installés ;</li>
+	<li><b>Outils Internet</b> : Navigateur Web, <b>Client FTP</b> (voir la section <a href="#ftp">Client FTP</a>), puis NETTEST et HTTPGET s'ils sont installés ;</li>
 	<li><b>Outils système</b> : <b>Défragmenteur de disque</b>, Gestionnaire des tâches, <b>Informations système</b>, <b>Nettoyage de disque</b>, ScanDisk (vérification du disque C:), <b>Tâches planifiées</b>, puis FATTEST, PROCTEST et HELLO s'ils sont installés.</li>
 </ul>
 
@@ -362,6 +363,41 @@ Essayé avec le serveur <b>FreeRDP</b> (shadow, NLA et NTLMv2 obligatoires, 800x
 <table>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_COMMUNICATIONS.png" width="400" alt="Menu Communications"><br><i>Accessoires, Communications</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/BUREAU_DISTANCE.png" width="400" alt="Connexion Bureau à distance"><br><i>La boîte de connexion</i></td></tr>
 	<tr><td align="center" colspan="2"><img src="IMAGE/SCREENSHOTS/BUREAU_DISTANCE_SESSION.png" width="400" alt="Session RDP"><br><i>Session de 800x600 dans une fenêtre (serveur FreeRDP avec NLA)</i></td></tr>
+</table>
+
+<h2 id="ftp">Client FTP</h2>
+
+<b>APPS/FTPCLI.PAS</b> (FTPCLI.EXE, compilé par <b>WPC -CW32</b>, sans unité supplémentaire) est un client <b>FTP</b> et <b>SFTP</b> dans le genre de <b>FileZilla</b>, avec l'apparence de Windows 95 : <i>Démarrer, Programmes, Accessoires, Outils Internet, Client FTP</i>. La fenêtre reprend la disposition de FileZilla :
+
+<ul>
+	<li>une <b>barre d'outils</b> (Gestionnaire de sites, Actualiser, Traiter la file d'attente, Annuler, Déconnecter, Reconnecter, afficher la file) et une barre de <b>connexion rapide</b> (Hôte, Identifiant, Mot de passe, Port, bouton <b>Connexion</b> et historique des connexions récentes) : <i>serveur</i>, <i>sftp://utilisateur@serveur:port/dossier</i> ou le port 22 choisissent SFTP ;</li>
+	<li>le <b>journal des messages</b> en couleurs (Statut, Commande, Réponse, Erreur) ;</li>
+	<li>deux panneaux, <b>Site local</b> et <b>Site distant</b>, avec chemin modifiable, colonnes triables (nom, taille, date, et droits et propriétaire côté serveur), dossier parent « .. », <b>sélection multiple</b> (Maj+clic, Ctrl+clic), et une ligne d'état (« 3 fichiers et 1 dossier. Taille totale : ... ») ; double clic sur un dossier pour l'ouvrir, sur un fichier pour le transférer ; <b>glisser-déposer</b> d'un panneau à l'autre ou vers la file ; Retour arrière, Suppr, F2 et F5 ;</li>
+	<li>la <b>file d'attente</b> avec ses onglets <b>Fichiers en attente</b>, <b>Transferts échoués</b> et <b>Transferts réussis</b> : barre de progression, vitesse dans la barre d'état, dossiers transférés avec leur contenu (récursivement, dans les deux sens), question quand le fichier cible existe (Oui, Non, Annuler, ou <i>Transfert, Si le fichier existe</i> : toujours remplacer ou ignorer), recommencer les transferts échoués ;</li>
+	<li>des <b>menus déroulants</b> (Fichier, Édition, Affichage, Transfert, Serveur, ?) et des <b>menus contextuels</b> : Envoyer, Télécharger, Ajouter à la file d'attente, Ouvrir, Créer un dossier, Actualiser, Supprimer (dossiers avec leur contenu), Renommer, Copier l'URL dans le presse-papiers, <b>Droits d'accès</b> (cases lecture, écriture, exécution et valeur octale, comme FileZilla) ; <i>Serveur, Entrer une commande personnalisée</i> (FTP) ; affichage des fichiers masqués.</li>
+</ul>
+
+Le <b>Gestionnaire de sites</b> enregistre les serveurs dans <b>sitemanager.xml</b>, au même format XML que FileZilla 3 (éléments <i>Server</i> dans des <i>Folder</i>, Protocol 0 = FTP et 1 = SFTP, Logontype anonyme, normale ou « demander le mot de passe », mot de passe en base64 comme FileZilla, dossiers local et distant par défaut, commentaires) ; on peut donc <b>importer</b> le <i>sitemanager.xml</i> de FileZilla (<i>Fichier, Importer des sites</i>) ou <b>exporter</b> les sites. On s'y connecte d'un clic sur <b>Connexion</b>, ou immédiatement avec la barre de connexion rapide, dont l'historique est gardé dans <b>recentservers.xml</b>. Ces fichiers sont à côté du programme (sur C:\ quand Pasdows démarre du CD-ROM).
+
+Les protocoles sont entièrement écrits en Pascal dans le programme, sur WSOCK32 :
+
+<ul>
+	<li><b>FTP</b> : mode passif <b>EPSV</b> puis PASV (une adresse privée annoncée par le serveur est remplacée par celle du serveur), FEAT, <b>UTF-8</b>, TYPE I, listes <b>MLSD</b> ou LIST (formats Unix et MS-DOS ; l'année manquante des fichiers récents est complétée), RETR, STOR, MKD, RMD, DELE, RNFR/RNTO, SITE CHMOD ;</li>
+	<li><b>SFTP</b> (version 3) sur <b>SSH-2</b> : échange de clés <b>curve25519-sha256</b> (X25519), clés d'hôte <b>ssh-ed25519</b>, <b>rsa-sha2-512</b> et <b>rsa-sha2-256</b> dont la signature est vérifiée (Ed25519 et SHA-512, RSA en arithmétique de Montgomery), chiffrement <b>aes128-ctr</b> et <b>hmac-sha2-256</b>, « kex strict » (protection contre l'attaque Terrapin), authentification par mot de passe ou clavier interactif, canal <i>session</i> et sous-système <i>sftp</i>, lectures et écritures de 32 Ko avec 8 requêtes en vol ; la première connexion à un serveur affiche l'<b>empreinte SHA-256</b> de sa clé (comme FileZilla et OpenSSH), qui peut être mémorisée dans <b>knownhosts.txt</b> ; une clé changée est signalée.</li>
+</ul>
+
+Les échanges réseau se font dans un second <b>thread</b> (CreateThread, événement, PostMessage vers la fenêtre) : la fenêtre reste utilisable pendant les transferts, et <b>Annuler</b> interrompt l'opération en cours. Le code de WPC partageant ses tampons de chaînes entre les threads, un verrou (section critique) les protège ; le thread réseau le rend pendant les attentes du réseau et à chaque étape de la progression.
+
+En écrivant ce programme, un défaut de <b>WPC</b> a été corrigé : <b>Delete(S, Pos, N)</b> ne bornait pas N à la fin de la chaîne (la copie continuait après le zéro final : <i>Delete(S, 1, Length(S) + 1)</i> ne vidait pas la chaîne) ; il se comporte maintenant comme en Turbo Pascal (rien si Pos est hors de la chaîne ou N ≤ 0). Tous les programmes ont été recompilés.
+
+Limites : pas de FTPS (FTP sur TLS), pas d'authentification SSH par clé, un seul algorithme de chacun des types SSH ci-dessus (ceux qu'OpenSSH propose par défaut), pas de reprise des transferts interrompus ni de comparaison de dossiers ; le choix du protocole se fait par des boutons radio. En SFTP, le chiffrement en Pascal limite le débit (environ 430 Ko/s sous qemu sans KVM, contre 2,6 Mo/s en FTP).
+
+Essayé avec <b>vsftpd</b> (FTP, listes LIST, envoi et téléchargement d'un dossier, fichier de 20 Mo, renommage, droits, suppression récursive, identifiant refusé) et <b>OpenSSH 9.6</b> (SFTP, clés Ed25519 et RSA, mot de passe et clavier interactif) : fichiers identiques des deux côtés (md5). Avec qemu, le serveur de l'hôte est <b>10.0.2.2</b>.
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_OUTILS_INTERNET.png" width="400" alt="Menu Outils Internet"><br><i>Accessoires, Outils Internet, Client FTP</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP.png" width="400" alt="Client FTP"><br><i>Connecté en SFTP : téléchargement en cours</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_SITES.png" width="400" alt="Gestionnaire de sites"><br><i>Gestionnaire de sites (sitemanager.xml)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_CLE_HOTE.png" width="400" alt="Clé d'hôte inconnue"><br><i>Première connexion SFTP : empreinte de la clé d'hôte</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_REMPLACER.png" width="400" alt="Le fichier cible existe déjà"><br><i>Le fichier cible existe déjà</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_DROITS.png" width="400" alt="Droits d'accès"><br><i>Modifier les droits d'accès (FTP : SITE CHMOD)</i></td></tr>
 </table>
 
 <h2 id="freecell">FreeCell</h2>
