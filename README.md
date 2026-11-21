@@ -128,6 +128,21 @@ L'<b>Explorateur Pasdows</b> (<i>Démarrer, Programmes, Explorateur Pasdows</i>)
 
 Dans l'arbre de l'Explorateur, un <b>clic droit</b> sur le Bureau, le Poste de travail, un lecteur ou un dossier ouvre son menu contextuel : <i>Ouvrir</i> (fenêtre de dossier), <i>Explorer</i> (nouvel Explorateur ouvert sur cet élément) et <i>Propriétés</i> : Propriétés d'affichage pour le Bureau, Propriétés Système pour le Poste de travail, boîte <i>Propriétés</i> du lecteur (avec son graphique en secteurs) pour un lecteur, et pour un dossier son emplacement, sa taille (sous-dossiers compris) et son contenu. Le <b>menu système</b> s'ouvre aussi par un clic sur l'icône de la barre de titre de toute fenêtre (<i>Restaurer</i>, <i>Réduire</i>, <i>Agrandir</i>, <i>Fermer</i>).
 
+Dans le volet de droite (et dans les fenêtres de dossier), un <b>clic droit sur un fichier ou un dossier</b> ouvre le menu de Windows 95 : <i>Ouvrir</i>, <b>Couper</b>, <b>Copier</b>, <b>Coller</b> (dans le dossier visé), <i>Supprimer</i>, <i>Renommer</i>, <b>Sélectionner tout</b> et <b>Propriétés</b> ; un clic droit sur le fond du dossier propose <b>Sélectionner tout</b>, <b>Actualiser</b>, <b>Coller</b>, <i>Nouveau</i> et <i>Propriétés</i>. Les documents et dossiers du bureau ont le même menu, et le menu du bureau a <b>Coller</b>. Sur le CD-ROM, seuls Ouvrir, Copier, Sélectionner tout et Propriétés sont actifs.
+
+<ul>
+	<li><b>Sélection multiple</b> : <b>Ctrl+clic</b> ajoute ou retire un élément, <b>Maj+clic</b> choisit une plage, <b>Sélectionner tout</b> (ou <b>Ctrl+A</b>) tout le dossier ; la barre d'état donne « <i>n</i> objet(s) sélectionné(s) » et leur taille. Couper, Copier, Supprimer et Propriétés portent sur tous les éléments choisis (« Voulez-vous vraiment supprimer ces 3 éléments ? ») ; Renommer n'est actif que pour un seul.</li>
+	<li><b>Couper / Copier / Coller</b> (aussi <b>Ctrl+X</b>, <b>Ctrl+C</b>, <b>Ctrl+V</b>) : les fichiers et les dossiers (avec tout leur contenu) sont copiés d'un lecteur à l'autre (FAT, NTFS, HPFS, lecteurs réseau SMB2, depuis le CD-ROM) ; Couper déplace (renommage sur le même volume, sinon copie puis suppression). Copier dans le même dossier crée « Copie de <i>nom</i> », « Copie (2) de <i>nom</i> »... ; un élément qui existe déjà fait demander <i>Voulez-vous le remplacer ?</i> (Oui, Non, Annuler) ; copier un dossier dans lui-même est refusé. Comme sous Windows, le presse-papiers contient alors la liste des fichiers (<b>CF_HDROP</b> pour les programmes : GetClipboardData, IsClipboardFormatAvailable, EnumClipboardFormats, <b>DragQueryFileA</b>/<b>W</b>).</li>
+	<li><b>Propriétés</b> d'un fichier ou d'un dossier, onglet <i>Général</i> : icône et nom, <b>type</b> (Application, Document texte, Fichier de commandes MS-DOS, Image bitmap...), <b>emplacement</b>, <b>taille</b> (« 375 Ko (384 000 octets) »), <b>contenu</b> d'un dossier (fichiers et sous-dossiers), <b>nom MS-DOS</b> (8.3), dates de <b>création</b>, de <b>modification</b> et de <b>dernier accès</b> (« samedi 21 novembre 2026 21:51:30 », lues dans l'entrée FAT) et <b>attributs</b> <i>Lecture seule</i>, <i>Masqué</i>, <i>Archive</i> (modifiables sur les volumes FAT, écrits sur le disque par OK ou Appliquer ; <b>SetFileAttributesA</b> les écrit aussi) et <i>Système</i>. Pour plusieurs éléments : nombre de fichiers et de dossiers, dossier commun et taille totale.</li>
+	<li>Clavier : <b>Suppr</b>, <b>F2</b> (renommer), <b>F5</b> (actualiser), les <b>flèches</b> déplacent l'élément choisi, <b>Entrée</b> l'ouvre et <b>Retour arrière</b> remonte au dossier parent.</li>
+</ul>
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/EXPLORATEUR_MENU_FICHIER.png" width="400" alt="Menu contextuel d'un fichier"><br><i>Clic droit sur un fichier : Couper, Copier, Coller, Sélectionner tout, Propriétés</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/EXPLORATEUR_SELECTION.png" width="400" alt="Sélection multiple"><br><i>Maj+clic et Ctrl+clic : 4 éléments choisis</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/PROPRIETES_FICHIER.png" width="400" alt="Propriétés d'un fichier"><br><i>Propriétés d'un fichier (copié sur le bureau)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/PROPRIETES_DOSSIER.png" width="400" alt="Propriétés d'un dossier"><br><i>Propriétés d'un dossier copié avec son contenu</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/EXPLORATEUR_REMPLACER.png" width="400" alt="Confirmer le remplacement"><br><i>Coller sur un élément existant</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/PROPRIETES_PLUSIEURS.png" width="400" alt="Propriétés de plusieurs éléments"><br><i>Propriétés de plusieurs éléments</i></td></tr>
+</table>
+
 Dans le <b>Poste de travail</b> comme dans l'Explorateur, un <b>clic droit sur un lecteur</b> ouvre son menu contextuel (<i>Ouvrir</i>, <i>Formater...</i>, <i>Propriétés</i>) ; la barre d'état donne l'espace libre et la capacité du lecteur sélectionné. La boîte <b>Propriétés</b> reprend celle de Windows 95 :
 
 <ul>
@@ -661,6 +676,15 @@ Pour compiler Paint, WPC (destination <b>-CW32</b>) a été étendu au dialecte 
 
 VMM32 exporte aussi les fonctions nécessaires à PAINT : <b>sprintf</b> et <b>strtod</b> (formatage et lecture des réels du runtime de WPC), QueryPerformanceCounter/Frequency, CoTaskMemAlloc/Free, PropVariantClear, SysAllocString/SysFreeString (OLEAUT32) et WININET (voir la section <a href="#https">HTTPS</a>).
 
+
+<b>Taille du code.</b> L'image du noyau doit finir sous 4 Mo (adresse de chargement des programmes Win32) : VMM32.VXD ne doit pas dépasser 3 Mo en mémoire. Pour faire de la place, WPC génère maintenant un code plus compact, sans changer le sens des programmes (IO.SYS et INSTALL.SYS restent identiques à l'octet près) :
+
+<ul>
+	<li>une somme de littéraux (<i>'abc' + 'def'</i>, <i>'Fichier ' + #174' '</i>, chaînes coupées sur plusieurs lignes) est une seule constante, comme dans Turbo Pascal, au lieu d'appels de concaténation à l'exécution (sauf si un littéral contient #0, qui en fait une chaîne Pascal) ;</li>
+	<li>une fenêtre d'optimisation sur les instructions émises (x86 32 bits) remplace <i>LEA EAX,[lit] / MOV ESI,EAX / CALL STRRET</i> par <i>MOV ESI,OFFSET lit / CALL STRRET</i> (littéral copié pour un paramètre chaîne), et <i>LEA EAX,[x] / PUSH EAX</i> suivi d'une instruction qui remplace EAX par <i>PUSH OFFSET x</i>.</li>
+</ul>
+
+Le noyau a ainsi perdu 32 Ko de code (environ 4 600 et 3 500 séquences), les programmes Win32 un peu moins.
 <h2>Construire et essayer</h2>
 
 ```bash
