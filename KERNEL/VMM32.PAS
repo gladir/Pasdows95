@@ -13736,6 +13736,8 @@ Const
   cmCharMap = 61; cmCdPlayer = 62; cmWab = 63; cmImaging = 64;
   cmFindFiles = 65; cmFindComp = 66; cmScanDisk = 67; cmChess = 68;
   cmSol = 69; cmDefrag = 70; cmCleanMgr = 71; cmMsInfo = 72; cmMsTask = 73;
+  cmNewFolder = 74; cmNewText = 75; cmNewBmp = 76; cmNewHtml = 77;
+  cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmKnownBase = 900;                 { + programme connu (KnownExe) }
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
@@ -13765,6 +13767,7 @@ Const
   mnSysGen = 23;                  { menu systeme (icone du titre) }
   mnAccess = 24; mnGames = 25;    { Programmes, Accessoires, Jeux... }
   mnMedia = 26; mnInet = 27; mnTools = 28; mnFind = 29;
+  mnNew = 30; mnExpCtx = 31;      { Nouveau ; fond d'un dossier }
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -13798,13 +13801,18 @@ Const
     309, 208, 105, 0, -105, -208, -309, -407, -500, -588, -669, -743,
     -809, -866, -914, -951, -978, -995, -1000, -995, -978, -951, -914,
     -866, -809, -743, -669, -588, -500, -407, -309, -208, -105);
-  MaxDesk = 12;
+  MaxDesk = 40;
 
 Type
   TFdNmArr = Array[0..199] Of String[63];
 
 Const
   NoteStH = 20;                 { barre d'etat du Bloc-notes }
+
+
+Type
+  TDeskNmArr = Array[0..MaxDesk - 1] Of String[63];
+  TDeskPtArr = Array[0..MaxDesk - 1] Of String[127];
 
 Var
   { Propriete de Affichage : boite ouverte, profondeurs proposees,
@@ -13862,11 +13870,13 @@ Var
   MenuDepth : LongInt;
   DeskSel   : LongInt;
   DeskCnt   : LongInt;
-  DeskName  : Array[0..MaxDesk - 1] Of String[63];
+  DeskName  : ^TDeskNmArr;                 { dans le tas }
   DeskIco   : Array[0..MaxDesk - 1] Of LongInt;
   DeskCmd   : Array[0..MaxDesk - 1] Of LongInt;
-  DeskPath  : Array[0..MaxDesk - 1] Of String[63];
+  DeskPath  : ^TDeskPtArr;
   LastMinute : LongInt;
+  NewDir, CtxPath : String[127];     { Nouveau : dossier ; element }
+  NewWin, DelAskW : LongInt;         { Explorateur (-1 : bureau) }
   DimOn     : Boolean;
   ExePaths  : Array[0..15] Of String[63];
   ExeCnt    : LongInt;
@@ -13966,8 +13976,8 @@ End;
 Procedure DeskAdd(Name : String; Ico, Cmd : LongInt; Path : String);
 Begin
   If DeskCnt >= MaxDesk Then Exit;
-  DeskName[DeskCnt] := Name; DeskIco[DeskCnt] := Ico;
-  DeskCmd[DeskCnt] := Cmd; DeskPath[DeskCnt] := Path;
+  DeskName^[DeskCnt] := Name; DeskIco[DeskCnt] := Ico;
+  DeskCmd[DeskCnt] := Cmd; DeskPath^[DeskCnt] := Path;
   Inc(DeskCnt);
 End;
 
@@ -14119,7 +14129,7 @@ Begin
 End;
 
 Procedure DeskBuild;
-Var I, Lba, Size, Fl, Tm : LongInt; Nm : String; Dir : Boolean;
+Var I, Lba, Size, Fl, Tm : LongInt; Nm, D : String; Dir : Boolean;
 Begin
   DeskCnt := 0; ExeCnt := 0;
   For I := 0 To KnownN - 1 Do
@@ -14151,6 +14161,20 @@ Begin
       Inc(ExeCnt);
     End;
     Inc(I);
+  End;
+  { dossier du bureau (C:\WINDOWS\Desktop) : dossiers et documents }
+  If DeskOk Then
+  Begin
+    ExpCW := -1;
+    I := 0;
+    { (variable : un resultat de fonction passe en Const est temporaire) }
+    D := DeskDir;
+    While (DeskCnt < MaxDesk) And ExpEntryP(D, I, Nm, Fl, Size) Do
+    Begin
+      DeskAdd(ItemLabel(Nm, Fl), ItemIcon(Nm, Fl), cmDeskFile,
+              D + '\' + Nm);
+      Inc(I);
+    End;
   End;
 End;
 
@@ -14208,7 +14232,7 @@ Begin
     If RInter(T, T, R) Then
     Begin
       PaintIcon(DeskIco[I], X + 26, Y, 32);
-      DrawLabel(X + 2, Y + 35, 80, DeskName[I], DeskSel = I, Fg);
+      DrawLabel(X + 2, Y + 35, 80, DeskName^[I], DeskSel = I, Fg);
     End;
   End;
   If DimOn Then
@@ -14654,7 +14678,9 @@ Begin
     mnDesk : MenuCount := 9;
     mnArrange : MenuCount := 2;
     mnColors : MenuCount := DepN;
-    mnIcon : MenuCount := 3;
+    mnIcon : MenuCount := 6;
+    mnNew : MenuCount := 5;
+    mnExpCtx : MenuCount := 3;
     mnDocs :
     Begin
       N := 0;
@@ -14995,7 +15021,7 @@ Begin
             End;
         6 : Begin
               T := L('Nouveau', 'New', 'Neu', 'Nuovo', 'Nuevo');
-              Cmd := cmGray;
+              If DeskOk Then Sub := mnNew Else Cmd := cmGray;
             End;
         8 : Begin
               T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
@@ -15160,18 +15186,64 @@ Begin
         Cmd := cmTzBase + I;
       End;
     mnIcon :
+      Case I Of
+        0 : Begin
+              T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
+              Cmd := cmIconOpen;
+            End;
+        2 : Begin
+              T := L('Supprimer', 'Delete', 'L'#148'schen', 'Elimina',
+                     'Eliminar');
+              If CtxPath <> '' Then Cmd := cmCtxDel Else Cmd := cmGray;
+            End;
+        3 : Begin
+              T := L('Renommer', 'Rename', 'Umbenennen', 'Rinomina',
+                     'Cambiar nombre');
+              If CtxPath <> '' Then Cmd := cmCtxRen Else Cmd := cmGray;
+            End;
+        5 : Begin
+              T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+                     'Propriet'#133, 'Propiedades');
+              If (NewWin < 0) And (DeskSel >= 0) And
+                 (DeskCmd[DeskSel] = cmComputer) Then Cmd := cmSysProps
+              Else If (CtxPath <> '') And IsDirPath(CtxPath) Then
+                Cmd := cmFoldProps
+              Else Cmd := cmGray;
+            End;
+      End;
+    mnNew :
+      Case I Of
+        0 : Begin
+              T := L('Dossier', 'Folder', 'Ordner', 'Cartella', 'Carpeta');
+              Cmd := cmNewFolder; Icon := icFolder;
+            End;
+        2 : Begin
+              T := L('Document texte', 'Text Document', 'Textdokument',
+                     'Documento di testo', 'Documento de texto');
+              Cmd := cmNewText; Icon := icText;
+            End;
+        3 : Begin
+              T := L('Image bitmap', 'Bitmap Image', 'Bitmap',
+                     'Immagine bitmap', 'Imagen de mapa de bits');
+              Cmd := cmNewBmp; Icon := icPaint;
+            End;
+        4 : Begin
+              T := L('Document HTML', 'HTML Document', 'HTML-Dokument',
+                     'Documento HTML', 'Documento HTML');
+              Cmd := cmNewHtml; Icon := icWeb;
+            End;
+      End;
+    mnExpCtx :
       If I = 0 Then
       Begin
-        T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
-        Cmd := cmIconOpen;
+        T := L('Nouveau', 'New', 'Neu', 'Nuovo', 'Nuevo');
+        Sub := mnNew;
       End
       Else If I = 2 Then
       Begin
         T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
                'Propriet'#133, 'Propiedades');
-        If (DeskSel >= 0) And (DeskCmd[DeskSel] = cmComputer) Then
-          Cmd := cmSysProps
-        Else Cmd := cmGray;
+        Cmd := cmFoldProps;
       End;
     mnSysGen :
       Case I Of
@@ -15753,6 +15825,11 @@ Begin
     FmtAskW := -1;
     If Res = IDYES Then FormatDisk0;
   End;
+  If (W = DelAskW) And (DelAskW >= 0) Then
+  Begin
+    DelAskW := -1;
+    If Res = IDYES Then CtxDelete;
+  End;
   Wnds^[W].K1 := Res;
   Wnds^[W].DlgEnded := True;
   ShowW(W, False, False);
@@ -16030,6 +16107,7 @@ Begin
   Else If E = 'COM' Then ExpIcon := icApp
   Else If (E = 'TXT') Or (E = 'BAT') Or (E = 'INI') Or (E = 'SYS') Then
     ExpIcon := icText
+  Else If ItemIcon(Nm, Fl) <> icText Then ExpIcon := ItemIcon(Nm, Fl)
   Else ExpIcon := icDocs;
 End;
 
@@ -16526,18 +16604,9 @@ Begin
     If (Fl And 2) <> 0 Then Wnds^[W].KS := P
     Else
     Begin
-      E := UpStr(Copy(Nm, Pos('.', Nm) + 1, 3));
-      If (E = 'EXE') Or (E = 'COM') Then RunExe(P, '')
-      { fichier d'aide : Aide de Windows (WINHLP32.EXE) }
-      Else If E = 'HLP' Then RunExe('WINHLP32.EXE', '"' + P + '"')
-      { musique et listes de lecture : Lecteur MP3 (MP3PLAY.EXE) }
-      Else If (E = 'MP3') Or (E = 'M3U') Then
-        RunExe('MP3PLAY.EXE', '"' + P + '"')
-      { images : Imaging (IMAGING.EXE) }
-      Else If (E = 'BMP') Or (E = 'GIF') Or (E = 'PNG') Or (E = 'JPG') Or
-              (E = 'JPE') Or (E = 'TIF') Then
-        RunExe('IMAGING.EXE', '"' + P + '"')
-      Else NoteOpen(P);
+      { programme, ou document selon son extension (ShellOpen : Aide,
+        Lecteur MP3, Paint, Imaging, Navigateur, Bloc-notes) }
+      If Not ShellOpen(P, '') Then NoteOpen(P);
       Exit;
     End;
   End;
@@ -16629,11 +16698,21 @@ Begin
       Wnds^[W].K1 := I;
       KRepaint(W);
     End;
+    ExpCtxW := W; ExpCtxI := I;
+    CloseMenus(0);
     If (I >= 0) And (Wnds^[W].KS = '') Then
+      OpenMenu(0, mnDrvCtx, X, Y, False)
+    Else If (Wnds^[W].KS <> '') And (FatVolOf(Wnds^[W].KS) >= 0) Then
     Begin
-      ExpCtxW := W; ExpCtxI := I;
-      CloseMenus(0);
-      OpenMenu(0, mnDrvCtx, X, Y, False);
+      { dossier d'un disque : element (Ouvrir, Supprimer, Renommer) ou
+        fond (Nouveau, Proprietes) }
+      NewWin := W; NewDir := Wnds^[W].KS; CtxPath := '';
+      If I >= 0 Then
+      Begin
+        CtxPath := Wnds^[W].KS + '\' + Nm;
+        OpenMenu(0, mnIcon, X, Y, False);
+      End
+      Else OpenMenu(0, mnExpCtx, X, Y, False);
     End;
     Exit;
   End;
@@ -17570,6 +17649,14 @@ Begin
     ikRun :
     Begin
       PaintIcon(icRun, X1 + 12, Y1 + 12, 32);
+      If Wnds^[W].K1 = 1 Then
+        WrapText(X1 + 56, Y1 + 10, X2 - X1 - 64, L(
+          'Tapez le nouveau nom de '#174' ' + BaseName(CtxPath) + ' '#175'.',
+          'Type the new name of "' + BaseName(CtxPath) + '".',
+          'Neuer Name f'#129'r "' + BaseName(CtxPath) + '":',
+          'Nuovo nome di "' + BaseName(CtxPath) + '":',
+          'Nuevo nombre de "' + BaseName(CtxPath) + '":'), cBlack, True)
+      Else
       WrapText(X1 + 56, Y1 + 10, X2 - X1 - 64, L(
         'Tapez le nom d''un programme ou d''un document, et Pasdows ' +
         'l''ouvrira pour vous.',
@@ -17579,12 +17666,22 @@ Begin
         'Digitare il nome del programma o documento da aprire.',
         'Escriba el nombre del programa o documento que desea abrir.'),
         cBlack, True);
+      If Wnds^[W].K1 = 1 Then
+        OutTxt(X1 + 12, Y1 + 68, L('Nom :', 'Name:', 'Name:', 'Nome:',
+               'Nombre:'), cBlack)
+      Else
       OutTxt(X1 + 12, Y1 + 68, L('Ouvrir :', 'Open:', #153'ffnen:', 'Apri:',
              'Abrir:'), cBlack);
       Sunken(X1 + 84, Y1 + 64, X2 - 12, Y1 + 87, cWhite);
       { fin de la commande si elle depasse la zone }
       T := Wnds^[W].KS;
       While (T <> '') And (TextW(T) > X2 - X1 - 104) Do Delete(T, 1, 1);
+      If Wnds^[W].K2 = 1 Then
+      Begin
+        FBar(X1 + 88, Y1 + 67, X1 + 89 + TextW(T), Y1 + 83, cNavy);
+        OutTxt(X1 + 89, Y1 + 68, T, cWhite);
+      End
+      Else
       OutTxt(X1 + 89, Y1 + 68, T, cBlack);
       VLine(X1 + 89 + TextW(T), Y1 + 67, Y1 + 83, cBlack);
       N := 2;
@@ -17681,6 +17778,14 @@ Procedure DialogAction(W, B : LongInt);
 Var S : String; K : LongInt;
 Begin
   K := Wnds^[W].IKind;
+  If (K = ikRun) And (Wnds^[W].K1 = 1) Then
+  Begin
+    { Renommer }
+    S := Trim(Wnds^[W].KS);
+    DestroyW(W);
+    If (B = 0) And (S <> '') Then CtxRenameTo(S);
+    Exit;
+  End;
   If K = ikRun Then
   Begin
     S := Trim(Wnds^[W].KS);
@@ -21607,13 +21712,13 @@ Begin
     Begin
       If ByType And (DeskIco[J] <> DeskIco[J + 1]) Then
         Swap := DeskIco[J] > DeskIco[J + 1]
-      Else Swap := UpStr(DeskName[J]) > UpStr(DeskName[J + 1]);
+      Else Swap := UpStr(DeskName^[J]) > UpStr(DeskName^[J + 1]);
       If Swap Then
       Begin
-        N := DeskName[J]; DeskName[J] := DeskName[J + 1];
-        DeskName[J + 1] := N;
-        P := DeskPath[J]; DeskPath[J] := DeskPath[J + 1];
-        DeskPath[J + 1] := P;
+        N := DeskName^[J]; DeskName^[J] := DeskName^[J + 1];
+        DeskName^[J + 1] := N;
+        P := DeskPath^[J]; DeskPath^[J] := DeskPath^[J + 1];
+        DeskPath^[J + 1] := P;
         K := DeskIco[J]; DeskIco[J] := DeskIco[J + 1]; DeskIco[J + 1] := K;
         K := DeskCmd[J]; DeskCmd[J] := DeskCmd[J + 1]; DeskCmd[J + 1] := K;
       End;
@@ -21778,7 +21883,25 @@ Begin
     cmAlign : MarkAll;
     cmArrName : DeskArrange(False);
     cmArrType : DeskArrange(True);
-    cmIconOpen : If DeskSel >= 0 Then KCommand(DeskCmd[DeskSel]);
+    cmIconOpen :
+      If NewWin >= 0 Then
+      Begin
+        If Wnds^[NewWin].Used And (Wnds^[NewWin].IKind = ikExplorer) Then
+          ExpOpenItem(NewWin, ExpCtxI);
+      End
+      Else If DeskSel >= 0 Then KCommand(DeskCmd[DeskSel]);
+    cmNewFolder .. cmNewHtml : NewItem(Cmd - cmNewFolder);
+    cmDeskFile :
+      If DeskSel >= 0 Then
+        If Not ShellOpen(DeskPath^[DeskSel], '') Then
+          MsgBoxOpen(DeskName^[DeskSel], L('Impossible d''ouvrir ce ' +
+                     'fichier.', 'Cannot open this file.', 'Datei kann ' +
+                     'nicht ge'#148'ffnet werden.', 'Impossibile aprire il ' +
+                     'file.', 'No se puede abrir el archivo.'), $10);
+    cmCtxDel : CtxDeleteAsk;
+    cmCtxRen : CtxRenameOpen;
+    cmFoldProps :
+      If CtxPath <> '' Then FolderProps(CtxPath) Else FolderProps(NewDir);
     cmComputer, cmExplorer :
     Begin
       If Cmd = cmExplorer Then
@@ -21971,6 +22094,8 @@ Begin
       End;
       ActivateW(-1);
       LastClickW := -1;
+      NewWin := -1; NewDir := DeskDir; CtxPath := '';
+      If (I >= 0) And (DeskCmd[I] = cmDeskFile) Then CtxPath := DeskPath^[I];
       If I >= 0 Then OpenMenu(0, mnIcon, X, Y, False)
       Else OpenMenu(0, mnDesk, X, Y, False);
       Exit;
@@ -23046,6 +23171,13 @@ Begin
   If W = -2 Then
   Begin
     If (VK = $0D) And (DeskSel >= 0) Then KCommand(DeskCmd[DeskSel]);
+    { F2 : renommer, Suppr : supprimer (document du bureau) }
+    If ((VK = $71) Or (VK = $2E)) And (DeskSel >= 0) Then
+      If DeskCmd[DeskSel] = cmDeskFile Then
+      Begin
+        NewWin := -1; CtxPath := DeskPath^[DeskSel];
+        If VK = $71 Then CtxRenameOpen Else CtxDeleteAsk;
+      End;
     Exit;
   End;
   { programme MS-DOS : touches enfoncees et relachees }
@@ -23104,11 +23236,22 @@ Begin
       Else If VK = $1B Then DialogAction(W, 1)
       Else If VK = 8 Then
       Begin
+        If Wnds^[W].K2 = 1 Then Wnds^[W].KS := '';
+        Wnds^[W].K2 := 0;
         Delete(Wnds^[W].KS, Length(Wnds^[W].KS), 1);
+        KRepaint(W);
+      End
+      Else If (VK = $23) Or (VK = $24) Or (VK = $25) Or (VK = $27) Then
+      Begin
+        { fleches, Debut, Fin : le nom n'est plus choisi }
+        Wnds^[W].K2 := 0;
         KRepaint(W);
       End
       Else If (Ch >= 32) And (Length(Wnds^[W].KS) < 250) Then
       Begin
+        { nom choisi (Renommer) : la frappe le remplace }
+        If Wnds^[W].K2 = 1 Then Wnds^[W].KS := '';
+        Wnds^[W].K2 := 0;
         Wnds^[W].KS := Wnds^[W].KS + Chr(Ch);
         KRepaint(W);
       End;
@@ -38047,13 +38190,238 @@ Begin
   FindExecutableA := 31;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Bureau et dossiers : Nouveau, Supprimer, Renommer                    }
+{ ------------------------------------------------------------------ }
+
+Function DeskDir : String;
+Begin
+  DeskDir := SysDir + 'Desktop';
+End;
+
+{ bureau sur un disque dur (dossier C:\WINDOWS\Desktop) }
+Function DeskOk : Boolean;
+Begin
+  DeskOk := FatVolOf(SysDir) >= 0;
+End;
+
+Function ExtOf(Const Nm : String) : String;
+Var P : LongInt;
+Begin
+  P := Length(Nm);
+  While (P > 0) And (Nm[P] <> '.') And (Nm[P] <> '\') Do Dec(P);
+  If (P > 0) And (Nm[P] = '.') Then ExtOf := UpStr(Copy(Nm, P + 1, 9))
+  Else ExtOf := '';
+End;
+
+Function IsDirPath(Const P : String) : Boolean;
+Var A, Sz, Tm, Lb, Rm : LongInt;
+Begin
+  IsDirPath := PathInfo(P, A, Sz, Tm, Lb, Rm) And ((A And $10) <> 0);
+End;
+
+{ nom affiche : sans l'extension des documents }
+Function ItemLabel(Const Nm : String; Fl : LongInt) : String;
+Var E : String;
+Begin
+  E := ExtOf(Nm);
+  If ((Fl And 2) = 0) And (E <> '') And (Length(E) <= 4) Then
+    ItemLabel := Copy(Nm, 1, Length(Nm) - Length(E) - 1)
+  Else ItemLabel := Nm;
+End;
+
+Function ItemIcon(Const Nm : String; Fl : LongInt) : LongInt;
+Var E : String;
+Begin
+  E := ExtOf(Nm);
+  If (Fl And 2) <> 0 Then ItemIcon := icFolder
+  Else If E = 'EXE' Then ItemIcon := ExeIcon(UpStr(Nm))
+  Else If E = 'BMP' Then ItemIcon := icPaint
+  Else If (E = 'HTM') Or (E = 'HTML') Then ItemIcon := icWeb
+  Else If (E = 'GIF') Or (E = 'PNG') Or (E = 'JPG') Or (E = 'TIF') Then
+    ItemIcon := icImaging
+  Else If (E = 'MP3') Or (E = 'WAV') Or (E = 'MID') Then ItemIcon := icSound
+  Else If E = 'HLP' Then ItemIcon := icHelp
+  Else ItemIcon := icText;
+End;
+
+{ apres un changement : le bureau et les fenetres de l'Explorateur }
+Procedure NewRefresh;
+Var I : LongInt;
+Begin
+  ExpCW := -1;
+  DeskBuild;
+  MarkAll;
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And (Wnds^[I].IKind = ikExplorer) Then
+    Begin
+      Wnds^[I].K1 := -1;
+      KRepaint(I);
+    End;
+End;
+
+{ Renommer : boite Executer en mode K1 = 1 }
+Procedure CtxRenameOpen;
+Var W : LongInt; B : String;
+Begin
+  If CtxPath = '' Then Exit;
+  W := KCreate(ikRun, L('Renommer', 'Rename', 'Umbenennen', 'Rinomina',
+               'Cambiar nombre'), icRun, Max(0, (ScrW - 370) Div 2),
+               Max(0, (TaskY - 172) Div 2), 370, 172,
+               WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+  If W < 0 Then Exit;
+  Wnds^[W].K1 := 1; Wnds^[W].K2 := 1;
+  B := BaseName(CtxPath);
+  If IsDirPath(CtxPath) Then Wnds^[W].KS := B
+  Else Wnds^[W].KS := ItemLabel(B, 0);
+  ShowW(W, True, True);
+End;
+
+Procedure CtxRenameTo(S : String);
+Var E, N, A, B : String;
+Begin
+  E := ExtOf(CtxPath);
+  { extension cachee : la garder si le nouveau nom n'en a pas }
+  If Not IsDirPath(CtxPath) And (E <> '') And (ExtOf(S) = '') Then
+    S := S + Copy(CtxPath, Length(CtxPath) - Length(E), 9);
+  N := ParentDir(CtxPath);
+  If N[Length(N)] <> '\' Then N := N + '\';
+  N := N + S;
+  If N = CtxPath Then Exit;
+  A := CtxPath + #0; B := N + #0;
+  If MoveFileA(LongInt(@A[1]), LongInt(@B[1])) = 0 Then
+    MsgBoxOpen(L('Renommer', 'Rename', 'Umbenennen', 'Rinomina',
+               'Cambiar nombre'), L('Impossible de renommer '#174' ',
+               'Cannot rename "', 'Umbenennen nicht m'#148'glich: "',
+               'Impossibile rinominare "', 'No se puede cambiar "') +
+               BaseName(CtxPath) + L(' '#175'.', '".', '".', '".', '".'), $10);
+  NewRefresh;
+End;
+
+Procedure CtxDeleteAsk;
+Begin
+  If CtxPath = '' Then Exit;
+  DelAskW := MsgBoxOpen(L('Confirmer la suppression', 'Confirm Delete',
+    'L'#148'schen best'#132'tigen', 'Conferma eliminazione',
+    'Confirmar eliminaci'#162'n'), L('Voulez-vous vraiment supprimer '#174' ',
+    'Are you sure you want to delete "', 'M'#148'chten Sie "',
+    'Eliminare "', #168'Desea eliminar "') + BaseName(CtxPath) +
+    L(' '#175' ?', '"?', '" wirklich l'#148'schen?', '"?', '"?'), $24);
+End;
+
+{ supprimer un fichier, ou un dossier et son contenu }
+Function DelTree(P : String; Depth : LongInt) : Boolean;
+Var Nm, S : String; Fl, Sz, K : LongInt;
+Begin
+  DelTree := False;
+  If IsDirPath(P) Then
+  Begin
+    If Depth > 12 Then Exit;
+    K := 0;
+    ExpCW := -1;
+    While (K < 4000) And ExpEntryP(P, 0, Nm, Fl, Sz) Do
+    Begin
+      S := P + '\' + Nm;
+      If Not DelTree(S, Depth + 1) Then Exit;
+      ExpCW := -1;
+      Inc(K);
+    End;
+    S := P + #0;
+    DelTree := RemoveDirectoryA(LongInt(@S[1])) <> 0;
+  End
+  Else
+  Begin
+    S := P + #0;
+    DelTree := DeleteFileA(LongInt(@S[1])) <> 0;
+  End;
+End;
+
+Procedure CtxDelete;
+Begin
+  If Not DelTree(CtxPath, 0) Then
+    MsgBoxOpen(L('Supprimer', 'Delete', 'L'#148'schen', 'Elimina',
+               'Eliminar'), L('Impossible de supprimer '#174' ',
+               'Cannot delete "', 'L'#148'schen nicht m'#148'glich: "',
+               'Impossibile eliminare "', 'No se puede eliminar "') +
+               BaseName(CtxPath) + L(' '#175'.', '".', '".', '".', '".'), $10);
+  NewRefresh;
+End;
+
+{ Nouveau : 0 dossier, 1 document texte, 2 image bitmap, 3 document HTML
+  dans NewDir ; puis Renommer, comme Windows }
+Procedure NewItem(Kind : LongInt);
+Var P, B, E, S : String; N, H, A, Sz, Tm, Lb, Rm : LongInt;
+Begin
+  If NewDir = '' Then NewDir := DeskDir;
+  S := NewDir + #0;
+  CreateDirectoryA(LongInt(@S[1]), 0);
+  Case Kind Of
+    0 : Begin
+          B := L('Nouveau dossier', 'New Folder', 'Neuer Ordner',
+                 'Nuova cartella', 'Nueva carpeta'); E := '';
+        End;
+    1 : Begin
+          B := L('Nouveau Document texte', 'New Text Document',
+                 'Neues Textdokument', 'Nuovo documento di testo',
+                 'Nuevo documento de texto'); E := '.txt';
+        End;
+    2 : Begin
+          B := L('Nouvelle Image bitmap', 'New Bitmap Image', 'Neue Bitmap',
+                 'Nuova immagine bitmap', 'Nueva imagen de mapa de bits');
+          E := '.bmp';
+        End;
+  Else
+    B := L('Nouveau Document HTML', 'New HTML Document',
+           'Neues HTML-Dokument', 'Nuovo documento HTML',
+           'Nuevo documento HTML'); E := '.htm';
+  End;
+  N := 1;
+  Repeat
+    P := NewDir + '\' + B;
+    If N > 1 Then P := P + ' (' + IntStr(N) + ')';
+    P := P + E;
+    Inc(N);
+  Until Not PathInfo(P, A, Sz, Tm, Lb, Rm) Or (N > 99);
+  If Kind = 0 Then
+  Begin
+    S := P + #0;
+    A := CreateDirectoryA(LongInt(@S[1]), 0);
+  End
+  Else
+  Begin
+    H := KOpenFile(P, True, 1);
+    A := Ord(H <> INVALID_HANDLE);
+    If (Kind = 3) And (A <> 0) Then
+    Begin
+      S := '<html>'#13#10'<head><title>' + B + '</title></head>'#13#10 +
+           '<body>'#13#10'</body>'#13#10'</html>'#13#10;
+      KWriteFile(H, LongInt(@S[1]), Length(S));
+    End;
+    If A <> 0 Then CloseHandle(H);
+  End;
+  If A = 0 Then
+  Begin
+    MsgBoxOpen(L('Nouveau', 'New', 'Neu', 'Nuovo', 'Nuevo'),
+               L('Impossible de cr'#130'er ', 'Cannot create ',
+               'Erstellen nicht m'#148'glich: ', 'Impossibile creare ',
+               'No se puede crear ') + BaseName(P), $10);
+    Exit;
+  End;
+  NewRefresh;
+  { l'element cree est choisi, puis Renommer }
+  If NewWin < 0 Then
+    For N := 0 To DeskCnt - 1 Do
+      If UpStr(DeskPath^[N]) = UpStr(P) Then DeskSel := N;
+  CtxPath := P;
+  CtxRenameOpen;
+End;
+
 { programme, dossier (Explorateur) ou document selon son extension,
   comme un double clic dans l'Explorateur }
-Function ShellExecuteA(H, Op, F, Prm, D, Show : LongInt) : LongInt;
-Var P, E : String; A, Sz, Tm, Lb, Rm : LongInt; Ok, Doc : Boolean;
+Function ShellOpen(P, Args : String) : Boolean;
+Var E : String; A, Sz, Tm, Lb, Rm : LongInt; Ok, Doc : Boolean;
 Begin
-  ShellExecuteA := 33;
-  P := PStr(F);
+  ShellOpen := True;
   E := UpStr(Copy(P, Length(P) - 3, 4));
   A := 0;
   Ok := PathInfo(P, A, Sz, Tm, Lb, Rm);
@@ -38064,21 +38432,30 @@ Begin
   Begin
     If Not Ok Then
     Begin
-      ShellExecuteA := 2;
+      ShellOpen := False;
       Exit;
     End;
     If (A And $10) <> 0 Then ExpWindowAt(P, False)
     Else If E = '.HLP' Then RunExe('WINHLP32.EXE', '"' + P + '"')
     Else If (E = '.MP3') Or (E = '.M3U') Then
       RunExe('MP3PLAY.EXE', '"' + P + '"')
-    Else If (E = '.BMP') Or (E = '.GIF') Or (E = '.PNG') Or
+    Else If E = '.BMP' Then RunExe('PAINT.EXE', '"' + P + '"')
+    Else If (E = '.HTM') Or (E = 'HTML') Then
+      RunExe('BROWSER.EXE', '"' + P + '"')
+    Else If (E = '.GIF') Or (E = '.PNG') Or
             (E = '.JPG') Or (E = '.TIF') Or (E = 'TIFF') Or
             (E = 'JPEG') Then
       RunExe('IMAGING.EXE', '"' + P + '"')
     Else NoteOpen(P);
     Exit;
   End;
-  If Not RunExe(P, PStr(Prm)) Then ShellExecuteA := 2;
+  If Not RunExe(P, Args) Then ShellOpen := False;
+End;
+
+Function ShellExecuteA(H, Op, F, Prm, D, Show : LongInt) : LongInt;
+Begin
+  If ShellOpen(PStr(F), PStr(Prm)) Then ShellExecuteA := 33
+  Else ShellExecuteA := 2;
 End;
 
 { OLE32 }
@@ -85853,6 +86230,10 @@ BEGIN
   Move(I, FdNm, 4);
   I := KAlloc(SizeOf(TDevResArr));
   Move(I, DevRes, 4);
+  I := KAlloc(SizeOf(TDeskNmArr));
+  Move(I, DeskName, 4);
+  I := KAlloc(SizeOf(TDeskPtArr));
+  Move(I, DeskPath, 4);
   I := KAlloc(SizeOf(TDevNmArr));
   Move(I, DevName, 4);
   I := KAlloc(SizeOf(TDevMfArr));
@@ -85931,7 +86312,7 @@ BEGIN
   AtaInit;
   CdInit;
   BootStep(2);
-  FmtAskW := -1; ExpCW := -1;
+  FmtAskW := -1; ExpCW := -1; DelAskW := -1; NewWin := -1;
   FatInit;
   CurDirS := 'D:';
   SysDirInit;
