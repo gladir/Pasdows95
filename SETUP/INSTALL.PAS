@@ -2578,9 +2578,9 @@ Begin
     Lecteur MP3, la Table de caracteres, FreeCell, le Lecteur CD,
     Imaging, le Carnet d'adresses, Rechercher, les Echecs, le
     Solitaire, les outils systeme (Defragmenteur, Nettoyage de disque,
-    Informations systeme, Planificateur de taches) et le Panneau de
-    configuration sont toujours installes ; le morceau d'exemple suit
-    les sons du systeme }
+    Informations systeme, Planificateur de taches), le Panneau de
+    configuration et la Connexion Bureau a distance sont toujours
+    installes ; le morceau d'exemple suit les sons du systeme }
   If (N = 'AURORE.MP3') And Not CompSnd Then Exit;
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
      (N <> 'CALC.EXE') And (N <> 'TASKMGR.EXE') And (N <> 'DXDIAG.EXE') And
@@ -2591,7 +2591,8 @@ Begin
      (N <> 'WAB.EXE') And (N <> 'FINDFILE.EXE') And
      (N <> 'ECHECS.EXE') And (N <> 'SOL.EXE') And (N <> 'DEFRAG.EXE') And
      (N <> 'CLEANMGR.EXE') And (N <> 'MSINFO32.EXE') And
-     (N <> 'MSTASK.EXE') And (N <> 'CONTROL.EXE') And Not CompEx Then
+     (N <> 'MSTASK.EXE') And (N <> 'CONTROL.EXE') And
+     (N <> 'MSTSC.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;

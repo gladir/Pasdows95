@@ -33,6 +33,7 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>APPS/FINDFILE.PAS</b></td><td><b>Rechercher</b> (FINDFILE.EXE) : fichiers ou dossiers, et ordinateur (/C), voir la section <a href="#rechercher">Rechercher</a>.</td></tr>
 	<tr><td><b>APPS/IMAGING.PAS</b></td><td><b>Imaging</b> (IMAGING.EXE) : visionneuse TIFF (plusieurs pages), BMP, GIF, PNG et JPEG, voir la section <a href="#imaging">Imaging</a>.</td></tr>
 	<tr><td><b>APPS/WAB.PAS</b></td><td><b>Carnet d'adresses</b> (WAB.EXE), voir la section <a href="#carnet">Carnet d'adresses</a>.</td></tr>
+	<tr><td><b>APPS/MSTSC.PAS</b></td><td><b>Connexion Bureau à distance</b> (MSTSC.EXE, compilé par <b>WPC -CW32</b>) : client RDP avec TLS et NLA (CredSSP), voir la section <a href="#rdp">Connexion Bureau à distance</a>.</td></tr>
 	<tr><td><b>APPS/CONTROL.PAS</b></td><td><b>Panneau de configuration</b> (CONTROL.EXE) : applets désignées par leur fichier .CPL, boîtes Souris, Clavier et Paramètres régionaux, voir la section <a href="#panneau">Panneau de configuration</a>.</td></tr>
 	<tr><td><b>APPS/MP3PLAY.PAS</b></td><td><b>Lecteur MP3</b> (MP3PLAY.EXE, compilé par <b>WPC -CW32</b>) : le lecteur MP3PLAY.PAS du projet <a href="https://github.com/gladir/OS2-0">OS2-0</a> converti des API d'OS/2 (MDM, PMWIN, PMGPI, DOSCALLS) aux API de Windows (WINMM, USER32, GDI32, KERNEL32), voir la section <a href="#mp3">Lecteur MP3</a>.</td></tr>
 	<tr><td><b>EXAMPLES/HTTPGET.PAS</b></td><td>Exemple Win32 en mode console (HTTPGET.EXE) : télécharge une adresse <b>http://</b> ou <b>https://</b> avec WININET (<i>HTTPGET url [fichier]</i>), voir la section <a href="#https">HTTPS</a>.</td></tr>
@@ -188,7 +189,8 @@ La liste est relue toutes les deux secondes : un logiciel installé ou supprimé
 Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Accessoires</b>, suivi de l'Explorateur Pasdows et de l'Invite MS-DOS ; viennent ensuite les autres programmes du dossier du système. Les programmes de Pasdows déjà présents dans les menus (Calculatrice, Navigateur Web, Lecteur MP3, Lecteur CD, Échecs, FreeCell, Solitaire, outils système, Table de caractères, Carnet d'adresses, Imaging, Rechercher, Aide, Ajout/Suppression de programmes, Gestionnaire des tâches, programmes d'essai) n'y sont plus répétés, ni sur le bureau.
 
 <ul>
-	<li><b>Accessoires</b> : les groupes <b>Jeux</b>, <b>Multimédia</b>, <b>Outils Internet</b> et <b>Outils système</b>, puis Bloc-notes, Calculatrice, <b>Carnet d'adresses</b>, <b>Imaging</b>, Paint et <b>Table de caractères</b> ;</li>
+	<li><b>Accessoires</b> : les groupes <b>Communications</b>, <b>Jeux</b>, <b>Multimédia</b>, <b>Outils Internet</b> et <b>Outils système</b>, puis Bloc-notes, Calculatrice, <b>Carnet d'adresses</b>, <b>Imaging</b>, Paint et <b>Table de caractères</b> ;</li>
+	<li><b>Communications</b> : <b>Connexion Bureau à distance</b> (voir la section <a href="#rdp">Connexion Bureau à distance</a>) ;</li>
 	<li><b>Jeux</b> : <b>Échecs</b>, <b>FreeCell</b> et <b>Solitaire</b> ;</li>
 	<li><b>Multimédia</b> : <b>Lecteur CD</b>, <b>Lecteur MP3</b>, Contrôle du volume, puis les programmes DirectX installés : Outil de diagnostic DirectX (DXDIAG), DDTEST, D3DTEST, D3D8TEST et GLTEST ;</li>
 	<li><b>Outils Internet</b> : Navigateur Web, puis NETTEST et HTTPGET s'ils sont installés ;</li>
@@ -319,6 +321,32 @@ Essayé avec Samba 4 réglé comme Windows Server 2019 (SMB2 minimum, NTLMv2 seu
 <table>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/POSTE_MENU_RESEAU.png" width="400" alt="Menu du Poste de travail"><br><i>Clic droit sur le Poste de travail</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CONNECTER_LECTEUR.png" width="400" alt="Connecter un lecteur réseau"><br><i>Connecter un lecteur réseau</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/LECTEUR_RESEAU.png" width="400" alt="Lecteur réseau Z:"><br><i>Le partage ouvert en Z:</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/EXPLORATEUR_MENU_RESEAU.png" width="400" alt="Explorateur"><br><i>Explorateur : le lecteur réseau dans l'arbre et le menu du Poste de travail</i></td></tr>
+</table>
+
+<h2 id="rdp">Connexion Bureau à distance</h2>
+
+<b>APPS/MSTSC.PAS</b> (MSTSC.EXE, compilé par <b>WPC -CW32</b>, sans unité supplémentaire) est un client <b>RDP</b> écrit en Pascal : <i>Démarrer, Programmes, Accessoires, Communications, Connexion Bureau à distance</i>. La boîte demande l'<b>ordinateur</b> (nom ou adresse, <i>serveur:port</i> si le port n'est pas 3389), le <b>nom d'utilisateur</b> (<i>DOMAINE\nom</i> ou <i>nom</i>), le <b>mot de passe</b>, le <b>domaine</b> et la <b>taille de l'écran</b> (640x480, 800x600, 1024x768 ou plein écran). Le dernier ordinateur et le nom d'utilisateur de chaque serveur sont gardés comme sous Windows dans <i>HKEY_CURRENT_USER\Software\Microsoft\Terminal Server Client</i> (Default\MRU0, Servers\&lt;serveur&gt;\UsernameHint) ; le mot de passe n'est jamais enregistré.
+
+Windows Server 2019 exige par défaut l'<b>authentification au niveau du réseau</b> (NLA) ; le client implémente toute la pile nécessaire :
+
+<ul>
+	<li><b>X.224</b> avec négociation (RDP_NEG_REQ : TLS et CredSSP), puis <b>TLS 1.2</b> (ECDHE x25519, AES-128-GCM, le code TLS du noyau, celui de WININET) ;</li>
+	<li><b>CredSSP</b> (versions 2 à 6, TSRequest en DER) avec <b>NTLMv2</b> (KEY_EXCH, scellement RC4 et signature HMAC-MD5), preuve de la clé publique du certificat (hachage SHA-256 avec nonce pour CredSSP 5 et 6) et envoi des TSPasswordCreds : la session s'ouvre sans écran de connexion du serveur ;</li>
+	<li>serveurs sans NLA (sécurité « SSL ») : TLS seul, puis l'écran de connexion de Windows ;</li>
+	<li><b>MCS</b> (Connect-Initial en BER, GCC en PER, blocs CS_CORE, CS_SECURITY, CS_NET, CS_CLUSTER), Erect Domain, Attach User, Channel Join ; Client Info (ouverture automatique, options de performance), <b>licences</b> (licence valide, ou demande de nouvelle licence), Demand/Confirm Active, Synchronize, Control et Font List ;</li>
+	<li>mises à jour <b>bitmap</b> en 8, 15, 16 et 24 bits, compressées (RLE entrelacé) ou non, par le chemin lent et le chemin rapide (<i>fast-path</i>, avec fragmentation) ; image de 16 bits affichée par StretchDIBits ;</li>
+	<li>entrées par le <b>fast-path</b> : clavier en codes de balayage (touches étendues, disposition du clavier de GetKeyboardLayout), souris (déplacements, trois boutons, molette) et synchronisation des verrouillages.</li>
+</ul>
+
+La session s'ouvre dans une fenêtre avec barres de défilement quand le bureau distant est plus grand que l'écran ; <b>Ctrl+Alt+Fin</b> envoie Ctrl+Alt+Suppr au serveur, <b>Ctrl+Alt+Pause</b> ou <b>Ctrl+Alt+Entrée</b> passe du plein écran à la fenêtre et inversement, fermer la fenêtre demande confirmation et déconnecte la session (qui reste ouverte sur le serveur, comme sous Windows). Les erreurs du serveur sont traduites (mot de passe incorrect, compte désactivé, session fermée par l'administrateur, inactivité, autre ouverture de session, etc.).
+
+Limites : pas de sécurité RDP « standard » (chiffrement RC4 sans TLS, désactivé par défaut depuis Windows Server 2012), pas de presse-papiers, de son, de redirection de lecteurs ni d'imprimantes, pas de RemoteFX ni de compression RDP 6 (le client ne demande que des bitmaps). Un serveur ayant le rôle <i>Hôte de session Bureau à distance</i> avec un serveur de licences (licences d'accès client RDS) envoie un défi de plate-forme que le client ne sait pas encore traiter ; l'accès d'administration à distance de Windows Server 2019 (deux sessions, sans licence) fonctionne.
+
+Essayé avec le serveur <b>FreeRDP</b> (shadow, NLA et NTLMv2 obligatoires, 800x600 en 32 bits) et <b>xrdp</b> (TLS seul, licences, écran de connexion) : ouverture de session, affichage, frappe dans un terminal, souris et molette, défilement, plein écran, mauvais mot de passe, déconnexion. Avec qemu, le serveur de l'hôte est <b>10.0.2.2</b>.
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_COMMUNICATIONS.png" width="400" alt="Menu Communications"><br><i>Accessoires, Communications</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/BUREAU_DISTANCE.png" width="400" alt="Connexion Bureau à distance"><br><i>La boîte de connexion</i></td></tr>
+	<tr><td align="center" colspan="2"><img src="IMAGE/SCREENSHOTS/BUREAU_DISTANCE_SESSION.png" width="400" alt="Session RDP"><br><i>Session de 800x600 dans une fenêtre (serveur FreeRDP avec NLA)</i></td></tr>
 </table>
 
 <h2 id="freecell">FreeCell</h2>
