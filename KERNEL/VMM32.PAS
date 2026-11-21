@@ -766,11 +766,13 @@ End;
 
 Procedure TimerTail; Forward;
 Procedure CpuTick; Forward;
+Procedure PcmTick; Forward;
 
 Procedure IrqTimer; Interrupt;
 Begin
   Inc(Ticks);
   CpuTick;
+  If (Ticks And 3) = 0 Then PcmTick;
   Port[$20] := $20;
   If PreemptOn Then TimerTail;
 End;
@@ -11453,6 +11455,8 @@ Type
   PWndArr = ^TWndArr;
   TClassArr = Array[0..MaxClass - 1] Of TClass;
   PClassArr = ^TClassArr;
+  TPropArr = Array[0..MaxProp - 1] Of TProp;
+  PPropArr = ^TPropArr;
 
 Var
   Classes  : PClassArr;       { alloue dans le tas }
@@ -11460,7 +11464,7 @@ Var
   ZList    : Array[0..MaxWnd - 1] Of LongInt;
   ZCnt     : LongInt;
   ZTaskW   : LongInt;                 { barre des taches (-1 : aucune) }
-  Props    : Array[0..MaxProp - 1] Of TProp;
+  Props    : PPropArr;          { alloue dans le tas }
   WTimers  : Array[0..MaxTimer - 1] Of TTimerW;
   ActiveWin, FocusWin, CaptureWin : LongInt;
   WndSeq   : LongInt;
@@ -12411,7 +12415,7 @@ Begin
     If WTimers[I].Used And (WTimers[I].Wnd = W) Then
       WTimers[I].Used := False;
   For I := 0 To MaxProp - 1 Do
-    If Props[I].Used And (Props[I].Wnd = W) Then Props[I].Used := False;
+    If Props^[I].Used And (Props^[I].Wnd = W) Then Props^[I].Used := False;
   If IsChildW(W) And (Wnds^[W].Parent >= 0) Then
     InvalAll(Wnds^[W].Parent, True);
   If Not IsChildW(W) Then
@@ -18666,12 +18670,16 @@ Const
 
 Type
   TDevResArr = Array[0..MaxDev - 1] Of String[160];
+  TDevNmArr = Array[0..MaxDev - 1] Of String[63];
+  PDevNmArr = ^TDevNmArr;
+  TDevMfArr = Array[0..MaxDev - 1] Of String[31];
+  PDevMfArr = ^TDevMfArr;
 
 Var
   DevN : LongInt;
   DevCat, DevIco : Array[0..MaxDev - 1] Of LongInt;
-  DevName : Array[0..MaxDev - 1] Of String[63];
-  DevMfg : Array[0..MaxDev - 1] Of String[31];
+  DevName : PDevNmArr;                   { alloues dans le tas }
+  DevMfg : PDevMfArr;
   DevRes : ^TDevResArr;             { dans le tas (image sous 4 Mo) }
   CatOpen : Array[0..DevCats - 1] Of Boolean;
   RowN : LongInt;
@@ -18741,7 +18749,7 @@ End;
 Procedure DevAdd(C : LongInt; Const N, M, R : String);
 Begin
   If DevN >= MaxDev Then Exit;
-  DevCat[DevN] := C; DevName[DevN] := N; DevMfg[DevN] := M;
+  DevCat[DevN] := C; DevName^[DevN] := N; DevMfg^[DevN] := M;
   DevRes^[DevN] := R; DevIco[DevN] := CatIcon(C);
   Inc(DevN);
 End;
@@ -18813,6 +18821,9 @@ Begin
     $20001022 : PciName := 'AMD PCnet (Am79C970A / Am79C973)';
     $50001274 : PciName := 'Ensoniq AudioPCI (ES1370)';
     $24158086 : PciName := 'Intel 82801AA AC''97 Audio';
+    $26688086 : PciName := 'Intel 82801FB (ICH6) High Definition Audio';
+    $293E8086 : PciName := 'Intel 82801I (ICH9) High Definition Audio';
+    $27D88086 : PciName := 'Intel 82801G (ICH7) High Definition Audio';
     $88115333 : PciName := 'S3 Trio32/64';
     $00B81013 : PciName := 'Cirrus Logic GD5446';
     $BEEF80EE : PciName := 'VirtualBox Graphics Adapter';
@@ -18878,6 +18889,10 @@ Begin
                   If (Irq > 0) And (Irq < 16) Then PciNetIrq := Irq;
                 End;
         $0101 : If PciIdeName = '' Then PciIdeName := N;
+        { carte son pilotee : entree propre (avec ses ressources) }
+        $0401, $0403 : If SndKind < 2 Then
+                         DevAdd(C, N, '(PCI ' + HexStr(Id And $FFFF, 4) +
+                                ')', R);
       Else
         DevAdd(C, N, '(PCI ' + HexStr(Id And $FFFF, 4) + ')', R);
       End;
@@ -19035,7 +19050,17 @@ Begin
              RIrq(PciNetIrq))
     Else DevAdd(1, N, 'Novell/Anthem', RIo(NicBase, NicBase + $1F));
   End;
-  If SbOk Then
+  If SndKind >= 2 Then
+  Begin
+    If SndKind = 3 Then
+      R := 'M' + HexStr(PcmMmio, 8) + '-' + HexStr(PcmMmio + $3FFF, 8) + '|'
+    Else If SndKind = 2 Then
+      R := RIo(PcmIo, PcmIo + $FF) + RIo(PcmIo2, PcmIo2 + $3F)
+    Else R := RIo(PcmIo, PcmIo + $3F);
+    If (PcmIrq > 0) And (PcmIrq < 16) Then R := R + RIrq(PcmIrq);
+    DevAdd(5, PcmName, PcmMfg, R);
+  End
+  Else If SbOk Then
   Begin
     If Sb16 Then
       DevAdd(5, 'Creative ' + SbName, 'Creative Labs',
@@ -19353,7 +19378,7 @@ Begin
       Else
         Begin
           X := LX1 + 46; Ic := DevIco[RowIdx[R]];
-          T := DevName[RowIdx[R]];
+          T := DevName^[RowIdx[R]];
         End;
       End;
       PaintIcon(Ic, X, Y, 16);
@@ -19413,7 +19438,7 @@ Begin
   If (DevPW >= 0) And Wnds^[DevPW].Used Then DestroyW(DevPW);
   DevPW := KCreate(ikDevProps, L('Propri'#130't'#130's de ', 'Properties of ',
                    'Eigenschaften von ', 'Propriet'#133' di ',
-                   'Propiedades de ') + Fit(DevName[D], 220), DevIco[D],
+                   'Propiedades de ') + Fit(DevName^[D], 220), DevIco[D],
                    Max(0, (ScrW - 440) Div 2), Max(0, (TaskY - 360) Div 2),
                    440, 360, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
                    WS_EX_DLGMODALFRAME);
@@ -19429,7 +19454,7 @@ Begin
   FBar(X1, Y1, X2, Y2, cSilver);
   D := Wnds^[W].K1;
   PaintIcon(DevIco[D], X1 + 14, Y1 + 12, 32);
-  OutTxt(X1 + 60, Y1 + 20, Fit(DevName[D], X2 - X1 - 70), cBlack);
+  OutTxt(X1 + 60, Y1 + 20, Fit(DevName^[D], X2 - X1 - 70), cBlack);
   HLine(X1 + 12, X2 - 12, Y1 + 52, cGray);
   HLine(X1 + 12, X2 - 12, Y1 + 53, cWhite);
   OutTxt(X1 + 14, Y1 + 62, L('Type de p'#130'riph'#130'rique :', 'Device type:',
@@ -19437,7 +19462,7 @@ Begin
   OutTxt(X1 + 200, Y1 + 62, Fit(CatName(DevCat[D]), X2 - X1 - 210), cBlack);
   OutTxt(X1 + 14, Y1 + 80, L('Fabricant :', 'Manufacturer:', 'Hersteller:',
          'Produttore:', 'Fabricante:'), cBlack);
-  OutTxt(X1 + 200, Y1 + 80, Fit(DevMfg[D], X2 - X1 - 210), cBlack);
+  OutTxt(X1 + 200, Y1 + 80, Fit(DevMfg^[D], X2 - X1 - 210), cBlack);
   GroupBox(X1 + 12, Y1 + 110, X2 - 12, Y1 + 150, L(''#144'tat du ' +
            'p'#130'riph'#130'rique', 'Device status', 'Ger'#132'testatus',
            'Stato', 'Estado'));
@@ -24114,10 +24139,12 @@ Type
     Name : String[63];
     Refs : LongInt;
   End;
+  TAtomArr = Array[0..MaxAtom - 1] Of TAtom;
+  PAtomArr = ^TAtomArr;
 
 Var
   VBlks      : Array[0..MaxVBlk - 1] Of TVBlk;
-  Atoms      : Array[0..MaxAtom - 1] Of TAtom;
+  Atoms      : PAtomArr;                   { alloue dans le tas }
   EnvBlk     : Array[0..4095] Of Byte;
   EnvLen     : LongInt;
 
@@ -26416,7 +26443,7 @@ Begin
   AtomFind := 0;
   S := UpStr(S);
   For I := 0 To MaxAtom - 1 Do
-    If Atoms[I].Used And (Atoms[I].Name = S) Then
+    If Atoms^[I].Used And (Atoms^[I].Name = S) Then
     Begin
       AtomFind := $C000 + I;
       Exit;
@@ -26429,17 +26456,17 @@ Begin
   A := AtomFind(S);
   If A <> 0 Then
   Begin
-    Inc(Atoms[A - $C000].Refs);
+    Inc(Atoms^[A - $C000].Refs);
     AtomAdd := A;
     Exit;
   End;
   AtomAdd := 0;
   For I := 0 To MaxAtom - 1 Do
-    If Not Atoms[I].Used Then
+    If Not Atoms^[I].Used Then
     Begin
-      Atoms[I].Used := True;
-      Atoms[I].Name := UpStr(S);
-      Atoms[I].Refs := 1;
+      Atoms^[I].Used := True;
+      Atoms^[I].Name := UpStr(S);
+      Atoms^[I].Refs := 1;
       AtomAdd := $C000 + I;
       Exit;
     End;
@@ -26461,8 +26488,8 @@ Function GlobalDeleteAtom(A : LongInt) : LongInt;
 Begin
   If (A >= $C000) And (A < $C000 + MaxAtom) Then
   Begin
-    Dec(Atoms[A - $C000].Refs);
-    If Atoms[A - $C000].Refs <= 0 Then Atoms[A - $C000].Used := False;
+    Dec(Atoms^[A - $C000].Refs);
+    If Atoms^[A - $C000].Refs <= 0 Then Atoms^[A - $C000].Used := False;
   End;
   GlobalDeleteAtom := 0;
 End;
@@ -26470,10 +26497,10 @@ End;
 Function GlobalGetAtomNameA(A, Buf, N : LongInt) : LongInt;
 Begin
   GlobalGetAtomNameA := 0;
-  If (A >= $C000) And (A < $C000 + MaxAtom) And Atoms[A - $C000].Used Then
+  If (A >= $C000) And (A < $C000 + MaxAtom) And Atoms^[A - $C000].Used Then
   Begin
-    PutPStr(Buf, Atoms[A - $C000].Name, N);
-    GlobalGetAtomNameA := Length(Atoms[A - $C000].Name);
+    PutPStr(Buf, Atoms^[A - $C000].Name, N);
+    GlobalGetAtomNameA := Length(Atoms^[A - $C000].Name);
   End;
 End;
 
@@ -31006,16 +31033,16 @@ Begin
   N := PropName(S);
   F := -1;
   For I := 0 To MaxProp - 1 Do
-    If Props[I].Used And (Props[I].Wnd = W) And (Props[I].Name = N) Then
+    If Props^[I].Used And (Props^[I].Wnd = W) And (Props^[I].Name = N) Then
     Begin
-      Props[I].Val := V;
+      Props^[I].Val := V;
       SetPropA := 1;
       Exit;
     End
-    Else If Not Props[I].Used And (F < 0) Then F := I;
+    Else If Not Props^[I].Used And (F < 0) Then F := I;
   If F < 0 Then Exit;
-  Props[F].Used := True; Props[F].Wnd := W; Props[F].Name := N;
-  Props[F].Val := V;
+  Props^[F].Used := True; Props^[F].Wnd := W; Props^[F].Name := N;
+  Props^[F].Val := V;
   SetPropA := 1;
 End;
 
@@ -31026,9 +31053,9 @@ Begin
   W := WndOf(H);
   N := PropName(S);
   For I := 0 To MaxProp - 1 Do
-    If Props[I].Used And (Props[I].Wnd = W) And (Props[I].Name = N) Then
+    If Props^[I].Used And (Props^[I].Wnd = W) And (Props^[I].Name = N) Then
     Begin
-      GetPropA := Props[I].Val;
+      GetPropA := Props^[I].Val;
       Exit;
     End;
 End;
@@ -31040,10 +31067,10 @@ Begin
   W := WndOf(H);
   N := PropName(S);
   For I := 0 To MaxProp - 1 Do
-    If Props[I].Used And (Props[I].Wnd = W) And (Props[I].Name = N) Then
+    If Props^[I].Used And (Props^[I].Wnd = W) And (Props^[I].Name = N) Then
     Begin
-      RemovePropA := Props[I].Val;
-      Props[I].Used := False;
+      RemovePropA := Props^[I].Val;
+      Props^[I].Used := False;
       Exit;
     End;
 End;
@@ -34362,16 +34389,37 @@ Var
   SbDev : LongInt;                       { peripherique waveOut sur la carte }
   SbBits, SbChans, SbRate : LongInt;     { format du programme }
   SbOBits, SbOChans : LongInt;           { format envoye a la carte }
+  SbORate : LongInt;                     { frequence de la carte }
+  SbStep, SbFrac : LongInt;              { pas de conversion (1/4096) }
+  SndKind : LongInt;                     { 1 SB, 2 AC'97, 3 HDA, 4 ES }
   SbNext : LongInt;                      { moitie a remplir (0/1) }
   SbQueued, SbPlayed : LongInt;          { octets (format carte) }
   SbCopyK, SbCopyOff : LongInt;          { tampon et position en copie }
-  SbSilent : LongInt;                    { moities de silence de suite }
+  SbSilent : LongInt;                    { octets de silence de suite }
   SbIrqs : LongInt;
   MixVolL, MixVolR : Array[0..MixLines - 1] Of LongInt;   { 0..255 }
   MixMute : Array[0..MixLines - 1] Of Boolean;
   OplVoiceNote, OplVoiceChan, OplVoiceAge : Array[0..8] Of LongInt;
   OplAge : LongInt;
   MidiOpen : Boolean;
+
+Const
+  skSb = 1; skAc97 = 2; skHda = 3; skEs = 4;
+  HdaMaxDac = 8;
+  PcmNCh = 32;                     { blocs du tampon (cartes PCI) }
+  PcmChL = 1024;                   { octets par bloc }
+
+Var
+  PcmIo, PcmIo2, PcmMmio, PcmIrq, PcmId, PcmCh, PcmVra : LongInt;
+  PcmMem, PcmBus, PcmDev, PcmFn, PcmCtl : LongInt;
+  PcmName, PcmMfg : String[63];
+  HdaCorbN, HdaRirbN, HdaWp, HdaRp, HdaCodec, HdaSd, HdaAfg : LongInt;
+  HdaDacN : LongInt;
+  HdaDac, HdaOff : Array[0..HdaMaxDac - 1] Of LongInt;
+  HdaCaps : Array[0..127] Of LongInt;
+  HdaWLo, HdaWHi : LongInt;
+
+Procedure PcmVol; Forward;
 
 Function IntOff : LongInt;
 Var F : LongInt;
@@ -34493,6 +34541,7 @@ End;
 Function SbName : String;
 Begin
   If Not SbOk Then SbName := ''
+  Else If SndKind >= 2 Then SbName := PcmName
   Else If Sb16 Then SbName := 'Sound Blaster 16'
   Else If SbVer >= $300 Then SbName := 'Sound Blaster Pro'
   Else If SbVer >= $200 Then SbName := 'Sound Blaster 2.0'
@@ -34505,6 +34554,11 @@ Var I, L, R : LongInt;
   Reg16, RegPro : Array[0..MixLines - 1] Of LongInt;
 Begin
   If Not SbOk Then Exit;
+  If SndKind >= 2 Then
+  Begin
+    PcmVol;
+    Exit;
+  End;
   Reg16[0] := $30; Reg16[1] := $32; Reg16[2] := $34; Reg16[3] := $36;
   Reg16[4] := $38;
   RegPro[0] := $22; RegPro[1] := $04; RegPro[2] := $26; RegPro[3] := $28;
@@ -34572,48 +34626,67 @@ End;
   peripherique SbDev (format carte), sinon du silence }
 Procedure DSMixInto(D, N : LongInt); Forward;
 
-Procedure SbFill0(H : LongInt);
-Var D, P, Hdr, Len, B, V, Got, SBy, Fr, K, L, R : LongInt;
+Procedure SbFill0(Ofs, N : LongInt);
+Var D, P, Hdr, Len, B, Got, SBy, OBy, K, Fr, L, R, Q : LongInt;
 Begin
-  D := SbDmaBuf + H * SbHalf;
+  D := SbDmaBuf + Ofs;
   P := 0; Got := 0;
   SBy := (SbBits Div 8) * SbChans;               { octets par trame }
-  While (P < SbHalf) And (SbDev >= 0) And
+  OBy := (SbOBits Div 8) * SbOChans;
+  While (P < N) And (SbDev >= 0) And
         (SbCopyK < WaveDevs[SbDev].QN) Do
   Begin
     Hdr := WaveQHdr[SbDev * MaxWaveQ + SbCopyK];
     Len := MemL[0:Hdr + 4];
     B := MemL[0:Hdr];
-    If (SbOBits = SbBits) And (SbOChans = SbChans) Then
+    If (SbOBits = SbBits) And (SbOChans = SbChans) And
+       (SbORate = SbRate) Then
     Begin
-      K := Min(Len - SbCopyOff, SbHalf - P);
+      K := Min(Len - SbCopyOff, N - P);
       If K > 0 Then MoveMem(B + SbCopyOff, D + P, K);
       SbCopyOff := SbCopyOff + Max(K, 0); P := P + Max(K, 0);
     End
     Else
     Begin
-      { conversion vers 8 bits mono (cartes 8 bits) }
-      While (SbCopyOff + SBy <= Len) And (P < SbHalf) Do
+      { conversion : 8/16 bits, mono/stereo, frequence (pas SbStep) }
+      While (SbCopyOff + SBy <= Len) And (P + OBy <= N) Do
       Begin
         Fr := B + SbCopyOff;
         If SbBits = 16 Then
         Begin
           L := MemW[0:Fr]; If L >= 32768 Then L := L - 65536;
+          R := L;
           If SbChans = 2 Then
           Begin
             R := MemW[0:Fr + 2]; If R >= 32768 Then R := R - 65536;
-            L := (L + R) Div 2;
           End;
-          V := (L Div 256) + 128;
         End
         Else
         Begin
-          V := Mem[0:Fr];
-          If SbChans = 2 Then V := (V + Mem[0:Fr + 1]) Div 2;
+          L := (Mem[0:Fr] - 128) * 256; R := L;
+          If SbChans = 2 Then R := (Mem[0:Fr + 1] - 128) * 256;
         End;
-        Mem[0:D + P] := V;
-        Inc(P);
-        SbCopyOff := SbCopyOff + SBy;
+        Q := D + P;
+        If SbOBits = 16 Then
+        Begin
+          If SbOChans = 2 Then
+          Begin
+            MemW[0:Q] := L And $FFFF; MemW[0:Q + 2] := R And $FFFF;
+          End
+          Else MemW[0:Q] := ((L + R) Div 2) And $FFFF;
+        End
+        Else If SbOChans = 2 Then
+        Begin
+          Mem[0:Q] := L Div 256 + 128; Mem[0:Q + 1] := R Div 256 + 128;
+        End
+        Else Mem[0:Q] := (L + R) Div 512 + 128;
+        P := P + OBy;
+        SbFrac := SbFrac + SbStep;
+        While SbFrac >= 4096 Do
+        Begin
+          SbCopyOff := SbCopyOff + SBy;
+          SbFrac := SbFrac - 4096;
+        End;
       End;
       If SbCopyOff + SBy > Len Then SbCopyOff := Len;
     End;
@@ -34626,19 +34699,19 @@ Begin
     End;
     Got := 1;
   End;
-  If P < SbHalf Then
+  If P < N Then
   Begin
-    If SbOBits = 16 Then FillMem(D + P, SbHalf - P, 0)
-    Else FillMem(D + P, SbHalf - P, $80);
+    If SbOBits = 16 Then FillMem(D + P, N - P, 0)
+    Else FillMem(D + P, N - P, $80);
   End;
-  If Got = 0 Then Inc(SbSilent) Else SbSilent := 0;
-  DSMixInto(D, SbHalf);
-  SbQueued := SbQueued + SbHalf;
+  If Got = 0 Then SbSilent := SbSilent + N Else SbSilent := 0;
+  DSMixInto(D, N);
+  SbQueued := SbQueued + N;
 End;
 
 { Remplir une moitie du tampon DMA : les WAVEHDR et les donnees sont
   lus dans l'espace d'adresses du processus qui a ouvert la carte }
-Procedure SbFill1(H : LongInt);
+Procedure SbFill1(Ofs, N : LongInt);
 Var Old, New : LongInt;
 Begin
   Old := Cr3Now;
@@ -34646,7 +34719,7 @@ Begin
   If (SbDev >= 0) And WaveDevs[SbDev].Used Then
     New := ProcCr3(WaveDevs[SbDev].PrcId);
   If New <> Old Then SetCr3(New);
-  SbFill0(H);
+  SbFill0(Ofs, N);
   If New <> Old Then SetCr3(Old);
 End;
 
@@ -34658,7 +34731,7 @@ Begin
   Inc(SbIrqs);
   If Not SbPlaying Then Exit;
   SbPlayed := SbPlayed + SbHalf;
-  SbFill1(SbNext);
+  SbFill1(SbNext * SbHalf, SbHalf);
   SbNext := 1 - SbNext;
 End;
 
@@ -34689,10 +34762,654 @@ Begin
   End;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Cartes son PCI : AC'97 (Intel ICH), HD Audio (Intel), ES1370       }
+{ ------------------------------------------------------------------ }
+{ Les cartes PCI lisent elles-memes la memoire (bus maitre) : le meme
+  tampon de 32 Ko en 90000h, en deux moities jouees en boucle. Sans
+  interruption : toutes les 4 ms, la minuterie lit la position de
+  lecture de la carte ; une moitie finie est aussitot remplie avec la
+  suite des tampons (comme l'interruption de la Sound Blaster).
+  AC'97 (VirtualBox, QEMU) : liste de 32 descripteurs (moities
+  alternees), 16 bits stereo, frequence variable (VRA) ou 48 000 Hz.
+  HD Audio : commandes au codec par les anneaux CORB et RIRB ; les
+  broches de sortie analogiques et leur convertisseur (DAC) sont
+  cherches dans le graphe du codec, puis le chemin est ouvert (choix
+  des entrees, amplis sans sourdine) ; premier flux de sortie, 16 bits
+  stereo. ES1370 (Sound Blaster PCI 64) : canal DAC2 en boucle, format
+  du programme, frequence 1 411 200 / (diviseur + 2). Les autres
+  formats et frequences sont convertis au remplissage (SbFill0). }
+
+Function PInL(P : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  asm
+    mov edx,P
+    in eax,dx
+    mov R,eax
+  end;
+  PInL := R;
+End;
+
+Procedure POutL(P, V : LongInt);
+Begin
+  asm
+    mov edx,P
+    mov eax,V
+    out dx,eax
+  end;
+End;
+
+{ attente bornee (ms) : vrai si la condition est remplie }
+Function PcmWaitB(A, Mask, Want, Ms : LongInt; Mmio : Boolean) : Boolean;
+Var T, V : LongInt;
+Begin
+  T := Ticks + Ms;
+  Repeat
+    If Mmio Then V := MemL[0:A] Else V := Port[A];
+    If (V And Mask) = Want Then
+    Begin
+      PcmWaitB := True;
+      Exit;
+    End;
+  Until Ticks > T;
+  PcmWaitB := False;
+End;
+
+{ ------------------------------- AC'97 ---------------------------- }
+
+Function Ac97Init : Boolean;
+Var K : LongInt;
+Begin
+  Ac97Init := False;
+  PcmIo := PciRead(PcmBus, PcmDev, PcmFn, $10) And $FFFC;   { NAMBAR }
+  PcmIo2 := PciRead(PcmBus, PcmDev, PcmFn, $14) And $FFFC;  { NABMBAR }
+  If (PcmIo = 0) Or (PcmIo2 = 0) Then Exit;
+  K := PciRead(PcmBus, PcmDev, PcmFn, 4);
+  PciWrite(PcmBus, PcmDev, PcmFn, 4, (K And $FFFF) Or 5);
+  { remise a zero a froid du lien, puis codec pret (bit 8) }
+  If (PInL(PcmIo2 + $30) And $100) = 0 Then
+  Begin
+    POutL(PcmIo2 + $2C, 0);
+    KDelay(2);
+    POutL(PcmIo2 + $2C, 2);
+    K := Ticks + 300;
+    While ((PInL(PcmIo2 + $30) And $100) = 0) And (Ticks < K) Do Idle;
+  End
+  Else POutL(PcmIo2 + $2C, 2);
+  If (PInL(PcmIo2 + $30) And $100) = 0 Then
+    KLog('Son : codec AC''97 non pret');
+  PortW[PcmIo] := 0;                              { remise a zero }
+  KDelay(5);
+  PortW[PcmIo + $02] := 0;                        { general }
+  PortW[PcmIo + $04] := 0;                        { casque }
+  PortW[PcmIo + $18] := $0808;                    { sortie PCM }
+  PcmVra := 0;
+  If (PortW[PcmIo + $28] And 1) <> 0 Then
+  Begin
+    PortW[PcmIo + $2A] := PortW[PcmIo + $2A] Or 1;
+    PcmVra := 1;
+  End;
+  { 32 descripteurs de 1 Ko : tout le tampon }
+  For K := 0 To PcmNCh - 1 Do
+  Begin
+    MemL[0:PcmMem + K * 8] := SbDmaBuf + K * PcmChL;
+    MemL[0:PcmMem + K * 8 + 4] := PcmChL Div 2;     { echantillons }
+  End;
+  Ac97Init := True;
+End;
+
+Procedure Ac97Start;
+Var R : LongInt;
+Begin
+  SbOBits := 16; SbOChans := 2;
+  R := Max(8000, Min(SbRate, 48000));
+  If PcmVra <> 0 Then
+  Begin
+    PortW[PcmIo + $2C] := R;
+    R := PortW[PcmIo + $2C];
+    If R = 0 Then R := 48000;
+  End
+  Else R := 48000;
+  SbORate := R;
+  Port[PcmIo2 + $1B] := 0;
+  Port[PcmIo2 + $1B] := 2;                        { remise a zero }
+  PcmWaitB(PcmIo2 + $1B, 2, 0, 20, False);
+  POutL(PcmIo2 + $10, PcmMem);                    { BDBAR }
+  PortW[PcmIo2 + $16] := $1C;
+End;
+
+Procedure Ac97Stop;
+Begin
+  Port[PcmIo2 + $1B] := 0;
+  Port[PcmIo2 + $1B] := 2;
+End;
+
+{ blocs consommes depuis PcmCh ; le controleur s'arrete au dernier
+  descripteur valide (LVI) s'il rattrape les donnees }
+Function Ac97Used : LongInt;
+Var Civ, Sr, N : LongInt;
+Begin
+  Civ := Port[PcmIo2 + $14] And 31;
+  Sr := PortW[PcmIo2 + $16];
+  N := (Civ - PcmCh + PcmNCh) Mod PcmNCh;
+  If (Sr And 1) <> 0 Then
+  Begin
+    { arrete : le descripteur LVI est lui aussi joue }
+    N := (Civ + 1 - PcmCh + PcmNCh) Mod PcmNCh;
+    If N = 0 Then N := PcmNCh;
+  End;
+  If (Sr And $1C) <> 0 Then PortW[PcmIo2 + $16] := Sr And $1C;
+  Ac97Used := N;
+End;
+
+{ attenuation AC'97 (0..31, bit 15 : sourdine) du volume V (0..255) }
+Function Ac97Att(L, R : LongInt; M : Boolean) : LongInt;
+Begin
+  If M Or ((L = 0) And (R = 0)) Then Ac97Att := $8000
+  Else Ac97Att := (((255 - L) * 31) Div 255) Shl 8 +
+                  ((255 - R) * 31) Div 255;
+End;
+
+{ ------------------------------- HD Audio ------------------------- }
+
+Function HdaRL(R : LongInt) : LongInt;
+Begin
+  HdaRL := MemL[0:PcmMmio + R];
+End;
+
+Procedure HdaWL(R, V : LongInt);
+Begin
+  MemL[0:PcmMmio + R] := V;
+End;
+
+{ commande au codec (CORB) et reponse (RIRB) ; -1 sans reponse }
+Function HdaCmd(Nid, Verb : LongInt) : LongInt;
+Var T : LongInt;
+Begin
+  HdaWp := (HdaWp + 1) Mod HdaCorbN;
+  MemL[0:PcmMem + $400 + HdaWp * 4] := (HdaCodec Shl 28) Or
+    ((Nid And $7F) Shl 20) Or (Verb And $FFFFF);
+  MemW[0:PcmMmio + $48] := HdaWp;
+  T := Ticks + 50;
+  While ((MemW[0:PcmMmio + $58] And $FF) = HdaRp) And (Ticks <= T) Do;
+  If (MemW[0:PcmMmio + $58] And $FF) = HdaRp Then
+  Begin
+    HdaCmd := -1;
+    Exit;
+  End;
+  HdaRp := (HdaRp + 1) Mod HdaRirbN;
+  HdaCmd := MemL[0:PcmMem + $800 + HdaRp * 8];
+  { compteur de reponses remis a zero (sinon le controleur attend) }
+  Mem[0:PcmMmio + $5D] := 5;
+End;
+
+Function HdaType(N : LongInt) : LongInt;
+Begin
+  If (N < HdaWLo) Or (N > HdaWHi) Then HdaType := -1
+  Else HdaType := (HdaCaps[N] Shr 20) And 15;
+End;
+
+{ gain 0 dB d'un ampli (pas de decalage), du noeud ou du groupe }
+Function HdaAmp0(N, Par : LongInt) : LongInt;
+Var C : LongInt;
+Begin
+  C := HdaCmd(N, $F0000 Or Par);
+  If (C = 0) Or (C = -1) Then C := HdaCmd(HdaAfg, $F0000 Or Par);
+  If C = -1 Then C := 0;
+  HdaAmp0 := C And $7F;
+End;
+
+{ Chemin du noeud N vers un DAC (profondeur D) : l'ouvre et rend le
+  DAC (0 sans chemin) }
+Function HdaPath(N, D : LongInt) : LongInt;
+Var T, L, I, R, C, Dac, Long : LongInt;
+Begin
+  HdaPath := 0;
+  T := HdaType(N);
+  If T = 0 Then
+  Begin
+    If (HdaCaps[N] And $200) = 0 Then HdaPath := N;   { pas numerique }
+    Exit;
+  End;
+  If (D > 4) Or ((T <> 2) And (T <> 3) And (T <> 4)) Then Exit;
+  L := HdaCmd(N, $F000E);
+  If L = -1 Then Exit;
+  Long := (L Shr 7) And 1;
+  L := L And $7F;
+  R := 0;
+  For I := 0 To L - 1 Do
+  Begin
+    If Long = 0 Then
+    Begin
+      If (I And 3) = 0 Then R := HdaCmd(N, $F0200 Or I);
+      C := (R Shr ((I And 3) * 8)) And $7F;
+    End
+    Else
+    Begin
+      If (I And 1) = 0 Then R := HdaCmd(N, $F0200 Or I);
+      C := (R Shr ((I And 1) * 16)) And $7F;
+    End;
+    Dac := HdaPath(C, D + 1);
+    If Dac <> 0 Then
+    Begin
+      If ((T = 3) Or (T = 4)) And (L > 1) Then HdaCmd(N, $70100 Or I);
+      If (T = 2) And ((HdaCaps[N] And 2) <> 0) Then  { entree du melangeur }
+        HdaCmd(N, $37000 Or (I Shl 8) Or HdaAmp0(N, $0D));
+      If (T <> 4) And ((HdaCaps[N] And 4) <> 0) Then
+        HdaCmd(N, $3B000 Or HdaAmp0(N, $12));
+      HdaPath := Dac;
+      Exit;
+    End;
+  End;
+End;
+
+Function HdaInit : Boolean;
+Var K, St, Gcap, R, N, Pc, Cfg, Dt, Dac, J : LongInt; Have : Boolean;
+Begin
+  HdaInit := False;
+  K := PciRead(PcmBus, PcmDev, PcmFn, $10);
+  If (K And 1) <> 0 Then Exit;
+  PcmMmio := K And LongInt($FFFFFFF0);
+  If PcmMmio = 0 Then Exit;
+  K := PciRead(PcmBus, PcmDev, PcmFn, 4);
+  PciWrite(PcmBus, PcmDev, PcmFn, 4, (K And $FFFF) Or 6);
+  { remise a zero du controleur (GCTL.CRST), puis enumeration }
+  HdaWL($08, HdaRL($08) And Not 1);
+  PcmWaitB(PcmMmio + $08, 1, 0, 100, True);
+  KDelay(1);
+  HdaWL($08, HdaRL($08) Or 1);
+  If Not PcmWaitB(PcmMmio + $08, 1, 1, 100, True) Then Exit;
+  KDelay(10);
+  St := MemW[0:PcmMmio + $0E];
+  If St = 0 Then
+  Begin
+    KLog('Son : HD Audio sans codec');
+    Exit;
+  End;
+  HdaCodec := 0;
+  While (St And (1 Shl HdaCodec)) = 0 Do Inc(HdaCodec);
+  Gcap := MemW[0:PcmMmio];
+  If ((Gcap Shr 12) And 15) = 0 Then Exit;
+  HdaSd := $80 + ((Gcap Shr 8) And 15) * $20;      { 1er flux de sortie }
+  { anneaux CORB (PcmMem + 400h) et RIRB (PcmMem + 800h) }
+  Mem[0:PcmMmio + $4C] := 0; Mem[0:PcmMmio + $5C] := 0;
+  KDelay(1);
+  K := Mem[0:PcmMmio + $4E];
+  If (K And $40) <> 0 Then Begin HdaCorbN := 256; R := 2; End
+  Else If (K And $20) <> 0 Then Begin HdaCorbN := 16; R := 1; End
+  Else Begin HdaCorbN := 2; R := 0; End;
+  Mem[0:PcmMmio + $4E] := (K And $F0) Or R;
+  K := Mem[0:PcmMmio + $5E];
+  If (K And $40) <> 0 Then Begin HdaRirbN := 256; R := 2; End
+  Else If (K And $20) <> 0 Then Begin HdaRirbN := 16; R := 1; End
+  Else Begin HdaRirbN := 2; R := 0; End;
+  Mem[0:PcmMmio + $5E] := (K And $F0) Or R;
+  HdaWL($40, PcmMem + $400); HdaWL($44, 0);
+  HdaWL($50, PcmMem + $800); HdaWL($54, 0);
+  MemW[0:PcmMmio + $4A] := $8000;                  { CORBRP a zero }
+  PcmWaitB(PcmMmio + $48, LongInt($80000000), LongInt($80000000), 5,
+           True);
+  MemW[0:PcmMmio + $4A] := 0;
+  PcmWaitB(PcmMmio + $48, LongInt($80000000), 0, 5, True);
+  MemW[0:PcmMmio + $48] := 0; HdaWp := 0;
+  MemW[0:PcmMmio + $58] := $8000; HdaRp := 0;      { RIRBWP a zero }
+  MemW[0:PcmMmio + $5A] := $FF;                    { RINTCNT }
+  Mem[0:PcmMmio + $4C] := 2; Mem[0:PcmMmio + $5C] := 2;
+  KDelay(1);
+  { groupe de fonctions audio (AFG) }
+  R := HdaCmd(0, $F0004);
+  If R = -1 Then
+  Begin
+    KLog('Son : HD Audio, le codec ne repond pas');
+    Exit;
+  End;
+  HdaAfg := 0;
+  For N := (R Shr 16) And $7F To ((R Shr 16) And $7F) + (R And $7F) - 1 Do
+    If (HdaAfg = 0) And ((HdaCmd(N, $F0005) And $FF) = 1) Then
+      HdaAfg := N;
+  If HdaAfg = 0 Then
+  Begin
+    KLog('Son : HD Audio sans groupe audio');
+    Exit;
+  End;
+  HdaCmd(HdaAfg, $70500);                         { alimentation D0 }
+  R := HdaCmd(HdaAfg, $F0004);
+  HdaWLo := (R Shr 16) And $7F;
+  HdaWHi := Min(127, HdaWLo + (R And $7F) - 1);
+  For N := HdaWLo To HdaWHi Do
+  Begin
+    HdaCaps[N] := HdaCmd(N, $F0009);
+    If HdaCaps[N] = -1 Then HdaCaps[N] := 0;
+    If (HdaCaps[N] And $400) <> 0 Then HdaCmd(N, $70500);
+  End;
+  { broches de sortie analogiques (sortie ligne, haut-parleur, casque) }
+  HdaDacN := 0;
+  For N := HdaWLo To HdaWHi Do
+    If (HdaType(N) = 4) And ((HdaCaps[N] And $200) = 0) Then
+    Begin
+      Pc := HdaCmd(N, $F000C);
+      Cfg := HdaCmd(N, $F1C00);
+      Dt := (Cfg Shr 20) And 15;
+      If (Pc <> -1) And ((Pc And $10) <> 0) And
+         (((Cfg Shr 30) And 3) <> 1) And (Dt <= 2) Then
+      Begin
+        Dac := HdaPath(N, 0);
+        If Dac <> 0 Then
+        Begin
+          If (Dt = 2) And ((Pc And 8) <> 0) Then HdaCmd(N, $707C0)
+          Else HdaCmd(N, $70740);
+          If (Pc And $10000) <> 0 Then HdaCmd(N, $70C02);    { EAPD }
+          If (HdaCaps[N] And 4) <> 0 Then
+            HdaCmd(N, $3B000 Or HdaAmp0(N, $12));
+          Have := False;
+          For J := 0 To HdaDacN - 1 Do
+            If HdaDac[J] = Dac Then Have := True;
+          If Not Have And (HdaDacN < HdaMaxDac) Then
+          Begin
+            HdaDac[HdaDacN] := Dac;
+            HdaOff[HdaDacN] := HdaAmp0(Dac, $12);
+            Inc(HdaDacN);
+          End;
+        End;
+      End;
+    End;
+  If HdaDacN = 0 Then
+  Begin
+    KLog('Son : HD Audio, aucune sortie analogique');
+    Exit;
+  End;
+  For J := 0 To HdaDacN - 1 Do HdaCmd(HdaDac[J], $70610); { flux 1 }
+  HdaInit := True;
+End;
+
+{ format de flux HD Audio (16 bits stereo) le plus proche de R }
+Function HdaFmt(R : LongInt; Var Act : LongInt) : LongInt;
+Var F : LongInt;
+Begin
+  Act := R;
+  Case R Of
+    8000 : F := $0500;
+    11025 : F := $4300;
+    12000 : F := $0300;
+    16000 : F := $0200;
+    22050 : F := $4100;
+    24000 : F := $0100;
+    32000 : F := $0A00;
+    44100 : F := $4000;
+    48000 : F := $0000;
+  Else
+    F := 0; Act := 48000;
+  End;
+  HdaFmt := F Or $11;
+End;
+
+Procedure HdaStart;
+Var F, J, A : LongInt;
+Begin
+  SbOBits := 16; SbOChans := 2;
+  F := HdaFmt(SbRate, A);
+  SbORate := A;
+  HdaWL(HdaSd, 0);
+  PcmWaitB(PcmMmio + HdaSd, 2, 0, 10, True);
+  HdaWL(HdaSd, 1);                                 { remise a zero }
+  PcmWaitB(PcmMmio + HdaSd, 1, 1, 10, True);
+  HdaWL(HdaSd, 0);
+  PcmWaitB(PcmMmio + HdaSd, 1, 0, 10, True);
+  For J := 0 To 1 Do
+  Begin
+    MemL[0:PcmMem + J * 16] := SbDmaBuf + J * SbHalf;
+    MemL[0:PcmMem + J * 16 + 4] := 0;
+    MemL[0:PcmMem + J * 16 + 8] := SbHalf;
+    MemL[0:PcmMem + J * 16 + 12] := 0;
+  End;
+  HdaWL(HdaSd + $18, PcmMem); HdaWL(HdaSd + $1C, 0);
+  HdaWL(HdaSd + $08, SbDmaLen);
+  MemW[0:PcmMmio + HdaSd + $0C] := 1;              { LVI }
+  MemW[0:PcmMmio + HdaSd + $12] := F;
+  For J := 0 To HdaDacN - 1 Do
+  Begin
+    HdaCmd(HdaDac[J], $20000 Or F);
+    HdaCmd(HdaDac[J], $70610);
+  End;
+  HdaWL(HdaSd, $100000);                           { flux 1 }
+End;
+
+Procedure HdaStop;
+Begin
+  HdaWL(HdaSd, $100000);
+End;
+
+{ ------------------------------- ES1370 --------------------------- }
+
+Procedure EsCodec(R, V : LongInt);
+Var T : LongInt;
+Begin
+  T := Ticks + 5;
+  While ((PInL(PcmIo + 4) And $200) <> 0) And (Ticks <= T) Do;
+  PortW[PcmIo + $10] := ((R And 255) Shl 8) Or (V And 255);
+End;
+
+Function EsInit : Boolean;
+Var K : LongInt;
+Begin
+  EsInit := False;
+  PcmIo := PciRead(PcmBus, PcmDev, PcmFn, $10) And $FFFC;
+  If PcmIo = 0 Then Exit;
+  K := PciRead(PcmBus, PcmDev, PcmFn, 4);
+  PciWrite(PcmBus, PcmDev, PcmFn, 4, (K And $FFFF) Or 5);
+  PcmCtl := 2;                                     { CDC_EN }
+  POutL(PcmIo, PcmCtl);
+  POutL(PcmIo + $20, 0);
+  EsCodec($16, 2); KDelay(2); EsCodec($16, 3);
+  EsCodec($17, 0);
+  EsCodec($00, 0); EsCodec($01, 0);                { general }
+  EsCodec($02, 0); EsCodec($03, 0);                { voix (DAC2) }
+  EsCodec($10, 0); EsCodec($11, $0C);              { melangeur : voix }
+  EsInit := True;
+End;
+
+Procedure EsStart;
+Var Dv, Sc, F : LongInt;
+Begin
+  SbOBits := SbBits; SbOChans := SbChans;
+  Dv := 1411200 Div Max(4000, Min(SbRate, 48000)) - 2;
+  SbORate := 1411200 Div (Dv + 2);
+  PcmCtl := (PcmCtl And Not LongInt($1FFF0020)) Or ((Dv And $1FFF) Shl 16);
+  POutL(PcmIo, PcmCtl);
+  POutL(PcmIo + $0C, $0C);                         { page DAC2 }
+  POutL(PcmIo + $38, SbDmaBuf);
+  POutL(PcmIo + $3C, SbDmaLen Div 4 - 1);
+  F := 0;
+  If SbOBits = 16 Then F := F Or 2;
+  If SbOChans = 2 Then F := F Or 1;
+  Sc := PInL(PcmIo + $20);
+  Sc := (Sc And Not ($0C Or $1000 Or $4000)) Or (F Shl 2);
+  POutL(PcmIo + $20, Sc);
+  POutL(PcmIo + $28, SbHalf Div ((SbOBits Div 8) * SbOChans) - 1);
+End;
+
+Procedure EsStop;
+Begin
+  PcmCtl := PcmCtl And Not $20;
+  POutL(PcmIo, PcmCtl);
+End;
+
+Function EsPos : LongInt;
+Begin
+  POutL(PcmIo + $0C, $0C);
+  EsPos := (((PInL(PcmIo + $3C) Shr 16) And $FFFF) * 4) Mod SbDmaLen;
+End;
+
+{ ------------------------------- commun --------------------------- }
+
+Procedure PcmVol;
+Var L, R, J, G, V : LongInt; M : Boolean;
+Begin
+  M := MixMute[0] Or MixMute[1];
+  L := (MixVolL[0] * MixVolL[1]) Div 255;
+  R := (MixVolR[0] * MixVolR[1]) Div 255;
+  Case SndKind Of
+    skAc97 :
+      Begin
+        PortW[PcmIo + $02] := Ac97Att(MixVolL[0], MixVolR[0], MixMute[0]);
+        PortW[PcmIo + $18] := Ac97Att(MixVolL[1], MixVolR[1], MixMute[1]);
+      End;
+    skHda :
+      For J := 0 To HdaDacN - 1 Do
+      Begin
+        V := HdaOff[J];
+        If V = 0 Then V := 127;
+        G := (V * L) Div 255;
+        If M Or (L = 0) Then G := $80;
+        HdaCmd(HdaDac[J], $3A000 Or G);
+        G := (V * R) Div 255;
+        If M Or (R = 0) Then G := $80;
+        HdaCmd(HdaDac[J], $39000 Or G);
+      End;
+    skEs :
+      Begin
+        G := Ac97Att(MixVolL[0], MixVolR[0], MixMute[0]);
+        If G = $8000 Then Begin EsCodec(0, $80); EsCodec(1, $80); End
+        Else Begin EsCodec(0, G Shr 8); EsCodec(1, G And 31); End;
+        G := Ac97Att(MixVolL[1], MixVolR[1], MixMute[1]);
+        If G = $8000 Then Begin EsCodec(2, $80); EsCodec(3, $80); End
+        Else Begin EsCodec(2, G Shr 8); EsCodec(3, G And 31); End;
+      End;
+  End;
+End;
+
+{ Minuterie : les blocs de 1 Ko lus par la carte depuis la derniere
+  fois sont remplis avec la suite (AC'97 : par l'indice du descripteur
+  courant ; HD Audio et ES1370 : par la position de lecture) }
+Procedure PcmCheck;
+Var N, K, P : LongInt;
+Begin
+  If SndKind = skAc97 Then N := Ac97Used
+  Else
+  Begin
+    If SndKind = skHda Then P := HdaRL(HdaSd + 4) Mod SbDmaLen
+    Else P := EsPos;
+    N := (P Div PcmChL - PcmCh + PcmNCh) Mod PcmNCh;
+  End;
+  While N > 0 Do
+  Begin
+    K := Min(N, PcmNCh - PcmCh);                    { sans repli }
+    SbPlayed := SbPlayed + K * PcmChL;
+    SbFill1(PcmCh * PcmChL, K * PcmChL);
+    PcmCh := (PcmCh + K) Mod PcmNCh;
+    N := N - K;
+    If SndKind = skAc97 Then
+    Begin
+      Port[PcmIo2 + $15] := (PcmCh + PcmNCh - 1) Mod PcmNCh;
+      If (PortW[PcmIo2 + $16] And 1) <> 0 Then
+      Begin
+        PortW[PcmIo2 + $16] := $1C;
+        Port[PcmIo2 + $1B] := 1;                    { relancer }
+      End;
+    End;
+  End;
+End;
+
+Procedure PcmTick;
+Var C : LongInt;
+Begin
+  If (SndKind < skAc97) Or Not SbPlaying Then Exit;
+  C := 0;
+  If KPd <> 0 Then
+  Begin
+    asm
+      mov eax,cr3
+      mov C,eax
+      mov eax,KPd
+      mov cr3,eax
+    end;
+  End;
+  PcmCheck;
+  If (C <> 0) And (C <> KPd) Then
+  Begin
+    asm
+      mov eax,C
+      mov cr3,eax
+    end;
+  End;
+End;
+
+{ Recherche des cartes PCI (bus 0 a 3) }
+Function PcmProbe : Boolean;
+Var B, D, F, Nf, Id, Cl, Ho, K : LongInt; Ok : Boolean;
+Begin
+  PcmProbe := False;
+  If PciRead(0, 0, 0, 0) = -1 Then Exit;
+  For B := 0 To 3 Do
+    For D := 0 To 31 Do
+    Begin
+      Id := PciRead(B, D, 0, 0);
+      If (Id And $FFFF) = $FFFF Then Continue;
+      If ((PciRead(B, D, 0, $0C) Shr 16) And $80) <> 0 Then Nf := 7
+      Else Nf := 0;
+      For F := 0 To Nf Do
+      Begin
+        Id := PciRead(B, D, F, 0);
+        If (Id And $FFFF) = $FFFF Then Continue;
+        Cl := (PciRead(B, D, F, 8) Shr 16) And $FFFF;
+        K := 0;
+        If Id = $50001274 Then K := skEs
+        Else If Cl = $0403 Then K := skHda
+        Else If (Cl = $0401) And ((Id = $24158086) Or (Id = $24258086) Or
+          (Id = $24458086) Or (Id = $24858086) Or (Id = $24C58086) Or
+          (Id = $24D58086) Or (Id = $266E8086) Or (Id = $27DE8086) Or
+          (Id = $71958086) Or (Id = $746D1022) Or (Id = $006A10DE) Or
+          (Id = $00DA10DE)) Then K := skAc97;
+        If K = 0 Then Continue;
+        PcmBus := B; PcmDev := D; PcmFn := F; PcmId := Id;
+        PcmIrq := PciRead(B, D, F, $3C) And 255;
+        If PcmMem = 0 Then
+        Begin
+          Ho := HeapOwner; HeapOwner := 0;
+          PcmMem := KAlloc(4096 + 128);
+          HeapOwner := Ho;
+          If PcmMem = 0 Then Exit;
+          PcmMem := (PcmMem + 127) And Not 127;
+          FillMem(PcmMem, 4096, 0);
+        End;
+        Case K Of
+          skAc97 : Ok := Ac97Init;
+          skHda : Ok := HdaInit;
+        Else
+          Ok := EsInit;
+        End;
+        If Ok Then
+        Begin
+          SndKind := K;
+          PcmName := PciName(Id);
+          Case Id And $FFFF Of
+            $8086 : PcmMfg := 'Intel';
+            $1274 : PcmMfg := 'Ensoniq';
+            $10DE : PcmMfg := 'NVIDIA';
+            $1022 : PcmMfg := 'Advanced Micro Devices (AMD)';
+          Else
+            PcmMfg := '(PCI ' + HexStr(Id And $FFFF, 4) + ')';
+          End;
+          If PcmName = '' Then
+            Case K Of
+              skAc97 : PcmName := 'Audio AC''97';
+              skHda : PcmName := 'High Definition Audio';
+            Else
+              PcmName := 'Ensoniq AudioPCI (ES1370)';
+            End;
+          PcmProbe := True;
+          Exit;
+        End;
+      End;
+    End;
+End;
+
 Procedure SndInit;
-Var V, B, I, Hi, Lo : LongInt; Bl : String;
+Var V, B, I, Hi, Lo : LongInt; Bl, T : String;
 Begin
   SbOk := False; Sb16 := False; SbDev := -1; SbPlaying := False;
+  SndKind := 0; PcmMem := 0;
   For I := 0 To MixLines - 1 Do
   Begin
     MixVolL[I] := 192; MixVolR[I] := 192; MixMute[I] := False;
@@ -34751,6 +35468,22 @@ Begin
     KLog('Son : ' + SbName + ' (DSP ' + IntStr(SbVer Shr 8) + '.' +
          Pad2(SbVer And 255) + ') en ' + HexStr(SbBase, 3) + 'h, IRQ ' +
          IntStr(SbIrq) + ', DMA ' + IntStr(SbDma8) + '/' + IntStr(SbDma16));
+    SndKind := skSb;
+  End
+  Else If PcmProbe Then
+  Begin
+    { carte PCI : 16 bits stereo, comme une Sound Blaster 16 }
+    SbOk := True; Sb16 := True;
+    PcmVol;
+    If SndKind = skHda Then
+      KLog('Son : ' + PcmName + ' en ' + HexStr(PcmMmio, 8) + 'h, codec ' +
+           IntStr(HdaCodec) + ', ' + IntStr(HdaDacN) + ' DAC (noeud ' +
+           IntStr(HdaDac[0]) + ')')
+    Else
+    Begin
+      If SndKind = skAc97 Then T := ', VRA ' + IntStr(PcmVra) Else T := '';
+      KLog('Son : ' + PcmName + ' en ' + HexStr(PcmIo, 4) + 'h' + T);
+    End;
   End;
   OplOk := OplDetect;
   If OplOk Then
@@ -34771,6 +35504,37 @@ Procedure SbStart;
 Var TC, N, Md : LongInt;
 Begin
   If Not SbOk Or SbPlaying Or ((SbDev < 0) And Not DSOwn) Then Exit;
+  SbORate := SbRate;
+  If SndKind >= 2 Then
+  Begin
+    { carte PCI : format et frequence de la carte, puis les deux moities
+      remplies et la lecture lancee }
+    Case SndKind Of
+      skAc97 : Ac97Start;
+      skHda : HdaStart;
+      skEs : EsStart;
+    End;
+    SbStep := (SbRate * 4096) Div Max(1, SbORate); SbFrac := 0;
+    SbQueued := 0; SbPlayed := 0; SbCopyK := 0; SbCopyOff := 0;
+    SbSilent := 0; SbNext := 0; SbPaused := False; PcmCh := 0;
+    SbFill1(0, SbDmaLen);                           { tout le tampon }
+    SbPlaying := True;
+    Case SndKind Of
+      skAc97 :
+        Begin
+          Port[PcmIo2 + $15] := PcmNCh - 1;               { LVI }
+          Port[PcmIo2 + $1B] := 1;                        { marche }
+        End;
+      skHda : HdaWL(HdaSd, $100002);
+      skEs :
+        Begin
+          PcmCtl := PcmCtl Or $20;                        { DAC2_EN }
+          POutL(PcmIo, PcmCtl);
+        End;
+    End;
+    Exit;
+  End;
+  SbStep := 4096; SbFrac := 0;
   If Sb16 Then
   Begin
     SbOBits := SbBits; SbOChans := SbChans;
@@ -34781,7 +35545,7 @@ Begin
   End;
   SbQueued := 0; SbPlayed := 0; SbCopyK := 0; SbCopyOff := 0;
   SbSilent := 0; SbNext := 0; SbPaused := False;
-  SbFill1(0); SbFill1(1);
+  SbFill1(0, SbHalf); SbFill1(SbHalf, SbHalf);
   SbPlaying := True;
   SbWriteDsp($D1);
   If SbOBits = 16 Then DmaStart(SbDma16) Else DmaStart(SbDma8);
@@ -34818,6 +35582,16 @@ Procedure SbStop;
 Begin
   If Not SbPlaying Then Exit;
   SbPlaying := False;
+  If SndKind >= 2 Then
+  Begin
+    Case SndKind Of
+      skAc97 : Ac97Stop;
+      skHda : HdaStop;
+      skEs : EsStop;
+    End;
+    KLog('Son : fin de lecture (' + IntStr(SbPlayed) + ' octets)');
+    Exit;
+  End;
   If Sb16 Then
   Begin
     If SbOBits = 16 Then
@@ -35009,7 +35783,7 @@ Begin
         While (WaveDevs[I].QN > 0) And (SbCopyK > 0) And
               (SbPlayed >= WaveQEnd[I * MaxWaveQ]) Do
           WaveDone(I, 0);
-        If SbPlaying And (WaveDevs[I].QN = 0) And (SbSilent >= 2) And
+        If SbPlaying And (WaveDevs[I].QN = 0) And (SbSilent >= SbDmaLen) And
            Not DSAnyPlaying Then
           SbStop;
       End
@@ -38348,9 +39122,13 @@ End;
 Const
   MaxView = 32;
 
+Type
+  TDdeStrArr = Array[0..63] Of String[63];
+  PDdeStrArr = ^TDdeStrArr;
+
 Var
   ViewAddr, ViewMap, ViewOfs, ViewSize : Array[0..MaxView - 1] Of LongInt;
-  DdeStr : Array[0..63] Of String[63];
+  DdeStr : PDdeStrArr;                     { alloue dans le tas }
   DdeData : Array[0..15] Of LongInt;
 
 { ------------------------------- KERNEL32 ------------------------- }
@@ -38821,10 +39599,10 @@ Var I : LongInt;
 Begin
   DdeCreateStringHandleA := 0;
   For I := 1 To 63 Do
-    If DdeStr[I] = '' Then
+    If DdeStr^[I] = '' Then
     Begin
-      DdeStr[I] := Copy(PStr(P), 1, 63);
-      If DdeStr[I] = '' Then DdeStr[I] := ' ';
+      DdeStr^[I] := Copy(PStr(P), 1, 63);
+      If DdeStr^[I] = '' Then DdeStr^[I] := ' ';
       DdeCreateStringHandleA := I;
       Exit;
     End;
@@ -38832,7 +39610,7 @@ End;
 
 Function DdeFreeStringHandle(Id, H : LongInt) : LongInt;
 Begin
-  If (H > 0) And (H < 64) Then DdeStr[H] := '';
+  If (H > 0) And (H < 64) Then DdeStr^[H] := '';
   DdeFreeStringHandle := 1;
 End;
 
@@ -38841,8 +39619,8 @@ Begin
   DdeConnect := 0;
   If (HSrv > 0) And (HSrv < 64) Then
   Begin
-    KLog('DDE : connexion a ' + DdeStr[HSrv]);
-    If UpStr(DdeStr[HSrv]) = 'PROGMAN' Then DdeConnect := $5150;
+    KLog('DDE : connexion a ' + DdeStr^[HSrv]);
+    If UpStr(DdeStr^[HSrv]) = 'PROGMAN' Then DdeConnect := $5150;
   End;
 End;
 
@@ -48278,7 +49056,7 @@ Begin
     Begin
       If Not Any Then FillMem(DSMixBuf, Fr * 8, 0);
       Any := True;
-      DSRun(B, Fr, SbRate, DSMixBuf);
+      DSRun(B, Fr, SbORate, DSMixBuf);
     End;
   End;
   DSClock := DSClock + Fr;
@@ -48356,7 +49134,7 @@ Begin
   End
   Else DSLastT := Ticks;
   DSFire;
-  If DSOwn And SbPlaying And (SbDev < 0) And (SbSilent >= 4) And
+  If DSOwn And SbPlaying And (SbDev < 0) And (SbSilent >= 2 * SbDmaLen) And
      Not DSAnyPlaying Then SbStop;
 End;
 
@@ -48562,8 +49340,14 @@ Begin
       G := KAlloc(16);
       DXGuid(G, LongInt($BD6DD71A), $3DEB, $11D1, LongInt($C000B1B4),
              LongInt($4FB7F3C2));
-      If Sb16 Then D := DXStr(SbName, Wide) Else D := DXStr(SbName, Wide);
-      M := DXStr('SB16.VXD', Wide);
+      D := DXStr(SbName, Wide);
+      Case SndKind Of
+        skAc97 : M := DXStr('ICHAUD.VXD', Wide);
+        skHda : M := DXStr('HDAUDIO.VXD', Wide);
+        skEs : M := DXStr('ES1370.VXD', Wide);
+      Else
+        M := DXStr('SB16.VXD', Wide);
+      End;
       DXCall4(Cb, G, D, M, Ctx);
       KFree(G);
     End
@@ -79333,11 +80117,15 @@ Const
   EmsHMax = 64;
   EmsFrame = $E000;
 
+Type
+  TEmsNmArr = Array[0..EmsHMax - 1] Of String[8];
+  PEmsNmArr = ^TEmsNmArr;
+
 Var
   EmsPool, EmsPoolBlk : LongInt;
   EmsPgH, EmsPgL : Array[0..EmsPages - 1] Of LongInt;   { H -1 : libre }
   EmsHUsed : Array[0..EmsHMax - 1] Of Boolean;
-  EmsHName : Array[0..EmsHMax - 1] Of String[8];
+  EmsHName : PEmsNmArr;                    { alloue dans le tas }
   EmsHSaved : Array[0..EmsHMax - 1] Of Boolean;
   EmsSvH, EmsSvL : Array[0..EmsHMax * 4 - 1] Of LongInt;
   EmsMapH, EmsMapL : Array[0..3] Of LongInt;
@@ -79349,7 +80137,7 @@ Begin
   For I := 0 To EmsPages - 1 Do EmsPgH[I] := -1;
   For I := 0 To EmsHMax - 1 Do
   Begin
-    EmsHUsed[I] := False; EmsHName[I] := ''; EmsHSaved[I] := False;
+    EmsHUsed[I] := False; EmsHName^[I] := ''; EmsHSaved[I] := False;
   End;
   EmsHUsed[0] := True;               { poignee du systeme }
   For I := 0 To 3 Do
@@ -79558,7 +80346,7 @@ Begin
         Else If Not EmsAllocP(H, N) Then E := $88
         Else
         Begin
-          EmsHUsed[H] := True; EmsHName[H] := ''; EmsHSaved[H] := False;
+          EmsHUsed[H] := True; EmsHName^[H] := ''; EmsHSaved[H] := False;
           VS(fEdx, H);
         End;
       End;
@@ -79582,7 +80370,7 @@ Begin
         For I := 0 To 3 Do If EmsMapH[I] = H Then EmsSetMap(I, -1, -1);
         For I := 0 To EmsPages - 1 Do If EmsPgH[I] = H Then EmsPgH[I] := -1;
         If H <> 0 Then EmsHUsed[H] := False;
-        EmsHName[H] := '';
+        EmsHName^[H] := '';
       End;
     End;
     $46 : VSL(fEax, $40);
@@ -79739,16 +80527,16 @@ Begin
       Begin
         P := VmPtr(fEs, fEdi);
         FillMem(P, 8, 0);
-        For I := 1 To Length(EmsHName[H]) Do
-          Mem[0:P + I - 1] := Ord(EmsHName[H][I]);
+        For I := 1 To Length(EmsHName^[H]) Do
+          Mem[0:P + I - 1] := Ord(EmsHName^[H][I]);
       End
       Else If AL = 1 Then
       Begin
         P := VmPtr(fDs, fEsi);
-        EmsHName[H] := '';
+        EmsHName^[H] := '';
         For I := 0 To 7 Do
           If Mem[0:P + I] <> 0 Then
-            EmsHName[H] := EmsHName[H] + Chr(Mem[0:P + I]);
+            EmsHName^[H] := EmsHName^[H] + Chr(Mem[0:P + I]);
       End
       Else E := $8F;
     End;
@@ -79763,8 +80551,8 @@ Begin
             Begin
               MemW[0:P + N * 10] := I;
               FillMem(P + N * 10 + 2, 8, 0);
-              For K := 1 To Length(EmsHName[I]) Do
-                Mem[0:P + N * 10 + 1 + K] := Ord(EmsHName[I][K]);
+              For K := 1 To Length(EmsHName^[I]) Do
+                Mem[0:P + N * 10 + 1 + K] := Ord(EmsHName^[I][K]);
               Inc(N);
             End;
           VSL(fEax, N);
@@ -79774,8 +80562,8 @@ Begin
           P := VmPtr(fDs, fEsi);
           E := $A0;
           For I := 1 To EmsHMax - 1 Do
-            If EmsHUsed[I] And (EmsHName[I] <> '') And
-               (EmsHName[I] = PStrN(P, 8)) Then
+            If EmsHUsed[I] And (EmsHName^[I] <> '') And
+               (EmsHName^[I] = PStrN(P, 8)) Then
             Begin
               VS(fEdx, I);
               E := 0;
@@ -83054,6 +83842,22 @@ BEGIN
   Move(I, FdNm, 4);
   I := KAlloc(SizeOf(TDevResArr));
   Move(I, DevRes, 4);
+  I := KAlloc(SizeOf(TDevNmArr));
+  Move(I, DevName, 4);
+  I := KAlloc(SizeOf(TDevMfArr));
+  Move(I, DevMfg, 4);
+  I := KAlloc(SizeOf(TPropArr));
+  FillMem(I, SizeOf(TPropArr), 0);
+  Move(I, Props, 4);
+  I := KAlloc(SizeOf(TAtomArr));
+  FillMem(I, SizeOf(TAtomArr), 0);
+  Move(I, Atoms, 4);
+  I := KAlloc(SizeOf(TDdeStrArr));
+  FillMem(I, SizeOf(TDdeStrArr), 0);
+  Move(I, DdeStr, 4);
+  I := KAlloc(SizeOf(TEmsNmArr));
+  FillMem(I, SizeOf(TEmsNmArr), 0);
+  Move(I, EmsHName, 4);
   I := KAlloc(SizeOf(TGdiArr));
   Move(I, Gdis, 4);
   I := KAlloc(SizeOf(TWndArr));
