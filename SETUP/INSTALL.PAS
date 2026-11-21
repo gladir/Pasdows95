@@ -2562,15 +2562,17 @@ Begin
   { COMMAND.EXE, Paint, la Calculatrice et le Navigateur Web
     (accessoires), le Gestionnaire des taches, l'Outil de diagnostic
     DirectX, Ajout/Suppression de programmes, l'Aide de Windows, le
-    Lecteur MP3, la Table de caracteres et FreeCell sont toujours
-    installes ; le morceau d'exemple suit les
-    sons du systeme }
+    Lecteur MP3, la Table de caracteres, FreeCell, le Lecteur CD,
+    Imaging, le Carnet d'adresses et Rechercher sont toujours
+    installes ; le morceau d'exemple suit les sons du systeme }
   If (N = 'AURORE.MP3') And Not CompSnd Then Exit;
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
      (N <> 'CALC.EXE') And (N <> 'TASKMGR.EXE') And (N <> 'DXDIAG.EXE') And
      (N <> 'BROWSER.EXE') And (N <> 'APPWIZ.EXE') And
      (N <> 'WINHLP32.EXE') And (N <> 'MP3PLAY.EXE') And
-     (N <> 'FREECELL.EXE') And (N <> 'CHARMAP.EXE') And Not CompEx Then
+     (N <> 'FREECELL.EXE') And (N <> 'CHARMAP.EXE') And
+     (N <> 'CDPLAYER.EXE') And (N <> 'IMAGING.EXE') And
+     (N <> 'WAB.EXE') And (N <> 'FINDFILE.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;
