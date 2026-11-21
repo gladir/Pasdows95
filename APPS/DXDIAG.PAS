@@ -141,6 +141,8 @@ Function RegCloseKey(K : LongInt) : LongInt; stdcall;
   external 'advapi32.dll' name 'RegCloseKey';
 Function midiOutGetNumDevs : LongInt; stdcall;
   external 'winmm.dll' name 'midiOutGetNumDevs';
+Function midiOutGetDevCapsA(Id : LongInt; P : Pointer; N : LongInt) : LongInt;
+  stdcall; external 'winmm.dll' name 'midiOutGetDevCapsA';
 Function waveOutGetNumDevs : LongInt; stdcall;
   external 'winmm.dll' name 'waveOutGetNumDevs';
 Function DirectDrawCreateEx(G : Pointer; Var DD : LongInt; Iid : Pointer;
@@ -1472,7 +1474,42 @@ Begin
 End;
 
 Procedure PageMusic(X, Y, R, B : LongInt);
+Var Caps : Array[0..12] Of LongInt; Nm, T1, T2 : String; K, Tech, Vo : LongInt;
 Begin
+  { premier peripherique MIDI : nom, technologie (4 FM, 7 logiciel), voix }
+  Nm := L('(aucun)', '(none)', '(keiner)', '(nessuno)', '(ninguno)');
+  Tech := 0; Vo := 0;
+  For K := 0 To 12 Do Caps[K] := 0;
+  If midiOutGetNumDevs > 0 Then
+    If midiOutGetDevCapsA(0, @Caps, 52) = 0 Then
+    Begin
+      Nm := '';
+      K := 8;
+      While (K < 40) And (PByte(LongInt(@Caps) + K)^ <> 0) Do
+      Begin
+        Nm := Nm + Chr(PByte(LongInt(@Caps) + K)^);
+        Inc(K);
+      End;
+      Tech := Caps[10] And $FFFF; Vo := (Caps[10] Shr 16) And $FFFF;
+    End;
+  If Tech = 7 Then
+  Begin
+    T1 := L('logiciel (mix'#130' dans le flux de la carte son)',
+            'software (mixed into the sound card stream)',
+            'Software (in den Soundkartenstrom gemischt)',
+            'software (mixato nel flusso della scheda audio)',
+            'software (mezclado en el flujo de la tarjeta)');
+    T2 := L(' voix, General MIDI.', ' voices, General MIDI.',
+            ' Stimmen, General MIDI.', ' voci, General MIDI.',
+            ' voces, General MIDI.');
+  End
+  Else
+  Begin
+    T1 := L('FM, compatible OPL2 (AdLib)', 'FM, OPL2 compatible (AdLib)',
+            'FM, OPL2-kompatibel (AdLib)', 'FM, compatibile OPL2 (AdLib)',
+            'FM, compatible OPL2 (AdLib)');
+    T2 := L(' voix.', ' voices.', ' Stimmen.', ' voci.', ' voces.');
+  End;
   Group(X - 4, Y, R, Y + 80, L('G'#130'n'#130'ral', 'General', 'Allgemein', 'Generale', 'General'));
   Row(X + 160,
       Y + 20,
@@ -1481,11 +1518,7 @@ Begin
       'Standardanschluss',
       'Porta predefinita',
       'Puerto predeterminado'),
-      L('Synth'#130'tiseur FM Pasdows (AdLib)',
-      'Pasdows FM synthesizer (AdLib)',
-      'Pasdows FM-Synthesizer (AdLib)',
-      'Sintetizzatore FM Pasdows (AdLib)',
-      'Sintetizador FM Pasdows (AdLib)'));
+      Nm);
   Row(X + 160,
       Y + 36,
       L('P'#130'riph'#130'riques MIDI',
@@ -1513,18 +1546,12 @@ Begin
       'Puertos de m'#163'sica'));
   Txt(X + 8,
       Y + 110,
-      L('Synth'#130'tiseur FM Pasdows : sortie, MIDI (MMSYSTEM),',
-      'Pasdows FM synthesizer: Output, MIDI (MMSYSTEM),',
-      'Pasdows FM-Synthesizer: Ausgabe, MIDI (MMSYSTEM),',
-      'Sintetizzatore FM Pasdows: uscita, MIDI (MMSYSTEM),',
-      'Sintetizador FM Pasdows: salida, MIDI (MMSYSTEM),'));
+      Nm + L(' : sortie, MIDI (MMSYSTEM),', ': Output, MIDI (MMSYSTEM),',
+      ': Ausgabe, MIDI (MMSYSTEM),', ': uscita, MIDI (MMSYSTEM),',
+      ': salida, MIDI (MMSYSTEM),'));
   Txt(X + 8,
       Y + 126,
-      L('  9 voix, compatible OPL2.',
-      '  9 voices, OPL2 compatible.',
-      '  9 Stimmen, OPL2-kompatibel.',
-      '  9 voci, compatibile OPL2.',
-      '  9 voces, compatible OPL2.'));
+      '  ' + T1 + ', ' + IStr(Vo) + T2);
   Txt(X + 8,
       Y + 150,
       L('DirectMusic : non install'#130' (le MIDI passe par',
