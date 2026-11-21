@@ -2561,10 +2561,12 @@ Begin
   If (N = 'LISEZMOI.TXT') And Not CompDoc Then Exit;
   { COMMAND.EXE, Paint, la Calculatrice et le Navigateur Web
     (accessoires), le Gestionnaire des taches, l'Outil de diagnostic
-    DirectX et Ajout/Suppression de programmes sont toujours installes }
+    DirectX, Ajout/Suppression de programmes et l'Aide de Windows sont
+    toujours installes }
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
      (N <> 'CALC.EXE') And (N <> 'TASKMGR.EXE') And (N <> 'DXDIAG.EXE') And
-     (N <> 'BROWSER.EXE') And (N <> 'APPWIZ.EXE') And Not CompEx Then
+     (N <> 'BROWSER.EXE') And (N <> 'APPWIZ.EXE') And
+     (N <> 'WINHLP32.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;

@@ -11378,9 +11378,10 @@ Const
   ikNotepad = 10; ikConsole = 11; ikDisplay = 12; ikDateTime = 13;
   ikVolPop = 14; ikMixer = 15; ikAudio = 16; ikSysProps = 17;
   ikDevProps = 18; ikFileDlg = 19; ikFind = 28; ikVolProps = 29;
+  ikScanDisk = 30;
   ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
-  ikMdiClient = 27;
+  ikMdiClient = 27; ikConProps = 31;
 
 Type
   TClass = Record
@@ -11481,6 +11482,12 @@ Var
 Procedure KPaint(W : LongInt); Forward;
 Function KWndProc(W, Msg, WP, LP : LongInt) : LongInt; Forward;
 Procedure KMouse(W, Msg, X, Y : LongInt); Forward;
+Procedure ConMouse(W, Msg, X, Y : LongInt); Forward;
+Procedure ConPropsMouse(W, Msg, X, Y : LongInt); Forward;
+Procedure PaintConProps(W : LongInt); Forward;
+Procedure ConPropsKey(W, VK, Ch : LongInt); Forward;
+Procedure ConSaveTo(Const P : String); Forward;
+Procedure ConCommand(Cmd : LongInt); Forward;
 Procedure KKey(W, Msg, VK, Ch : LongInt); Forward;
 Procedure DosKeyIn(Up : Boolean; VK, Ch : LongInt); Forward;
 Procedure DosMouseIn(Msg, X, Y : LongInt); Forward;
@@ -12387,6 +12394,8 @@ Begin
   If (W = ConW) And (ConW >= 0) Then
   Begin
     ConW := -1;
+    ConLogFlush;
+    ConHistN := 0; ConHistPos := 0; ConView := 0; ConSelOn := False;
     ChainExec := ''; ChainRet := ''; ConKeep := False;
     If AppRunning Then ConKillReq := True;
   End;
@@ -13080,6 +13089,23 @@ Begin
         Exit;
       End;
     End;
+    { icone de la barre de titre : menu systeme (l'Invite MS-DOS a le
+      sien : Modifier, Proprietes) }
+    If ((Wnds^[T].Style And WS_CAPTION) = WS_CAPTION) And
+       ((Wnds^[T].Style And WS_SYSMENU) <> 0) And
+       ((Wnds^[T].ExStyle And WS_EX_DLGMODALFRAME) = 0) And
+       (OY < Wnds^[T].CL + 19) And (OX < Wnds^[T].CL + 20) Then
+    Begin
+      SysMenuW := T;
+      CloseMenus(0);
+      If T = ConW Then
+        OpenMenu(0, mnConSys, Wnds^[T].X + Wnds^[T].CL,
+                 Wnds^[T].Y + Wnds^[T].CL + 19, False)
+      Else
+        OpenMenu(0, mnSysGen, Wnds^[T].X + Wnds^[T].CL,
+                 Wnds^[T].Y + Wnds^[T].CL + 19, False);
+      Exit;
+    End;
     If ((Wnds^[T].Style And WS_CAPTION) = WS_CAPTION) And
        (OY < Wnds^[T].CL + 19) Then
     Begin
@@ -13498,6 +13524,10 @@ Const
   cmNSelAll = 40; cmNTime = 41; cmNFind = 42; cmNFindNext = 43;
   cmNAbout = 44;
   cmAddRemove = 45;                  { Ajout/Suppression de programmes }
+  cmTrOpen = 46; cmTrExplore = 47; cmTrProps = 48;   { arbre }
+  cmSysMin = 49; cmSysMax = 50; cmSysRestore = 51; cmSysClose = 52;
+  cmConMark = 53; cmConCopy = 54; cmConPaste = 55; cmConSelAll = 56;
+  cmConSave = 57; cmConProps = 58;
   cmFdDrive = 600;                   { + lettre (0 = A) : boite Fichier }
   cmFdType = 640;                    { + type de fichier }
   cmGray = 99;                       { element de menu grise }
@@ -13511,6 +13541,9 @@ Const
   mnMonths = 9; mnTz = 10; mnVolCtx = 11;
   mnNFile = 12; mnNEdit = 13; mnNSearch = 14; mnNHelp = 15;
   mnFdDrives = 16; mnFdTypes = 17; mnTaskCtx = 18; mnDrvCtx = 19;
+  mnTreeCtx = 20;                 { element de l'arbre de l'Explorateur }
+  mnConSys = 21; mnConEdit = 22;  { menus de l'Invite MS-DOS }
+  mnSysGen = 23;                  { menu systeme (icone du titre) }
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -13549,6 +13582,9 @@ Const
 Type
   TFdNmArr = Array[0..199] Of String[63];
 
+Const
+  NoteStH = 20;                 { barre d'etat du Bloc-notes }
+
 Var
   { Propriete de Affichage : boite ouverte, profondeurs proposees,
     resolutions de la profondeur choisie, question de redemarrage }
@@ -13572,6 +13608,7 @@ Var
     d'enregistrement en cours et action qui suit }
   NotePath : String;
   NoteDirty, NoteGroup, NoteUndoOk, NoteCase : Boolean;
+  NoteOvr : Boolean;            { mode Refrappe (touche Inser) }
   NoteSel, NoteLeft, NoteUndoBuf, NoteUndoLen, NoteUndoPos : LongInt;
   NoteFind : String[63];
   NoteAskW, NoteAskAct, NotePend, NoteMenuSel : LongInt;
@@ -13592,6 +13629,13 @@ Var
   TzDst : Boolean;
   DispiOk   : Boolean;                     { interface Bochs/QEMU (1CEh) }
   KClass    : Array[0..31] Of LongInt;     { classe interne par sorte }
+  SysMenuW  : LongInt;                     { fenetre du menu systeme }
+  { Invite MS-DOS : selection a la souris (lignes et colonnes
+    affichees), mode Marquer, fenetre Proprietes }
+  ConSelOn, ConSelDrag, ConMark : Boolean;
+  ConSR0, ConSC0, ConSR1, ConSC1 : LongInt;
+  ConPropW : LongInt;
+  ConPPath : String[79];
   TaskbarW  : LongInt;
   MenuW     : Array[0..3] Of LongInt;      { menus ouverts (niveaux) }
   MenuDepth : LongInt;
@@ -14238,6 +14282,10 @@ Begin
     mnVolCtx : MenuCount := 2;
     mnTaskCtx : MenuCount := 2;
     mnDrvCtx : MenuCount := 5;
+    mnTreeCtx : MenuCount := 4;
+    mnConSys : MenuCount := 5;
+    mnConEdit : MenuCount := 6;
+    mnSysGen : MenuCount := 5;
     mnNFile : MenuCount := 9;
     mnNEdit : MenuCount := 10;
     mnNSearch : MenuCount := 2;
@@ -14615,6 +14663,105 @@ Begin
         If (DeskSel >= 0) And (DeskCmd[DeskSel] = cmComputer) Then
           Cmd := cmSysProps
         Else Cmd := cmGray;
+      End;
+    mnSysGen :
+      Case I Of
+        0 : Begin
+              T := L('Restaurer', 'Restore', 'Wiederherstellen',
+                     'Ripristina', 'Restaurar');
+              If (SysMenuW >= 0) And Wnds^[SysMenuW].Max Then
+                Cmd := cmSysRestore
+              Else Cmd := cmGray;
+            End;
+        1 : Begin
+              T := L('R'#130'duire', 'Minimize', 'Minimieren', 'Riduci a icona',
+                     'Minimizar');
+              If (SysMenuW >= 0) And
+                 ((Wnds^[SysMenuW].Style And WS_MINIMIZEBOX) <> 0) Then
+                Cmd := cmSysMin
+              Else Cmd := cmGray;
+            End;
+        2 : Begin
+              T := L('Agrandir', 'Maximize', 'Maximieren', 'Ingrandisci',
+                     'Maximizar');
+              If (SysMenuW >= 0) And Not Wnds^[SysMenuW].Max And
+                 ((Wnds^[SysMenuW].Style And WS_MAXIMIZEBOX) <> 0) Then
+                Cmd := cmSysMax
+              Else Cmd := cmGray;
+            End;
+        4 : Begin
+              T := L('Fermer      Alt+F4', 'Close      Alt+F4',
+                     'Schlie'#225'en   Alt+F4', 'Chiudi     Alt+F4',
+                     'Cerrar     Alt+F4');
+              Cmd := cmSysClose;
+            End;
+      End;
+    mnConSys :
+      Case I Of
+        0 : Begin
+              T := L('R'#130'duire', 'Minimize', 'Minimieren', 'Riduci a icona',
+                     'Minimizar');
+              Cmd := cmSysMin;
+            End;
+        1 : Begin
+              T := L('Fermer', 'Close', 'Schlie'#225'en', 'Chiudi', 'Cerrar');
+              Cmd := cmSysClose;
+            End;
+        3 : Begin
+              T := L('Modifier', 'Edit', 'Bearbeiten', 'Modifica',
+                     'Edici'#162'n');
+              Sub := mnConEdit;
+            End;
+        4 : Begin
+              T := L('Propri'#130't'#130's...', 'Properties...',
+                     'Eigenschaften...', 'Propriet'#133'...', 'Propiedades...');
+              Cmd := cmConProps;
+            End;
+      End;
+    mnConEdit :
+      Case I Of
+        0 : Begin
+              T := L('Marquer', 'Mark', 'Markieren', 'Seleziona', 'Marcar');
+              Cmd := cmConMark;
+            End;
+        1 : Begin
+              T := L('Copier      Entr'#130'e', 'Copy        Enter',
+                     'Kopieren    Eingabe', 'Copia       Invio',
+                     'Copiar      Entrar');
+              If ConSelOn Then Cmd := cmConCopy Else Cmd := cmGray;
+            End;
+        2 : Begin
+              T := L('Coller', 'Paste', 'Einf'#129'gen', 'Incolla', 'Pegar');
+              If ClipLen > 0 Then Cmd := cmConPaste Else Cmd := cmGray;
+            End;
+        3 : Begin
+              T := L('S'#130'lectionner tout', 'Select All', 'Alles markieren',
+                     'Seleziona tutto', 'Seleccionar todo');
+              Cmd := cmConSelAll;
+            End;
+        5 : Begin
+              T := L('Enregistrer le contenu...', 'Save Contents...',
+                     'Inhalt speichern...', 'Salva contenuto...',
+                     'Guardar contenido...');
+              Cmd := cmConSave;
+            End;
+      End;
+    mnTreeCtx :
+      If I = 0 Then
+      Begin
+        T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
+        Cmd := cmTrOpen;
+      End
+      Else If I = 1 Then
+      Begin
+        T := L('Explorer', 'Explore', 'Explorer', 'Esplora', 'Explorar');
+        Cmd := cmTrExplore;
+      End
+      Else If I = 3 Then
+      Begin
+        T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+               'Propriet'#133, 'Propiedades');
+        Cmd := cmTrProps;
       End;
     mnDrvCtx :
       If I = 0 Then
@@ -15152,6 +15299,7 @@ Var
   ExpCW, ExpCI, ExpCIdx : LongInt;      { parcours FAT en cours }
   ExpCS : String[127];
   ExpCtxW, ExpCtxI : LongInt;           { lecteur du menu contextuel }
+  TreeCtxP : String[79];                { noeud du menu de l'arbre }
 
 { Lettre du lecteur I de la liste du Poste de travail }
 Function ExpDrive(I : LongInt) : Char;
@@ -15801,6 +15949,8 @@ Begin
     Begin
       E := UpStr(Copy(Nm, Pos('.', Nm) + 1, 3));
       If (E = 'EXE') Or (E = 'COM') Then RunExe(P, '')
+      { fichier d'aide : Aide de Windows (WINHLP32.EXE) }
+      Else If E = 'HLP' Then RunExe('WINHLP32.EXE', '"' + P + '"')
       Else NoteOpen(P);
       Exit;
     End;
@@ -15828,6 +15978,28 @@ Begin
   KRepaint(W);
 End;
 
+{ Clic droit dans l'arbre : selectionne le noeud et ouvre son menu
+  (Ouvrir, Explorer, Proprietes) }
+Procedure TreeRight(W, X, Y, Y1, Y2 : LongInt);
+Var T : PTree; R : LongInt;
+Begin
+  T := ExpTree(W);
+  R := T^.Top + (Y - Y1 - 2) Div TreeRow;
+  If (R < 0) Or (R >= T^.N) Or (Y > Y2) Then Exit;
+  TreeCtxP := T^.Nd[R].P;
+  If (TreeCtxP <> '*') And (TreeCtxP <> 'C:') Or (VolN > 0) Then
+  Begin
+    T^.Sel := R;
+    If TreeCtxP = '*' Then Wnds^[W].KS := '' Else Wnds^[W].KS := TreeCtxP;
+    Wnds^[W].K1 := -1; Wnds^[W].K2 := 0;
+    ExpTitle(W);
+    KRepaint(W);
+  End;
+  ExpCtxW := W;
+  CloseMenus(0);
+  OpenMenu(0, mnTreeCtx, X, Y, False);
+End;
+
 Procedure ExpMouse(W, Msg, X, Y : LongInt);
 Var X1, Y1, X2, Y2, CX, CY, TW, Cols, I, Fl, Size : LongInt; Nm : String;
 Begin
@@ -15842,7 +16014,8 @@ Begin
     Begin
       If Msg <> WM_RBUTTONDOWN Then
         TreeMouse(W, X, Y, X1, Y1 + 22, X1 + TW, Y2 - 22,
-                  Msg = WM_LBUTTONDBLCLK);
+                  Msg = WM_LBUTTONDBLCLK)
+      Else TreeRight(W, X, Y, Y1 + 22, Y2 - 22);
       Exit;
     End;
     CX := X1 + TW + 3; CY := Y1 + 22;
@@ -16143,7 +16316,7 @@ Var B, N, C, X1, Y1, X2, Y2, Rows, Cols, Ln, P, Col : LongInt;
 Begin
   B := Wnds^[W].Extra; N := Wnds^[W].K1; C := Wnds^[W].K2;
   KClient(W, X1, Y1, X2, Y2);
-  Rows := Max(1, (Y2 - Y1 - 24) Div 16);
+  Rows := Max(1, (Y2 - Y1 - 24 - NoteStH) Div 16);
   Cols := Max(1, (X2 - X1 - 6) Div 8);
   If C < Wnds^[W].K3 Then Wnds^[W].K3 := NLineStart(B, C)
   Else
@@ -16188,6 +16361,31 @@ Begin
   NoteMenuX := X;
 End;
 
+{ Barre d'etat : position du curseur (ligne, colonne) et mode
+  Insertion (INS) ou Refrappe (RFP) }
+Procedure NoteStatus(W : LongInt);
+Var X1, Y1, X2, Y2, B, C, I, Ln, Col, Y, X : LongInt; S : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  B := Wnds^[W].Extra; C := Wnds^[W].K2;
+  Ln := 1;
+  For I := 0 To C - 1 Do If Mem[0:B + I] = 13 Then Inc(Ln);
+  Col := C - NLineStart(B, C) + 1;
+  Y := Y2 - NoteStH + 1;
+  FBar(X1, Y, X2, Y2, cSilver);
+  HLine(X1, X2, Y, cWhite);
+  S := L('Ln ', 'Ln ', 'Z ', 'Ri ', 'L'#161'n ') + IntStr(Ln) + ', ' +
+       L('Col ', 'Col ', 'Sp ', 'Col ', 'Col ') + IntStr(Col);
+  { cases en creux, a droite : position, puis mode }
+  X := X2 - 44;
+  Edge(X, Y + 3, X2 - 4, Y2 - 2, cGray, cWhite);
+  If NoteOvr Then OutTxt(X + 6, Y + 3, L('RFP', 'OVR', 'UEB', 'SSC', 'SOB'),
+                         cBlack)
+  Else OutTxt(X + 6, Y + 3, L('INS', 'INS', 'EINF', 'INS', 'INS'), cBlack);
+  Edge(X - 4 - (Length(S) * 8 + 12), Y + 3, X - 4, Y2 - 2, cGray, cWhite);
+  OutTxt(X - (Length(S) * 8 + 10), Y + 3, S, cBlack);
+End;
+
 Procedure PaintNotepad(W : LongInt);
 Var X1, Y1, X2, Y2, Rows, Cols, R, CC, B, N, P, E, Q, I, SA, SB, TX, Fg,
     Bg, Ch, MX, M : LongInt;
@@ -16210,7 +16408,8 @@ Begin
   End;
   FBar(X1, Y1 + 20, X2, Y2, cWhite);
   B := Wnds^[W].Extra; N := Wnds^[W].K1;
-  Rows := (Y2 - Y1 - 24) Div 16;
+  NoteStatus(W);
+  Rows := (Y2 - Y1 - 24 - NoteStH) Div 16;
   Cols := (X2 - X1 - 6) Div 8;
   SA := -1; SB := -1;
   If NoteSel >= 0 Then NoteSelRange(W, SA, SB);
@@ -16243,7 +16442,18 @@ Begin
     Begin
       CC := Wnds^[W].K2 - P - NoteLeft;
       If (CC >= 0) And (CC <= Cols) Then
-        VLine(X1 + 3 + CC * 8, Y1 + 22 + R * 16, Y1 + 36 + R * 16, cBlack);
+        If NoteOvr And (Wnds^[W].K2 < E) Then
+        Begin
+          { Refrappe : pave inverse sur le caractere }
+          TX := X1 + 3 + CC * 8;
+          FBar(TX, Y1 + 22 + R * 16, TX + 7, Y1 + 37 + R * 16, cBlack);
+          Ch := Mem[0:B + Wnds^[W].K2];
+          If Ch < 32 Then Ch := 32;
+          DrawChar(TX, Y1 + 22 + R * 16, Chr(Ch), cWhite);
+        End
+        Else
+          VLine(X1 + 3 + CC * 8, Y1 + 22 + R * 16, Y1 + 36 + R * 16,
+                cBlack);
     End;
     P := E + 1;
   End;
@@ -16408,6 +16618,24 @@ Begin
   Sh := (KeyState[$10] And $80) <> 0;
   Ctl := (KeyState[$11] And $80) <> 0;
   { raccourcis }
+  { Inser : mode Insertion / Refrappe ; Ctrl+Inser copie, Maj+Inser
+    colle, Maj+Suppr coupe (comme Windows) }
+  If VK = $2D Then
+  Begin
+    If Ctl Then KCommand(cmNCopy)
+    Else If Sh Then KCommand(cmNPaste)
+    Else
+    Begin
+      NoteOvr := Not NoteOvr;
+      KRepaint(W);
+    End;
+    Exit;
+  End;
+  If (VK = $2E) And Sh And Not Ctl Then
+  Begin
+    KCommand(cmNCut);
+    Exit;
+  End;
   If Ctl Then
   Begin
     Case VK Of
@@ -16494,7 +16722,14 @@ Begin
     If (Ch = 13) Or ((Ch >= 32) And (Ch < 256)) Then
     Begin
       NoteSnap(W);
-      NoteDelSel(W);
+      { Refrappe : le caractere tape remplace celui du curseur (pas la
+        fin de ligne) }
+      If Not NoteDelSel(W) And NoteOvr And (Ch <> 13) And (C < N) And
+         (Mem[0:B + C] <> 13) Then
+      Begin
+        MoveMem(B + C + 1, B + C, N - C - 1);
+        Wnds^[W].K1 := N - 1;
+      End;
       NoteGroup := True;
       T := Chr(Ch);
       NoteInsert(W, LongInt(@T[1]), 1);
@@ -19483,6 +19718,13 @@ Begin
       GroupBox(X1 + 16, Y1 + 40, X2 - 16, Y1 + 120, L('V'#130'rification ' +
                'des erreurs', 'Error-checking status', 'Fehler'#129'berpr'#129 +
                'fung', 'Controllo errori', 'Comprobaci'#162'n de errores'));
+      If (D >= 'A') And (D <= 'Z') And (SdChecked[Ord(D) - 65] <> '') Then
+        WrapText(X1 + 60, Y1 + 58, X2 - X1 - 90, L('Derni'#138're ' +
+                 'v'#130'rification : ', 'Last checked: ', 'Zuletzt ' +
+                 'gepr'#129'ft: ', 'Ultimo controllo: ', #233'ltima ' +
+                 'comprobaci'#162'n: ') + SdChecked[Ord(D) - 65] + '.',
+                 cBlack, True)
+      Else
       WrapText(X1 + 60, Y1 + 58, X2 - X1 - 90, L('Aucune v'#130'rification ' +
                'n''a encore '#130't'#130' effectu'#130'e sur ce lecteur.',
                'Pasdows has no record of when you last checked this drive ' +
@@ -19523,9 +19765,14 @@ Begin
                  'Jetzt defragmentieren...', 'Deframmenta ora...',
                  'Desfragmentar ahora...');
         End;
-        Raised(BX1, BY1, BX2, BY2, False);
-        OutCenter(BX1 + 1, BX2 + 1, BY1 + 4, T, cWhite);
-        OutCenter(BX1, BX2, BY1 + 3, T, cGray);
+        If (I = 0) And (FatVolOf(D + ':') >= 0) Then
+          PushButton(BX1, BY1, BX2, BY2, T, False, False)
+        Else
+        Begin
+          Raised(BX1, BY1, BX2, BY2, False);
+          OutCenter(BX1 + 1, BX2 + 1, BY1 + 4, T, cWhite);
+          OutCenter(BX1, BX2, BY1 + 3, T, cGray);
+        End;
       End;
     End;
   Else
@@ -19597,6 +19844,558 @@ Begin
   If VpW = W Then VpW := -1;
 End;
 
+{ ------------------------------------------------------------------ }
+{ ScanDisk : verification d'un volume FAT (Proprietes du lecteur,      }
+{ Outils, Verifier maintenant...). Comme ScanDisk de Windows 95 :      }
+{ chaines de clusters des fichiers et dossiers (clusters hors du       }
+{ volume, chaines croisees, tailles incorrectes), fragments perdus     }
+{ (clusters occupes qu'aucun fichier n'utilise), copies de la FAT ;    }
+{ test minutieux : lecture de toutes les donnees. Correction           }
+{ automatique : fragments perdus liberes, chaines trop longues         }
+{ raccourcies, FAT recopiee. Travail par etapes (ScanStep, appele par  }
+{ la boucle du systeme) : la fenetre reste a jour.                     }
+{   K1 phase (0 attente, 1 dossiers, 2 fragments, 3 FAT, 4 lecture,    }
+{   9 fini), K2 lettre, K3 options (1 minutieux, 2 corriger), K4       }
+{   progression (0..1000), KS etat                                      }
+{ ------------------------------------------------------------------ }
+
+Const
+  SdMaxDepth = 64;
+
+Var
+  SdW, SdV, SdMap, SdBuf, SdDepth, SdC : LongInt;
+  SdStk, SdIdx : Array[0..SdMaxDepth - 1] Of LongInt;
+  SdFiles, SdDirs, SdHid, SdFileB, SdDirB, SdHidB, SdBadC, SdLost,
+    SdCross, SdBadChain, SdSize, SdFatDiff, SdReadErr, SdFixed,
+    SdUsedC, SdDone, SdTotal : LongInt;
+  SdChecked : Array[0..25] Of String[24];   { derniere verification }
+
+Function SdBit(C : LongInt) : Boolean;
+Begin
+  SdBit := (Mem[0:SdMap + C Shr 3] And (1 Shl (C And 7))) <> 0;
+End;
+
+Procedure SdSetBit(C : LongInt);
+Begin
+  Mem[0:SdMap + C Shr 3] := Mem[0:SdMap + C Shr 3] Or (1 Shl (C And 7));
+End;
+
+{ Chaine de clusters d'un fichier (Size octets) ou d'un dossier (Dir) }
+Procedure SdChain(First, Size : LongInt; Dir, Fix : Boolean);
+Var C, N, Need, Bpc, Prev, Nx : LongInt;
+Begin
+  If First = 0 Then
+  Begin
+    If (Size > 0) And Not Dir Then Inc(SdSize);
+    Exit;
+  End;
+  If Not ClusOk(SdV, First) Then
+  Begin
+    Inc(SdBadChain);
+    Exit;
+  End;
+  Bpc := VolSpc[SdV] * 512;
+  If Dir Then Need := -1 Else Need := (Size + Bpc - 1) Div Bpc;
+  C := First; N := 0; Prev := 0;
+  While ClusOk(SdV, C) And (N <= VolClus[SdV]) Do
+  Begin
+    If SdBit(C) Then
+    Begin
+      Inc(SdCross);
+      Exit;
+    End;
+    SdSetBit(C);
+    Inc(N);
+    Inc(SdUsedC);
+    { fichier trop long pour sa taille : raccourcir la chaine }
+    If Fix And (Need > 0) And (N = Need) Then
+    Begin
+      Nx := FatGet(SdV, C);
+      If ClusOk(SdV, Nx) Then
+      Begin
+        Inc(SdSize);
+        FatSet(SdV, C, FatEoc);
+        Inc(SdFixed);
+        Exit;
+      End;
+    End;
+    Prev := C;
+    C := FatGet(SdV, C);
+  End;
+  If (C <> FatEoc) And (C <> 0) Then Inc(SdBadChain);
+  If (Need >= 0) And (N <> Need) Then Inc(SdSize);
+End;
+
+{ Etape du parcours des dossiers (pile explicite) ; False a la fin }
+Function SdDirStep : Boolean;
+Var K, D, Cl, Sz, At : LongInt; Nm : String;
+Begin
+  SdDirStep := True;
+  For K := 1 To 64 Do
+  Begin
+    If SdDepth < 0 Then
+    Begin
+      SdDirStep := False;
+      Exit;
+    End;
+    D := SdStk[SdDepth];
+    If Not DirNext(SdV, D, SdIdx[SdDepth]) Then
+    Begin
+      Dec(SdDepth);
+      Continue;
+    End;
+    Nm := FfName; Cl := FfClus; Sz := FfSize; At := FfAttr;
+    If (Nm = '.') Or (Nm = '..') Then Continue;
+    If (At And $10) <> 0 Then
+    Begin
+      Inc(SdDirs);
+      SdDirB := SdDirB + VolSpc[SdV] * 512;
+      If ClusOk(SdV, Cl) And Not SdBit(Cl) Then
+      Begin
+        SdChain(Cl, 0, True, False);
+        If SdDepth < SdMaxDepth - 1 Then
+        Begin
+          Inc(SdDepth);
+          SdStk[SdDepth] := Cl;
+          SdIdx[SdDepth] := 0;
+        End;
+      End
+      Else If Cl <> 0 Then SdChain(Cl, 0, True, False);
+    End
+    Else
+    Begin
+      If (At And 6) <> 0 Then
+      Begin
+        Inc(SdHid);
+        SdHidB := SdHidB + Sz;
+      End
+      Else
+      Begin
+        Inc(SdFiles);
+        SdFileB := SdFileB + Sz;
+      End;
+      SdChain(Cl, Sz, False, (Wnds^[SdW].K3 And 2) <> 0);
+    End;
+  End;
+End;
+
+Function SdPhaseText(P : LongInt) : String;
+Begin
+  Case P Of
+    1 : SdPhaseText := L('V'#130'rification des dossiers...',
+                         'Checking folders...', 'Ordner werden gepr'#129'ft...',
+                         'Controllo delle cartelle...',
+                         'Comprobando carpetas...');
+    2 : SdPhaseText := L('Recherche des fragments perdus...',
+                         'Checking for lost file fragments...',
+                         'Suche nach verlorenen Fragmenten...',
+                         'Ricerca di frammenti persi...',
+                         'Buscando fragmentos perdidos...');
+    3 : SdPhaseText := L('V'#130'rification des tables d''allocation...',
+                         'Checking file allocation tables...',
+                         'Dateizuordnungstabellen werden gepr'#129'ft...',
+                         'Controllo delle tabelle FAT...',
+                         'Comprobando tablas de asignaci'#162'n...');
+    4 : SdPhaseText := L('Lecture des donn'#130'es (test minutieux)...',
+                         'Reading data (thorough test)...',
+                         'Daten werden gelesen...', 'Lettura dei dati...',
+                         'Leyendo datos...');
+  Else
+    SdPhaseText := '';
+  End;
+End;
+
+Procedure SdResults; Forward;
+
+{ Une etape de ScanDisk (appelee par la boucle du systeme) }
+Procedure ScanStep;
+Var W, K, C, V, A, S, F2, N, Fs : LongInt; Fix : Boolean;
+    Tmp : Array[0..511] Of Byte;
+Begin
+  W := SdW;
+  If (W < 0) Or Not Wnds^[W].Used Or (Wnds^[W].IKind <> ikScanDisk) Then
+    Exit;
+  If (Wnds^[W].K1 < 1) Or (Wnds^[W].K1 > 4) Then Exit;
+  V := SdV;
+  Fix := (Wnds^[W].K3 And 2) <> 0;
+  Case Wnds^[W].K1 Of
+    1 :
+    Begin
+      If Not SdDirStep Then
+      Begin
+        Wnds^[W].K1 := 2;
+        SdC := 2;
+      End;
+      Wnds^[W].K4 := Min(300, SdUsedC * 300 Div Max(1, SdTotal));
+    End;
+    2 :
+    Begin
+      N := 0;
+      While (SdC <= VolClus[V] + 1) And (N < 40000) Do
+      Begin
+        C := FatGet(V, SdC);
+        If C = $0FFFFFF7 Then Inc(SdBadC)
+        Else If (C <> 0) And Not SdBit(SdC) Then
+        Begin
+          Inc(SdLost);
+          If Fix Then
+          Begin
+            FatSet(V, SdC, 0);
+            Inc(VolFree[V]);
+            Inc(SdFixed);
+          End;
+        End;
+        Inc(SdC);
+        Inc(N);
+      End;
+      Wnds^[W].K4 := 300 + (SdC * 300) Div Max(1, VolClus[V]);
+      If SdC > VolClus[V] + 1 Then
+      Begin
+        Wnds^[W].K1 := 3;
+        SdC := 0;
+      End;
+    End;
+    3 :
+    Begin
+      { copies de la FAT (FAT active, pas de miroir : rien a comparer) }
+      If (VolNFats[V] < 2) Or (VolActFat[V] >= 0) Then SdC := VolFatSz[V];
+      N := 0;
+      While (SdC < VolFatSz[V]) And (N < 256) Do
+      Begin
+        A := VSec(V, VolRsvd[V] + SdC);
+        MoveMem(A, LongInt(@Tmp), 512);
+        For F2 := 1 To VolNFats[V] - 1 Do
+        Begin
+          S := VolRsvd[V] + F2 * VolFatSz[V] + SdC;
+          A := VSec(V, S);
+          K := 0;
+          While (K < 512) And (Mem[0:A + K] = Tmp[K]) Do Inc(K);
+          If K < 512 Then
+          Begin
+            Inc(SdFatDiff);
+            If Fix Then
+            Begin
+              MoveMem(LongInt(@Tmp), A, 512);
+              VPut(V, S);
+              Inc(SdFixed);
+            End;
+          End;
+        End;
+        Inc(SdC);
+        Inc(N);
+      End;
+      Wnds^[W].K4 := 600 + (SdC * 100) Div Max(1, VolFatSz[V]);
+      If SdC >= VolFatSz[V] Then
+      Begin
+        If (Wnds^[W].K3 And 1) <> 0 Then
+        Begin
+          Wnds^[W].K1 := 4;
+          SdC := 2; SdDone := 0;
+        End
+        Else Wnds^[W].K1 := 9;
+      End;
+    End;
+    4 :
+    Begin
+      { lecture des clusters utilises, par series contigues }
+      N := 0;
+      While (SdC <= VolClus[V] + 1) And (N < 256) Do
+      Begin
+        If SdBit(SdC) Then
+        Begin
+          K := 1;
+          Fs := Max(1, 32768 Div (VolSpc[V] * 512));
+          While (K < Fs) And (SdC + K <= VolClus[V] + 1) And
+                SdBit(SdC + K) Do Inc(K);
+          If Not HdRead(VolDisk[V], VolStart[V] + ClusSec(V, SdC),
+                        K * VolSpc[V], SdBuf) Then Inc(SdReadErr);
+          SdDone := SdDone + K;
+          SdC := SdC + K;
+          Inc(N);
+        End
+        Else Inc(SdC);
+      End;
+      Wnds^[W].K4 := 700 + (SdDone * 300) Div Max(1, SdUsedC);
+      If SdC > VolClus[V] + 1 Then Wnds^[W].K1 := 9;
+    End;
+  End;
+  If Wnds^[W].K1 = 9 Then
+  Begin
+    Wnds^[W].K4 := 1000;
+    If Fix Then FatFlush;
+    KRepaint(W);
+    SdResults;
+    Exit;
+  End;
+  Wnds^[W].KS := SdPhaseText(Wnds^[W].K1);
+  KRepaint(W);
+End;
+
+Procedure ScanStart(W : LongInt);
+Var D : Char;
+Begin
+  D := Chr(Wnds^[W].K2);
+  SdV := FatVolOf(D + ':');
+  If SdV < 0 Then
+  Begin
+    MsgBoxOpen('ScanDisk', L('ScanDisk ne peut v'#130'rifier que les ' +
+               'lecteurs FAT12, FAT16 et FAT32.', 'ScanDisk can only ' +
+               'check FAT12, FAT16 and FAT32 drives.', 'ScanDisk pr'#129'ft ' +
+               'nur FAT-Laufwerke.', 'ScanDisk controlla solo unit'#133' ' +
+               'FAT.', 'ScanDisk s'#162'lo comprueba unidades FAT.'), $40);
+    Exit;
+  End;
+  If SdMap <> 0 Then KFree(SdMap);
+  If SdBuf = 0 Then SdBuf := KAlloc(32768 + 512);
+  SdMap := KAlloc(VolClus[SdV] Div 8 + 16);
+  If (SdMap = 0) Or (SdBuf = 0) Then Exit;
+  SdFiles := 0; SdDirs := 0; SdHid := 0; SdFileB := 0; SdDirB := 0;
+  SdHidB := 0; SdBadC := 0; SdLost := 0; SdCross := 0; SdBadChain := 0;
+  SdSize := 0; SdFatDiff := 0; SdReadErr := 0; SdFixed := 0; SdUsedC := 0;
+  SdTotal := Max(1, VolClus[SdV] - VolFree[SdV]);
+  SdDepth := 0;
+  SdStk[0] := RootOf(SdV);
+  SdIdx[0] := 0;
+  If VolType[SdV] = 32 Then SdChain(RootOf(SdV), 0, True, False);
+  Wnds^[W].K1 := 1;
+  Wnds^[W].K4 := 0;
+  Wnds^[W].KS := SdPhaseText(1);
+  KRepaint(W);
+End;
+
+Function SdBytes(B : LongInt) : String;
+Begin
+  SdBytes := BytesStr((B + 511) Div 512);
+End;
+
+{ Resultats (comme ScanDisk de Windows 95) }
+Procedure SdResults;
+Var S, P : String; D : Char; Bpc, Tot : LongInt;
+Begin
+  D := Chr(Wnds^[SdW].K2);
+  Bpc := VolSpc[SdV] * 512;
+  Tot := SdLost + SdCross + SdBadChain + SdSize + SdFatDiff + SdReadErr;
+  If Tot = 0 Then
+    P := L('ScanDisk n''a trouv'#130' aucune erreur sur ce lecteur.',
+           'ScanDisk did not find any errors on this drive.',
+           'ScanDisk hat keine Fehler gefunden.',
+           'ScanDisk non ha trovato errori.',
+           'ScanDisk no encontr'#162' errores.')
+  Else
+  Begin
+    P := L('Erreurs trouv'#130'es : ', 'Errors found: ', 'Fehler: ',
+           'Errori: ', 'Errores: ');
+    If SdLost > 0 Then
+      P := P + IntStr(SdLost) + L(' fragment(s) perdu(s), ',
+           ' lost fragment(s), ', ' verlorene Fragmente, ',
+           ' frammenti persi, ', ' fragmentos perdidos, ');
+    If SdCross > 0 Then
+      P := P + IntStr(SdCross) + L(' cha'#140'ne(s) crois'#130'e(s), ',
+           ' cross-linked chain(s), ', ' Querverbindungen, ',
+           ' catene incrociate, ', ' cadenas cruzadas, ');
+    If SdBadChain > 0 Then
+      P := P + IntStr(SdBadChain) + L(' cha'#140'ne(s) invalide(s), ',
+           ' invalid chain(s), ', ' ung'#129'ltige Ketten, ',
+           ' catene non valide, ', ' cadenas no v'#160'lidas, ');
+    If SdSize > 0 Then
+      P := P + IntStr(SdSize) + L(' taille(s) incorrecte(s), ',
+           ' incorrect size(s), ', ' falsche Gr'#148#225'en, ',
+           ' dimensioni errate, ', ' tama'#164'os incorrectos, ');
+    If SdFatDiff > 0 Then
+      P := P + IntStr(SdFatDiff) + L(' secteur(s) de FAT diff'#130'rent(s), ',
+           ' mismatched FAT sector(s), ', ' abweichende FAT-Sektoren, ',
+           ' settori FAT diversi, ', ' sectores FAT distintos, ');
+    If SdReadErr > 0 Then
+      P := P + IntStr(SdReadErr) + L(' erreur(s) de lecture, ',
+           ' read error(s), ', ' Lesefehler, ', ' errori di lettura, ',
+           ' errores de lectura, ');
+    P := Copy(P, 1, Length(P) - 2) + '.';
+    If SdFixed > 0 Then
+      P := P + L(' Corrig'#130'es : ', ' Fixed: ', ' Behoben: ',
+                 ' Corretti: ', ' Corregidos: ') + IntStr(SdFixed) + '.';
+  End;
+  S := P + '||' +
+       SdBytes(VolClus[SdV] * Bpc) + L(' d''espace disque total',
+       ' total disk space', ' Speicherplatz gesamt',
+       ' di spazio totale', ' de espacio total') + '|' +
+       SdBytes(SdHidB) + L(' dans ', ' in ', ' in ', ' in ', ' en ') +
+       IntStr(SdHid) + L(' fichiers cach'#130's', ' hidden files',
+       ' versteckten Dateien', ' file nascosti', ' archivos ocultos') +
+       '|' + SdBytes(SdDirB) + L(' dans ', ' in ', ' in ', ' in ', ' en ') +
+       IntStr(SdDirs) + L(' dossiers', ' folders', ' Ordnern', ' cartelle',
+       ' carpetas') + '|' + SdBytes(SdFileB) + L(' dans ', ' in ', ' in ',
+       ' in ', ' en ') + IntStr(SdFiles) + L(' fichiers utilisateur',
+       ' user files', ' Benutzerdateien', ' file utente',
+       ' archivos de usuario') + '|' + SdBytes(SdBadC * Bpc) +
+       L(' dans des secteurs d'#130'fectueux', ' in bad sectors',
+       ' in fehlerhaften Sektoren', ' in settori danneggiati',
+       ' en sectores defectuosos') + '|' +
+       SdBytes(VolFree[SdV] * Bpc) + L(' disponibles', ' available',
+       ' verf'#129'gbar', ' disponibili', ' disponibles') + '||' +
+       IntStr(Bpc) + L(' octets par unit'#130' d''allocation',
+       ' bytes in each allocation unit', ' Bytes je Zuordnungseinheit',
+       ' byte per unit'#133' di allocazione',
+       ' bytes por unidad de asignaci'#162'n') + '|' +
+       IntStr(VolClus[SdV]) + L(' unit'#130's d''allocation au total',
+       ' total allocation units', ' Zuordnungseinheiten insgesamt',
+       ' unit'#133' di allocazione totali', ' unidades en total') + '|' +
+       IntStr(VolFree[SdV]) + L(' unit'#130's d''allocation disponibles',
+       ' available allocation units', ' verf'#129'gbare Einheiten',
+       ' unit'#133' disponibili', ' unidades disponibles');
+  ReadRtc;
+  If (D >= 'A') And (D <= 'Z') Then
+    SdChecked[Ord(D) - 65] := Pad2(RtcDay) + '/' + Pad2(RtcMonth) + '/' +
+                              IntStr(RtcYear) + ' ' + Pad2(RtcHour) + ':' +
+                              Pad2(RtcMin);
+  MsgBoxOpen(L('R'#130'sultats de ScanDisk - (', 'ScanDisk Results - (',
+               'ScanDisk-Ergebnisse - (', 'Risultati di ScanDisk - (',
+               'Resultados de ScanDisk - (') + D + ':)', S, $40);
+End;
+
+Procedure ScanClose(W : LongInt);
+Begin
+  If SdW = W Then SdW := -1;
+  DestroyW(W);
+End;
+
+Procedure ScanDiskOpen(D : Char);
+Begin
+  If (SdW >= 0) And Wnds^[SdW].Used And (Wnds^[SdW].IKind = ikScanDisk)
+  Then
+  Begin
+    ActivateW(SdW);
+    Exit;
+  End;
+  SdW := KCreate(ikScanDisk, 'ScanDisk - (' + D + ':)', icHardDisk,
+                 Max(0, (ScrW - 400) Div 2), Max(0, (TaskY - 330) Div 2),
+                 400, 330, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                 WS_EX_DLGMODALFRAME);
+  If SdW < 0 Then Exit;
+  Wnds^[SdW].K1 := 0; Wnds^[SdW].K2 := Ord(D); Wnds^[SdW].K3 := 2;
+  Wnds^[SdW].K4 := 0; Wnds^[SdW].KS := '';
+  ShowW(SdW, True, True);
+End;
+
+Procedure PaintScanDisk(W : LongInt);
+Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2, PX : LongInt; T : String;
+    Run : Boolean;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  Run := (Wnds^[W].K1 >= 1) And (Wnds^[W].K1 <= 4);
+  PaintIcon(icHardDisk, X1 + 14, Y1 + 12, 32);
+  OutTxt(X1 + 58, Y1 + 14, L('Lecteur '#133' v'#130'rifier :',
+         'Select the drive to check:', 'Zu pr'#129'fendes Laufwerk:',
+         'Unit'#133' da controllare:', 'Unidad que desea comprobar:'), cBlack);
+  Sunken(X1 + 58, Y1 + 32, X2 - 14, Y1 + 54, cWhite);
+  OutTxt(X1 + 64, Y1 + 35, DriveName(Chr(Wnds^[W].K2)), cBlack);
+  GroupBox(X1 + 14, Y1 + 72, X2 - 14, Y1 + 150, L('Type de test',
+           'Type of test', 'Pr'#129'fungsart', 'Tipo di controllo',
+           'Tipo de prueba'));
+  RadioButton(X1 + 26, Y1 + 88, 'Standard', (Wnds^[W].K3 And 1) = 0);
+  OutTxt(X1 + 46, Y1 + 104, L('(fichiers et dossiers)', '(checks files ' +
+         'and folders)', '(Dateien und Ordner)', '(file e cartelle)',
+         '(archivos y carpetas)'), cGray);
+  RadioButton(X1 + 26, Y1 + 120, L('Minutieux (lit aussi les donn'#130'es)',
+              'Thorough (also reads the data)', 'Intensiv (liest Daten)',
+              'Accurato (legge i dati)', 'Completa (lee los datos)'),
+              (Wnds^[W].K3 And 1) <> 0);
+  CheckBox(X1 + 14, Y1 + 160, L('Corriger automatiquement les erreurs',
+           'Automatically fix errors', 'Fehler automatisch korrigieren',
+           'Correggi automaticamente', 'Reparar errores autom'#160'ticamente'),
+           (Wnds^[W].K3 And 2) <> 0);
+  { progression }
+  OutTxt(X1 + 14, Y1 + 196, Fit(Wnds^[W].KS, X2 - X1 - 28), cBlack);
+  Sunken(X1 + 14, Y1 + 216, X2 - 14, Y1 + 236, cWhite);
+  PX := X1 + 16 + ((X2 - X1 - 32) * Wnds^[W].K4) Div 1000;
+  If Wnds^[W].K4 > 0 Then FBar(X1 + 16, Y1 + 218, PX, Y1 + 234, cNavy);
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If I = 0 Then T := L('D'#130'marrer', 'Start', 'Starten', 'Avvia',
+                         'Iniciar')
+    Else If Run Then T := TxtCancel
+    Else T := L('Fermer', 'Close', 'Schlie'#225'en', 'Chiudi', 'Cerrar');
+    If (I = 0) And Run Then
+    Begin
+      Raised(BX1, BY1, BX2, BY2, False);
+      OutCenter(BX1 + 1, BX2 + 1, BY1 + 4, T, cWhite);
+      OutCenter(BX1, BX2, BY1 + 3, T, cGray);
+    End
+    Else
+      PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+                 I = 0);
+  End;
+End;
+
+Procedure ScanMouse(W, Msg, X, Y : LongInt);
+Var I, BX1, BY1, BX2, BY2, X1, Y1, X2, Y2 : LongInt; Run : Boolean;
+Begin
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  Run := (Wnds^[W].K1 >= 1) And (Wnds^[W].K1 <= 4);
+  If Msg = WM_LBUTTONDBLCLK Then Msg := WM_LBUTTONDOWN;
+  If (Msg = WM_LBUTTONDOWN) And Not Run Then
+  Begin
+    If InRect(X, Y, X1 + 24, Y1 + 86, X2 - 20, Y1 + 116) Then
+    Begin
+      Wnds^[W].K3 := Wnds^[W].K3 And Not 1;
+      KRepaint(W);
+      Exit;
+    End;
+    If InRect(X, Y, X1 + 24, Y1 + 118, X2 - 20, Y1 + 136) Then
+    Begin
+      Wnds^[W].K3 := Wnds^[W].K3 Or 1;
+      KRepaint(W);
+      Exit;
+    End;
+    If InRect(X, Y, X1 + 12, Y1 + 156, X2 - 20, Y1 + 176) Then
+    Begin
+      Wnds^[W].K3 := Wnds^[W].K3 Xor 2;
+      KRepaint(W);
+      Exit;
+    End;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If (I = 0) And Run Then Exit;
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        If I = 0 Then ScanStart(W)
+        Else If Run Then
+        Begin
+          Wnds^[W].K1 := 0; Wnds^[W].K4 := 0;
+          Wnds^[W].KS := L('V'#130'rification annul'#130'e.', 'Check ' +
+                           'cancelled.', 'Abgebrochen.', 'Annullato.',
+                           'Cancelado.');
+          KRepaint(W);
+        End
+        Else ScanClose(W);
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
 Procedure VolPropsMouse(W, Msg, X, Y : LongInt);
 Var I, BX1, BY1, BX2, BY2 : LongInt;
 Begin
@@ -19611,6 +20410,17 @@ Begin
       Wnds^[W].K3 := Wnds^[W].K3 And Not 1;
       KRepaint(W);
       Exit;
+    End;
+    { Outils : Verifier maintenant... (ScanDisk) }
+    If Wnds^[W].K1 = 1 Then
+    Begin
+      KClient(W, BX1, BY1, BX2, BY2);
+      If InRect(X, Y, BX2 - 250, BY1 + 90, BX2 - 26, BY1 + 112) And
+         (FatVolOf(Chr(Wnds^[W].K2) + ':') >= 0) Then
+      Begin
+        ScanDiskOpen(Chr(Wnds^[W].K2));
+        Exit;
+      End;
     End;
     If Wnds^[W].K1 = 0 Then
     Begin
@@ -20017,6 +20827,7 @@ Begin
   FdOk := Ok; FdDone := True;
   If (FdW >= 0) And Wnds^[FdW].Used Then DestroyW(FdW);
   FdW := -1;
+  If (FdOwner = 2) And Ok Then ConSaveTo(FdResult);
   If FdOwner <> 0 Then Exit;
   W := KFindKind(ikNotepad);
   If W < 0 Then Exit;
@@ -20205,6 +21016,89 @@ Begin
   MarkAll;
 End;
 
+{ Fenetre de dossier (Ouvrir) ou Explorateur (Explorer) sur le chemin
+  P ('*' : Bureau, '' : Poste de travail) }
+Procedure ExpWindowAt(P : String; Tree : Boolean);
+Var W : LongInt;
+Begin
+  If P = '*' Then P := '';
+  If Tree Then
+    W := KCreate(ikExplorer, '', icExplorer,
+                 Max(0, Min(30 + Ticks Mod 30, ScrW - 620)),
+                 Max(0, Min(24 + Ticks Mod 20, TaskY - 420)),
+                 Min(ScrW, 620), Min(TaskY, 420), WS_OVERLAPPED Or
+                 WS_CAPTION Or WS_SYSMENU Or WS_THICKFRAME Or
+                 WS_MINIMIZEBOX Or WS_MAXIMIZEBOX, 0)
+  Else
+    W := KCreate(ikExplorer, '', icFolder, 70 + Ticks Mod 40,
+                 44 + Ticks Mod 30, 440, 320, WS_OVERLAPPED Or WS_CAPTION Or
+                 WS_SYSMENU Or WS_THICKFRAME Or WS_MINIMIZEBOX Or
+                 WS_MAXIMIZEBOX, 0);
+  If W < 0 Then Exit;
+  Wnds^[W].K1 := -1;
+  Wnds^[W].KS := P;
+  If Tree Then
+  Begin
+    TreeInit(W);
+    Wnds^[W].K4 := icExplorer;
+  End;
+  ExpTitle(W);
+  ShowW(W, True, True);
+End;
+
+Var
+  FpFiles, FpDirs, FpBytes : LongInt;
+
+{ Taille et contenu d'un dossier (sous-dossiers compris, 8 niveaux) }
+Procedure FolderScan(Const P : String; Depth : LongInt);
+Var H : LongInt; Fd : Array[0..319] Of Byte; Pat, Nm : String;
+Begin
+  If (Depth > 8) Or (FpFiles + FpDirs > 20000) Then Exit;
+  Pat := P + '\*.*' + #0;
+  H := FindFirstFileA(LongInt(@Pat[1]), LongInt(@Fd));
+  If H = INVALID_HANDLE Then Exit;
+  Repeat
+    Nm := PStr(LongInt(@Fd) + 44);
+    If (Nm <> '.') And (Nm <> '..') And (Nm <> '') Then
+    Begin
+      If (MemL[0:LongInt(@Fd)] And $10) <> 0 Then
+      Begin
+        Inc(FpDirs);
+        FolderScan(P + '\' + Nm, Depth + 1);
+      End
+      Else
+      Begin
+        Inc(FpFiles);
+        FpBytes := FpBytes + MemL[0:LongInt(@Fd) + 32];
+      End;
+    End;
+  Until FindNextFileA(H, LongInt(@Fd)) = 0;
+  FindClose(H);
+End;
+
+{ Proprietes d'un dossier : type, emplacement, taille, contenu }
+Procedure FolderProps(P : String);
+Var S : String;
+Begin
+  FpFiles := 0; FpDirs := 0; FpBytes := 0;
+  FolderScan(P, 0);
+  S := L('Type : Dossier', 'Type: Folder', 'Typ: Ordner', 'Tipo: Cartella',
+         'Tipo: Carpeta') + '|' +
+       L('Emplacement : ', 'Location: ', 'Ort: ', 'Percorso: ',
+         'Ubicaci'#162'n: ') + ParentDir(P) + '|' +
+       L('Taille : ', 'Size: ', 'Gr'#148#225'e: ', 'Dimensioni: ',
+         'Tama'#164'o: ') + SizeShort((FpBytes + 511) Div 512) + ' (' +
+       IntStr(FpBytes) + L(' octets)', ' bytes)', ' Bytes)', ' byte)',
+       ' bytes)') + '|' +
+       L('Contenu : ', 'Contains: ', 'Inhalt: ', 'Contenuto: ',
+         'Contenido: ') + IntStr(FpFiles) + L(' fichiers, ', ' files, ',
+       ' Dateien, ', ' file, ', ' archivos, ') + IntStr(FpDirs) +
+       L(' dossiers', ' folders', ' Ordner', ' cartelle', ' carpetas');
+  MsgBoxOpen(L('Propri'#130't'#130's de ', 'Properties of ',
+               'Eigenschaften von ', 'Propriet'#133' di ',
+               'Propiedades de ') + BaseName(P), S, $40);
+End;
+
 Procedure KCommand(Cmd : LongInt);
 Var W, I : LongInt; Nm : String;
 Begin
@@ -20263,6 +21157,17 @@ Begin
          (Wnds^[ExpCtxW].IKind = ikExplorer) Then
         ExpOpenItem(ExpCtxW, ExpCtxI);
     cmDrvProps : VolPropsOpen(ExpDrive(ExpCtxI));
+    cmTrOpen, cmTrExplore : ExpWindowAt(TreeCtxP, Cmd = cmTrExplore);
+    cmSysMin : If SysMenuW >= 0 Then SysCommand(SysMenuW, SC_MINIMIZE);
+    cmSysMax : If SysMenuW >= 0 Then SysCommand(SysMenuW, SC_MAXIMIZE);
+    cmSysRestore : If SysMenuW >= 0 Then SysCommand(SysMenuW, SC_RESTORE);
+    cmSysClose : If SysMenuW >= 0 Then SysCommand(SysMenuW, SC_CLOSE);
+    cmConMark .. cmConProps : ConCommand(Cmd);
+    cmTrProps :
+      If TreeCtxP = '*' Then DispOpen
+      Else If TreeCtxP = '' Then SysOpen
+      Else If Length(TreeCtxP) = 2 Then VolPropsOpen(TreeCtxP[1])
+      Else FolderProps(TreeCtxP);
     cmAudioProps : AudioOpen;
     cmAlign : MarkAll;
     cmArrName : DeskArrange(False);
@@ -20391,6 +21296,16 @@ Begin
     DosMouseIn(Msg, X, Y);
     Exit;
   End;
+  If (W >= 0) And (W = ConW) Then
+  Begin
+    ConMouse(W, Msg, X, Y);
+    Exit;
+  End;
+  If (W >= 0) And (Wnds^[W].IKind = ikConProps) Then
+  Begin
+    ConPropsMouse(W, Msg, X, Y);
+    Exit;
+  End;
   If W < 0 Then
   Begin
     { bureau }
@@ -20450,6 +21365,7 @@ Begin
     ikAudio : AudioMouse(W, Msg, X, Y);
     ikSysProps : SysPropsMouse(W, Msg, X, Y);
     ikVolProps : VolPropsMouse(W, Msg, X, Y);
+    ikScanDisk : ScanMouse(W, Msg, X, Y);
     ikNotepad : NoteMouse(W, Msg, X, Y);
     ikFileDlg : FileDlgMouse(W, Msg, X, Y);
     ikFind : FindMouse(W, Msg, X, Y);
@@ -20469,7 +21385,8 @@ End;
 Const
   ConCols = 80; ConRows = 25;
   ConCW = 7; ConChH = 16;
-  ConQMax = 64;
+  ConQMax = 1024;                       { touches et texte colle }
+  ConSbW = 16;                          { barre de defilement }
   { couleurs de la console (ordre des attributs : bit 0 bleu, 1 vert,
     2 rouge, 3 intensite) }
   ConRGB : Array[0..15] Of LongInt = (
@@ -20498,6 +21415,14 @@ Var
   ConKillReq : Boolean;                  { fenetre fermee : arreter le
                                            programme (tache 0) }
   ConTitle : String[79];
+  { lignes retenues (sorties par le haut de l'ecran) : anneau de
+    ConHistMax lignes de 80 caracteres puis 80 attributs ; ConView :
+    lignes remontees dans l'affichage (0 : ecran courant) }
+  ConHist, ConHistMax, ConHistN, ConHistPos, ConView : LongInt;
+  { journal : les lignes retenues sont aussi ecrites dans un fichier }
+  ConLogOn : Boolean;
+  ConLogPath : String[79];
+  ConLogBuf, ConLogLen : LongInt;
   { programme lance depuis l'Invite (CreateProcessA), puis retour }
   ChainExec, ChainArgs, ChainRet, ChainRetArgs, ChainDir : String;
   ChainObj : LongInt;
@@ -20535,6 +21460,9 @@ Begin
   If ConW >= 0 Then Exit;
   ConAttr := 7; ConInMode := 7; ConCurVis := True;
   ConQHead := 0; ConQLen := 0; ConPend := '';
+  ConView := 0; ConSelOn := False; ConMark := False;
+  If ConHistMax <= 0 Then ConHistMax := 1000;
+  If ConLogPath = '' Then ConLogPath := 'C:\WINDOWS\CONSOLE.LOG';
   ConDLo := 0; ConDHi := ConRows - 1;
   If ConTitle = '' Then
     ConTitle := PromptName;
@@ -20544,7 +21472,7 @@ Begin
   If ConW < 0 Then Exit;
   { zone cliente exacte : 80 x 25 cellules }
   KClient(ConW, X1, Y1, X2, Y2);
-  DW := ConCols * ConCW - (X2 - X1 + 1);
+  DW := ConCols * ConCW + ConSbW - (X2 - X1 + 1);
   DH := ConRows * ConChH - (Y2 - Y1 + 1);
   If (DW <> 0) Or (DH <> 0) Then
     MoveW(ConW, Wnds^[ConW].X, Wnds^[ConW].Y, Wnds^[ConW].W + DW,
@@ -20553,9 +21481,75 @@ Begin
   ShowW(ConW, True, True);
 End;
 
+Procedure ConLogFlush;
+Var H : LongInt;
+Begin
+  If (ConLogLen = 0) Or (ConLogBuf = 0) Then Exit;
+  If ConLogOn And (ConLogPath <> '') Then
+  Begin
+    H := KOpenFile(ConLogPath, True, 4);
+    If H <> -1 Then
+    Begin
+      SetFilePointer(H, 0, 0, 2);
+      KWriteFile(H, ConLogBuf, ConLogLen);
+      CloseHandle(H);
+    End;
+  End;
+  ConLogLen := 0;
+End;
+
+{ Ligne R de l'ecran (texte sans les espaces de fin) }
+Function ConRowText(R : LongInt) : String;
+Var S : String; I : LongInt;
+Begin
+  S := '';
+  For I := 0 To ConCols - 1 Do S := S + Chr(ConCh[R * ConCols + I]);
+  While (S <> '') And (S[Length(S)] = ' ') Do Delete(S, Length(S), 1);
+  ConRowText := S;
+End;
+
+{ La premiere ligne de l'ecran va dans les lignes retenues (et le
+  journal) }
+Procedure ConHistPush;
+Var A, Own : LongInt; S : String;
+Begin
+  If ConHistMax <= 0 Then Exit;
+  If ConHist = 0 Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    ConHist := KAlloc(ConHistMax * ConCols * 2);
+    HeapOwner := Own;
+    If ConHist = 0 Then Exit;
+  End;
+  A := ConHist + ConHistPos * ConCols * 2;
+  MoveMem(LongInt(@ConCh), A, ConCols);
+  MoveMem(LongInt(@ConAt), A + ConCols, ConCols);
+  ConHistPos := (ConHistPos + 1) Mod ConHistMax;
+  If ConHistN < ConHistMax Then Inc(ConHistN);
+  { l'affichage remonte reste sur les memes lignes }
+  If ConView > 0 Then ConView := Min(ConView + 1, ConHistN);
+  If ConLogOn Then
+  Begin
+    If ConLogBuf = 0 Then
+    Begin
+      Own := HeapOwner; HeapOwner := 0;
+      ConLogBuf := KAlloc(4096);
+      HeapOwner := Own;
+    End;
+    If ConLogBuf <> 0 Then
+    Begin
+      S := ConRowText(0) + #13#10;
+      If ConLogLen + Length(S) > 4000 Then ConLogFlush;
+      MoveMem(LongInt(@S[1]), ConLogBuf + ConLogLen, Length(S));
+      ConLogLen := ConLogLen + Length(S);
+    End;
+  End;
+End;
+
 Procedure ConScrollUp;
 Var I : LongInt;
 Begin
+  ConHistPush;
   MoveMem(LongInt(@ConCh) + ConCols, LongInt(@ConCh),
           ConCols * (ConRows - 1));
   MoveMem(LongInt(@ConAt) + ConCols, LongInt(@ConAt),
@@ -20716,8 +21710,58 @@ Begin
   end;
 End;
 
+{ Caractere et attribut affiches en (R, C), compte tenu des lignes
+  remontees (ConView) }
+Procedure ConCellAt(R, C : LongInt; Var Ch, At : LongInt);
+Var L, H, A : LongInt;
+Begin
+  L := R - ConView;
+  If L >= 0 Then
+  Begin
+    Ch := ConCh[L * ConCols + C]; At := ConAt[L * ConCols + C];
+    Exit;
+  End;
+  H := ConHistN + L;
+  If (H < 0) Or (ConHist = 0) Then
+  Begin
+    Ch := 32; At := 7;
+    Exit;
+  End;
+  A := ConHist + ((ConHistPos - ConHistN + H + ConHistMax) Mod ConHistMax) *
+       ConCols * 2;
+  Ch := Mem[0:A + C]; At := Mem[0:A + ConCols + C];
+End;
+
+Function ConInSel(R, C : LongInt) : Boolean;
+Begin
+  ConInSel := ConSelOn And (R >= Min(ConSR0, ConSR1)) And
+              (R <= Max(ConSR0, ConSR1)) And (C >= Min(ConSC0, ConSC1)) And
+              (C <= Max(ConSC0, ConSC1));
+End;
+
+{ Barre de defilement des lignes retenues (a droite de la console) }
+Procedure ConPaintSb(W : LongInt);
+Var X1, Y1, X2, Y2, SX, TH, T, N, Y : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  SX := X1 + ConCols * ConCW;
+  If SX + ConSbW - 1 > X2 Then Exit;
+  FBar(SX, Y1, X2, Y2, cSilver);
+  Raised(SX, Y1, X2, Y1 + 15, False);
+  Arrow(SX + 4, Y1 + 6, 0, cBlack);
+  Raised(SX, Y2 - 15, X2, Y2, False);
+  Arrow(SX + 4, Y2 - 9, 1, cBlack);
+  N := ConHistN;
+  If N = 0 Then Exit;
+  TH := Max(12, ((Y2 - Y1 - 32) * ConRows) Div (N + ConRows));
+  T := (Y2 - Y1 - 32 - TH);
+  Y := Y1 + 16 + (T * (N - ConView)) Div N;
+  Raised(SX, Y, X2, Y + TH - 1, False);
+End;
+
 Procedure PaintConsole(W : LongInt);
-Var X1, Y1, X2, Y2, R, C, I, A, P, F, Fg, Bg, R0, R1, NC, NR : LongInt;
+Var X1, Y1, X2, Y2, R, C, I, A, P, F, Fg, Bg, R0, R1, NC, NR, Ch, At
+    : LongInt;
 Begin
   KClient(W, X1, Y1, X2, Y2);
   NC := Min(ConCols, (X2 - X1 + 1) Div ConCW);
@@ -20744,19 +21788,29 @@ Begin
   ConDLo := ConRows; ConDHi := -1;
   ConPR0 := R0; ConPR1 := R1;
   ConLastCY := ConY;
+  If (ConView > 0) Or ConSelOn Then
+  Begin
+    R0 := 0; R1 := NR - 1;
+  End;
+  If (R0 = 0) And (R1 = NR - 1) Then ConPaintSb(W);
   For R := R0 To R1 Do
     For C := 0 To NC - 1 Do
     Begin
-      I := R * ConCols + C;
-      Fg := ConPal[ConAt[I] And 15]; Bg := ConPal[(ConAt[I] Shr 4) And 15];
-      F := FontAddr + ConCh[I] * 16;
+      ConCellAt(R, C, Ch, At);
+      Fg := ConPal[At And 15]; Bg := ConPal[(At Shr 4) And 15];
+      If ConInSel(R, C) Then
+      Begin
+        I := Fg; Fg := Bg; Bg := I;
+      End;
+      F := FontAddr + Ch * 16;
       A := DS.Bits + (Y1 + R * ConChH - DOY) * DS.Pitch +
            (X1 + C * ConCW - DOX) * PxBytes(DS.Bpp);
       If DS.Bpp = 8 Then ConCell(A, F, DS.Pitch, Fg, Bg)
       Else ConCellX(A, F, DS.Pitch, RawOf(Fg, DS.Bpp), RawOf(Bg, DS.Bpp),
                     DS.Bpp);
       { curseur : soulignement, fenetre active seulement }
-      If ConCurVis And (R = ConY) And (C = ConX) And (W = ActiveWin) Then
+      If ConCurVis And (R = ConY) And (C = ConX) And (W = ActiveWin) And
+         (ConView = 0) Then
       Begin
         P := A + 13 * DS.Pitch;
         FillRaw(P, ConCW, RawOf(Fg, DS.Bpp), DS.Bpp);
@@ -20766,9 +21820,57 @@ Begin
 End;
 
 { Touche frappee dans la fenetre de la console }
+{ Titre de la console (Marquer - ... en mode Marquer) }
+Procedure ConSetTitle;
+Begin
+  If ConW < 0 Then Exit;
+  If ConMark Then
+    Wnds^[ConW].Text := L('Marquer - ', 'Mark - ', 'Markieren - ',
+                          'Seleziona - ', 'Marcar - ') + ConTitle
+  Else Wnds^[ConW].Text := ConTitle;
+  Wnds^[ConW].NeedNc := True;
+  TaskbarChanged;
+End;
+
+{ Remonte (D > 0) ou redescend l'affichage dans les lignes retenues }
+Procedure ConScrollView(D : LongInt);
+Begin
+  ConView := ConView + D;
+  If ConView > ConHistN Then ConView := ConHistN;
+  If ConView < 0 Then ConView := 0;
+  ConFull := True;
+  If ConW >= 0 Then KRepaint(ConW);
+End;
+
 Procedure ConKeyIn(VK, Ch : LongInt);
 Var I, Ctl : LongInt;
 Begin
+  { mode Marquer : Entree copie, Echap annule }
+  If ConMark Then
+  Begin
+    If VK = $0D Then KCommand(cmConCopy);
+    If (VK = $0D) Or (VK = $1B) Then
+    Begin
+      ConMark := False; ConSelOn := False;
+      ConSetTitle;
+      ConFull := True;
+      If ConW >= 0 Then KRepaint(ConW);
+    End;
+    Exit;
+  End;
+  { Maj+Page precedente / suivante : lignes retenues }
+  If ((KeyState[$10] And $80) <> 0) And ((VK = $21) Or (VK = $22)) Then
+  Begin
+    If VK = $21 Then ConScrollView(ConRows - 1)
+    Else ConScrollView(-(ConRows - 1));
+    Exit;
+  End;
+  If (ConView > 0) Or ConSelOn Then
+  Begin
+    ConView := 0; ConSelOn := False;
+    ConFull := True;
+    If ConW >= 0 Then KRepaint(ConW);
+  End;
   If ConQLen >= ConQMax Then Exit;
   Ctl := 0;
   If (KeyState[$10] And $80) <> 0 Then Ctl := Ctl Or $10;
@@ -20785,6 +21887,420 @@ Begin
   I := (ConQHead + ConQLen) Mod ConQMax;
   ConQVk[I] := VK; ConQCh[I] := Ch And 255; ConQCtl[I] := Ctl;
   Inc(ConQLen);
+End;
+
+
+{ ------------------------------------------------------------------ }
+{ Invite MS-DOS : selection, menus Modifier et Proprietes             }
+{ ------------------------------------------------------------------ }
+
+Procedure ConMouse(W, Msg, X, Y : LongInt);
+Var X1, Y1, X2, Y2, R, C, TH, TY, N : LongInt;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  { barre de defilement des lignes retenues }
+  If X >= ConCols * ConCW Then
+  Begin
+    If (Msg <> WM_LBUTTONDOWN) And (Msg <> WM_LBUTTONDBLCLK) Then Exit;
+    If Y < 16 Then ConScrollView(1)
+    Else If Y > Y2 - Y1 - 16 Then ConScrollView(-1)
+    Else
+    Begin
+      N := Max(1, ConHistN);
+      TH := Max(12, ((Y2 - Y1 - 32) * ConRows) Div (N + ConRows));
+      TY := 16 + ((Y2 - Y1 - 32 - TH) * (N - ConView)) Div N;
+      If Y < TY Then ConScrollView(ConRows - 1)
+      Else If Y > TY + TH Then ConScrollView(-(ConRows - 1));
+    End;
+    Exit;
+  End;
+  R := Max(0, Min(ConRows - 1, Y Div ConChH));
+  C := Max(0, Min(ConCols - 1, X Div ConCW));
+  Case Msg Of
+    WM_LBUTTONDOWN, WM_LBUTTONDBLCLK :
+    Begin
+      ConSR0 := R; ConSC0 := C; ConSR1 := R; ConSC1 := C;
+      ConSelOn := True; ConSelDrag := True;
+      CaptureWin := W;
+      ConFull := True;
+      KRepaint(W);
+    End;
+    WM_MOUSEMOVE :
+      If ConSelDrag And ((R <> ConSR1) Or (C <> ConSC1)) Then
+      Begin
+        ConSR1 := R; ConSC1 := C;
+        ConFull := True;
+        KRepaint(W);
+      End;
+    WM_LBUTTONUP :
+      If ConSelDrag Then
+      Begin
+        ConSelDrag := False;
+        CaptureWin := -1;
+        { simple clic : pas de selection }
+        If (ConSR0 = ConSR1) And (ConSC0 = ConSC1) And Not ConMark Then
+          ConSelOn := False;
+        ConFull := True;
+        KRepaint(W);
+      End;
+    WM_RBUTTONDOWN :
+    Begin
+      SysMenuW := W;
+      CloseMenus(0);
+      OpenMenu(0, mnConEdit, CurX, CurY, False);
+    End;
+  End;
+End;
+
+{ Texte des lignes affichees R0..R1, colonnes C0..C1 (CR LF entre les
+  lignes, sans les espaces de fin) }
+Function ConGrab(R0, R1, C0, C1, Dst : LongInt) : LongInt;
+Var R, C, K, E, Ch, At : LongInt;
+Begin
+  K := 0;
+  For R := R0 To R1 Do
+  Begin
+    E := K;
+    For C := C0 To C1 Do
+    Begin
+      ConCellAt(R, C, Ch, At);
+      If Ch = 0 Then Ch := 32;
+      Mem[0:Dst + K] := Ch;
+      Inc(K);
+      If Ch <> 32 Then E := K;
+    End;
+    K := E;
+    If R < R1 Then
+    Begin
+      Mem[0:Dst + K] := 13; Mem[0:Dst + K + 1] := 10;
+      K := K + 2;
+    End;
+  End;
+  ConGrab := K;
+End;
+
+Procedure ConCopy;
+Var Own : LongInt;
+Begin
+  If Not ConSelOn Then Exit;
+  If ClipBuf <> 0 Then KFree(ClipBuf);
+  Own := HeapOwner; HeapOwner := 0;
+  ClipBuf := KAlloc(ConRows * (ConCols + 2) + 16);
+  HeapOwner := Own;
+  ClipLen := 0;
+  If ClipBuf = 0 Then Exit;
+  ClipLen := ConGrab(Min(ConSR0, ConSR1), Max(ConSR0, ConSR1),
+                     Min(ConSC0, ConSC1), Max(ConSC0, ConSC1), ClipBuf);
+  Mem[0:ClipBuf + ClipLen] := 0;
+End;
+
+{ Enregistre les lignes retenues et l'ecran dans le fichier P }
+Procedure ConSaveTo(Const P : String);
+Var H, B, I, K, A, Own, Last : LongInt; S : String;
+Begin
+  H := KOpenFile(P, True, 2);
+  If H = -1 Then
+  Begin
+    MsgBoxOpen(ConTitle, L('Impossible d''enregistrer ', 'Cannot save ',
+               'Speichern nicht m'#148'glich: ', 'Impossibile salvare ',
+               'No se puede guardar ') + P, $10);
+    Exit;
+  End;
+  Own := HeapOwner; HeapOwner := 0;
+  B := KAlloc(4096);
+  HeapOwner := Own;
+  K := 0;
+  For I := 0 To ConHistN - 1 Do
+  Begin
+    A := ConHist + ((ConHistPos - ConHistN + I + ConHistMax) Mod
+         ConHistMax) * ConCols * 2;
+    S[0] := Chr(ConCols);
+    MoveMem(A, LongInt(@S[1]), ConCols);
+    While (S <> '') And ((S[Length(S)] = ' ') Or (S[Length(S)] = #0)) Do
+      Delete(S, Length(S), 1);
+    S := S + #13#10;
+    If K + Length(S) > 4000 Then
+    Begin
+      KWriteFile(H, B, K);
+      K := 0;
+    End;
+    MoveMem(LongInt(@S[1]), B + K, Length(S));
+    K := K + Length(S);
+  End;
+  { ecran : jusqu'a la derniere ligne non vide (ou le curseur) }
+  Last := ConY;
+  For I := 0 To ConRows - 1 Do If ConRowText(I) <> '' Then Last := Max(Last, I);
+  For I := 0 To Last Do
+  Begin
+    S := ConRowText(I) + #13#10;
+    If K + Length(S) > 4000 Then
+    Begin
+      KWriteFile(H, B, K);
+      K := 0;
+    End;
+    MoveMem(LongInt(@S[1]), B + K, Length(S));
+    K := K + Length(S);
+  End;
+  If K > 0 Then KWriteFile(H, B, K);
+  CloseHandle(H);
+  KFree(B);
+End;
+
+Procedure ConPropsOpen;
+Begin
+  If (ConPropW >= 0) And Wnds^[ConPropW].Used And
+     (Wnds^[ConPropW].IKind = ikConProps) Then
+  Begin
+    ActivateW(ConPropW);
+    Exit;
+  End;
+  ConPropW := KCreate(ikConProps, L('Propri'#130't'#130's de ', 'Properties ' +
+                      'of ', 'Eigenschaften von ', 'Propriet'#133' di ',
+                      'Propiedades de ') + PromptName, icDos,
+                      Max(0, (ScrW - 400) Div 2), Max(0, (TaskY - 260) Div 2),
+                      400, 260, WS_POPUP Or WS_CAPTION Or WS_SYSMENU,
+                      WS_EX_DLGMODALFRAME);
+  If ConPropW < 0 Then Exit;
+  { K1 champ actif (1 lignes, 2 fichier), K2 journal, KS lignes ; le
+    chemin du journal est dans KS2 (ConPPath) }
+  Wnds^[ConPropW].K1 := 1;
+  Wnds^[ConPropW].K2 := Ord(ConLogOn);
+  Wnds^[ConPropW].KS := IntStr(ConHistMax);
+  ConPPath := ConLogPath;
+  ShowW(ConPropW, True, True);
+End;
+
+{ Colle le presse-papiers dans l'entree de la console }
+Procedure ConPasteClip;
+Var I, C : LongInt;
+Begin
+  For I := 0 To ClipLen - 1 Do
+  Begin
+    C := Mem[0:ClipBuf + I];
+    If C = 13 Then ConKeyIn($0D, 13)
+    Else If (C >= 32) Or (C = 9) Then ConKeyIn(0, C);
+  End;
+End;
+
+Procedure ConCommand(Cmd : LongInt);
+Begin
+  If ConW < 0 Then Exit;
+  Case Cmd Of
+    cmConMark :
+    Begin
+      ConMark := True; ConSelOn := False;
+      ConSetTitle;
+    End;
+    cmConCopy :
+    Begin
+      ConCopy;
+      ConMark := False; ConSelOn := False;
+      ConSetTitle;
+    End;
+    cmConPaste :
+    Begin
+      ConMark := False; ConSelOn := False;
+      ConPasteClip;
+    End;
+    cmConSelAll :
+    Begin
+      ConSR0 := 0; ConSC0 := 0; ConSR1 := ConRows - 1;
+      ConSC1 := ConCols - 1;
+      ConSelOn := True; ConMark := True;
+      ConSetTitle;
+    End;
+    cmConSave : FdOpen(1, 2, 'C:\WINDOWS', 'CONSOLE.TXT');
+    cmConProps : ConPropsOpen;
+  End;
+  ConFull := True;
+  KRepaint(ConW);
+End;
+
+{ Champs de la boite Proprietes }
+Procedure CpField(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  If I = 1 Then
+  Begin
+    X1 := CX2 - 104; Y1 := CY1 + 34; X2 := CX2 - 28; Y2 := CY1 + 54;
+  End
+  Else
+  Begin
+    X1 := CX1 + 28; Y1 := CY1 + 140; X2 := CX2 - 28; Y2 := CY1 + 160;
+  End;
+End;
+
+Procedure PaintConProps(W : LongInt);
+Var X1, Y1, X2, Y2, FX1, FY1, FX2, FY2, I, BX1, BY1, BX2, BY2 : LongInt;
+    T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  GroupBox(X1 + 12, Y1 + 12, X2 - 12, Y1 + 84, L('M'#130'moire tampon de ' +
+           'l''affichage', 'Screen buffer', 'Bildschirmpuffer',
+           'Buffer dello schermo', 'B'#163'fer de pantalla'));
+  OutTxt(X1 + 24, Y1 + 37, L('Nombre de lignes retenues :',
+         'Lines kept:', 'Gespeicherte Zeilen:', 'Righe conservate:',
+         'L'#161'neas guardadas:'), cBlack);
+  OutTxt(X1 + 24, Y1 + 60, L('(25 '#133' 32000 ; '#133' revoir avec la ' +
+         'barre de d'#130'filement)', '(25 to 32000; see them with the ' +
+         'scroll bar)', '(25 bis 32000)', '(da 25 a 32000)',
+         '(de 25 a 32000)'), cGray);
+  GroupBox(X1 + 12, Y1 + 96, X2 - 12, Y1 + 176, L('Journal', 'Log',
+           'Protokoll', 'Registro', 'Registro'));
+  CheckBox(X1 + 24, Y1 + 114, L('Enregistrer aussi les lignes dans le ' +
+           'fichier :', 'Also save the lines to the file:', 'Zeilen ' +
+           'auch in Datei speichern:', 'Salva le righe nel file:',
+           'Guardar las l'#161'neas en el archivo:'), Wnds^[W].K2 <> 0);
+  For I := 1 To 2 Do
+  Begin
+    CpField(W, I, FX1, FY1, FX2, FY2);
+    Sunken(FX1, FY1, FX2, FY2, cWhite);
+    If I = 1 Then T := Wnds^[W].KS Else T := ConPPath;
+    T := Fit(T, FX2 - FX1 - 8);
+    OutTxt(FX1 + 4, FY1 + 3, T, cBlack);
+    If Wnds^[W].K1 = I Then
+      VLine(FX1 + 5 + TextW(T), FY1 + 3, FY2 - 3, cBlack);
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If I = 0 Then T := TxtOk Else T := TxtCancel;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+{ OK : nouveau nombre de lignes (les dernieres sont gardees) et journal }
+Procedure ConPropsApply(W : LongInt);
+Var N, C, K, I, NB, Own : LongInt;
+Begin
+  Val(Wnds^[W].KS, N, C);
+  If (C <> 0) Or (N < 25) Then N := 25;
+  If N > 32000 Then N := 32000;
+  If N <> ConHistMax Then
+  Begin
+    Own := HeapOwner; HeapOwner := 0;
+    NB := KAlloc(N * ConCols * 2);
+    HeapOwner := Own;
+    If NB <> 0 Then
+    Begin
+      K := Min(N, ConHistN);
+      For I := 0 To K - 1 Do
+        MoveMem(ConHist + ((ConHistPos - K + I + ConHistMax) Mod
+                ConHistMax) * ConCols * 2, NB + I * ConCols * 2,
+                ConCols * 2);
+      If ConHist <> 0 Then KFree(ConHist);
+      ConHist := NB;
+      ConHistMax := N; ConHistN := K; ConHistPos := K Mod N;
+      ConView := 0;
+    End;
+  End;
+  ConLogFlush;
+  ConLogOn := Wnds^[W].K2 <> 0;
+  If ConPPath <> '' Then ConLogPath := ConPPath;
+  ConFull := True;
+  If ConW >= 0 Then KRepaint(ConW);
+End;
+
+Procedure ConPropsClose(W : LongInt);
+Begin
+  If ConPropW = W Then ConPropW := -1;
+  DestroyW(W);
+End;
+
+Procedure ConPropsMouse(W, Msg, X, Y : LongInt);
+Var I, BX1, BY1, BX2, BY2, X1, Y1, X2, Y2 : LongInt;
+Begin
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  If Msg = WM_LBUTTONDBLCLK Then Msg := WM_LBUTTONDOWN;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    For I := 1 To 2 Do
+    Begin
+      CpField(W, I, BX1, BY1, BX2, BY2);
+      If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+      Begin
+        Wnds^[W].K1 := I;
+        KRepaint(W);
+        Exit;
+      End;
+    End;
+    If InRect(X, Y, X1 + 22, Y1 + 110, X2 - 24, Y1 + 130) Then
+    Begin
+      Wnds^[W].K2 := 1 - Wnds^[W].K2;
+      KRepaint(W);
+      Exit;
+    End;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        If I = 0 Then ConPropsApply(W);
+        ConPropsClose(W);
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure ConPropsKey(W, VK, Ch : LongInt);
+Var S : String;
+Begin
+  Case VK Of
+    $1B :
+    Begin
+      ConPropsClose(W);
+      Exit;
+    End;
+    $0D :
+    Begin
+      ConPropsApply(W);
+      ConPropsClose(W);
+      Exit;
+    End;
+    $09 :
+    Begin
+      Wnds^[W].K1 := 3 - Wnds^[W].K1;
+      KRepaint(W);
+      Exit;
+    End;
+  End;
+  If Wnds^[W].K1 = 1 Then S := Wnds^[W].KS Else S := ConPPath;
+  If VK = 8 Then
+  Begin
+    If S <> '' Then Delete(S, Length(S), 1);
+  End
+  Else If Wnds^[W].K1 = 1 Then
+  Begin
+    If (Ch >= 48) And (Ch <= 57) And (Length(S) < 5) Then S := S + Chr(Ch);
+  End
+  Else If (Ch >= 32) And (Ch < 256) And (Length(S) < 79) Then
+    S := S + UpCase(Chr(Ch));
+  If Wnds^[W].K1 = 1 Then Wnds^[W].KS := S Else ConPPath := S;
+  KRepaint(W);
 End;
 
 Procedure ConQPop(Var VK, Ch, Ctl : LongInt);
@@ -20927,6 +22443,8 @@ Begin
     ikDateTime : DateTimeKey(W, VK);
     ikSysProps : SysPropsKey(W, VK);
     ikVolProps : VolPropsKey(W, VK, Ch);
+    ikScanDisk : If VK = $1B Then ScanClose(W);
+    ikConProps : ConPropsKey(W, VK, Ch);
     ikFileDlg : FileDlgKey(W, VK, Ch);
     ikFind : FindKey(W, VK, Ch);
     ikDevProps : If (VK = $0D) Or (VK = $1B) Then
@@ -20997,6 +22515,8 @@ Begin
     ikAudio : PaintAudio(W);
     ikSysProps : PaintSysProps(W);
     ikVolProps : PaintVolProps(W);
+    ikScanDisk : PaintScanDisk(W);
+    ikConProps : PaintConProps(W);
     ikFileDlg : PaintFileDlg(W);
     ikFind : PaintFind(W);
     ikDevProps : PaintDevProps(W);
@@ -30691,9 +32211,46 @@ Begin
   ExitWindowsEx := 1;
 End;
 
+{ WinHelp : lance l'Aide de Windows (WINHLP32.EXE) sur le fichier F.
+  HELP_CONTEXT (1) : -n numero ; HELP_CONTEXTPOPUP (8) et l'aide
+  "Qu'est-ce que c'est ?" (HELP_CONTEXTMENU 10, HELP_WM_HELP 12 :
+  paires identifiant du controle / numero d'aide) : -p numero, fenetre
+  contextuelle seule ; HELP_KEY (101h) et HELP_PARTIALKEY (105h) :
+  -k mot-cle ; HELP_QUIT (2) ferme l'aide ; les autres (sommaire,
+  Rubriques d'aide) ouvrent le fichier. Une seule fenetre d'aide : la
+  precedente est fermee. }
 Function WinHelpA(H, F, Cmd, Data : LongInt) : LongInt;
+Var S, A : String; I, Id, W : LongInt;
 Begin
-  WinHelpA := 0;
+  WinHelpA := 1;
+  Cmd := Cmd And $FFFF;
+  For W := 0 To MaxWnd - 1 Do
+    If Wnds^[W].Used And Not IsChildW(W) And
+       (Classes^[Wnds^[W].Cls].Name = 'MS_WINHELP') Then
+      PostMsgW(W, WM_CLOSE, 0, 0);
+  If Cmd = 2 Then Exit;
+  S := '';
+  If F <> 0 Then S := PStr(F);
+  If S = '' Then Exit;
+  A := '';
+  Case Cmd Of
+    1 : A := '-n ' + IntStr(Data);
+    8 : A := '-p ' + IntStr(Data);
+    $A, $C :
+    Begin
+      { tableau de paires (controle, numero d'aide) termine par 0 }
+      If Data = 0 Then Exit;
+      Id := GetDlgCtrlID(H);
+      I := 0;
+      While (I < 256) And (MemL[0:Data + I * 8] <> 0) And
+            (MemL[0:Data + I * 8] <> Id) Do Inc(I);
+      If (I >= 256) Or (MemL[0:Data + I * 8] = 0) Then Exit;
+      A := '-p ' + IntStr(MemL[0:Data + I * 8 + 4]);
+    End;
+    $101, $105 : If Data <> 0 Then A := '-k ' + PStr(Data);
+  End;
+  If A <> '' Then A := A + ' ';
+  RunExe('WINHLP32.EXE', A + '"' + S + '"');
 End;
 
 Function FlashWindow(H, Inv : LongInt) : LongInt;
@@ -81171,6 +82728,8 @@ Begin
   KClass[ikFind] := ClassAdd('#Find', 0, ikFind, 0);
   KClass[ikDevProps] := ClassAdd('#DevProps', 0, ikDevProps, 0);
   KClass[ikVolProps] := ClassAdd('#VolProps', 0, ikVolProps, 0);
+  KClass[ikScanDisk] := ClassAdd('#ScanDisk', 0, ikScanDisk, 0);
+  KClass[ikConProps] := ClassAdd('#ConProps', 0, ikConProps, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
@@ -81439,6 +82998,7 @@ Begin
     RunMMTimers;
     RunWave;
     KPaintAll;
+    If SdW >= 0 Then ScanStep;
     { registre modifie par un programme termine : sur le disque }
     If RegSaveDue Then
     Begin
@@ -81629,6 +83189,7 @@ BEGIN
   RegInit;
   RegLoad;
   WinInitRun;
+  SdW := -1;
   BootStep(5);
   InitW16;
   InitW16Apis;
@@ -81640,6 +83201,7 @@ BEGIN
   BootStep(7);
   AppProcObj := -1;
   ConW := -1; ConTitle := ''; ConRowsDue := False; ConLastCY := -1;
+  ConPropW := -1; SysMenuW := -1; ConHistMax := 1000;
   ConPalVer := -1;
   ConKeep := False; ConKillReq := False;
   VmT := -1; VmOn := False;
