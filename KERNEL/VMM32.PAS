@@ -8346,7 +8346,7 @@ Const
   icFind     = 44; icScanDisk = 45; icDxDiag   = 46; icCharMap  = 47;
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
-  icAppWiz   = 56;
+  icAppWiz   = 56; icRdp      = 57;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9859,6 +9859,16 @@ Begin
       QD(15, 12, 5, cWhite);
       QR(14, 9, 16, 9, cBlue);
       QR(14, 11, 16, 15, cBlue);
+    End;
+    icRdp :
+    Begin
+      { Bureau a distance : deux ecrans relies }
+      IFrame(13, 2, 30, 15, cSilver); QR(15, 4, 28, 12, cBlue);
+      QR(19, 15, 24, 17, cGray);
+      IFrame(2, 11, 20, 25, cSilver); QR(4, 13, 18, 22, cTeal);
+      QR(8, 26, 14, 28, cGray);
+      QL(20, 18, 26, 18, cRed); QL(26, 18, 26, 22, cRed);
+      QL(23, 21, 26, 18, cRed);
     End;
     icNetDrv :
     Begin
@@ -13873,6 +13883,7 @@ Const
   cmNewFolder = 74; cmNewText = 75; cmNewBmp = 76; cmNewHtml = 77;
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
+  cmMstsc = 86;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
   cmKnownBase = 900;                 { + programme connu (KnownExe) }
   { Bloc-notes }
@@ -13905,6 +13916,7 @@ Const
   mnMedia = 26; mnInet = 27; mnTools = 28; mnFind = 29;
   mnNew = 30; mnExpCtx = 31;      { Nouveau ; fond d'un dossier }
   mnNetLet = 32; mnMyComp = 33;   { lettres libres ; Poste de travail }
+  mnComm = 34;                    { Accessoires, Communications }
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -14264,7 +14276,7 @@ Begin
     (Nm = 'WAB.EXE') Or (Nm = 'IMAGING.EXE') Or (Nm = 'CDPLAYER.EXE') Or
     (Nm = 'FINDFILE.EXE') Or (Nm = 'ECHECS.EXE') Or (Nm = 'SOL.EXE') Or
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
-    (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE');
+    (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -14826,7 +14838,8 @@ Begin
     mnFind : MenuCount := 2;
     mnTools : MenuCount := 6 + KnownCount('S');
     mnPrograms : MenuCount := 4 + ExeCnt;
-    mnAccess : MenuCount := 10;
+    mnAccess : MenuCount := 11;
+    mnComm : MenuCount := 1;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
     mnInet : MenuCount := 1 + KnownCount('I');
@@ -14959,6 +14972,14 @@ Begin
       End;
     { Programmes, Accessoires : groupes, puis programmes (comme Windows) }
     mnAccess :
+    Begin
+      If I = 0 Then
+      Begin
+        T := L('Communications', 'Communications', 'Kommunikation',
+               'Comunicazioni', 'Comunicaciones');
+        Sub := mnComm; Icon := icPrograms;
+      End;
+      Dec(I);
       Case I Of
         0 : Begin
               T := L('Jeux', 'Games', 'Spiele', 'Giochi', 'Juegos');
@@ -15009,6 +15030,14 @@ Begin
               Cmd := cmCharMap; Icon := icCharMap;
             End;
       End;
+    End;
+    mnComm :
+    Begin
+      T := L('Connexion Bureau '#133' distance', 'Remote Desktop Connection',
+             'Remotedesktopverbindung', 'Connessione Desktop remoto',
+             'Conexi'#162'n a Escritorio remoto');
+      Cmd := cmMstsc; Icon := icRdp;
+    End;
     mnGames :
       If I = 0 Then
       Begin
@@ -16367,6 +16396,7 @@ Begin
   Else If Nm = 'MSINFO32.EXE' Then ExeIcon := icMsInfo
   Else If Nm = 'MSTASK.EXE' Then ExeIcon := icTaskSch
   Else If Nm = 'CONTROL.EXE' Then ExeIcon := icControl
+  Else If Nm = 'MSTSC.EXE' Then ExeIcon := icRdp
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
@@ -22222,6 +22252,7 @@ Begin
     cmMapDrv : WNetDlgOpen(False);
     cmDiscDrv : WNetDlgOpen(True);
     cmControl : RunExe('CONTROL.EXE', '');
+    cmMstsc : RunExe('MSTSC.EXE', '');
     cmNetDisc :
       If CtxNetDrv <> #0 Then
       Begin
