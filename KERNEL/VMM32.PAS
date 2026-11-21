@@ -8260,6 +8260,8 @@ Const
   icChip     = 37; icDiskCtl  = 38; icWeb      = 39;
   icCards    = 40; icAddress  = 41; icImaging  = 42; icCdPlayer = 43;
   icFind     = 44; icScanDisk = 45; icDxDiag   = 46; icCharMap  = 47;
+  icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
+  icMsInfo   = 52; icTaskSch  = 53;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9718,6 +9720,68 @@ Begin
       End;
       For I := 0 To 4 Do QR(8, 13 + I * 4, 23, 13 + I * 4, cBlue);
       QR(10, 11, 10, 28, cRed);
+    End;
+    icChess :
+    Begin
+      { cavalier noir sur un damier }
+      For I := 0 To 15 Do
+        If Odd(I + I Div 4) Then
+          QR(2 + (I Mod 4) * 7, 2 + (I Div 4) * 7, 8 + (I Mod 4) * 7,
+             8 + (I Div 4) * 7, cOlive)
+        Else QR(2 + (I Mod 4) * 7, 2 + (I Div 4) * 7, 8 + (I Mod 4) * 7,
+                8 + (I Div 4) * 7, cCream);
+      QR(9, 26, 23, 28, cBlack);
+      QR(12, 17, 21, 25, cBlack);
+      QR(9, 9, 20, 16, cBlack);
+      QR(14, 6, 17, 8, cBlack);
+      QR(12, 11, 13, 12, cWhite);
+    End;
+    icSolitair :
+    Begin
+      { trois cartes en eventail : dos, pique, coeur }
+      IFrame(2, 6, 15, 27, cNavy);
+      QR(4, 8, 13, 25, cBlue);
+      IFrame(8, 4, 21, 25, cWhite);
+      QD(14, 12, 3, cBlack); QR(14, 12, 14, 18, cBlack);
+      IFrame(15, 8, 29, 30, cWhite);
+      QD(20, 16, 2, cRed); QD(24, 16, 2, cRed);
+      For I := 0 To 4 Do QR(18 + I, 17 + I, 26 - I, 17 + I, cRed);
+    End;
+    icDefrag :
+    Begin
+      { blocs du disque : rouges en desordre, bleus ranges }
+      IFrame(2, 3, 29, 28, cWhite);
+      For I := 0 To 11 Do
+        QR(4 + (I Mod 6) * 4, 5 + (I Div 6) * 4, 6 + (I Mod 6) * 4,
+           7 + (I Div 6) * 4, cBlue);
+      For I := 0 To 5 Do
+        If Odd(I) Then
+          QR(4 + I * 4, 17, 6 + I * 4, 19, cRed)
+        Else QR(4 + I * 4, 21, 6 + I * 4, 23, cAqua);
+    End;
+    icCleanMgr :
+    Begin
+      { disque et balai }
+      IFrame(2, 18, 23, 28, cSilver);
+      QR(17, 24, 19, 25, cLime);
+      QL(26, 2, 17, 19, cMaroon); QL(27, 3, 18, 20, cMaroon);
+      For I := 0 To 4 Do QL(14 + I, 18, 10 + I * 2, 26, cYellow);
+    End;
+    icMsInfo :
+    Begin
+      { ordinateur et i bleu }
+      IconMonitor(cNavy);
+      QD(15, 12, 5, cWhite);
+      QR(14, 9, 16, 9, cBlue);
+      QR(14, 11, 16, 15, cBlue);
+    End;
+    icTaskSch :
+    Begin
+      { dossier et horloge }
+      IconFolder(cYellow);
+      QD(20, 19, 7, cWhite);
+      QC(20, 19, 7, cBlack);
+      QR(20, 14, 20, 19, cBlack); QR(20, 19, 23, 19, cBlack);
     End;
     icCards :
     Begin
@@ -13670,7 +13734,8 @@ Const
   cmDrvOpen = 26; cmDrvProps = 27;   { lecteur (Poste de travail) }
   cmCalc = 28; cmBrowser = 29; cmMp3Play = 59; cmFreeCell = 60;
   cmCharMap = 61; cmCdPlayer = 62; cmWab = 63; cmImaging = 64;
-  cmFindFiles = 65; cmFindComp = 66; cmScanDisk = 67;
+  cmFindFiles = 65; cmFindComp = 66; cmScanDisk = 67; cmChess = 68;
+  cmSol = 69; cmDefrag = 70; cmCleanMgr = 71; cmMsInfo = 72; cmMsTask = 73;
   cmKnownBase = 900;                 { + programme connu (KnownExe) }
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
@@ -14046,7 +14111,9 @@ Begin
     (Nm = 'FREECELL.EXE') Or (Nm = 'CHARMAP.EXE') Or
     (Nm = 'WINHLP32.EXE') Or (Nm = 'APPWIZ.EXE') Or (Nm = 'TASKMGR.EXE') Or
     (Nm = 'WAB.EXE') Or (Nm = 'IMAGING.EXE') Or (Nm = 'CDPLAYER.EXE') Or
-    (Nm = 'FINDFILE.EXE');
+    (Nm = 'FINDFILE.EXE') Or (Nm = 'ECHECS.EXE') Or (Nm = 'SOL.EXE') Or
+    (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
+    (Nm = 'MSTASK.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -14068,6 +14135,10 @@ Begin
   { Paint (APPS\PAINT.PAS) : icone dediee }
   If PathInfo(SysDir + 'PAINT.EXE', Fl, Size, Tm, Lba, I) Then
     DeskAdd('Paint', icPaint, cmPaint, SysDir + 'PAINT.EXE');
+  If PathInfo(SysDir + 'BROWSER.EXE', Fl, Size, Tm, Lba, I) Then
+    DeskAdd(L('Navigateur Web', 'Web Browser', 'Webbrowser',
+              'Browser Web', 'Navegador Web'), icWeb, cmBrowser,
+            SysDir + 'BROWSER.EXE');
   I := 0;
   While SysEntry(I, Nm, Dir) Do
   Begin
@@ -14558,10 +14629,10 @@ Begin
   Case M Of
     mnStart : MenuCount := 9;
     mnFind : MenuCount := 2;
-    mnTools : MenuCount := 2 + KnownCount('S');
+    mnTools : MenuCount := 6 + KnownCount('S');
     mnPrograms : MenuCount := 4 + ExeCnt;
     mnAccess : MenuCount := 10;
-    mnGames : MenuCount := 1;
+    mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
     mnInet : MenuCount := 1 + KnownCount('I');
     mnSettings : MenuCount := 8;
@@ -14740,9 +14811,21 @@ Begin
             End;
       End;
     mnGames :
+      If I = 0 Then
+      Begin
+        T := L(#144'checs', 'Chess', 'Schach', 'Scacchi', 'Ajedrez');
+        Cmd := cmChess; Icon := icChess;
+      End
+      Else If I = 1 Then
       Begin
         T := 'FreeCell';
         Cmd := cmFreeCell; Icon := icCards;
+      End
+      Else
+      Begin
+        T := L('Solitaire', 'Solitaire', 'Solit'#132'r', 'Solitario',
+               'Solitario');
+        Cmd := cmSol; Icon := icSolitair;
       End;
     mnMedia :
       If I = 0 Then
@@ -14781,20 +14864,48 @@ Begin
         T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnTools :
-      If I = 0 Then
-      Begin
-        T := 'ScanDisk';
-        Cmd := cmScanDisk; Icon := icScanDisk;
-      End
-      Else If I = 1 Then
-      Begin
-        T := L('Gestionnaire des t'#131'ches', 'Task Manager',
-               'Task-Manager', 'Task Manager', 'Administrador de tareas');
-        Cmd := cmTaskMgr; Icon := icChip;
-      End
+      Case I Of
+        0 :
+        Begin
+          T := L('D'#130'fragmenteur de disque', 'Disk Defragmenter',
+                 'Defragmentierung', 'Utilit'#133' di deframmentazione',
+                 'Desfragmentador de disco');
+          Cmd := cmDefrag; Icon := icDefrag;
+        End;
+        1 :
+        Begin
+          T := L('Gestionnaire des t'#131'ches', 'Task Manager',
+                 'Task-Manager', 'Task Manager', 'Administrador de tareas');
+          Cmd := cmTaskMgr; Icon := icChip;
+        End;
+        2 :
+        Begin
+          T := L('Informations syst'#138'me', 'System Information',
+                 'Systeminformationen', 'Informazioni di sistema',
+                 'Informaci'#162'n del sistema');
+          Cmd := cmMsInfo; Icon := icMsInfo;
+        End;
+        3 :
+        Begin
+          T := L('Nettoyage de disque', 'Disk Cleanup',
+                 'Datentr'#132'gerbereinigung', 'Pulizia disco',
+                 'Liberador de espacio en disco');
+          Cmd := cmCleanMgr; Icon := icCleanMgr;
+        End;
+        4 :
+        Begin
+          T := 'ScanDisk';
+          Cmd := cmScanDisk; Icon := icScanDisk;
+        End;
+        5 :
+        Begin
+          T := L('T'#131'ches planifi'#130'es', 'Scheduled Tasks',
+                 'Geplante Tasks', 'Operazioni pianificate',
+                 'Tareas programadas');
+          Cmd := cmMsTask; Icon := icTaskSch;
+        End;
       Else
-      Begin
-        K := KnownAt('S', I - 2);
+        K := KnownAt('S', I - 6);
         T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnFind :
@@ -15885,6 +15996,12 @@ Function ExeIcon(Nm : String) : LongInt;
 Begin
   Nm := UpStr(Nm);
   If Nm = 'FREECELL.EXE' Then ExeIcon := icCards
+  Else If Nm = 'ECHECS.EXE' Then ExeIcon := icChess
+  Else If Nm = 'SOL.EXE' Then ExeIcon := icSolitair
+  Else If Nm = 'DEFRAG.EXE' Then ExeIcon := icDefrag
+  Else If Nm = 'CLEANMGR.EXE' Then ExeIcon := icCleanMgr
+  Else If Nm = 'MSINFO32.EXE' Then ExeIcon := icMsInfo
+  Else If Nm = 'MSTASK.EXE' Then ExeIcon := icTaskSch
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
   Else If Nm = 'CALC.EXE' Then ExeIcon := icCalc
@@ -21712,6 +21829,12 @@ Begin
     cmWab : RunSys('WAB.EXE', '', L('Carnet d''adresses', 'Address Book',
                    'Adressbuch', 'Rubrica', 'Libreta de direcciones'));
     cmImaging : RunSys('IMAGING.EXE', '', 'Imaging');
+    cmChess : RunSys('ECHECS.EXE', '', #144'checs');
+    cmSol : RunSys('SOL.EXE', '', 'Solitaire');
+    cmDefrag : RunSys('DEFRAG.EXE', '', 'Defrag');
+    cmCleanMgr : RunSys('CLEANMGR.EXE', '', 'Cleanmgr');
+    cmMsInfo : RunSys('MSINFO32.EXE', '', 'Msinfo32');
+    cmMsTask : RunSys('MSTASK.EXE', '', 'Mstask');
     cmFindFiles : RunSys('FINDFILE.EXE', '', L('Rechercher', 'Find',
                          'Suchen', 'Trova', 'Buscar'));
     cmFindComp : RunSys('FINDFILE.EXE', '/C', L('Rechercher', 'Find',
@@ -24340,6 +24463,38 @@ Begin
 End;
 
 { Procedure des controles et des fenetres internes }
+{ Boutons radio automatiques : decocher ceux du groupe de W. Le groupe
+  (comme Windows) va du frere precedent qui a WS_GROUP (ou du premier)
+  au frere suivant qui a WS_GROUP, dans l'ordre de creation }
+Function RadioSib(I, W : LongInt) : Boolean;
+Begin
+  RadioSib := Wnds^[I].Used And (Wnds^[I].Parent = Wnds^[W].Parent) And
+              IsChildW(I);
+End;
+
+Procedure RadioGroupOff(W : LongInt);
+Var I, G : LongInt;
+Begin
+  G := W;
+  I := W - 1;
+  While ((Wnds^[G].Style And $20000) = 0) And (I >= 0) Do
+  Begin
+    If RadioSib(I, W) Then G := I;
+    Dec(I);
+  End;
+  For I := G To MaxWnd - 1 Do
+    If RadioSib(I, W) Then
+    Begin
+      If (I > G) And ((Wnds^[I].Style And $20000) <> 0) Then Exit;
+      If (Wnds^[I].IKind = ikButton) And
+         ((Wnds^[I].Style And BS_TYPEMASK) = BS_AUTORADIOBUTTON) Then
+      Begin
+        Wnds^[I].K1 := 0;
+        InvalAll(I, True);
+      End;
+    End;
+End;
+
 Function KWndProc(W, Msg, WP, LP : LongInt) : LongInt;
 Var Typ, I, N : LongInt; S : String;
 Begin
@@ -24461,14 +24616,7 @@ Begin
         If Typ = BS_AUTOCHECKBOX Then Wnds^[W].K1 := 1 - Wnds^[W].K1;
         If Typ = BS_AUTORADIOBUTTON Then
         Begin
-          For I := 0 To MaxWnd - 1 Do
-            If Wnds^[I].Used And (Wnds^[I].Parent = Wnds^[W].Parent) And
-               (Wnds^[I].IKind = ikButton) And
-               ((Wnds^[I].Style And BS_TYPEMASK) = BS_AUTORADIOBUTTON) Then
-            Begin
-              Wnds^[I].K1 := 0;
-              InvalAll(I, True);
-            End;
+          RadioGroupOff(W);
           Wnds^[W].K1 := 1;
         End;
         InvalAll(W, True);
@@ -25542,6 +25690,25 @@ Begin
     If I < 0 Then Exit;
     KObjs^[I].F1 := -1; KObjs^[I].F4 := -2; KObjs^[I].F5 := 1;
     KObjs^[I].Name := 'NUL';
+    KOpenFile := KHandle(I);
+    Exit;
+  End;
+  { volume entier (\\.\C:) : DeviceIoControl (defragmentation) }
+  If (Length(Name) = 6) And (Copy(Name, 1, 4) = '\\.\') And
+     (Name[6] = ':') Then
+  Begin
+    E := FatVolOf(UpStr(Copy(Name, 5, 2)) + '\');
+    If E < 0 Then
+    Begin
+      SetErr(ErrFileNotFound);
+      Exit;
+    End;
+    I := KObjNew(koFile);
+    If I < 0 Then Exit;
+    KObjs^[I].F1 := E; KObjs^[I].F2 := 0; KObjs^[I].F3 := 0;
+    KObjs^[I].F4 := -3; KObjs^[I].F5 := 0;
+    KObjs^[I].Name := Name;
+    SetErr(0);
     KOpenFile := KHandle(I);
     Exit;
   End;
@@ -38210,6 +38377,24 @@ Begin
   RegTab := A;
 End;
 
+{ Liste des peripheriques (Gestionnaire de peripheriques) publiee dans
+  HKLM\Enum\Pasdows\nn : Class, DeviceDesc, Mfg, Resources (I E/S, Q
+  IRQ, D DMA, M memoire), lue par les Informations systeme }
+Procedure RegDevices;
+Var I : LongInt; S : String;
+Begin
+  DevScan;
+  For I := 0 To DevN - 1 Do
+  Begin
+    S := 'Enum\Pasdows\' + Pad2(I);
+    RegSetStr(S, 'Class', CatName(DevCat[I]));
+    RegSetStr(S, 'DeviceDesc', DevName^[I]);
+    RegSetStr(S, 'Mfg', DevMfg^[I]);
+    RegSetStr(S, 'Resources', DevRes^[I]);
+  End;
+  RegSetStr('Enum\Pasdows', 'Count', IntStr(DevN));
+End;
+
 Procedure RegInit;
 Var I, A : LongInt; S : String;
 Begin
@@ -38302,6 +38487,7 @@ Begin
   CreateDirectoryA(LongInt(@S[1]), 0);
   S := 'C:\Program Files\Common Files' + #0;
   CreateDirectoryA(LongInt(@S[1]), 0);
+  RegDevices;
 End;
 
 Function RegOpenKeyA(K, Sub, PR : LongInt) : LongInt;
@@ -38347,8 +38533,11 @@ Begin
   RegCloseKey := 0;
 End;
 
+{ RegFlushKey : le registre est ecrit sur le disque (PASDOWS.REG) au
+  prochain tour de la boucle du systeme }
 Function RegFlushKey(K : LongInt) : LongInt;
 Begin
+  RegSaveDue := True;
   RegFlushKey := 0;
 End;
 
@@ -38492,6 +38681,36 @@ Begin
         Exit;
       End;
       Dec(N);
+    End;
+End;
+
+{ Programmes de HKLM\...\CurrentVersion\Run, lances au demarrage
+  (l'agent du Planificateur de taches, par exemple) }
+Procedure RunKeyApps;
+Var K, V, I : LongInt; S, P, A : String;
+Begin
+  K := RegWalk(2, 'Software\Microsoft\Windows\CurrentVersion\Run', False);
+  If K < 0 Then Exit;
+  For V := 0 To MaxRV - 1 Do
+    If RVUsed^[V] And (RVKey^[V] = K) And (RVType^[V] = 1) Then
+    Begin
+      S := Trim(PStr(RVData^[V]));
+      If S = '' Then Continue;
+      If S[1] = '"' Then
+      Begin
+        Delete(S, 1, 1);
+        I := Pos('"', S);
+        If I = 0 Then I := Length(S) + 1;
+      End
+      Else
+      Begin
+        I := Pos(' ', S);
+        If I = 0 Then I := Length(S) + 1;
+      End;
+      P := Copy(S, 1, I - 1);
+      A := Trim(Copy(S, I + 1, 255));
+      KLog('Run : ' + P + ' ' + A);
+      RunExe(P, A);
     End;
 End;
 
@@ -69101,12 +69320,264 @@ Begin
 End;
 
 { DeviceIoControl : aucun pilote de peripherique (VxD) a interroger }
+{ DeviceIoControl : les commandes de defragmentation de Windows NT sur
+  les volumes FAT (poignee \\.\C: et poignees de fichiers) :
+  FSCTL_GET_VOLUME_BITMAP (clusters occupes), FSCTL_GET_RETRIEVAL_
+  POINTERS (morceaux d'un fichier) et FSCTL_MOVE_FILE (deplacer des
+  clusters d'un fichier vers des clusters libres). Le LCN 0 est le
+  cluster 2 de la FAT. }
+Function IoVolOf(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  IoVolOf := -1;
+  I := KObjOf(H, koFile);
+  If (I >= 0) And (KObjs^[I].F4 = -3) Then IoVolOf := KObjs^[I].F1;
+End;
+
+Function IoFileOf(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  IoFileOf := -1;
+  I := KObjOf(H, koFile);
+  If (I >= 0) And (KObjs^[I].F4 <= -1000) Then
+    IoFileOf := -1000 - KObjs^[I].F4;
+End;
+
+Function FatLikeVol(V : LongInt) : Boolean;
+Begin
+  FatLikeVol := (V >= 0) And (VolType[V] <> NtfsT) And
+                (VolType[V] <> HpfsT);
+End;
+
+Function IoVolBitmap(V, PIn, POut, NOut : LongInt; Var Ret : LongInt)
+  : LongInt;
+Var St, N, K, A, B : LongInt;
+Begin
+  IoVolBitmap := 0;
+  If (PIn = 0) Or (NOut < 17) Then
+  Begin
+    SetErr(122);
+    Exit;
+  End;
+  St := MemL[0:PIn];
+  If (St < 0) Or (St >= VolClus[V]) Then
+  Begin
+    SetErr(ErrInvalidParam);
+    Exit;
+  End;
+  N := VolClus[V] - St;
+  If N > (NOut - 16) * 8 Then N := (NOut - 16) * 8;
+  MemL[0:POut] := St; MemL[0:POut + 4] := 0;
+  MemL[0:POut + 8] := VolClus[V] - St; MemL[0:POut + 12] := 0;
+  A := POut + 16;
+  FillMem(A, (N + 7) Div 8, 0);
+  For K := 0 To N - 1 Do
+    If FatGet(V, St + K + 2) <> 0 Then
+    Begin
+      B := Mem[0:A + K Shr 3];
+      Mem[0:A + K Shr 3] := B Or (1 Shl (K And 7));
+    End;
+  Ret := 16 + (N + 7) Div 8;
+  If N < VolClus[V] - St Then
+  Begin
+    SetErr(234);                                   { ERROR_MORE_DATA }
+    Exit;
+  End;
+  SetErr(0);
+  IoVolBitmap := 1;
+End;
+
+Function IoRetrieval(F, PIn, POut, NOut : LongInt; Var Ret : LongInt)
+  : LongInt;
+Var V, C, Vcn, StV, NE, MaxE, Run0, RunL, Prev : LongInt;
+Begin
+  IoRetrieval := 0;
+  V := FoVol[F];
+  If (PIn = 0) Or (NOut < 32) Then
+  Begin
+    SetErr(122);
+    Exit;
+  End;
+  StV := MemL[0:PIn];
+  If (FoClus[F] = 0) Or (StV < 0) Then
+  Begin
+    SetErr(38);                                    { ERROR_HANDLE_EOF }
+    Exit;
+  End;
+  MaxE := (NOut - 16) Div 16;
+  NE := 0; Vcn := 0; C := FoClus[F]; Run0 := -1; RunL := 0; Prev := -1;
+  While ClusOk(V, C) And (Vcn <= VolClus[V]) Do
+  Begin
+    If Vcn >= StV Then
+    Begin
+      If (Run0 >= 0) And (C = Prev + 1) Then Inc(RunL)
+      Else
+      Begin
+        If Run0 >= 0 Then
+        Begin
+          If NE >= MaxE Then
+          Begin
+            MemL[0:POut] := NE;
+            Ret := 16 + NE * 16;
+            SetErr(234);
+            Exit;
+          End;
+          MemL[0:POut + 16 + NE * 16] := Vcn;
+          MemL[0:POut + 20 + NE * 16] := 0;
+          MemL[0:POut + 24 + NE * 16] := Run0 - 2;
+          MemL[0:POut + 28 + NE * 16] := 0;
+          Inc(NE);
+        End;
+        Run0 := C; RunL := 1;
+      End;
+      Prev := C;
+    End;
+    C := FatGet(V, C);
+    Inc(Vcn);
+  End;
+  If Vcn <= StV Then
+  Begin
+    SetErr(38);
+    Exit;
+  End;
+  If Run0 >= 0 Then
+  Begin
+    If NE >= MaxE Then
+    Begin
+      MemL[0:POut] := NE;
+      Ret := 16 + NE * 16;
+      SetErr(234);
+      Exit;
+    End;
+    MemL[0:POut + 16 + NE * 16] := Vcn;
+    MemL[0:POut + 20 + NE * 16] := 0;
+    MemL[0:POut + 24 + NE * 16] := Run0 - 2;
+    MemL[0:POut + 28 + NE * 16] := 0;
+    Inc(NE);
+  End;
+  MemL[0:POut] := NE; MemL[0:POut + 4] := 0;
+  MemL[0:POut + 8] := StV; MemL[0:POut + 12] := 0;
+  Ret := 16 + NE * 16;
+  SetErr(0);
+  IoRetrieval := 1;
+End;
+
+{ deplacer les clusters [Vcn, Vcn + N) du fichier F vers les clusters
+  libres [Lcn, Lcn + N) : copie, nouvelle chaine, anciens liberes }
+Function IoMoveFile(V, PIn : LongInt) : LongInt;
+Var F, Vcn, Lcn, N, K, C, Prev, After, Buf, CB, Cnt, G : LongInt;
+    Old : Array[0..255] Of LongInt;
+Begin
+  IoMoveFile := 0;
+  SetErr(ErrInvalidParam);
+  If PIn = 0 Then Exit;
+  F := IoFileOf(MemL[0:PIn]);
+  Vcn := MemL[0:PIn + 8]; Lcn := MemL[0:PIn + 16]; N := MemL[0:PIn + 24];
+  If (F < 0) Or (FoVol[F] <> V) Or (N <= 0) Or (N > 256) Or (Vcn < 0) Or
+     (Lcn < 0) Or (Lcn + N > VolClus[V]) Then Exit;
+  { clusters du fichier : celui avant Vcn, les N deplaces, le suivant }
+  C := FoClus[F]; Cnt := 0; Prev := 0;
+  While ClusOk(V, C) And (Cnt < Vcn) Do
+  Begin
+    Prev := C;
+    C := FatGet(V, C);
+    Inc(Cnt);
+  End;
+  For K := 0 To N - 1 Do
+  Begin
+    If Not ClusOk(V, C) Then Exit;
+    Old[K] := C;
+    C := FatGet(V, C);
+  End;
+  After := C;
+  { la destination doit etre libre (ou deja la bonne place) }
+  For K := 0 To N - 1 Do
+    If (FatGet(V, Lcn + K + 2) <> 0) And (Old[K] <> Lcn + K + 2) Then
+    Begin
+      SetErr(ErrAccessDenied);
+      Exit;
+    End;
+  For K := 0 To N - 1 Do
+    For G := 0 To N - 1 Do
+      If (Old[G] = Lcn + K + 2) And (G <> K) Then
+      Begin
+        SetErr(ErrAccessDenied);
+        Exit;
+      End;
+  CB := ClusBytes(V);
+  Buf := KAlloc(CB);
+  If Buf = 0 Then
+  Begin
+    SetErr(ErrNotEnoughMem);
+    Exit;
+  End;
+  FatIoErr := False;
+  For K := 0 To N - 1 Do
+    If Old[K] <> Lcn + K + 2 Then
+    Begin
+      ClusIo(V, Old[K], 0, CB, Buf, False);
+      ClusIo(V, Lcn + K + 2, 0, CB, Buf, True);
+    End;
+  KFree(Buf);
+  If FatIoErr Then
+  Begin
+    SetErr(29);
+    Exit;
+  End;
+  { nouvelle chaine, puis liberer les anciens clusters }
+  For K := 0 To N - 1 Do
+    If K < N - 1 Then FatSet(V, Lcn + K + 2, Lcn + K + 3)
+    Else If ClusOk(V, After) Then FatSet(V, Lcn + K + 2, After)
+    Else FatSet(V, Lcn + K + 2, FatEoc);
+  If Prev <> 0 Then FatSet(V, Prev, Lcn + 2);
+  For K := 0 To N - 1 Do
+  Begin
+    G := 0;
+    For C := 0 To N - 1 Do If Old[K] = Lcn + C + 2 Then G := 1;
+    If G = 0 Then FatSet(V, Old[K], 0);
+  End;
+  If Prev = 0 Then
+  Begin
+    { premier cluster : l'entree du repertoire et les autres poignees }
+    For K := 0 To MaxFo - 1 Do
+      If FoUsed[K] And (FoVol[K] = V) And (FoDir[K] = FoDir[F]) And
+         (FoIdx[K] = FoIdx[F]) Then FoClus[K] := Lcn + 2;
+    EntSet(V, FoDir[F], FoIdx[F], Lcn + 2, FoSize[F], False);
+  End;
+  For K := 0 To MaxFo - 1 Do
+    If FoUsed[K] And (FoVol[K] = V) Then FoCIdx[K] := -1;
+  VolFsDirty[V] := True;
+  FatFlush;
+  SetErr(0);
+  IoMoveFile := 1;
+End;
+
 Function DeviceIoControl(H, Code, PIn, NIn, POut, NOut, PRet, Ovl
   : LongInt) : LongInt;
+Var V, F, Ret, R : LongInt;
 Begin
-  If PRet <> 0 Then MemL[0:PRet] := 0;
-  SetErr(50);
   DeviceIoControl := 0;
+  Ret := 0; R := 0;
+  V := IoVolOf(H);
+  F := IoFileOf(H);
+  If (Code = $9006F) And FatLikeVol(V) Then
+    R := IoVolBitmap(V, PIn, POut, NOut, Ret)
+  Else If (Code = $90073) And (F >= 0) And FatLikeVol(FoVol[F]) Then
+    R := IoRetrieval(F, PIn, POut, NOut, Ret)
+  Else If (Code = $90074) And FatLikeVol(V) Then R := IoMoveFile(V, PIn)
+  Else If (Code = $90018) And (V >= 0) Then
+  Begin
+    { FSCTL_LOCK_VOLUME / UNLOCK : acceptes }
+    R := 1; SetErr(0);
+  End
+  Else If (Code = $9001C) And (V >= 0) Then
+  Begin
+    R := 1; SetErr(0);
+  End
+  Else SetErr(50);
+  If PRet <> 0 Then MemL[0:PRet] := Ret;
+  { ERROR_MORE_DATA : la sortie partielle est valide }
+  DeviceIoControl := R;
 End;
 
 Function GetComputerNameW(Buf, PN : LongInt) : LongInt;
@@ -85557,5 +86028,6 @@ BEGIN
   CursorDraw;
   KLog('Memoire libre : ' + IntStr(HeapFreeBytes Div 1024) + ' Ko');
   StartupSound;
+  RunKeyApps;
   SystemLoop;
 END.
