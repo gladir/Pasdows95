@@ -9934,6 +9934,16 @@ Begin
  {$I-} Reset(F, 1); {$I+}
  FileMode:=OldFileMode;
  If IOResult <> 0 Then Exit;
+ { fichier vide (Nouveau, Image bitmap du bureau) : nouvelle image qui
+   portera ce nom, comme Paint de Windows }
+ If FileSize(F) = 0 Then Begin
+  {$I-} Close(F); {$I+}
+  If IOResult <> 0 Then;
+  ImageBuffer.FileName := FileName;
+  ImageBuffer.Format := FMT_BMP;
+  LoadImage := True;
+  Exit;
+ End;
  {$I-} Close(F); {$I+}
  If IOResult <> 0 Then;
 
