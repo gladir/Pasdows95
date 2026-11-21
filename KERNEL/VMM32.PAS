@@ -123,6 +123,11 @@ Const
 
 Type
   TLanguage = (_French, _English, _Germany, _Italian, _Spain);
+  { tableaux alloues dans le tas a l'initialisation (taille reelle
+    donnee a KAlloc ; l'image du noyau doit rester sous 3 Mo) }
+  TLongArr = Array[0..65535] Of LongInt;
+  TByteArr = Array[0..65535] Of Byte;
+  TStr127Arr = Array[0..255] Of String[127];
 
   TDescPtr = Record
     Limit : Word;
@@ -1778,8 +1783,9 @@ End;
 
 Const
   MaxDisk = 4;
-  MaxVol = 4;
+  MaxVol = 12;                       { disques et lecteurs reseau }
   MaxFo = 32;
+  NetT = 20;                         { VolType d'un lecteur reseau }
   SecSlots = 64;
   FatEoc = $0FFFFFFF;
 
@@ -7615,6 +7621,25 @@ End;
 { Operations sur les fichiers (appelees par l'API Win32)               }
 { ------------------------------------------------------------------ }
 
+{ lecteurs reseau (client SMB2, partie 16c) }
+Function SmbResolve(V : LongInt; Path : String) : Boolean; Forward;
+Function NetDirEntry(Dir : String; Var Idx : LongInt) : Boolean;
+  Forward;
+Function NetOpen(V : LongInt; Path, Orig : String; Wr : Boolean;
+                 Disp : LongInt; Var Err : LongInt) : LongInt; Forward;
+Function NetRead(F, Pos0, N0, Dst : LongInt) : LongInt; Forward;
+Function NetWrite(F, Pos0, N0, Src : LongInt) : LongInt; Forward;
+Function NetSetSize(F, NewSize : LongInt) : Boolean; Forward;
+Procedure NetCloseF(F : LongInt); Forward;
+Function NetRemove(V : LongInt; Path : String; Dir : Boolean)
+  : LongInt; Forward;
+Function NetMkDir(V : LongInt; Path, Orig : String) : LongInt;
+  Forward;
+Function NetRename(V : LongInt; Src, Dst, Orig : String) : LongInt;
+  Forward;
+Procedure NetSpace(V : LongInt; Var Free0, Total, Spc : LongInt); Forward;
+Function NdLabel(V : LongInt) : String; Forward;
+
 { Informations sur un chemin complet d'un volume FAT }
 Function FatPathInfo(Const Path : String; Var Attr, Size, Time : LongInt)
   : Boolean;
@@ -7630,6 +7655,10 @@ Begin
   Else If VolType[V] = HpfsT Then
   Begin
     If Not HpResolve(V, Path) Then Exit;
+  End
+  Else If VolType[V] = NetT Then
+  Begin
+    If Not SmbResolve(V, Path) Then Exit;
   End
   Else If Not FatResolve(V, Path) Then Exit;
   Attr := FfAttr And $37;
@@ -7696,6 +7725,11 @@ Begin
     FatMkDir := HpMkDir(V, Path, Orig);
     Exit;
   End;
+  If VolType[V] = NetT Then
+  Begin
+    FatMkDir := NetMkDir(V, Path, Orig);
+    Exit;
+  End;
   If FatResolve(V, Path) Then
   Begin
     FatMkDir := 183;                               { existe deja }
@@ -7721,6 +7755,11 @@ Begin
   If (V >= 0) And (VolType[V] = HpfsT) Then
   Begin
     FatRmDir := HpRemove(V, Path, True);
+    Exit;
+  End;
+  If (V >= 0) And (VolType[V] = NetT) Then
+  Begin
+    FatRmDir := NetRemove(V, Path, True);
     Exit;
   End;
   If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
@@ -7752,6 +7791,11 @@ Begin
   If (V >= 0) And (VolType[V] = HpfsT) Then
   Begin
     FatDelete := HpRemove(V, Path, False);
+    Exit;
+  End;
+  If (V >= 0) And (VolType[V] = NetT) Then
+  Begin
+    FatDelete := NetRemove(V, Path, False);
     Exit;
   End;
   If (V < 0) Or Not FatResolve(V, Path) Or (FfIdx < 0) Then Exit;
@@ -7792,6 +7836,11 @@ Begin
   If VolType[V] = HpfsT Then
   Begin
     FatRename := HpRename(V, Src, Dst, Orig);
+    Exit;
+  End;
+  If VolType[V] = NetT Then
+  Begin
+    FatRename := NetRename(V, Src, Dst, Orig);
     Exit;
   End;
   If Not FatResolve(V, Src) Or (FfIdx < 0) Then Exit;
@@ -7852,6 +7901,11 @@ Begin
   If VolType[V] = HpfsT Then
   Begin
     FatOpen := HpOpen(V, Path, Orig, Wr, Disp, Err);
+    Exit;
+  End;
+  If VolType[V] = NetT Then
+  Begin
+    FatOpen := NetOpen(V, Path, Orig, Wr, Disp, Err);
     Exit;
   End;
   Ex := FatResolve(V, Path);
@@ -7960,6 +8014,11 @@ Begin
     FatRead := HpRead(F, Pos0, N, Dst);
     Exit;
   End;
+  If VolType[FoVol[F]] = NetT Then
+  Begin
+    FatRead := NetRead(F, Pos0, N, Dst);
+    Exit;
+  End;
   If Pos0 + N > FoSize[F] Then N := FoSize[F] - Pos0;
   If N < 0 Then N := 0;
   CB := ClusBytes(FoVol[F]);
@@ -7989,6 +8048,11 @@ Begin
   If VolType[FoVol[F]] = HpfsT Then
   Begin
     FatWrite := HpWrite(F, Pos0, N, Src);
+    Exit;
+  End;
+  If VolType[FoVol[F]] = NetT Then
+  Begin
+    FatWrite := NetWrite(F, Pos0, N, Src);
     Exit;
   End;
   { ecriture au-dela de la fin : remplir l'intervalle de zeros }
@@ -8028,6 +8092,11 @@ Begin
   If VolType[FoVol[F]] = HpfsT Then
   Begin
     FatSetSize := HpSetSize(F, NewSize);
+    Exit;
+  End;
+  If VolType[FoVol[F]] = NetT Then
+  Begin
+    FatSetSize := NetSetSize(F, NewSize);
     Exit;
   End;
   If NewSize = FoSize[F] Then Exit;
@@ -8074,6 +8143,11 @@ Begin
     If FoDirty[F] Then HpClose(F);
     Exit;
   End;
+  If VolType[FoVol[F]] = NetT Then
+  Begin
+    NetCloseF(F);
+    Exit;
+  End;
   If FoDirty[F] Then FatFlush;
 End;
 
@@ -8092,7 +8166,7 @@ Begin
       KFree(A);
       A := 0;
     End;
-  FoUsed[F] := False;
+  FatClose(F);
   FatLoad := A;
 End;
 
@@ -8115,6 +8189,11 @@ Begin
     FatDirEntry := HpDirEntry(Dir, Idx);
     Exit;
   End;
+  If VolType[V] = NetT Then
+  Begin
+    FatDirEntry := NetDirEntry(Dir, Idx);
+    Exit;
+  End;
   C := FatDirClus(V, Dir);
   If C < 0 Then Exit;
   K := 0;
@@ -8129,6 +8208,11 @@ End;
 { Espace libre et total d'un volume (en clusters) }
 Procedure FatSpace(V : LongInt; Var Free0, Total, Spc : LongInt);
 Begin
+  If VolType[V] = NetT Then
+  Begin
+    NetSpace(V, Free0, Total, Spc);
+    Exit;
+  End;
   If (VolType[V] = NtfsT) Or (VolType[V] = HpfsT) Then
   Begin
     Free0 := VolFree[V]; Total := VolClus[V]; Spc := VolSpc[V];
@@ -8261,7 +8345,8 @@ Const
   icCards    = 40; icAddress  = 41; icImaging  = 42; icCdPlayer = 43;
   icFind     = 44; icScanDisk = 45; icDxDiag   = 46; icCharMap  = 47;
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
-  icMsInfo   = 52; icTaskSch  = 53;
+  icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
+  icAppWiz   = 56;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -8321,9 +8406,9 @@ Var
   SysPal    : Array[0..767] Of Byte;       { R, G, B (8 bits) }
   SysX      : Array[0..255] Of LongInt;    { la meme en 00RRGGBB }
   PalVer    : LongInt;
-  NcKey     : Array[0..4095] Of LongInt;   { antememoire RGB -> indice }
-  NcVal     : Array[0..4095] Of Byte;
-  NcVer     : Array[0..4095] Of LongInt;
+  NcKey     : ^TLongArr;  { antememoire RGB -> indice (4096, tas) }
+  NcVal     : ^TByteArr;
+  NcVer     : ^TLongArr;
   { cible de dessin courante (coordonnees ecran, bornes incluses) }
   DS        : TSurf;
   DOX, DOY  : LongInt;
@@ -8699,9 +8784,9 @@ Var Key, H, I, D, BestD, Best, DR, DG, DB : LongInt;
 Begin
   Key := (R Shl 16) Or (G Shl 8) Or B;
   H := ((R * 7) Xor (G * 31) Xor (B * 131) Xor (R Shr 3)) And 4095;
-  If (NcVer[H] = PalVer) And (NcKey[H] = Key) Then
+  If (NcVer^[H] = PalVer) And (NcKey^[H] = Key) Then
   Begin
-    NearestIdx := NcVal[H];
+    NearestIdx := NcVal^[H];
     Exit;
   End;
   Best := 0; BestD := $7FFFFFFF;
@@ -8716,7 +8801,7 @@ Begin
       If D = 0 Then Break;
     End;
   End;
-  NcVer[H] := PalVer; NcKey[H] := Key; NcVal[H] := Best;
+  NcVer^[H] := PalVer; NcKey^[H] := Key; NcVal^[H] := Best;
   NearestIdx := Best;
 End;
 
@@ -9774,6 +9859,37 @@ Begin
       QD(15, 12, 5, cWhite);
       QR(14, 9, 16, 9, cBlue);
       QR(14, 11, 16, 15, cBlue);
+    End;
+    icNetDrv :
+    Begin
+      { lecteur reseau : disque, cable et prise }
+      IFrame(3, 4, 28, 15, cSilver);
+      QR(4, 5, 27, 5, cWhite);
+      QR(6, 11, 12, 12, cGray);
+      QR(23, 12, 25, 13, cLime);
+      QR(15, 16, 16, 23, cBlack);
+      QR(3, 26, 28, 27, cBlack);
+      IFrame(11, 21, 20, 29, cGreen);
+      QR(13, 23, 18, 24, cLime);
+    End;
+    icFonts :
+    Begin
+      { dossier des polices : lettre A }
+      IconFolder(cYellow);
+      QL(10, 26, 16, 11, cNavy); QL(11, 26, 17, 11, cNavy);
+      QL(16, 11, 22, 26, cNavy); QL(17, 11, 23, 26, cNavy);
+      QR(13, 20, 20, 21, cNavy);
+    End;
+    icAppWiz :
+    Begin
+      { boite de logiciel et disque compact }
+      IFrame(3, 8, 19, 29, cSilver);
+      QR(5, 11, 17, 16, cBlue);
+      QR(5, 19, 17, 20, cGray); QR(5, 23, 14, 24, cGray);
+      QD(21, 13, 9, cAqua);
+      QC(21, 13, 9, cGray);
+      QD(21, 13, 3, cWhite);
+      QC(21, 13, 3, cGray);
     End;
     icTaskSch :
     Begin
@@ -11594,7 +11710,7 @@ Const
   ikScanDisk = 30;
   ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
-  ikMdiClient = 27; ikConProps = 31;
+  ikMdiClient = 27; ikConProps = 31; ikMapDrv = 32;
 
 Type
   TClass = Record
@@ -11687,6 +11803,11 @@ Var
   KExt     : Boolean;
   LastClickT, LastClickW, LastClickX, LastClickY : LongInt;
   MouseBtn : LongInt;
+  { Panneau de configuration (Souris, Clavier) : double-clic (ms),
+    vitesse du pointeur (1..20), delai (0..3) et vitesse (0..31) de la
+    repetition des touches, boutons inverses (gaucher) }
+  DblMs, MouSpd, KbDelay, KbSpeed : LongInt;
+  MouSwap : Boolean;
   { deplacement d'une fenetre par sa barre de titre }
   DragWin, DragDX, DragDY : LongInt;
   PressWin, PressBtn : LongInt;
@@ -11701,6 +11822,12 @@ Procedure ConMouse(W, Msg, X, Y : LongInt); Forward;
 Procedure ConPropsMouse(W, Msg, X, Y : LongInt); Forward;
 Procedure PaintConProps(W : LongInt); Forward;
 Procedure ConPropsKey(W, VK, Ch : LongInt); Forward;
+Procedure PaintMapDrv(W : LongInt); Forward;
+Procedure MapDrvMouse(W, Msg, X, Y : LongInt); Forward;
+Procedure MapDrvKey(W, VK, Ch : LongInt); Forward;
+Function WNetDlgOpen(Disc : Boolean) : Boolean; Forward;
+Function NetUnmap(Ch : Char; Force, Forget : Boolean) : LongInt; Forward;
+Function NetLetterFree(Ch : Char) : Boolean; Forward;
 Procedure ConSaveTo(Const P : String); Forward;
 Procedure ConCommand(Cmd : LongInt); Forward;
 Procedure KKey(W, Msg, VK, Ch : LongInt); Forward;
@@ -13324,7 +13451,7 @@ Begin
     If ((Wnds^[T].Style And WS_CAPTION) = WS_CAPTION) And
        (OY < Wnds^[T].CL + 19) Then
     Begin
-      Dbl := (LastClickW = -2 - T) And (Ticks - LastClickT < 700);
+      Dbl := (LastClickW = -2 - T) And (Ticks - LastClickT < DblMs);
       LastClickW := -2 - T; LastClickT := Ticks;
       If Dbl And ((Wnds^[T].Style And WS_MAXIMIZEBOX) <> 0) Then
       Begin
@@ -13349,7 +13476,7 @@ Begin
   Begin
     If Down Then
     Begin
-      Dbl := (LastClickW = W) And (Ticks - LastClickT < 700) And
+      Dbl := (LastClickW = W) And (Ticks - LastClickT < DblMs) And
              (Abs(CurX - LastClickX) < 4) And (Abs(CurY - LastClickY) < 4);
       LastClickW := W; LastClickT := Ticks;
       LastClickX := CurX; LastClickY := CurY;
@@ -13488,6 +13615,8 @@ Procedure VwTcloPoll; Forward;
 { Etat des boutons (souris PS/2 ou absolue) }
 Procedure MouseSetBtn(Bt : LongInt; Var Moved : Boolean);
 Begin
+  If MouSwap Then
+    Bt := (Bt And Not 3) Or ((Bt And 1) Shl 1) Or ((Bt Shr 1) And 1);
   If (Bt And 1) <> (MouseBtn And 1) Then
   Begin
     If Moved Then MouseMoved;
@@ -13600,6 +13729,11 @@ Begin
     If VbAbs Then
     Begin
       Dx := 0; Dy := 0;
+    End;
+    { vitesse du pointeur (Panneau de configuration, Souris) }
+    If (MouSpd <> 10) And (MouSpd > 0) Then
+    Begin
+      Dx := (Dx * MouSpd) Div 10; Dy := (Dy * MouSpd) Div 10;
     End;
     NX := NX + Dx; NY := NY + Dy;
     DIMX := DIMX + Dx; DIMY := DIMY + Dy; DIMBtn := Bt;
@@ -13738,6 +13872,8 @@ Const
   cmSol = 69; cmDefrag = 70; cmCleanMgr = 71; cmMsInfo = 72; cmMsTask = 73;
   cmNewFolder = 74; cmNewText = 75; cmNewBmp = 76; cmNewHtml = 77;
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
+  cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
+  cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
   cmKnownBase = 900;                 { + programme connu (KnownExe) }
   { Bloc-notes }
   cmNNew = 30; cmNOpen = 31; cmNSave = 32; cmNSaveAs = 33; cmNExit = 34;
@@ -13768,6 +13904,7 @@ Const
   mnAccess = 24; mnGames = 25;    { Programmes, Accessoires, Jeux... }
   mnMedia = 26; mnInet = 27; mnTools = 28; mnFind = 29;
   mnNew = 30; mnExpCtx = 31;      { Nouveau ; fond d'un dossier }
+  mnNetLet = 32; mnMyComp = 33;   { lettres libres ; Poste de travail }
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -13857,7 +13994,7 @@ Var
   TrayClickT : LongInt;                    { double-clic sur l'icone }
   TzDst : Boolean;
   DispiOk   : Boolean;                     { interface Bochs/QEMU (1CEh) }
-  KClass    : Array[0..31] Of LongInt;     { classe interne par sorte }
+  KClass    : Array[0..47] Of LongInt;     { classe interne par sorte }
   SysMenuW  : LongInt;                     { fenetre du menu systeme }
   { Invite MS-DOS : selection a la souris (lignes et colonnes
     affichees), mode Marquer, fenetre Proprietes }
@@ -13876,6 +14013,10 @@ Var
   DeskPath  : ^TDeskPtArr;
   LastMinute : LongInt;
   NewDir, CtxPath : String[127];     { Nouveau : dossier ; element }
+  CtxNetDrv : Char;                  { lecteur reseau du menu (#0) }
+  CtxTreeComp : Boolean;             { menu de l'arbre : Poste de travail }
+  MdLet : Char;                      { Connecter : lettre choisie }
+  MapW, MapRes : LongInt;            { boite Connecter / Deconnecter }
   NewWin, DelAskW : LongInt;         { Explorateur (-1 : bureau) }
   DimOn     : Boolean;
   ExePaths  : Array[0..15] Of String[63];
@@ -14123,7 +14264,7 @@ Begin
     (Nm = 'WAB.EXE') Or (Nm = 'IMAGING.EXE') Or (Nm = 'CDPLAYER.EXE') Or
     (Nm = 'FINDFILE.EXE') Or (Nm = 'ECHECS.EXE') Or (Nm = 'SOL.EXE') Or
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
-    (Nm = 'MSTASK.EXE');
+    (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -14387,7 +14528,7 @@ Begin
     Else If Msg = WM_LBUTTONDOWN Then
     Begin
       CloseMenus(0);
-      If Ticks - TrayClickT < 700 Then
+      If Ticks - TrayClickT < DblMs Then
       Begin
         TrayClickT := 0;
         KCommand(cmMixer);
@@ -14642,6 +14783,36 @@ Begin
   End;
 End;
 
+{ Lettres libres pour un lecteur reseau (menu de la boite Connecter) :
+  les 12 dernieres jusqu'a Z: (les fleches parcourent toutes les lettres) }
+Function NetLetAt(K : LongInt) : Char;
+Var Ch : Char; F : LongInt;
+Begin
+  NetLetAt := #0;
+  F := 0;
+  For Ch := 'E' To 'Z' Do
+    If NetLetterFree(Ch) Then Inc(F);
+  If F > 12 Then K := K + F - 12;
+  For Ch := 'E' To 'Z' Do
+    If NetLetterFree(Ch) Then
+    Begin
+      If K = 0 Then
+      Begin
+        NetLetAt := Ch;
+        Exit;
+      End;
+      Dec(K);
+    End;
+End;
+
+Function NetLetCount : LongInt;
+Var K : LongInt;
+Begin
+  K := 0;
+  While (K < 12) And (NetLetAt(K) <> #0) Do Inc(K);
+  NetLetCount := K;
+End;
+
 Function MenuCount(M : LongInt) : LongInt;
 Var N : LongInt; S : String; L : Array[0..63] Of LongInt;
 Begin
@@ -14659,12 +14830,14 @@ Begin
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
     mnInet : MenuCount := 1 + KnownCount('I');
-    mnSettings : MenuCount := 8;
+    mnSettings : MenuCount := 10;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
     mnTaskCtx : MenuCount := 2;
     mnDrvCtx : MenuCount := 5;
-    mnTreeCtx : MenuCount := 4;
+    mnNetLet : MenuCount := NetLetCount;
+    mnMyComp : MenuCount := 4;
+    mnTreeCtx : If CtxTreeComp Then MenuCount := 7 Else MenuCount := 4;
     mnConSys : MenuCount := 5;
     mnConEdit : MenuCount := 6;
     mnSysGen : MenuCount := 5;
@@ -14949,6 +15122,16 @@ Begin
         Cmd := cmFindComp; Icon := icComputer;
       End;
     mnSettings :
+    Begin
+      { Panneau de configuration, puis les applets les plus utilisees }
+      If I = 0 Then
+      Begin
+        T := L('Panneau de configuration', 'Control Panel',
+               'Systemsteuerung', 'Pannello di controllo',
+               'Panel de control');
+        Cmd := cmControl; Icon := icControl;
+      End;
+      If I >= 2 Then I := I - 2 Else I := -1;
       If I = 0 Then
       Begin
         T := L('Affichage...', 'Display...', 'Anzeige...', 'Schermo...',
@@ -14994,6 +15177,34 @@ Begin
         T := L('Mode MS-DOS', 'MS-DOS mode', 'MS-DOS-Modus',
                'Modalit'#133' MS-DOS', 'Modo MS-DOS');
         Cmd := cmDosMode; Icon := icDos;
+      End;
+    End;
+    mnNetLet :
+    Begin
+      T := NetLetAt(I) + ':';
+      Cmd := cmNetLetBase + Ord(NetLetAt(I)) - 65; Icon := icNetDrv;
+    End;
+    mnMyComp :
+      Case I Of
+        0 : Begin
+              T := L('Connecter un lecteur r'#130'seau...',
+                     'Map Network Drive...', 'Netzlaufwerk verbinden...',
+                     'Connetti unit'#133' di rete...',
+                     'Conectar a unidad de red...');
+              Cmd := cmMapDrv; Icon := icNetDrv;
+            End;
+        1 : Begin
+              T := L('D'#130'connecter un lecteur r'#130'seau...',
+                     'Disconnect Network Drive...', 'Netzlaufwerk ' +
+                     'trennen...', 'Disconnetti unit'#133' di rete...',
+                     'Desconectar unidad de red...');
+              Cmd := cmDiscDrv;
+            End;
+        3 : Begin
+              T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+                     'Propriet'#133, 'Propiedades');
+              Cmd := cmSysProps;
+            End;
       End;
     mnDesk :
       Case I Of
@@ -15191,12 +15402,32 @@ Begin
               T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
               Cmd := cmIconOpen;
             End;
-        2 : Begin
+        2 : If (NewWin < 0) And (DeskSel >= 0) And
+               (DeskCmd[DeskSel] = cmComputer) Then
+            Begin
+              T := L('Connecter un lecteur r'#130'seau...',
+                     'Map Network Drive...', 'Netzlaufwerk verbinden...',
+                     'Connetti unit'#133' di rete...',
+                     'Conectar a unidad de red...');
+              Cmd := cmMapDrv; Icon := icNetDrv;
+            End
+            Else
+            Begin
               T := L('Supprimer', 'Delete', 'L'#148'schen', 'Elimina',
                      'Eliminar');
               If CtxPath <> '' Then Cmd := cmCtxDel Else Cmd := cmGray;
             End;
-        3 : Begin
+        3 : If (NewWin < 0) And (DeskSel >= 0) And
+               (DeskCmd[DeskSel] = cmComputer) Then
+            Begin
+              T := L('D'#130'connecter un lecteur r'#130'seau...',
+                     'Disconnect Network Drive...', 'Netzlaufwerk ' +
+                     'trennen...', 'Disconnetti unit'#133' di rete...',
+                     'Desconectar unidad de red...');
+              Cmd := cmDiscDrv;
+            End
+            Else
+            Begin
               T := L('Renommer', 'Rename', 'Umbenennen', 'Rinomina',
                      'Cambiar nombre');
               If CtxPath <> '' Then Cmd := cmCtxRen Else Cmd := cmGray;
@@ -15338,7 +15569,23 @@ Begin
         T := L('Explorer', 'Explore', 'Explorer', 'Esplora', 'Explorar');
         Cmd := cmTrExplore;
       End
-      Else If I = 3 Then
+      Else If CtxTreeComp And (I = 3) Then
+      Begin
+        T := L('Connecter un lecteur r'#130'seau...',
+               'Map Network Drive...', 'Netzlaufwerk verbinden...',
+               'Connetti unit'#133' di rete...',
+               'Conectar a unidad de red...');
+        Cmd := cmMapDrv; Icon := icNetDrv;
+      End
+      Else If CtxTreeComp And (I = 4) Then
+      Begin
+        T := L('D'#130'connecter un lecteur r'#130'seau...',
+               'Disconnect Network Drive...', 'Netzlaufwerk trennen...',
+               'Disconnetti unit'#133' di rete...',
+               'Desconectar unidad de red...');
+        Cmd := cmDiscDrv;
+      End
+      Else If (I = 3) And Not CtxTreeComp Or (I = 6) Then
       Begin
         T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
                'Propriet'#133, 'Propiedades');
@@ -15349,6 +15596,12 @@ Begin
       Begin
         T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
         Cmd := cmDrvOpen;
+      End
+      Else If (I = 2) And (CtxNetDrv <> #0) Then
+      Begin
+        T := L('D'#130'connecter', 'Disconnect', 'Trennen', 'Disconnetti',
+               'Desconectar');
+        Cmd := cmNetDisc;
       End
       Else If I = 2 Then
       Begin
@@ -15930,11 +16183,38 @@ Var
   TreeCtxP : String[79];                { noeud du menu de l'arbre }
 
 { Lettre du lecteur I de la liste du Poste de travail }
+{ Volume de l'element I (>= 2) du Poste de travail : les volumes apres
+  C: qui ont une lettre (un lecteur reseau deconnecte n'en a plus) ;
+  -1 au-dela (Panneau de configuration) }
+Function ExpVolAt(I : LongInt) : LongInt;
+Var V : LongInt;
+Begin
+  ExpVolAt := -1;
+  I := I - 2;
+  For V := 1 To VolN - 1 Do
+    If VolLetter[V] >= 65 Then
+    Begin
+      If I = 0 Then
+      Begin
+        ExpVolAt := V;
+        Exit;
+      End;
+      Dec(I);
+    End;
+End;
+
+Function CplName : String;
+Begin
+  CplName := L('Panneau de configuration', 'Control Panel',
+               'Systemsteuerung', 'Pannello di controllo', 'Panel de control');
+End;
+
 Function ExpDrive(I : LongInt) : Char;
 Begin
   If I <= 0 Then ExpDrive := 'C'
   Else If I = 1 Then ExpDrive := 'D'
-  Else ExpDrive := Chr(VolLetter[I - 1]);
+  Else If ExpVolAt(I) >= 0 Then ExpDrive := Chr(VolLetter[ExpVolAt(I)])
+  Else ExpDrive := #0;
 End;
 
 { Espace libre et capacite d'un lecteur, en secteurs de 512 octets }
@@ -16022,10 +16302,17 @@ Begin
     Begin
       Nm := VolLabel + ' (D:)'; ExpEntryP := True;
     End
-    Else If I < VolN + 1 Then
+    Else If ExpVolAt(I) >= 0 Then
     Begin
-      V := I - 1;
-      Nm := Trim(VolLab[V] + ' (' + Chr(VolLetter[V]) + ':)');
+      V := ExpVolAt(I);
+      If VolType[V] = NetT Then Nm := NdLabel(V)
+      Else Nm := Trim(VolLab[V] + ' (' + Chr(VolLetter[V]) + ':)');
+      ExpEntryP := True;
+    End
+    Else If (I = 2) Or (ExpVolAt(I - 1) >= 0) Then
+    Begin
+      { apres les lecteurs, comme Windows 95 }
+      Nm := CplName; Fl := 0;
       ExpEntryP := True;
     End;
     Exit;
@@ -16079,6 +16366,8 @@ Begin
   Else If Nm = 'CLEANMGR.EXE' Then ExeIcon := icCleanMgr
   Else If Nm = 'MSINFO32.EXE' Then ExeIcon := icMsInfo
   Else If Nm = 'MSTASK.EXE' Then ExeIcon := icTaskSch
+  Else If Nm = 'CONTROL.EXE' Then ExeIcon := icControl
+  Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
   Else If Nm = 'CALC.EXE' Then ExeIcon := icCalc
@@ -16100,6 +16389,12 @@ Var E : String;
 Begin
   E := UpStr(Copy(Nm, Pos('.', Nm) + 1, 3));
   If Pos('(D:)', Nm) > 0 Then ExpIcon := icCdrom
+  Else If Nm = CplName Then ExpIcon := icControl
+  Else If (Pos(':)', Nm) > 0) And (Nm[Length(Nm)] = ')') And
+          (Length(Nm) >= 4) And
+          (FatVolOf(Copy(Nm, Length(Nm) - 2, 2)) >= 0) And
+          (VolType[FatVolOf(Copy(Nm, Length(Nm) - 2, 2))] = NetT) Then
+    ExpIcon := icNetDrv
   Else If (Pos(':)', Nm) > 0) And (Nm[Length(Nm)] = ')') Then
     ExpIcon := icHardDisk
   Else If (Fl And 2) <> 0 Then ExpIcon := icFolder
@@ -16150,7 +16445,8 @@ Function DriveName(D : Char) : String;
 Var V : LongInt;
 Begin
   V := FatVolOf(D + ':');
-  If V >= 0 Then DriveName := Trim(VolLab[V] + ' (' + D + ':)')
+  If (V >= 0) And (VolType[V] = NetT) Then DriveName := NdLabel(V)
+  Else If V >= 0 Then DriveName := Trim(VolLab[V] + ' (' + D + ':)')
   Else If D = 'D' Then DriveName := Trim(VolLabel + ' (D:)')
   Else DriveName := '(' + D + ':)';
 End;
@@ -16400,7 +16696,9 @@ Begin
     Else If Length(P) = 2 Then
     Begin
       Dr := FatVolOf(P);
-      If (P[1] = 'D') And (Dr < 0) Then Ic := icCdrom Else Ic := icHardDisk;
+      If (P[1] = 'D') And (Dr < 0) Then Ic := icCdrom
+      Else If (Dr >= 0) And (VolType[Dr] = NetT) Then Ic := icNetDrv
+      Else Ic := icHardDisk;
     End
     Else Ic := icFolder;
     PaintIcon(Ic, C + 8, Y + 1, 16);
@@ -16594,9 +16892,14 @@ Begin
         'C: es un disco virtual en memoria.'), $40);
       Exit;
     End;
+    If (I >= 2) And (ExpDrive(I) = #0) Then
+    Begin
+      RunExe('CONTROL.EXE', '');
+      Exit;
+    End;
     If I = 0 Then Wnds^[W].KS := 'C:'
     Else If I = 1 Then Wnds^[W].KS := 'D:'
-    Else Wnds^[W].KS := Chr(VolLetter[I - 1]) + ':';
+    Else Wnds^[W].KS := ExpDrive(I) + ':';
   End
   Else
   Begin
@@ -16651,6 +16954,7 @@ Begin
     KRepaint(W);
   End;
   ExpCtxW := W;
+  CtxTreeComp := TreeCtxP = '';
   CloseMenus(0);
   OpenMenu(0, mnTreeCtx, X, Y, False);
 End;
@@ -16700,8 +17004,16 @@ Begin
     End;
     ExpCtxW := W; ExpCtxI := I;
     CloseMenus(0);
-    If (I >= 0) And (Wnds^[W].KS = '') Then
+    CtxNetDrv := #0;
+    If (I >= 2) And (Wnds^[W].KS = '') And (ExpDrive(I) <> #0) Then
+      If VolType[FatVolOf(ExpDrive(I) + ':')] = NetT Then
+        CtxNetDrv := ExpDrive(I);
+    If (I >= 0) And (Wnds^[W].KS = '') And (ExpDrive(I) = #0) Then
+      RunExe('CONTROL.EXE', '')
+    Else If (I >= 0) And (Wnds^[W].KS = '') Then
       OpenMenu(0, mnDrvCtx, X, Y, False)
+    Else If Wnds^[W].KS = '' Then
+      OpenMenu(0, mnMyComp, X, Y, False)
     Else If (Wnds^[W].KS <> '') And (FatVolOf(Wnds^[W].KS) >= 0) Then
     Begin
       { dossier d'un disque : element (Ouvrir, Supprimer, Renommer) ou
@@ -20258,6 +20570,7 @@ Begin
   Ok := V >= 0;
   If Ok And (VolType[V] = NtfsT) Then Ok := NvRO[V] = 0;
   If Ok And (VolType[V] = HpfsT) Then Ok := HvRO[V] = 0;
+  If Ok And (VolType[V] = NetT) Then Ok := False;
   VpWritable := Ok;
 End;
 
@@ -20270,6 +20583,7 @@ Begin
     If VolType[V] = 32 Then VpFs := 'FAT32'
     Else If VolType[V] = NtfsT Then VpFs := 'NTFS'
     Else If VolType[V] = HpfsT Then VpFs := 'HPFS'
+    Else If VolType[V] = NetT Then VpFs := 'NTFS (SMB2)'
     Else VpFs := 'FAT';
   End
   Else If D = 'D' Then VpFs := 'CDFS'
@@ -21271,7 +21585,7 @@ Begin
         If (RowKind[R] = 1) And (X >= X0 - 16) And (X <= X0 - 4) Then
           DmActivate(W, R)
         Else If (R = Wnds^[W].K2) And (Dbl Or ((DmClickR = R) And
-                (Ticks - DmClickT < 700))) Then
+                (Ticks - DmClickT < DblMs))) Then
         Begin
           DmClickR := -1;
           DmActivate(W, R);
@@ -21635,7 +21949,7 @@ Begin
       If (R >= 0) And (R < FdN) Then
       Begin
         If (R = FdSel) And (Dbl Or ((FdClickR = R) And
-           (Ticks - FdClickT < 700))) Then
+           (Ticks - FdClickT < DblMs))) Then
         Begin
           FdClickR := -1;
           FdName := FdNm^[R];
@@ -21830,6 +22144,12 @@ Begin
     NoteCmd(Cmd);
     Exit;
   End;
+  If (Cmd >= cmNetLetBase) And (Cmd < cmNetLetBase + 26) Then
+  Begin
+    MdLet := Chr(65 + Cmd - cmNetLetBase);
+    If (MapW >= 0) And Wnds^[MapW].Used Then KRepaint(MapW);
+    Exit;
+  End;
   If (Cmd >= cmFdDrive) And (Cmd < cmFdDrive + 26) Then
   Begin
     FdDir := Chr(65 + Cmd - cmFdDrive) + ':';
@@ -21899,6 +22219,16 @@ Begin
                      'nicht ge'#148'ffnet werden.', 'Impossibile aprire il ' +
                      'file.', 'No se puede abrir el archivo.'), $10);
     cmCtxDel : CtxDeleteAsk;
+    cmMapDrv : WNetDlgOpen(False);
+    cmDiscDrv : WNetDlgOpen(True);
+    cmControl : RunExe('CONTROL.EXE', '');
+    cmNetDisc :
+      If CtxNetDrv <> #0 Then
+      Begin
+        I := NetUnmap(CtxNetDrv, False, True);
+        If I = 2401 Then
+          NetUnmap(CtxNetDrv, True, True);
+      End;
     cmCtxRen : CtxRenameOpen;
     cmFoldProps :
       If CtxPath <> '' Then FolderProps(CtxPath) Else FolderProps(NewDir);
@@ -22077,6 +22407,11 @@ Begin
     ConPropsMouse(W, Msg, X, Y);
     Exit;
   End;
+  If (W >= 0) And (Wnds^[W].IKind = ikMapDrv) Then
+  Begin
+    MapDrvMouse(W, Msg, X, Y);
+    Exit;
+  End;
   If W < 0 Then
   Begin
     { bureau }
@@ -22100,7 +22435,7 @@ Begin
       Else OpenMenu(0, mnDesk, X, Y, False);
       Exit;
     End;
-    If (I >= 0) And (I = LastClickW - 10000) And (Ticks - LastClickT < 700)
+    If (I >= 0) And (I = LastClickW - 10000) And (Ticks - LastClickT < DblMs)
     Then
     Begin
       LastClickW := -1;
@@ -23271,6 +23606,7 @@ Begin
     ikVolProps : VolPropsKey(W, VK, Ch);
     ikScanDisk : If VK = $1B Then ScanClose(W);
     ikConProps : ConPropsKey(W, VK, Ch);
+    ikMapDrv : MapDrvKey(W, VK, Ch);
     ikFileDlg : FileDlgKey(W, VK, Ch);
     ikFind : FindKey(W, VK, Ch);
     ikDevProps : If (VK = $0D) Or (VK = $1B) Then
@@ -23343,6 +23679,7 @@ Begin
     ikVolProps : PaintVolProps(W);
     ikScanDisk : PaintScanDisk(W);
     ikConProps : PaintConProps(W);
+    ikMapDrv : PaintMapDrv(W);
     ikFileDlg : PaintFileDlg(W);
     ikFind : PaintFind(W);
     ikDevProps : PaintDevProps(W);
@@ -26479,7 +26816,9 @@ Begin
   If S = '' Then S := CurDirS;
   If FatVolOf(Copy(S, 1, 1) + ':') >= 0 Then
   Begin
-    GetDriveTypeA := 3;
+    If VolType[FatVolOf(Copy(S, 1, 1) + ':')] = NetT Then
+      GetDriveTypeA := 4                          { DRIVE_REMOTE }
+    Else GetDriveTypeA := 3;
     Exit;
   End;
   Case S[1] Of
@@ -26535,6 +26874,7 @@ Begin
       If VolType[V] = 32 Then PutPStr(PFs, 'FAT32', FsSize)
       Else If VolType[V] = NtfsT Then PutPStr(PFs, 'NTFS', FsSize)
       Else If VolType[V] = HpfsT Then PutPStr(PFs, 'HPFS', FsSize)
+      Else If VolType[V] = NetT Then PutPStr(PFs, 'NTFS', FsSize)
       Else PutPStr(PFs, 'FAT', FsSize);
     If (PFlags <> 0) And (VolType[V] = NtfsT) Then MemL[0:PFlags] := $1F;
     If (PFlags <> 0) And (VolType[V] = HpfsT) Then MemL[0:PFlags] := 3;
@@ -26570,6 +26910,7 @@ Begin
   VolSetLabel := False;
   If (V < 0) Or (V >= VolN) Then Exit;
   Lab := Trim(Copy(Lab, 1, 11));
+  If VolType[V] = NetT Then Exit;
   If VolType[V] = NtfsT Then
   Begin
     If NvRO[V] <> 0 Then Exit;
@@ -32765,6 +33106,13 @@ Begin
   Begin
     { icones du systeme (LoadIcon(0, IDI_...)) : IDI_HAND, IDI_QUESTION,
       IDI_EXCLAMATION, IDI_ASTERISK ; l'icone d'application sinon }
+    { icones du noyau (ExtractIcon d'une applet .CPL) }
+    If (H >= $7E00) And (H < $7F00) Then
+    Begin
+      If CW <= 0 Then CW := 32;
+      PaintIcon(H - $7E00, X, Y, CW);
+      Exit;
+    End;
     Case H Of
       $7F01 : PaintIcon(icError, X, Y, 32);
       $7F02 : PaintIcon(icQuestion, X, Y, 32);
@@ -33032,7 +33380,17 @@ End;
 
 Function GetDoubleClickTime : LongInt;
 Begin
-  GetDoubleClickTime := 500;
+  GetDoubleClickTime := DblMs;
+End;
+
+Procedure InputSave; Forward;
+Procedure KbTypematic; Forward;
+
+Function SetDoubleClickTime(Ms : LongInt) : LongInt;
+Begin
+  If Ms <= 0 Then Ms := 500;
+  DblMs := Min(Ms, 5000);
+  SetDoubleClickTime := 1;
 End;
 
 Function GetCaretBlinkTime : LongInt;
@@ -33048,6 +33406,11 @@ End;
 
 Function GetSystemMetrics(I : LongInt) : LongInt;
 Begin
+  If I = 23 Then
+  Begin
+    GetSystemMetrics := Ord(MouSwap);                 { SM_SWAPBUTTON }
+    Exit;
+  End;
   Case I Of
     0, 16 : GetSystemMetrics := ScrW;
     1 : GetSystemMetrics := ScrH;
@@ -33086,6 +33449,35 @@ Function SystemParametersInfoA(Act, Param, PV, WinIni : LongInt) : LongInt;
 Var R : TRect;
 Begin
   SystemParametersInfoA := 1;
+  { souris et clavier (Panneau de configuration) ; SPIF_UPDATEINIFILE :
+    dans HKCU\Control Panel }
+  Case Act Of
+    10, 22, 112 :
+    Begin
+      If PV <> 0 Then
+        Case Act Of
+          10 : MemL[0:PV] := KbSpeed;
+          22 : MemL[0:PV] := KbDelay;
+        Else
+          MemL[0:PV] := MouSpd;
+        End;
+      Exit;
+    End;
+    11, 23, 32, 33, 113 :
+    Begin
+      Case Act Of
+        11 : KbSpeed := Max(0, Min(Param, 31));
+        23 : KbDelay := Max(0, Min(Param, 3));
+        32 : If Param <= 0 Then DblMs := 500 Else DblMs := Min(Param, 5000);
+        33 : MouSwap := Param <> 0;
+      Else
+        MouSpd := Max(1, Min(PV, 20));
+      End;
+      If (Act = 11) Or (Act = 23) Then KbTypematic;
+      If (WinIni And 1) <> 0 Then InputSave;
+      Exit;
+    End;
+  End;
   Case Act Of
     48 :
     Begin
@@ -38728,6 +39120,68 @@ Begin
   If K >= 0 Then RVSize^[K] := Length(V) + 1;
 End;
 
+{ Valeur chaine Nm de la cle Path (racine Root), '' si absente }
+Function RegGetStrK(Root : LongInt; Path, Nm : String) : String;
+Var K : LongInt;
+Begin
+  RegGetStrK := '';
+  K := RegWalk(Root, Path, False);
+  If K < 0 Then Exit;
+  K := RegVal(K, Nm);
+  If (K >= 0) And (RVData^[K] <> 0) Then RegGetStrK := PStr(RVData^[K]);
+End;
+
+{ Repetition des touches : commande F3h du clavier (delai 0..3, vitesse :
+  0 lente .. 31 rapide, comme Windows ; le clavier compte a l'envers) }
+Procedure KbTypematic;
+Begin
+  KbcWaitIn;
+  Port[$60] := $F3;
+  KbcWaitIn;
+  Port[$60] := ((KbDelay And 3) Shl 5) Or (31 - (KbSpeed And 31));
+End;
+
+Procedure InputSave;
+Begin
+  RegSetStrK(1, 'Control Panel\Mouse', 'DoubleClickSpeed', IntStr(DblMs));
+  RegSetStrK(1, 'Control Panel\Mouse', 'SwapMouseButtons',
+             IntStr(Ord(MouSwap)));
+  RegSetStrK(1, 'Control Panel\Mouse', 'MouseSensitivity', IntStr(MouSpd));
+  RegSetStrK(1, 'Control Panel\Keyboard', 'KeyboardDelay', IntStr(KbDelay));
+  RegSetStrK(1, 'Control Panel\Keyboard', 'KeyboardSpeed', IntStr(KbSpeed));
+  RegSaveDue := True;
+End;
+
+{ Valeurs du registre au demarrage (souris, clavier, langue) }
+Procedure InputRestore;
+Var S : String; V, C : LongInt;
+Begin
+  S := RegGetStrK(1, 'Control Panel\Mouse', 'DoubleClickSpeed');
+  Val(S, V, C);
+  If (S <> '') And (C = 0) And (V >= 100) Then DblMs := Min(V, 5000);
+  MouSwap := RegGetStrK(1, 'Control Panel\Mouse', 'SwapMouseButtons') = '1';
+  S := RegGetStrK(1, 'Control Panel\Mouse', 'MouseSensitivity');
+  Val(S, V, C);
+  If (S <> '') And (C = 0) Then MouSpd := Max(1, Min(V, 20));
+  S := RegGetStrK(1, 'Control Panel\Keyboard', 'KeyboardDelay');
+  Val(S, V, C);
+  If (S <> '') And (C = 0) Then KbDelay := Max(0, Min(V, 3));
+  S := RegGetStrK(1, 'Control Panel\Keyboard', 'KeyboardSpeed');
+  Val(S, V, C);
+  If (S <> '') And (C = 0) Then KbSpeed := Max(0, Min(V, 31));
+  KbTypematic;
+  { Parametres regionaux : langue de Pasdows (Locale, comme Windows 95) }
+  S := UpStr(RegGetStrK(1, 'Control Panel\International', 'Locale'));
+  S := Copy(S, Length(S) - 3, 4);
+  If (S = '040C') Or (S = '0C0C') Or (S = '080C') Or (S = '100C') Then
+    Language := _French
+  Else If (S = '0409') Or (S = '0809') Or (S = '1009') Then
+    Language := _English
+  Else If (S = '0407') Or (S = '0807') Then Language := _Germany
+  Else If (S = '0410') Or (S = '0810') Then Language := _Italian
+  Else If (S = '040A') Or (S = '0C0A') Then Language := _Spain;
+End;
+
 Procedure RegDelTree(K : LongInt);
 Var I : LongInt;
 Begin
@@ -39189,7 +39643,7 @@ Var
     (' VBE.DLL FM20.DLL ', vide : tous) ; ImpTrace : module en cours }
   TraceMods : String;
   ImpTrace : Boolean;
-  TrRet, TrName : Array[0..MaxThread * 32 - 1] Of LongInt;
+  TrRet, TrName : ^TLongArr;               { MaxThread * 32, tas }
   TrDepth : Array[0..MaxThread - 1] Of LongInt;
   TraceSkip : String;
 
@@ -39351,8 +39805,8 @@ Begin
     D := TrDepth[CurT];
     If (D < 32) And (TraceRetStub <> 0) Then
     Begin
-      TrRet[CurT * 32 + D] := MemL[0:F + 44];
-      TrName[CurT * 32 + D] := Name;
+      TrRet^[CurT * 32 + D] := MemL[0:F + 44];
+      TrName^[CurT * 32 + D] := Name;
       TrDepth[CurT] := D + 1;
       MemL[0:F + 44] := TraceRetStub;
     End;
@@ -39374,8 +39828,8 @@ Begin
     HaltCpu;
   End;
   TrDepth[CurT] := D;
-  MemL[0:F + 40] := TrRet[CurT * 32 + D];
-  KLog('< ' + PStr(TrName[CurT * 32 + D]) + ' = ' + HexStr(MemL[0:F + 36], 8));
+  MemL[0:F + 40] := TrRet^[CurT * 32 + D];
+  KLog('< ' + PStr(TrName^[CurT * 32 + D]) + ' = ' + HexStr(MemL[0:F + 36], 8));
 End;
 
 Procedure TraceInit;
@@ -42081,46 +42535,6 @@ Begin
   Until N <= 0;
   KFree(B);
   LZCopy := T;
-End;
-
-{ -------------------------------- MPR ------------------------------ }
-{ Pas de reseau }
-
-Function WNetGetConnectionA(PLocal, PRemote, PLen : LongInt) : LongInt;
-Begin
-  WNetGetConnectionA := 2250;
-End;
-
-Function WNetAddConnectionA(PRemote, PPass, PLocal : LongInt) : LongInt;
-Begin
-  WNetAddConnectionA := 1222;
-End;
-
-Function WNetAddConnection2A(PRes, PPass, PUser, Flags : LongInt) : LongInt;
-Begin
-  WNetAddConnection2A := 1222;
-End;
-
-Function WNetCancelConnectionA(PName, Force : LongInt) : LongInt;
-Begin
-  WNetCancelConnectionA := 2250;
-End;
-
-Function WNetCancelConnection2A(PName, Flags, Force : LongInt) : LongInt;
-Begin
-  WNetCancelConnection2A := 2250;
-End;
-
-Function WNetConnectionDialog(H, Typ : LongInt) : LongInt;
-Begin
-  WNetConnectionDialog := 1222;
-End;
-
-Function WNetGetLastErrorA(PErr, PBuf, NBuf, PName, NName : LongInt)
-  : LongInt;
-Begin
-  If PErr <> 0 Then MemL[0:PErr] := 0;
-  WNetGetLastErrorA := 0;
 End;
 
 { ----------------------- Unicode et parametres regionaux ------------ }
@@ -45205,7 +45619,7 @@ Var
   NeSegSel : Array[0..MaxNe * MaxNeSeg - 1] Of LongInt;
   { API : module (lettre), ordinal, signature, taille des arguments }
   ApiLet : Array[0..W16ApiN - 1] Of Char;
-  ApiOrd, ApiArgB, ApiEq : Array[0..W16ApiN - 1] Of LongInt;
+  ApiOrd, ApiArgB, ApiEq : ^TLongArr;      { W16ApiN, tas }
   ApiWarned : Array[0..W16ApiN - 1] Of Boolean;
   W16Env : LongInt;
   SysLetS : String;
@@ -45298,32 +45712,32 @@ Begin
   Begin
     S := W16Apis(I);
     ApiLet[I] := S[1];
-    Val(Copy(S, 2, 3), ApiOrd[I], V);
-    ApiEq[I] := -1;
+    Val(Copy(S, 2, 3), ApiOrd^[I], V);
+    ApiEq^[I] := -1;
     ApiWarned[I] := False;
     If S[6] = '=' Then
     Begin
       Sg := Copy(S, 7, 20);
       If Pos(' ', Sg) > 0 Then Sg := Copy(Sg, 1, Pos(' ', Sg) - 1);
-      Val(Sg, ApiEq[I], V);
-      ApiArgB[I] := 0;
+      Val(Sg, ApiEq^[I], V);
+      ApiArgB^[I] := 0;
       Continue;
     End;
     Sg := ApiSig(I);
-    If (Sg = 'V') Or (Sg = 'R') Or (Sg = 'X') Then ApiArgB[I] := 0
-    Else ApiArgB[I] := SigBytes(Sg);
+    If (Sg = 'V') Or (Sg = 'R') Or (Sg = 'X') Then ApiArgB^[I] := 0
+    Else ApiArgB^[I] := SigBytes(Sg);
     A := W16ThunkLin + I * 16;
     PutB(A, $68); PutB(A, I And $FF); PutB(A, I Shr 8);
     PutB(A, $9A); PutB(A, 0); PutB(A, 0); PutB(A, SelGateApi); PutB(A, 0);
-    If ApiArgB[I] = 0 Then PutB(A, $CB)
+    If ApiArgB^[I] = 0 Then PutB(A, $CB)
     Else
     Begin
-      PutB(A, $CA); PutB(A, ApiArgB[I] And $FF); PutB(A, ApiArgB[I] Shr 8);
+      PutB(A, $CA); PutB(A, ApiArgB^[I] And $FF); PutB(A, ApiArgB^[I] Shr 8);
     End;
   End;
   { __WINFLAGS : mode protege, 486, mode etendu, coprocesseur, pagination }
   For I := 0 To W16ApiN - 1 Do
-    If (ApiLet[I] = 'K') And (ApiOrd[I] = 178) Then ApiEq[I] := $0C29;
+    If (ApiLet[I] = 'K') And (ApiOrd^[I] = 178) Then ApiEq^[I] := $0C29;
 End;
 
 Function ApiFind(Let : Char; Ord : LongInt) : LongInt;
@@ -45331,7 +45745,7 @@ Var I : LongInt;
 Begin
   ApiFind := -1;
   For I := 0 To W16ApiN - 1 Do
-    If (ApiLet[I] = Let) And (ApiOrd[I] = Ord) Then
+    If (ApiLet[I] = Let) And (ApiOrd^[I] = Ord) Then
     Begin
       ApiFind := I;
       Exit;
@@ -45498,10 +45912,10 @@ Begin
       KLog('Win16 : ordinal inconnu ' + Nm + '.' + IntStr(Ord));
       Exit;
     End;
-    If ApiEq[I] >= 0 Then
+    If ApiEq^[I] >= 0 Then
     Begin
       Eq := True;
-      NeImport := ApiEq[I];
+      NeImport := ApiEq^[I];
       Exit;
     End;
     NeImport := MakeFar(W16ThunkSel, I * 16);
@@ -46215,7 +46629,7 @@ End;
 
 Var
   T16Psp, T16Show : Array[0..MaxThread - 1] Of LongInt;
-  T16Cmd : Array[0..MaxThread - 1] Of String[127];
+  T16Cmd : ^TStr127Arr;                     { MaxThread, tas }
   NeSeq : Array[0..MaxNe - 1] Of LongInt;
   NeSeqN : LongInt;
 
@@ -46295,7 +46709,7 @@ Begin
   Lin := SelBase(T16Psp[CurT]);
   Mem[0:Lin] := $CD; Mem[0:Lin + 1] := $20;
   MemW[0:Lin + $2C] := W16Env;
-  S := T16Cmd[CurT];
+  S := T16Cmd^[CurT];
   If S <> '' Then S := ' ' + S;
   If Length(S) > 125 Then S := Copy(S, 1, 125);
   Mem[0:Lin + $80] := Length(S);
@@ -46369,7 +46783,7 @@ Begin
   ThrW16[T] := True;
   ThrOwner[T] := 16 + T;
   ThrProc[T] := 0; ThrCurP[T] := 0; ThrCr3[T] := KPd;
-  T16Cmd[T] := Args;
+  T16Cmd^[T] := Args;
   T16Show[T] := Show;
   T16Sp[T] := 0;
   RunNe := True;
@@ -47106,7 +47520,7 @@ Procedure W16Dispatch(Idx : LongInt);
 Var Code, R, P, K, N, S, H, M, T, F, Ss, Sp : LongInt; Str : String;
 Begin
   If W16Buf = 0 Then W16Buf := KAlloc(4096);
-  Code := Pos(ApiLet[Idx], SysLetS) * 1000 + ApiOrd[Idx];
+  Code := Pos(ApiLet[Idx], SysLetS) * 1000 + ApiOrd^[Idx];
   If ApiSig(Idx) <> 'R' Then SetDXAX(0);
   Case Code Of
     { -------------------------------- KERNEL ------------------------ }
@@ -47636,7 +48050,7 @@ Begin
       ApiWarned[Idx] := True;
       KLog('Win16 : API non implementee ' + ApiName(Idx) + ' (' +
            W16SysMods[Pos(ApiLet[Idx], SysLetS)] + '.' +
-           IntStr(ApiOrd[Idx]) + ')');
+           IntStr(ApiOrd^[Idx]) + ')');
     End;
   End;
 End;
@@ -69203,6 +69617,8 @@ Begin
   MsgBoxOpen('Ping', S, I);
 End;
 
+Function NetUseCmd(S : String) : Boolean; Forward;
+
 { Commandes TCP/IP de la boite Executer }
 Function NetRunCmd(S : String) : Boolean;
 Var U : String;
@@ -69214,8 +69630,2403 @@ Begin
      (U = 'IPCONFIG.EXE') Then NetConfigBox
   Else If (Copy(U, 1, 5) = 'PING ') And (Length(Trim(Copy(S, 6, 255))) > 0)
   Then NetPingBox(Trim(Copy(S, 6, 255)))
+  Else If (U = 'NET USE') Or (Copy(U, 1, 8) = 'NET USE ') Then
+    NetUseCmd(Copy(S, 8, 255))
   Else NetRunCmd := False;
 End;
+{ ==================================================================== }
+{ Partie 16c - Lecteurs reseau : client SMB2 et MPR (WNet*)            }
+{ ==================================================================== }
+{ Connecter un lecteur reseau (\\serveur\partage -> Z:) comme Windows :
+  SMB 2.0.2 et 2.1 sur TCP 445 (Windows Server 2008 a 2022, Samba ;
+  SMB1 est desactive depuis Windows Server 2019), authentification
+  NTLMv2 dans SPNEGO, signature HMAC-SHA256 quand le serveur l'exige.
+  Le lecteur est un volume (VolType NetT, VolStart : indice du lecteur)
+  et les operations communes des volumes (FatOpen, FatRead,
+  FatDirEntry...) viennent ici : l'Explorateur, les boites Ouvrir et
+  les programmes Win32 et MS-DOS l'utilisent comme un disque. Les
+  connexions permanentes sont dans HKCU\Network\<lettre> comme sous
+  Windows (RemotePath, UserName...), avec le hachage NT du mot de passe
+  (jamais le mot de passe) ; elles sont retablies a la premiere
+  utilisation du lecteur. }
+
+Const
+  MaxNd = 8;
+  SmbBufSz = 69632;                  { 64 Ko de donnees + en-tetes }
+  SmbChunk = 61440;                  { lecture et ecriture par requete }
+  SmbCMax = 4096;                    { entrees du dossier en cache }
+  SmbCSize = 262144;
+  { NTLMSSP_NEGOTIATE : UNICODE, REQUEST_TARGET, SIGN, NTLM, ALWAYS_SIGN,
+    EXTENDED_SESSIONSECURITY, TARGET_INFO, 128, 56 }
+  NtlmFlags = LongInt($A0888215);
+  Md5K : Array[0..63] Of LongWord = (
+    $D76AA478, $E8C7B756, $242070DB, $C1BDCEEE, $F57C0FAF, $4787C62A,
+    $A8304613, $FD469501, $698098D8, $8B44F7AF, $FFFF5BB1, $895CD7BE,
+    $6B901122, $FD987193, $A679438E, $49B40821, $F61E2562, $C040B340,
+    $265E5A51, $E9B6C7AA, $D62F105D, $02441453, $D8A1E681, $E7D3FBC8,
+    $21E1CDE6, $C33707D6, $F4D50D87, $455A14ED, $A9E3E905, $FCEFA3F8,
+    $676F02D9, $8D2A4C8A, $FFFA3942, $8771F681, $6D9D6122, $FDE5380C,
+    $A4BEEA44, $4BDECFA9, $F6BB4B60, $BEBFBC70, $289B7EC6, $EAA127FA,
+    $D4EF3085, $04881D05, $D9D4D039, $E6DB99E5, $1FA27CF8, $C4AC5665,
+    $F4292244, $432AFF97, $AB9423A7, $FC93A039, $655B59C3, $8F0CCC92,
+    $FFEFF47D, $85845DD1, $6FA87E4F, $FE2CE6E0, $A3014314, $4E0811A1,
+    $F7537E82, $BD3AF235, $2AD7D2BB, $EB86D391);
+  Md5S : Array[0..15] Of Byte = (7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16,
+    23, 6, 10, 15, 21);
+  Md4S : Array[0..11] Of Byte = (3, 7, 11, 19, 3, 5, 9, 13, 3, 9, 11, 15);
+  Md4K2 : Array[0..15] Of Byte = (0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14,
+    3, 7, 11, 15);
+  Md4K3 : Array[0..15] Of Byte = (0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13,
+    3, 11, 7, 15);
+  { SPNEGO : OID de SPNEGO puis mechTypes (NTLMSSP) }
+  SpnOid : Array[0..7] Of Byte = ($06, $06, $2B, $06, $01, $05, $05, $02);
+  SpnMech : Array[0..15] Of Byte = ($A0, $0E, $30, $0C, $06, $0A, $2B,
+    $06, $01, $04, $01, $82, $37, $02, $02, $0A);
+
+Type
+  TMd = Record
+    H : Array[0..3] Of LongInt;
+    B : Array[0..63] Of Byte;
+    N, Len : LongInt;
+    Four : Boolean;                  { MD4 (sinon MD5) }
+  End;
+  TNetDrv = Record
+    Used, Conn, Sign, Persist : Boolean;
+    Vol, Sock, Tree, SessLo, SessHi, Mid, MaxRd, MaxWr, SpcT : LongInt;
+    Server, Share, User, Dom : String[63];
+  End;
+  TNdArr = Array[0..MaxNd - 1] Of TNetDrv;
+
+Var
+  Nds : ^TNdArr;
+  NdKeys : LongInt;              { 32 octets par lecteur : hachage, cle }
+  SmbTx, SmbRx, SmbWk, SmbSave : LongInt;
+  SmbBusy, SmbInConn : Boolean;
+  SmbSt : LongInt;               { dernier statut NT }
+  SmbLastErr : LongInt;          { derniere erreur Win32 (WNet) }
+  { reponse de CREATE }
+  ScFid : Array[0..3] Of LongInt;
+  ScAttr, ScSize, ScTime, ScAct : LongInt;
+  { dossier en cache (le dernier liste) }
+  SmbCBuf, SmbCIdx, SmbCN, SmbCVol, SmbCT : LongInt;
+  SmbCRel : String;
+
+{ ---- MD4 et MD5 (RFC 1320 et 1321) ---- }
+
+Function MdRol(X, N : LongInt) : LongInt;
+Begin
+  MdRol := (X Shl N) Or (X Shr (32 - N));
+End;
+
+Procedure MdBlock(Var C : TMd);
+Var M : Array[0..15] Of LongInt; X : Array[0..3] Of LongInt;
+    I, T, A, B, Cc, D, F, G, S : LongInt;
+Begin
+  For I := 0 To 15 Do
+    M[I] := C.B[I * 4] Or (C.B[I * 4 + 1] Shl 8) Or (C.B[I * 4 + 2] Shl 16)
+            Or (C.B[I * 4 + 3] Shl 24);
+  For I := 0 To 3 Do X[I] := C.H[I];
+  If C.Four Then
+    For I := 0 To 47 Do
+    Begin
+      T := (4 - (I And 3)) And 3;
+      A := X[T]; B := X[(T + 1) And 3]; Cc := X[(T + 2) And 3];
+      D := X[(T + 3) And 3];
+      If I < 16 Then
+      Begin
+        F := (B And Cc) Or ((Not B) And D); G := I; S := Md4S[I And 3];
+      End
+      Else If I < 32 Then
+      Begin
+        F := (B And Cc) Or (B And D) Or (Cc And D);
+        F := F + $5A827999; G := Md4K2[I - 16]; S := Md4S[4 + (I And 3)];
+      End
+      Else
+      Begin
+        F := (B Xor Cc Xor D) + LongInt($6ED9EBA1); G := Md4K3[I - 32];
+        S := Md4S[8 + (I And 3)];
+      End;
+      X[T] := MdRol(A + F + M[G], S);
+    End
+  Else
+    For I := 0 To 63 Do
+    Begin
+      T := (4 - (I And 3)) And 3;
+      A := X[T]; B := X[(T + 1) And 3]; Cc := X[(T + 2) And 3];
+      D := X[(T + 3) And 3];
+      If I < 16 Then
+      Begin
+        F := (B And Cc) Or ((Not B) And D); G := I;
+      End
+      Else If I < 32 Then
+      Begin
+        F := (D And B) Or ((Not D) And Cc); G := (5 * I + 1) And 15;
+      End
+      Else If I < 48 Then
+      Begin
+        F := B Xor Cc Xor D; G := (3 * I + 5) And 15;
+      End
+      Else
+      Begin
+        F := Cc Xor (B Or (Not D)); G := (7 * I) And 15;
+      End;
+      X[T] := B + MdRol(A + F + LongInt(Md5K[I]) + M[G],
+                        Md5S[(I Shr 4) * 4 + (I And 3)]);
+    End;
+  For I := 0 To 3 Do C.H[I] := C.H[I] + X[I];
+End;
+
+Procedure MdInit(Var C : TMd; Four : Boolean);
+Begin
+  C.H[0] := $67452301; C.H[1] := LongInt($EFCDAB89);
+  C.H[2] := LongInt($98BADCFE); C.H[3] := $10325476;
+  C.N := 0; C.Len := 0; C.Four := Four;
+End;
+
+Procedure MdAdd(Var C : TMd; A, N : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To N - 1 Do
+  Begin
+    C.B[C.N] := Mem[0:A + I];
+    Inc(C.N);
+    If C.N = 64 Then
+    Begin
+      MdBlock(C);
+      C.N := 0;
+    End;
+  End;
+  C.Len := C.Len + N;
+End;
+
+Procedure MdDone(Var C : TMd; Out0 : LongInt);
+Var Z : Array[0..7] Of Byte; L, I : LongInt;
+Begin
+  L := C.Len;
+  Z[0] := $80;
+  MdAdd(C, LongInt(@Z[0]), 1);
+  Z[0] := 0;
+  While C.N <> 56 Do MdAdd(C, LongInt(@Z[0]), 1);
+  Z[0] := (L Shl 3) And 255; Z[1] := (L Shr 5) And 255;
+  Z[2] := (L Shr 13) And 255; Z[3] := (L Shr 21) And 255;
+  Z[4] := (L Shr 29) And 7; Z[5] := 0; Z[6] := 0; Z[7] := 0;
+  MdAdd(C, LongInt(@Z[0]), 8);
+  For I := 0 To 3 Do MemL[0:Out0 + I * 4] := C.H[I];
+End;
+
+{ HMAC-MD5 (cle de 64 octets au plus) de Msg puis Msg2 }
+Procedure HmacMd5(Key, KLen, Msg, MLen, Msg2, M2Len, Out0 : LongInt);
+Var C : TMd; Pad : Array[0..63] Of Byte; In0 : Array[0..15] Of Byte;
+    I : LongInt;
+Begin
+  For I := 0 To 63 Do
+    If I < KLen Then Pad[I] := Mem[0:Key + I] Xor $36 Else Pad[I] := $36;
+  MdInit(C, False);
+  MdAdd(C, LongInt(@Pad[0]), 64);
+  MdAdd(C, Msg, MLen);
+  If M2Len > 0 Then MdAdd(C, Msg2, M2Len);
+  MdDone(C, LongInt(@In0[0]));
+  For I := 0 To 63 Do Pad[I] := Pad[I] Xor ($36 Xor $5C);
+  MdInit(C, False);
+  MdAdd(C, LongInt(@Pad[0]), 64);
+  MdAdd(C, LongInt(@In0[0]), 16);
+  MdDone(C, Out0);
+End;
+
+{ Chaine (Latin-1) en UTF-16LE en A ; octets ecrits }
+Function SmbUni(A : LongInt; S : String) : LongInt;
+Var I : LongInt;
+Begin
+  For I := 1 To Length(S) Do MemW[0:A + (I - 1) * 2] := Ord(S[I]);
+  SmbUni := Length(S) * 2;
+End;
+
+{ Hachage NT : MD4 du mot de passe en UTF-16LE }
+Procedure NtHash(Pw : String; Out0 : LongInt);
+Var C : TMd; B : Array[0..511] Of Byte; N : LongInt;
+Begin
+  N := SmbUni(LongInt(@B[0]), Pw);
+  MdInit(C, True);
+  MdAdd(C, LongInt(@B[0]), N);
+  MdDone(C, Out0);
+End;
+
+Function HexOf(A, N : LongInt) : String;
+Var S : String; I : LongInt;
+Begin
+  S := '';
+  For I := 0 To N - 1 Do S := S + HexStr(Mem[0:A + I], 2);
+  HexOf := S;
+End;
+
+Procedure HexTo(S : String; A, N : LongInt);
+Var I, J, V, C : LongInt;
+Begin
+  For I := 0 To N - 1 Do
+  Begin
+    V := 0;
+    For J := 1 To 2 Do
+    Begin
+      If I * 2 + J <= Length(S) Then C := Ord(UpCase(S[I * 2 + J]))
+      Else C := 48;
+      If C >= 65 Then C := C - 55 Else C := C - 48;
+      V := V * 16 + (C And 15);
+    End;
+    Mem[0:A + I] := V;
+  End;
+End;
+
+{ ---- transport (TCP 445, en-tete NetBIOS de 4 octets) ---- }
+
+Function SmbTab(N : LongInt) : LongInt;
+Var A, H : LongInt;
+Begin
+  H := HeapOwner; HeapOwner := 0;
+  A := KAlloc(N);
+  HeapOwner := H;
+  If A <> 0 Then FillMem(A, N, 0);
+  SmbTab := A;
+End;
+
+Function SmbInit : Boolean;
+Var A : LongInt;
+Begin
+  SmbInit := True;
+  If Nds <> Nil Then Exit;
+  A := SmbTab(SizeOf(TNdArr));
+  Move(A, Nds, 4);
+  NdKeys := SmbTab(MaxNd * 32);
+  SmbTx := SmbTab(SmbBufSz); SmbRx := SmbTab(SmbBufSz);
+  SmbSave := SmbTab(SmbBufSz); SmbWk := SmbTab(16384);
+  SmbCBuf := SmbTab(SmbCSize); SmbCIdx := SmbTab(SmbCMax * 4);
+  SmbCVol := -1; SmbCN := 0;
+  SmbInit := (Nds <> Nil) And (SmbCIdx <> 0);
+End;
+
+{ un seul echange a la fois (plusieurs taches peuvent lire un lecteur) }
+Procedure SmbEnter;
+Begin
+  While SmbBusy Do
+    If CurT = 0 Then KYield Else KSleep(1);
+  SmbBusy := True;
+End;
+
+Procedure SmbLeave;
+Begin
+  SmbBusy := False;
+End;
+
+Procedure NdDrop(N : LongInt);
+Begin
+  If Nds^[N].Sock >= 0 Then WS_closesocket(Nds^[N].Sock);
+  Nds^[N].Sock := -1;
+  Nds^[N].Conn := False;
+End;
+
+Function SmbRecvAll(S, A, N : LongInt) : Boolean;
+Var K, R, T, I : LongInt;
+Begin
+  SmbRecvAll := False;
+  K := 0; T := Ticks; I := S - SockBase;
+  While K < N Do
+  Begin
+    If (I < 0) Or (I >= MaxSock) Or Not SkUsed[I] Then Exit;
+    If (SkRxLen[I] = 0) And ((SkFlags[I] And sfFinRcvd) = 0) And
+       (SkErr[I] = 0) Then
+    Begin
+      { 30 s sans reponse : serveur perdu }
+      If Ticks - T > 30000 Then Exit;
+      NetWait;
+      Continue;
+    End;
+    R := WS_recv(S, A + K, N - K, 0);
+    If R <= 0 Then Exit;
+    K := K + R;
+    T := Ticks;
+  End;
+  SmbRecvAll := True;
+End;
+
+{ En-tete SMB2 de la requete Cmd (SmbTx + 4) ; corps mis a zero }
+Procedure SmbHdr(N, Cmd : LongInt);
+Var A : LongInt;
+Begin
+  A := SmbTx + 4;
+  FillMem(A, 64 + 160, 0);
+  MemL[0:A] := $424D53FE;
+  MemW[0:A + 4] := 64;
+  MemW[0:A + 12] := Cmd;
+  MemW[0:A + 14] := 64;
+  MemL[0:A + 32] := $FEFF;
+  MemL[0:A + 36] := Nds^[N].Tree;
+  MemL[0:A + 40] := Nds^[N].SessLo;
+  MemL[0:A + 44] := Nds^[N].SessHi;
+End;
+
+Function NdConnect(N : LongInt) : LongInt; Forward;
+
+{ Envoyer la requete (corps de BodyLen octets) ; reponse dans SmbRx
+  (en-tete SMB2 en SmbRx, corps en SmbRx + 64) ; statut NT, -1 si la
+  connexion est perdue (une fois retablie, la requete est renvoyee) }
+Function SmbCall(N, BodyLen : LongInt) : LongInt;
+Var A, L, S, Mid, Try0 : LongInt; Sig : Array[0..31] Of Byte;
+    Ok : Boolean;
+Begin
+  SmbCall := -1; SmbSt := -1;
+  A := SmbTx + 4;
+  L := 64 + BodyLen;
+  For Try0 := 0 To 1 Do
+  Begin
+    If Not Nds^[N].Conn And Not SmbInConn Then
+    Begin
+      { connexion perdue : la retablir et renvoyer la requete }
+      If Try0 = 0 Then Exit;
+      MoveMem(SmbTx, SmbSave, L + 4);
+      If NdConnect(N) <> 0 Then Exit;
+      MoveMem(SmbSave, SmbTx, L + 4);
+      MemL[0:A + 36] := Nds^[N].Tree;
+      MemL[0:A + 40] := Nds^[N].SessLo;
+      MemL[0:A + 44] := Nds^[N].SessHi;
+    End;
+    S := Nds^[N].Sock;
+    Mid := Nds^[N].Mid;
+    Inc(Nds^[N].Mid);
+    MemL[0:A + 24] := Mid; MemL[0:A + 28] := 0;
+    MemL[0:A + 16] := MemL[0:A + 16] And Not 8;
+    FillMem(A + 48, 16, 0);
+    If Nds^[N].Sign Then
+    Begin
+      MemL[0:A + 16] := MemL[0:A + 16] Or 8;
+      TlHmac(NdKeys + N * 32 + 16, 16, A, L, 0, 0, LongInt(@Sig[0]));
+      MoveMem(LongInt(@Sig[0]), A + 48, 16);
+    End;
+    Mem[0:SmbTx] := 0;
+    Mem[0:SmbTx + 1] := (L Shr 16) And 255;
+    Mem[0:SmbTx + 2] := (L Shr 8) And 255;
+    Mem[0:SmbTx + 3] := L And 255;
+    Ok := WS_send(S, SmbTx, L + 4, 0) = L + 4;
+    While Ok Do
+    Begin
+      Ok := SmbRecvAll(S, SmbRx, 4);
+      If Not Ok Then Break;
+      L := (Mem[0:SmbRx + 1] Shl 16) Or (Mem[0:SmbRx + 2] Shl 8) Or
+           Mem[0:SmbRx + 3];
+      If (L < 64) Or (L > SmbBufSz) Then
+      Begin
+        Ok := False;
+        Break;
+      End;
+      Ok := SmbRecvAll(S, SmbRx, L);
+      If Not Ok Then Break;
+      SmbSt := MemL[0:SmbRx + 8];
+      { reponse provisoire (STATUS_PENDING) ou message d'un autre
+        numero (rupture d'oplock) : attendre la suivante }
+      If (MemL[0:SmbRx + 24] = Mid) And (SmbSt <> $103) Then
+      Begin
+        SmbCall := SmbSt;
+        Exit;
+      End;
+    End;
+    { echec : connexion fermee (le serveur coupe les sessions
+      inactives) ; une seconde tentative si elle se retablit }
+    NdDrop(N);
+    If SmbInConn Then Exit;
+    L := 64 + BodyLen;
+  End;
+End;
+
+{ Statut NT -> erreur Win32 }
+Function SmbWin(St : LongInt) : LongInt;
+Begin
+  Case St Of
+    0 : SmbWin := 0;
+    -1 : SmbWin := 59;                         { ERROR_UNEXP_NET_ERR }
+    LongInt($C0000034), LongInt($C000000F) : SmbWin := 2;
+    LongInt($C000003A), LongInt($C0000033), LongInt($C0000039) :
+      SmbWin := 3;
+    LongInt($C0000022), LongInt($C0000061), LongInt($C00000BA),
+    LongInt($C0000056), LongInt($C0000121) : SmbWin := 5;
+    LongInt($C0000035) : SmbWin := 183;
+    LongInt($C0000043), LongInt($C0000054) : SmbWin := 32;
+    LongInt($C0000101) : SmbWin := 145;
+    LongInt($C000007F) : SmbWin := 112;
+    LongInt($C0000103) : SmbWin := 267;
+    LongInt($C00000A2) : SmbWin := 19;
+    LongInt($C000006D), LongInt($C000006A), LongInt($C0000064) :
+      SmbWin := 1326;                        { ERROR_LOGON_FAILURE }
+    LongInt($C0000072) : SmbWin := 1331;     { compte desactive }
+    LongInt($C0000071) : SmbWin := 1330;     { mot de passe expire }
+    LongInt($C00000CC) : SmbWin := 67;       { ERROR_BAD_NET_NAME }
+    LongInt($C00000BB) : SmbWin := 50;
+  Else
+    SmbWin := 59;
+  End;
+End;
+
+{ ---- SPNEGO (DER) et NTLMSSP ---- }
+
+{ Tag, longueur DER puis N octets de Src en Dst ; octets ecrits }
+Function DerWrap(Tag, Src, N, Dst : LongInt) : LongInt;
+Var H : LongInt;
+Begin
+  Mem[0:Dst] := Tag;
+  If N < 128 Then
+  Begin
+    Mem[0:Dst + 1] := N; H := 2;
+  End
+  Else If N < 256 Then
+  Begin
+    Mem[0:Dst + 1] := $81; Mem[0:Dst + 2] := N; H := 3;
+  End
+  Else
+  Begin
+    Mem[0:Dst + 1] := $82; Mem[0:Dst + 2] := N Shr 8;
+    Mem[0:Dst + 3] := N And 255; H := 4;
+  End;
+  MoveMem(Src, Dst + H, N);
+  DerWrap := H + N;
+End;
+
+{ Jeton NTLMSSP (Tok, N) dans SPNEGO en Dst : NegTokenInit (Init) ou
+  NegTokenResp ; octets ecrits. Tampons de travail : SmbWk }
+Function SpnWrap(Tok, N, Dst : LongInt; Init : Boolean) : LongInt;
+Var W1, W2, K : LongInt;
+Begin
+  W1 := SmbWk; W2 := SmbWk + 4096;
+  K := DerWrap($04, Tok, N, W1);                 { OCTET STRING }
+  K := DerWrap($A2, W1, K, W2);                  { [2] mechToken }
+  If Init Then
+  Begin
+    MoveMem(LongInt(@SpnMech[0]), W1, 16);       { [0] mechTypes }
+    MoveMem(W2, W1 + 16, K);
+    K := DerWrap($30, W1, K + 16, W2);           { NegTokenInit }
+    K := DerWrap($A0, W2, K, W1);
+    MoveMem(LongInt(@SpnOid[0]), W2, 8);
+    MoveMem(W1, W2 + 8, K);
+    SpnWrap := DerWrap($60, W2, K + 8, Dst);
+  End
+  Else
+  Begin
+    K := DerWrap($30, W2, K, W1);                { NegTokenResp }
+    SpnWrap := DerWrap($A1, W1, K, Dst);
+  End;
+End;
+
+{ Debut du message NTLMSSP dans (A, N), 0 s'il n'y en a pas }
+Function NtlmFind(A, N : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  NtlmFind := 0;
+  For I := 0 To N - 8 Do
+    If (MemL[0:A + I] = $4D4C544E) And (MemL[0:A + I + 4] = $00505353)
+    Then
+    Begin
+      NtlmFind := A + I;
+      Exit;
+    End;
+End;
+
+{ Champ (longueur, longueur, decalage) d'un message NTLMSSP }
+Procedure NtlmField(M, F, Len, Ofs : LongInt);
+Begin
+  MemW[0:M + F] := Len; MemW[0:M + F + 2] := Len;
+  MemL[0:M + F + 4] := Ofs;
+End;
+
+{ Message AUTHENTICATE (NTLMv2) en Dst, d'apres le message CHALLENGE C
+  (CLen octets) ; octets ecrits. Cle de session en NdKeys (lecteur N) }
+Function NtlmAuth(N, C, CLen, Dst : LongInt) : LongInt;
+Var TI, TLen, P, K, Q, Id, Ln, Tmp, TmpN : LongInt;
+    NtV2 : Array[0..15] Of Byte; Proof : Array[0..15] Of Byte;
+    Ts : Array[0..7] Of Byte; Cc : Array[0..7] Of Byte;
+    U : Array[0..299] Of Byte; Dom, Usr : String; Anon : Boolean;
+Begin
+  TLen := MemW[0:C + 40]; TI := C + MemL[0:C + 44];
+  If MemL[0:C + 44] + TLen > CLen Then TLen := 0;
+  Usr := Nds^[N].User; Dom := Nds^[N].Dom;
+  Anon := Usr = '';
+  { domaine : celui donne (DOMAINE\nom), sinon celui du serveur (comptes
+    locaux d'un serveur autonome) }
+  If (Dom = '') And Not Anon Then
+  Begin
+    K := MemW[0:C + 12]; Q := C + MemL[0:C + 16];
+    For P := 0 To Min(K Div 2, 63) - 1 Do
+      Dom := Dom + Chr(Mem[0:Q + P * 2]);
+  End;
+  { horodatage : MsvAvTimestamp du serveur, sinon son heure }
+  FillMem(LongInt(@Ts[0]), 8, 0);
+  P := 0;
+  While P + 4 <= TLen Do
+  Begin
+    Id := MemW[0:TI + P]; Ln := MemW[0:TI + P + 2];
+    If Id = 0 Then Break;
+    If (Id = 7) And (Ln = 8) Then MoveMem(TI + P + 4, LongInt(@Ts[0]), 8);
+    P := P + 4 + Ln;
+  End;
+  If (MemL[0:LongInt(@Ts[0])] = 0) And (MemL[0:LongInt(@Ts[4])] = 0) Then
+    MoveMem(NdKeys + N * 32 + 16, LongInt(@Ts[0]), 8);
+  TlRandom(LongInt(@Cc[0]), 8);
+  FillMem(Dst, 64, 0);
+  MemL[0:Dst] := $4D4C544E; MemL[0:Dst + 4] := $00505353;
+  MemL[0:Dst + 8] := 3;
+  MemL[0:Dst + 60] := NtlmFlags And MemL[0:C + 20];
+  If Anon Then MemL[0:Dst + 60] := MemL[0:Dst + 60] Or $800;
+  P := 64;
+  { domaine, utilisateur, poste }
+  K := SmbUni(Dst + P, Dom); NtlmField(Dst, 28, K, P); P := P + K;
+  K := SmbUni(Dst + P, Usr); NtlmField(Dst, 36, K, P); P := P + K;
+  K := SmbUni(Dst + P, 'PASDOWS'); NtlmField(Dst, 44, K, P); P := P + K;
+  If Anon Then
+  Begin
+    { session anonyme : reponse LM d'un octet nul, reponse NT vide }
+    Mem[0:Dst + P] := 0; NtlmField(Dst, 12, 1, P); P := P + 1;
+    NtlmField(Dst, 20, 0, P);
+    NtlmField(Dst, 52, 0, P);
+    FillMem(NdKeys + N * 32 + 16, 16, 0);
+    NtlmAuth := P;
+    Exit;
+  End;
+  { NTOWFv2 = HMAC_MD5(hachage NT, UNICODE(MAJ(utilisateur) + domaine)) }
+  K := SmbUni(LongInt(@U[0]), UpStr(Usr));
+  K := K + SmbUni(LongInt(@U[K]), Dom);
+  HmacMd5(NdKeys + N * 32, 16, LongInt(@U[0]), K, 0, 0,
+          LongInt(@NtV2[0]));
+  { reponse LM : 24 zeros (horodatage present) }
+  FillMem(Dst + P, 24, 0); NtlmField(Dst, 12, 24, P); P := P + 24;
+  { reponse NT : NTProofStr + temp ; temp = 01 01 0 0 horodatage, defi
+    du client, 0, informations du serveur, 0 }
+  Tmp := Dst + P + 16;
+  FillMem(Tmp, 28, 0);
+  Mem[0:Tmp] := 1; Mem[0:Tmp + 1] := 1;
+  MoveMem(LongInt(@Ts[0]), Tmp + 8, 8);
+  MoveMem(LongInt(@Cc[0]), Tmp + 16, 8);
+  MoveMem(TI, Tmp + 28, TLen);
+  FillMem(Tmp + 28 + TLen, 4, 0);
+  TmpN := 32 + TLen;
+  HmacMd5(LongInt(@NtV2[0]), 16, C + 24, 8, Tmp, TmpN,
+          LongInt(@Proof[0]));
+  MoveMem(LongInt(@Proof[0]), Dst + P, 16);
+  NtlmField(Dst, 20, 16 + TmpN, P); P := P + 16 + TmpN;
+  NtlmField(Dst, 52, 0, P);
+  { cle de session : HMAC_MD5(NTOWFv2, NTProofStr) }
+  HmacMd5(LongInt(@NtV2[0]), 16, LongInt(@Proof[0]), 16, 0, 0,
+          NdKeys + N * 32 + 16);
+  NtlmAuth := P;
+End;
+
+{ Nom NetBIOS (sans point, 15 caracteres au plus) -> adresse IP par une
+  requete NBNS diffusee (UDP 137), comme Windows quand le DNS ne connait
+  pas le serveur (reseau local, groupe de travail) }
+Function NbLookup(Name : String; Var IP : LongInt) : Boolean;
+Var S, I, C, T, N, Try0 : LongInt; P : Array[0..63] Of Byte;
+    R : Array[0..599] Of Byte; Ad : Array[0..15] Of Byte;
+Begin
+  NbLookup := False;
+  If (NetIP = 0) Or (Length(Name) > 15) Or (Pos('.', Name) > 0) Then Exit;
+  Name := UpStr(Name);
+  While Length(Name) < 15 Do Name := Name + ' ';
+  Name := Name + ' ';                   { suffixe 20h : serveur de fichiers }
+  FillMem(LongInt(@P[0]), 64, 0);
+  P[0] := $50; P[1] := Ticks And 255;
+  P[2] := $01; P[3] := $10;             { requete diffusee, recursion }
+  P[5] := 1;
+  P[12] := 32;
+  For I := 0 To 15 Do
+  Begin
+    C := Ord(Name[I + 1]);
+    P[13 + I * 2] := (C Shr 4) + 65; P[14 + I * 2] := (C And 15) + 65;
+  End;
+  P[47] := $20; P[49] := 1;             { type NB, classe IN }
+  S := WS_socket(2, 2, 17);
+  If S < 0 Then Exit;
+  SkPrc[S - SockBase] := 0;
+  FillMem(LongInt(@Ad[0]), 16, 0);
+  Ad[0] := 2; Ad[3] := 137;
+  MemL[0:LongInt(@Ad[4])] := NetIP Or Not NetMask;
+  For Try0 := 1 To 3 Do
+  Begin
+    WS_sendto(S, LongInt(@P[0]), 50, 0, LongInt(@Ad[0]), 16);
+    T := Ticks;
+    While Ticks - T < 750 Do
+    Begin
+      NetWait;
+      If SkRxLen[S - SockBase] >= 12 Then
+      Begin
+        N := WS_recvfrom(S, LongInt(@R[0]), 600, 0, 0, 0);
+        { reponse positive : nom (34 octets), type, classe, TTL,
+          longueur, drapeaux puis l'adresse }
+        If (N >= 62) And (R[0] = P[0]) And (R[1] = P[1]) And
+           ((R[2] And $80) <> 0) And ((R[3] And 15) = 0) And
+           (R[7] > 0) Then
+        Begin
+          IP := MemL[0:LongInt(@R[58])];
+          WS_closesocket(S);
+          KLog('SMB : ' + Trim(Name) + ' (NetBIOS) -> ' + IpStr(IP));
+          NbLookup := True;
+          Exit;
+        End;
+      End;
+    End;
+  End;
+  WS_closesocket(S);
+End;
+
+{ ---- connexion : NEGOTIATE, SESSION_SETUP, TREE_CONNECT ---- }
+
+{ 0 ou erreur Win32 }
+Function NdConnect(N : LongInt) : LongInt;
+Var IP, S, B, K, R, St, C, CL, E : LongInt; A : Array[0..15] Of Byte;
+    Path : String; SignReq : Boolean;
+Begin
+  NdConnect := 53;                               { ERROR_BAD_NETPATH }
+  NdDrop(N);
+  If Not NetLookup(Nds^[N].Server, IP) Then
+    If Not NbLookup(Nds^[N].Server, IP) Then
+    Begin
+      KLog('SMB : serveur introuvable : ' + Nds^[N].Server);
+      Exit;
+    End;
+  S := WS_socket(2, 1, 6);
+  If S < 0 Then Exit;
+  { prise du systeme : survit au programme qui a ouvert le lecteur }
+  SkPrc[S - SockBase] := 0;
+  FillMem(LongInt(@A[0]), 16, 0);
+  A[0] := 2; A[2] := 445 Shr 8; A[3] := 445 And 255;
+  MemL[0:LongInt(@A[4])] := IP;
+  If WS_connect(S, LongInt(@A[0]), 16) <> 0 Then
+  Begin
+    WS_closesocket(S);
+    KLog('SMB : connexion impossible a ' + Nds^[N].Server + ':445');
+    Exit;
+  End;
+  Nds^[N].Sock := S; Nds^[N].Conn := True; Nds^[N].Sign := False;
+  Nds^[N].Mid := 0; Nds^[N].Tree := 0;
+  Nds^[N].SessLo := 0; Nds^[N].SessHi := 0;
+  SmbInConn := True;
+  NdConnect := 59;
+  { NEGOTIATE : dialectes 2.0.2 et 2.1, signature possible }
+  SmbHdr(N, 0);
+  B := SmbTx + 68;
+  MemW[0:B] := 36; MemW[0:B + 2] := 2; MemW[0:B + 4] := 1;
+  TlRandom(B + 12, 16);
+  MemW[0:B + 36] := $0202; MemW[0:B + 38] := $0210;
+  St := SmbCall(N, 40);
+  If St <> 0 Then
+  Begin
+    KLog('SMB : NEGOTIATE refuse (' + HexStr(St, 8) + ')');
+    SmbInConn := False; NdDrop(N); Exit;
+  End;
+  R := SmbRx + 64;
+  { signature exigee : seulement apres SESSION_SETUP (cle de session) }
+  SignReq := (MemW[0:R + 2] And 2) <> 0;
+  Nds^[N].MaxRd := Min(MemL[0:R + 32], SmbChunk);
+  Nds^[N].MaxWr := Min(MemL[0:R + 36], SmbChunk);
+  If Nds^[N].MaxRd <= 0 Then Nds^[N].MaxRd := 65536;
+  If Nds^[N].MaxWr <= 0 Then Nds^[N].MaxWr := 65536;
+  { heure du serveur (horodatage NTLMv2 s'il n'en donne pas) }
+  MoveMem(R + 40, NdKeys + N * 32 + 16, 8);
+  KLog('SMB : ' + Nds^[N].Server + ' dialecte ' +
+       HexStr(MemW[0:R + 4], 4) + ', signature ' +
+       IntStr(Ord(SignReq)));
+  { SESSION_SETUP 1 : NTLMSSP NEGOTIATE }
+  SmbHdr(N, 1);
+  B := SmbTx + 68;
+  MemW[0:B] := 25; Mem[0:B + 3] := 1;
+  C := SmbWk + 8192;
+  FillMem(C, 32, 0);
+  MemL[0:C] := $4D4C544E; MemL[0:C + 4] := $00505353;
+  MemL[0:C + 8] := 1; MemL[0:C + 12] := NtlmFlags;
+  K := SpnWrap(C, 32, B + 24, True);
+  MemW[0:B + 12] := 88; MemW[0:B + 14] := K;
+  St := SmbCall(N, 24 + K);
+  If St <> LongInt($C0000016) Then
+  Begin
+    KLog('SMB : SESSION_SETUP 1 (' + HexStr(St, 8) + ')');
+    E := SmbWin(St);
+    If St = 0 Then E := 1326;
+    NdConnect := E;
+    SmbInConn := False; NdDrop(N); Exit;
+  End;
+  Nds^[N].SessLo := MemL[0:SmbRx + 40]; Nds^[N].SessHi := MemL[0:SmbRx + 44];
+  R := SmbRx + 64;
+  C := NtlmFind(SmbRx + MemW[0:R + 4], MemW[0:R + 6]);
+  If C = 0 Then
+  Begin
+    KLog('SMB : pas de defi NTLMSSP');
+    SmbInConn := False; NdDrop(N); Exit;
+  End;
+  CL := MemW[0:R + 6] - (C - SmbRx - MemW[0:R + 4]);
+  { copier le defi : SmbRx sera ecrase }
+  If CL > 4096 Then CL := 4096;
+  MoveMem(C, SmbWk + 12288, CL);
+  { SESSION_SETUP 2 : NTLMSSP AUTHENTICATE }
+  K := NtlmAuth(N, SmbWk + 12288, CL, SmbWk + 8192);
+  SmbHdr(N, 1);
+  B := SmbTx + 68;
+  MemW[0:B] := 25; Mem[0:B + 3] := 1;
+  K := SpnWrap(SmbWk + 8192, K, B + 24, False);
+  MemW[0:B + 12] := 88; MemW[0:B + 14] := K;
+  St := SmbCall(N, 24 + K);
+  If St <> 0 Then
+  Begin
+    KLog('SMB : authentification refusee (' + HexStr(St, 8) + ')');
+    E := SmbWin(St);
+    If E = 59 Then E := 1326;
+    NdConnect := E;
+    SmbInConn := False; NdDrop(N); Exit;
+  End;
+  { invite ou session anonyme : pas de signature }
+  Nds^[N].Sign := SignReq And ((MemW[0:SmbRx + 66] And 3) = 0) And
+                  (Nds^[N].User <> '');
+  { TREE_CONNECT \\serveur\partage }
+  Path := '\\' + Nds^[N].Server + '\' + Nds^[N].Share;
+  SmbHdr(N, 3);
+  B := SmbTx + 68;
+  MemW[0:B] := 9; MemW[0:B + 4] := 72;
+  K := SmbUni(B + 8, Path);
+  MemW[0:B + 6] := K;
+  St := SmbCall(N, 8 + K);
+  SmbInConn := False;
+  If St <> 0 Then
+  Begin
+    KLog('SMB : partage ' + Path + ' refuse (' + HexStr(St, 8) + ')');
+    E := SmbWin(St);
+    If St = LongInt($C0000022) Then E := 5;
+    NdConnect := E;
+    NdDrop(N); Exit;
+  End;
+  Nds^[N].Tree := MemL[0:SmbRx + 36];
+  KLog('SMB : ' + Path + ' connecte');
+  NdConnect := 0;
+End;
+
+{ Lecteur pret (connexion etablie au besoin) ; SmbLastErr sinon }
+Function NdEnsure(N : LongInt) : Boolean;
+Begin
+  SmbLastErr := 0;
+  If Not Nds^[N].Conn Then SmbLastErr := NdConnect(N);
+  NdEnsure := Nds^[N].Conn;
+End;
+
+{ ---- requetes sur les fichiers ---- }
+
+{ Fid de ScFid (ou d'un fichier ouvert) dans le corps, en B }
+Procedure SmbPutFid(B : LongInt);
+Var I : LongInt;
+Begin
+  For I := 0 To 3 Do MemL[0:B + I * 4] := ScFid[I];
+End;
+
+{ CREATE : statut ; ScFid, ScAttr, ScSize, ScTime, ScAct }
+Function SmbCreate(N : LongInt; Rel : String;
+                   Acc, Attr, Disp, Opt : LongInt) : LongInt;
+Var B, K, R, I : LongInt;
+Begin
+  SmbHdr(N, 5);
+  B := SmbTx + 68;
+  MemW[0:B] := 57;
+  MemL[0:B + 4] := 2;                            { impersonation }
+  MemL[0:B + 24] := Acc;
+  MemL[0:B + 28] := Attr;
+  MemL[0:B + 32] := 7;                           { partage complet }
+  MemL[0:B + 36] := Disp;
+  MemL[0:B + 40] := Opt;
+  MemW[0:B + 44] := 120;
+  K := SmbUni(B + 56, Rel);
+  MemW[0:B + 46] := K;
+  If K = 0 Then
+  Begin
+    Mem[0:B + 56] := 0; K := 1;
+  End;
+  SmbCreate := SmbCall(N, 56 + K);
+  If SmbSt <> 0 Then Exit;
+  R := SmbRx + 64;
+  ScAct := MemL[0:R + 4];
+  ScTime := NtDosTime(MemL[0:R + 24], MemL[0:R + 28]);
+  ScSize := MemL[0:R + 48];
+  If (MemL[0:R + 52] <> 0) Or (ScSize < 0) Then ScSize := $7FFFFFFF;
+  ScAttr := MemL[0:R + 56];
+  For I := 0 To 3 Do ScFid[I] := MemL[0:R + 64 + I * 4];
+End;
+
+Procedure SmbClose(N : LongInt);
+Var B : LongInt;
+Begin
+  SmbHdr(N, 6);
+  B := SmbTx + 68;
+  MemW[0:B] := 24;
+  SmbPutFid(B + 8);
+  SmbCall(N, 24);
+End;
+
+{ SET_INFO (classe de fichier Cls, Len octets de Src) sur ScFid }
+Function SmbSetInfo(N, Cls, Src, Len : LongInt) : LongInt;
+Var B : LongInt;
+Begin
+  SmbHdr(N, $11);
+  B := SmbTx + 68;
+  MemW[0:B] := 33; Mem[0:B + 2] := 1; Mem[0:B + 3] := Cls;
+  MemL[0:B + 4] := Len; MemW[0:B + 8] := 96;
+  SmbPutFid(B + 16);
+  MoveMem(Src, B + 32, Len);
+  SmbSetInfo := SmbCall(N, 32 + Len);
+End;
+
+{ Chemin du volume (Z:\A\B) -> chemin dans le partage (A\B) }
+Function NetRel(Path : String) : String;
+Var R : String;
+Begin
+  R := Copy(Path, 4, 255);
+  While (R <> '') And (R[Length(R)] = '\') Do Delete(R, Length(R), 1);
+  NetRel := R;
+End;
+
+Function NdOfVol(V : LongInt) : LongInt;
+Begin
+  NdOfVol := -1;
+  If (V >= 0) And (V < VolN) And (VolType[V] = NetT) And (Nds <> Nil) Then
+    If Nds^[VolStart[V]].Used Then NdOfVol := VolStart[V];
+End;
+
+{ Nom (UTF-16, N caracteres) -> chaine Latin-1 }
+Function SmbStr(A, N : LongInt) : String;
+Var S : String; K, W : LongInt;
+Begin
+  S := '';
+  For K := 0 To Min(N, 255) - 1 Do
+  Begin
+    W := MemW[0:A + K * 2];
+    If W < 256 Then S := S + Chr(W) Else S := S + '_';
+  End;
+  SmbStr := S;
+End;
+
+{ Chaine Pascal (longueur puis caracteres) en A }
+Function SmbPStr(A : LongInt) : String;
+Var S : String;
+Begin
+  S[0] := Chr(Mem[0:A]);
+  MoveMem(A + 1, LongInt(@S[1]), Mem[0:A]);
+  SmbPStr := S;
+End;
+
+Procedure SmbInval;
+Begin
+  SmbCVol := -1;
+End;
+
+{ Contenu du dossier Rel en cache (QUERY_DIRECTORY, classe
+  FileBothDirectoryInformation) ; enregistrements : attributs, taille,
+  heure DOS, nom long, nom court }
+Function NdList(N, V : LongInt; Rel : String) : Boolean;
+Var St, B, R, E, Nx, P, I, Sz, NL, SL : LongInt; First : Boolean;
+    Nm, Sh : String; Fid : Array[0..3] Of LongInt;
+Begin
+  NdList := False;
+  St := SmbCreate(N, Rel, $100081, 0, 1, 1);
+  If St <> 0 Then Exit;
+  For I := 0 To 3 Do Fid[I] := ScFid[I];
+  SmbCN := 0; P := 0; First := True;
+  Repeat
+    SmbHdr(N, $0E);
+    B := SmbTx + 68;
+    MemW[0:B] := 33; Mem[0:B + 2] := 3;
+    If First Then Mem[0:B + 3] := 1;
+    For I := 0 To 3 Do MemL[0:B + 8 + I * 4] := Fid[I];
+    MemW[0:B + 24] := 96; MemW[0:B + 26] := 2;
+    MemL[0:B + 28] := SmbChunk;
+    MemW[0:B + 32] := Ord('*');
+    St := SmbCall(N, 34);
+    First := False;
+    If St <> 0 Then Break;
+    R := SmbRx + MemW[0:SmbRx + 66];
+    E := R;
+    Repeat
+      NL := MemL[0:E + 60] Div 2;
+      Nm := SmbStr(E + 94, NL);
+      SL := Mem[0:E + 68] Div 2;
+      If (Nm <> '.') And (Nm <> '..') And (SmbCN < SmbCMax) And
+         (P + 600 < SmbCSize) Then
+      Begin
+        Sh := UpStr(SmbStr(E + 70, SL));
+        If Sh = '' Then Sh := NtShort(Nm);
+        Sz := MemL[0:E + 40];
+        If (MemL[0:E + 44] <> 0) Or (Sz < 0) Then Sz := $7FFFFFFF;
+        MemL[0:SmbCIdx + SmbCN * 4] := P;
+        MemL[0:SmbCBuf + P] := MemL[0:E + 56];
+        MemL[0:SmbCBuf + P + 4] := Sz;
+        MemL[0:SmbCBuf + P + 8] := NtDosTime(MemL[0:E + 24],
+                                             MemL[0:E + 28]);
+        P := P + 12;
+        Mem[0:SmbCBuf + P] := Length(Nm);
+        MoveMem(LongInt(@Nm[1]), SmbCBuf + P + 1, Length(Nm));
+        P := P + 1 + Length(Nm);
+        Mem[0:SmbCBuf + P] := Length(Sh);
+        MoveMem(LongInt(@Sh[1]), SmbCBuf + P + 1, Length(Sh));
+        P := P + 1 + Length(Sh);
+        Inc(SmbCN);
+      End;
+      Nx := MemL[0:E];
+      E := E + Nx;
+    Until Nx = 0;
+  Until False;
+  For I := 0 To 3 Do ScFid[I] := Fid[I];
+  SmbClose(N);
+  SmbCVol := V; SmbCRel := UpStr(Rel); SmbCT := Ticks;
+  NdList := (St = LongInt($80000006)) Or (St = 0);
+End;
+
+{ Entree I du cache -> Ff* }
+Procedure SmbSetFf(I : LongInt);
+Var P : LongInt;
+Begin
+  P := SmbCBuf + MemL[0:SmbCIdx + I * 4];
+  FfAttr := MemL[0:P] And $37;
+  FfSize := MemL[0:P + 4];
+  FfTime := MemL[0:P + 8];
+  FfName := SmbPStr(P + 12);
+  FfShort := SmbPStr(P + 13 + Mem[0:P + 12]);
+  If (FfAttr And $10) <> 0 Then FfSize := 0;
+  FfClus := 0; FfDirClus := -1; FfIdx := I; FfNEnt := 1;
+End;
+
+{ Cache du dossier Rel du volume V encore valable (2 s) ? }
+Function SmbCFresh(V : LongInt; Rel : String) : Boolean;
+Begin
+  SmbCFresh := (SmbCVol = V) And (SmbCRel = UpStr(Rel)) And
+               (Ticks - SmbCT < 2000);
+End;
+
+{ ---- operations des volumes (appelees par FatPathInfo, FatOpen...) ---- }
+
+{ Ff* de Path (chemin complet du volume V) ; False s'il n'existe pas }
+Function SmbResolve(V : LongInt; Path : String) : Boolean;
+Var N, I, St : LongInt; Rel, Dir, B : String;
+Begin
+  SmbResolve := False;
+  N := NdOfVol(V);
+  If N < 0 Then Exit;
+  Rel := NetRel(Path);
+  If Rel = '' Then
+  Begin
+    FfName := Chr(VolLetter[V]) + ':\'; FfShort := FfName;
+    FfAttr := $10; FfSize := 0; FfTime := 0; FfClus := 0;
+    FfDirClus := -1; FfIdx := -1; FfNEnt := 0;
+    SmbResolve := True;
+    Exit;
+  End;
+  I := Length(Rel);
+  While (I > 0) And (Rel[I] <> '\') Do Dec(I);
+  Dir := Copy(Rel, 1, I - 1);
+  B := UpStr(Copy(Rel, I + 1, 255));
+  { dossier parent liste a l'instant (Explorateur) : sans requete }
+  If SmbCFresh(V, Dir) Then
+  Begin
+    For I := 0 To SmbCN - 1 Do
+    Begin
+      SmbSetFf(I);
+      If (UpStr(FfName) = B) Or (FfShort = B) Then
+      Begin
+        SmbResolve := True;
+        Exit;
+      End;
+    End;
+    Exit;
+  End;
+  SmbEnter;
+  If NdEnsure(N) Then
+  Begin
+    St := SmbCreate(N, Rel, $80, 0, 1, 0);
+    If St = 0 Then
+    Begin
+      FfName := Copy(Rel, Length(Dir) + 2, 255);
+      If Length(Dir) = 0 Then FfName := Rel;
+      FfShort := NtShort(FfName);
+      FfAttr := ScAttr And $37; FfSize := ScSize; FfTime := ScTime;
+      If (FfAttr And $10) <> 0 Then FfSize := 0;
+      FfClus := 0; FfDirClus := -1; FfIdx := -1; FfNEnt := 1;
+      SmbClose(N);
+      SmbResolve := True;
+    End;
+  End;
+  SmbLeave;
+End;
+
+{ Entree Idx du dossier Dir ; Idx avance }
+Function NetDirEntry(Dir : String; Var Idx : LongInt) : Boolean;
+Var V, N : LongInt; Ok : Boolean; Rel : String;
+Begin
+  NetDirEntry := False;
+  V := FatVolOf(Dir);
+  N := NdOfVol(V);
+  If N < 0 Then Exit;
+  Rel := NetRel(Dir);
+  If Not ((SmbCVol = V) And (SmbCRel = UpStr(Rel)) And
+          ((Idx > 0) Or (Ticks - SmbCT < 2000))) Then
+  Begin
+    SmbEnter;
+    Ok := NdEnsure(N) And NdList(N, V, Rel);
+    SmbLeave;
+    If Not Ok Then
+    Begin
+      SmbInval;
+      Exit;
+    End;
+  End;
+  If (Idx < 0) Or (Idx >= SmbCN) Then Exit;
+  SmbSetFf(Idx);
+  Inc(Idx);
+  NetDirEntry := True;
+End;
+
+{ Chemin dans le partage, dernier element avec sa casse d'origine }
+Function NetRelOrig(Path, Orig : String) : String;
+Var R, D : String;
+Begin
+  D := NetRel(ParentDir(Path));
+  R := DispName(Path, Orig);
+  If D <> '' Then R := D + '\' + R;
+  NetRelOrig := R;
+End;
+
+{ Win32 CreateFile -> SMB2 : CREATE_NEW 1 -> FILE_CREATE 2,
+  CREATE_ALWAYS 2 -> OVERWRITE_IF 5, OPEN_EXISTING 3 -> OPEN 1,
+  OPEN_ALWAYS 4 -> OPEN_IF 3, TRUNCATE_EXISTING 5 -> OVERWRITE 4 }
+Function NetOpen(V : LongInt; Path, Orig : String; Wr : Boolean;
+                 Disp : LongInt; Var Err : LongInt) : LongInt;
+Var N, F, I, D, Acc, St : LongInt; Rel : String;
+Begin
+  NetOpen := -1;
+  Err := 3;
+  N := NdOfVol(V);
+  If N < 0 Then Exit;
+  F := -1;
+  For I := MaxFo - 1 DownTo 0 Do If Not FoUsed[I] Then F := I;
+  If F < 0 Then
+  Begin
+    Err := 4;
+    Exit;
+  End;
+  Case Disp Of
+    1 : D := 2;
+    2 : D := 5;
+    4 : D := 3;
+    5 : D := 4;
+  Else
+    D := 1;
+  End;
+  Acc := LongInt($80000000);
+  If Wr Or (Disp = 1) Or (Disp = 2) Or (Disp = 5) Then
+    Acc := LongInt($C0000000);
+  Rel := NetRelOrig(Path, Orig);
+  SmbEnter;
+  If Not NdEnsure(N) Then
+  Begin
+    Err := SmbLastErr;
+    SmbLeave;
+    Exit;
+  End;
+  St := SmbCreate(N, Rel, Acc, $80, D, $40);
+  { lecture seule sur le serveur : ouvrir en lecture }
+  If (St = LongInt($C0000022)) And Not Wr And (D = 1) Then
+    St := SmbCreate(N, Rel, $120089, $80, D, $40);
+  SmbLeave;
+  If St <> 0 Then
+  Begin
+    Err := SmbWin(St);
+    If (St = LongInt($C0000035)) Then Err := 80;
+    Exit;
+  End;
+  FoUsed[F] := True;
+  FoVol[F] := V; FoSize[F] := ScSize; FoTime[F] := ScTime;
+  FoClus[F] := ScFid[0]; FoDir[F] := ScFid[1];
+  FoIdx[F] := ScFid[2]; FoCClus[F] := ScFid[3];
+  FoCIdx[F] := -1;
+  FoDirty[F] := ScAct = 2;
+  If ScAct <> 1 Then SmbInval;
+  Err := 0;
+  NetOpen := F;
+End;
+
+Procedure NetFid(F : LongInt);
+Begin
+  ScFid[0] := FoClus[F]; ScFid[1] := FoDir[F];
+  ScFid[2] := FoIdx[F]; ScFid[3] := FoCClus[F];
+End;
+
+Function NetRead(F, Pos0, N0, Dst : LongInt) : LongInt;
+Var N, Done, C, B, K, St : LongInt;
+Begin
+  NetRead := 0;
+  N := NdOfVol(FoVol[F]);
+  If N < 0 Then Exit;
+  If Pos0 + N0 > FoSize[F] Then N0 := FoSize[F] - Pos0;
+  Done := 0;
+  SmbEnter;
+  While Done < N0 Do
+  Begin
+    C := Min(N0 - Done, Nds^[N].MaxRd);
+    SmbHdr(N, 8);
+    B := SmbTx + 68;
+    MemW[0:B] := 49; Mem[0:B + 2] := $50;
+    MemL[0:B + 4] := C; MemL[0:B + 8] := Pos0 + Done;
+    NetFid(F);
+    SmbPutFid(B + 16);
+    St := SmbCall(N, 49);
+    If St <> 0 Then
+    Begin
+      If St <> LongInt($C0000011) Then FatIoErr := True;
+      Break;
+    End;
+    K := Min(MemL[0:SmbRx + 68], C);
+    If K <= 0 Then Break;
+    MoveMem(SmbRx + Mem[0:SmbRx + 66], Dst + Done, K);
+    Done := Done + K;
+    If K < C Then Break;
+  End;
+  SmbLeave;
+  NetRead := Done;
+End;
+
+Function NetWrite(F, Pos0, N0, Src : LongInt) : LongInt;
+Var N, Done, C, B, K, St : LongInt;
+Begin
+  NetWrite := -1;
+  N := NdOfVol(FoVol[F]);
+  If N < 0 Then Exit;
+  Done := 0;
+  SmbEnter;
+  While Done < N0 Do
+  Begin
+    C := Min(N0 - Done, Nds^[N].MaxWr);
+    SmbHdr(N, 9);
+    B := SmbTx + 68;
+    MemW[0:B] := 49; MemW[0:B + 2] := 112;
+    MemL[0:B + 4] := C; MemL[0:B + 8] := Pos0 + Done;
+    NetFid(F);
+    SmbPutFid(B + 16);
+    MoveMem(Src + Done, B + 48, C);
+    St := SmbCall(N, 48 + C);
+    If St <> 0 Then
+    Begin
+      FatIoErr := True;
+      If Done = 0 Then
+      Begin
+        SmbLeave;
+        Exit;
+      End;
+      Break;
+    End;
+    K := MemL[0:SmbRx + 68];
+    If K <= 0 Then Break;
+    Done := Done + K;
+    If K < C Then Break;
+  End;
+  SmbLeave;
+  If Pos0 + Done > FoSize[F] Then FoSize[F] := Pos0 + Done;
+  FoDirty[F] := True;
+  NetWrite := Done;
+End;
+
+Function NetSetSize(F, NewSize : LongInt) : Boolean;
+Var N : LongInt; Q : Array[0..1] Of LongInt;
+Begin
+  NetSetSize := False;
+  N := NdOfVol(FoVol[F]);
+  If N < 0 Then Exit;
+  Q[0] := NewSize; Q[1] := 0;
+  SmbEnter;
+  NetFid(F);
+  NetSetSize := SmbSetInfo(N, 20, LongInt(@Q[0]), 8) = 0;
+  SmbLeave;
+  FoSize[F] := NewSize;
+  FoDirty[F] := True;
+End;
+
+Procedure NetCloseF(F : LongInt);
+Var N : LongInt;
+Begin
+  N := NdOfVol(FoVol[F]);
+  If N < 0 Then Exit;
+  SmbEnter;
+  If Nds^[N].Conn Then
+  Begin
+    NetFid(F);
+    SmbClose(N);
+  End;
+  SmbLeave;
+  If FoDirty[F] Then SmbInval;
+End;
+
+{ Supprimer (Dir : un dossier) : 0 ou erreur Win32 }
+Function NetRemove(V : LongInt; Path : String; Dir : Boolean)
+  : LongInt;
+Var N, St, Opt : LongInt; B : Byte;
+Begin
+  NetRemove := 3;
+  N := NdOfVol(V);
+  If (N < 0) Or (NetRel(Path) = '') Then Exit;
+  If Dir Then Opt := 1 Else Opt := $40;
+  SmbEnter;
+  If NdEnsure(N) Then
+  Begin
+    St := SmbCreate(N, NetRel(Path), $10080, 0, 1, Opt);
+    If St = 0 Then
+    Begin
+      B := 1;
+      St := SmbSetInfo(N, 13, LongInt(@B), 1);
+      SmbClose(N);
+    End;
+    NetRemove := SmbWin(St);
+    If Not Dir And (St = LongInt($C00000BA)) Then NetRemove := 5;
+  End
+  Else NetRemove := SmbLastErr;
+  SmbLeave;
+  SmbInval;
+End;
+
+Function NetMkDir(V : LongInt; Path, Orig : String) : LongInt;
+Var N, St : LongInt;
+Begin
+  NetMkDir := 3;
+  N := NdOfVol(V);
+  If N < 0 Then Exit;
+  SmbEnter;
+  If NdEnsure(N) Then
+  Begin
+    St := SmbCreate(N, NetRelOrig(Path, Orig), $100081, $10, 2, 1);
+    If St = 0 Then SmbClose(N);
+    NetMkDir := SmbWin(St);
+  End
+  Else NetMkDir := SmbLastErr;
+  SmbLeave;
+  SmbInval;
+End;
+
+{ Renommer ou deplacer dans le meme partage }
+Function NetRename(V : LongInt; Src, Dst, Orig : String) : LongInt;
+Var N, St, K : LongInt; R : String; I : Array[0..599] Of Byte;
+Begin
+  NetRename := 2;
+  N := NdOfVol(V);
+  If N < 0 Then Exit;
+  R := NetRelOrig(Dst, Orig);
+  FillMem(LongInt(@I[0]), 20, 0);
+  K := SmbUni(LongInt(@I[20]), R);
+  MemL[0:LongInt(@I[16])] := K;
+  SmbEnter;
+  If NdEnsure(N) Then
+  Begin
+    St := SmbCreate(N, NetRel(Src), $110080, 0, 1, 0);
+    If St = 0 Then
+    Begin
+      St := SmbSetInfo(N, 10, LongInt(@I[0]), 20 + K);
+      SmbClose(N);
+    End;
+    NetRename := SmbWin(St);
+  End
+  Else NetRename := SmbLastErr;
+  SmbLeave;
+  SmbInval;
+End;
+
+{ Espace libre et total (QUERY_INFO FileFsSizeInformation), 5 s }
+Procedure NetSpace(V : LongInt; Var Free0, Total, Spc : LongInt);
+Var N, St, B, R, U : LongInt;
+Begin
+  N := NdOfVol(V);
+  If (N >= 0) And ((VolClus[V] = 0) Or (Ticks - Nds^[N].SpcT > 5000)) Then
+  Begin
+    SmbEnter;
+    If NdEnsure(N) Then
+    Begin
+      St := SmbCreate(N, '', $100081, 0, 1, 1);
+      If St = 0 Then
+      Begin
+        SmbHdr(N, $10);
+        B := SmbTx + 68;
+        MemW[0:B] := 41; Mem[0:B + 2] := 2; Mem[0:B + 3] := 3;
+        MemL[0:B + 4] := 24;
+        SmbPutFid(B + 24);
+        If SmbCall(N, 41) = 0 Then
+        Begin
+          R := SmbRx + MemW[0:SmbRx + 66];
+          U := (MemL[0:R + 16] * MemL[0:R + 20]) Div 512;
+          If U < 1 Then U := 1;
+          VolSpc[V] := U;
+          If (MemL[0:R + 4] <> 0) Or (MemL[0:R] < 0) Then
+            VolClus[V] := $7FFFFFFF
+          Else VolClus[V] := MemL[0:R];
+          If (MemL[0:R + 12] <> 0) Or (MemL[0:R + 8] < 0) Then
+            VolFree[V] := $7FFFFFFF
+          Else VolFree[V] := MemL[0:R + 8];
+          Nds^[N].SpcT := Ticks;
+        End;
+        SmbClose(N);
+      End;
+    End;
+    SmbLeave;
+  End;
+  Free0 := VolFree[V]; Total := VolClus[V]; Spc := VolSpc[V];
+  If Spc < 1 Then Spc := 8;
+End;
+
+{ ---- lecteurs connectes ---- }
+
+{ Lecteur de la lettre Ch (A..Z), -1 sinon }
+Function NdOfLetter(Ch : Char) : LongInt;
+Var V : LongInt;
+Begin
+  NdOfLetter := -1;
+  For V := 0 To VolN - 1 Do
+    If (VolType[V] = NetT) And (VolLetter[V] = Ord(UpCase(Ch))) Then
+      NdOfLetter := NdOfVol(V);
+End;
+
+{ Lettre libre pour un lecteur reseau (A, B, C et D exclues) ? }
+Function NetLetterFree(Ch : Char) : Boolean;
+Var S : String;
+Begin
+  Ch := UpCase(Ch);
+  S := Ch + ':';
+  NetLetterFree := (Ch >= 'E') And (Ch <= 'Z') And (FatVolOf(S) < 0);
+End;
+
+{ \\serveur\partage }
+Function NdRemote(N : LongInt) : String;
+Begin
+  NdRemote := '\\' + Nds^[N].Server + '\' + Nds^[N].Share;
+End;
+
+{ Nom affiche dans le Poste de travail : partage sur 'serveur' (Z:) }
+Function NdLabel(V : LongInt) : String;
+Var N : LongInt;
+Begin
+  N := NdOfVol(V);
+  If N < 0 Then NdLabel := '(' + Chr(VolLetter[V]) + ':)'
+  Else NdLabel := Nds^[N].Share + L(' sur ''', ' on ''', ' auf ''', ' su ''',
+                  ' en ''') + Nds^[N].Server + ''' (' + Chr(VolLetter[V]) +
+                  ':)';
+End;
+
+{ HKCU\Network\<lettre> : connexion permanente }
+Procedure NdSaveReg(N : LongInt);
+Var K, D : LongInt; P, U : String;
+Begin
+  P := 'Network\' + Chr(VolLetter[Nds^[N].Vol]);
+  RegSetStrK(1, P, 'RemotePath', NdRemote(N));
+  U := Nds^[N].User;
+  If Nds^[N].Dom <> '' Then U := Nds^[N].Dom + '\' + U;
+  RegSetStrK(1, P, 'UserName', U);
+  RegSetStrK(1, P, 'ProviderName', 'Microsoft Windows Network');
+  RegSetStrK(1, P, 'PasdowsHash', HexOf(NdKeys + N * 32, 16));
+  K := RegWalk(1, P, True);
+  D := 1;
+  RegSetK(K, 'ConnectionType', 4, LongInt(@D), 4);
+  RegSetK(K, 'DeferFlags', 4, LongInt(@D), 4);
+  RegSaveDue := True;
+End;
+
+Procedure NdDelReg(Ch : Char);
+Var K : LongInt;
+Begin
+  K := RegWalk(1, 'Network\' + Ch, False);
+  If K < 0 Then Exit;
+  RegDelTree(K);
+  RegSaveDue := True;
+End;
+
+{ Nouveau lecteur Ch: -> Remote (\\serveur\partage), sans connexion ;
+  indice ou -1 }
+Function NdAdd(Ch : Char; Remote, User : String) : LongInt;
+Var N, V, I, P : LongInt;
+Begin
+  NdAdd := -1;
+  If Not SmbInit Then Exit;
+  Ch := UpCase(Ch);
+  If Not NetLetterFree(Ch) Then Exit;
+  While (Remote <> '') And (Remote[Length(Remote)] = '\') Do
+    Delete(Remote, Length(Remote), 1);
+  If Copy(Remote, 1, 2) <> '\\' Then Exit;
+  Remote := Copy(Remote, 3, 255);
+  P := Pos('\', Remote);
+  If (P < 2) Or (P = Length(Remote)) Then Exit;
+  N := -1;
+  For I := MaxNd - 1 DownTo 0 Do If Not Nds^[I].Used Then N := I;
+  If N < 0 Then Exit;
+  { volume : une place liberee par une deconnexion, sinon une nouvelle }
+  V := -1;
+  For I := 0 To VolN - 1 Do
+    If (VolType[I] = NetT) And (VolLetter[I] = 0) Then V := I;
+  If V < 0 Then
+  Begin
+    If VolN >= MaxVol Then Exit;
+    V := VolN;
+    Inc(VolN);
+  End;
+  FillMem(LongInt(@Nds^[N]), SizeOf(TNetDrv), 0);
+  Nds^[N].Used := True; Nds^[N].Sock := -1; Nds^[N].Vol := V;
+  Nds^[N].Server := Copy(Remote, 1, P - 1);
+  Nds^[N].Share := Copy(Remote, P + 1, 63);
+  { sous-dossier (\\serveur\partage\dossier) : le partage seul }
+  If Pos('\', Nds^[N].Share) > 0 Then
+    Nds^[N].Share := Copy(Nds^[N].Share, 1, Pos('\', Nds^[N].Share) - 1);
+  P := Pos('\', User);
+  If P > 0 Then
+  Begin
+    Nds^[N].Dom := Copy(User, 1, P - 1);
+    User := Copy(User, P + 1, 63);
+  End;
+  Nds^[N].User := User;
+  VolType[V] := NetT; VolLetter[V] := Ord(Ch); VolStart[V] := N;
+  VolDisk[V] := -1; VolSpc[V] := 8; VolClus[V] := 0; VolFree[V] := 0;
+  VolSecs[V] := 0; VolFsDirty[V] := False;
+  VolLab[V] := Copy(UpStr(Nds^[N].Share), 1, 11);
+  VolSerial[V] := 0;
+  For I := 1 To Length(Remote) Do
+    VolSerial[V] := VolSerial[V] * 31 + Ord(UpCase(Remote[I]));
+  NdAdd := N;
+End;
+
+Procedure NdFree(N : LongInt);
+Var V : LongInt;
+Begin
+  NdDrop(N);
+  V := Nds^[N].Vol;
+  If (V >= 0) And (V < VolN) Then VolLetter[V] := 0;
+  Nds^[N].Used := False;
+  SmbInval;
+End;
+
+{ Connecter Ch: a Remote : 0 ou erreur Win32 (WNetAddConnection2) }
+Function NetMap(Ch : Char; Remote, User, Pass : String;
+                Persist : Boolean) : LongInt;
+Var N, E : LongInt;
+Begin
+  If Not SmbInit Then
+  Begin
+    NetMap := 8;
+    Exit;
+  End;
+  If Not NetLetterFree(Ch) Then
+  Begin
+    NetMap := 85;                               { ERROR_ALREADY_ASSIGNED }
+    Exit;
+  End;
+  N := NdAdd(Ch, Remote, User);
+  If N < 0 Then
+  Begin
+    NetMap := 67;                               { ERROR_BAD_NET_NAME }
+    Exit;
+  End;
+  NtHash(Pass, NdKeys + N * 32);
+  If NicBase = 0 Then E := 1222                 { ERROR_NO_NETWORK }
+  Else
+  Begin
+    SmbEnter;
+    E := NdConnect(N);
+    SmbLeave;
+  End;
+  If E <> 0 Then
+  Begin
+    NdFree(N);
+    NetMap := E;
+    Exit;
+  End;
+  Nds^[N].Persist := Persist;
+  If Persist Then NdSaveReg(N);
+  NewRefresh;
+  NetMap := 0;
+End;
+
+{ Deconnecter Ch: (0, 2250 pas connecte, 2401 fichiers ouverts) }
+Function NetUnmap(Ch : Char; Force, Forget : Boolean) : LongInt;
+Var N, F : LongInt;
+Begin
+  NetUnmap := 2250;                             { ERROR_NOT_CONNECTED }
+  If Nds = Nil Then Exit;
+  N := NdOfLetter(Ch);
+  If N < 0 Then Exit;
+  For F := 0 To MaxFo - 1 Do
+    If FoUsed[F] And (FoVol[F] = Nds^[N].Vol) Then
+    Begin
+      If Not Force Then
+      Begin
+        NetUnmap := 2401;
+        Exit;
+      End;
+      FoUsed[F] := False;
+    End;
+  SmbEnter;
+  If Nds^[N].Conn Then
+  Begin
+    { fin propre : TREE_DISCONNECT et LOGOFF }
+    SmbHdr(N, 4); MemW[0:SmbTx + 68] := 4; SmbCall(N, 4);
+    SmbHdr(N, 2); MemW[0:SmbTx + 68] := 4; SmbCall(N, 4);
+  End;
+  NdFree(N);
+  SmbLeave;
+  If Forget Then NdDelReg(UpCase(Ch));
+  NewRefresh;
+  NetUnmap := 0;
+End;
+
+{ Connexions permanentes du registre (au demarrage, sans connexion) }
+Procedure NetRestore;
+Var K, I, J, N : LongInt; Ch : Char; R, U : String;
+Begin
+  K := RegWalk(1, 'Network', False);
+  If K < 0 Then Exit;
+  For I := 0 To MaxRK - 1 Do
+    If RKUsed^[I] And (RKPar^[I] = K) And (Length(RKName(I)) = 1) Then
+    Begin
+      Ch := UpCase(RKName(I)[1]);
+      J := RegVal(I, 'RemotePath');
+      If (J < 0) Or (RVData^[J] = 0) Then Continue;
+      R := PStr(RVData^[J]);
+      U := '';
+      J := RegVal(I, 'UserName');
+      If (J >= 0) And (RVData^[J] <> 0) Then U := PStr(RVData^[J]);
+      N := NdAdd(Ch, R, U);
+      If N < 0 Then Continue;
+      Nds^[N].Persist := True;
+      J := RegVal(I, 'PasdowsHash');
+      If (J >= 0) And (RVData^[J] <> 0) Then
+        HexTo(PStr(RVData^[J]), NdKeys + N * 32, 16)
+      Else NtHash('', NdKeys + N * 32);
+      KLog('SMB : ' + Ch + ': -> ' + R + ' (connexion permanente)');
+    End;
+End;
+
+{ ---- MPR.DLL : WNet* ---- }
+
+{ Lettre d'un nom local (Z: ou Z:\) ou d'un nom distant (\\s\p) }
+Function NetNameLetter(S : String) : Char;
+Var V, N : LongInt; U : String;
+Begin
+  NetNameLetter := #0;
+  U := UpStr(S);
+  If (Length(U) >= 2) And (U[2] = ':') Then
+  Begin
+    NetNameLetter := U[1];
+    Exit;
+  End;
+  If Nds = Nil Then Exit;
+  While (U <> '') And (U[Length(U)] = '\') Do Delete(U, Length(U), 1);
+  For V := 0 To VolN - 1 Do
+  Begin
+    N := NdOfVol(V);
+    If (N >= 0) And (VolLetter[V] > 0) Then
+      If UpStr(NdRemote(N)) = U Then NetNameLetter := Chr(VolLetter[V]);
+  End;
+End;
+
+{ Connexion sans lettre (WNetAddConnection2 sans lpLocalName) : verifier
+  le partage et les droits avec une lettre provisoire }
+Function NetProbe(Rem, U, P : String) : LongInt;
+Var Ch : Char;
+Begin
+  NetProbe := 85;
+  Ch := 'Z';
+  While (Ch >= 'E') And Not NetLetterFree(Ch) Do Dec(Ch);
+  If Ch < 'E' Then Exit;
+  NetProbe := NetMap(Ch, Rem, U, P, False);
+  NetUnmap(Ch, True, False);
+End;
+
+{ NETRESOURCEA : dwScope, dwType, dwDisplayType, dwUsage, lpLocalName,
+  lpRemoteName, lpComment, lpProvider ; CONNECT_UPDATE_PROFILE (1) :
+  connexion permanente }
+Function WNetAddConnection2A(PRes, PPass, PUser, Flags : LongInt) : LongInt;
+Var Loc, Rem, U, P : String; E : LongInt;
+Begin
+  WNetAddConnection2A := 87;
+  If (PRes = 0) Or (MemL[0:PRes + 20] = 0) Then Exit;
+  Loc := '';
+  If MemL[0:PRes + 16] <> 0 Then Loc := UpStr(PStr(MemL[0:PRes + 16]));
+  Rem := PStr(MemL[0:PRes + 20]);
+  U := ''; P := '';
+  If PUser <> 0 Then U := PStr(PUser);
+  If PPass <> 0 Then P := PStr(PPass);
+  If Loc = '' Then E := NetProbe(Rem, U, P)
+  Else E := NetMap(Loc[1], Rem, U, P, (Flags And 1) <> 0);
+  SmbLastErr := E;
+  WNetAddConnection2A := E;
+End;
+
+Function WNetAddConnection3A(H, PRes, PPass, PUser, Flags : LongInt)
+  : LongInt;
+Begin
+  WNetAddConnection3A := WNetAddConnection2A(PRes, PPass, PUser, Flags);
+End;
+
+Function WNetAddConnectionA(PRemote, PPass, PLocal : LongInt) : LongInt;
+Var R : Array[0..7] Of LongInt;
+Begin
+  FillMem(LongInt(@R[0]), 32, 0);
+  R[1] := 1; R[4] := PLocal; R[5] := PRemote;
+  WNetAddConnectionA := WNetAddConnection2A(LongInt(@R[0]), PPass, 0, 1);
+End;
+
+Function WNetCancelConnection2A(PName, Flags, Force : LongInt) : LongInt;
+Var Ch : Char; S : String;
+Begin
+  WNetCancelConnection2A := 2250;
+  If PName = 0 Then Exit;
+  S := PStr(PName);
+  Ch := NetNameLetter(S);
+  If Ch = #0 Then Exit;
+  WNetCancelConnection2A := NetUnmap(Ch, Force <> 0, (Flags And 1) <> 0);
+End;
+
+Function WNetCancelConnectionA(PName, Force : LongInt) : LongInt;
+Begin
+  WNetCancelConnectionA := WNetCancelConnection2A(PName, 1, Force);
+End;
+
+Function WNetGetConnectionA(PLocal, PRemote, PLen : LongInt) : LongInt;
+Var N : LongInt; S, R : String;
+Begin
+  WNetGetConnectionA := 2250;
+  If (PLocal = 0) Or (Nds = Nil) Then Exit;
+  S := UpStr(PStr(PLocal));
+  If S = '' Then Exit;
+  N := NdOfLetter(S[1]);
+  If N < 0 Then Exit;
+  R := NdRemote(N);
+  If (PLen = 0) Or (MemL[0:PLen] < Length(R) + 1) Then
+  Begin
+    If PLen <> 0 Then MemL[0:PLen] := Length(R) + 1;
+    WNetGetConnectionA := 234;                  { ERROR_MORE_DATA }
+    Exit;
+  End;
+  PutPStr(PRemote, R, MemL[0:PLen]);
+  WNetGetConnectionA := 0;
+End;
+
+{ UNIVERSAL_NAME_INFO (1) ou REMOTE_NAME_INFO (2) de Z:\dossier }
+Function WNetGetUniversalNameA(Loc, Lvl, Buf, PN : LongInt) : LongInt;
+Var N, Need : LongInt; S, U, Rm, Rest : String;
+Begin
+  WNetGetUniversalNameA := 2250;
+  If (Loc = 0) Or (PN = 0) Or (Nds = Nil) Then Exit;
+  S := PStr(Loc);
+  If (Length(S) < 2) Or (S[2] <> ':') Then Exit;
+  N := NdOfLetter(S[1]);
+  If N < 0 Then Exit;
+  Rm := NdRemote(N);
+  Rest := Copy(S, 3, 255);
+  U := Rm + Rest;
+  If Lvl = 1 Then Need := 4 + Length(U) + 1
+  Else Need := 12 + Length(U) + Length(Rm) + Length(Rest) + 3;
+  If MemL[0:PN] < Need Then
+  Begin
+    MemL[0:PN] := Need;
+    WNetGetUniversalNameA := 234;
+    Exit;
+  End;
+  If Lvl = 1 Then
+  Begin
+    MemL[0:Buf] := Buf + 4;
+    PutPStr(Buf + 4, U, Length(U) + 1);
+  End
+  Else
+  Begin
+    MemL[0:Buf] := Buf + 12;
+    PutPStr(Buf + 12, U, Length(U) + 1);
+    MemL[0:Buf + 4] := Buf + 13 + Length(U);
+    PutPStr(Buf + 13 + Length(U), Rm, Length(Rm) + 1);
+    MemL[0:Buf + 8] := Buf + 14 + Length(U) + Length(Rm);
+    PutPStr(Buf + 14 + Length(U) + Length(Rm), Rest, Length(Rest) + 1);
+  End;
+  WNetGetUniversalNameA := 0;
+End;
+
+Var
+  NeScope, NeIdx : LongInt;                     { WNetOpenEnum en cours }
+
+{ RESOURCE_CONNECTED (1) et RESOURCE_REMEMBERED (3) : lecteurs connectes ;
+  le voisinage reseau (RESOURCE_GLOBALNET) est vide }
+Function WNetOpenEnumA(Scope, Typ, Usage, Res, PH : LongInt) : LongInt;
+Begin
+  NeScope := Scope; NeIdx := 0;
+  If PH <> 0 Then MemL[0:PH] := $00E70000 + Scope;
+  WNetOpenEnumA := 0;
+End;
+
+Function WNetEnumResourceA(H, PCount, Buf, PSize : LongInt) : LongInt;
+Var V, N, K, Mx, Top, E : LongInt; S, R : String;
+Begin
+  WNetEnumResourceA := 259;                     { ERROR_NO_MORE_ITEMS }
+  If (PCount = 0) Or (Buf = 0) Or (PSize = 0) Or (Nds = Nil) Then Exit;
+  If (NeScope <> 1) And (NeScope <> 3) Then Exit;
+  Mx := MemL[0:PCount];
+  If Mx <= 0 Then Mx := 1000;
+  K := 0; Top := Buf + MemL[0:PSize]; E := Buf;
+  V := NeIdx;
+  While (V < VolN) And (K < Mx) Do
+  Begin
+    N := NdOfVol(V);
+    If (N >= 0) And (VolLetter[V] > 0) And
+       ((NeScope = 1) Or Nds^[N].Persist) Then
+    Begin
+      S := Chr(VolLetter[V]) + ':';
+      R := NdRemote(N);
+      If E + 32 + Length(S) + Length(R) + 30 > Top - 0 Then Break;
+      Top := Top - (Length(S) + 1);
+      PutPStr(Top, S, Length(S) + 1);
+      FillMem(E, 32, 0);
+      MemL[0:E] := NeScope; MemL[0:E + 4] := 1; MemL[0:E + 8] := 3;
+      MemL[0:E + 12] := 1; MemL[0:E + 16] := Top;
+      Top := Top - (Length(R) + 1);
+      PutPStr(Top, R, Length(R) + 1);
+      MemL[0:E + 20] := Top;
+      Top := Top - 26;
+      PutPStr(Top, 'Microsoft Windows Network', 26);
+      MemL[0:E + 28] := Top;
+      E := E + 32;
+      Inc(K);
+    End;
+    Inc(V);
+  End;
+  NeIdx := V;
+  MemL[0:PCount] := K;
+  If K > 0 Then WNetEnumResourceA := 0
+  Else If V < VolN Then WNetEnumResourceA := 234;
+End;
+
+Function WNetCloseEnum(H : LongInt) : LongInt;
+Begin
+  NeScope := 0;
+  WNetCloseEnum := 0;
+End;
+
+Function WNetGetUserA(Name, Buf, PN : LongInt) : LongInt;
+Var N : LongInt; S : String;
+Begin
+  { utilisateur d'une connexion (Z: ou \\serveur\partage) }
+  If (Name <> 0) And (Nds <> Nil) And (PN <> 0) Then
+  Begin
+    S := PStr(Name);
+    N := NdOfLetter(NetNameLetter(S));
+    If (S <> '') And (N >= 0) Then
+    Begin
+      S := Nds^[N].User;
+      If MemL[0:PN] < Length(S) + 1 Then
+      Begin
+        MemL[0:PN] := Length(S) + 1;
+        WNetGetUserA := 234;
+        Exit;
+      End;
+      PutPStr(Buf, S, MemL[0:PN]);
+      WNetGetUserA := 0;
+      Exit;
+    End;
+  End;
+  If GetUserNameA(Buf, PN) <> 0 Then WNetGetUserA := 0
+  Else WNetGetUserA := 1222;
+End;
+
+Function WNetGetLastErrorA(PErr, PBuf, NBuf, PName, NName : LongInt)
+  : LongInt;
+Begin
+  If PErr <> 0 Then MemL[0:PErr] := SmbLastErr;
+  If (PBuf <> 0) And (NBuf > 0) Then PutPStr(PBuf, '', NBuf);
+  If (PName <> 0) And (NName > 0) Then
+    PutPStr(PName, 'Microsoft Windows Network', NName);
+  WNetGetLastErrorA := 0;
+End;
+
+{ Boites Connecter / Deconnecter un lecteur reseau : depuis un programme,
+  attendre leur fermeture ; 0 ou -1 (annulee) }
+Function WNetConnectionDialog(H, Typ : LongInt) : LongInt;
+Begin
+  WNetConnectionDialog := -1;
+  If Not WNetDlgOpen(False) Then Exit;
+  If CurT <> 0 Then
+    While (MapW >= 0) And Wnds^[MapW].Used And
+          (Wnds^[MapW].IKind = ikMapDrv) Do KSleep(50);
+  MapW := -1;
+  WNetConnectionDialog := MapRes;
+End;
+
+Function WNetDisconnectDialog(H, Typ : LongInt) : LongInt;
+Begin
+  WNetDisconnectDialog := -1;
+  If Not WNetDlgOpen(True) Then Exit;
+  If CurT <> 0 Then
+    While (MapW >= 0) And Wnds^[MapW].Used And
+          (Wnds^[MapW].IKind = ikMapDrv) Do KSleep(50);
+  MapW := -1;
+  WNetDisconnectDialog := MapRes;
+End;
+
+{ ---- Panneau de configuration : SHELL32 Control_RunDLL ---- }
+
+Var
+  PendCmd : LongInt;          { commande du noyau demandee par un programme }
+
+{ Applet d'un fichier .CPL (et numero @n) -> commande du noyau ; 0 : a
+  CONTROL.EXE (souris, clavier, parametres regionaux), -1 : inconnu }
+Function CplCmd(S : String) : LongInt;
+Var P : LongInt;
+Begin
+  S := UpStr(Trim(S));
+  If (S <> '') And (S[1] = '"') Then S := Copy(S, 2, 255);
+  P := Pos('.CPL', S);
+  If P > 0 Then S := Copy(S, 1, P - 1);
+  While Pos('\', S) > 0 Do Delete(S, 1, Pos('\', S));
+  If S = 'DESK' Then CplCmd := cmDisplay
+  Else If S = 'TIMEDATE' Then CplCmd := cmDateTime
+  Else If S = 'SYSDM' Then CplCmd := cmSysProps
+  Else If S = 'APPWIZ' Then CplCmd := cmAddRemove
+  Else If S = 'MMSYS' Then CplCmd := cmAudioProps
+  Else If (S = 'NETCPL') Or (S = 'NCPA') Or (S = 'INETCPL') Then
+    CplCmd := cmNetwork
+  Else If (S = 'MAIN') Or (S = 'INTL') Or (S = 'MOUSE') Or
+          (S = 'KEYBOARD') Then CplCmd := 0
+  Else CplCmd := -1;
+End;
+
+{ Control_RunDLL(hwnd, hinst, "desk.cpl,,0", nCmdShow) }
+Procedure Control_RunDLLA(H, Inst, PCmd, Show : LongInt);
+Var S : String; C : LongInt;
+Begin
+  S := '';
+  If PCmd <> 0 Then S := PStr(PCmd);
+  C := CplCmd(Copy(S, 1, Pos(',', S + ',') - 1));
+  If C > 0 Then PendCmd := C
+  Else If C = 0 Then RunExe('CONTROL.EXE', S)
+  Else If Trim(S) = '' Then RunExe('CONTROL.EXE', '');
+End;
+
+Procedure Control_RunDLL(H, Inst, PCmd, Show : LongInt);
+Begin
+  Control_RunDLLA(H, Inst, PCmd, Show);
+End;
+
+{ Icone d'une applet (ExtractIcon sur un .CPL) : icone du noyau }
+Function CplIcon(S : String; I : LongInt) : LongInt;
+Begin
+  S := UpStr(S);
+  While Pos('\', S) > 0 Do Delete(S, 1, Pos('\', S));
+  CplIcon := 0;
+  If S = 'DESK.CPL' Then CplIcon := icDisplay
+  Else If S = 'TIMEDATE.CPL' Then CplIcon := icClock
+  Else If S = 'SYSDM.CPL' Then CplIcon := icSystem
+  Else If S = 'APPWIZ.CPL' Then CplIcon := icAppWiz
+  Else If S = 'MMSYS.CPL' Then
+  Begin
+    If I = 1 Then CplIcon := icSpeaker Else CplIcon := icSound;
+  End
+  Else If (S = 'NETCPL.CPL') Or (S = 'NCPA.CPL') Then CplIcon := icNet
+  Else If S = 'INTL.CPL' Then CplIcon := icRegional
+  Else If S = 'MAIN.CPL' Then
+    Case I Of
+      1 : CplIcon := icKeyboard;
+      2 : CplIcon := icFonts;
+    Else
+      CplIcon := icMouse;
+    End;
+End;
+
+{ ---- boites Connecter / Deconnecter un lecteur reseau ---- }
+
+Var
+  MdPath, MdUser, MdPass : String;
+  MdField : LongInt;              { 1 chemin, 2 utilisateur, 3 mot de passe }
+  MdRecon, MdDisc : Boolean;
+  MdSel : LongInt;                      { Deconnecter : volume choisi }
+
+Function MapTitle : String;
+Begin
+  If MdDisc Then
+    MapTitle := L('D'#130'connecter un lecteur r'#130'seau',
+                  'Disconnect Network Drive', 'Netzlaufwerk trennen',
+                  'Disconnetti unit'#133' di rete',
+                  'Desconectar unidad de red')
+  Else
+    MapTitle := L('Connecter un lecteur r'#130'seau', 'Map Network Drive',
+                  'Netzlaufwerk verbinden', 'Connetti unit'#133' di rete',
+                  'Conectar a unidad de red');
+End;
+
+{ Premiere lettre libre (E: ... Z:) }
+Function FirstFreeLetter : Char;
+Var Ch : Char;
+Begin
+  FirstFreeLetter := #0;
+  For Ch := 'Z' DownTo 'E' Do
+    If NetLetterFree(Ch) Then FirstFreeLetter := Ch;
+End;
+
+{ Volumes des lecteurs reseau, dans l'ordre des lettres }
+Function NetVolAt(I : LongInt) : LongInt;
+Var Ch : Char; V, K : LongInt;
+Begin
+  NetVolAt := -1;
+  K := 0;
+  For Ch := 'E' To 'Z' Do
+    For V := 0 To VolN - 1 Do
+      If (VolType[V] = NetT) And (VolLetter[V] = Ord(Ch)) And
+         (NdOfVol(V) >= 0) Then
+      Begin
+        If K = I Then
+        Begin
+          NetVolAt := V;
+          Exit;
+        End;
+        Inc(K);
+      End;
+End;
+
+Function NetVolCount : LongInt;
+Var K : LongInt;
+Begin
+  K := 0;
+  While NetVolAt(K) >= 0 Do Inc(K);
+  NetVolCount := K;
+End;
+
+Function WNetDlgOpen(Disc : Boolean) : Boolean;
+Var H : LongInt;
+Begin
+  WNetDlgOpen := False;
+  If (MapW >= 0) And Wnds^[MapW].Used And
+     (Wnds^[MapW].IKind = ikMapDrv) Then
+  Begin
+    ActivateW(MapW);
+    Exit;
+  End;
+  If Not SmbInit Then Exit;
+  MdDisc := Disc;
+  MapRes := -1;
+  If Disc Then
+  Begin
+    If NetVolCount = 0 Then
+    Begin
+      MsgBoxOpen(MapTitle, L('Aucun lecteur r'#130'seau n''est connect'#130'.',
+                 'No network drive is connected.',
+                 'Es sind keine Netzlaufwerke verbunden.',
+                 'Nessuna unit'#133' di rete connessa.',
+                 'No hay unidades de red conectadas.'), $40);
+      Exit;
+    End;
+    H := 120 + Min(NetVolCount, 8) * 18;
+    MdSel := 0;
+  End
+  Else
+  Begin
+    MdLet := FirstFreeLetter;
+    If MdLet = #0 Then Exit;
+    MdPath := '\\'; MdUser := ''; MdPass := '';
+    MdField := 1; MdRecon := True;
+    H := 236;
+  End;
+  MapW := KCreate(ikMapDrv, MapTitle, icNetDrv, Max(0, (ScrW - 440) Div 2),
+                  Max(0, (TaskY - H) Div 2), 440, H,
+                  WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
+  If MapW < 0 Then Exit;
+  ShowW(MapW, True, True);
+  WNetDlgOpen := True;
+End;
+
+{ Rectangle du champ I (0 lettre, 1 chemin, 2 utilisateur, 3 mot de
+  passe) }
+Procedure MapField(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt);
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 166; Y1 := CY1 + 12 + I * 30; Y2 := Y1 + 21;
+  If I = 0 Then X2 := X1 + 70 Else X2 := CX2 - 14;
+End;
+
+Procedure PaintMapDrv(W : LongInt);
+Var X1, Y1, X2, Y2, FX1, FY1, FX2, FY2, I, V, N, BX1, BY1, BX2, BY2
+    : LongInt;
+    T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  FBar(X1, Y1, X2, Y2, cSilver);
+  If MdDisc Then
+  Begin
+    OutTxt(X1 + 12, Y1 + 10, L('Lecteur r'#130'seau '#133' d'#130'connecter :',
+           'Network drive to disconnect:', 'Zu trennendes Laufwerk:',
+           'Unit'#133' da disconnettere:', 'Unidad que desea desconectar:'),
+           cBlack);
+    Sunken(X1 + 12, Y1 + 30, X2 - 12, Y2 - 42, cWhite);
+    For I := 0 To 7 Do
+    Begin
+      V := NetVolAt(I);
+      If V < 0 Then Break;
+      N := NdOfVol(V);
+      T := Chr(VolLetter[V]) + ':   ' + NdRemote(N);
+      T := Fit(T, X2 - X1 - 60);
+      If I = MdSel Then
+      Begin
+        FBar(X1 + 15, Y1 + 33 + I * 18, X2 - 15, Y1 + 50 + I * 18, cNavy);
+        PaintIcon(icNetDrv, X1 + 16, Y1 + 34 + I * 18, 16);
+        OutTxt(X1 + 38, Y1 + 34 + I * 18, T, cWhite);
+      End
+      Else
+      Begin
+        PaintIcon(icNetDrv, X1 + 16, Y1 + 34 + I * 18, 16);
+        OutTxt(X1 + 38, Y1 + 34 + I * 18, T, cBlack);
+      End;
+    End;
+  End
+  Else
+  Begin
+    PaintIcon(icNetDrv, X1 + 12, Y1 + 12, 32);
+    OutTxt(X1 + 56, Y1 + 15, L('Lecteur :', 'Drive:', 'Laufwerk:',
+           'Unit'#133':', 'Unidad:'), cBlack);
+    OutTxt(X1 + 56, Y1 + 45, L('Chemin :', 'Path:', 'Pfad:', 'Percorso:',
+           'Ruta:'), cBlack);
+    OutTxt(X1 + 12, Y1 + 75, L('Nom d''utilisateur :', 'User name:',
+           'Benutzername:', 'Nome utente:', 'Usuario:'), cBlack);
+    OutTxt(X1 + 12, Y1 + 105, L('Mot de passe :', 'Password:',
+           'Kennwort:', 'Password:', 'Contrase'#164'a:'), cBlack);
+    For I := 0 To 3 Do
+    Begin
+      MapField(W, I, FX1, FY1, FX2, FY2);
+      Sunken(FX1, FY1, FX2, FY2, cWhite);
+      Case I Of
+        0 : T := MdLet + ':';
+        1 : T := MdPath;
+        2 : T := MdUser;
+      Else
+        T := '';
+        For N := 1 To Length(MdPass) Do T := T + '*';
+      End;
+      { fin du texte si trop long }
+      While (T <> '') And (TextW(T) > FX2 - FX1 - 10) Do Delete(T, 1, 1);
+      OutTxt(FX1 + 4, FY1 + 3, T, cBlack);
+      If I = 0 Then
+      Begin
+        { bouton de la liste deroulante }
+        PushButton(FX2 - 17, FY1 + 2, FX2 - 2, FY2 - 2, '', False, False);
+        For N := 0 To 3 Do
+          HLine(FX2 - 13 + N, FX2 - 7 - N, FY1 + 9 + N, cBlack);
+      End
+      Else If (MdField = I) And (W = ActiveWin) Then
+        VLine(FX1 + 5 + TextW(T), FY1 + 3, FY2 - 3, cBlack);
+    End;
+    OutTxt(X1 + 166, Y1 + 132, L('(DOMAINE\nom ; vide : invit'#130')',
+           '(DOMAIN\name; empty: guest)', '(DOM'#132'NE\Name; leer: Gast)',
+           '(DOMINIO\nome; vuoto: ospite)', '(DOMINIO\nombre; vac'#161'o: ' +
+           'invitado)'), cGray);
+    CheckBox(X1 + 12, Y1 + 154, L('Se reconnecter '#133' l''ouverture de ' +
+             'session', 'Reconnect at logon', 'Verbindung beim Anmelden ' +
+             'wiederherstellen', 'Riconnetti all''accesso',
+             'Volver a conectar al iniciar sesi'#162'n'), MdRecon);
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If I = 0 Then T := TxtOk Else T := TxtCancel;
+    PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+               I = 0);
+  End;
+End;
+
+Procedure MapClose(W : LongInt);
+Begin
+  If MapW = W Then MapW := -1;
+  DestroyW(W);
+End;
+
+{ Texte d'une erreur de connexion }
+Function NetErrText(E : LongInt) : String;
+Begin
+  Case E Of
+    53 : NetErrText := L('Le chemin r'#130'seau est introuvable (serveur ' +
+           'injoignable sur le port 445).', 'The network path was not ' +
+           'found (server unreachable on port 445).', 'Netzwerkpfad nicht ' +
+           'gefunden (Port 445).', 'Percorso di rete non trovato (porta ' +
+           '445).', 'No se encontr'#162' la ruta de red (puerto 445).');
+    67 : NetErrText := L('Le nom r'#130'seau est introuvable (partage ' +
+           'inexistant).', 'The network name cannot be found (no such ' +
+           'share).', 'Netzwerkname nicht gefunden.', 'Nome di rete non ' +
+           'trovato.', 'No se encuentra el nombre de red.');
+    1326, 86 : NetErrText := L('Nom d''utilisateur ou mot de passe ' +
+           'incorrect.', 'Logon failure: unknown user name or bad ' +
+           'password.', 'Benutzername oder Kennwort falsch.', 'Nome utente ' +
+           'o password errati.', 'Usuario o contrase'#164'a incorrectos.');
+    5 : NetErrText := L('Acc'#138's refus'#130'.', 'Access is denied.',
+           'Zugriff verweigert.', 'Accesso negato.', 'Acceso denegado.');
+    1222 : NetErrText := L('Aucune carte r'#130'seau : le r'#130'seau est ' +
+           'absent.', 'The network is not present.', 'Kein Netzwerk.',
+           'Rete non presente.', 'La red no est'#160' presente.');
+    85 : NetErrText := L('Cette lettre de lecteur est d'#130'j'#133' ' +
+           'utilis'#130'e.', 'The local device name is already in use.',
+           'Laufwerksbuchstabe belegt.', 'Lettera gi'#133' in uso.',
+           'La letra ya est'#160' en uso.');
+    2401 : NetErrText := L('Des fichiers sont ouverts sur ce lecteur.',
+           'There are open files on this drive.',
+           'Es sind Dateien ge'#148'ffnet.', 'Ci sono file aperti.',
+           'Hay archivos abiertos.');
+  Else
+    NetErrText := L('Erreur r'#130'seau ', 'Network error ', 'Netzwerkfehler ',
+                    'Errore di rete ', 'Error de red ') + IntStr(E) + '.';
+  End;
+End;
+
+Procedure MapApply(W : LongInt);
+Var E, V : LongInt; R : String; Ch : Char;
+Begin
+  If MdDisc Then
+  Begin
+    V := NetVolAt(MdSel);
+    MapClose(W);
+    If V < 0 Then Exit;
+    Ch := Chr(VolLetter[V]);
+    E := NetUnmap(Ch, False, True);
+    If E = 2401 Then
+      E := NetUnmap(Ch, True, True);
+    If E = 0 Then MapRes := 0;
+    Exit;
+  End;
+  R := Trim(MdPath);
+  If (Copy(R, 1, 2) <> '\\') Or (Length(R) < 5) Then
+  Begin
+    MsgBoxOpen(MapTitle, L('Tapez un chemin de la forme ' +
+               '\\serveur\partage.', 'Type a path such as \\server\share.',
+               'Pfad wie \\Server\Freigabe eingeben.', 'Digitare un ' +
+               'percorso come \\server\condivisione.', 'Escriba una ruta ' +
+               'como \\servidor\recurso.'), $30);
+    Exit;
+  End;
+  CursorSetShape(1);
+  E := NetMap(MdLet, R, Trim(MdUser), MdPass, MdRecon);
+  CursorSetShape(0);
+  If E <> 0 Then
+  Begin
+    MsgBoxOpen(MapTitle, L('Impossible de se connecter '#133' ', 'Cannot ' +
+               'connect to ', 'Keine Verbindung zu ', 'Impossibile ' +
+               'connettersi a ', 'No se puede conectar a ') + R + '.||' +
+               NetErrText(E), $10);
+    Exit;
+  End;
+  MapRes := 0;
+  V := FatVolOf(MdLet + ':');
+  MapClose(W);
+  { ouvrir le lecteur, comme Windows }
+  ExpWindowAt(MdLet + ':', False);
+End;
+
+Procedure MapDrvMouse(W, Msg, X, Y : LongInt);
+Var I, BX1, BY1, BX2, BY2, X1, Y1, X2, Y2 : LongInt;
+Begin
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  KClient(W, X1, Y1, X2, Y2);
+  If Msg = WM_LBUTTONDBLCLK Then
+  Begin
+    If MdDisc And InRect(X, Y, X1 + 12, Y1 + 30, X2 - 12, Y2 - 42) Then
+    Begin
+      MapApply(W);
+      Exit;
+    End;
+    Msg := WM_LBUTTONDOWN;
+  End;
+  If Msg = WM_LBUTTONDOWN Then
+  Begin
+    If MdDisc Then
+    Begin
+      If InRect(X, Y, X1 + 12, Y1 + 30, X2 - 12, Y2 - 42) Then
+      Begin
+        I := (Y - Y1 - 33) Div 18;
+        If (I >= 0) And (NetVolAt(I) >= 0) Then MdSel := I;
+        KRepaint(W);
+        Exit;
+      End;
+    End
+    Else
+    Begin
+      For I := 0 To 3 Do
+      Begin
+        MapField(W, I, BX1, BY1, BX2, BY2);
+        If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+        Begin
+          If I = 0 Then
+            OpenMenu(0, mnNetLet, BX1, BY2 + 1, False)
+          Else MdField := I;
+          KRepaint(W);
+          Exit;
+        End;
+      End;
+      If InRect(X, Y, X1 + 10, Y1 + 150, X2 - 20, Y1 + 170) Then
+      Begin
+        MdRecon := Not MdRecon;
+        KRepaint(W);
+        Exit;
+      End;
+    End;
+  End;
+  For I := 0 To 1 Do
+  Begin
+    DlgBtnRect(W, I, 2, BX1, BY1, BX2, BY2);
+    If InRect(X, Y, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        If I = 0 Then MapApply(W) Else MapClose(W);
+      End;
+      Exit;
+    End;
+  End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure MapDrvKey(W, VK, Ch : LongInt);
+Var S : String; C : Char;
+Begin
+  Case VK Of
+    $1B :
+    Begin
+      MapClose(W);
+      Exit;
+    End;
+    $0D :
+    Begin
+      MapApply(W);
+      Exit;
+    End;
+    $09 :
+    Begin
+      If Not MdDisc Then
+      Begin
+        If (KeyState[$10] And $80) <> 0 Then
+          MdField := (MdField + 1) Mod 3 + 1
+        Else MdField := MdField Mod 3 + 1;
+      End;
+      KRepaint(W);
+      Exit;
+    End;
+    $26, $28 :
+    Begin
+      If MdDisc Then
+      Begin
+        If (VK = $26) And (MdSel > 0) Then Dec(MdSel);
+        If (VK = $28) And (NetVolAt(MdSel + 1) >= 0) Then Inc(MdSel);
+      End
+      Else
+      Begin
+        { lettre precedente ou suivante libre }
+        C := MdLet;
+        Repeat
+          If VK = $26 Then Dec(C) Else Inc(C);
+        Until (C < 'E') Or (C > 'Z') Or NetLetterFree(C);
+        If (C >= 'E') And (C <= 'Z') Then MdLet := C;
+      End;
+      KRepaint(W);
+      Exit;
+    End;
+  End;
+  If MdDisc Then Exit;
+  Case MdField Of
+    1 : S := MdPath;
+    2 : S := MdUser;
+  Else
+    S := MdPass;
+  End;
+  If VK = 8 Then
+  Begin
+    If S <> '' Then Delete(S, Length(S), 1);
+  End
+  Else If (Ch >= 32) And (Ch < 256) And (Length(S) < 120) Then
+    S := S + Chr(Ch)
+  Else Exit;
+  Case MdField Of
+    1 : MdPath := S;
+    2 : MdUser := S;
+  Else
+    MdPass := S;
+  End;
+  KRepaint(W);
+End;
+
+
+{ NET USE [Z: [\\serveur\partage [mot de passe] [/USER:nom]
+  [/PERSISTENT:YES|NO]] [/DELETE]] (boite Executer) }
+Function NetUseCmd(S : String) : Boolean;
+Var Tok : Array[0..7] Of String[127]; N, I, E, V, K : LongInt;
+    Ch : Char; Rem, Usr, Pw, T, U : String; Del, Pers : Boolean;
+Begin
+  NetUseCmd := True;
+  N := 0;
+  S := Trim(S);
+  While (S <> '') And (N < 8) Do
+  Begin
+    I := Pos(' ', S + ' ');
+    Tok[N] := Copy(S, 1, I - 1);
+    { Delete ne va pas au-dela de la fin : chaine videe a la main }
+    If I > Length(S) Then S := '' Else Delete(S, 1, I);
+    S := Trim(S);
+    Inc(N);
+  End;
+  Ch := #0; Rem := ''; Usr := ''; Pw := ''; Del := False; Pers := True;
+  For I := 0 To N - 1 Do
+  Begin
+    T := Tok[I]; U := UpStr(T);
+    If (Length(U) = 2) And (U[2] = ':') Then Ch := U[1]
+    Else If Copy(U, 1, 2) = '\\' Then Rem := T
+    Else If Copy(U, 1, 6) = '/USER:' Then Usr := Copy(T, 7, 127)
+    Else If (U = '/DELETE') Or (U = '/D') Then Del := True
+    Else If Copy(U, 1, 12) = '/PERSISTENT:' Then
+      Pers := Copy(U, 13, 1) <> 'N'
+    Else Pw := T;
+  End;
+  If (Ch = #0) And (Rem = '') Then
+  Begin
+    { liste des connexions }
+    T := '';
+    K := 0;
+    While NetVolAt(K) >= 0 Do
+    Begin
+      V := NetVolAt(K);
+      T := T + Chr(VolLetter[V]) + ':   ' + NdRemote(NdOfVol(V)) + '|';
+      Inc(K);
+    End;
+    If T = '' Then T := L('Aucune connexion r'#130'seau.',
+                          'There are no entries in the list.',
+                          'Keine Verbindungen.', 'Nessuna connessione.',
+                          'No hay conexiones.');
+    MsgBoxOpen('NET USE', T, $40);
+    Exit;
+  End;
+  If Del Then
+  Begin
+    If Ch = #0 Then Ch := NetNameLetter(Rem);
+    E := NetUnmap(Ch, True, True);
+  End
+  Else If Ch = #0 Then E := NetProbe(Rem, Usr, Pw)
+  Else E := NetMap(Ch, Rem, Usr, Pw, Pers);
+  If E = 0 Then
+    MsgBoxOpen('NET USE', L('La commande s''est termin'#130'e correctement.',
+               'The command completed successfully.', 'Befehl ' +
+               'erfolgreich ausgef'#129'hrt.', 'Comando completato.',
+               'El comando se ha completado correctamente.'), $40)
+  Else
+    MsgBoxOpen('NET USE', L('Erreur syst'#138'me ', 'System error ',
+               'Systemfehler ', 'Errore di sistema ', 'Error del sistema ') +
+               IntStr(E) + '.||' + NetErrText(E), $10);
+End;
+
 { ==================================================================== }
 { Partie 16b - API complementaires (Microsoft Office 97)              }
 { ==================================================================== }
@@ -69723,7 +72534,7 @@ End;
 Function FatLikeVol(V : LongInt) : Boolean;
 Begin
   FatLikeVol := (V >= 0) And (VolType[V] <> NtfsT) And
-                (VolType[V] <> HpfsT);
+                (VolType[V] <> HpfsT) And (VolType[V] <> NetT);
 End;
 
 Function IoVolBitmap(V, PIn, POut, NOut : LongInt; Var Ret : LongInt)
@@ -70262,32 +73073,6 @@ Var B : TZBuf;
 Begin
   If (Name And $FFFF0000) <> 0 Then Name := WZ(Name, B);
   LoadImageW := LoadImageA(Inst, Name, Typ, CX, CY, Fl);
-End;
-
-{ ------------------------------------------------------------------ }
-{ MPR.DLL : pas de reseau Microsoft (lecteurs reseau)                 }
-{ ------------------------------------------------------------------ }
-
-Function WNetOpenEnumA(Scope, Typ, Usage, Res, PH : LongInt) : LongInt;
-Begin
-  If PH <> 0 Then MemL[0:PH] := 0;
-  WNetOpenEnumA := 1222;
-End;
-
-Function WNetEnumResourceA(H, PCount, Buf, PSize : LongInt) : LongInt;
-Begin
-  WNetEnumResourceA := 259;
-End;
-
-Function WNetCloseEnum(H : LongInt) : LongInt;
-Begin
-  WNetCloseEnum := 0;
-End;
-
-Function WNetGetUserA(Name, Buf, PN : LongInt) : LongInt;
-Begin
-  If GetUserNameA(Buf, PN) <> 0 Then WNetGetUserA := 0
-  Else WNetGetUserA := 1222;
 End;
 
 { ------------------------------------------------------------------ }
@@ -71237,8 +74022,12 @@ End;
 
 { ExtractIcon : nombre d'icones (I = -1) ou icone d'application }
 Function ExtractIconA(Inst, PFile, I : LongInt) : LongInt;
+Var S : String;
 Begin
+  S := '';
+  If PFile <> 0 Then S := PStr(PFile);
   If I = -1 Then ExtractIconA := 1
+  Else If CplIcon(S, I) > 0 Then ExtractIconA := $7E00 + CplIcon(S, I)
   Else ExtractIconA := LoadIconA(0, 32512);
 End;
 
@@ -71756,11 +74545,6 @@ End;
 Function WNetAddConnection3W(H, Res, Pw, User, Fl : LongInt) : LongInt;
 Begin
   WNetAddConnection3W := 1222;
-End;
-
-Function WNetGetUniversalNameA(Loc, Lvl, Buf, PN : LongInt) : LongInt;
-Begin
-  WNetGetUniversalNameA := 2250;
 End;
 
 Function WNetGetCachedPassword(R, NR, P, PN, Typ : LongInt) : LongInt;
@@ -74516,7 +77300,8 @@ End;
 
 Function SwapMouseButton(Sw : LongInt) : LongInt;
 Begin
-  SwapMouseButton := 0;
+  SwapMouseButton := Ord(MouSwap);
+  MouSwap := Sw <> 0;
 End;
 
 Function WaitForInputIdle(H, Ms : LongInt) : LongInt;
@@ -75889,7 +78674,8 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   LZOpenFileA, LZClose,
   LZCopy, WNetGetConnectionA, WNetAddConnectionA, WNetAddConnection2A,
   WNetCancelConnectionA, WNetCancelConnection2A, WNetConnectionDialog,
-  WNetGetLastErrorA,
+  WNetGetLastErrorA, WNetAddConnection3A, WNetDisconnectDialog,
+  Control_RunDLLA, Control_RunDLL, SetDoubleClickTime,
   GetEnvironmentVariableA, SetEnvironmentVariableA,
   GetEnvironmentStrings, GetEnvironmentStringsA, FreeEnvironmentStringsA,
   GetVersion, GetVersionExA, GetSystemInfo, GetCommandLineA, GetStartupInfoA,
@@ -85876,7 +88662,7 @@ End;
 Procedure InitClasses;
 Var I : LongInt;
 Begin
-  For I := 0 To 31 Do KClass[I] := -1;
+  For I := 0 To 47 Do KClass[I] := -1;
   KClass[ikTaskbar] := ClassAdd('#Taskbar', 0, ikTaskbar, 0);
   KClass[ikMenu] := ClassAdd('#32768', 0, ikMenu, 0);
   KClass[ikExplorer] := ClassAdd('#Explorer', 0, ikExplorer, CS_DBLCLKS);
@@ -85895,6 +88681,7 @@ Begin
   KClass[ikVolProps] := ClassAdd('#VolProps', 0, ikVolProps, 0);
   KClass[ikScanDisk] := ClassAdd('#ScanDisk', 0, ikScanDisk, 0);
   KClass[ikConProps] := ClassAdd('#ConProps', 0, ikConProps, 0);
+  KClass[ikMapDrv] := ClassAdd('#MapDrive', 0, ikMapDrv, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
@@ -86165,6 +88952,13 @@ Begin
     CdaPoll;
     KPaintAll;
     If SdW >= 0 Then ScanStep;
+    { commande demandee par un programme (Control_RunDLL) }
+    If PendCmd <> 0 Then
+    Begin
+      I := PendCmd;
+      PendCmd := 0;
+      KCommand(I);
+    End;
     { registre modifie par un programme termine : sur le disque }
     If RegSaveDue Then
     Begin
@@ -86212,6 +89006,16 @@ BEGIN
   I := KAlloc(SizeOf(TProcArr));
   FillMem(I, SizeOf(TProcArr), 0);
   Move(I, Procs, 4);
+  I := KAlloc(4096 * 9); FillMem(I, 4096 * 9, 0);
+  Move(I, NcKey, 4); I := I + 16384; Move(I, NcVer, 4);
+  I := I + 16384; Move(I, NcVal, 4);
+  I := KAlloc(MaxThread * 256); FillMem(I, MaxThread * 256, 0);
+  Move(I, TrRet, 4); I := I + MaxThread * 128; Move(I, TrName, 4);
+  I := KAlloc(W16ApiN * 12); FillMem(I, W16ApiN * 12, 0);
+  Move(I, ApiOrd, 4); I := I + W16ApiN * 4; Move(I, ApiArgB, 4);
+  I := I + W16ApiN * 4; Move(I, ApiEq, 4);
+  I := KAlloc(MaxThread * 128); FillMem(I, MaxThread * 128, 0);
+  Move(I, T16Cmd, 4);
   I := KAlloc(SizeOf(TClassArr));
   FillMem(I, SizeOf(TClassArr), 0);
   Move(I, Classes, 4);
@@ -86375,7 +89179,11 @@ BEGIN
   InitExports;
   If ApiTrace Then TraceInit;
   RegInit;
+  DblMs := 500; MouSpd := 10; KbDelay := 1; KbSpeed := 31;
+  MouSwap := False;
   RegLoad;
+  InputRestore;
+  NetRestore;
   WinInitRun;
   SdW := -1;
   BootStep(5);
@@ -86389,7 +89197,7 @@ BEGIN
   BootStep(7);
   AppProcObj := -1;
   ConW := -1; ConTitle := ''; ConRowsDue := False; ConLastCY := -1;
-  ConPropW := -1; SysMenuW := -1; ConHistMax := 1000;
+  ConPropW := -1; SysMenuW := -1; ConHistMax := 1000; MapW := -1;
   ConPalVer := -1;
   ConKeep := False; ConKillReq := False;
   VmT := -1; VmOn := False;
