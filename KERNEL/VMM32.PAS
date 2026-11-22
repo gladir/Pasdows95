@@ -696,6 +696,7 @@ Procedure GlDumpRing; Forward;
 Var
   DrWatch, DrHits : LongInt;     { point d'arret de donnees (DRWATCH) }
   { debogage Win32 (une session : un debogueur, un programme debogue) }
+  Dummy : LongInt;                       { resultat ignore }
   DbgOn, DbgPend, DbgBusy, DbgStop, DbgPause : Boolean;
   DbgProc, DbgOwner, DbgT, DbgFrame, DbgOfs, DbgCont : LongInt;
   DbgEntry, DbgEntryB : LongInt;
@@ -13962,6 +13963,7 @@ Const
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
   cmMstsc = 86; cmFtp = 93; cmSsh = 94; cmPasDev = 95; cmPasDbg = 96;
+  cmPasteLnk = 97; cmRecProps = 98;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -14114,6 +14116,13 @@ Var
   DeskIco   : Array[0..MaxDesk - 1] Of LongInt;
   DeskCmd   : Array[0..MaxDesk - 1] Of LongInt;
   DeskPath  : ^TDeskPtArr;
+  DeskMul   : Array[0..MaxDesk - 1] Of Boolean;   { Selectionner tout }
+  DeskMulN  : LongInt;
+  { raccourcis deja crees sur le bureau (C:\WINDOWS\DESKLNK.INI) : un
+    raccourci supprime par l'utilisateur n'est pas recree }
+  DkKey     : Array[0..MaxDesk - 1] Of String[15];
+  DkN       : LongInt;
+  DkLoaded  : Boolean;
   LastMinute : LongInt;
   NewDir, CtxPath : String[127];     { Nouveau : dossier ; element }
   CtxNetDrv : Char;                  { lecteur reseau du menu (#0) }
@@ -14390,27 +14399,41 @@ Begin
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
 
+Procedure DeskShortcuts; Forward;
+Function LnkIcon(Const P : String) : LongInt; Forward;
+
 Procedure DeskBuild;
-Var I, Lba, Size, Fl, Tm : LongInt; Nm, D : String; Dir : Boolean;
+Var I, Lba, Size, Fl, Tm, Ic : LongInt; Nm, D : String; Dir, Hd : Boolean;
 Begin
   DeskCnt := 0; ExeCnt := 0;
+  For I := 0 To MaxDesk - 1 Do DeskMul[I] := False;
+  DeskMulN := 0;
+  { bureau sur le disque dur : Lisez-moi, Invite MS-DOS, Paint, Navigateur
+    Web et les programmes du dossier du systeme sont de vrais raccourcis
+    (.LNK) du dossier du bureau, crees une fois ; sur le CD-ROM, des
+    icones fixes }
+  Hd := DeskOk;
+  If Hd Then DeskShortcuts;
   For I := 0 To KnownN - 1 Do
     KnownHere[I] := PathInfo(SysDir + KnownExe[I], Fl, Size, Tm, Lba, Lba);
   DeskAdd(L('Poste de travail', 'My Computer', 'Arbeitsplatz',
             'Risorse del computer', 'Mi PC'), icComputer, cmComputer, '');
   DeskAdd(L('Corbeille', 'Recycle Bin', 'Papierkorb', 'Cestino',
             'Papelera de reciclaje'), icRecycle, cmRecycle, '');
-  DeskAdd(L('Lisez-moi', 'Read Me', 'Liesmich', 'Leggimi', 'L'#130'ame'),
-          icText, cmReadme, '');
-  If PathInfo(CmdPath, Fl, Size, Tm, Lba, I) Then
-    DeskAdd(PromptName, icDos, cmPrompt, CmdPath);
-  { Paint (APPS\PAINT.PAS) : icone dediee }
-  If PathInfo(SysDir + 'PAINT.EXE', Fl, Size, Tm, Lba, I) Then
-    DeskAdd('Paint', icPaint, cmPaint, SysDir + 'PAINT.EXE');
-  If PathInfo(SysDir + 'BROWSER.EXE', Fl, Size, Tm, Lba, I) Then
-    DeskAdd(L('Navigateur Web', 'Web Browser', 'Webbrowser',
-              'Browser Web', 'Navegador Web'), icWeb, cmBrowser,
-            SysDir + 'BROWSER.EXE');
+  If Not Hd Then
+  Begin
+    DeskAdd(L('Lisez-moi', 'Read Me', 'Liesmich', 'Leggimi', 'L'#130'ame'),
+            icText, cmReadme, SysDir + 'LISEZMOI.TXT');
+    If PathInfo(CmdPath, Fl, Size, Tm, Lba, I) Then
+      DeskAdd(PromptName, icDos, cmPrompt, CmdPath);
+    { Paint (APPS\PAINT.PAS) : icone dediee }
+    If PathInfo(SysDir + 'PAINT.EXE', Fl, Size, Tm, Lba, I) Then
+      DeskAdd('Paint', icPaint, cmPaint, SysDir + 'PAINT.EXE');
+    If PathInfo(SysDir + 'BROWSER.EXE', Fl, Size, Tm, Lba, I) Then
+      DeskAdd(L('Navigateur Web', 'Web Browser', 'Webbrowser',
+                'Browser Web', 'Navegador Web'), icWeb, cmBrowser,
+              SysDir + 'BROWSER.EXE');
+  End;
   I := 0;
   While SysEntry(I, Nm, Dir) Do
   Begin
@@ -14418,8 +14441,9 @@ Begin
        Not MenuApp(Nm) And (ExeCnt < 16) Then
     Begin
       ExePaths^[ExeCnt] := SysDir + Nm;
-      DeskAdd(Copy(Nm, 1, Length(Nm) - 4), ExeIcon(Nm), cmExeBase + ExeCnt,
-              SysDir + Nm);
+      If Not Hd Then
+        DeskAdd(Copy(Nm, 1, Length(Nm) - 4), ExeIcon(Nm),
+                cmExeBase + ExeCnt, SysDir + Nm);
       Inc(ExeCnt);
     End;
     Inc(I);
@@ -14433,8 +14457,9 @@ Begin
     D := DeskDir;
     While (DeskCnt < MaxDesk) And ExpEntryP(D, I, Nm, Fl, Size) Do
     Begin
-      DeskAdd(ItemLabel(Nm, Fl), ItemIcon(Nm, Fl), cmDeskFile,
-              D + '\' + Nm);
+      If ExtOf(Nm) = 'LNK' Then Ic := LnkIcon(D + '\' + Nm)
+      Else Ic := ItemIcon(Nm, Fl);
+      DeskAdd(ItemLabel(Nm, Fl), Ic, cmDeskFile, D + '\' + Nm);
       Inc(I);
     End;
   End;
@@ -14480,6 +14505,16 @@ Begin
   If B <> '' Then OutCenter(X, X + W - 1, Y + 16, B, Fg);
 End;
 
+{ fleche des raccourcis (coin bas gauche de l'icone, 10 x 10) }
+Procedure LnkArrow(X, Y : LongInt);
+Begin
+  FBar(X, Y, X + 9, Y + 9, cWhite);
+  HLine(X, X + 9, Y, cBlack); HLine(X, X + 9, Y + 9, cBlack);
+  VLine(X, Y, Y + 9, cBlack); VLine(X + 9, Y, Y + 9, cBlack);
+  DLine(X + 2, Y + 7, X + 6, Y + 3, cBlack);
+  HLine(X + 4, X + 7, Y + 2, cBlack); VLine(X + 7, Y + 2, Y + 5, cBlack);
+End;
+
 Procedure DeskDraw(R : TRect);
 Var I, X, Y : LongInt; T : TRect; Fg : LongInt;
 Begin
@@ -14494,7 +14529,9 @@ Begin
     If RInter(T, T, R) Then
     Begin
       PaintIcon(DeskIco[I], X + 26, Y, 32);
-      DrawLabel(X + 2, Y + 35, 80, DeskName^[I], DeskSel = I, Fg);
+      If ExtOf(DeskPath^[I]) = 'LNK' Then LnkArrow(X + 26, Y + 22);
+      DrawLabel(X + 2, Y + 35, 80, DeskName^[I], (DeskSel = I) Or DeskMul[I],
+                Fg);
     End;
   End;
   If DimOn Then
@@ -14934,6 +14971,13 @@ Begin
   NetLetCount := K;
 End;
 
+{ menu de l'icone de la Corbeille (bureau) }
+Function IconRecycle : Boolean;
+Begin
+  IconRecycle := (NewWin < 0) And (DeskSel >= 0) And
+                 (DeskCmd[DeskSel] = cmRecycle);
+End;
+
 { menu de l'icone du Poste de travail (bureau) }
 Function IconComp : Boolean;
 Begin
@@ -14981,7 +15025,10 @@ Begin
     mnDesk : MenuCount := 9;
     mnArrange : MenuCount := 2;
     mnColors : MenuCount := DepN;
-    mnIcon : If IconComp Then MenuCount := 6 Else MenuCount := 12;
+    mnIcon :
+      If IconComp Then MenuCount := 6
+      Else If IconRecycle Then MenuCount := 4
+      Else MenuCount := 12;
     mnNew : MenuCount := 5;
     mnExpCtx : MenuCount := 8;
     mnDocs :
@@ -15404,7 +15451,8 @@ Begin
               T := L('Coller le raccourci', 'Paste Shortcut',
                      'Verkn'#129'pfung einf'#129'gen', 'Incolla collegamento',
                      'Pegar acceso directo');
-              Cmd := cmGray;
+              If DeskOk And (ClipFN > 0) Then Cmd := cmPasteLnk
+              Else Cmd := cmGray;
             End;
         6 : Begin
               T := L('Nouveau', 'New', 'Neu', 'Nuovo', 'Nuevo');
@@ -15599,6 +15647,25 @@ Begin
                 Cmd := cmSysProps;
               End;
         End
+      Else If IconRecycle Then
+        Case I Of
+          0 : Begin
+                T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir');
+                Cmd := cmIconOpen;
+              End;
+          1 : Begin
+                { pas de fichiers dans la Corbeille : Supprimer efface }
+                T := L('Vider la Corbeille', 'Empty Recycle Bin',
+                       'Papierkorb leeren', 'Svuota Cestino',
+                       'Vaciar Papelera');
+                Cmd := cmGray;
+              End;
+          3 : Begin
+                T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
+                       'Propriet'#133, 'Propiedades');
+                Cmd := cmRecProps;
+              End;
+        End
       Else
         Case I Of
           0 : Begin
@@ -15616,8 +15683,11 @@ Begin
               End;
           4 : Begin
                 T := L('Coller', 'Paste', 'Einf'#129'gen', 'Incolla', 'Pegar');
+                { dossier : dedans ; document du bureau : sur le bureau }
                 If (CtxPath <> '') And (ClipFN > 0) And Not CtxRO And
-                   (CtxSelN <= 1) And IsDirPath(CtxPath) Then Cmd := cmPaste
+                   (CtxSelN <= 1) And
+                   (IsDirPath(CtxPath) Or ((NewWin < 0) And DeskOk)) Then
+                  Cmd := cmPaste
                 Else Cmd := cmGray;
               End;
           6 : Begin
@@ -15637,7 +15707,7 @@ Begin
                 T := L('S'#130'lectionner tout', 'Select All',
                        'Alles markieren', 'Seleziona tutto',
                        'Seleccionar todo');
-                If NewWin >= 0 Then Cmd := cmSelAll Else Cmd := cmGray;
+                Cmd := cmSelAll;
               End;
           11 : Begin
                  T := L('Propri'#130't'#130's', 'Properties', 'Eigenschaften',
@@ -22573,10 +22643,26 @@ Begin
       If CtxPath <> '' Then FolderProps(CtxPath) Else FolderProps(NewDir);
     cmFileProps : CtxProps;
     cmCut, cmCopy : CtxClip(Cmd = cmCut);
-    cmPaste : If CtxPath <> '' Then PasteTo(CtxPath) Else PasteTo(NewDir);
+    cmPaste :
+      If (CtxPath <> '') And IsDirPath(CtxPath) Then PasteTo(CtxPath)
+      Else PasteTo(NewDir);
+    cmPasteLnk : PasteShortcuts;
+    cmRecProps :
+      MsgBoxOpen(L('Propri'#130't'#130's de Corbeille', 'Recycle Bin ' +
+        'Properties', 'Eigenschaften von Papierkorb', 'Propriet'#133' ' +
+        'Cestino', 'Propiedades de Papelera'), L('La Corbeille est vide. ' +
+        'Les fichiers supprim'#130's ne sont pas d'#130'plac'#130's dans la ' +
+        'Corbeille : ils sont effac'#130's imm'#130'diatement.',
+        'The Recycle Bin is empty. Deleted files are not moved to the ' +
+        'Recycle Bin: they are removed immediately.', 'Der Papierkorb ' +
+        'ist leer. Gel'#148'schte Dateien werden sofort entfernt.',
+        'Il Cestino '#138' vuoto. I file eliminati vengono rimossi ' +
+        'subito.', 'La Papelera est'#160' vac'#161'a. Los archivos ' +
+        'eliminados se quitan de inmediato.'), $40);
     cmSelAll :
       If (NewWin >= 0) And Wnds^[NewWin].Used And
-         (Wnds^[NewWin].IKind = ikExplorer) Then ExpSelectAll(NewWin);
+         (Wnds^[NewWin].IKind = ikExplorer) Then ExpSelectAll(NewWin)
+      Else If NewWin < 0 Then DeskSelectAll;
     cmRefresh : NewRefresh;
     cmComputer, cmExplorer :
     Begin
@@ -22775,9 +22861,9 @@ Begin
       End;
       ActivateW(-1);
       LastClickW := -1;
-      NewWin := -1; NewDir := DeskDir; CtxPath := '';
-      CtxRO := False; CtxSelN := 1;
-      If (I >= 0) And (DeskCmd[I] = cmDeskFile) Then CtxPath := DeskPath^[I];
+      { clic hors de la selection multiple : elle est abandonnee }
+      If (I < 0) Or Not DeskMul[I] Then DeskClearMul;
+      DeskCtxSet;
       If I >= 0 Then OpenMenu(0, mnIcon, X, Y, False)
       Else OpenMenu(0, mnDesk, X, Y, False);
       Exit;
@@ -22790,6 +22876,7 @@ Begin
       Exit;
     End;
     LastClickW := 10000 + I; LastClickT := Ticks;
+    DeskClearMul;
     If I <> DeskSel Then
     Begin
       DeskRedraw(DeskSel);
@@ -23854,14 +23941,26 @@ Begin
   If W = -2 Then
   Begin
     If (VK = $0D) And (DeskSel >= 0) Then KCommand(DeskCmd[DeskSel]);
-    { F2 : renommer, Suppr : supprimer (document du bureau) }
-    If ((VK = $71) Or (VK = $2E)) And (DeskSel >= 0) Then
-      If DeskCmd[DeskSel] = cmDeskFile Then
+    { F2 renommer, Suppr supprimer, Ctrl+A tout selectionner, Ctrl+C
+      copier, Ctrl+X couper, Ctrl+V coller (documents du bureau) }
+    K := VK;
+    If (KeyState[$11] And $80) = 0 Then K := 0;
+    If K = Ord('A') Then DeskSelectAll
+    Else If (VK = $71) Or (VK = $2E) Or (K = Ord('C')) Or (K = Ord('X')) Or
+            (K = Ord('V')) Then
+    Begin
+      DeskCtxSet;
+      If K = Ord('V') Then
       Begin
-        NewWin := -1; CtxPath := DeskPath^[DeskSel];
-        CtxRO := False; CtxSelN := 1;
-        If VK = $71 Then CtxRenameOpen Else CtxDeleteAsk;
-      End;
+        If DeskOk Then PasteTo(DeskDir);
+      End
+      Else If (CtxPath <> '') Or (CtxSelN > 1) Then
+        If K = Ord('C') Then CtxClip(False)
+        Else If Not CtxRO Then
+          If K = Ord('X') Then CtxClip(True)
+          Else If VK = $2E Then CtxDeleteAsk
+          Else If CtxSelN <= 1 Then CtxRenameOpen;
+    End;
     Exit;
   End;
   { programme MS-DOS : touches enfoncees et relachees }
@@ -39148,17 +39247,284 @@ End;
 { Elements d'une commande : la selection de l'Explorateur NewWin,
   sinon l'element CtxPath (bureau) }
 Procedure CtxGather;
+Var I : LongInt;
 Begin
   OpN := 0;
   If (NewWin >= 0) And Wnds^[NewWin].Used And
      (Wnds^[NewWin].IKind = ikExplorer) And (Wnds^[NewWin].KS <> '') Then
     ExpGather(NewWin);
+  If (OpN = 0) And (NewWin < 0) And (DeskMulN > 0) Then
+    For I := 0 To DeskCnt - 1 Do
+      If DeskMul[I] And (DeskCmd[I] = cmDeskFile) And (OpN < MaxOp) Then
+      Begin
+        OpP^[OpN] := DeskPath^[I];
+        Inc(OpN);
+      End;
   If (OpN = 0) And (CtxPath <> '') Then
   Begin
     OpP^[0] := CtxPath;
     OpN := 1;
   End;
 End;
+
+{ ---------------- Bureau : selection, raccourcis (.LNK) ---------------- }
+
+Procedure DeskClearMul;
+Var I : LongInt;
+Begin
+  If DeskMulN = 0 Then Exit;
+  For I := 0 To MaxDesk - 1 Do DeskMul[I] := False;
+  DeskMulN := 0;
+  MarkAll;
+End;
+
+Procedure DeskSelectAll;
+Var I : LongInt;
+Begin
+  For I := 0 To DeskCnt - 1 Do DeskMul[I] := True;
+  DeskMulN := DeskCnt;
+  MarkAll;
+End;
+
+{ element du menu contextuel du bureau : l'icone choisie (document ou
+  raccourci) ou la selection multiple ; une icone fixe (bureau sur le
+  CD-ROM) se copie et montre ses proprietes, sans plus }
+Procedure DeskCtxSet;
+Var I : LongInt;
+Begin
+  NewWin := -1; NewDir := DeskDir; CtxPath := '';
+  CtxRO := False; CtxSelN := 1;
+  If DeskMulN > 0 Then
+  Begin
+    CtxSelN := 0;
+    For I := 0 To DeskCnt - 1 Do
+      If DeskMul[I] And (DeskCmd[I] = cmDeskFile) Then
+      Begin
+        Inc(CtxSelN);
+        CtxPath := DeskPath^[I];
+      End;
+    If CtxSelN = 0 Then
+    Begin
+      CtxRO := True;
+      CtxSelN := 1;
+    End;
+    Exit;
+  End;
+  If DeskSel < 0 Then Exit;
+  CtxPath := DeskPath^[DeskSel];
+  If DeskCmd[DeskSel] <> cmDeskFile Then CtxRO := True;
+End;
+
+{ Raccourci Windows (.LNK, MS-SHLLINK) : en-tete de 76 octets, puis
+  LinkInfo avec le chemin local de la cible }
+Function LnkWrite(Const P, Target : String) : Boolean;
+Var B : Array[0..511] Of Byte; N, H, Li, Done, I, A : LongInt; S : String;
+Begin
+  LnkWrite := False;
+  A := LongInt(@B);
+  FillMem(A, SizeOf(B), 0);
+  MemL[0:A] := $4C;
+  { CLSID 00021401-0000-0000-C000-000000000046 }
+  MemL[0:A + 4] := $00021401;
+  B[12] := $C0; B[19] := $46;
+  MemL[0:A + 20] := 2;                      { HasLinkInfo }
+  MemL[0:A + 24] := $20;
+  MemL[0:A + 60] := 1;                      { SW_SHOWNORMAL }
+  Li := $4C;
+  { LinkInfo : en-tete 28 octets, VolumeID 17 octets, chemin local }
+  MemL[0:A + Li + 4] := $1C;
+  MemL[0:A + Li + 8] := 1;                  { VolumeIDAndLocalBasePath }
+  MemL[0:A + Li + 12] := $1C;
+  MemL[0:A + Li + 16] := $1C + 17;
+  MemL[0:A + Li + $1C] := 17;
+  MemL[0:A + Li + $1C + 4] := 3;            { DRIVE_FIXED }
+  MemL[0:A + Li + $1C + 12] := 16;
+  N := Li + $1C + 17;
+  For I := 1 To Length(Target) Do
+  Begin
+    B[N] := Ord(Target[I]);
+    Inc(N);
+  End;
+  Inc(N);
+  MemL[0:A + Li + 24] := N - Li;            { CommonPathSuffix : '' }
+  Inc(N);
+  MemL[0:A + Li] := N - Li;
+  N := N + 4;                               { bloc de fin }
+  S := P + #0;
+  H := CreateFileA(LongInt(@S[1]), $40000000, 0, 0, 2, $80, 0);
+  If H = INVALID_HANDLE Then Exit;
+  Done := 0;
+  WriteFile(H, A, N, LongInt(@Done), 0);
+  CloseHandle(H);
+  LnkWrite := Done = N;
+End;
+
+{ cible d'un raccourci (chemin local du LinkInfo) ; '' si illisible }
+Function LnkTarget(Const P : String) : String;
+Var B : Array[0..1023] Of Byte; H, N, O, Fl, Li, K, A : LongInt;
+    S, T : String;
+Begin
+  LnkTarget := '';
+  A := LongInt(@B);
+  S := P + #0;
+  H := CreateFileA(LongInt(@S[1]), $80000000, 1, 0, 3, $80, 0);
+  If H = INVALID_HANDLE Then Exit;
+  N := 0;
+  ReadFile(H, A, SizeOf(B), LongInt(@N), 0);
+  CloseHandle(H);
+  If (N < $4C) Or (MemL[0:A] <> $4C) Then Exit;
+  Fl := MemL[0:A + 20];
+  O := $4C;
+  If (Fl And 1) <> 0 Then O := O + 2 + MemW[0:A + O];
+  If ((Fl And 2) = 0) Or (O + 28 > N) Then Exit;
+  Li := O;
+  If (MemL[0:A + Li + 8] And 1) = 0 Then Exit;
+  K := Li + MemL[0:A + Li + 16];
+  T := '';
+  While (K < N) And (B[K] <> 0) And (Length(T) < 127) Do
+  Begin
+    T := T + Chr(B[K]);
+    Inc(K);
+  End;
+  LnkTarget := T;
+End;
+
+{ icone d'un raccourci : celle de sa cible }
+Function LnkIcon(Const P : String) : LongInt;
+Var T : String;
+Begin
+  T := LnkTarget(P);
+  If T = '' Then LnkIcon := icApp
+  Else If UpStr(T) = UpStr(CmdPath) Then LnkIcon := icDos
+  Else If IsDirPath(T) Then LnkIcon := icFolder
+  Else LnkIcon := ItemIcon(BaseName(T), 0);
+End;
+
+Function DkHas(Const K : String) : Boolean;
+Var I : LongInt;
+Begin
+  DkHas := True;
+  For I := 0 To DkN - 1 Do If DkKey[I] = K Then Exit;
+  DkHas := False;
+End;
+
+{ liste des raccourcis deja crees (une cle par ligne) }
+Procedure DkLoad;
+Var B : Array[0..1023] Of Byte; H, N, I : LongInt; S, T : String;
+Begin
+  DkLoaded := True; DkN := 0;
+  S := SysDir + 'DESKLNK.INI' + #0;
+  H := CreateFileA(LongInt(@S[1]), $80000000, 1, 0, 3, $80, 0);
+  If H = INVALID_HANDLE Then Exit;
+  N := 0;
+  ReadFile(H, LongInt(@B), SizeOf(B), LongInt(@N), 0);
+  CloseHandle(H);
+  T := '';
+  For I := 0 To N Do
+    If (I = N) Or (B[I] = 13) Or (B[I] = 10) Then
+    Begin
+      If (T <> '') And (DkN < MaxDesk) And Not DkHas(T) Then
+      Begin
+        DkKey[DkN] := T;
+        Inc(DkN);
+      End;
+      T := '';
+    End
+    Else If Length(T) < 15 Then T := T + UpCase(Chr(B[I]));
+End;
+
+Procedure DkSave;
+Var B : Array[0..1023] Of Byte; H, N, I, K, Done : LongInt; S : String;
+Begin
+  N := 0;
+  For I := 0 To DkN - 1 Do
+    If N < 1000 Then
+    Begin
+      For K := 1 To Length(DkKey[I]) Do
+      Begin
+        B[N] := Ord(DkKey[I][K]);
+        Inc(N);
+      End;
+      B[N] := 13; B[N + 1] := 10; N := N + 2;
+    End;
+  S := SysDir + 'DESKLNK.INI' + #0;
+  H := CreateFileA(LongInt(@S[1]), $40000000, 0, 0, 2, $80, 0);
+  If H = INVALID_HANDLE Then Exit;
+  Done := 0;
+  WriteFile(H, LongInt(@B), N, LongInt(@Done), 0);
+  CloseHandle(H);
+End;
+
+{ raccourci Nm.LNK vers Target, si sa cle n'a jamais ete creee }
+Function DkMake(Const Nm, Key, Target : String) : Boolean;
+Var A, Sz, Tm, Lb, Rm : LongInt; P : String;
+Begin
+  DkMake := False;
+  If DkHas(Key) Or (DkN >= MaxDesk) Then Exit;
+  If Not PathInfo(Target, A, Sz, Tm, Lb, Rm) Then Exit;
+  P := DeskDir + '\' + Nm + '.LNK';
+  If Not PathInfo(P, A, Sz, Tm, Lb, Rm) Then
+    If Not LnkWrite(P, Target) Then Exit;
+  DkKey[DkN] := Key;
+  Inc(DkN);
+  DkMake := True;
+End;
+
+{ raccourcis du bureau : Lisez-moi, Invite MS-DOS, Paint, Navigateur Web
+  et les programmes du dossier du systeme absents des menus }
+Procedure DeskShortcuts;
+Var I : LongInt; Nm, S : String; Dir, Ch : Boolean;
+Begin
+  If Not DkLoaded Then DkLoad;
+  S := DeskDir + #0;
+  If Not IsDirPath(DeskDir) Then CreateDirectoryA(LongInt(@S[1]), 0);
+  Ch := DkMake(L('Lisez-moi', 'Read Me', 'Liesmich', 'Leggimi',
+               'L'#130'ame'), 'LISEZMOI.TXT', SysDir + 'LISEZMOI.TXT');
+  If DkMake(PromptName, 'COMMAND.EXE', CmdPath) Then Ch := True;
+  If DkMake('Paint', 'PAINT.EXE', SysDir + 'PAINT.EXE') Then Ch := True;
+  If DkMake(L('Navigateur Web', 'Web Browser', 'Webbrowser', 'Browser Web',
+            'Navegador Web'), 'BROWSER.EXE', SysDir + 'BROWSER.EXE') Then
+    Ch := True;
+  I := 0;
+  While SysEntry(I, Nm, Dir) Do
+  Begin
+    If Not Dir And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
+       Not MenuApp(Nm) Then
+      If DkMake(Copy(Nm, 1, Length(Nm) - 4), Copy(Nm, 1, 15), SysDir + Nm)
+      Then Ch := True;
+    Inc(I);
+  End;
+  If Ch Then DkSave;
+  ExpCW := -1;
+End;
+
+{ Coller le raccourci : un raccourci sur le bureau pour chaque element du
+  presse-papiers }
+Procedure PasteShortcuts;
+Var I, A, Sz, Tm, Lb, Rm : LongInt; T, Nm, P : String;
+Begin
+  If (ClipFN <= 0) Or Not DeskOk Then Exit;
+  T := DeskDir + #0;
+  If Not IsDirPath(DeskDir) Then CreateDirectoryA(LongInt(@T[1]), 0);
+  For I := 0 To ClipFN - 1 Do
+  Begin
+    T := ClipFP^[I];
+    { raccourci copie : un raccourci vers la meme cible }
+    If ExtOf(T) = 'LNK' Then
+    Begin
+      Nm := ItemLabel(BaseName(T), 0);
+      T := LnkTarget(T);
+    End
+    Else If IsDirPath(T) Then Nm := BaseName(T)
+    Else Nm := ItemLabel(BaseName(T), 0);
+    P := DeskDir + '\' + L('Raccourci vers ', 'Shortcut to ',
+         'Verkn'#129'pfung mit ', 'Collegamento a ', 'Acceso directo a ') +
+         Nm + '.LNK';
+    If Not PathInfo(P, A, Sz, Tm, Lb, Rm) Then LnkWrite(P, T);
+  End;
+  NewRefresh;
+End;
+
 
 { Couper ou Copier : les elements vont dans le presse-papiers (qui ne
   contient plus de texte, comme sous Windows) }
@@ -39573,6 +39939,13 @@ Begin
   For I := 0 To 7 Do FpTxt^[I] := '';
   FpTxt^[0] := FpType(Nm, Dir);
   FpTxt^[1] := ParentDir(P);
+  { raccourci : sa cible (ligne Cible) }
+  If Not Dir And (ExtOf(Nm) = 'LNK') Then
+  Begin
+    FpTxt^[0] := L('Raccourci', 'Shortcut', 'Verkn'#129'pfung',
+                   'Collegamento', 'Acceso directo');
+    FpTxt^[3] := LnkTarget(P);
+  End;
   If Dir Then
   Begin
     FpFiles := 0; FpDirs := 0; FpBytes := 0;
@@ -39606,7 +39979,9 @@ Begin
     End;
   End;
   FpTxt^[6] := FpDate(Tm, True);
-  If Dir Then FpIco := icFolder Else FpIco := ExpIcon(Nm, 0);
+  If Dir Then FpIco := icFolder
+  Else If ExtOf(Nm) = 'LNK' Then FpIco := LnkIcon(P)
+  Else FpIco := ExpIcon(Nm, 0);
   FpW := KCreate(ikFileProps, L('Propri'#130't'#130's de ',
                  'Properties of ', 'Eigenschaften von ', 'Propriet'#133' di ',
                  'Propiedades de ') + Nm, FpIco,
@@ -39755,8 +40130,12 @@ Begin
         'Percorso:', 'Ubicaci'#162'n:'), FpTxt^[1]);
   FpRow(X1, X2, Y1 + 134, L('Taille :', 'Size:', 'Gr'#148#225'e:',
         'Dimensioni:', 'Tama'#164'o:'), FpTxt^[2]);
-  FpRow(X1, X2, Y1 + 156, L('Contenu :', 'Contains:', 'Inhalt:',
-        'Contenuto:', 'Contenido:'), FpTxt^[3]);
+  If ExtOf(Wnds^[W].KS) = 'LNK' Then
+    FpRow(X1, X2, Y1 + 156, L('Cible :', 'Target:', 'Ziel:', 'Destinazione:',
+          'Destino:'), FpTxt^[3])
+  Else
+    FpRow(X1, X2, Y1 + 156, L('Contenu :', 'Contains:', 'Inhalt:',
+          'Contenuto:', 'Contenido:'), FpTxt^[3]);
   If Not Multi Then
   Begin
     FpSep(X1, X2, Y1 + 182);
@@ -40028,10 +40407,23 @@ End;
 { programme, dossier (Explorateur) ou document selon son extension,
   comme un double clic dans l'Explorateur }
 Function ShellOpen(P, Args : String) : Boolean;
-Var E : String; A, Sz, Tm, Lb, Rm : LongInt; Ok, Doc : Boolean;
+Var E, T : String; A, Sz, Tm, Lb, Rm : LongInt; Ok, Doc : Boolean;
 Begin
   ShellOpen := True;
   E := UpStr(Copy(P, Length(P) - 3, 4));
+  { raccourci : sa cible (raccourci d'un raccourci : 4 niveaux au plus) }
+  A := 0;
+  While (E = '.LNK') And (A < 4) Do
+  Begin
+    P := LnkTarget(P);
+    E := UpStr(Copy(P, Length(P) - 3, 4));
+    Inc(A);
+  End;
+  If (P = '') Or (E = '.LNK') Then
+  Begin
+    ShellOpen := False;
+    Exit;
+  End;
   A := 0;
   Ok := PathInfo(P, A, Sz, Tm, Lb, Rm);
   Doc := Ok And ((A And $10) <> 0);
@@ -90559,6 +90951,8 @@ Begin
   Until False;
 End;
 
+Var
+  I : LongInt;                       { programme principal }
 
 BEGIN
   SerialInit;
