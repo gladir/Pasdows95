@@ -15565,7 +15565,7 @@ Begin
       End
       Else If I = 2 Then
       Begin
-        T := L(#183' propos du Bloc-notes', 'About Notepad', #142'ber Editor',
+        T := L('A propos du Bloc-notes', 'About Notepad', #154'ber Editor',
                'Informazioni su Blocco note', 'Acerca del Bloc de notas');
         Cmd := cmNAbout;
       End;
@@ -18198,11 +18198,13 @@ Begin
     cmNFindNext : NoteFindNext(W, False);
     cmNAbout :
     Begin
-      MsgBoxOpen(L(#183' propos du Bloc-notes', 'About Notepad',
-        #142'ber Editor', 'Informazioni su Blocco note',
+      MsgBoxOpen(L('A propos du Bloc-notes', 'About Notepad',
+        #154'ber Editor', 'Informazioni su Blocco note',
         'Acerca del Bloc de notas'), 'Pasdows 95 - ' + L('Bloc-notes',
         'Notepad', 'Editor', 'Blocco note', 'Bloc de notas') + '|Version ' +
-        KVersion + '|Copyright (C) 2026 Gladir.com', $40);
+        KVersion + '|' + L('Auteur : ', 'Author: ', 'Autor: ', 'Autore: ',
+        'Autor: ') + 'Sylvain Maltais|' + L('Licence : ', 'License: ',
+        'Lizenz: ', 'Licenza: ', 'Licencia: ') + 'MIT', $40);
       Exit;
     End;
   End;
@@ -20754,19 +20756,22 @@ Begin
            'Sistema:'), cBlack);
     OutTxt(X + 20, Y + 18, 'Pasdows 95', cBlack);
     OutTxt(X + 20, Y + 36, KVersion, cBlack);
-    OutTxt(X, Y + 70, L('Enregistr'#130' '#133' :', 'Registered to:',
-           'Registriert f'#129'r:', 'Registrato a:', 'Registrado a:'), cBlack);
-    OutTxt(X + 20, Y + 88, 'Gladir.com', cBlack);
-    OutTxt(X, Y + 122, L('Ordinateur :', 'Computer:', 'Computer:',
+    OutTxt(X, Y + 70, L('Auteur :', 'Author:', 'Autor:', 'Autore:',
+           'Autor:'), cBlack);
+    OutTxt(X + 20, Y + 88, 'Sylvain Maltais', cBlack);
+    OutTxt(X, Y + 106, L('Licence :', 'License:', 'Lizenz:', 'Licenza:',
+           'Licencia:'), cBlack);
+    OutTxt(X + 20, Y + 124, 'MIT', cBlack);
+    OutTxt(X, Y + 158, L('Ordinateur :', 'Computer:', 'Computer:',
            'Computer:', 'Equipo:'), cBlack);
     T := CpuName;
     R := Pos(' ', T);
     If R = 0 Then R := Length(T) + 1;
-    OutTxt(X + 20, Y + 140, Copy(T, 1, R - 1), cBlack);
-    OutTxt(X + 20, Y + 158, Fit(Copy(T, R + 1, 255), X2 - X - 30), cBlack);
+    OutTxt(X + 20, Y + 176, Copy(T, 1, R - 1), cBlack);
+    OutTxt(X + 20, Y + 194, Fit(Copy(T, R + 1, 255), X2 - X - 30), cBlack);
     { memoire comptee comme Windows 95 (avec la zone de 640 Ko a 1 Mo) }
     I := MemKb + 384;
-    OutTxt(X + 20, Y + 176, IntStr(I Div 1024) + ',' +
+    OutTxt(X + 20, Y + 212, IntStr(I Div 1024) + ',' +
            IntStr(((I Mod 1024) * 10) Div 1024) +
            L(' Mo de RAM', ' MB RAM', ' MB RAM', ' MB di RAM', ' MB de RAM'),
            cBlack);
