@@ -4456,7 +4456,6 @@ Begin
   End;
   KnownHost := R;
 End;
-End;
 
 Procedure SaveHost(Key, Val : String);
 Var I, St : LongInt; L : String;

@@ -35,6 +35,7 @@ _N'ayez pas peur ! Avec le Pascal, tout est possible !_
 	<tr><td><b>APPS/WAB.PAS</b></td><td><b>Carnet d'adresses</b> (WAB.EXE), voir la section <a href="#carnet">Carnet d'adresses</a>.</td></tr>
 	<tr><td><b>APPS/MSTSC.PAS</b></td><td><b>Connexion Bureau à distance</b> (MSTSC.EXE, compilé par <b>WPC -CW32</b>) : client RDP avec TLS et NLA (CredSSP), voir la section <a href="#rdp">Connexion Bureau à distance</a>.</td></tr>
 	<tr><td><b>APPS/FTPCLI.PAS</b></td><td><b>Client FTP</b> (FTPCLI.EXE, compilé par <b>WPC -CW32</b>) : client FTP et SFTP (SSH-2) dans le genre de FileZilla, avec gestionnaire de sites en XML, voir la section <a href="#ftp">Client FTP</a>.</td></tr>
+	<tr><td><b>APPS/SSHCLI.PAS</b></td><td><b>Client SSH</b> (SSHCLI.EXE, compilé par <b>WPC -CW32</b>) : terminal SSH-2 (xterm) dans le genre de MobaXterm, onglets de sessions, panneau Sessions / Outils / Macros / SFTP, sessions en XML, voir la section <a href="#ssh">Client SSH</a>.</td></tr>
 	<tr><td><b>APPS/CONTROL.PAS</b></td><td><b>Panneau de configuration</b> (CONTROL.EXE) : applets désignées par leur fichier .CPL, boîtes Souris, Clavier et Paramètres régionaux, voir la section <a href="#panneau">Panneau de configuration</a>.</td></tr>
 	<tr><td><b>APPS/MP3PLAY.PAS</b></td><td><b>Lecteur MP3</b> (MP3PLAY.EXE, compilé par <b>WPC -CW32</b>) : le lecteur MP3PLAY.PAS du projet <a href="https://github.com/gladir/OS2-0">OS2-0</a> converti des API d'OS/2 (MDM, PMWIN, PMGPI, DOSCALLS) aux API de Windows (WINMM, USER32, GDI32, KERNEL32), voir la section <a href="#mp3">Lecteur MP3</a>.</td></tr>
 	<tr><td><b>EXAMPLES/HTTPGET.PAS</b></td><td>Exemple Win32 en mode console (HTTPGET.EXE) : télécharge une adresse <b>http://</b> ou <b>https://</b> avec WININET (<i>HTTPGET url [fichier]</i>), voir la section <a href="#https">HTTPS</a>.</td></tr>
@@ -209,7 +210,7 @@ Comme dans Windows 95, <i>Démarrer, Programmes</i> commence par le groupe <b>Ac
 	<li><b>Communications</b> : <b>Connexion Bureau à distance</b> (voir la section <a href="#rdp">Connexion Bureau à distance</a>) ;</li>
 	<li><b>Jeux</b> : <b>Échecs</b>, <b>FreeCell</b> et <b>Solitaire</b> ;</li>
 	<li><b>Multimédia</b> : <b>Lecteur CD</b>, <b>Lecteur MP3</b>, Contrôle du volume, puis les programmes DirectX installés : Outil de diagnostic DirectX (DXDIAG), DDTEST, D3DTEST, D3D8TEST et GLTEST ;</li>
-	<li><b>Outils Internet</b> : Navigateur Web, <b>Client FTP</b> (voir la section <a href="#ftp">Client FTP</a>), puis NETTEST et HTTPGET s'ils sont installés ;</li>
+	<li><b>Outils Internet</b> : Navigateur Web, <b>Client FTP</b> (voir la section <a href="#ftp">Client FTP</a>), <b>Client SSH</b> (voir la section <a href="#ssh">Client SSH</a>), puis NETTEST et HTTPGET s'ils sont installés ;</li>
 	<li><b>Outils système</b> : <b>Défragmenteur de disque</b>, Gestionnaire des tâches, <b>Informations système</b>, <b>Nettoyage de disque</b>, ScanDisk (vérification du disque C:), <b>Tâches planifiées</b>, puis FATTEST, PROCTEST et HELLO s'ils sont installés.</li>
 </ul>
 
@@ -395,9 +396,40 @@ Limites : pas de FTPS (FTP sur TLS), pas d'authentification SSH par clé, un seu
 Essayé avec <b>vsftpd</b> (FTP, listes LIST, envoi et téléchargement d'un dossier, fichier de 20 Mo, renommage, droits, suppression récursive, identifiant refusé) et <b>OpenSSH 9.6</b> (SFTP, clés Ed25519 et RSA, mot de passe et clavier interactif) : fichiers identiques des deux côtés (md5). Avec qemu, le serveur de l'hôte est <b>10.0.2.2</b>.
 
 <table>
-	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_OUTILS_INTERNET.png" width="400" alt="Menu Outils Internet"><br><i>Accessoires, Outils Internet, Client FTP</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP.png" width="400" alt="Client FTP"><br><i>Connecté en SFTP : téléchargement en cours</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/MENU_OUTILS_INTERNET.png" width="400" alt="Menu Outils Internet"><br><i>Accessoires, Outils Internet : Client FTP et Client SSH</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP.png" width="400" alt="Client FTP"><br><i>Connecté en SFTP : téléchargement en cours</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_SITES.png" width="400" alt="Gestionnaire de sites"><br><i>Gestionnaire de sites (sitemanager.xml)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_CLE_HOTE.png" width="400" alt="Clé d'hôte inconnue"><br><i>Première connexion SFTP : empreinte de la clé d'hôte</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_REMPLACER.png" width="400" alt="Le fichier cible existe déjà"><br><i>Le fichier cible existe déjà</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_FTP_DROITS.png" width="400" alt="Droits d'accès"><br><i>Modifier les droits d'accès (FTP : SITE CHMOD)</i></td></tr>
+</table>
+
+<h2 id="ssh">Client SSH</h2>
+
+<b>APPS/SSHCLI.PAS</b> (SSHCLI.EXE, compilé par <b>WPC -CW32</b>, sans unité supplémentaire) est un client <b>SSH</b> dans le genre de <b>MobaXterm</b>, avec l'apparence de Windows 95 : <i>Démarrer, Programmes, Accessoires, Outils Internet, Client SSH</i>.
+
+<ul>
+	<li><b>Barre d'outils</b> à grandes icônes : Session (nouvelle session), Sessions (sessions enregistrées), Outils, Affichage (panneau de gauche), <b>MultiExec</b> (la frappe va dans tous les terminaux ouverts), Macros, SFTP, Paramètres, Aide, Quitter ; <b>menus déroulants</b> Terminal, Sessions, Affichage, Outils, Paramètres, Macros et ? ; barre d'état (utilisateur@serveur:port, taille du terminal, type, UTF-8).</li>
+	<li><b>Panneau de gauche</b> avec la <b>connexion rapide</b> (<i>utilisateur@serveur:port</i>, puis Entrée ; le mot de passe est demandé) et quatre <b>onglets horizontaux</b> :
+		<ul>
+			<li><b>Sessions</b> : arbre « Sessions utilisateur » avec dossiers dépliables ; double clic pour se connecter ; petite barre d'outils et menu contextuel (Connexion, Connexion en tant que..., Modifier, Renommer, Dupliquer, Supprimer, Nouvelle session, Nouveau dossier) ;</li>
+			<li><b>Outils</b> : Invite MS-DOS, Gestionnaire des tâches, Informations système, Panneau de configuration, Bloc-notes, Calculatrice, Table de caractères, <b>Table ASCII</b> (page 437, code décimal, hexadécimal et Unicode ; double clic : le caractère est tapé dans le terminal), Client FTP, Connexion Bureau à distance, <b>Générateur de mots de passe</b>, Navigateur Web ;</li>
+			<li><b>Macros</b> : enregistrement des frappes au clavier dans le terminal (bouton rouge, puis carré pour arrêter), nouvelle macro écrite à la main (<i>\r</i> Entrée, <i>\t</i>, <i>\e</i> Échap, <i>\xHH</i>), exécution d'un double clic, gardées dans <b>macros.xml</b> ;</li>
+			<li><b>SFTP</b> : les fichiers de la session active (seconde connexion SSH ouverte après la connexion), chemin modifiable, dossier parent, dossier personnel, actualiser, <b>télécharger</b> (boîte Enregistrer sous), <b>envoyer</b> (boîte Ouvrir), créer un dossier, renommer, supprimer.</li>
+		</ul></li>
+	<li><b>Onglets des sessions</b> au-dessus du terminal : onglet d'accueil (nouvelle session, configuration, sessions enregistrées), un onglet par session (jusqu'à 8 à la fois, chacune dans sa tâche), croix de fermeture, bouton +, menu contextuel (Reconnecter, Dupliquer, Renommer, Fermer). Quand la session se termine, le code de sortie s'affiche : Entrée ferme l'onglet, R relance la session.</li>
+	<li>Les sessions sont enregistrées dans <b>sessions.xml</b> (élément <i>Folder</i> pour chaque dossier, <i>Session</i> avec l'hôte, le port, l'utilisateur, le mot de passe facultatif en base64, la commande à exécuter, le type de terminal et un commentaire), importables et exportables (<i>Sessions, Importer / Exporter</i>) ; les paramètres sont dans <b>settings.xml</b> ; les empreintes des clés d'hôte acceptées dans <b>knownhosts.txt</b>, commun avec le Client FTP.</li>
+</ul>
+
+Le <b>terminal</b> émule un <b>xterm</b> : couleurs (16 couleurs, palettes de 256 couleurs et RVB ramenées aux 16), gras, vidéo inverse, souligné, positionnement du curseur, effacements, insertion et suppression de lignes et de caractères, <b>région de défilement</b>, <b>écran alternatif</b> (vim, less, top, nano), tabulations, sauvegarde du curseur, titre de la fenêtre (OSC), réponses DSR et DA, mode curseur d'application, collage entre crochets ; les caractères <b>UTF-8</b> sont affichés avec la police 8 × 16 de l'écran (page 437 : accents, cadres, blocs, flèches ; les autres caractères sont approchés) et les <b>graphismes DEC</b> sont convertis en cadres. Clavier : flèches, Origine, Fin, Inser, Suppr, Page précédente et suivante, F1 à F12 (avec Maj et Ctrl), Ctrl+lettre, Retour arrière (^? ou ^H). Historique de 1 000 lignes (molette, barre de défilement, Maj+Page précédente), <b>sélection à la souris</b> copiée aussitôt (double clic : un mot), collage par Maj+Inser, le clic du milieu ou le clic droit (au choix), enregistrement du texte du terminal dans un fichier. La taille du terminal suit celle de la fenêtre (le serveur est prévenu : <i>window-change</i>). Quatre jeux de couleurs : blanc sur noir, noir sur blanc, vert sur noir, ambre sur noir.
+
+La pile <b>SSH-2</b> est celle du Client FTP (curve25519-sha256, clés d'hôte ssh-ed25519, rsa-sha2-512 et rsa-sha2-256 vérifiées, aes128-ctr, hmac-sha2-256, « kex strict », mot de passe ou clavier interactif), avec un canal <i>session</i>, un pseudo-terminal (<i>pty-req</i>), le <i>shell</i> ou une commande (<i>exec</i>), le maintien de la connexion (paquets <i>ignore</i> toutes les 60 secondes, réglable) et le code de sortie (<i>exit-status</i>). Chaque session a sa tâche réseau, qui attend à la fois les données du serveur et les frappes (<i>select</i> avec un délai de 30 ms). Les variables de la pile SSH étant globales, le verrou qui protège les chaînes du runtime de WPC <b>échange le contexte SSH</b> de la tâche qui le prend (<i>TlsGetValue</i>) : chaque tâche retrouve sa connexion.
+
+Limites : pas d'authentification par clé, de redirection de ports (tunnels), de X11 ni de terminal local ; un seul algorithme de chaque sorte (ceux d'OpenSSH par défaut) ; caractères larges (chinois, émojis) affichés sur une seule case ; le navigateur SFTP ne transfère pas de dossiers entiers.
+
+Essayé avec <b>OpenSSH 9.6</b> : connexion rapide et sessions enregistrées, deux sessions en même temps, MultiExec, <i>ls --color</i>, accents et cadres UTF-8, <i>top</i> (et changement de taille pendant qu'il tourne), <i>vim</i>, sélection et collage, macros, téléchargement et envoi SFTP (fichiers identiques, md5), <i>exit 3</i> (code de sortie affiché), serveur arrêté (message d'erreur, puis R pour relancer).
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_SSH.png" width="400" alt="Client SSH"><br><i>Session SSH et onglet SFTP</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_SSH_TOP.png" width="400" alt="top dans le Client SSH"><br><i>top, panneau masqué (78 colonnes)</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_SSH_SESSION.png" width="400" alt="Propriétés d'une session"><br><i>Propriétés de la session (sessions.xml)</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_SSH_ACCUEIL.png" width="400" alt="Accueil"><br><i>Onglet d'accueil et arbre des sessions</i></td></tr>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_SSH_OUTILS.png" width="400" alt="Onglet Outils"><br><i>Onglet Outils</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/CLIENT_SSH_MACROS.png" width="400" alt="Onglet Macros"><br><i>Onglet Macros</i></td></tr>
 </table>
 
 <h2 id="freecell">FreeCell</h2>
