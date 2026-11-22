@@ -9,7 +9,8 @@
 #  3. compile les programmes systeme (SYSTEM/*.PAS, dont COMMAND.EXE,
 #     l'interpreteur de commandes) et les exemples Win32 (EXAMPLES/*.PAS),
 #     avec WPC -CW32, puis les applications (APPS/*.PAS, dont PAINT.EXE,
-#     le Paint de CloneDRAW) ;
+#     le Paint de CloneDRAW, PASDEV.EXE et PASDBG.EXE du Developer Kit),
+#     et WPC.EXE (WPC -CW32 TOOLS/WPC.PAS : le compilateur pour Pasdows) ;
 #  4. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec tous
 #     les fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
 #     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) ;
@@ -65,6 +66,10 @@ for P in "$ROOT"/APPS/*.PAS; do
   "$W/wpc" -CW32 "$P" "$W/cd/$N.EXE"
   cp "$W/cd/$N.EXE" "$ROOT/IMAGE/CDROM/$N.EXE"
 done
+
+echo "== WPC.EXE : le compilateur compile par lui-meme (WPC -CW32)"
+"$W/wpc" -CW32 "$ROOT/TOOLS/WPC.PAS" "$W/cd/WPC.EXE"
+cp "$W/cd/WPC.EXE" "$ROOT/IMAGE/CDROM/WPC.EXE"
 
 echo "== CD-ROM amorcable"
 "$W/makeiso" "$ROOT/IMAGE/PASDOWS.ISO" /BOOT:"$W/cd/IO.SYS" /LABEL:PASDOWS95 "$W/cd/*"

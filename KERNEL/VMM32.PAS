@@ -695,6 +695,14 @@ Procedure GlDumpRing; Forward;
 
 Var
   DrWatch, DrHits : LongInt;     { point d'arret de donnees (DRWATCH) }
+  { debogage Win32 (une session : un debogueur, un programme debogue) }
+  DbgOn, DbgPend, DbgBusy, DbgStop, DbgPause : Boolean;
+  DbgProc, DbgOwner, DbgT, DbgFrame, DbgOfs, DbgCont : LongInt;
+  DbgEntry, DbgEntryB : LongInt;
+  DbgEv : Array[0..23] Of LongInt;    { DEBUG_EVENT (96 octets) }
+  KNextStd, KNextDbg : LongInt;     { CreateProcessA -> ProcStart }
+
+Function DbgTrapK(Vec, F : LongInt) : Boolean; Forward;
 
 { #DB du point d'arret de donnees DR0 : ecriture de sa propre adresse a
   l'adresse surveillee (diagnostic des piles corrompues) }
@@ -736,6 +744,8 @@ Begin
     DbgTrap(F);
     Exit;
   End;
+  If DbgOn Then
+    If DbgTrapK(Vec, F) Then Exit;
   KFault(Vec, F);
 End;
 
@@ -1789,6 +1799,8 @@ Const
   SecSlots = 64;
   FatEoc = $0FFFFFFF;
 
+Type
+  TVolLabTab = Array[0..MaxVol - 1] Of String[11];
 Var
   DiskN     : LongInt;
   DiskBase, DiskCtrl, DiskSecs : Array[0..MaxDisk - 1] Of LongInt;
@@ -1800,7 +1812,7 @@ Var
   VolFree, VolNext, VolFsInfo, VolSerial, VolLetter, VolActFat
     : Array[0..MaxVol - 1] Of LongInt;
   VolFsDirty : Array[0..MaxVol - 1] Of Boolean;
-  VolLab    : Array[0..MaxVol - 1] Of String[11];
+  VolLab    : ^TVolLabTab;
   SecLba, SecDisk, SecBuf, SecAge : Array[0..SecSlots - 1] Of LongInt;
   SecTick   : LongInt;
   FatIoErr  : Boolean;
@@ -2964,7 +2976,7 @@ Begin
   End;
   If Mem[0:A + 38 + 28 * Ord(VolType[V] = 32)] <> $29 Then S := '';
   If S = 'NO NAME    ' Then S := '';
-  VolLab[V] := Trim(S);
+  VolLab^[V] := Trim(S);
   If (VolType[V] = 32) And (VolFsInfo[V] > 0) And
      (VolFsInfo[V] < VolRsvd[V]) Then
   Begin
@@ -2989,7 +3001,7 @@ Begin
     Begin
       S := '';
       For FatSz := 0 To 10 Do S := S + Chr(Mem[0:A + FatSz]);
-      VolLab[V] := Trim(S);
+      VolLab^[V] := Trim(S);
       Break;
     End;
     Inc(K);
@@ -2997,7 +3009,7 @@ Begin
   KLog('FAT' + IntStr(VolType[V]) + ' : ' + Chr(VolLetter[V]) +
        ': disque ' + IntStr(D) + ' secteur ' + IntStr(Start) + ', ' +
        IntStr(VolClus[V]) + ' clusters de ' + IntStr(VolSpc[V] * 512) +
-       ' octets, etiquette ' + VolLab[V]);
+       ' octets, etiquette ' + VolLab^[V]);
   VolMount := True;
 End;
 
@@ -3964,7 +3976,7 @@ Begin
     If (A <> 0) And (Mem[0:A + 8] = 0) Then
       NvVer[V] := Mem[0:NtResVal(A) + 8];
   End;
-  VolLab[V] := Copy(S, 1, 11);
+  VolLab^[V] := Copy(S, 1, 11);
   { $UpCase }
   NvUpc[V] := 0;
   If NtReadRec(V, 10, R) Then
@@ -4029,7 +4041,7 @@ Begin
        ': disque ' + IntStr(D) + ' secteur ' + IntStr(Start) + ', ' +
        IntStr(VolClus[V]) + ' clusters de ' + IntStr(NvCb[V]) +
        ' octets, MFT ' + IntStr(NvRecN[V]) + ' enregistrements, ' +
-       IntStr(VolFree[V]) + ' clusters libres, etiquette ' + VolLab[V]);
+       IntStr(VolFree[V]) + ' clusters libres, etiquette ' + VolLab^[V]);
   NtMount := True;
 End;
 { ------------------------------------------------------------------ }
@@ -6744,7 +6756,7 @@ Begin
   End;
   VolFree[V] := N;
   VolClus[V] := VolSecs[V];
-  VolLab[V] := Copy(Lab, 1, 11);
+  VolLab^[V] := Copy(Lab, 1, 11);
   If VolN = 0 Then VolLetter[V] := Ord('C')
   Else VolLetter[V] := Ord('D') + VolN;
   VolFsDirty[V] := False;
@@ -6753,7 +6765,7 @@ Begin
   KLog('HPFS : ' + Chr(VolLetter[V]) + ': disque ' + IntStr(D) +
        ' secteur ' + IntStr(Start) + ', ' + IntStr(VolSecs[V]) +
        ' secteurs, ' + IntStr(HvNB[V]) + ' bandes, ' + IntStr(VolFree[V]) +
-       ' libres, etiquette ' + VolLab[V]);
+       ' libres, etiquette ' + VolLab^[V]);
   HpMount := True;
 End;
 
@@ -8365,6 +8377,7 @@ Const
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
   icAppWiz   = 56; icRdp      = 57; icFtp      = 58; icSsh      = 59;
+  icPasDev   = 60; icPasDbg   = 61;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9888,6 +9901,31 @@ Begin
       QL(20, 18, 26, 18, cRed); QL(26, 18, 26, 22, cRed);
       QL(23, 21, 26, 18, cRed);
     End;
+    icPasDev :
+    Begin
+      { Pascal Developer : fenetre d'edition, lignes de code colorees et
+        grand P }
+      IFrame(2, 3, 29, 28, cWhite);
+      QR(3, 4, 28, 7, cNavy);
+      QR(5, 10, 13, 11, cBlue); QR(7, 14, 17, 15, cMaroon);
+      QR(7, 18, 14, 19, cBlack); QR(5, 22, 12, 23, cBlue);
+      QR(18, 10, 20, 26, cGreen);
+      QR(20, 10, 25, 11, cGreen); QR(20, 17, 25, 18, cGreen);
+      QR(25, 11, 26, 17, cGreen);
+    End;
+    icPasDbg :
+    Begin
+      { Pasdows Debugger : insecte sur une page de code }
+      IFrame(2, 3, 24, 28, cWhite);
+      QR(4, 7, 14, 8, cBlue); QR(4, 11, 18, 12, cBlue);
+      QR(3, 15, 22, 16, cYellow); QR(4, 19, 12, 20, cBlue);
+      QL(14, 13, 11, 10, cBlack); QL(24, 13, 27, 10, cBlack);
+      QL(13, 19, 9, 19, cBlack); QL(25, 19, 29, 19, cBlack);
+      QL(14, 25, 11, 28, cBlack); QL(24, 25, 27, 28, cBlack);
+      QD(19, 20, 6, cRed); QC(19, 20, 6, cMaroon);
+      QD(19, 12, 3, cBlack);
+      QR(19, 14, 19, 26, cBlack);
+    End;
     icSsh :
     Begin
       { client SSH : terminal noir, invite verte et cle }
@@ -11231,9 +11269,12 @@ Begin
   If VmOn And (CurT = VmT) And (((MemL[0:F + 52] And $20000) <> 0) Or
      ((MemL[0:F + 48] And 3) = 3)) Then
     VmTick(F + 12);
+  Eip := MemL[0:F + 44];
+  If DbgPause And DbgOn And (CurT > 0) And (ThrProc[CurT] = DbgProc) And
+     ((Eip < KImgLo) Or (Eip >= KImgHi)) Then
+    MemL[0:F + 52] := MemL[0:F + 52] Or $100;
   If (CurT <= 0) Or (Ticks - SliceStart < 20) Then Exit;
   If Not Threads[CurT].IsApp Then Exit;
-  Eip := MemL[0:F + 44];
   { code 16 bits (anneau 3) : toujours preemptible }
   If (MemL[0:F + 48] And 3) <> 3 Then
     If (Eip >= KImgLo) And (Eip < KImgHi) Then Exit;
@@ -13920,7 +13961,7 @@ Const
   cmNewFolder = 74; cmNewText = 75; cmNewBmp = 76; cmNewHtml = 77;
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
-  cmMstsc = 86; cmFtp = 93; cmSsh = 94;
+  cmMstsc = 86; cmFtp = 93; cmSsh = 94; cmPasDev = 95; cmPasDbg = 96;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -13956,6 +13997,7 @@ Const
   mnNew = 30; mnExpCtx = 31;      { Nouveau ; fond d'un dossier }
   mnNetLet = 32; mnMyComp = 33;   { lettres libres ; Poste de travail }
   mnComm = 34;                    { Accessoires, Communications }
+  mnDevKit = 35;                  { Programmes, Developer Kit }
   TzCount = 18;
   { fuseaux horaires (Date/Heure) : decalage en minutes, nom }
   TzOfs : Array[0..TzCount - 1] Of LongInt = (
@@ -14004,6 +14046,14 @@ Type
   TDeskPtArr = Array[0..MaxDesk - 1] Of String[127];
   TPathArr = Array[0..MaxOp - 1] Of String[127];
 
+Type
+  TExePathsTab = Array[0..15] Of String[63];
+Type
+  TFdFiltPatTab = Array[0..7] Of String[127];
+Type
+  TFdFiltDescTab = Array[0..7] Of String[63];
+Type
+  TFpTxtTab = Array[0..7] Of String[127];
 Var
   { Propriete de Affichage : boite ouverte, profondeurs proposees,
     resolutions de la profondeur choisie, question de redemarrage }
@@ -14038,8 +14088,8 @@ Var
   FdDir, FdName, FdMask, FdResult, FdDefExt, FdTitle : String;
   FdNm : ^TFdNmArr;                 { dans le tas (image sous 4 Mo) }
   FdIsDir : Array[0..199] Of Boolean;
-  FdFiltDesc : Array[0..7] Of String[63];
-  FdFiltPat : Array[0..7] Of String[127];
+  FdFiltDesc : ^TFdFiltDescTab;
+  FdFiltPat : ^TFdFiltPatTab;
   FdDone, FdOk : Boolean;
   FdClickR, FdClickT : LongInt;
   FindW : LongInt;
@@ -14086,9 +14136,9 @@ Var
   PasteOver : Boolean;
   PasteErr : String;
   FpW, FpIco : LongInt;              { boite Proprietes d'un fichier }
-  FpTxt : Array[0..7] Of String[127];
+  FpTxt : ^TFpTxtTab;
   DimOn     : Boolean;
-  ExePaths  : Array[0..15] Of String[63];
+  ExePaths  : ^TExePathsTab;
   ExeCnt    : LongInt;
   NoteBuf   : LongInt;
 
@@ -14334,7 +14384,8 @@ Begin
     (Nm = 'FINDFILE.EXE') Or (Nm = 'ECHECS.EXE') Or (Nm = 'SOL.EXE') Or
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
     (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE') Or
-    (Nm = 'FTPCLI.EXE') Or (Nm = 'SSHCLI.EXE');
+    (Nm = 'FTPCLI.EXE') Or (Nm = 'SSHCLI.EXE') Or (Nm = 'PASDEV.EXE') Or
+    (Nm = 'PASDBG.EXE') Or (Nm = 'WPC.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -14366,7 +14417,7 @@ Begin
     If Not Dir And (Copy(Nm, Length(Nm) - 3, 4) = '.EXE') And
        Not MenuApp(Nm) And (ExeCnt < 16) Then
     Begin
-      ExePaths[ExeCnt] := SysDir + Nm;
+      ExePaths^[ExeCnt] := SysDir + Nm;
       DeskAdd(Copy(Nm, 1, Length(Nm) - 4), ExeIcon(Nm), cmExeBase + ExeCnt,
               SysDir + Nm);
       Inc(ExeCnt);
@@ -14902,9 +14953,10 @@ Begin
     mnStart : MenuCount := 9;
     mnFind : MenuCount := 2;
     mnTools : MenuCount := 6 + KnownCount('S');
-    mnPrograms : MenuCount := 4 + ExeCnt;
+    mnPrograms : MenuCount := 5 + ExeCnt;
     mnAccess : MenuCount := 11;
     mnComm : MenuCount := 1;
+    mnDevKit : MenuCount := 2;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
     mnInet : MenuCount := 3 + KnownCount('I');
@@ -15016,24 +15068,41 @@ Begin
       End
       Else If I = 1 Then
       Begin
+        T := 'Developer Kit';
+        Sub := mnDevKit; Icon := icPrograms;
+      End
+      Else If I = 2 Then
+      Begin
         T := L('Explorateur Pasdows', 'Pasdows Explorer',
                'Pasdows-Explorer', 'Esplora risorse Pasdows',
                'Explorador de Pasdows');
         Cmd := cmExplorer; Icon := icExplorer;
       End
-      Else If I = 2 Then
+      Else If I = 3 Then
       Begin
         T := PromptName;
         Cmd := cmPrompt; Icon := icDos;
       End
-      Else If I = 3 Then
+      Else If I = 4 Then
       Begin
         T := '-';
       End
       Else
       Begin
-        T := BaseName(ExePaths[I - 4]);
-        Cmd := cmExeBase + I - 4; Icon := ExeIcon(T);
+        T := BaseName(ExePaths^[I - 5]);
+        Cmd := cmExeBase + I - 5; Icon := ExeIcon(T);
+      End;
+    { Programmes, Developer Kit : l'EDI Pascal (WPC) et le debogueur }
+    mnDevKit :
+      If I = 0 Then
+      Begin
+        T := 'Pascal Developer';
+        Cmd := cmPasDev; Icon := icPasDev;
+      End
+      Else
+      Begin
+        T := 'Pasdows Debugger';
+        Cmd := cmPasDbg; Icon := icPasDbg;
       End;
     { Programmes, Accessoires : groupes, puis programmes (comme Windows) }
     mnAccess :
@@ -15461,7 +15530,7 @@ Begin
       End;
     mnFdTypes :
       Begin
-        T := FdFiltDesc[I];
+        T := FdFiltDesc^[I];
         Cmd := cmFdType + I;
       End;
     mnVolCtx :
@@ -16454,7 +16523,7 @@ Begin
     Fl := 2; Size := 0;
     If I = 0 Then
     Begin
-      If VolN > 0 Then Nm := Trim(VolLab[0] + ' (C:)') Else Nm := '(C:)';
+      If VolN > 0 Then Nm := Trim(VolLab^[0] + ' (C:)') Else Nm := '(C:)';
       ExpEntryP := True;
     End
     Else If I = 1 Then
@@ -16465,7 +16534,7 @@ Begin
     Begin
       V := ExpVolAt(I);
       If VolType[V] = NetT Then Nm := NdLabel(V)
-      Else Nm := Trim(VolLab[V] + ' (' + Chr(VolLetter[V]) + ':)');
+      Else Nm := Trim(VolLab^[V] + ' (' + Chr(VolLetter[V]) + ':)');
       ExpEntryP := True;
     End
     Else If (I = 2) Or (ExpVolAt(I - 1) >= 0) Then
@@ -16597,6 +16666,8 @@ Begin
   Else If Nm = 'MSTSC.EXE' Then ExeIcon := icRdp
   Else If Nm = 'FTPCLI.EXE' Then ExeIcon := icFtp
   Else If Nm = 'SSHCLI.EXE' Then ExeIcon := icSsh
+  Else If Nm = 'PASDEV.EXE' Then ExeIcon := icPasDev
+  Else If Nm = 'PASDBG.EXE' Then ExeIcon := icPasDbg
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
@@ -16676,7 +16747,7 @@ Var V : LongInt;
 Begin
   V := FatVolOf(D + ':');
   If (V >= 0) And (VolType[V] = NetT) Then DriveName := NdLabel(V)
-  Else If V >= 0 Then DriveName := Trim(VolLab[V] + ' (' + D + ':)')
+  Else If V >= 0 Then DriveName := Trim(VolLab^[V] + ' (' + D + ':)')
   Else If D = 'D' Then DriveName := Trim(VolLabel + ' (D:)')
   Else DriveName := '(' + D + ':)';
 End;
@@ -20872,7 +20943,7 @@ Function VpLabel(D : Char) : String;
 Var V : LongInt;
 Begin
   V := FatVolOf(D + ':');
-  If V >= 0 Then VpLabel := VolLab[V]
+  If V >= 0 Then VpLabel := VolLab^[V]
   Else If D = 'D' Then VpLabel := VolLabel
   Else VpLabel := 'PASDOWS';
 End;
@@ -21030,11 +21101,11 @@ Begin
       GroupBox(X1 + 16, Y1 + 40, X2 - 16, Y1 + 120, L('V'#130'rification ' +
                'des erreurs', 'Error-checking status', 'Fehler'#129'berpr'#129 +
                'fung', 'Controllo errori', 'Comprobaci'#162'n de errores'));
-      If (D >= 'A') And (D <= 'Z') And (SdChecked[Ord(D) - 65] <> '') Then
+      If (D >= 'A') And (D <= 'Z') And (SdChecked^[Ord(D) - 65] <> '') Then
         WrapText(X1 + 60, Y1 + 58, X2 - X1 - 90, L('Derni'#138're ' +
                  'v'#130'rification : ', 'Last checked: ', 'Zuletzt ' +
                  'gepr'#129'ft: ', 'Ultimo controllo: ', #233'ltima ' +
-                 'comprobaci'#162'n: ') + SdChecked[Ord(D) - 65] + '.',
+                 'comprobaci'#162'n: ') + SdChecked^[Ord(D) - 65] + '.',
                  cBlack, True)
       Else
       WrapText(X1 + 60, Y1 + 58, X2 - X1 - 90, L('Aucune v'#130'rification ' +
@@ -21136,7 +21207,7 @@ Begin
     If Ok Then
     Begin
       Wnds^[W].K3 := Wnds^[W].K3 And Not 2;
-      Wnds^[W].KS := VolLab[V];
+      Wnds^[W].KS := VolLab^[V];
       For I := 0 To MaxWnd - 1 Do
         If Wnds^[I].Used And (Wnds^[I].IKind = ikExplorer) Then KRepaint(I);
     End
@@ -21174,13 +21245,15 @@ End;
 Const
   SdMaxDepth = 64;
 
+Type
+  TSdCheckedTab = Array[0..25] Of String[24];
 Var
   SdW, SdV, SdMap, SdBuf, SdDepth, SdC : LongInt;
   SdStk, SdIdx : Array[0..SdMaxDepth - 1] Of LongInt;
   SdFiles, SdDirs, SdHid, SdFileB, SdDirB, SdHidB, SdBadC, SdLost,
     SdCross, SdBadChain, SdSize, SdFatDiff, SdReadErr, SdFixed,
     SdUsedC, SdDone, SdTotal : LongInt;
-  SdChecked : Array[0..25] Of String[24];   { derniere verification }
+  SdChecked : ^TSdCheckedTab;   { derniere verification }
 
 Function SdBit(C : LongInt) : Boolean;
 Begin
@@ -21547,7 +21620,7 @@ Begin
        IntStr(Bpc) + L(' octets', ' bytes', ' Bytes', ' byte', ' bytes');
   ReadRtc;
   If (D >= 'A') And (D <= 'Z') Then
-    SdChecked[Ord(D) - 65] := Pad2(RtcDay) + '/' + Pad2(RtcMonth) + '/' +
+    SdChecked^[Ord(D) - 65] := Pad2(RtcDay) + '/' + Pad2(RtcMonth) + '/' +
                               IntStr(RtcYear) + ' ' + Pad2(RtcHour) + ':' +
                               Pad2(RtcMin);
   MsgBoxOpen(L('R'#130'sultats de ScanDisk - (', 'ScanDisk Results - (',
@@ -22012,19 +22085,19 @@ Begin
   If Owner = 0 Then
   Begin
     FdFiltN := 2;
-    FdFiltDesc[0] := L('Documents texte (*.txt)', 'Text Documents (*.txt)',
+    FdFiltDesc^[0] := L('Documents texte (*.txt)', 'Text Documents (*.txt)',
                        'Textdateien (*.txt)', 'Documenti di testo (*.txt)',
                        'Documentos de texto (*.txt)');
-    FdFiltPat[0] := '*.TXT';
-    FdFiltDesc[1] := L('Tous les fichiers (*.*)', 'All Files (*.*)',
+    FdFiltPat^[0] := '*.TXT';
+    FdFiltDesc^[1] := L('Tous les fichiers (*.*)', 'All Files (*.*)',
                        'Alle Dateien (*.*)', 'Tutti i file (*.*)',
                        'Todos los archivos (*.*)');
-    FdFiltPat[1] := '*.*';
+    FdFiltPat^[1] := '*.*';
     FdFiltI := 0;
     FdDefExt := 'TXT';
     FdTitle := '';
   End;
-  If FdFiltN > 0 Then FdMask := FdFiltPat[FdFiltI] Else FdMask := '*.*';
+  If FdFiltN > 0 Then FdMask := FdFiltPat^[FdFiltI] Else FdMask := '*.*';
   If (Pos('*', Name) > 0) Or (Pos('?', Name) > 0) Then FdName := ''
   Else FdName := Name;
   FdRefresh;
@@ -22107,7 +22180,7 @@ Begin
          'Tipo:', 'Tipo:'), cBlack);
   Sunken(X1 + 150, Y1 + 236, X2 - 110, Y1 + 258, cWhite);
   If FdFiltN > 0 Then
-    OutTxt(X1 + 154, Y1 + 239, Fit(FdFiltDesc[FdFiltI], X2 - X1 - 282),
+    OutTxt(X1 + 154, Y1 + 239, Fit(FdFiltDesc^[FdFiltI], X2 - X1 - 282),
            cBlack);
   Raised(X2 - 128, Y1 + 238, X2 - 112, Y1 + 256, False);
   Arrow(X2 - 123, Y1 + 245, 1, cBlack);
@@ -22421,7 +22494,7 @@ Begin
   If (Cmd >= cmFdType) And (Cmd < cmFdType + 8) Then
   Begin
     FdFiltI := Cmd - cmFdType;
-    FdMask := FdFiltPat[FdFiltI];
+    FdMask := FdFiltPat^[FdFiltI];
     FdRefresh;
     If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
     Exit;
@@ -22486,6 +22559,8 @@ Begin
     cmMstsc : RunExe('MSTSC.EXE', '');
     cmFtp : RunExe('FTPCLI.EXE', '');
     cmSsh : RunExe('SSHCLI.EXE', '');
+    cmPasDev : RunSys('PASDEV.EXE', '', 'Pascal Developer');
+    cmPasDbg : RunSys('PASDBG.EXE', '', 'Pasdows Debugger');
     cmNetDisc :
       If CtxNetDrv <> #0 Then
       Begin
@@ -22652,7 +22727,7 @@ Begin
         'Reinicie y pulse F5 o F8.'), $40);
     cmDosMode : DoShutdown(2);
   Else
-    If Cmd >= cmExeBase Then RunExe(ExePaths[Cmd - cmExeBase], '')
+    If Cmd >= cmExeBase Then RunExe(ExePaths^[Cmd - cmExeBase], '')
     Else If Cmd >= cmDocBase Then
     Begin
       If DocFile(Cmd - cmDocBase, Nm) Then NoteOpen(SysDir + Nm);
@@ -25759,6 +25834,11 @@ End;
 
 Function GetStdHandle(N : LongInt) : LongInt;
 Begin
+  If (AppStdOut <> 0) And ((N = -11) Or (N = -12)) Then
+  Begin
+    GetStdHandle := AppStdOut;
+    Exit;
+  End;
   Case N Of
     -10 : GetStdHandle := HStdIn;
     -11 : GetStdHandle := HStdOut;
@@ -27147,7 +27227,7 @@ Begin
   If V >= 0 Then
   Begin
     { volume FAT : noms longs, casse conservee, Unicode sur le disque }
-    If PVol <> 0 Then PutPStr(PVol, VolLab[V], VolSize);
+    If PVol <> 0 Then PutPStr(PVol, VolLab^[V], VolSize);
     If PSerial <> 0 Then MemL[0:PSerial] := VolSerial[V];
     If PMaxComp <> 0 Then MemL[0:PMaxComp] := 255;
     If PFlags <> 0 Then MemL[0:PFlags] := 6;
@@ -27210,7 +27290,7 @@ Begin
           MemW[0:NtResVal(P) + (I - 1) * 2] := Ord(Lab[I]);
         If NtWriteRec(V, 3, R) Then
         Begin
-          VolLab[V] := Lab;
+          VolLab^[V] := Lab;
           VolSetLabel := True;
         End;
       End;
@@ -27230,7 +27310,7 @@ Begin
       For I := 0 To 10 Do Mem[0:A + 43 + I] := Ord(S[I + 1]);
       If HpWr(V, 0, 1, A) Then
       Begin
-        VolLab[V] := Trim(S);
+        VolLab^[V] := Trim(S);
         VolSetLabel := True;
       End;
     End;
@@ -27298,7 +27378,7 @@ Begin
     FatIoErr := False;
     Exit;
   End;
-  VolLab[V] := Trim(S);
+  VolLab^[V] := Trim(S);
   VolSetLabel := True;
 End;
 
@@ -34248,6 +34328,9 @@ Begin
       While M < 1 Do Begin M := M * 10; Dec(E); End;
     End;
     If Sci Then N := Prec + 1 Else N := E + 1 + Prec;
+    { au-dela de 17 chiffres significatifs, des zeros (DigitAt) : Dg
+      reste court (1E300 en virgule fixe debordait la chaine) }
+    If N > 20 Then N := 20;
     Dg := '';
     If N >= 0 Then
     Begin
@@ -38813,11 +38896,11 @@ Begin
   A := MemL[0:P + 12];
   While (A <> 0) And (Mem[0:A] <> 0) And (FdFiltN < 8) Do
   Begin
-    FdFiltDesc[FdFiltN] := PStr(A);
+    FdFiltDesc^[FdFiltN] := PStr(A);
     A := A + Length(PStr(A)) + 1;
     S := PStr(A);
     A := A + Length(S) + 1;
-    FdFiltPat[FdFiltN] := S;
+    FdFiltPat^[FdFiltN] := S;
     Inc(FdFiltN);
   End;
   FdFiltI := Max(0, Min(FdFiltN - 1, MemL[0:P + 24] - 1));
@@ -39487,28 +39570,28 @@ Begin
   Then DestroyW(FpW);
   Dir := (A And $10) <> 0;
   Nm := BaseName(P);
-  For I := 0 To 7 Do FpTxt[I] := '';
-  FpTxt[0] := FpType(Nm, Dir);
-  FpTxt[1] := ParentDir(P);
+  For I := 0 To 7 Do FpTxt^[I] := '';
+  FpTxt^[0] := FpType(Nm, Dir);
+  FpTxt^[1] := ParentDir(P);
   If Dir Then
   Begin
     FpFiles := 0; FpDirs := 0; FpBytes := 0;
     FolderScan(P, 0);
-    FpTxt[2] := FpSize(FpBytes);
-    FpTxt[3] := IntStr(FpFiles) + L(' fichier(s), ', ' file(s), ',
+    FpTxt^[2] := FpSize(FpBytes);
+    FpTxt^[3] := IntStr(FpFiles) + L(' fichier(s), ', ' file(s), ',
                 ' Datei(en), ', ' file, ', ' archivo(s), ') +
                 IntStr(FpDirs) + L(' dossier(s)', ' folder(s)',
                 ' Ordner', ' cartelle', ' carpeta(s)');
   End
-  Else FpTxt[2] := FpSize(Sz);
+  Else FpTxt^[2] := FpSize(Sz);
   { nom MS-DOS et dates : entree du repertoire (FAT : creation et
     dernier acces) }
   V := FatVolOf(P);
   Ed := False;
-  FpTxt[4] := UpStr(Nm);
+  FpTxt^[4] := UpStr(Nm);
   If (V >= 0) And FatPathInfo(P, A, Sz, Tm) Then
   Begin
-    If FfShort <> '' Then FpTxt[4] := FfShort;
+    If FfShort <> '' Then FpTxt^[4] := FfShort;
     If (VolType[V] <> NtfsT) And (VolType[V] <> HpfsT) And
        (VolType[V] <> NetT) And (FfIdx >= 0) Then
     Begin
@@ -39516,13 +39599,13 @@ Begin
       E := DirEnt(V, FfDirClus, FfIdx, Sec, False);
       If E <> 0 Then
       Begin
-        FpTxt[5] := FpDate((MemW[0:E + 16] Shl 16) Or MemW[0:E + 14],
+        FpTxt^[5] := FpDate((MemW[0:E + 16] Shl 16) Or MemW[0:E + 14],
                            True);
-        FpTxt[7] := FpDate(MemW[0:E + 18] Shl 16, False);
+        FpTxt^[7] := FpDate(MemW[0:E + 18] Shl 16, False);
       End;
     End;
   End;
-  FpTxt[6] := FpDate(Tm, True);
+  FpTxt^[6] := FpDate(Tm, True);
   If Dir Then FpIco := icFolder Else FpIco := ExpIcon(Nm, 0);
   FpW := KCreate(ikFileProps, L('Propri'#130't'#130's de ',
                  'Properties of ', 'Eigenschaften von ', 'Propriet'#133' di ',
@@ -39558,16 +39641,16 @@ Begin
         Inc(NF);
         FpBytes := FpBytes + Sz;
       End;
-  For I := 0 To 7 Do FpTxt[I] := '';
+  For I := 0 To 7 Do FpTxt^[I] := '';
   T := IntStr(NF) + L(' fichier(s), ', ' file(s), ', ' Datei(en), ',
        ' file, ', ' archivo(s), ') + IntStr(ND) + L(' dossier(s)',
        ' folder(s)', ' Ordner', ' cartelle', ' carpeta(s)');
-  FpTxt[0] := L('Plusieurs types', 'Multiple Types', 'Verschiedene Typen',
+  FpTxt^[0] := L('Plusieurs types', 'Multiple Types', 'Verschiedene Typen',
                 'Tipi diversi', 'Varios tipos');
-  FpTxt[1] := L('Tous dans ', 'All in ', 'Alle in ', 'Tutti in ',
+  FpTxt^[1] := L('Tous dans ', 'All in ', 'Alle in ', 'Tutti in ',
                 'Todos en ') + ParentDir(OpP^[0]);
-  FpTxt[2] := FpSize(FpBytes);
-  FpTxt[3] := IntStr(NF + FpFiles) + L(' fichier(s), ', ' file(s), ',
+  FpTxt^[2] := FpSize(FpBytes);
+  FpTxt^[3] := IntStr(NF + FpFiles) + L(' fichier(s), ', ' file(s), ',
               ' Datei(en), ', ' file, ', ' archivo(s), ') +
               IntStr(ND + FpDirs) + L(' dossier(s)', ' folder(s)',
               ' Ordner', ' cartelle', ' carpeta(s)');
@@ -39667,25 +39750,25 @@ Begin
   OutTxt(X1 + 94, Y1 + 47, Fit(T, X2 - X1 - 120), cBlack);
   FpSep(X1, X2, Y1 + 80);
   FpRow(X1, X2, Y1 + 90, L('Type :', 'Type:', 'Typ:', 'Tipo:', 'Tipo:'),
-        FpTxt[0]);
+        FpTxt^[0]);
   FpRow(X1, X2, Y1 + 112, L('Emplacement :', 'Location:', 'Ort:',
-        'Percorso:', 'Ubicaci'#162'n:'), FpTxt[1]);
+        'Percorso:', 'Ubicaci'#162'n:'), FpTxt^[1]);
   FpRow(X1, X2, Y1 + 134, L('Taille :', 'Size:', 'Gr'#148#225'e:',
-        'Dimensioni:', 'Tama'#164'o:'), FpTxt[2]);
+        'Dimensioni:', 'Tama'#164'o:'), FpTxt^[2]);
   FpRow(X1, X2, Y1 + 156, L('Contenu :', 'Contains:', 'Inhalt:',
-        'Contenuto:', 'Contenido:'), FpTxt[3]);
+        'Contenuto:', 'Contenido:'), FpTxt^[3]);
   If Not Multi Then
   Begin
     FpSep(X1, X2, Y1 + 182);
     FpRow(X1, X2, Y1 + 192, L('Nom MS-DOS :', 'MS-DOS name:',
-          'MS-DOS-Name:', 'Nome MS-DOS:', 'Nombre MS-DOS:'), FpTxt[4]);
+          'MS-DOS-Name:', 'Nome MS-DOS:', 'Nombre MS-DOS:'), FpTxt^[4]);
     FpRow(X1, X2, Y1 + 214, L('Cr'#130#130' le :', 'Created:', 'Erstellt:',
-          'Creato:', 'Creado:'), FpTxt[5]);
+          'Creato:', 'Creado:'), FpTxt^[5]);
     FpRow(X1, X2, Y1 + 236, L('Modifi'#130' le :', 'Modified:',
-          'Ge'#132'ndert:', 'Modificato:', 'Modificado:'), FpTxt[6]);
+          'Ge'#132'ndert:', 'Modificato:', 'Modificado:'), FpTxt^[6]);
     FpRow(X1, X2, Y1 + 258, L('Dernier acc'#138's :', 'Accessed:',
           'Letzter Zugriff:', 'Ultimo accesso:', #233'ltimo acceso:'),
-          FpTxt[7]);
+          FpTxt^[7]);
     FpSep(X1, X2, Y1 + 284);
     OutTxt(X1 + 22, Y1 + 296, L('Attributs :', 'Attributes:',
            'Attribute:', 'Attributi:', 'Atributos:'), cBlack);
@@ -41974,6 +42057,18 @@ Begin
   End;
   If (CaptureWin >= 0) And (Wnds^[CaptureWin].Used = False) Then
     CaptureWin := -1;
+  { programme debogue : EXIT_PROCESS_DEBUG_EVENT ; debogueur : fin }
+  If DbgOn And (P = DbgProc) Then
+  Begin
+    FillMem(LongInt(@DbgEv), 96, 0);
+    DbgEv[0] := 5; DbgEv[1] := Procs^[P].Pid; DbgEv[3] := Code;
+    DbgProc := -1; DbgStop := False; DbgBusy := False; DbgPend := True;
+  End;
+  If DbgOn And (P = DbgOwner) Then
+  Begin
+    DbgOn := False; DbgStop := False;
+    If DbgProc > 0 Then KillProc(DbgProc, -1);
+  End;
   { objet processus : signale, code de sortie }
   I := Procs^[P].Obj;
   If P = CurProc Then I := AppProcObj;
@@ -42101,6 +42196,15 @@ Begin
          ', processus ' + IntStr(Procs^[P].Pid) + ')');
     { programme console : la console (fenetre Invite MS-DOS) }
     AppConsole := Sub = 3;
+    { STARTF_USESTDHANDLES : sorties dans un fichier, sans console }
+    AppStdOut := KNextStd;
+    If KNextStd <> 0 Then AppConsole := False;
+    { debogage : INT 3 au point d'entree (premier arret) }
+    If KNextDbg <> 0 Then
+    Begin
+      DbgEntry := AppEntry; DbgEntryB := Mem[0:AppEntry];
+      Mem[0:AppEntry] := $CC;
+    End;
     If AppConsole Then
     Begin
       If ConW < 0 Then ConTitle := '';
@@ -42160,6 +42264,256 @@ End;
   termine, le programme demande demarre, puis l'appelant est relance
   (l'Invite MS-DOS avec /R : sans banniere, meme console, meme
   repertoire). }
+
+{ ------------------------------------------------------------------ }
+{ Debogage Win32 : CreateProcess (DEBUG_PROCESS), WaitForDebugEvent,  }
+{ ContinueDebugEvent, Get/SetThreadContext, Read/WriteProcessMemory,  }
+{ DebugBreakProcess. Une session a la fois. Les programmes tournent   }
+{ en anneau 0 : une faute du programme debogue (INT 3, pas a pas TF,  }
+{ exception) arrete sa tache dans Trap, le cadre de la faute restant  }
+{ sur sa pile (ses registres) jusqu'a ContinueDebugEvent. Jamais      }
+{ d'arret dans le code du noyau (verrous, peinture du bureau).        }
+{ ------------------------------------------------------------------ }
+
+{ debut : CREATE_PROCESS_DEBUG_EVENT, tache principale suspendue }
+Procedure DbgStart(P : LongInt);
+Var T : LongInt;
+Begin
+  DbgOn := True; DbgProc := P; DbgOwner := CurProc;
+  DbgPause := False; DbgStop := False; DbgBusy := False;
+  T := Procs^[P].MainT;
+  DbgT := T; DbgFrame := 0;
+  FillMem(LongInt(@DbgEv), 96, 0);
+  DbgEv[0] := 3; DbgEv[1] := Procs^[P].Pid; DbgEv[2] := ThreadId(T);
+  DbgEv[4] := KHandle(Procs^[P].Obj);
+  If Threads[T].KObj >= 0 Then DbgEv[5] := KHandle(Threads[T].KObj);
+  DbgEv[6] := Procs^[P].Base; DbgEv[10] := DbgEntry;
+  DbgPend := True;
+End;
+
+{ faute de la tache courante (Trap) : True si traitee (reprise) }
+Function DbgTrapK(Vec, F : LongInt) : Boolean;
+Var E, Eip, Cd, Ad, N : LongInt;
+Begin
+  DbgTrapK := False;
+  If (CurT <= 0) Or (ThrProc[CurT] <> DbgProc) Then Exit;
+  E := Vec And 255;
+  If Vec >= 256 Then DbgOfs := 4 Else DbgOfs := 0;
+  Eip := MemL[0:F + 44 + DbgOfs];
+  { dans le noyau : pas a pas poursuivi jusqu'au retour au programme }
+  If (Eip >= KImgLo) And (Eip < KImgHi) Then
+  Begin
+    DbgTrapK := E = 1;
+    Exit;
+  End;
+  FillMem(LongInt(@DbgEv), 96, 0);
+  N := 0; Ad := Eip;
+  Case E Of
+    3 :
+      Begin
+        Cd := $80000003; Ad := Eip - 1;
+        If (DbgEntry <> 0) And (Eip - 1 = DbgEntry) Then
+        Begin
+          { premier arret : le point d'entree, octet d'origine rendu }
+          Mem[0:DbgEntry] := DbgEntryB;
+          MemL[0:F + 44] := DbgEntry;
+          DbgEntry := 0;
+        End;
+      End;
+    1 :
+      Begin
+        MemL[0:F + 52] := MemL[0:F + 52] And Not $100;
+        If DbgPause Then Cd := $80000003 Else Cd := $80000004;
+        DbgPause := False;
+      End;
+    0 : Cd := LongInt($C0000094);
+    4 : Cd := LongInt($C0000095);
+    5 : Cd := LongInt($C000008C);
+    6 : Cd := LongInt($C000001D);
+    16 : Cd := LongInt($C0000090);
+    17 : Cd := LongInt($80000002);
+    14 :
+      Begin
+        Cd := LongInt($C0000005); N := 2;
+        DbgEv[8] := (MemL[0:F + 44] Shr 1) And 1;
+        asm
+          mov eax,cr2
+          mov N,eax
+        end;
+        DbgEv[9] := N; N := 2;
+      End;
+  Else
+    Cd := LongInt($C0000005);
+  End;
+  DbgEv[0] := 1; DbgEv[1] := Procs^[DbgProc].Pid; DbgEv[2] := ThreadId(CurT);
+  DbgEv[3] := Cd; DbgEv[6] := Ad; DbgEv[7] := N; DbgEv[23] := 1;
+  DbgT := CurT; DbgFrame := F; DbgCont := $10002;
+  DbgStop := True; DbgPend := True;
+  asm
+    sti
+  end;
+  While DbgStop And DbgOn Do KSleep(5);
+  DbgFrame := 0; DbgT := -1;
+  { DBG_EXCEPTION_NOT_HANDLED : faute ordinaire (programme arrete) }
+  DbgTrapK := (E = 1) Or (E = 3) Or (DbgCont <> LongInt($80010001));
+End;
+
+Function WaitForDebugEvent(PEv, Ms : LongInt) : LongInt;
+Var T0 : LongInt;
+Begin
+  WaitForDebugEvent := 0;
+  T0 := Ticks;
+  Repeat
+    If DbgOn And DbgPend And (CurProc = DbgOwner) Then
+    Begin
+      MoveMem(LongInt(@DbgEv), PEv, 96);
+      DbgPend := False; DbgBusy := True;
+      WaitForDebugEvent := 1;
+      Exit;
+    End;
+    If (Ms <> -1) And (Ticks - T0 >= Ms) Then Break;
+    KSleep(10);
+  Until False;
+  SetErr(121);
+End;
+
+Function ContinueDebugEvent(Pid, Tid, St : LongInt) : LongInt;
+Begin
+  ContinueDebugEvent := 0;
+  If Not DbgOn Or Not DbgBusy Then Exit;
+  DbgBusy := False; DbgCont := St;
+  Case DbgEv[0] Of
+    3 : If DbgT >= 0 Then Threads[DbgT].Susp := 0;
+    5 : DbgOn := False;
+  Else
+    DbgStop := False;
+  End;
+  ContinueDebugEvent := 1;
+End;
+
+Function DebugBreakProcess(H : LongInt) : LongInt;
+Begin
+  DbgPause := DbgOn;
+  DebugBreakProcess := Ord(DbgOn);
+End;
+
+Function IsDebuggerPresent : LongInt;
+Begin
+  IsDebuggerPresent := Ord(DbgOn And (ThrProc[CurT] = DbgProc));
+End;
+
+{ tache arretee designee par une poignee de fil : cadre de sa faute }
+Function DbgFrameOf(H : LongInt) : LongInt;
+Var I : LongInt;
+Begin
+  DbgFrameOf := 0;
+  I := KObjOf(H, koThread);
+  If (I >= 0) And DbgOn And (DbgFrame <> 0) And (KObjs^[I].F1 = DbgT) Then
+    DbgFrameOf := DbgFrame;
+End;
+
+{ CONTEXT x86 : Edi 156, Esi 160, Ebx 164, Edx 168, Ecx 172, Eax 176,
+  Ebp 180, Eip 184, SegCs 188, EFlags 192, Esp 196, SegSs 200 }
+Function GetThreadContext(H, C : LongInt) : LongInt;
+Var F, S : LongInt;
+Begin
+  GetThreadContext := 0;
+  F := DbgFrameOf(H);
+  If F = 0 Then Exit;
+  FillMem(C + 4, 200, 0);
+  MemL[0:C + 156] := MemL[0:F + 12]; MemL[0:C + 160] := MemL[0:F + 16];
+  MemL[0:C + 164] := MemL[0:F + 28]; MemL[0:C + 168] := MemL[0:F + 32];
+  MemL[0:C + 172] := MemL[0:F + 36]; MemL[0:C + 176] := MemL[0:F + 40];
+  MemL[0:C + 180] := MemL[0:F + 20];
+  MemL[0:C + 184] := MemL[0:F + 44 + DbgOfs];
+  MemL[0:C + 188] := MemL[0:F + 48 + DbgOfs] And $FFFF;
+  MemL[0:C + 192] := MemL[0:F + 52 + DbgOfs];
+  MemL[0:C + 196] := F + 56 + DbgOfs;
+  asm
+    xor eax,eax
+    mov ax,ds
+    mov S,eax
+  end;
+  MemL[0:C + 152] := S; MemL[0:C + 148] := S; MemL[0:C + 200] := S;
+  GetThreadContext := 1;
+End;
+
+{ ESP et les segments ne changent pas (cadre de l'anneau 0) }
+Function SetThreadContext(H, C : LongInt) : LongInt;
+Var F : LongInt;
+Begin
+  SetThreadContext := 0;
+  F := DbgFrameOf(H);
+  If F = 0 Then Exit;
+  MemL[0:F + 12] := MemL[0:C + 156]; MemL[0:F + 16] := MemL[0:C + 160];
+  MemL[0:F + 28] := MemL[0:C + 164]; MemL[0:F + 32] := MemL[0:C + 168];
+  MemL[0:F + 36] := MemL[0:C + 172]; MemL[0:F + 40] := MemL[0:C + 176];
+  MemL[0:F + 20] := MemL[0:C + 180];
+  MemL[0:F + 44 + DbgOfs] := MemL[0:C + 184];
+  MemL[0:F + 52 + DbgOfs] := (MemL[0:C + 192] And $DD5) Or $202;
+  SetThreadContext := 1;
+End;
+
+Var DbgBuf : Array[0..4095] Of Byte;    { memoire d'un autre processus }
+
+{ copie entre l'espace du processus de H et la memoire du noyau ; Wr :
+  vers le processus (jamais le code du noyau, partage) }
+Function DbgCopy(H, A, B, N, PDone : LongInt; Wr : Boolean) : LongInt;
+Var I, P, C, Done, Old, Fl : LongInt; Ok : Boolean;
+Begin
+  DbgCopy := 0;
+  P := CurProc;
+  If H <> -1 Then
+  Begin
+    I := KObjOf(H, koProcess);
+    If I < 0 Then Exit;
+    P := KObjs^[I].F1;
+  End;
+  If Wr And (A < KImgHi) Then
+  Begin
+    SetErr(998);
+    Exit;
+  End;
+  Done := 0;
+  While Done < N Do
+  Begin
+    C := 4096 - ((A + Done) And 4095);
+    If C > N - Done Then C := N - Done;
+    If Wr Then MoveMem(B + Done, LongInt(@DbgBuf), C);
+    asm
+      pushfd
+      pop eax
+      mov Fl,eax
+      cli
+    end;
+    Old := Cr3Now;
+    SetCr3(ProcCr3(P));
+    Ok := LinOk(A + Done) And LinOk(A + Done + C - 1);
+    If Ok Then
+      If Wr Then MoveMem(LongInt(@DbgBuf), A + Done, C)
+      Else MoveMem(A + Done, LongInt(@DbgBuf), C);
+    SetCr3(Old);
+    If (Fl And $200) <> 0 Then
+      asm
+        sti
+      end;
+    If Not Ok Then Break;
+    If Not Wr Then MoveMem(LongInt(@DbgBuf), B + Done, C);
+    Done := Done + C;
+  End;
+  If PDone <> 0 Then MemL[0:PDone] := Done;
+  If Done = N Then DbgCopy := 1 Else SetErr(299);
+End;
+
+Function ReadProcessMemory(H, A, B, N, PDone : LongInt) : LongInt;
+Begin
+  ReadProcessMemory := DbgCopy(H, A, B, N, PDone, False);
+End;
+
+Function WriteProcessMemory(H, A, B, N, PDone : LongInt) : LongInt;
+Begin
+  WriteProcessMemory := DbgCopy(H, A, B, N, PDone, True);
+End;
 
 Function CreateProcessA(PApp, PCmd, PA, TA, Inh, Flags, Env, PDir, SI,
                         PI : LongInt) : LongInt;
@@ -42242,7 +42596,21 @@ Begin
     If (SI <> 0) And ((MemL[0:SI + 44] And 1) <> 0) Then Sh := MemW[0:SI + 48];
     D := '';
     If PDir <> 0 Then D := PStr(PDir);
-    P := ProcStart(F, Args, D, Sh, (Flags And 4) <> 0);
+    { STARTF_USESTDHANDLES (100h) : hStdOutput (+60) }
+    KNextStd := 0;
+    If (SI <> 0) And ((MemL[0:SI + 44] And $100) <> 0) Then
+      KNextStd := MemL[0:SI + 60];
+    { DEBUG_PROCESS / DEBUG_ONLY_THIS_PROCESS : une session a la fois }
+    KNextDbg := Flags And 3;
+    If (KNextDbg <> 0) And DbgOn Then
+    Begin
+      KNextStd := 0; KNextDbg := 0;
+      SetErr(5);
+      Exit;
+    End;
+    P := ProcStart(F, Args, D, Sh, ((Flags And 4) <> 0) Or (KNextDbg <> 0));
+    If (P >= 0) And (KNextDbg <> 0) Then DbgStart(P);
+    KNextStd := 0; KNextDbg := 0;
     If P < 0 Then
     Begin
       SetErr(193);
@@ -46212,6 +46580,8 @@ Type
   TLdtArr = Array[0..LdtMax - 1] Of LongInt;
   PLdtArr = ^TLdtArr;
 
+Type
+  TCtx16Tab = Array[0..MaxThread * 16 - 1] Of LongInt;
 Var
   Ldt : Array[0..LdtMax * 2 - 1] Of LongInt;
   LdtUsed : Array[0..LdtMax - 1] Of Boolean;
@@ -46223,7 +46593,7 @@ Var
   W16ThunkSel, W16ThunkLin : LongInt;
   EnterStub, ApiGateStub, CbGateStub : LongInt;
   Ret16Ax, Ret16Dx, W16Cf : LongInt;
-  Ctx16 : Array[0..MaxThread * 16 - 1] Of LongInt;
+  Ctx16 : ^TCtx16Tab;
   Ctx16N : Array[0..MaxThread - 1] Of LongInt;
   { pile 16 bits courante de chaque tache (dernier appel d'API) }
   T16Ss, T16Sp, T16Ds, T16Mod : Array[0..MaxThread - 1] Of LongInt;
@@ -46581,7 +46951,7 @@ End;
 
 Function CbFinish : LongInt;
 Begin
-  CbFinish := Ctx16[CurT * 16 + Ctx16N[CurT] - 1];
+  CbFinish := Ctx16^[CurT * 16 + Ctx16N[CurT] - 1];
 End;
 
 Procedure W16ApiEntry(Frame : LongInt); Forward;
@@ -46665,7 +47035,7 @@ Begin
   C16[0] := Cs And $FFFF; C16[1] := Ip And $FFFF;
   C16[2] := Ss And $FFFF; C16[3] := Sp And $FFFF;
   C16[4] := Ds And $FFFF; C16[5] := Es And $FFFF;
-  C16[13] := LongInt(@Ctx16[CurT * 16 + N]);
+  C16[13] := LongInt(@Ctx16^[CurT * 16 + N]);
   C16[14] := LongInt(@ThrEsp0[CurT]);
   Ctx16N[CurT] := N + 1;
   OldE := ThrEsp0[CurT];
@@ -46744,13 +47114,19 @@ Const
     'KEYBOARD', 'LZEXPAND', 'SHELL', 'MMSYSTEM', 'WIN87EM', 'WING', 'VER',
     'COMMDLG', 'TOOLHELP', 'SYSTEM', 'DISPLAY', 'SOUND');
 
+Type
+  TNeSegSelTab = Array[0..MaxNe * MaxNeSeg - 1] Of LongInt;
+Type
+  TNePathTab = Array[0..MaxNe - 1] Of String[80];
+Type
+  TNeNameTab = Array[0..MaxNe - 1] Of String[12];
 Var
   NeUsed, NeDll, NeInit : Array[0..MaxNe - 1] Of Boolean;
-  NeName : Array[0..MaxNe - 1] Of String[12];
-  NePath : Array[0..MaxNe - 1] Of String[80];
+  NeName : ^TNeNameTab;
+  NePath : ^TNePathTab;
   NeFile, NeHdr, NeNSeg, NeAuto, NeHMod, NeInst : Array[0..MaxNe - 1]
     Of LongInt;
-  NeSegSel : Array[0..MaxNe * MaxNeSeg - 1] Of LongInt;
+  NeSegSel : ^TNeSegSelTab;
   { API : module (lettre), ordinal, signature, taille des arguments }
   ApiLet : Array[0..W16ApiN - 1] Of Char;
   ApiOrd, ApiArgB, ApiEq : ^TLongArr;      { W16ApiN, tas }
@@ -46911,7 +47287,7 @@ Begin
   NeFind := -1;
   Name := UpStr(Name);
   For I := 0 To MaxNe - 1 Do
-    If NeUsed[I] And (NeName[I] = Name) Then
+    If NeUsed[I] And (NeName^[I] = Name) Then
     Begin
       NeFind := I;
       Exit;
@@ -46934,7 +47310,7 @@ Begin
         Exit;
       End;
       For K := 0 To NeNSeg[I] - 1 Do
-        If (NeSegSel[I * MaxNeSeg + K] Or 3) = H Then
+        If (NeSegSel^[I * MaxNeSeg + K] Or 3) = H Then
         Begin
           NeOfHandle := I;
           Exit;
@@ -47015,7 +47391,7 @@ Var Sg, Of2 : LongInt;
 Begin
   NeEntryFar := 0;
   If NeEntry(M, Ord, Sg, Of2) And (Sg >= 1) And (Sg <= NeNSeg[M]) Then
-    NeEntryFar := MakeFar(NeSegSel[M * MaxNeSeg + Sg - 1], Of2);
+    NeEntryFar := MakeFar(NeSegSel^[M * MaxNeSeg + Sg - 1], Of2);
 End;
 
 Function LoadNe(Path : String; IsDll : Boolean) : LongInt; Forward;
@@ -47077,7 +47453,7 @@ Begin
   If (Fl And $100) = 0 Then Exit;
   R := NeFile[M] + (MemW[0:Sg] Shl MemW[0:NeHdr[M] + $32]);
   If MemW[0:Sg + 2] = 0 Then R := R + $10000 Else R := R + MemW[0:Sg + 2];
-  Lin := SelBase(NeSegSel[M * MaxNeSeg + S]);
+  Lin := SelBase(NeSegSel^[M * MaxNeSeg + S]);
   Cnt := MemW[0:R];
   For K := 0 To Cnt - 1 Do
   Begin
@@ -47093,7 +47469,7 @@ Begin
       0 :
         If (A And $FF) = $FF Then Tgt := NeEntryFar(M, B)
         Else If (A And $FF) <= NeNSeg[M] Then
-          Tgt := MakeFar(NeSegSel[M * MaxNeSeg + (A And $FF) - 1], B);
+          Tgt := MakeFar(NeSegSel^[M * MaxNeSeg + (A And $FF) - 1], B);
       1 : Tgt := NeImport(M, A, B, '', Eq);
       2 :
       Begin
@@ -47168,7 +47544,7 @@ Begin
       End;
       If ((Mem[0:P] And 1) <> 0) And (Sg >= 1) And (Sg <= NeNSeg[M]) Then
       Begin
-        Lin := SelBase(NeSegSel[M * MaxNeSeg + Sg - 1]) + Of2;
+        Lin := SelBase(NeSegSel^[M * MaxNeSeg + Sg - 1]) + Of2;
         If (Mem[0:Lin + 2] = $90) And (((Mem[0:Lin] = $1E) And
            (Mem[0:Lin + 1] = $58)) Or ((Mem[0:Lin] = $8C) And
            (Mem[0:Lin + 1] = $D8))) Then
@@ -47207,9 +47583,9 @@ Begin
   NeNSeg[M] := Min(MemW[0:Ne + $1C], MaxNeSeg);
   NeAuto[M] := MemW[0:Ne + $0E];
   L := Ne + MemW[0:Ne + $26];
-  NeName[M] := UpStr(PStrN(L + 1, Mem[0:L]));
-  NePath[M] := Path;
-  KLog('Win16 : module ' + NeName[M] + ' (' + Path + '), ' +
+  NeName^[M] := UpStr(PStrN(L + 1, Mem[0:L]));
+  NePath^[M] := Path;
+  KLog('Win16 : module ' + NeName^[M] + ' (' + Path + '), ' +
        IntStr(NeNSeg[M]) + ' segments');
   Own := HeapOwner;
   NeHMod[M] := GAlloc16(64, False);
@@ -47227,7 +47603,7 @@ Begin
     If Sz < Len Then Sz := Len;
     If I + 1 = NeAuto[M] Then Sz := $10000;
     Sel := GAlloc16(Sz, (Fl And 1) = 0);
-    NeSegSel[M * MaxNeSeg + I] := Sel;
+    NeSegSel^[M * MaxNeSeg + I] := Sel;
     If Sel = 0 Then Exit;
     Lin := SelBase(Sel);
     If (Off <> 0) And (Len > 0) Then MoveMem(F + Off, Lin, Len);
@@ -47791,7 +48167,7 @@ Begin
   M := T16Mod[CurT];
   If (M >= 0) And NeUsed[M] And Not NeDll[M] Then
   Begin
-    For K := 0 To NeNSeg[M] - 1 Do GFree16(NeSegSel[M * MaxNeSeg + K]);
+    For K := 0 To NeNSeg[M] - 1 Do GFree16(NeSegSel^[M * MaxNeSeg + K]);
     GFree16(NeHMod[M]);
     KFree(NeFile[M]);
     NeUsed[M] := False;
@@ -47810,11 +48186,11 @@ Begin
   Cs := MemW[0:Ne + $16]; Ip := MemW[0:Ne + $14];
   If (Cs = 0) Or (Cs > NeNSeg[M]) Then Exit;
   Ds := NeInst[M];
-  KLog('Win16 : initialisation de ' + NeName[M]);
+  KLog('Win16 : initialisation de ' + NeName^[M]);
   C16[6] := 0; C16[7] := 0; C16[8] := MemW[0:Ne + $10]; C16[9] := 0;
   C16[10] := 0; C16[11] := Ds; C16[12] := 0;
   If Ds = 0 Then C16[11] := NeHMod[M];
-  Call16(NeSegSel[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, 0);
+  Call16(NeSegSel^[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, 0);
 End;
 
 Function W16TaskMain(M : LongInt) : LongInt;
@@ -47833,7 +48209,7 @@ Begin
   If DataSz = 0 Then DataSz := MemW[0:Sg + 2];
   Ss := Ds;
   If MemW[0:Ne + $1A] <> NeAuto[M] Then
-    Ss := NeSegSel[M * MaxNeSeg + MemW[0:Ne + $1A] - 1];
+    Ss := NeSegSel^[M * MaxNeSeg + MemW[0:Ne + $1A] - 1];
   Sp := MemW[0:Ne + $18];
   If Sp = 0 Then Sp := DataSz + StkSz;
   If Sp > $FFFE Then Sp := $FFFE;
@@ -47864,11 +48240,11 @@ Begin
     If Best >= 0 Then W16InitDll(Best, Ss, Sp - 16);
   Until Best < 0;
   Cs := MemW[0:Ne + $16]; Ip := MemW[0:Ne + $14];
-  KLog('Win16 : lancement de ' + NeName[M] + ' CS:IP ' + HexStr(Cs, 2) +
+  KLog('Win16 : lancement de ' + NeName^[M] + ' CS:IP ' + HexStr(Cs, 2) +
        ':' + HexStr(Ip, 4) + ' SS:SP ' + HexStr(Ss, 4) + ':' + HexStr(Sp, 4));
   C16[6] := 0; C16[7] := StkSz; C16[8] := Heap; C16[9] := 0;
   C16[10] := 0; C16[11] := Ds; C16[12] := 0;
-  Call16(NeSegSel[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, T16Psp[CurT]);
+  Call16(NeSegSel^[M * MaxNeSeg + Cs - 1], Ip, Ss, Sp, Ds, T16Psp[CurT]);
   W16Terminate(0);
 End;
 
@@ -48661,7 +49037,7 @@ Begin
     1001, 1137 :
     Begin
       If Code = 1137 Then Str := PStr(A(2)) Else Str := 'FatalExit';
-      W16Fail(NeName[T16Mod[CurT]] + ' : ' + Str);
+      W16Fail(NeName^[T16Mod[CurT]] + ' : ' + Str);
     End;
     1003 : SetDXAX($07005F03);
     1004 :
@@ -48732,9 +49108,9 @@ Begin
     1049 :
     Begin
       M := NeOfHandle(A(1));
-      If M >= 0 Then RetStrCopy(A(2), LongInt(@NePath[M]) + 1, A(3))
+      If M >= 0 Then RetStrCopy(A(2), LongInt(@NePath^[M]) + 1, A(3))
       Else SetAX(0);
-      If M >= 0 Then PutPStr(A(2), NePath[M], A(3));
+      If M >= 0 Then PutPStr(A(2), NePath^[M], A(3));
     End;
     1050 :
     Begin
@@ -50334,8 +50710,10 @@ End;
 Const
   DXMaxSf = 1024;
 
+Type
+  TDXSfsTab = Array[0..DXMaxSf - 1] Of LongInt;
 Var
-  DXSfs : Array[0..DXMaxSf - 1] Of LongInt;    { surfaces vivantes }
+  DXSfs : ^TDXSfsTab;    { surfaces vivantes }
   DXLockR : Array[0..3] Of LongInt;            { verrou de la primaire }
   DXLockAll : Boolean;
 
@@ -50370,14 +50748,14 @@ Procedure SfReg(S : LongInt; On : Boolean);
 Var I : LongInt;
 Begin
   For I := 0 To DXMaxSf - 1 Do
-    If On And (DXSfs[I] = 0) Then
+    If On And (DXSfs^[I] = 0) Then
     Begin
-      DXSfs[I] := S;
+      DXSfs^[I] := S;
       Exit;
     End
-    Else If Not On And (DXSfs[I] = S) Then
+    Else If Not On And (DXSfs^[I] = S) Then
     Begin
-      DXSfs[I] := 0;
+      DXSfs^[I] := 0;
       Exit;
     End;
 End;
@@ -51410,7 +51788,7 @@ Begin
   Sl := SfSlotOf(V);
   For I := 0 To DXMaxSf - 1 Do
   Begin
-    S := DXSfs[I];
+    S := DXSfs^[I];
     If S = 0 Then Continue;
     Ok := True;
     If (PDesc <> 0) And ((Fl And 2) = 0) And
@@ -51519,7 +51897,7 @@ Begin
   MemL[0:PP] := 0;
   For I := 0 To DXMaxSf - 1 Do
   Begin
-    S := DXSfs[I];
+    S := DXSfs^[I];
     If (S <> 0) And (MemL[0:S + 152] = Hdc) And (Hdc <> 0) Then
     Begin
       DD_GetSurfaceFromDC := ComGive(S, SfSlotOf(V), SfVt(SfSlotOf(V)),
@@ -54747,7 +55125,7 @@ Var I : LongInt;
 Begin
   For I := 0 To DSMaxB - 1 Do DSBufs[I] := 0;
   For I := 0 To DIMaxD - 1 Do DIDevs[I] := 0;
-  For I := 0 To DXMaxSf - 1 Do DXSfs[I] := 0;
+  For I := 0 To DXMaxSf - 1 Do DXSfs^[I] := 0;
   If DSOwn Then
   Begin
     If SbPlaying And (SbDev < 0) Then SbStop;
@@ -72215,7 +72593,7 @@ Begin
   VolType[V] := NetT; VolLetter[V] := Ord(Ch); VolStart[V] := N;
   VolDisk[V] := -1; VolSpc[V] := 8; VolClus[V] := 0; VolFree[V] := 0;
   VolSecs[V] := 0; VolFsDirty[V] := False;
-  VolLab[V] := Copy(UpStr(Nds^[N].Share), 1, 11);
+  VolLab^[V] := Copy(UpStr(Nds^[N].Share), 1, 11);
   VolSerial[V] := 0;
   For I := 1 To Length(Remote) Do
     VolSerial[V] := VolSerial[V] * 31 + Ord(UpCase(Remote[I]));
@@ -80051,6 +80429,9 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   PeekNamedPipe, FindFirstChangeNotificationA, FindFirstChangeNotificationW,
   FindNextChangeNotification, FindCloseChangeNotification, MapViewOfFileEx,
   VirtualProtect, VirtualUnlock, FlushInstructionCache,
+  WaitForDebugEvent, ContinueDebugEvent, DebugBreakProcess,
+  IsDebuggerPresent, GetThreadContext, SetThreadContext,
+  ReadProcessMemory, WriteProcessMemory,
   SetProcessWorkingSetSize, TerminateThread, GetStringTypeExA,
   GetNumberFormatA, GetCurrencyFormatA, EnumResourceTypesA,
   EnumResourceNamesA, EnumResourceLanguagesA,
@@ -90206,6 +90587,18 @@ BEGIN
   I := KAlloc(SizeOf(TProcArr));
   FillMem(I, SizeOf(TProcArr), 0);
   Move(I, Procs, 4);
+  { tables peu utilisees : dans le tas (place pour le debogage Win32) }
+  I := KAlloc(SizeOf(TNeSegSelTab)); Move(I, NeSegSel, 4);
+  I := KAlloc(SizeOf(TSdCheckedTab)); Move(I, SdChecked, 4);
+  I := KAlloc(SizeOf(TNePathTab)); Move(I, NePath, 4);
+  I := KAlloc(SizeOf(TNeNameTab)); Move(I, NeName, 4);
+  I := KAlloc(SizeOf(TExePathsTab)); Move(I, ExePaths, 4);
+  I := KAlloc(SizeOf(TFdFiltPatTab)); Move(I, FdFiltPat, 4);
+  I := KAlloc(SizeOf(TFdFiltDescTab)); Move(I, FdFiltDesc, 4);
+  I := KAlloc(SizeOf(TDXSfsTab)); Move(I, DXSfs, 4);
+  I := KAlloc(SizeOf(TCtx16Tab)); Move(I, Ctx16, 4);
+  I := KAlloc(SizeOf(TVolLabTab)); Move(I, VolLab, 4);
+  I := KAlloc(SizeOf(TFpTxtTab)); Move(I, FpTxt, 4);
   I := KAlloc(4096 * 9); FillMem(I, 4096 * 9, 0);
   Move(I, NcKey, 4); I := I + 16384; Move(I, NcVer, 4);
   I := I + 16384; Move(I, NcVal, 4);

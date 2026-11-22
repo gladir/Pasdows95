@@ -2579,7 +2579,8 @@ Begin
     Imaging, le Carnet d'adresses, Rechercher, les Echecs, le
     Solitaire, les outils systeme (Defragmenteur, Nettoyage de disque,
     Informations systeme, Planificateur de taches), le Panneau de
-    configuration et la Connexion Bureau a distance sont toujours
+    configuration, la Connexion Bureau a distance et le Developer Kit
+    (Pascal Developer, Pasdows Debugger, compilateur WPC) sont toujours
     installes ; le morceau d'exemple suit les sons du systeme }
   If (N = 'AURORE.MP3') And Not CompSnd Then Exit;
   If (E = '.EXE') And (N <> 'COMMAND.EXE') And (N <> 'PAINT.EXE') And
@@ -2593,6 +2594,7 @@ Begin
      (N <> 'CLEANMGR.EXE') And (N <> 'MSINFO32.EXE') And
      (N <> 'MSTASK.EXE') And (N <> 'CONTROL.EXE') And
      (N <> 'MSTSC.EXE') And (N <> 'FTPCLI.EXE') And (N <> 'SSHCLI.EXE') And
+     (N <> 'PASDEV.EXE') And (N <> 'PASDBG.EXE') And (N <> 'WPC.EXE') And
      Not CompEx Then
     Exit;
   WantFile := True;

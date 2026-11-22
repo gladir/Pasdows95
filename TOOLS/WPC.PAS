@@ -244,6 +244,9 @@ Type
   { tableau de noms dans le tas (borne d indexation seulement) }
   TNameArr = Array[0..$7FFFFF] Of TProcStr;
 
+Type
+  TPrgArr = Array[0..15] Of LongInt;
+
 Var
   { Options }
   Opts : TOptions;
@@ -258,6 +261,13 @@ Var
   ErrorCount : Integer;
   WarnCount  : Integer;
   TotalLines : LongInt;
+  { progression (-PRG) : memoire partagee nommee WPC.PRG creee par Pascal
+    Developer : [0] 'PRG1', [1] etape (1 lecture, 2 declarations,
+    3 procedures, 4 code, 5 ecriture, 9 fin), [2] ligne en cours, [3]
+    lignes lues, [4] erreurs, [5] avertissements }
+  PrgP       : ^TPrgArr;
+  PrgWanted  : Boolean;
+  OptAppGui  : Boolean;   { -WG (sous-systeme Windows) / -WC }
 
   { Fichier de sortie interne (pour future emission) }
   OutF       : Text;
@@ -409,6 +419,7 @@ Function MsgLinePfx(Const Msg : TString) : TString; Forward;
 Procedure FatalError(Const Msg : TString);
 Begin
   WriteLn('WPC: FATAL: ', MsgLinePfx(Msg), Msg);
+  If PrgP <> Nil Then Begin PrgP^[4] := PrgP^[4] + 1; PrgP^[1] := 9 End;
   If OutFOpen Then
   Begin
     Close(OutF);
@@ -422,6 +433,12 @@ Begin
   If Not Opts.Warnings Then Exit;
   WriteLn('WPC: warning: ', MsgLinePfx(Msg), Msg);
   Inc(WarnCount);
+  If PrgP <> Nil Then PrgP^[5] := WarnCount;
+End;
+
+Procedure PrgStep(Ph : LongInt);
+Begin
+  If PrgP <> Nil Then PrgP^[1] := Ph;
 End;
 
 { ------------------------------------------------------------ }
@@ -566,6 +583,8 @@ Begin
   WriteLn;
   WriteLn('General :');
   WriteLn('  -v             Mode verbeux (banniere + statistiques)');
+  WriteLn('  -WG / -WC      Sous-systeme Windows (GUI) ou console (-CW32)');
+  WriteLn('  -PRG           Progression dans la memoire partagee WPC.PRG');
   WriteLn('  -d             Debug tokens (affiche chaque token)');
   WriteLn('  -w             Afficher les avertissements');
   WriteLn('  -h, --help, /? Afficher cette aide');
@@ -611,6 +630,14 @@ Begin
     If (Arg = '-h') Or (Arg = '--help') Or (Arg = '/?') Or
        (Arg = '/h') Or (Arg = '/H') Then
       ShowHelp
+    Else If Arg = '-PRG' Then
+      PrgWanted := True
+    { -WG / -WC : sous-systeme Windows (GUI) ou console, comme Free Pascal ;
+      la directive $APPTYPE du source l'emporte }
+    Else If Arg = '-WG' Then
+      OptAppGui := True
+    Else If Arg = '-WC' Then
+      OptAppGui := False
     Else If Arg = '-v' Then
       Opts.Verbose := True
     Else If Arg = '-d' Then
@@ -1339,6 +1366,7 @@ Var
   { Gestion des portees }
   CurScopeLevel : Integer;   { niveau de scope courant (0 = global)    }
   CurScopeId    : Integer;   { id du scope courant                     }
+  ScopeIdStk    : Array[0..MAX_SCOPE] Of Integer;  { ids des scopes englobants }
   ScopeIdSeq    : Integer;   { sequence pour generer des ids uniques    }
 
   { Table des unites importees (TODO 26) }
@@ -1619,6 +1647,10 @@ Begin
     ReadLn(LexSrcF, LexLine);
     Inc(LexLineNo);
     Inc(TotalLines);
+    If PrgP <> Nil Then
+    Begin
+      PrgP^[2] := TotalLines; PrgP^[3] := TotalLines;
+    End;
     LexColNo := 1;
   End;
 End;
@@ -1937,6 +1969,19 @@ End;
 { (ex. #0#27'abc'#8#9'def'#13'ghi')                              }
 { ------------------------------------------------------------ }
 
+{ StrAddCh : ajouter C a S par la longueur (et non par concatenation :
+  dans WPC compile par lui-meme, la concatenation s arrete au premier #0,
+  et 'LANGUAGE'#0 perdait son zero) }
+Procedure StrAddCh(Var S : TString; C : Char);
+Var N : Integer;
+Begin
+  N := Length(S);
+  If N >= MAX_STR Then Exit;
+  S[0] := Chr(N + 1);
+  S[N + 1] := C;
+  If N + 2 <= MAX_STR Then S[N + 2] := #0;
+End;
+
 Procedure LexLitTail(Var S : TString);
 Var
   V  : LongInt;
@@ -1968,7 +2013,7 @@ Begin
         End;
       End;
       If Length(S) < MAX_STR Then
-        S := S + Chr(V And $FF);
+        StrAddCh(S, Chr(V And $FF));
     End
     Else
     Begin
@@ -2921,7 +2966,7 @@ End;
 { ---- DataAddStr : ajouter une chaine avec label auto-genere ---- }
 { Retourne le label (ex: _TPK_1) }
 Function DataAddStr(Const S : TString) : TString;
-Var Lbl : TString; K : Integer;
+Var Lbl, T : TString; K : Integer;
 Begin
   Inc(LabelGenSeq);
   Lbl := TP_STR_PFX + IntToStr_(LabelGenSeq);
@@ -2929,7 +2974,11 @@ Begin
   { Pascal (octet de longueur puis caracteres) et charge comme une chaine Pascal.         }
   If (Pos(#0, S) > 0) And (Length(S) < 255) And ((Opts.DestTarget = DEST_WIN32) Or (Opts.DestTarget = DEST_W32) Or (Opts.DestTarget = DEST_OS2) Or (Opts.DestTarget = DEST_OS2KRNL)) And (Not Opts.Dos16Mode) Then
   Begin
-    K := DataAdd(Lbl, DK_STR, 0, Chr(Length(S)) + S, 0, 0);
+    { octet de longueur puis caracteres, par la longueur (StrAddCh) : une
+      concatenation perdrait les #0 dans WPC compile par lui-meme }
+    T := Chr(Length(S));
+    For K := 1 To Length(S) Do StrAddCh(T, S[K]);
+    K := DataAdd(Lbl, DK_STR, 0, T, 0, 0);
     If K >= 0 Then DataTab^[K]^.IsPStr := True;
   End
   Else
@@ -3687,10 +3736,10 @@ End;
 Const
   NAME_HASH = 65536;
 Var
-  SymHashHead  : Array[0..NAME_HASH - 1] Of LongInt;
+  SymHashHead  : ^TTabLongArr;      { NAME_HASH entrees (tas) }
   SymHashNext  : ^TTabLongArr;      { par index de symbole }
   SymHashCap   : LongInt;
-  TypeHashHead : Array[0..NAME_HASH - 1] Of LongInt;
+  TypeHashHead : ^TTabLongArr;
   TypeHNodeIdx : ^TTabLongArr;      { noeuds : index de type }
   TypeHNodeNxt : ^TTabLongArr;
   TypeHNodeCnt, TypeHNodeCapI, TypeHNodeCapN : LongInt;
@@ -3706,7 +3755,8 @@ End;
 Procedure SymHashReset;
 Var I : LongInt;
 Begin
-  For I := 0 To NAME_HASH - 1 Do SymHashHead[I] := -1;
+  If SymHashHead = Nil Then GetMem(SymHashHead, NAME_HASH * SizeOf(LongInt));
+  For I := 0 To NAME_HASH - 1 Do SymHashHead^[I] := -1;
 End;
 
 { le symbole I (nom definitif) entre dans sa chaine, en tete : les
@@ -3716,14 +3766,15 @@ Var H : LongInt;
 Begin
   TabRoom(Pointer(SymHashNext), SymHashCap, I + 1, SizeOf(LongInt));
   H := NameHash(SymTab^[I]^.Name);
-  SymHashNext^[I] := SymHashHead[H];
-  SymHashHead[H] := I;
+  SymHashNext^[I] := SymHashHead^[H];
+  SymHashHead^[H] := I;
 End;
 
 Procedure TypeHashReset;
 Var I : LongInt;
 Begin
-  For I := 0 To NAME_HASH - 1 Do TypeHashHead[I] := -1;
+  If TypeHashHead = Nil Then GetMem(TypeHashHead, NAME_HASH * SizeOf(LongInt));
+  For I := 0 To NAME_HASH - 1 Do TypeHashHead^[I] := -1;
   TypeHNodeCnt := 0;
 End;
 
@@ -3737,8 +3788,8 @@ Begin
   TabRoom(Pointer(TypeHNodeNxt), TypeHNodeCapN, TypeHNodeCnt + 1, SizeOf(LongInt));
   H := NameHash(TypeTab^[I]^.Name);
   TypeHNodeIdx^[TypeHNodeCnt] := I;
-  TypeHNodeNxt^[TypeHNodeCnt] := TypeHashHead[H];
-  TypeHashHead[H] := TypeHNodeCnt;
+  TypeHNodeNxt^[TypeHNodeCnt] := TypeHashHead^[H];
+  TypeHashHead^[H] := TypeHNodeCnt;
   Inc(TypeHNodeCnt);
 End;
 
@@ -3835,7 +3886,7 @@ Var
   Up : TString;
 Begin
   Up := StrUpperCase(Name);
-  I := SymHashHead[NameHash(Up)];
+  I := SymHashHead^[NameHash(Up)];
   While I >= 0 Do
   Begin
     If (I < SymCount) And (SymTab^[I]^.Name = Up) And
@@ -3862,7 +3913,7 @@ Var
 Begin
   Up := StrUpperCase(Name);
   { chaine du nom : du plus recent au plus ancien (recherche descendante) }
-  I := SymHashHead[NameHash(Up)];
+  I := SymHashHead^[NameHash(Up)];
   While I >= 0 Do
   Begin
     If (I < SymCount) And (SymTab^[I]^.Name = Up) And
@@ -3977,7 +4028,13 @@ Begin
     Begin
       If RedeclOn And (CurScopeLevel = 0) And (Dup >= RedeclFrom) Then
         RedeclNote(Up);
-      WarnMsg('symbole deja defini dans ce scope: ' + Up);
+      { procedures imbriquees de meme nom dans des procedures differentes
+        (pre-analyse au niveau global ; ProcTab les distingue), nom
+        predefini (Graph.CenterText...) redefini : pas d avertissement }
+      If Not ((Kind In [SK_PROC, SK_FUNC]) And
+              (SymTab^[Dup]^.Kind In [SK_PROC, SK_FUNC])) And
+         Not (Dup < RedeclFrom) Then
+        WarnMsg('symbole deja defini dans ce scope: ' + Up);
       SymAdd := Dup;
       Exit;
     End;
@@ -4016,6 +4073,7 @@ Begin
     WarnMsg('profondeur de scope maximale atteinte');
     Exit;
   End;
+  ScopeIdStk[CurScopeLevel] := CurScopeId;
   Inc(CurScopeLevel);
   Inc(ScopeIdSeq);
   CurScopeId := ScopeIdSeq;
@@ -4034,10 +4092,12 @@ Begin
   If Opts.DebugMode Then
     WriteLn('  SCOPE_LEAVE: level=', CurScopeLevel);
   Dec(CurScopeLevel);
+  { retour au scope englobant (procedures imbriquees de meme nom dans
+    des procedures differentes : scopes distincts) }
   If CurScopeLevel = 0 Then
     CurScopeId := 0
   Else
-    CurScopeId := CurScopeLevel;
+    CurScopeId := ScopeIdStk[CurScopeLevel];
 End;
 
 { ------------------------------------------------------------ }
@@ -5024,7 +5084,7 @@ Begin
   { plus petit index portant ce nom (comme la recherche croissante) :
     noeuds de la chaine verifies sur le nom courant }
   Best := -1;
-  I := TypeHashHead[NameHash(Up)];
+  I := TypeHashHead^[NameHash(Up)];
   While I >= 0 Do
   Begin
     K := TypeHNodeIdx^[I];
@@ -6147,7 +6207,7 @@ Begin
   EmitRaw('RTERR_AT  DB '' at $'',0');
   EmitRaw('HEXBUF    DB 12 DUP(0)');
   EmitRaw('REALTMP   DB 8 DUP(0)');     { reel temporaire (Double)      }
-  EmitRaw('FMTBUF    DB 96 DUP(0)');    { tampon sprintf                }
+  EmitRaw('FMTBUF    DB 320 DUP(0)');   { tampon sprintf (1E300:0:6 : 308) }
   EmitRaw('FMT_FIX   DB ''%*.*f'',0');  { format :w:d                   }
   EmitRaw('FMT_SCI   DB ''% .*E'',0');  { format scientifique           }
   EmitRaw('FPUCW     DW 1332h');        { mot de controle x87 de FPC : exceptions IE/ZE/OE non masquees }
@@ -8341,7 +8401,12 @@ Begin
 
           { Type inconnu : erreur fatale (ex: ByteStream sans --applepascal) }
           If TIdx < 0 Then
+          Begin
+            If (I > 0) And (I <= TokenCount) Then
+              FatalError('ligne ' + IntToStr_(TokenPool^[I - 1]^.Line) +
+                         ' : Type non declare: ' + TName);
             FatalError('Type non declare: ' + TName);
+          End;
 
           { Verifier si c'est une declaration ABSOLUTE (TODO 28) }
           { Syntaxe : var X : Type absolute $Seg:$Ofs;           }
@@ -11313,6 +11378,11 @@ Begin
                    IntToStr_(TokenPool^[EP]^.Line) + ')';
     Inc(ImplUnkN);
   End;
+  { -w : avertissement (une variable implicite cache souvent une faute) }
+  If Opts.Warnings And (EP >= 0) And (EP < TokenCount) Then
+    WarnMsg('ligne ' + IntToStr_(TokenPool^[EP]^.Line) +
+            ' : identificateur non declare : ' + Up +
+            ' (variable implicite)');
   DataAdd(TP_VAR_PFX + Up, DK_DWORD, 0, '', 0, 0);
   SI := SymAdd(Up, SK_VAR, TY_IDX_LONGINT);
   If SI >= 0 Then
@@ -21292,10 +21362,14 @@ Begin
                                             TYK_DYNARR];
     { la valeur du pointeur n est prise que pour PRec(P)^... ou PChar(P)[I] ;
       sans suffixe, Pointer(V) designe la variable V elle-meme (parametre
-      VAR : GrowMem(Pointer(Tab), ...) passe l adresse de Tab) ; seulement
-      pour un identificateur seul (pas F(...) ni un type procedural) }
+      VAR : GrowMem(Pointer(Tab), ...) ou GrowMem(Pointer(R^[I].P), ...)
+      passe l adresse de la variable) ; pas pour un appel de fonction
+      (TProc(F(x))(...), PChar(F(x))) ni pour un type procedural }
     If PV And (TypeTab^[TypeResolve(K)]^.Kind <> TYK_PROCVAR) And
-       (TokenPool^[EP]^.Kind = TK_IDENT) And TokIsPunct(EP + 1, ')') Then
+       (TokenPool^[EP]^.Kind = TK_IDENT) And Not TokIsPunct(EP + 1, '(') And
+       ((FindLocal(PI, StrUpperCase(TokenPool^[EP]^.Val)) >= 0) Or
+        (FindParam(PI, StrUpperCase(TokenPool^[EP]^.Val)) >= 0) Or
+        (W32FindProc(PI, StrUpperCase(TokenPool^[EP]^.Val)) < 0)) Then
     Begin
       J := EP; Depth := 1;
       While (J < EPEnd) And (Depth > 0) Do
@@ -21305,7 +21379,7 @@ Begin
         Inc(J);
       End;
       If Not ((J < EPEnd) And (TokIsOp(J, '^') Or TokIsPunct(J, '^') Or
-                               TokIsPunct(J, '['))) Then
+                               TokIsPunct(J, '[') Or TokIsPunct(J, '('))) Then
         PV := False;
     End;
     If PV Then
@@ -25285,6 +25359,8 @@ Var
   ElemSz  : Integer;
   WI      : Integer;
 Begin
+  If PrgP <> Nil Then
+    If (EP >= 0) And (EP < TokenCount) Then PrgP^[2] := TokenPool^[EP]^.Line;
   If EPAtEnd Then Exit;
   If Opts.DebugMode And Opts.Verbose Then
     WriteLn('  [stmt] ligne ', TokenPool^[EP]^.Line, ' : ', TokenPool^[EP]^.Val,
@@ -40843,9 +40919,9 @@ End;
 Const
   BC_HASH = 262139;
 Var
-  BcLblHead  : Array[0..BC_HASH - 1] Of LongInt;
+  BcLblHead  : ^TTabLongArr;    { BC_HASH entrees (tas, au premier usage) }
   BcLblNext  : ^TTabLongArr;    { BcLabelCap entrees }
-  BcDLblHead : Array[0..BC_HASH - 1] Of LongInt;
+  BcDLblHead : ^TTabLongArr;
   BcDLblNext : ^TTabLongArr;    { BcDLabelCap entrees }
 
 Procedure BcLabelRoom(N : LongInt);
@@ -40879,13 +40955,15 @@ End;
 Procedure BcHashResetCode;
 Var I: LongInt;
 Begin
-  For I := 0 To BC_HASH - 1 Do BcLblHead[I] := -1;
+  If BcLblHead = Nil Then GetMem(BcLblHead, BC_HASH * SizeOf(LongInt));
+  For I := 0 To BC_HASH - 1 Do BcLblHead^[I] := -1;
 End;
 
 Procedure BcHashResetData;
 Var I: LongInt;
 Begin
-  For I := 0 To BC_HASH - 1 Do BcDLblHead[I] := -1;
+  If BcDLblHead = Nil Then GetMem(BcDLblHead, BC_HASH * SizeOf(LongInt));
+  For I := 0 To BC_HASH - 1 Do BcDLblHead^[I] := -1;
 End;
 
 Procedure BcHashCheck;
@@ -40902,7 +40980,7 @@ Function BcFindDataIdx(Const Nm: TString): LongInt;
 Var I: LongInt;
 Begin
   BcHashCheck;
-  I := BcDLblHead[BcHashName(Nm)];
+  I := BcDLblHead^[BcHashName(Nm)];
   While (I >= 0) And (BcDLabels^[I].Name <> Nm) Do I := BcDLblNext^[I];
   BcFindDataIdx := I;
 End;
@@ -40915,8 +40993,8 @@ Begin
     If BcFindDataIdx(Nm) < 0 Then
     Begin
       H := BcHashName(Nm);
-      BcDLblNext^[BcDLabelCnt] := BcDLblHead[H];
-      BcDLblHead[H] := BcDLabelCnt;
+      BcDLblNext^[BcDLabelCnt] := BcDLblHead^[H];
+      BcDLblHead^[H] := BcDLabelCnt;
     End;
     BcDLabels^[BcDLabelCnt].Name := Nm;
     BcDLabels^[BcDLabelCnt].Offset := BcDataLen;
@@ -40936,7 +41014,7 @@ Function BcFindCodeIdx(Const Nm: TString): LongInt;
 Var I: LongInt;
 Begin
   BcHashCheck;
-  I := BcLblHead[BcHashName(Nm)];
+  I := BcLblHead^[BcHashName(Nm)];
   While (I >= 0) And (BcLabels^[I].Name <> Nm) Do I := BcLblNext^[I];
   BcFindCodeIdx := I;
 End;
@@ -40950,8 +41028,8 @@ Begin
     If BcFindCodeIdx(Nm) < 0 Then
     Begin
       H := BcHashName(Nm);
-      BcLblNext^[BcLabelCnt] := BcLblHead[H];
-      BcLblHead[H] := BcLabelCnt;
+      BcLblNext^[BcLabelCnt] := BcLblHead^[H];
+      BcLblHead^[H] := BcLabelCnt;
     End;
     BcLabels^[BcLabelCnt].Name := Nm;
     BcLabels^[BcLabelCnt].Offset := BcCodeLen;
@@ -45427,7 +45505,7 @@ Begin
   BcDefineDataLabel('RTERR_MSG'); BcDataStr('Runtime error ');
   BcDefineDataLabel('RTERR_AT');  BcDataStr(' at $');
   BcDefineDataLabel('REALTMP');   BcDataZeros(8);
-  BcDefineDataLabel('FMTBUF');    BcDataZeros(96);
+  BcDefineDataLabel('FMTBUF');    BcDataZeros(320);
   BcDefineDataLabel('FMT_FIX');   BcDataStr('%*.*f');
   BcDefineDataLabel('FMT_SCI');   BcDataStr('% .*E');
   BcDefineDataLabel('FPUCW');     BcDataB($32); BcDataB($13); BcDataB(0); BcDataB(0);
@@ -46210,7 +46288,7 @@ Const
   CRAY_OP_STS     = $48;   { 110 octal - M(Aj+exp) <- Si }
   CRAY_OP_LDIMM   = $60;   { 140 octal - Si <- imm22     }
 
-  CRAY_MAX_PARCELS = 32768;
+  CRAY_MAX_PARCELS = {$IFDEF WPC}256{$ELSE}32768{$ENDIF};
 
 Type
   TCrayParcel = Word;
@@ -46394,8 +46472,8 @@ End;
 { patche les parcels apres assemblage complet.                 }
 { ============================================================ }
 Const
-  CRAY_MAX_LABELS = 1024;
-  CRAY_MAX_FIXUPS = 2048;
+  CRAY_MAX_LABELS = {$IFDEF WPC}256{$ELSE}1024{$ENDIF};
+  CRAY_MAX_FIXUPS = {$IFDEF WPC}256{$ELSE}2048{$ENDIF};
 
 Var
   CrayLblName  : Array[0..CRAY_MAX_LABELS-1] Of TString;
@@ -48144,6 +48222,7 @@ Var
   End;
 
 Begin
+  PrgStep(5);
   Krnl := (Opts.DestTarget = DEST_OS2KRNL);
   { tables de travail : une entree par importation et par exportation }
   NImp := BcImportCnt + 1;
@@ -49590,13 +49669,13 @@ End;
 { ============================================================ }
 
 Const
-  D16_MAX_CODE   = {$IFDEF FPC}1048576{$ELSE}32768{$ENDIF};
+  D16_MAX_CODE   = {$IFDEF WPC}32768{$ELSE}{$IFDEF FPC}1048576{$ELSE}32768{$ENDIF}{$ENDIF};
   D16_MAX_DATA   = 65536;
-  D16_MAX_LABEL  = {$IFDEF FPC}65536{$ELSE}1024{$ENDIF};
-  D16_MAX_FIXUP  = {$IFDEF FPC}131072{$ELSE}2048{$ENDIF};
+  D16_MAX_LABEL  = {$IFDEF WPC}1024{$ELSE}{$IFDEF FPC}65536{$ELSE}1024{$ENDIF}{$ENDIF};
+  D16_MAX_FIXUP  = {$IFDEF WPC}2048{$ELSE}{$IFDEF FPC}131072{$ELSE}2048{$ENDIF}{$ENDIF};
   D16_MAX_SEG    = 16;
-  D16_MAX_RELOC  = {$IFDEF FPC}32768{$ELSE}512{$ENDIF};
-  D16_LBL_HASH   = {$IFDEF FPC}16384{$ELSE}256{$ENDIF};
+  D16_MAX_RELOC  = {$IFDEF WPC}512{$ELSE}{$IFDEF FPC}32768{$ELSE}512{$ENDIF}{$ENDIF};
+  D16_LBL_HASH   = {$IFDEF WPC}256{$ELSE}{$IFDEF FPC}16384{$ELSE}256{$ENDIF}{$ENDIF};
   D16_SEG_LIMIT  = 61440;   { au-dela, ouvrir un nouveau segment de code }
 
   { Types de fixups }
@@ -49834,7 +49913,7 @@ End;
   far, OFFSET/SEG, saut) situee dans du code conserve ou hors plage rend la
   plage cible vivante.  Le code hors plage (noyau asm) est toujours conserve. }
 Const
-  D16_MAX_RANGE = {$IFDEF FPC}16384{$ELSE}512{$ENDIF};
+  D16_MAX_RANGE = {$IFDEF WPC}512{$ELSE}{$IFDEF FPC}16384{$ELSE}512{$ENDIF}{$ENDIF};
 Type
   TD16Range = Record
     Seg      : Integer;
@@ -51162,15 +51241,15 @@ End;
 { ------------------------------------------------------------ }
 
 Const
-  D16_MAX_TYPES  = {$IFDEF FPC}8192{$ELSE}256{$ENDIF};
-  D16_MAX_SYMS   = {$IFDEF FPC}32768{$ELSE}512{$ENDIF};
-  D16_MAX_FIELDS = {$IFDEF FPC}32768{$ELSE}512{$ENDIF};
-  D16_SYM_HASH   = {$IFDEF FPC}8192{$ELSE}256{$ENDIF};
+  D16_MAX_TYPES  = {$IFDEF WPC}256{$ELSE}{$IFDEF FPC}8192{$ELSE}256{$ENDIF}{$ENDIF};
+  D16_MAX_SYMS   = {$IFDEF WPC}512{$ELSE}{$IFDEF FPC}32768{$ELSE}512{$ENDIF}{$ENDIF};
+  D16_MAX_FIELDS = {$IFDEF WPC}512{$ELSE}{$IFDEF FPC}32768{$ELSE}512{$ENDIF}{$ENDIF};
+  D16_SYM_HASH   = {$IFDEF WPC}256{$ELSE}{$IFDEF FPC}8192{$ELSE}256{$ENDIF}{$ENDIF};
   D16_MAX_WITH   = 16;
   D16_MAX_UNITS  = 16;
   D16_MAX_LOOP   = 32;
-  D16_MAX_SWITCH = {$IFDEF FPC}4096{$ELSE}128{$ENDIF};
-  D16_MAX_LIT    = {$IFDEF FPC}16384{$ELSE}256{$ENDIF};
+  D16_MAX_SWITCH = {$IFDEF WPC}128{$ELSE}{$IFDEF FPC}4096{$ELSE}128{$ENDIF}{$ENDIF};
+  D16_MAX_LIT    = {$IFDEF WPC}256{$ELSE}{$IFDEF FPC}16384{$ELSE}256{$ENDIF}{$ENDIF};
 
   { Genres de types }
   DT_NONE     = 0;
@@ -52749,7 +52828,7 @@ End;
 { ------------------------------------------------------------ }
 
 Const
-  D16_MAX_PENDZ = 8192;
+  D16_MAX_PENDZ = {$IFDEF WPC}256{$ELSE}8192{$ENDIF};
 
 Var
   D16DataSeq : LongInt;                       { compteur de labels de donnees }
@@ -62714,6 +62793,8 @@ Var
   DataSymEnd : Integer;
 Begin
   ShowBanner;
+  PrgStep(1);
+  AppTypeGui := OptAppGui;
 
   { Ouvrir le fichier source }
   Assign(LexSrcF, Opts.SrcFile);
@@ -62792,6 +62873,7 @@ Begin
 
   { Enregistrer toutes les chaines dans le pool de donnees }
   TokenPoolRegisterStrings;
+  PrgStep(2);
 
   If Opts.Verbose Then
     WriteLn('  Tokens: ', TokenCount, '  Donnees: ', DataCount,
@@ -62849,6 +62931,7 @@ Begin
             '  Symboles=', SymCount);
 
   { Analyser les declarations PROCEDURE et FUNCTION (TODO 09) }
+  PrgStep(3);
   ParseProcDecls;
   CheckRedeclared(DataSymEnd);
   If IsLibrary Then Os2ResolveExports;
@@ -62877,6 +62960,7 @@ Begin
     If Opts.AsmOutput Then
       EmitOpen(ReplaceExt(Opts.OutFile, '.asm'));
 
+    PrgStep(4);
     EmitHeader;
     EmitDataSeg;
     EmitCodeSeg;
@@ -63125,6 +63209,34 @@ Begin
   ShowStats;
 End;
 
+{ -PRG : memoire de progression de Pascal Developer (WPC.EXE de Pasdows,
+  compile par WPC lui-meme ; ignore par la version Free Pascal) }
+{$IFDEF WPC}
+Function OpenFileMappingA(Acc, Inh, PName : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'OpenFileMappingA';
+Function MapViewOfFile(H, Acc, OfsHi, OfsLo, N : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'MapViewOfFile';
+{$ENDIF}
+Procedure PrgAttach;
+{$IFDEF WPC}
+Var Nm : Array[0..15] Of Byte; S : TString; K, H, P : LongInt;
+{$ENDIF}
+Begin
+  PrgP := Nil;
+  If Not PrgWanted Then Exit;
+{$IFDEF WPC}
+  S := 'WPC.PRG';
+  For K := 1 To Length(S) Do Nm[K - 1] := Ord(S[K]);
+  Nm[Length(S)] := 0;
+  H := OpenFileMappingA($F001F, 0, LongInt(@Nm));
+  If H = 0 Then Exit;
+  P := MapViewOfFile(H, $F001F, 0, 0, 64);
+  If P = 0 Then Exit;
+  PrgP := Pointer(P);
+  If PrgP^[0] <> $31475250 Then PrgP := Nil;
+{$ENDIF}
+End;
+
 { ============================================================ }
 { PROGRAMME PRINCIPAL                                          }
 { ============================================================ }
@@ -63135,8 +63247,11 @@ BEGIN
   TotalLines := 0;
   OutFOpen   := False;
 
+  PrgP := Nil; PrgWanted := False;
   ParseArgs;
+  PrgAttach;
   Run;
+  PrgStep(9);
   Cleanup;
   Halt(EXIT_OK);
 END.
