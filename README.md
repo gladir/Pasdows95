@@ -737,7 +737,7 @@ Pour compiler Paint, WPC (destination <b>-CW32</b>) a été étendu au dialecte 
 	<li>Types <b>Int64</b> / <b>QWord</b> (EDX:EAX, multiplication, division, décalages et comparaisons 64 bits), <b>AnsiString</b> en <b>{$H+}</b> (compteur de références, concaténation, Copy, Delete, SetLength, Length, chaînes constantes), <b>tableaux dynamiques</b> (SetLength, High, Length, libération automatique), <b>exceptions</b> (<b>Try...Except</b>, <b>Try...Finally</b>, <b>Raise</b>, classes d'exception sans champs), <b>{$PUSH}</b>/<b>{$POP}</b>, <b>{$APPTYPE GUI}</b>.</li>
 	<li>Conventions <b>stdcall</b> et <b>cdecl</b>, types procéduraux (avec appel par transtypage), procédures imbriquées avec lien statique, tableaux ouverts, paramètres Var/Const sans type, valeurs par défaut, transtypages vers les types du programme (y compris à gauche d'une affectation), arithmétique de pointeurs (POINTERMATH), <b>With</b> réentrant, résultat de fonction <b>Result</b>.</li>
 	<li>Corrections : constante nommée dans les bornes d'un tableau d'une section TYPE (le tableau n'avait qu'un élément), paramètres <b>Var</b> d'un type procédural pris pour des variables globales (une variable <i>Inc</i> masquait la procédure Inc), plus de 8 DLL importées (WININET et OLEAUT32 disparaissaient de la table d'importation), plus de 256 commutateurs {$I±}, {$R±}, <b>PType(expr)^ :=</b>, fonctions qui rendent un enregistrement (adresse dans une pile libérée), Ord, Abs et transtypages sur 32 bits, valeur d'un PChar littéral, adresse indiquée par les erreurs d'E/S.</li>
-	<li>Limites relevées : 1,5 million de jetons, 16 Mo de code, 32 Mo de données. Plus de limite fixe pour les <b>procédures et fonctions</b>, leurs <b>paramètres</b> et <b>variables locales</b>, les arguments d'un appel, les <b>exportations</b> (bibliothèques et noyau), les importations <b>External</b>, les DLL importées et leurs fonctions (générateur PE) ni pour les procédures et paramètres du générateur 16 bits : ces tables sont allouées dans le tas et agrandies au besoin (une fiche par procédure). Essais : 40 000 procédures et fonctions ; une procédure de 300 paramètres, une fonction de 3 000 variables locales et 600 importations External dans un même programme.</li>
+	<li>Limites relevées : plus de limite fixe pour les jetons, le code, les données, les symboles, les types, les champs d'un record (voir <a href="#wpc-tables">Tables sans taille maximale</a>), ni pour les <b>procédures et fonctions</b>, leurs <b>paramètres</b> et <b>variables locales</b>, les arguments d'un appel, les <b>exportations</b> (bibliothèques et noyau), les importations <b>External</b>, les DLL importées et leurs fonctions (générateur PE) ni pour les procédures et paramètres du générateur 16 bits : ces tables sont allouées dans le tas et agrandies au besoin (une fiche par procédure). Essais : 40 000 procédures et fonctions ; une procédure de 300 paramètres, une fonction de 3 000 variables locales et 600 importations External dans un même programme.</li>
 	<li><b>Sondage de la pile</b> : un cadre de plus de 4 Ko (grand tableau local) descend la pile page par page en touchant chaque page, comme le _chkstk des compilateurs Windows ; sauter d'un coup au-delà de la page de garde provoquait une faute de pile sous Windows.</li>
 	<li>Robustesse (trouvée avec le navigateur Web) : une chaîne occupe 256 octets, mais le runtime écrivait son zéro final <i>après</i> le dernier caractère, donc au 257<sup>e</sup> octet pour une chaîne de 255 caractères, écrasant la variable suivante (une adresse de feuille de style de plus de 255 caractères corrompait la pile et faisait sauter l'exécution dans le vide) ; les affectations, concaténations, Insert, conversions de tableaux et de PChar limitent désormais une chaîne à <b>254 caractères</b>. La borne d'une boucle <b>For</b> était rangée dans une variable globale propre à la boucle : un appel récursif (ou un autre fil) l'écrasait et la boucle de l'appelant tournait avec une autre borne (tableaux imbriqués) ; elle est maintenant gardée sur la pile, donc réentrante. La directive <b>{$M taille}</b> fixe en Win32 la pile du fil principal (en-tête PE, 1 Mo par défaut).</li>
 </ul>
@@ -753,6 +753,40 @@ VMM32 exporte aussi les fonctions nécessaires à PAINT : <b>sprintf</b> et <b>s
 </ul>
 
 Le noyau a ainsi perdu 32 Ko de code (environ 4 600 et 3 500 séquences), les programmes Win32 un peu moins.
+
+<h3 id="wpc-tables">Mise à niveau depuis OS2PC : tables sans taille maximale</h3>
+
+WPC avait pris du retard sur <b>OS2PC.PAS</b> d'OS2-0, son compilateur frère. Il a été mis à niveau commit par commit, sans faire planter les programmes qui fonctionnaient déjà : à chaque étape, les 37 programmes de Pasdows (IO.SYS, VMM32.VXD, INSTALL.SYS et tous les .EXE) ont été recompilés et comparés octet par octet à l'étape précédente, et chaque différence a été expliquée dans le code assembleur produit (<b>-asm</b>). Les changements propres à OS/2 (compilation native sous OS/2-0, tables réduites, mémoire partagée de Pascal Developer) n'ont pas été repris.
+
+<b>Tables sans taille maximale.</b> Comme dans OS2PC, les grandes tables du compilateur ne sont plus des tableaux statiques (plus de 1,4 Go réservés en mémoire, ramenés à 30 Mo) :
+
+<table>
+	<tr><th>Table</th><th>Avant</th><th>Maintenant</th></tr>
+	<tr><td>Jetons (TokenPool)</td><td>1 500 000</td><td>fiches stables allouées au fur et à mesure (TokenRoom)</td></tr>
+	<tr><td>Symboles (SymTab)</td><td>16 384</td><td>fiches stables (SymRoom)</td></tr>
+	<tr><td>Types (TypeTab)</td><td>8 192</td><td>fiches stables (TypeRoom)</td></tr>
+	<tr><td>Champs d'un record ou d'un objet</td><td>192</td><td>dans le tas, par type (FieldRoom)</td></tr>
+	<tr><td>Données, octets et adresses des constantes typées</td><td>16 384 / 4 Mo / 8 192</td><td>DataRoom, DataInitRoom, DataInitFixRoom</td></tr>
+	<tr><td>Code, données, labels et fixups de l'assembleur interne</td><td>16 Mo / 32 Mo / 524 288 / 2 097 152</td><td>agrandis par doublement (BcCodeRoom...)</td></tr>
+	<tr><td>Commutateurs {$I±} et {$R±}, constantes anticipées, pointeurs vers des types déclarés plus loin</td><td>16 384 / 16 384 / 4 096</td><td>TabRoom</td></tr>
+</table>
+
+Les tables de fiches (jetons, symboles, types, données) sont des tableaux de pointeurs vers des fiches allouées par blocs (<b>ChunkNew</b>), qui ne bougent jamais : un agrandissement ne recopie que les pointeurs. Les tables d'octets et d'entiers sont agrandies par doublement (<b>TabGrow</b>). Seize entrées réservées devant chaque table de fiches pointent vers une fiche vide commune, pour les indices -1 lus sans vérification, et une marge de fiches vides reste lisible après la dernière (le parseur lit souvent le jeton suivant sans tester la fin). Avec des tables sans limite, la recherche linéaire des symboles et des types devenait quadratique : des <b>index hachés</b> (SymFind, SymFindInScope, TypeFindByName) donnent les mêmes résultats que la recherche d'origine (le symbole le plus récent visible, le type de plus petit index), et VMM32 se compile maintenant en 8,7 s au lieu de 14,4 s, avec une mémoire de pointe un peu plus basse. Essai : un programme de 361 000 lignes (1,6 million de jetons, 9 000 types, 17 000 variables globales, un record de 300 champs, 20 000 commutateurs {$I±}), que l'ancien WPC refusait (« pool de tokens plein »), se compile en 4 s et s'exécute correctement dans Pasdows.
+
+<b>Corrections reprises d'OS2PC</b> (vérifiées par des programmes d'essai exécutés dans Pasdows) :
+
+<ul>
+	<li><b>Paramètres Const String</b> recopiés à l'entrée de la routine : l'argument est souvent une chaîne temporaire de l'anneau (concaténation, résultat de fonction) que la routine appelée pouvait recouvrir. La copie passe par une petite routine du runtime (_TPRT_PSTRPARM) pour garder le noyau sous 3 Mo.</li>
+	<li>Comparaison de deux chaînes calculées (<i>F(x) = G(y) + 'z'</i>) : l'opérande gauche est copié avant l'évaluation du droit, qui pouvait l'écraser.</li>
+	<li><b>Break</b> et <b>Continue</b> dans un <b>Case</b> à l'intérieur d'une boucle retirent le sélecteur du Case de la pile (il restait empilé et décalait les Case englobants).</li>
+	<li>Une procédure imbriquée d'une autre routine n'est plus appelée hors de sa portée : PAINT appelait par erreur la procédure locale <i>Insert</i> du compresseur PNG (avec trois arguments) au lieu de l'Insert des chaînes dans l'éditeur de texte.</li>
+	<li>Fonction <b>Single</b> : la mise à zéro du résultat écrasait l'EBP sauvé de l'appelant.</li>
+	<li>Paramètres <b>Byte</b>, <b>Boolean</b>, <b>Word</b> et <b>Integer</b> lus avec extension (MOVZX/MOVSX) : les bits hauts d'un argument venu d'un appelant externe ne faussent plus les tests.</li>
+	<li><b>With F(args)^ Do</b> et <b>With F^ Do</b> (pointeur rendu par une fonction) ; <b>Pointer(V)</b> passé en paramètre Var désigne la variable V ; appel par transtypage procédural d'un résultat de fonction conservé (<i>TProc(F(x))(a, b)</i>).</li>
+	<li><b>Pos</b> sur chaînes Pascal (_TPRT_PPOS) : suit les longueurs, donc trouve #0 et ne lit plus au-delà de la longueur d'une chaîne sans zéro final.</li>
+	<li><b>Move</b> sur zones qui se chevauchent (copie à rebours, comme Turbo Pascal), <b>Set Of (a, b, c)</b> anonyme, variables System et Crt (TextAttr, WindMin, FileMode...), <b>FileMode</b> respecté par Reset des fichiers typés, ClrEol et ClrScr à la couleur TextAttr, GetFAttr/SetFAttr, XCHG reg,[mém], octet nul dans les chaînes, une procédure du programme prioritaire sur une procédure prédéfinie du même nom.</li>
+	<li>Écriture des exécutables par un tampon de 64 Ko (au lieu d'un appel système par octet) et message clair quand le fichier de sortie ne peut pas être créé.</li>
+</ul>
 <h2>Construire et essayer</h2>
 
 ```bash
