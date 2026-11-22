@@ -15565,7 +15565,7 @@ Begin
       End
       Else If I = 2 Then
       Begin
-        T := L(#183' propos du Bloc-notes', 'About Notepad', #142'ber Editor',
+        T := L('A propos du Bloc-notes', 'About Notepad', #154'ber Editor',
                'Informazioni su Blocco note', 'Acerca del Bloc de notas');
         Cmd := cmNAbout;
       End;
@@ -18198,11 +18198,13 @@ Begin
     cmNFindNext : NoteFindNext(W, False);
     cmNAbout :
     Begin
-      MsgBoxOpen(L(#183' propos du Bloc-notes', 'About Notepad',
-        #142'ber Editor', 'Informazioni su Blocco note',
+      MsgBoxOpen(L('A propos du Bloc-notes', 'About Notepad',
+        #154'ber Editor', 'Informazioni su Blocco note',
         'Acerca del Bloc de notas'), 'Pasdows 95 - ' + L('Bloc-notes',
         'Notepad', 'Editor', 'Blocco note', 'Bloc de notas') + '|Version ' +
-        KVersion + '|Copyright (C) 2026 Gladir.com', $40);
+        KVersion + '|' + L('Auteur : ', 'Author: ', 'Autor: ', 'Autore: ',
+        'Autor: ') + 'Sylvain Maltais|' + L('Licence : ', 'License: ',
+        'Lizenz: ', 'Licenza: ', 'Licencia: ') + 'MIT', $40);
       Exit;
     End;
   End;
