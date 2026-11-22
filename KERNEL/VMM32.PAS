@@ -8378,7 +8378,7 @@ Const
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
   icAppWiz   = 56; icRdp      = 57; icFtp      = 58; icSsh      = 59;
-  icPasDev   = 60; icPasDbg   = 61;
+  icPasDev   = 60; icPasDbg   = 61; icGit      = 62;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9926,6 +9926,16 @@ Begin
       QD(19, 20, 6, cRed); QC(19, 20, 6, cMaroon);
       QD(19, 12, 3, cBlack);
       QR(19, 14, 19, 26, cBlack);
+    End;
+    icGit :
+    Begin
+      { client GitHub : page et graphe de branches (commits, fusion) }
+      IFrame(3, 2, 28, 29, cWhite);
+      QR(10, 7, 11, 25, cBlack);
+      QL(11, 18, 21, 12, cBlack); QL(11, 19, 21, 13, cBlack);
+      QR(21, 9, 22, 12, cBlack);
+      QD(10, 7, 3, cRed); QD(10, 25, 3, cRed); QD(21, 9, 3, cMaroon);
+      QD(10, 16, 2, cBlack);
     End;
     icSsh :
     Begin
@@ -13963,7 +13973,7 @@ Const
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
   cmMstsc = 86; cmFtp = 93; cmSsh = 94; cmPasDev = 95; cmPasDbg = 96;
-  cmPasteLnk = 97; cmRecProps = 98;
+  cmPasteLnk = 97; cmRecProps = 98; cmGit = 800;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -14394,7 +14404,7 @@ Begin
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
     (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE') Or
     (Nm = 'FTPCLI.EXE') Or (Nm = 'SSHCLI.EXE') Or (Nm = 'PASDEV.EXE') Or
-    (Nm = 'PASDBG.EXE') Or (Nm = 'WPC.EXE');
+    (Nm = 'PASDBG.EXE') Or (Nm = 'WPC.EXE') Or (Nm = 'GITCLI.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -15003,7 +15013,7 @@ Begin
     mnDevKit : MenuCount := 2;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
-    mnInet : MenuCount := 3 + KnownCount('I');
+    mnInet : MenuCount := 4 + KnownCount('I');
     mnSettings : MenuCount := 10;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -15279,9 +15289,15 @@ Begin
                'Cliente SSH');
         Cmd := cmSsh; Icon := icSsh;
       End
+      Else If I = 3 Then
+      Begin
+        T := L('Client GitHub', 'GitHub Client', 'GitHub-Client',
+               'Client GitHub', 'Cliente GitHub');
+        Cmd := cmGit; Icon := icGit;
+      End
       Else
       Begin
-        K := KnownAt('I', I - 3);
+        K := KnownAt('I', I - 4);
         T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnTools :
@@ -16736,6 +16752,7 @@ Begin
   Else If Nm = 'MSTSC.EXE' Then ExeIcon := icRdp
   Else If Nm = 'FTPCLI.EXE' Then ExeIcon := icFtp
   Else If Nm = 'SSHCLI.EXE' Then ExeIcon := icSsh
+  Else If Nm = 'GITCLI.EXE' Then ExeIcon := icGit
   Else If Nm = 'PASDEV.EXE' Then ExeIcon := icPasDev
   Else If Nm = 'PASDBG.EXE' Then ExeIcon := icPasDbg
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
@@ -22128,7 +22145,8 @@ Begin
     Nm := PStr(LongInt(@Fd) + 44);
     Dir := (MemL[0:LongInt(@Fd)] And $10) <> 0;
     If (Nm <> '.') And (Nm <> '..') And (Nm <> '') And
-       (Dir Or MatchMask(UpStr(Nm), UpStr(FdMask))) And (FdN < 200) Then
+       (Dir Or ((FdMode <> 2) And MatchMask(UpStr(Nm), UpStr(FdMask)))) And
+       (FdN < 200) Then
     Begin
       { insertion triee : dossiers d'abord, puis par nom }
       J := FdN;
@@ -22145,7 +22163,8 @@ Begin
   FindClose(H);
 End;
 
-{ Mode 0 : Ouvrir, 1 : Enregistrer sous ; Owner 0 : Bloc-notes, 1 :
+{ Mode 0 : Ouvrir, 1 : Enregistrer sous, 2 : dossier ; Owner 0 :
+  Bloc-notes, 1 :
   programme (GetOpenFileName, attend FdDone) }
 Procedure FdOpen(Mode, Owner : LongInt; Const Dir, Name : String);
 Var T : String;
@@ -22206,7 +22225,7 @@ Var X1, Y1, X2, Y2, LX1, LY1, LX2, LY2, Vis, I, Y, Fg, TY : LongInt;
 Begin
   KClient(W, X1, Y1, X2, Y2);
   FBar(X1, Y1, X2, Y2, cSilver);
-  If FdMode = 0 Then T := L('Regarder dans :', 'Look in:', 'Suchen in:',
+  If FdMode <> 1 Then T := L('Regarder dans :', 'Look in:', 'Suchen in:',
                             'Cerca in:', 'Buscar en:')
   Else T := L('Enregistrer dans :', 'Save in:', 'Speichern in:', 'Salva in:',
               'Guardar en:');
@@ -22245,25 +22264,33 @@ Begin
     TY := LY1 + 18 + (FdTop * (LY2 - LY1 - 52)) Div Max(1, FdN - Vis);
     Raised(LX2 - 17, TY, LX2 - 2, TY + 16, False);
   End;
-  OutTxt(X1 + 10, Y1 + 210, L('Nom de fichier :', 'File name:',
-         'Dateiname:', 'Nome file:', 'Nombre:'), cBlack);
+  If FdMode = 2 Then
+    OutTxt(X1 + 10, Y1 + 210, L('Dossier :', 'Folder:', 'Ordner:',
+           'Cartella:', 'Carpeta:'), cBlack)
+  Else
+    OutTxt(X1 + 10, Y1 + 210, L('Nom de fichier :', 'File name:',
+           'Dateiname:', 'Nome file:', 'Nombre:'), cBlack);
   Sunken(X1 + 150, Y1 + 206, X2 - 110, Y1 + 228, cWhite);
   OutTxt(X1 + 154, Y1 + 209, Fit(FdName, X2 - X1 - 270), cBlack);
   VLine(X1 + 154 + TextW(Fit(FdName, X2 - X1 - 270)), Y1 + 208, Y1 + 225,
         cBlack);
-  OutTxt(X1 + 10, Y1 + 240, L('Type :', 'Files of type:', 'Dateityp:',
-         'Tipo:', 'Tipo:'), cBlack);
-  Sunken(X1 + 150, Y1 + 236, X2 - 110, Y1 + 258, cWhite);
-  If FdFiltN > 0 Then
-    OutTxt(X1 + 154, Y1 + 239, Fit(FdFiltDesc^[FdFiltI], X2 - X1 - 282),
-           cBlack);
-  Raised(X2 - 128, Y1 + 238, X2 - 112, Y1 + 256, False);
-  Arrow(X2 - 123, Y1 + 245, 1, cBlack);
+  If FdMode <> 2 Then
+  Begin
+    OutTxt(X1 + 10, Y1 + 240, L('Type :', 'Files of type:', 'Dateityp:',
+           'Tipo:', 'Tipo:'), cBlack);
+    Sunken(X1 + 150, Y1 + 236, X2 - 110, Y1 + 258, cWhite);
+    If FdFiltN > 0 Then
+      OutTxt(X1 + 154, Y1 + 239, Fit(FdFiltDesc^[FdFiltI], X2 - X1 - 282),
+             cBlack);
+    Raised(X2 - 128, Y1 + 238, X2 - 112, Y1 + 256, False);
+    Arrow(X2 - 123, Y1 + 245, 1, cBlack);
+  End;
   For I := 0 To 1 Do
   Begin
     If I = 0 Then
     Begin
       If FdMode = 0 Then T := L('Ouvrir', 'Open', #148'ffnen', 'Apri', 'Abrir')
+      Else If FdMode = 2 Then T := 'OK'
       Else T := L('Enregistrer', 'Save', 'Speichern', 'Salva', 'Guardar');
     End
     Else T := TxtCancel;
@@ -22294,6 +22321,18 @@ Procedure FdAccept;
 Var N, F : String; Attr, Size, Time, Lba, Ram : LongInt;
 Begin
   N := Trim(FdName);
+  If FdMode = 2 Then
+  Begin
+    { dossier : saisi, selectionne ou courant }
+    If (N = '') And (FdSel >= 0) Then N := FdNm^[FdSel];
+    If N = '' Then F := FdDir
+    Else If (Pos(':', N) > 0) Or (N[1] = '\') Then F := FullPath(N)
+    Else F := FullPath(FdDir + '\' + N);
+    If Length(F) = 2 Then F := F + '\';
+    FdResult := F;
+    FdClose(True);
+    Exit;
+  End;
   If (N = '') And (FdSel >= 0) Then N := FdNm^[FdSel];
   If N = '' Then Exit;
   If (Pos('*', N) > 0) Or (Pos('?', N) > 0) Then
@@ -22378,6 +22417,16 @@ Begin
            (Ticks - FdClickT < DblMs))) Then
         Begin
           FdClickR := -1;
+          If FdMode = 2 Then
+          Begin
+            { dossier : double-clic = ouvrir le dossier }
+            FdDir := FullPath(FdDir + '\' + FdNm^[R]);
+            If Length(FdDir) = 3 Then FdDir := Copy(FdDir, 1, 2);
+            FdName := '';
+            FdRefresh;
+            KRepaint(W);
+            Exit;
+          End;
           FdName := FdNm^[R];
           FdAccept;
           If (FdW >= 0) And Wnds^[FdW].Used Then KRepaint(FdW);
@@ -22634,6 +22683,7 @@ Begin
     cmMstsc : RunExe('MSTSC.EXE', '');
     cmFtp : RunExe('FTPCLI.EXE', '');
     cmSsh : RunExe('SSHCLI.EXE', '');
+    cmGit : RunExe('GITCLI.EXE', '');
     cmPasDev : RunSys('PASDEV.EXE', '', 'Pascal Developer');
     cmPasDbg : RunSys('PASDBG.EXE', '', 'Pasdows Debugger');
     cmNetDisc :
@@ -70625,6 +70675,7 @@ Type
     IPos, IEnd : LongInt;
     Verb : String[15];                 { HttpOpenRequestA }
     NoRedir : Boolean;                 { INTERNET_FLAG_NO_AUTO_REDIRECT }
+    Sess : Byte;                       { session (InternetOpenA) }
   End;
 
   PHtReq = ^HtReq;
@@ -70753,6 +70804,41 @@ End;
 Var
   InetPxHost : String;       { proxy (InternetOpenA, type PROXY) }
   InetPxPort : LongInt;
+  InetByp : String[127];     { liste de contournement du proxy }
+
+{ hote sans proxy : <local> (nom sans point), hote exact, *.domaine,
+  prefixe* (separateurs ; , ou espace) }
+Function InetBypassed(Host : String) : Boolean;
+Var L, E : String; K : LongInt;
+Begin
+  InetBypassed := False;
+  Host := UpStr(Host);
+  L := UpStr(InetByp);
+  While L <> '' Do
+  Begin
+    K := 1;
+    While (K <= Length(L)) And Not (L[K] In [';', ',', ' ']) Do Inc(K);
+    E := Copy(L, 1, K - 1);
+    Delete(L, 1, K);
+    If E = '' Then Continue;
+    If E = '<LOCAL>' Then
+    Begin
+      If Pos('.', Host) = 0 Then InetBypassed := True;
+    End
+    Else If E[1] = '*' Then
+    Begin
+      Delete(E, 1, 1);
+      If Copy(Host, Length(Host) - Length(E) + 1, 255) = E Then
+        InetBypassed := True;
+    End
+    Else If E[Length(E)] = '*' Then
+    Begin
+      If Copy(Host, 1, Length(E) - 1) = Copy(E, 1, Length(E) - 1) Then
+        InetBypassed := True;
+    End
+    Else If E = Host Then InetBypassed := True;
+  End;
+End;
 
 { Connexion au serveur : directe, ou par le proxy HTTP (requete en
   adresse absolue ; pour https://, tunnel CONNECT puis TLS de bout en
@@ -70814,8 +70900,8 @@ End;
 Function HtSend(Var R : HtReq; Const Agent, Verb0 : String; Extra : TlPtr;
   ExtraLen : LongInt; Body : TlPtr; BodyLen : LongInt; Follow : Boolean)
   : Boolean;
-Var Https : Boolean; Host, Verb : String; Port, Path, Hops, I, C, O, L,
-    K : LongInt; Q : Array[0..HtMaxUrl + 1023] Of Byte; N : LongInt;
+Var Https : Boolean; Host, Verb, Px : String; Port, Path, Hops, I, C, O,
+    L, K : LongInt; Q : Array[0..HtMaxUrl + 1023] Of Byte; N : LongInt;
     Base : Array[0..HtMaxUrl - 1] Of Byte; BLen : LongInt;
 
   Procedure S(Const T : String);
@@ -70829,9 +70915,12 @@ Begin
   HtSend := False;
   Hops := 0;
   Verb := Verb0;
+  Px := InetPxHost;
   While True Do
   Begin
     If Not HtSplit(R, Https, Host, Port, Path) Then Exit;
+    InetPxHost := Px;
+    If InetBypassed(Host) Then InetPxHost := '';
     R.Conn := HtConnect(Host, Port, Https);
     If R.Conn < 0 Then Exit;
     N := 0;
@@ -71038,6 +71127,25 @@ Const
 
 Var
   InetAgent : String;
+  InetSPx : Array[0..7] Of String[63];     { sessions : proxy, }
+  InetSPort : Array[0..7] Of LongInt;
+  InetSByp : Array[0..7] Of String[127];   { contournement }
+  InetSN : LongInt;
+
+{ numero de session d'un HINTERNET de session }
+Function InetSessOf(H : LongInt) : LongInt;
+Begin
+  If (H >= InetSession) And (H < InetSession + 8) Then
+    InetSessOf := H - InetSession
+  Else InetSessOf := 0;
+End;
+
+{ reglages de proxy de la session S pour la requete suivante }
+Procedure InetUse(S : LongInt);
+Begin
+  InetPxHost := InetSPx[S]; InetPxPort := InetSPort[S];
+  InetByp := InetSByp[S];
+End;
 
 Function InetSlot(H : LongInt) : LongInt;
 Begin
@@ -71077,7 +71185,14 @@ Begin
       InetPxHost := P; InetPxPort := 80;
     End;
   End;
-  InternetOpenA := InetSession;
+  { une session par appel : proxy et contournement propres }
+  K := InetSN And 7;
+  Inc(InetSN);
+  InetSPx[K] := InetPxHost; InetSPort[K] := InetPxPort;
+  InetSByp[K] := '';
+  If Bypass <> 0 Then InetSByp[K] := Copy(PStr(Bypass), 1, 127);
+  InetByp := InetSByp[K];
+  InternetOpenA := InetSession + K;
 End;
 
 Function InternetOpenUrlA(H, Url, Hdr, HdrLen, Flags, Ctx : LongInt)
@@ -71099,6 +71214,8 @@ Begin
   End;
   HtR[I]^.UrlLen := K;
   HtR[I]^.Conn := -1;
+  HtR[I]^.Sess := InetSessOf(H);
+  InetUse(HtR[I]^.Sess);
   If Hdr = 0 Then HdrLen := 0
   Else If HdrLen < 0 Then
   Begin
@@ -71129,6 +71246,7 @@ Const
 
 Var
   InetCHost : Array[0..InetMaxConn - 1] Of String[127];
+  InetCSess : Array[0..InetMaxConn - 1] Of Byte;
   InetCPort : Array[0..InetMaxConn - 1] Of LongInt;
   InetCUsed : Array[0..InetMaxConn - 1] Of Boolean;
 
@@ -71142,6 +71260,7 @@ Begin
   While (I < InetMaxConn) And InetCUsed[I] Do Inc(I);
   If I >= InetMaxConn Then Begin SetErr(12004); Exit; End;
   InetCUsed[I] := True;
+  InetCSess[I] := InetSessOf(H);
   InetCHost[I] := Copy(PStr(Server), 1, 127);
   InetCPort[I] := Port;
   InternetConnectA := InetConnBase + I;
@@ -71200,6 +71319,7 @@ Begin
   If U = '' Then U := 'GET';
   HtR[I]^.Verb := U;
   HtR[I]^.NoRedir := (Flags And $00200000) <> 0;
+  HtR[I]^.Sess := InetCSess[C];
   HtR[I]^.Conn := -1; HtR[I]^.Status := 0; HtR[I]^.HdrLen := 0;
   HtR[I]^.Done := True; HtR[I]^.IPos := 0; HtR[I]^.IEnd := 0;
   HtR[I]^.Used := True;
@@ -71228,6 +71348,7 @@ Begin
     If I < HtR[InetSlot(H)]^.UrlLen Then
       S := S + Chr(HtR[InetSlot(H)]^.Url[I]);
   I := InetSlot(H);
+  InetUse(HtR[I]^.Sess);
   KLog('WININET : ' + HtR[I]^.Verb + ' ' + S);
   TlErr := '';
   If Not HtSend(HtR[I]^, InetAgent, HtR[I]^.Verb, Hdr, HdrLen, Opt, OptLen,
@@ -76083,10 +76204,27 @@ Procedure SHAddToRecentDocs(Fl, P : LongInt);
 Begin
 End;
 
-{ choix d'un dossier : annule }
+{ choix d'un dossier (BROWSEINFOA : +8 nom affiche, +12 titre) : boite
+  Ouvrir en mode dossier ; renvoie un ITEMIDLIST (SHGetPathFromIDList) }
 Function SHBrowseForFolderA(P : LongInt) : LongInt;
+Var S : String;
 Begin
   SHBrowseForFolderA := 0;
+  If (CurT = 0) Or (P = 0) Then Exit;
+  FdFiltN := 0;
+  FdTitle := L('Rechercher un dossier', 'Browse for Folder',
+    'Ordner suchen', 'Sfoglia per cartelle', 'Buscar carpeta');
+  If MemL[0:P + 12] <> 0 Then
+  Begin
+    S := PStr(MemL[0:P + 12]);
+    If (S <> '') And (Length(S) < 60) Then FdTitle := S;
+  End;
+  FdOpen(2, 1, CurDirS, '');
+  While Not FdDone Do KSleep(20);
+  If Not FdOk Then Exit;
+  If MemL[0:P + 8] <> 0 Then PutPStr(MemL[0:P + 8], BaseName(FdResult),
+    260);
+  SHBrowseForFolderA := PidlOf(FdResult);
 End;
 
 Function SHBrowseForFolder(P : LongInt) : LongInt;

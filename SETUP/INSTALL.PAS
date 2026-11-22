@@ -2595,7 +2595,7 @@ Begin
      (N <> 'MSTASK.EXE') And (N <> 'CONTROL.EXE') And
      (N <> 'MSTSC.EXE') And (N <> 'FTPCLI.EXE') And (N <> 'SSHCLI.EXE') And
      (N <> 'PASDEV.EXE') And (N <> 'PASDBG.EXE') And (N <> 'WPC.EXE') And
-     Not CompEx Then
+     (N <> 'GITCLI.EXE') And Not CompEx Then
     Exit;
   WantFile := True;
 End;
