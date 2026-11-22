@@ -8364,7 +8364,7 @@ Const
   icFind     = 44; icScanDisk = 45; icDxDiag   = 46; icCharMap  = 47;
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
-  icAppWiz   = 56; icRdp      = 57; icFtp      = 58;
+  icAppWiz   = 56; icRdp      = 57; icFtp      = 58; icSsh      = 59;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9887,6 +9887,16 @@ Begin
       QR(8, 26, 14, 28, cGray);
       QL(20, 18, 26, 18, cRed); QL(26, 18, 26, 22, cRed);
       QL(23, 21, 26, 18, cRed);
+    End;
+    icSsh :
+    Begin
+      { client SSH : terminal noir, invite verte et cle }
+      IFrame(2, 3, 29, 23, cSilver); QR(4, 5, 27, 21, cBlack);
+      QR(6, 8, 8, 9, cLime); QR(8, 10, 10, 11, cLime); QR(6, 12, 8, 13, cLime);
+      QR(12, 12, 17, 13, cLime);
+      QR(10, 23, 21, 25, cGray);
+      QR(19, 24, 24, 29, cYellow); QR(21, 26, 22, 27, cBlack);
+      QR(24, 26, 30, 27, cYellow); QR(28, 27, 29, 29, cYellow);
     End;
     icFtp :
     Begin
@@ -13910,7 +13920,7 @@ Const
   cmNewFolder = 74; cmNewText = 75; cmNewBmp = 76; cmNewHtml = 77;
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
-  cmMstsc = 86; cmFtp = 93;
+  cmMstsc = 86; cmFtp = 93; cmSsh = 94;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -14324,7 +14334,7 @@ Begin
     (Nm = 'FINDFILE.EXE') Or (Nm = 'ECHECS.EXE') Or (Nm = 'SOL.EXE') Or
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
     (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE') Or
-    (Nm = 'FTPCLI.EXE');
+    (Nm = 'FTPCLI.EXE') Or (Nm = 'SSHCLI.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -14897,7 +14907,7 @@ Begin
     mnComm : MenuCount := 1;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
-    mnInet : MenuCount := 2 + KnownCount('I');
+    mnInet : MenuCount := 3 + KnownCount('I');
     mnSettings : MenuCount := 10;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -15147,9 +15157,15 @@ Begin
                'Cliente FTP');
         Cmd := cmFtp; Icon := icFtp;
       End
+      Else If I = 2 Then
+      Begin
+        T := L('Client SSH', 'SSH Client', 'SSH-Client', 'Client SSH',
+               'Cliente SSH');
+        Cmd := cmSsh; Icon := icSsh;
+      End
       Else
       Begin
-        K := KnownAt('I', I - 2);
+        K := KnownAt('I', I - 3);
         T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnTools :
@@ -16580,6 +16596,7 @@ Begin
   Else If Nm = 'CONTROL.EXE' Then ExeIcon := icControl
   Else If Nm = 'MSTSC.EXE' Then ExeIcon := icRdp
   Else If Nm = 'FTPCLI.EXE' Then ExeIcon := icFtp
+  Else If Nm = 'SSHCLI.EXE' Then ExeIcon := icSsh
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
@@ -22468,6 +22485,7 @@ Begin
     cmControl : RunExe('CONTROL.EXE', '');
     cmMstsc : RunExe('MSTSC.EXE', '');
     cmFtp : RunExe('FTPCLI.EXE', '');
+    cmSsh : RunExe('SSHCLI.EXE', '');
     cmNetDisc :
       If CtxNetDrv <> #0 Then
       Begin

@@ -2592,7 +2592,8 @@ Begin
      (N <> 'ECHECS.EXE') And (N <> 'SOL.EXE') And (N <> 'DEFRAG.EXE') And
      (N <> 'CLEANMGR.EXE') And (N <> 'MSINFO32.EXE') And
      (N <> 'MSTASK.EXE') And (N <> 'CONTROL.EXE') And
-     (N <> 'MSTSC.EXE') And (N <> 'FTPCLI.EXE') And Not CompEx Then
+     (N <> 'MSTSC.EXE') And (N <> 'FTPCLI.EXE') And (N <> 'SSHCLI.EXE') And
+     Not CompEx Then
     Exit;
   WantFile := True;
 End;
