@@ -27079,7 +27079,10 @@ Begin
         ParseExpr(PI);
         EPMatch(')');
       End;
-      EmitComment('FindClose (stub - Win32 handles auto)');
+      { la recherche en cours (une seule a la fois) : son handle est ferme
+        (FindFirst suivi de FindClose sans aller jusqu au bout perdait
+        un objet du systeme a chaque appel) }
+      EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSE');
       If (Not EPAtEnd) And (TokenPool^[EP]^.Kind = TK_PUNCT) And
          (TokIsP(EP, ';')) Then
         Inc(EP);
@@ -36295,6 +36298,8 @@ Begin
   EmitInstr('PUSH EBP');
   EmitInstr('MOV EBP,ESP');
   EmitInstr('PUSHAD');
+  { une recherche precedente laissee ouverte est fermee }
+  EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSE');
   { FindFirstFileA(path, &finddata) }
   EmitInstr('MOV EAX,DWORD PTR [EBP+16]');  { Path (ASCIIZ, first pushed) }
   EmitInstr('PUSH OFFSET DOS_FINDDATA');
@@ -36348,9 +36353,24 @@ Begin
   EmitInstr('JMP ' + TP_RT_PFX + 'FF_DN');
   EmitLabel(TP_RT_PFX + 'FF_NF');
   EmitInstr('MOV DWORD PTR [DOSERROR],18'); { 18 = pas de fichier }
+  EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSE');   { aucune entree retenue }
   EmitLabel(TP_RT_PFX + 'FF_DN');
   EmitInstr('POPAD');
   EmitInstr('POP EBP');
+  EmitInstr('RET');
+
+  { ------ _TPRT_FINDCLOSE : ferme la recherche en cours (DOS_FINDHDL) ------ }
+  EmitBlankLine;
+  EmitLabel(TP_RT_PFX + 'FINDCLOSE');
+  EmitInstr('PUSHAD');
+  EmitInstr('MOV EAX,DWORD PTR [DOS_FINDHDL]');
+  EmitInstr('CMP EAX,-1');
+  EmitInstr('JE ' + TP_RT_PFX + 'FC_DN');
+  EmitInstr('MOV DWORD PTR [DOS_FINDHDL],-1');
+  EmitInstr('PUSH EAX');
+  EmitInstr('CALL FindClose');
+  EmitLabel(TP_RT_PFX + 'FC_DN');
+  EmitInstr('POPAD');
   EmitInstr('RET');
 
   { ------ _TPRT_FF_TIME : [EDI+4] = date/heure DOS (format TP) de ftLastWriteTime ------ }
