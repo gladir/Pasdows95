@@ -11891,6 +11891,7 @@ Const
   ikButton = 20; ikStatic = 21; ikEdit = 22;
   ikListBox = 23; ikScrollBar = 24; ikComboBox = 25; ikDialog = 26;
   ikMdiClient = 27; ikConProps = 31; ikMapDrv = 32; ikFileProps = 33;
+  ikSecurity = 34;
 
 Type
   TClass = Record
@@ -13727,6 +13728,12 @@ End;
 { ------------------------------------------------------------------ }
 
 Function RunExe(Path, Args : String) : Boolean; Forward;
+Procedure SecurityOpen(Mode : LongInt); Forward;
+Procedure SecUnlock; Forward;
+
+Var
+  SecLockOn : Boolean;               { ecran verrouille (Ctrl+Alt+Suppr) }
+  SecLockW : LongInt;
 
 Procedure KeyEvent(Sc : LongInt; Up, Ext : Boolean);
 Var Vk, Lp, Msg, W, Ch : LongInt; Alt : Boolean;
@@ -13747,15 +13754,21 @@ Begin
   Ch := 0;
   If Not Up Then Ch := ScanToChar(Sc);
   KeyScan := Sc; KeyExt := Ext;
-  { raccourcis du systeme : Ctrl+Alt+Suppr et Ctrl+Maj+Echap ouvrent le
-    Gestionnaire des taches (comme Windows XP) }
+  { raccourcis du systeme : Ctrl+Alt+Suppr ouvre la boite Securite de
+    Pasdows (ou deverrouille l'ecran), Ctrl+Maj+Echap le Gestionnaire
+    des taches (comme Windows XP) ; ecran verrouille : rien d'autre }
+  If SecLockOn And Not (Wnds^[SecLockW].Used And
+     (Wnds^[SecLockW].IKind = ikSecurity)) Then SecLockOn := False;
   If Not Up And ((KeyState[$11] And $80) <> 0) And
      (((Vk = $2E) And Alt) Or ((Vk = $1B) And
       ((KeyState[$10] And $80) <> 0))) Then
   Begin
-    RunExe('TASKMGR.EXE', '');
+    If SecLockOn Then SecUnlock
+    Else If Vk = $2E Then SecurityOpen(0)
+    Else RunExe('TASKMGR.EXE', '');
     Exit;
   End;
+  If SecLockOn Then Exit;
   If Not Up Then
   Begin
     KKey(-1, WM_KEYDOWN, Vk, Ch);
@@ -18698,6 +18711,261 @@ Begin
   End;
 End;
 
+{ ------------------------------------------------------------------ }
+{ Securite de Pasdows (Ctrl+Alt+Suppr), comme Windows NT/XP : K1 = 0  }
+{ panneau (Verrouiller, Fermer la session, Arreter, Gestionnaire des  }
+{ taches, Annuler), 1 ecran verrouille (Ctrl+Alt+Suppr deverrouille), }
+{ 2 confirmation de la fermeture de session                           }
+{ ------------------------------------------------------------------ }
+
+Function SecBtnText(I : LongInt) : String;
+Begin
+  Case I Of
+    0 : SecBtnText := L('Verrouiller l''ordinateur', 'Lock Computer',
+                        'Computer sperren', 'Blocca computer',
+                        'Bloquear equipo');
+    1 : SecBtnText := L('Fermer la session...', 'Log Off...',
+                        'Abmelden...', 'Disconnetti...',
+                        'Cerrar sesi'#162'n...');
+    2 : SecBtnText := L('Arr'#136'ter...', 'Shut Down...',
+                        'Herunterfahren...', 'Arresta...', 'Apagar...');
+    3 : SecBtnText := L('Gestionnaire des t'#131'ches', 'Task Manager',
+                        'Task-Manager', 'Task Manager',
+                        'Administrador de tareas');
+    5 : SecBtnText := L('Annuler', 'Cancel', 'Abbrechen', 'Annulla',
+                        'Cancelar');
+  Else
+    SecBtnText := '';
+  End;
+End;
+
+{ Bouton I : deux colonnes, trois rangees (4 : vide) ; confirmation :
+  Oui et Non }
+Function SecBtnRect(W, I : LongInt; Var X1, Y1, X2, Y2 : LongInt)
+  : Boolean;
+Var CX1, CY1, CX2, CY2 : LongInt;
+Begin
+  SecBtnRect := False;
+  If Wnds^[W].K1 = 2 Then
+  Begin
+    If I > 1 Then Exit;
+    DlgBtnRect(W, I, 2, X1, Y1, X2, Y2);
+    SecBtnRect := True;
+    Exit;
+  End;
+  If (Wnds^[W].K1 <> 0) Or (I = 4) Or (I > 5) Then Exit;
+  KClient(W, CX1, CY1, CX2, CY2);
+  X1 := CX1 + 16 + (I Mod 2) * 220; X2 := X1 + 210;
+  Y1 := CY1 + 136 + (I Div 2) * 32; Y2 := Y1 + 24;
+  SecBtnRect := True;
+End;
+
+Procedure SecurityOpen(Mode : LongInt);
+Var W, Sty, Ex : LongInt;
+Begin
+  For W := 0 To MaxWnd - 1 Do
+    If Wnds^[W].Used And (Wnds^[W].IKind = ikSecurity) And
+       (Wnds^[W].K1 = Mode) Then
+    Begin
+      ShowW(W, True, True);
+      Exit;
+    End;
+  Sty := WS_POPUP Or WS_CAPTION Or WS_SYSMENU;
+  Ex := WS_EX_DLGMODALFRAME Or WS_EX_TOPMOST;
+  If Mode = 1 Then
+    W := KCreate(ikSecurity, L('Ordinateur verrouill'#130,
+                 'Computer Locked', 'Computer gesperrt', 'Computer bloccato',
+                 'Equipo bloqueado'), icLogo, 0, 0, ScrW, ScrH, WS_POPUP,
+                 WS_EX_TOPMOST)
+  Else If Mode = 2 Then
+    W := KCreate(ikSecurity, L('Fermer la session', 'Log Off Pasdows',
+                 'Abmelden', 'Disconnetti', 'Cerrar sesi'#162'n'), icLogo,
+                 (ScrW - 380) Div 2, (ScrH - 140) Div 2, 380, 140, Sty, Ex)
+  Else
+    W := KCreate(ikSecurity, L('S'#130'curit'#130' de Pasdows',
+                 'Pasdows Security', 'Pasdows-Sicherheit',
+                 'Protezione di Pasdows', 'Seguridad de Pasdows'), icLogo,
+                 (ScrW - 470) Div 2, (ScrH - 270) Div 2, 470, 270, Sty, Ex);
+  If W < 0 Then Exit;
+  Wnds^[W].K1 := Mode;
+  If Mode = 1 Then
+  Begin
+    SecLockOn := True;
+    SecLockW := W;
+  End;
+  ShowW(W, True, True);
+  KRepaint(W);
+End;
+
+Procedure SecUnlock;
+Begin
+  SecLockOn := False;
+  If (SecLockW >= 0) And (SecLockW < MaxWnd) Then
+    If Wnds^[SecLockW].Used And (Wnds^[SecLockW].IKind = ikSecurity) Then
+      DestroyW(SecLockW);
+  SecLockW := -1;
+  MarkAll;
+End;
+
+{ Fermer la session : tous les programmes et les fenetres du Bloc-notes
+  et de l'Explorateur ; le bureau reste }
+Procedure SecLogoff;
+Var P, I : LongInt;
+Begin
+  For P := 1 To MaxProc - 1 Do
+    If Procs^[P].Used Then KillProc(P, 0);
+  For I := 0 To MaxWnd - 1 Do
+    If Wnds^[I].Used And ((Wnds^[I].IKind = ikNotepad) Or
+       (Wnds^[I].IKind = ikExplorer) Or (Wnds^[I].IKind = ikHelp)) Then
+      DestroyW(I);
+  MarkAll;
+End;
+
+Procedure SecAction(W, B : LongInt);
+Var M : LongInt;
+Begin
+  M := Wnds^[W].K1;
+  If M = 1 Then Exit;
+  DestroyW(W);
+  If M = 2 Then
+  Begin
+    If B = 0 Then SecLogoff;
+    Exit;
+  End;
+  Case B Of
+    0 : SecurityOpen(1);
+    1 : SecurityOpen(2);
+    2 : KCommand(cmShutdown);
+    3 : RunExe('TASKMGR.EXE', '');
+  End;
+End;
+
+Procedure SecKey(W, VK : LongInt);
+Begin
+  Case Wnds^[W].K1 Of
+    0 : If (VK = $0D) Or (VK = $1B) Then SecAction(W, 5)
+        Else If VK = $56 Then SecAction(W, 0)
+        Else If VK = $46 Then SecAction(W, 1)
+        Else If VK = $41 Then SecAction(W, 2)
+        Else If VK = $47 Then SecAction(W, 3);
+    2 : If (VK = $0D) Or (VK = $4F) Then SecAction(W, 0)
+        Else If (VK = $1B) Or (VK = $4E) Then SecAction(W, 1);
+  End;
+End;
+
+Procedure SecMouse(W, Msg, X, Y : LongInt);
+Var I, X1, Y1, X2, Y2 : LongInt;
+Begin
+  If Wnds^[W].K1 = 1 Then Exit;
+  X := X + Wnds^[W].X + Wnds^[W].CL; Y := Y + Wnds^[W].Y + Wnds^[W].CT;
+  For I := 0 To 5 Do
+    If SecBtnRect(W, I, X1, Y1, X2, Y2) And InRect(X, Y, X1, Y1, X2, Y2)
+    Then
+    Begin
+      If Msg = WM_LBUTTONDOWN Then
+      Begin
+        PressWin := W; PressBtn := I; CaptureWin := W;
+        KRepaint(W);
+      End
+      Else If (Msg = WM_LBUTTONUP) And (PressWin = W) And (PressBtn = I)
+      Then
+      Begin
+        PressWin := -1; CaptureWin := -1;
+        SecAction(W, I);
+      End;
+      Exit;
+    End;
+  If Msg = WM_LBUTTONUP Then
+  Begin
+    If PressWin = W Then
+    Begin
+      PressWin := -1;
+      KRepaint(W);
+    End;
+    CaptureWin := -1;
+  End;
+End;
+
+Procedure PaintSecurity(W : LongInt);
+Var X1, Y1, X2, Y2, I, BX1, BY1, BX2, BY2 : LongInt; T : String;
+Begin
+  KClient(W, X1, Y1, X2, Y2);
+  If Wnds^[W].K1 = 1 Then
+  Begin
+    FBar(X1, Y1, X2, Y2, DeskColor);
+    BX1 := (X1 + X2) Div 2 - 230; BY1 := (Y1 + Y2) Div 2 - 90;
+    BX2 := BX1 + 460; BY2 := BY1 + 180;
+    FBar(BX1, BY1, BX2, BY2, cSilver);
+    HLine(BX1, BX2, BY1, cWhite); VLine(BX1, BY1, BY2, cWhite);
+    HLine(BX1, BX2, BY2, cBlack); VLine(BX2, BY1, BY2, cBlack);
+    FBar(BX1 + 3, BY1 + 3, BX2 - 3, BY1 + 23, cNavy);
+    OutBold(BX1 + 8, BY1 + 5, Wnds^[W].Text, cWhite);
+    PaintIcon(icLogo, BX1 + 16, BY1 + 44, 32);
+    OutTxt(BX1 + 64, BY1 + 40, L('Cet ordinateur est en cours d''utilisation',
+           'This computer is in use and has been locked.',
+           'Dieser Computer wird verwendet und ist gesperrt.',
+           'Il computer '#138' in uso ed '#138' stato bloccato.',
+           'El equipo est'#160' en uso y se ha bloqueado.'), cBlack);
+    OutTxt(BX1 + 64, BY1 + 58, L('et a '#130't'#130' verrouill'#130'.', '',
+           '', '', ''), cBlack);
+    OutTxt(BX1 + 64, BY1 + 92, L('Appuyez sur Ctrl+Alt+Suppr pour le '
+           + 'd'#130'verrouiller.', 'Press Ctrl+Alt+Del to unlock it.',
+           'Strg+Alt+Entf entsperrt ihn.', 'Premere Ctrl+Alt+Canc.',
+           'Presione Ctrl+Alt+Supr.'), cBlack);
+    OutTxt(BX1 + 64, BY1 + 128, L('(VirtualBox : Ctrl droit+Suppr ;',
+           '(VirtualBox: Host+Del;', '(VirtualBox: Host+Entf;',
+           '(VirtualBox: Host+Canc;', '(VirtualBox: Host+Supr;'), cGray);
+    OutTxt(BX1 + 64, BY1 + 146, L(' Ctrl+Maj+'#144'chap aussi)',
+           ' Ctrl+Shift+Esc also works)', ' oder Strg+Umschalt+Esc)',
+           ' o Ctrl+Maiusc+Esc)', ' o Ctrl+May'#163's+Esc)'), cGray);
+    Exit;
+  End;
+  FBar(X1, Y1, X2, Y2, cSilver);
+  If Wnds^[W].K1 = 2 Then
+  Begin
+    PaintIcon(icLogo, X1 + 14, Y1 + 14, 32);
+    OutTxt(X1 + 60, Y1 + 14, L('Voulez-vous vraiment fermer la session ?',
+           'Are you sure you want to log off?', 'Wirklich abmelden?',
+           'Disconnettersi?', #168'Desea cerrar la sesi'#162'n?'), cBlack);
+    OutTxt(X1 + 60, Y1 + 34, L('Les programmes ouverts seront ferm'#130's.',
+           'Open programs will be closed.',
+           'Offene Programme werden beendet.',
+           'I programmi aperti verranno chiusi.',
+           'Se cerrar'#160'n los programas abiertos.'), cBlack);
+  End
+  Else
+  Begin
+    PaintIcon(icLogo, X1 + 16, Y1 + 14, 32);
+    OutBold(X1 + 64, Y1 + 12, 'Pasdows 95', cBlack);
+    OutTxt(X1 + 64, Y1 + 32, L('Ouvert en tant que : Utilisateur',
+           'Logged on as: User', 'Angemeldet als: Benutzer',
+           'Connesso come: Utente', 'Sesi'#162'n de: Usuario'), cBlack);
+    OutTxt(X1 + 16, Y1 + 70, L('Utilisez le Gestionnaire des t'#131'ches '
+           + 'pour fermer une', 'Use the Task Manager to close an '
+           + 'application', 'Mit dem Task-Manager beenden Sie ein',
+           'Usare Task Manager per chiudere un''applicazione',
+           'Use el Administrador de tareas para cerrar una'), cBlack);
+    OutTxt(X1 + 16, Y1 + 88, L('application qui ne r'#130'pond pas.',
+           'that is not responding.', 'Programm, das nicht reagiert.',
+           'che non risponde.', 'aplicaci'#162'n que no responde.'),
+           cBlack);
+    HLine(X1 + 10, X2 - 10, Y1 + 120, cGray);
+    HLine(X1 + 10, X2 - 10, Y1 + 121, cWhite);
+  End;
+  For I := 0 To 5 Do
+    If SecBtnRect(W, I, BX1, BY1, BX2, BY2) Then
+    Begin
+      If Wnds^[W].K1 = 2 Then
+      Begin
+        If I = 0 Then T := L('Oui', 'Yes', 'Ja', 'S'#141, 'S'#161)
+        Else T := L('Non', 'No', 'Nein', 'No', 'No');
+      End
+      Else T := SecBtnText(I);
+      PushButton(BX1, BY1, BX2, BY2, T, (PressWin = W) And (PressBtn = I),
+                 (I = 5) Or ((Wnds^[W].K1 = 2) And (I = 0)));
+    End;
+End;
+
 Procedure PaintHelp(W : LongInt);
 Var X1, Y1, X2, Y2 : LongInt;
 Begin
@@ -23047,6 +23315,7 @@ Begin
     ikMsgBox : MsgBoxMouse(W, Msg, X, Y);
     ikExplorer : ExpMouse(W, Msg, X, Y);
     ikAbout, ikRun, ikShutdown : DialogMouse(W, Msg, X, Y);
+    ikSecurity : SecMouse(W, Msg, X, Y);
     ikDisplay : DisplayMouse(W, Msg, X, Y);
     ikDateTime : DateTimeMouse(W, Msg, X, Y);
     ikVolPop : VolPopMouse(W, Msg, X, Y);
@@ -24196,6 +24465,7 @@ Begin
         KRepaint(W);
       End;
     ikAbout : If (VK = $0D) Or (VK = $1B) Then DestroyW(W);
+    ikSecurity : SecKey(W, VK);
     ikDisplay : DisplayKey(W, VK);
     ikDateTime : DateTimeKey(W, VK);
     ikSysProps : SysPropsKey(W, VK);
@@ -24264,6 +24534,7 @@ Begin
     ikMsgBox : PaintMsgBox(W);
     ikExplorer : PaintExplorer(W);
     ikAbout, ikRun, ikShutdown : PaintDialog(W);
+    ikSecurity : PaintSecurity(W);
     ikDisplay : PaintDisplay(W);
     ikDateTime : PaintDateTime(W);
     ikVolPop : PaintVolPop(W);
@@ -91216,6 +91487,7 @@ Begin
   KClass[ikMapDrv] := ClassAdd('#MapDrive', 0, ikMapDrv, 0);
   KClass[ikFileProps] := ClassAdd('#FileProps', 0, ikFileProps, 0);
   KClass[ikShutdown] := ClassAdd('#Shutdown', 0, ikShutdown, 0);
+  KClass[ikSecurity] := ClassAdd('#Security', 0, ikSecurity, 0);
   KClass[ikHelp] := ClassAdd('#Help', 0, ikHelp, 0);
   KClass[ikNotepad] := ClassAdd('#Notepad', 0, ikNotepad, 0);
   KClass[ikConsole] := ClassAdd('#Console', 0, ikConsole, 0);

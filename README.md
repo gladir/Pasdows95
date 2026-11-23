@@ -644,7 +644,7 @@ Exemple : <b>EXAMPLES/PROCTEST.PAS</b> (PROCTEST.EXE sur le CD-ROM) lance des co
 
 <h2 id="taskmgr">Gestionnaire des tâches</h2>
 
-<b>APPS/TASKMGR.PAS</b> est un <b>Gestionnaire des tâches</b> dans le style de celui de Windows XP, une application Win32 écrite en Pascal et compilée par WPC (TASKMGR.EXE). Il s'ouvre par <b>Ctrl+Alt+Suppr</b>, <b>Ctrl+Maj+Échap</b> ou le menu contextuel de la barre des tâches (<i>Gestionnaire des tâches</i>, à côté de <i>Réduire toutes les fenêtres</i>) ; un <b>mutex nommé</b> garde une seule instance : un second lancement ramène la fenêtre existante. Toutes les valeurs viennent des API du système, actualisées chaque seconde (fréquence <i>Haute</i>, <i>Normale</i>, <i>Basse</i> ou <i>Suspendue</i>).
+<b>APPS/TASKMGR.PAS</b> est un <b>Gestionnaire des tâches</b> dans le style de celui de Windows XP, une application Win32 écrite en Pascal et compilée par WPC (TASKMGR.EXE). Il s'ouvre par <b>Ctrl+Maj+Échap</b>, par le bouton <i>Gestionnaire des tâches</i> de la boîte <a href="#securite">Sécurité de Pasdows</a> (Ctrl+Alt+Suppr) ou par le menu contextuel de la barre des tâches (<i>Gestionnaire des tâches</i>, à côté de <i>Réduire toutes les fenêtres</i>) ; un <b>mutex nommé</b> garde une seule instance : un second lancement ramène la fenêtre existante. Toutes les valeurs viennent des API du système, actualisées chaque seconde (fréquence <i>Haute</i>, <i>Normale</i>, <i>Basse</i> ou <i>Suspendue</i>).
 
 <ul>
 	<li><b>Applications</b> : les fenêtres des programmes (EnumWindows) et leur état (<i>En cours d'exécution</i> ou <i>Ne répond pas</i>, par IsHungAppWindow) ; <i>Fin de tâche</i> (EndTask), <i>Basculer vers</i> (double-clic ou Entrée), <i>Nouvelle tâche...</i> (CreateProcess) et un menu contextuel (<i>Mettre au premier plan</i>, <i>Réduire</i>, <i>Agrandir</i>, <i>Aller au processus</i>).</li>
@@ -659,6 +659,24 @@ Exemple : <b>EXAMPLES/PROCTEST.PAS</b> (PROCTEST.EXE sur le CD-ROM) lance des co
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/TASKMGR_PERFORMANCES.png" width="400" alt="Gestionnaire des tâches, onglet Performances"><br><i>Onglet Performances</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/TASKMGR_PROCESSUS.png" width="400" alt="Onglet Processus"><br><i>Onglet Processus (colonnes PID, Threads, Handles)</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/TASKMGR_APPLICATIONS.png" width="400" alt="Onglet Applications"><br><i>Onglet Applications : Paint, DXDIAG, l'Invite DOS et HELLO en même temps</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/TASKMGR_MENU.png" width="400" alt="Menu contextuel d'un processus"><br><i>Menu contextuel d'un processus (TrackPopupMenu) : Définir la priorité</i></td></tr>
 	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/TASKMGR_RESEAU.png" width="400" alt="Onglet Mise en réseau"><br><i>Mise en réseau : trafic de NETTEST et HTTPGET (échelle de 1 %)</i></td><td></td></tr>
+</table>
+
+<h2 id="securite">Sécurité de Pasdows (Ctrl+Alt+Suppr)</h2>
+
+Comme sous Windows NT et XP, <b>Ctrl+Alt+Suppr</b> ouvre la boîte <b>Sécurité de Pasdows</b> (fenêtre interne du noyau) :
+
+<ul>
+	<li><b>Verrouiller l'ordinateur</b> (V) : un écran plein écran cache le bureau et la barre des tâches, le clavier et la souris ne vont plus aux programmes (qui continuent de tourner) ; <b>Ctrl+Alt+Suppr</b> (ou Ctrl+Maj+Échap) le déverrouille ;</li>
+	<li><b>Fermer la session...</b> (F) : après confirmation, tous les programmes et les fenêtres du Bloc-notes, de l'Explorateur et de l'Aide sont fermés, le bureau reste ;</li>
+	<li><b>Arrêter...</b> (A) : la boîte <i>Arrêter Pasdows</i> ;</li>
+	<li><b>Gestionnaire des tâches</b> (G) : TASKMGR.EXE ;</li>
+	<li><b>Annuler</b> (Entrée ou Échap).</li>
+</ul>
+
+Sous <b>VirtualBox</b>, Windows (l'hôte) garde pour lui Ctrl+Alt+Suppr : envoyez-le avec la touche hôte, <b>Ctrl droit + Suppr</b>, ou par le menu <i>Entrée, Clavier, Insérer Ctrl-Alt-Suppr</i> ; sous QEMU, <i>sendkey ctrl-alt-delete</i> dans le moniteur. <b>Ctrl+Maj+Échap</b> ouvre directement le Gestionnaire des tâches.
+
+<table>
+	<tr><td align="center"><img src="IMAGE/SCREENSHOTS/SECURITE.png" width="400" alt="Sécurité de Pasdows"><br><i>Ctrl+Alt+Suppr : Sécurité de Pasdows</i></td><td align="center"><img src="IMAGE/SCREENSHOTS/VERROUILLE.png" width="400" alt="Ordinateur verrouillé"><br><i>Ordinateur verrouillé</i></td></tr>
 </table>
 
 <h2 id="paint">Paint</h2>
