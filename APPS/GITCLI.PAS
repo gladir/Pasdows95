@@ -60,6 +60,7 @@ Type
 Var
   GitErr : String;                     { derniere erreur (texte) }
   ShaZero : TSha;
+  GitOom : Boolean;                    { une allocation a echoue }
 
 { progression d'une operation longue (definie par le programme) }
 Procedure GitProgress(Const What : String; Done, Total : LongInt); Forward;
@@ -83,7 +84,23 @@ Begin
   C := B.Cap * 2;
   If C < 256 Then C := 256;
   While C < N Do C := C * 2;
+  { gros tampons (images de plusieurs Mo) : au plus juste, +25 % au moins,
+    pour ne pas demander le double de la memoire necessaire }
+  If C > 4194304 Then
+  Begin
+    C := B.Cap + B.Cap Div 4;
+    If C < N Then C := N;
+    C := (C + 65535) And Not 65535;
+  End;
   GetMem(Q, C);
+  If Q = Nil Then
+  Begin
+    { memoire epuisee : le tampon garde sa taille, les ecritures qui ne
+      tiennent pas sont ignorees (GitOom) }
+    GitOom := True;
+    GitErr := 'm'#233'moire insuffisante';
+    Exit;
+  End;
   If B.N > 0 Then Move(B.P^[0], Q^[0], B.N);
   If B.P <> Nil Then FreeMem(B.P, B.Cap);
   B.P := Q; B.Cap := C;
@@ -92,6 +109,7 @@ End;
 Procedure BufByte(Var B : TBuf; V : LongInt);
 Begin
   If B.N >= B.Cap Then BufNeed(B, B.N + 1);
+  If B.N >= B.Cap Then Exit;
   B.P^[B.N] := V And 255;
   Inc(B.N);
 End;
@@ -100,6 +118,7 @@ Procedure BufStr(Var B : TBuf; Const S : String);
 Var I : LongInt;
 Begin
   BufNeed(B, B.N + Length(S));
+  If B.N + Length(S) > B.Cap Then Exit;
   For I := 1 To Length(S) Do
   Begin
     B.P^[B.N] := Ord(S[I]);
@@ -111,6 +130,7 @@ Procedure BufMem(Var B : TBuf; Const Src; N : LongInt);
 Begin
   If N <= 0 Then Exit;
   BufNeed(B, B.N + N);
+  If B.N + N > B.Cap Then Exit;
   Move(Src, B.P^[B.N], N);
   B.N := B.N + N;
 End;
@@ -119,6 +139,7 @@ Procedure BufAppend(Var B : TBuf; Var S : TBuf; Ofs, N : LongInt);
 Begin
   If N <= 0 Then Exit;
   BufNeed(B, B.N + N);
+  If B.N + N > B.Cap Then Exit;
   Move(S.P^[Ofs], B.P^[B.N], N);
   B.N := B.N + N;
 End;
@@ -280,11 +301,6 @@ Type
     Len : LongInt;                     { octets (moins de 512 Mo) }
   End;
 
-Function Rol(X, N : LongInt) : LongInt;
-Begin
-  Rol := (X Shl N) Or (X Shr (32 - N));
-End;
-
 Procedure Sha1Init(Var C : TSha1);
 Begin
   C.H0 := $67452301; C.H1 := LongInt($EFCDAB89); C.H2 := LongInt($98BADCFE);
@@ -292,38 +308,51 @@ Begin
   C.BN := 0; C.Len := 0;
 End;
 
-Procedure Sha1Block(Var C : TSha1);
-Var I, A, B, Cc, D, E, F, K, T : LongInt;
+{ un bloc de 64 octets (P^[O..O+63]) ; rotations ecrites en ligne et
+  une boucle par groupe de 20 tours (le SHA-1 de gros fichiers compte) }
+Procedure Sha1Run(Var C : TSha1; P : PBytes; O : LongInt);
+Var I, A, B, Cc, D, E, T, X : LongInt;
 Begin
   For I := 0 To 15 Do
-    C.W[I] := (C.Blk[I * 4] Shl 24) Or (C.Blk[I * 4 + 1] Shl 16) Or
-              (C.Blk[I * 4 + 2] Shl 8) Or C.Blk[I * 4 + 3];
+    C.W[I] := (P^[O + I * 4] Shl 24) Or (P^[O + I * 4 + 1] Shl 16) Or
+              (P^[O + I * 4 + 2] Shl 8) Or P^[O + I * 4 + 3];
   For I := 16 To 79 Do
-    C.W[I] := Rol(C.W[I - 3] Xor C.W[I - 8] Xor C.W[I - 14] Xor C.W[I - 16], 1);
-  A := C.H0; B := C.H1; Cc := C.H2; D := C.H3; E := C.H4;
-  For I := 0 To 79 Do
   Begin
-    If I < 20 Then
-    Begin
-      F := (B And Cc) Or ((Not B) And D); K := $5A827999;
-    End
-    Else If I < 40 Then
-    Begin
-      F := B Xor Cc Xor D; K := $6ED9EBA1;
-    End
-    Else If I < 60 Then
-    Begin
-      F := (B And Cc) Or (B And D) Or (Cc And D); K := LongInt($8F1BBCDC);
-    End
-    Else
-    Begin
-      F := B Xor Cc Xor D; K := LongInt($CA62C1D6);
-    End;
-    T := Rol(A, 5) + F + E + K + C.W[I];
-    E := D; D := Cc; Cc := Rol(B, 30); B := A; A := T;
+    X := C.W[I - 3] Xor C.W[I - 8] Xor C.W[I - 14] Xor C.W[I - 16];
+    C.W[I] := (X Shl 1) Or (X Shr 31);
+  End;
+  A := C.H0; B := C.H1; Cc := C.H2; D := C.H3; E := C.H4;
+  For I := 0 To 19 Do
+  Begin
+    T := ((A Shl 5) Or (A Shr 27)) + ((B And Cc) Or ((Not B) And D)) + E +
+      $5A827999 + C.W[I];
+    E := D; D := Cc; Cc := (B Shl 30) Or (B Shr 2); B := A; A := T;
+  End;
+  For I := 20 To 39 Do
+  Begin
+    T := ((A Shl 5) Or (A Shr 27)) + (B Xor Cc Xor D) + E + $6ED9EBA1 +
+      C.W[I];
+    E := D; D := Cc; Cc := (B Shl 30) Or (B Shr 2); B := A; A := T;
+  End;
+  For I := 40 To 59 Do
+  Begin
+    T := ((A Shl 5) Or (A Shr 27)) + ((B And Cc) Or (B And D) Or (Cc And D))
+      + E + LongInt($8F1BBCDC) + C.W[I];
+    E := D; D := Cc; Cc := (B Shl 30) Or (B Shr 2); B := A; A := T;
+  End;
+  For I := 60 To 79 Do
+  Begin
+    T := ((A Shl 5) Or (A Shr 27)) + (B Xor Cc Xor D) + E +
+      LongInt($CA62C1D6) + C.W[I];
+    E := D; D := Cc; Cc := (B Shl 30) Or (B Shr 2); B := A; A := T;
   End;
   C.H0 := C.H0 + A; C.H1 := C.H1 + B; C.H2 := C.H2 + Cc;
   C.H3 := C.H3 + D; C.H4 := C.H4 + E;
+End;
+
+Procedure Sha1Block(Var C : TSha1);
+Begin
+  Sha1Run(C, PBytes(@C.Blk), 0);
 End;
 
 Procedure Sha1Byte(Var C : TSha1; V : LongInt);
@@ -337,20 +366,35 @@ Begin
   End;
 End;
 
-Procedure Sha1Mem(Var C : TSha1; Var B : TBuf; Ofs, N : LongInt);
-Var I : LongInt;
+Procedure Sha1Ptr(Var C : TSha1; P : PBytes; Ofs, N : LongInt);
+Var I, E : LongInt;
 Begin
-  For I := Ofs To Ofs + N - 1 Do
+  I := Ofs; E := Ofs + N;
+  While I < E Do
   Begin
-    C.Blk[C.BN] := B.P^[I];
-    Inc(C.BN);
-    If C.BN = 64 Then
+    If (C.BN = 0) And (E - I >= 64) Then
     Begin
-      Sha1Block(C);
-      C.BN := 0;
+      { blocs entiers : directement depuis la source }
+      Sha1Run(C, P, I);
+      I := I + 64;
+    End
+    Else
+    Begin
+      C.Blk[C.BN] := P^[I];
+      Inc(C.BN); Inc(I);
+      If C.BN = 64 Then
+      Begin
+        Sha1Block(C);
+        C.BN := 0;
+      End;
     End;
   End;
   C.Len := C.Len + N;
+End;
+
+Procedure Sha1Mem(Var C : TSha1; Var B : TBuf; Ofs, N : LongInt);
+Begin
+  Sha1Ptr(C, B.P, Ofs, N);
 End;
 
 Procedure Sha1Str(Var C : TSha1; Const S : String);
@@ -410,18 +454,24 @@ Begin
   Crc32 := Not C;
 End;
 
-Function Adler32(Var B : TBuf; Ofs, N : LongInt) : LongInt;
+{ Adler-32 en continu : V = valeur precedente (1 au debut) }
+Function AdlerUpd(V : LongInt; P : PBytes; Ofs, N : LongInt) : LongInt;
 Var A, S, I : LongInt;
 Begin
-  A := 1; S := 0;
+  A := V And $FFFF; S := (V Shr 16) And $FFFF;
   For I := Ofs To Ofs + N - 1 Do
   Begin
-    A := A + B.P^[I];
+    A := A + P^[I];
     If A >= 65521 Then A := A - 65521;
     S := S + A;
     If S >= 65521 Then S := S - 65521;
   End;
-  Adler32 := (S Shl 16) Or A;
+  AdlerUpd := (S Shl 16) Or A;
+End;
+
+Function Adler32(Var B : TBuf; Ofs, N : LongInt) : LongInt;
+Begin
+  Adler32 := AdlerUpd(1, B.P, Ofs, N);
 End;
 
 { ==================================================================== }
@@ -435,12 +485,40 @@ Type
     Sym : Array[0..287] Of LongInt;
   End;
 
+{ fichiers (implantes par la plate-forme) : poignee >= 0, -1 si erreur }
+Function FOpenR(Const P : String) : LongInt; Forward;
+Function FCreate(Const P : String) : LongInt; Forward;
+Function FReadAt(H, Pos : LongInt; Q : PBytes; N : LongInt) : LongInt;
+  Forward;
+Function FWrite(H : LongInt; Q : PBytes; N : LongInt) : Boolean; Forward;
+Function FSize(H : LongInt) : LongInt; Forward;
+Procedure FClose(H : LongInt); Forward;
+{ supprime un dossier vide (sans erreur fatale) }
+Function FRmDir(Const P : String) : Boolean; Forward;
+
+Const
+  ZChunk = 32768;
+
+Type
+  TZChunk = Array[0..ZChunk - 1] Of Byte;
+
 Var
   ZIn : PBytes;                        { entree de l'inflate }
   ZPos, ZEnd, ZBit, ZBitN : LongInt;
   ZErr : Boolean;
   ZLitW, ZDst, ZFixL, ZFixD : THuff;
   ZFixOk : Boolean;
+  { entree depuis un fichier : tampon ZInB, ZFBase = position (fichier) de
+    ZInB[0] }
+  ZFH, ZFBase, ZFSize : LongInt;
+  ZInB : ^TZChunk;
+  { sortie : memoire (ZMem, ZO) ou flux (fenetre de 32 Ko, puis fichier
+    ZOutH et/ou empreinte ZSha) }
+  ZMem : Boolean;
+  ZO : ^TBuf;
+  ZWin, ZOB : ^TZChunk;
+  ZOBN, ZTotal, ZLimit, ZOutH, ZSkip : LongInt;
+  ZShaOn, ZStop : Boolean;
 
 Const
   LenBase : Array[0..28] Of LongInt = (3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17,
@@ -455,17 +533,81 @@ Const
   ClOrder : Array[0..18] Of LongInt = (16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11,
     4, 12, 3, 13, 2, 14, 1, 15);
 
+{ entree depuis un fichier : lit le morceau suivant }
+Function ZRefill : Boolean;
+Var N : LongInt;
+Begin
+  ZRefill := False;
+  If ZFH < 0 Then Exit;
+  ZFBase := ZFBase + ZEnd;
+  N := ZFSize - ZFBase;
+  If N > ZChunk Then N := ZChunk;
+  If N <= 0 Then Exit;
+  N := FReadAt(ZFH, ZFBase, PBytes(ZInB), N);
+  If N <= 0 Then Exit;
+  ZIn := PBytes(ZInB); ZPos := 0; ZEnd := N;
+  ZRefill := True;
+End;
+
+Function ZByteIn : LongInt;
+Begin
+  ZByteIn := -1;
+  If ZPos >= ZEnd Then
+    If Not ZRefill Then Exit;
+  ZByteIn := ZIn^[ZPos];
+  Inc(ZPos);
+End;
+
+{ sortie en flux : vide le tampon vers le fichier et l'empreinte }
+Var
+  ZSha : TSha1;
+
+Procedure ZFlush;
+Begin
+  If ZOBN <= 0 Then Exit;
+  If ZShaOn Then Sha1Ptr(ZSha, PBytes(ZOB), 0, ZOBN);
+  If ZOutH >= 0 Then
+    If Not FWrite(ZOutH, PBytes(ZOB), ZOBN) Then ZErr := True;
+  ZOBN := 0;
+End;
+
+Procedure ZOut(V : LongInt);
+Begin
+  If ZMem Then
+  Begin
+    If ZO^.N >= ZO^.Cap Then BufNeed(ZO^, ZO^.N + 1);
+    If ZO^.N >= ZO^.Cap Then
+    Begin
+      ZErr := True; Exit;
+    End;
+    ZO^.P^[ZO^.N] := V; Inc(ZO^.N);
+  End
+  Else
+  Begin
+    ZWin^[ZTotal And (ZChunk - 1)] := V;
+    If ZSkip > 0 Then Dec(ZSkip)
+    Else
+    Begin
+      ZOB^[ZOBN] := V; Inc(ZOBN);
+      If ZOBN >= ZChunk Then ZFlush;
+    End;
+  End;
+  Inc(ZTotal);
+  If ZTotal >= ZLimit Then ZStop := True;
+End;
+
 Function ZBits(N : LongInt) : LongInt;
 Var V : LongInt;
 Begin
   While ZBitN < N Do
   Begin
     If ZPos >= ZEnd Then
-    Begin
-      ZErr := True;
-      ZBits := 0;
-      Exit;
-    End;
+      If Not ZRefill Then
+      Begin
+        ZErr := True;
+        ZBits := 0;
+        Exit;
+      End;
     ZBit := ZBit Or (ZIn^[ZPos] Shl ZBitN);
     Inc(ZPos);
     ZBitN := ZBitN + 8;
@@ -498,8 +640,21 @@ Begin
   Code := 0; First := 0; Index := 0;
   For Len := 1 To 15 Do
   Begin
-    Code := Code Or ZBits(1);
-    If ZErr Then Begin HuffDecode := -1; Exit; End;
+    { un bit (ZBits(1) en ligne : c'est la boucle la plus parcourue) }
+    If ZBitN = 0 Then
+    Begin
+      If ZPos >= ZEnd Then
+        If Not ZRefill Then
+        Begin
+          ZErr := True; HuffDecode := -1; Exit;
+        End;
+      ZBit := ZIn^[ZPos];
+      Inc(ZPos);
+      ZBitN := 8;
+    End;
+    Code := Code Or (ZBit And 1);
+    ZBit := ZBit Shr 1;
+    Dec(ZBitN);
     C := H.Cnt[Len];
     If Code - C < First Then
     Begin
@@ -527,18 +682,14 @@ Begin
   ZFixOk := True;
 End;
 
-Function ZCodes(Var Lit, Dst : THuff; Var O : TBuf) : Boolean;
+Function ZCodes(Var Lit, Dst : THuff) : Boolean;
 Var S, Len, D, I, K : LongInt;
 Begin
   ZCodes := False;
   Repeat
     S := HuffDecode(Lit);
     If S < 0 Then Exit;
-    If S < 256 Then
-    Begin
-      If O.N >= O.Cap Then BufNeed(O, O.N + 1);
-      O.P^[O.N] := S; Inc(O.N);
-    End
+    If S < 256 Then ZOut(S)
     Else If S > 256 Then
     Begin
       S := S - 257;
@@ -547,11 +698,23 @@ Begin
       D := HuffDecode(Dst);
       If (D < 0) Or (D > 29) Then Exit;
       D := DistBase[D] + ZBits(DistExtra[D]);
-      If ZErr Or (D > O.N) Then Exit;
-      BufNeed(O, O.N + Len);
-      K := O.N - D;
-      For I := 0 To Len - 1 Do O.P^[O.N + I] := O.P^[K + I];
-      O.N := O.N + Len;
+      If ZErr Or (D > ZTotal) Or (D > ZChunk) Then Exit;
+      If ZMem Then
+      Begin
+        BufNeed(ZO^, ZO^.N + Len);
+        If ZO^.N + Len > ZO^.Cap Then Exit;
+        K := ZO^.N - D;
+        For I := 0 To Len - 1 Do ZO^.P^[ZO^.N + I] := ZO^.P^[K + I];
+        ZO^.N := ZO^.N + Len;
+        ZTotal := ZTotal + Len;
+        If ZTotal >= ZLimit Then ZStop := True;
+      End
+      Else
+        For I := 1 To Len Do ZOut(ZWin^[(ZTotal - D) And (ZChunk - 1)]);
+    End;
+    If ZStop Then
+    Begin
+      ZCodes := True; Exit;
     End;
   Until S = 256;
   ZCodes := Not ZErr;
@@ -600,19 +763,52 @@ Begin
   ZDynamic := True;
 End;
 
-{ flux zlib (en-tete, blocs, Adler-32) de Src a partir de Ofs -> O
-  (ajoute) ; Used : octets consommes ; faux si le flux est invalide }
-Function ZInflate(Var Src : TBuf; Ofs, Lim : LongInt; Var O : TBuf;
-  Var Used : LongInt) : Boolean;
-Var Fin, Typ, Len, NLen : LongInt; Ok : Boolean;
+{ source de l'inflate : memoire (Src, de Ofs a Ofs + Lim) ou fichier
+  (poignee H, a partir de Pos) }
+Procedure ZSrcMem(Var Src : TBuf; Ofs, Lim : LongInt);
 Begin
-  ZInflate := False;
+  ZFH := -1;
+  ZIn := Src.P; ZPos := Ofs; ZEnd := Ofs + Lim; ZFBase := 0;
+End;
+
+Procedure ZSrcFile(H, Pos : LongInt);
+Begin
+  If ZInB = Nil Then GetMem(ZInB, ZChunk);
+  ZFH := H; ZFSize := FSize(H);
+  ZFBase := Pos; ZEnd := 0; ZPos := 0;
+  ZIn := PBytes(ZInB);
+End;
+
+{ destination : memoire (ajoute a O) ou flux (fichier OutH >= 0 et/ou
+  empreinte ZSha si UseSha ; Skip octets ignores au debut) }
+Procedure ZDstMem(Var O : TBuf);
+Begin
+  ZMem := True; ZO := @O;
+End;
+
+Procedure ZDstStream(OutH : LongInt; UseSha : Boolean; Skip : LongInt);
+Begin
+  If ZWin = Nil Then
+  Begin
+    GetMem(ZWin, ZChunk); GetMem(ZOB, ZChunk);
+  End;
+  ZMem := False; ZOutH := OutH; ZShaOn := UseSha; ZSkip := Skip;
+  ZOBN := 0;
+End;
+
+{ decompresse le flux zlib ; s'arrete apres Limit octets produits ;
+  Used : octets du flux consommes }
+Function ZRun(Limit : LongInt; Var Used : LongInt) : Boolean;
+Var Fin, Typ, Len, NLen, Start, I, C : LongInt; Ok : Boolean;
+Begin
+  ZRun := False;
   Used := 0;
-  ZIn := Src.P; ZPos := Ofs; ZEnd := Ofs + Lim; ZBit := 0; ZBitN := 0;
-  ZErr := False;
-  If Lim < 6 Then Exit;
-  If (ZIn^[ZPos] And 15) <> 8 Then Exit;
-  ZPos := ZPos + 2;
+  Start := ZFBase + ZPos;
+  ZBit := 0; ZBitN := 0; ZErr := False; ZStop := False;
+  ZTotal := 0; ZLimit := Limit;
+  C := ZByteIn;
+  If (C < 0) Or ((C And 15) <> 8) Then Exit;
+  If ZByteIn < 0 Then Exit;
   If Not ZFixOk Then ZFixed;
   Repeat
     Fin := ZBits(1);
@@ -622,32 +818,57 @@ Begin
       0 :
         Begin
           ZBit := 0; ZBitN := 0;
-          If ZPos + 4 > ZEnd Then Exit;
-          Len := ZIn^[ZPos] Or (ZIn^[ZPos + 1] Shl 8);
-          NLen := ZIn^[ZPos + 2] Or (ZIn^[ZPos + 3] Shl 8);
-          ZPos := ZPos + 4;
+          Len := ZByteIn; C := ZByteIn;
+          Len := Len Or (C Shl 8);
+          NLen := ZByteIn; C := ZByteIn;
+          If C < 0 Then Exit;
+          NLen := NLen Or (C Shl 8);
           If ((Len Xor NLen) And $FFFF) <> $FFFF Then Exit;
-          If ZPos + Len > ZEnd Then Exit;
-          BufAppend(O, Src, ZPos, Len);
-          ZPos := ZPos + Len;
+          For I := 1 To Len Do
+          Begin
+            C := ZByteIn;
+            If C < 0 Then Exit;
+            ZOut(C);
+            If ZStop Then Break;
+          End;
         End;
-      1 : If Not ZCodes(ZFixL, ZFixD, O) Then Exit;
+      1 : If Not ZCodes(ZFixL, ZFixD) Then Exit;
       2 :
         Begin
           If Not ZDynamic Then Exit;
-          Ok := ZCodes(ZLitW, ZDst, O);
+          Ok := ZCodes(ZLitW, ZDst);
           If Not Ok Then Exit;
         End;
     Else
       Exit;
     End;
+    If ZStop Then
+    Begin
+      If Not ZMem Then ZFlush;
+      ZRun := Not ZErr;
+      Exit;
+    End;
   Until Fin = 1;
+  If Not ZMem Then ZFlush;
+  If ZErr Then Exit;
   { octets entiers restants dans le tampon de bits : rendus }
   ZPos := ZPos - (ZBitN Div 8);
-  ZPos := ZPos + 4;                     { Adler-32 }
-  If ZPos > ZEnd Then ZPos := ZEnd;
-  Used := ZPos - Ofs;
-  ZInflate := True;
+  Used := ZFBase + ZPos + 4 - Start;     { Adler-32 }
+  ZRun := True;
+End;
+
+{ flux zlib (en-tete, blocs, Adler-32) de Src a partir de Ofs -> O
+  (ajoute) ; Used : octets consommes ; faux si le flux est invalide }
+Function ZInflate(Var Src : TBuf; Ofs, Lim : LongInt; Var O : TBuf;
+  Var Used : LongInt) : Boolean;
+Begin
+  ZInflate := False;
+  Used := 0;
+  If Lim < 6 Then Exit;
+  ZSrcMem(Src, Ofs, Lim);
+  ZDstMem(O);
+  ZInflate := ZRun($7FFFFFFF, Used);
+  If Used > Lim Then Used := Lim;
 End;
 
 { flux zlib de N octets de Src (blocs stockes) -> O (ajoute) }
@@ -915,18 +1136,22 @@ Const
   OtCommit = 1; OtTree = 2; OtBlob = 3; OtTag = 4; OtOfsDelta = 6;
   OtRefDelta = 7;
   MaxPack = 100;
+  IxK = MaxPack;                       { pack en cours d'indexation }
+  BigObj = 2097152;                    { objet plus grand : fichier }
 
 Type
+  { pack : l'index (.idx) est en memoire, le .pack est lu dans le fichier
+    (un pack peut faire des centaines de Mo) }
   TPack = Record
     Name : String;                     { chemin sans extension }
-    Idx, Data : TBuf;                  { .idx et .pack charges }
-    N : LongInt;                       { objets }
+    Idx : TBuf;
+    N, H, Size : LongInt;              { objets, poignee du .pack }
     Loaded : Boolean;
   End;
 
 Var
   GitDir, WorkDir : String;            { .git et dossier de travail }
-  Packs : Array[0..MaxPack - 1] Of TPack;
+  Packs : Array[0..MaxPack] Of TPack;
   PackN : LongInt;
   PacksRead : Boolean;
 
@@ -970,10 +1195,289 @@ Begin
   Sha1Final(C, H);
 End;
 
+{ ------------------------------------------------------------------ }
+{ Fichiers temporaires (gros objets) dans .git\pasgit                  }
+{ ------------------------------------------------------------------ }
+
+Function TmpPath(Const N : String) : String;
+Begin
+  MkDirs(GitDir + PS + 'pasgit');
+  TmpPath := GitDir + PS + 'pasgit' + PS + N;
+End;
+
+{ copie un fichier par morceaux }
+Function FileCopy(Const A, B : String) : Boolean;
+Var HA, HB, N, Pos : LongInt; Ch : TBuf;
+Begin
+  FileCopy := False;
+  HA := FOpenR(A);
+  If HA < 0 Then Exit;
+  HB := FCreate(B);
+  If HB < 0 Then
+  Begin
+    FClose(HA); Exit;
+  End;
+  BufInit(Ch);
+  BufNeed(Ch, ZChunk);
+  Pos := 0;
+  FileCopy := Ch.Cap >= ZChunk;
+  If Ch.Cap >= ZChunk Then
+    Repeat
+      N := FReadAt(HA, Pos, Ch.P, ZChunk);
+      If N <= 0 Then Break;
+      If Not FWrite(HB, Ch.P, N) Then
+      Begin
+        FileCopy := False; Break;
+      End;
+      Pos := Pos + N;
+    Until False;
+  BufFree(Ch);
+  FClose(HA); FClose(HB);
+End;
+
+{ empreinte d'un fichier lu par morceaux (en-tete d'objet de type T) }
+Function HashFile(Const Path : String; T : LongInt; Var H : TSha)
+  : Boolean;
+Var F, Sz, Pos, N : LongInt; C : TSha1; Ch : TBuf;
+Begin
+  HashFile := False;
+  F := FOpenR(Path);
+  If F < 0 Then Exit;
+  Sz := FSize(F);
+  BufInit(Ch);
+  BufNeed(Ch, ZChunk);
+  If Ch.Cap >= ZChunk Then
+  Begin
+    Sha1Init(C);
+    Sha1Str(C, TypeName(T) + ' ' + IStr(Sz));
+    Sha1Byte(C, 0);
+    Pos := 0;
+    While Pos < Sz Do
+    Begin
+      N := FReadAt(F, Pos, Ch.P, MinL(ZChunk, Sz - Pos));
+      If N <= 0 Then Break;
+      Sha1Ptr(C, Ch.P, 0, N);
+      Pos := Pos + N;
+    End;
+    Sha1Final(C, H);
+    HashFile := Pos = Sz;
+  End;
+  BufFree(Ch);
+  FClose(F);
+End;
+
+{ cache des gros objets resolus (fichiers) : bases des chaines de deltas
+  de gros fichiers (images ISO...) }
+Const
+  BigN = 6;
+
+{ derniere base de delta chargee en memoire, en morceaux de 1 Mo (un
+  seul bloc de plusieurs dizaines de Mo n'est souvent pas disponible
+  quand la memoire est fragmentee) }
+Const
+  CkSz = 1048576;
+  CkMax = 32;
+
+Var
+  BaseCk : Array[0..CkMax - 1] Of PBytes;
+  BaseCkN, BaseCkLen : LongInt;        { morceaux, taille de la base }
+  DUseCk : Boolean;                    { DeltaApplyX : base = BaseCk }
+  BaseCFn : String;                    { son fichier (cache des gros objets) }
+  BigK, BigOfs, BigT, BigSz : Array[0..BigN - 1] Of LongInt;
+  BigSha : Array[0..BigN - 1] Of TSha;     { empreinte de l'objet }
+  BigUse : Array[0..BigN - 1] Of LongInt;  { dernier usage (LRU) }
+  BigTick : LongInt;
+  BigNext, BigMade, BaseLoads, BaseHits : LongInt;
+
+Function BigFile(I : LongInt) : String;
+Begin
+  BigFile := TmpPath('big' + IStr(I) + '.tmp');
+End;
+
+Procedure BaseCDrop;
+Var I : LongInt;
+Begin
+  For I := 0 To BaseCkN - 1 Do FreeMem(BaseCk[I], CkSz);
+  BaseCkN := 0; BaseCkLen := -1;
+  BaseCFn := '';
+End;
+
+{ lit tout le fichier H dans BaseCk ; faux si la memoire manque }
+Function BaseCLoad(H : LongInt) : Boolean;
+Var Sz, Pos, N, I : LongInt;
+Begin
+  BaseCLoad := False;
+  BaseCDrop;
+  Sz := FSize(H);
+  If (Sz < 0) Or (Sz > CkMax * CkSz) Then Exit;
+  While BaseCkN * CkSz < Sz Do
+  Begin
+    GetMem(BaseCk[BaseCkN], CkSz);
+    If BaseCk[BaseCkN] = Nil Then
+    Begin
+      BaseCDrop; Exit;
+    End;
+    Inc(BaseCkN);
+  End;
+  Pos := 0;
+  While Pos < Sz Do
+  Begin
+    I := Pos Div CkSz;
+    N := FReadAt(H, Pos, BaseCk[I], MinL(CkSz, Sz - Pos));
+    If N <= 0 Then Break;
+    Pos := Pos + N;
+  End;
+  If Pos <> Sz Then
+  Begin
+    BaseCDrop; Exit;
+  End;
+  BaseCkLen := Sz;
+  BaseCLoad := True;
+End;
+
+Procedure BigClear;
+Var I : LongInt;
+Begin
+  BaseCDrop;
+  For I := 0 To BigN - 1 Do
+  Begin
+    If BigOfs[I] <> 0 Then FileDel(BigFile(I));
+    BigOfs[I] := 0;
+  End;
+End;
+
+Function BigGet(K, Ofs : LongInt; Var T, Sz : LongInt; Var Fn : String)
+  : Boolean;
+Var I : LongInt;
+Begin
+  BigGet := False;
+  For I := 0 To BigN - 1 Do
+    If (BigOfs[I] = Ofs) And (BigK[I] = K) And (Ofs <> 0) Then
+    Begin
+      Inc(BigTick); BigUse[I] := BigTick;
+      T := BigT[I]; Sz := BigSz[I]; Fn := BigFile(I);
+      BigGet := True; Exit;
+    End;
+End;
+
+{ emplacement pour un gros objet (sauf le fichier Avoid, en usage) }
+Function BigNew(K, Ofs, T, Sz : LongInt; Const Avoid : String) : String;
+Var I, J : LongInt;
+Begin
+  { le moins recemment utilise (libre d'abord), sauf Avoid }
+  I := -1;
+  For J := 0 To BigN - 1 Do
+    If BigFile(J) <> Avoid Then
+      If (I < 0) Or (BigOfs[J] = 0) And (BigOfs[I] <> 0) Or
+         ((BigOfs[J] <> 0) = (BigOfs[I] <> 0)) And (BigUse[J] < BigUse[I])
+      Then I := J;
+  Inc(BigTick); BigUse[I] := BigTick;
+  Inc(BigMade);
+  If BaseCFn = BigFile(I) Then BaseCDrop;
+  BigK[I] := K; BigOfs[I] := Ofs; BigT[I] := T; BigSz[I] := Sz;
+  BigNew := BigFile(I);
+End;
+
+{ empreinte calculee pendant l'ecriture du gros objet Fn }
+Function BigShaOf(Const Fn : String; Var H : TSha) : Boolean;
+Var I : LongInt;
+Begin
+  BigShaOf := False;
+  For I := 0 To BigN - 1 Do
+    If (BigFile(I) = Fn) And (BigOfs[I] <> 0) Then
+    Begin
+      H := BigSha[I]; BigShaOf := True; Exit;
+    End;
+End;
+
+Procedure BigSetSha(Const Fn : String);
+Var I : LongInt;
+Begin
+  For I := 0 To BigN - 1 Do
+    If BigFile(I) = Fn Then Sha1Final(ZSha, BigSha[I]);
+End;
+
+{ commence l'empreinte d'un objet (en-tete) dans ZSha }
+Procedure ShaHead(T, Sz : LongInt);
+Begin
+  Sha1Init(ZSha);
+  Sha1Str(ZSha, TypeName(T) + ' ' + IStr(Sz));
+  Sha1Byte(ZSha, 0);
+End;
+
+Procedure BigDrop(Const Fn : String);
+Var I : LongInt;
+Begin
+  For I := 0 To BigN - 1 Do
+    If BigFile(I) = Fn Then BigOfs[I] := 0;
+  If BaseCFn = Fn Then BaseCDrop;
+  FileDel(Fn);
+End;
+
+{ cache des petits objets resolus (bases des chaines de deltas) }
+Const
+  DcN = 24;
+  DcMax = 262144;
+
+Var
+  DcKey, DcOfs, DcT : Array[0..DcN - 1] Of LongInt;
+  DcBuf : Array[0..DcN - 1] Of TBuf;
+  DcNext : LongInt;
+
+Procedure DcClear;
+Var I : LongInt;
+Begin
+  For I := 0 To DcN - 1 Do
+  Begin
+    DcKey[I] := 0; DcOfs[I] := -1;
+    BufFree(DcBuf[I]);
+  End;
+End;
+
+Function DcGet(Key, Ofs : LongInt; Var T : LongInt; Var D : TBuf) : Boolean;
+Var I : LongInt;
+Begin
+  DcGet := False;
+  For I := 0 To DcN - 1 Do
+    If (DcOfs[I] = Ofs) And (DcKey[I] = Key) Then
+    Begin
+      D.N := 0;
+      BufAppend(D, DcBuf[I], 0, DcBuf[I].N);
+      T := DcT[I];
+      DcGet := D.N = DcBuf[I].N;
+      Exit;
+    End;
+End;
+
+Procedure DcPut(Key, Ofs, T : LongInt; Var D : TBuf);
+Var I : LongInt; Oom : Boolean; E : String;
+Begin
+  If D.N > DcMax Then Exit;
+  I := DcNext;
+  DcNext := (DcNext + 1) Mod DcN;
+  DcBuf[I].N := 0;
+  DcOfs[I] := -1;
+  Oom := GitOom; E := GitErr;
+  BufAppend(DcBuf[I], D, 0, D.N);
+  If DcBuf[I].N <> D.N Then
+  Begin
+    { cache : pas de place, ce n'est pas une erreur }
+    BufFree(DcBuf[I]);
+    GitOom := Oom; GitErr := E;
+    Exit;
+  End;
+  DcKey[I] := Key; DcOfs[I] := Ofs; DcT[I] := T;
+End;
+
+{ ------------------------------------------------------------------ }
+{ Packs                                                                }
+{ ------------------------------------------------------------------ }
+
 Procedure PackFree(K : LongInt);
 Begin
   BufFree(Packs[K].Idx);
-  BufFree(Packs[K].Data);
+  If Packs[K].Loaded And (Packs[K].H >= 0) Then FClose(Packs[K].H);
+  Packs[K].H := -1;
   Packs[K].Loaded := False;
 End;
 
@@ -984,13 +1488,16 @@ Begin
   For K := 0 To PackN - 1 Do PackFree(K);
   PackN := 0;
   PacksRead := True;
+  DcClear;
+  BigClear;
   D := GitDir + PS + 'objects' + PS + 'pack' + PS;
   FindFirst(D + '*.idx', AnyFile, SR);
   While (DosError = 0) And (PackN < MaxPack) Do
   Begin
     Packs[PackN].Name := D + Copy(SR.Name, 1, Length(SR.Name) - 4);
-    BufInit(Packs[PackN].Idx); BufInit(Packs[PackN].Data);
+    BufInit(Packs[PackN].Idx);
     Packs[PackN].Loaded := False;
+    Packs[PackN].H := -1;
     Inc(PackN);
     FindNext(SR);
   End;
@@ -1005,8 +1512,8 @@ End;
 
 Procedure PutBE32(Var B : TBuf; V : LongInt);
 Begin
-  BufByte(B, V Shr 24); BufByte(B, V Shr 16); BufByte(B, V Shr 8);
-  BufByte(B, V);
+  BufByte(B, (V Shr 24) And 255); BufByte(B, (V Shr 16) And 255);
+  BufByte(B, (V Shr 8) And 255); BufByte(B, V And 255);
 End;
 
 Function PackLoad(K : LongInt) : Boolean;
@@ -1014,13 +1521,18 @@ Begin
   PackLoad := False;
   If Packs[K].Loaded Then Begin PackLoad := True; Exit; End;
   If Not FileLoad(Packs[K].Name + '.idx', Packs[K].Idx) Then Exit;
-  If Not FileLoad(Packs[K].Name + '.pack', Packs[K].Data) Then Exit;
   If (Packs[K].Idx.N < 1072) Or (BE32(Packs[K].Idx, 0) <> LongInt($FF744F63))
      Or (BE32(Packs[K].Idx, 4) <> 2) Then
   Begin
     GitErr := 'index de pack non pris en charge : ' + Packs[K].Name;
     Exit;
   End;
+  Packs[K].H := FOpenR(Packs[K].Name + '.pack');
+  If Packs[K].H < 0 Then
+  Begin
+    GitErr := 'pack illisible : ' + Packs[K].Name; Exit;
+  End;
+  Packs[K].Size := FSize(Packs[K].H);
   Packs[K].N := BE32(Packs[K].Idx, 8 + 255 * 4);
   Packs[K].Loaded := True;
   PackLoad := True;
@@ -1049,66 +1561,8 @@ Begin
   End;
 End;
 
-{ delta Git : base + instructions -> O }
-Function DeltaApply(Var Base, Dl : TBuf; Var O : TBuf) : Boolean;
-Var P, Sz, Sh, C, Ofs, Len : LongInt;
-
-  Function Vint : LongInt;
-  Var V, S, B : LongInt;
-  Begin
-    V := 0; S := 0;
-    Repeat
-      B := Dl.P^[P]; Inc(P);
-      V := V Or ((B And 127) Shl S);
-      S := S + 7;
-    Until ((B And 128) = 0) Or (P >= Dl.N);
-    Vint := V;
-  End;
-
-Begin
-  DeltaApply := False;
-  O.N := 0;
-  P := 0;
-  Sz := Vint;
-  If Sz <> Base.N Then Exit;
-  Sz := Vint;
-  BufNeed(O, Sz);
-  While P < Dl.N Do
-  Begin
-    C := Dl.P^[P]; Inc(P);
-    If (C And 128) <> 0 Then
-    Begin
-      Ofs := 0; Len := 0;
-      For Sh := 0 To 3 Do
-        If (C And (1 Shl Sh)) <> 0 Then
-        Begin
-          Ofs := Ofs Or (Dl.P^[P] Shl (Sh * 8)); Inc(P);
-        End;
-      For Sh := 0 To 2 Do
-        If (C And (16 Shl Sh)) <> 0 Then
-        Begin
-          Len := Len Or (Dl.P^[P] Shl (Sh * 8)); Inc(P);
-        End;
-      If Len = 0 Then Len := $10000;
-      If (Ofs < 0) Or (Ofs + Len > Base.N) Then Exit;
-      BufAppend(O, Base, Ofs, Len);
-    End
-    Else If C > 0 Then
-    Begin
-      If P + C > Dl.N Then Exit;
-      BufAppend(O, Dl, P, C);
-      P := P + C;
-    End
-    Else Exit;
-  End;
-  DeltaApply := O.N = Sz;
-End;
-
-Function ReadObject(Const H : TSha; Var T : LongInt; Var D : TBuf)
-  : Boolean; Forward;
-
-{ en-tete d'un objet de pack a la position Ofs : type, taille, debut
-  des donnees ; base d'un delta (OfsBase : position ; RefBase) }
+{ en-tete d'un objet de pack (dans un tampon) : type, taille, debut des
+  donnees, distance de la base (OFS_DELTA), base (REF_DELTA) }
 Procedure PackHdr(Var P : TBuf; Ofs : LongInt; Var T, Sz, DataAt,
   OfsBase : LongInt; Var RefBase : TSha);
 Var C, Sh, V : LongInt;
@@ -1143,140 +1597,544 @@ Begin
   DataAt := Ofs;
 End;
 
-Var
-  PackRefHookOn : Boolean;             { bases REF_DELTA du pack en cours }
-
-Function IxRefHook(Const H : TSha; Var T : LongInt; Var D : TBuf)
-  : Boolean; Forward;
-
-{ objet a la position Ofs du pack P (en memoire), deltas resolus ;
-  Raw : longueur des donnees compressees (-1 : inconnue) }
-{ cache des objets resolus (bases des chaines de deltas) }
-Const
-  DcN = 48;
-  DcMax = 262144;
-
-Var
-  DcKey, DcOfs, DcT : Array[0..DcN - 1] Of LongInt;
-  DcBuf : Array[0..DcN - 1] Of TBuf;
-  DcNext : LongInt;
-
-Procedure DcClear;
-Var I : LongInt;
+{ en-tete d'un objet du pack K (lu dans le fichier) }
+Function PackHdrK(K, Ofs : LongInt; Var T, Sz, DataAt, OfsBase : LongInt;
+  Var RefBase : TSha) : Boolean;
+Var B : TBuf; N : LongInt;
 Begin
-  For I := 0 To DcN - 1 Do
+  PackHdrK := False;
+  BufInit(B);
+  BufNeed(B, 64);
+  FillChar(B.P^[0], 64, 0);
+  N := FReadAt(Packs[K].H, Ofs, B.P, MinL(48, Packs[K].Size - Ofs));
+  If N > 0 Then
   Begin
-    DcKey[I] := 0; DcOfs[I] := -1;
-    BufFree(DcBuf[I]);
+    B.N := N;
+    PackHdr(B, 0, T, Sz, DataAt, OfsBase, RefBase);
+    DataAt := DataAt + Ofs;
+    PackHdrK := (T >= 1) And (T <= 7) And (T <> 5);
   End;
+  BufFree(B);
 End;
 
-Function DcGet(Key, Ofs : LongInt; Var T : LongInt; Var D : TBuf) : Boolean;
-Var I : LongInt;
+{ tailles en tete d'un delta : base, resultat ; P : debut des
+  instructions }
+Procedure DeltaHdr(Var Dl : TBuf; Var BSz, RSz, P : LongInt);
+
+  Function Vint : LongInt;
+  Var V, S, B : LongInt;
+  Begin
+    V := 0; S := 0;
+    Repeat
+      If P >= Dl.N Then Break;
+      B := Dl.P^[P]; Inc(P);
+      V := V Or ((B And 127) Shl S);
+      S := S + 7;
+    Until (B And 128) = 0;
+    Vint := V;
+  End;
+
 Begin
-  DcGet := False;
-  For I := 0 To DcN - 1 Do
-    If (DcOfs[I] = Ofs) And (DcKey[I] = Key) Then
+  P := 0;
+  BSz := Vint;
+  RSz := Vint;
+End;
+
+{ ecrit des octets vers la sortie d'un delta : memoire (O) ou flux
+  (tampon ZOB, puis fichier et/ou empreinte : voir ZDstStream) }
+Var
+  DOutMem : Boolean;
+  DO_ : ^TBuf;
+
+Procedure DEmit(P : PBytes; Ofs, N : LongInt);
+Var K : LongInt;
+Begin
+  If DOutMem Then
+  Begin
+    BufNeed(DO_^, DO_^.N + N);
+    If DO_^.N + N > DO_^.Cap Then
     Begin
-      D.N := 0;
-      BufAppend(D, DcBuf[I], 0, DcBuf[I].N);
-      T := DcT[I];
-      DcGet := True;
-      Exit;
+      ZErr := True; Exit;
     End;
-End;
-
-Procedure DcPut(Key, Ofs, T : LongInt; Var D : TBuf);
-Var I : LongInt;
-Begin
-  If D.N > DcMax Then Exit;
-  I := DcNext;
-  DcNext := (DcNext + 1) Mod DcN;
-  DcBuf[I].N := 0;
-  BufAppend(DcBuf[I], D, 0, D.N);
-  DcKey[I] := Key; DcOfs[I] := Ofs; DcT[I] := T;
-End;
-
-Function PackObj(Var P : TBuf; Ofs : LongInt; Var T : LongInt; Var D : TBuf;
-  Depth : LongInt) : Boolean;
-Var Sz, At, OB, U, BT, Key : LongInt; RB : TSha; Dl, Base : TBuf;
-    Ok : Boolean;
-Begin
-  PackObj := False;
-  If (Ofs < 12) Or (Ofs >= P.N) Or (Depth > 60) Then Exit;
-  Key := P.N Xor (P.P^[P.N - 1] Shl 24) Xor (P.P^[P.N - 2] Shl 16) Xor
-    (P.P^[P.N - 3] Shl 8) Xor P.P^[P.N - 4];
-  If DcGet(Key, Ofs, T, D) Then
-  Begin
-    PackObj := True; Exit;
-  End;
-  PackHdr(P, Ofs, T, Sz, At, OB, RB);
-  If (T >= OtCommit) And (T <= OtTag) Then
-  Begin
-    D.N := 0;
-    BufNeed(D, Sz + 1);
-    If Not ZInflate(P, At, P.N - At, D, U) Then Exit;
-    PackObj := D.N = Sz;
-    If (D.N = Sz) And (Depth > 0) Then DcPut(Key, Ofs, T, D);
+    Move(P^[Ofs], DO_^.P^[DO_^.N], N);
+    DO_^.N := DO_^.N + N;
     Exit;
   End;
-  If (T <> OtOfsDelta) And (T <> OtRefDelta) Then Exit;
-  BufInit(Dl); BufInit(Base);
-  Ok := ZInflate(P, At, P.N - At, Dl, U);
-  If Ok Then
+  While N > 0 Do
   Begin
-    If T = OtOfsDelta Then Ok := PackObj(P, Ofs - OB, BT, Base, Depth + 1)
+    K := MinL(N, ZChunk - ZOBN);
+    Move(P^[Ofs], ZOB^[ZOBN], K);
+    ZOBN := ZOBN + K; Ofs := Ofs + K; N := N - K;
+    If ZOBN >= ZChunk Then ZFlush;
+  End;
+End;
+
+{ applique le delta Dl a la base (memoire Base, ou fichier BaseH >= 0) ;
+  resultat : memoire O (OutH < 0 et pas d'empreinte) ou flux }
+Function DeltaApplyX(Var Base : TBuf; BaseH : LongInt; Var Dl : TBuf;
+  Var O : TBuf; OutH : LongInt; UseSha : Boolean) : Boolean;
+Const DWin = 65536;
+Var P, BSz, RSz, Sh, C, Ofs, Len, Done, N, BLen, WOfs : LongInt; Ch : TBuf;
+Begin
+  DeltaApplyX := False;
+  WOfs := 0;
+  DeltaHdr(Dl, BSz, RSz, P);
+  If DUseCk Then BLen := BaseCkLen
+  Else If BaseH >= 0 Then BLen := FSize(BaseH) Else BLen := Base.N;
+  If BSz <> BLen Then Exit;
+  DOutMem := (OutH < 0) And Not UseSha;
+  If DOutMem Then
+  Begin
+    O.N := 0;
+    DO_ := @O;
+    BufNeed(O, RSz);
+  End
+  Else ZDstStream(OutH, UseSha, 0);
+  ZErr := False;
+  BufInit(Ch);
+  Done := 0;
+  While (P < Dl.N) And Not ZErr Do
+  Begin
+    C := Dl.P^[P]; Inc(P);
+    If (C And 128) <> 0 Then
+    Begin
+      Ofs := 0; Len := 0;
+      For Sh := 0 To 3 Do
+        If (C And (1 Shl Sh)) <> 0 Then
+        Begin
+          Ofs := Ofs Or (Dl.P^[P] Shl (Sh * 8)); Inc(P);
+        End;
+      For Sh := 0 To 2 Do
+        If (C And (16 Shl Sh)) <> 0 Then
+        Begin
+          Len := Len Or (Dl.P^[P] Shl (Sh * 8)); Inc(P);
+        End;
+      If Len = 0 Then Len := $10000;
+      If (Ofs < 0) Or (Ofs + Len > BLen) Then
+      Begin
+        BufFree(Ch); Exit;
+      End;
+      If DUseCk Then
+      Begin
+        { base en morceaux : une copie peut chevaucher deux morceaux }
+        While Len > 0 Do
+        Begin
+          N := MinL(Len, CkSz - Ofs Mod CkSz);
+          DEmit(BaseCk[Ofs Div CkSz], Ofs Mod CkSz, N);
+          Ofs := Ofs + N; Len := Len - N; Done := Done + N;
+        End;
+      End
+      Else If BaseH < 0 Then DEmit(Base.P, Ofs, Len)
+      Else
+      Begin
+        { base dans un fichier : fenetre de lecture de 512 Ko (les copies
+          d'un delta sont nombreuses et souvent petites) }
+        BufNeed(Ch, DWin);
+        If Ch.Cap < DWin Then
+        Begin
+          BufFree(Ch); Exit;
+        End;
+        While Len > 0 Do
+        Begin
+          If (Ofs < WOfs) Or (Ofs >= WOfs + Ch.N) Then
+          Begin
+            WOfs := Ofs - 4096;
+            If WOfs < 0 Then WOfs := 0;
+            Ch.N := FReadAt(BaseH, WOfs, Ch.P, MinL(DWin, BLen - WOfs));
+            If (Ch.N <= 0) Or (Ofs >= WOfs + Ch.N) Then
+            Begin
+              BufFree(Ch); Exit;
+            End;
+          End;
+          N := MinL(Len, WOfs + Ch.N - Ofs);
+          DEmit(Ch.P, Ofs - WOfs, N);
+          Ofs := Ofs + N; Len := Len - N; Done := Done + N;
+        End;
+        Len := 0;
+      End;
+      Done := Done + Len;
+    End
+    Else If C > 0 Then
+    Begin
+      If P + C > Dl.N Then
+      Begin
+        BufFree(Ch); Exit;
+      End;
+      DEmit(Dl.P, P, C);
+      P := P + C;
+      Done := Done + C;
+    End
     Else
     Begin
-      Ok := False;
-      If PackRefHookOn Then Ok := IxRefHook(RB, BT, Base);
-      If Not Ok Then Ok := ReadObject(RB, BT, Base);
+      BufFree(Ch); Exit;
     End;
   End;
-  If Ok Then Ok := DeltaApply(Base, Dl, D);
-  T := BT;
-  BufFree(Dl); BufFree(Base);
-  If Ok And (Depth > 0) Then DcPut(Key, Ofs, T, D);
-  PackObj := Ok;
+  BufFree(Ch);
+  If Not DOutMem Then ZFlush;
+  DeltaApplyX := (Done = RSz) And Not ZErr;
 End;
 
-{ lit un objet (libre ou dans un pack) : type et contenu }
-Function ReadObject(Const H : TSha; Var T : LongInt; Var D : TBuf) : Boolean;
-Var Z, R : TBuf; U, I, K, Sz : LongInt; S : String;
+{ DeltaApplyX avec la base en morceaux (BaseCk) si Ck }
+Function DeltaApplyCk(Ck : Boolean; Var Base : TBuf; BaseH : LongInt;
+  Var Dl : TBuf; Var O : TBuf; OutH : LongInt; UseSha : Boolean) : Boolean;
 Begin
-  ReadObject := False;
-  T := 0;
-  BufInit(Z);
-  If FileLoad(ObjPath(H), Z) Then
+  DUseCk := Ck;
+  DeltaApplyCk := DeltaApplyX(Base, BaseH, Dl, O, OutH, UseSha);
+  DUseCk := False;
+End;
+
+{ delta Git en memoire : base + instructions -> O }
+Function DeltaApply(Var Base, Dl : TBuf; Var O : TBuf) : Boolean;
+Begin
+  DeltaApply := DeltaApplyX(Base, -1, Dl, O, -1, False);
+End;
+
+Var
+  PackRefHookOn : Boolean;
+  { resolution d'un pack : objet sans enfant dans l'arbre des deltas, seule
+    son empreinte est calculee (pas de fichier pour un gros objet) }
+  PgShaOnly, PgShaSet : Boolean;
+  PgSha : TSha;             { bases REF_DELTA du pack en cours }
+
+Function IxRefHook(Const H : TSha; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String) : Boolean; Forward;
+Function ObjGet(Const H : TSha; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String) : Boolean; Forward;
+
+Const
+  BaseMemMax = 33554432;               { base de delta en memoire : 32 Mo }
+
+Function PackGet(K, Ofs : LongInt; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String; Depth : LongInt) : Boolean; Forward;
+
+{ objet du pack K a la position Ofs, deltas resolus : en memoire (D) s'il
+  fait au plus BigObj octets, sinon dans le fichier Fn (cache) }
+Function PackGet1(K, Ofs : LongInt; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String; Depth : LongInt) : Boolean;
+Var T0, Sz0, At, OB, U, BT, BSz, BH, OH, P0, RSz : LongInt; RB : TSha;
+    Dl, Base : TBuf; Ok, UseCk : Boolean; BFn : String;
+Begin
+  PackGet1 := False;
+  Fn := '';
+  D.N := 0;
+  If Depth > 60 Then Exit;
+  If DcGet(K, Ofs, T, D) Then
   Begin
-    BufInit(R);
-    If ZInflate(Z, 0, Z.N, R, U) Then
+    Sz := D.N; PackGet1 := True; Exit;
+  End;
+  If BigGet(K, Ofs, T, Sz, Fn) Then
+  Begin
+    PackGet1 := True; Exit;
+  End;
+  If Not PackHdrK(K, Ofs, T0, Sz0, At, OB, RB) Then Exit;
+  If (T0 >= OtCommit) And (T0 <= OtTag) Then
+  Begin
+    T := T0; Sz := Sz0;
+    ZSrcFile(Packs[K].H, At);
+    If Sz0 <= BigObj Then
     Begin
-      I := 0;
-      While (I < R.N) And (R.P^[I] <> 0) Do Inc(I);
-      S := BufStrAt(R, 0, I);
-      K := Pos(' ', S);
-      T := TypeOfName(Copy(S, 1, K - 1));
-      Val(Copy(S, K + 1, 20), Sz, K);
-      D.N := 0;
-      BufAppend(D, R, I + 1, R.N - I - 1);
-      ReadObject := (T > 0) And (D.N = Sz);
+      BufNeed(D, Sz0 + 1);
+      ZDstMem(D);
+      Ok := ZRun($7FFFFFFF, U) And (D.N = Sz0) And Not ZErr;
+      If Ok And (Depth > 0) Then DcPut(K, Ofs, T, D);
+    End
+    Else
+    Begin
+      Fn := BigNew(K, Ofs, T, Sz, '');
+      OH := FCreate(Fn);
+      Ok := OH >= 0;
+      If Ok Then
+      Begin
+        ShaHead(T, Sz);
+        ZDstStream(OH, True, 0);
+        Ok := ZRun($7FFFFFFF, U) And (ZTotal = Sz0);
+        FClose(OH);
+        If Ok Then BigSetSha(Fn);
+      End;
+      If Not Ok Then BigDrop(Fn);
     End;
-    BufFree(R); BufFree(Z);
+    PackGet1 := Ok;
     Exit;
   End;
-  BufFree(Z);
+  { delta : la base d'abord (memoire ou fichier ; un seul niveau de la
+    chaine garde ses tampons a la fois), puis les instructions }
+  BufInit(Dl); BufInit(Base);
+  BFn := '';
+  If T0 = OtOfsDelta Then
+    Ok := PackGet(K, Ofs - OB, BT, BSz, Base, BFn, Depth + 1)
+  Else
+  Begin
+    Ok := False;
+    If PackRefHookOn And (K = IxK) Then
+      Ok := IxRefHook(RB, BT, BSz, Base, BFn);
+    If Not Ok Then Ok := ObjGet(RB, BT, BSz, Base, BFn);
+  End;
+  If Ok Then
+  Begin
+    BufNeed(Dl, Sz0 + 1);
+    ZSrcFile(Packs[K].H, At);
+    ZDstMem(Dl);
+    Ok := ZRun($7FFFFFFF, U) And (Dl.N = Sz0) And Not GitOom;
+  End;
+  If Ok Then
+  Begin
+    DeltaHdr(Dl, BSz, RSz, P0);
+    T := BT; Sz := RSz;
+    BH := -1;
+    UseCk := False;
+    { base dans un fichier : chargee en memoire si elle y tient (les
+      copies d'un delta sautent partout dans la base) et gardee pour les
+      deltas suivants qui ont la meme base ; sinon lue dans le fichier }
+    If BFn <> '' Then
+    Begin
+      If (BaseCFn = BFn) And (BaseCkLen = BSz) Then
+      Begin
+        UseCk := True; Inc(BaseHits);
+      End
+      Else
+      Begin
+        BH := FOpenR(BFn);
+        If (BH >= 0) And (BSz <= BaseMemMax) Then
+        Begin
+          Inc(BaseLoads);
+          If BaseCLoad(BH) Then
+          Begin
+            FClose(BH); BH := -1;
+            UseCk := True; BaseCFn := BFn;
+          End;
+        End;
+      End;
+    End;
+    If (BFn <> '') And (BH < 0) And Not UseCk Then
+    Begin
+      Ok := False;
+      GitErr := 'lecture impossible : ' + BFn;
+    End
+    Else If RSz <= BigObj Then
+    Begin
+      Ok := DeltaApplyCk(UseCk, Base, BH, Dl, D, -1, False);
+      If Ok And (Depth > 0) Then DcPut(K, Ofs, T, D);
+    End
+    Else If PgShaOnly And (Depth = 0) Then
+    Begin
+      ShaHead(T, RSz);
+      Ok := DeltaApplyCk(UseCk, Base, BH, Dl, D, -1, True);
+      If Ok Then Sha1Final(ZSha, PgSha);
+      PgShaSet := Ok;
+    End
+    Else
+    Begin
+      Fn := BigNew(K, Ofs, T, RSz, BFn);
+      OH := FCreate(Fn);
+      Ok := OH >= 0;
+      If Not Ok Then GitErr := 'cr'#233'ation impossible : ' + Fn;
+      If Ok Then
+      Begin
+        ShaHead(T, RSz);
+        Ok := DeltaApplyCk(UseCk, Base, BH, Dl, D, OH, True);
+        FClose(OH);
+        If Ok Then BigSetSha(Fn);
+      End;
+      If Not Ok Then
+      Begin
+        BigDrop(Fn); Fn := '';
+      End;
+    End;
+    If BH >= 0 Then FClose(BH);
+  End;
+  BufFree(Dl); BufFree(Base);
+  If Not Ok And (GitErr = '') Then GitErr := 'objet de pack illisible';
+  PackGet1 := Ok;
+End;
+
+{ PackGet1 ; si la memoire a manque, les caches (base en memoire, petits
+  objets) sont vides et l'objet est demande une seconde fois }
+Function PackGet(K, Ofs : LongInt; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String; Depth : LongInt) : Boolean;
+Var Ok, Oom : Boolean;
+Begin
+  If Depth > 0 Then
+  Begin
+    PackGet := PackGet1(K, Ofs, T, Sz, D, Fn, Depth);
+    Exit;
+  End;
+  Oom := GitOom;
+  GitOom := False;
+  Ok := PackGet1(K, Ofs, T, Sz, D, Fn, 0);
+  If (Not Ok) And GitOom Then
+  Begin
+    BaseCDrop; DcClear;
+    BufFree(D);
+    GitOom := False; GitErr := '';
+    Ok := PackGet1(K, Ofs, T, Sz, D, Fn, 0);
+  End;
+  { reussi : un manque de memoire en chemin (cache) n'est pas une erreur }
+  If Ok Then GitOom := Oom
+  Else If Oom Then GitOom := True;
+  PackGet := Ok;
+End;
+
+{ type et taille d'un objet du pack, sans le reconstituer }
+Function PackInfo(K, Ofs : LongInt; Var T, Sz : LongInt; Depth : LongInt)
+  : Boolean; Forward;
+
+Function ObjInfo(Const H : TSha; Var T, Sz : LongInt) : Boolean; Forward;
+
+Function PackInfo(K, Ofs : LongInt; Var T, Sz : LongInt; Depth : LongInt)
+  : Boolean;
+Var T0, Sz0, At, OB, U, BSz, P0, BS : LongInt; RB : TSha; Dl : TBuf;
+Begin
+  PackInfo := False;
+  If (Depth > 60) Or Not PackHdrK(K, Ofs, T0, Sz0, At, OB, RB) Then Exit;
+  If T0 <= OtTag Then
+  Begin
+    T := T0; Sz := Sz0; PackInfo := True; Exit;
+  End;
+  BufInit(Dl);
+  ZSrcFile(Packs[K].H, At);
+  ZDstMem(Dl);
+  If ZRun(32, U) Then
+  Begin
+    DeltaHdr(Dl, BSz, Sz, P0);
+    If T0 = OtOfsDelta Then PackInfo := PackInfo(K, Ofs - OB, T, BS,
+      Depth + 1)
+    Else PackInfo := ObjInfo(RB, T, BS);
+  End;
+  BufFree(Dl);
+End;
+
+{ en-tete d'un objet libre : type, taille, longueur de l'en-tete }
+Function LooseInfo(Const H : TSha; Var T, Sz, HL : LongInt) : Boolean;
+Var F, U, I, K : LongInt; R : TBuf; S : String;
+Begin
+  LooseInfo := False;
+  F := FOpenR(ObjPath(H));
+  If F < 0 Then Exit;
+  BufInit(R);
+  ZSrcFile(F, 0);
+  ZDstMem(R);
+  If ZRun(64, U) Then
+  Begin
+    I := 0;
+    While (I < R.N) And (R.P^[I] <> 0) Do Inc(I);
+    S := BufStrAt(R, 0, I);
+    K := Pos(' ', S);
+    T := TypeOfName(Copy(S, 1, K - 1));
+    Val(Copy(S, K + 1, 20), Sz, K);
+    HL := I + 1;
+    LooseInfo := (T > 0) And (I < R.N);
+  End;
+  BufFree(R);
+  FClose(F);
+End;
+
+Function ObjInfo(Const H : TSha; Var T, Sz : LongInt) : Boolean;
+Var K, I, HL : LongInt;
+Begin
+  ObjInfo := False;
+  If LooseInfo(H, T, Sz, HL) Then
+  Begin
+    ObjInfo := True; Exit;
+  End;
   If Not PacksRead Then PacksScan;
   For K := 0 To PackN - 1 Do
   Begin
     I := PackFind(K, H);
     If I >= 0 Then
     Begin
-      ReadObject := PackObj(Packs[K].Data, I, T, D, 0);
+      ObjInfo := PackInfo(K, I, T, Sz, 0);
       Exit;
     End;
   End;
   GitErr := 'objet introuvable : ' + ShaHex(H);
+End;
+
+{ objet (libre ou dans un pack) : en memoire (D) ou dans le fichier Fn
+  s'il est plus grand que BigObj }
+Function ObjGet(Const H : TSha; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String) : Boolean;
+Var F, U, I, K, HL, OH : LongInt; R : TBuf; Ok : Boolean;
+Begin
+  ObjGet := False;
+  Fn := '';
+  D.N := 0;
+  T := 0;
+  If LooseInfo(H, T, Sz, HL) Then
+  Begin
+    F := FOpenR(ObjPath(H));
+    If F < 0 Then Exit;
+    ZSrcFile(F, 0);
+    If Sz <= BigObj Then
+    Begin
+      BufInit(R);
+      BufNeed(R, Sz + HL + 1);
+      ZDstMem(R);
+      Ok := ZRun($7FFFFFFF, U) And (R.N = Sz + HL);
+      If Ok Then BufAppend(D, R, HL, Sz);
+      BufFree(R);
+    End
+    Else
+    Begin
+      Fn := BigNew(-2, (H[0] Shl 16) Or (H[1] Shl 8) Or H[2] Or 1, T, Sz,
+        '');
+      OH := FCreate(Fn);
+      Ok := OH >= 0;
+      If Ok Then
+      Begin
+        ZDstStream(OH, False, HL);
+        Ok := ZRun($7FFFFFFF, U) And (ZTotal = Sz + HL);
+        FClose(OH);
+      End;
+      If Not Ok Then
+      Begin
+        BigDrop(Fn); Fn := '';
+      End;
+    End;
+    FClose(F);
+    ObjGet := Ok;
+    Exit;
+  End;
+  If Not PacksRead Then PacksScan;
+  For K := 0 To PackN - 1 Do
+  Begin
+    I := PackFind(K, H);
+    If I >= 0 Then
+    Begin
+      ObjGet := PackGet(K, I, T, Sz, D, Fn, 0);
+      Exit;
+    End;
+  End;
+  GitErr := 'objet introuvable : ' + ShaHex(H);
+End;
+
+{ lit un objet en memoire (faux s'il est trop grand pour la memoire) }
+Function ReadObject(Const H : TSha; Var T : LongInt; Var D : TBuf) : Boolean;
+Var Sz : LongInt; Fn : String;
+Begin
+  ReadObject := False;
+  If Not ObjGet(H, T, Sz, D, Fn) Then Exit;
+  If Fn <> '' Then
+  Begin
+    GitErr := 'objet trop volumineux pour la m'#233'moire : ' + ShaHex(H);
+    D.N := 0;
+    Exit;
+  End;
+  ReadObject := True;
+End;
+
+{ ecrit le contenu d'un objet dans un fichier (toute taille) }
+Function ObjToFile(Const H : TSha; Const Path : String; Var T : LongInt)
+  : Boolean;
+Var D : TBuf; Sz : LongInt; Fn : String;
+Begin
+  BufInit(D);
+  ObjToFile := False;
+  If ObjGet(H, T, Sz, D, Fn) Then
+  Begin
+    If Fn <> '' Then ObjToFile := FileCopy(Fn, Path)
+    Else ObjToFile := FileSave(Path, D, 0, D.N);
+  End;
+  BufFree(D);
 End;
 
 Function HasObject(Const H : TSha) : Boolean;
@@ -1304,20 +2162,97 @@ Begin
   ZDeflate(R, 0, R.N, Z);
   P := ObjPath(H);
   MkDirs(ParentOf(P));
-  WriteObject := FileSave(P, Z, 0, Z.N);
+  If Not GitOom Then WriteObject := FileSave(P, Z, 0, Z.N);
   If Not FileExist(P) Then GitErr := ''#233'criture impossible : ' + P;
   BufFree(R); BufFree(Z);
 End;
 
+{ objet libre d'un gros fichier : lu par morceaux, blocs zlib stockes }
+Function WriteObjectFile(T : LongInt; Const Path : String; Var H : TSha)
+  : Boolean;
+Var F, O, Sz, Pos, N, A, Fin : LongInt; Ch, Hd : TBuf; P, Tmp : String;
+    Ok : Boolean;
+
+  { bloc stocke de N octets de B (a partir de 5) ; Fin : dernier bloc }
+  Function Blk(Var B : TBuf; N, Fin : LongInt) : Boolean;
+  Begin
+    B.P^[0] := Fin;
+    B.P^[1] := N And 255; B.P^[2] := (N Shr 8) And 255;
+    B.P^[3] := (Not N) And 255; B.P^[4] := ((Not N) Shr 8) And 255;
+    A := AdlerUpd(A, B.P, 5, N);
+    Blk := FWrite(O, B.P, N + 5);
+  End;
+
+Begin
+  WriteObjectFile := False;
+  If Not HashFile(Path, T, H) Then Exit;
+  If HasObject(H) Then
+  Begin
+    WriteObjectFile := True; Exit;
+  End;
+  F := FOpenR(Path);
+  If F < 0 Then Exit;
+  Sz := FSize(F);
+  P := ObjPath(H);
+  MkDirs(ParentOf(P));
+  Tmp := P + '.tmp';
+  O := FCreate(Tmp);
+  If O < 0 Then
+  Begin
+    FClose(F); Exit;
+  End;
+  BufInit(Ch); BufInit(Hd);
+  BufNeed(Ch, ZChunk + 8);
+  Ok := Ch.Cap >= ZChunk + 8;
+  A := 1;
+  If Ok Then
+  Begin
+    { en-tete zlib, bloc de l'en-tete de l'objet, puis le fichier en
+      blocs de 32 Ko au plus }
+    BufByte(Hd, $78); BufByte(Hd, $01);
+    Ok := FWrite(O, Hd.P, 2);
+    Ch.N := 5;
+    BufStr(Ch, TypeName(T) + ' ' + IStr(Sz));
+    BufByte(Ch, 0);
+    If Sz = 0 Then Fin := 1 Else Fin := 0;
+    Ok := Ok And Blk(Ch, Ch.N - 5, Fin);
+  End;
+  Pos := 0;
+  While Ok And (Pos < Sz) Do
+  Begin
+    N := MinL(ZChunk, Sz - Pos);
+    If FReadAt(F, Pos, PBytes(@Ch.P^[5]), N) <> N Then
+    Begin
+      Ok := False; Break;
+    End;
+    Pos := Pos + N;
+    If Pos >= Sz Then Fin := 1 Else Fin := 0;
+    Ok := Blk(Ch, N, Fin);
+  End;
+  Hd.N := 0;
+  PutBE32(Hd, A);
+  Ok := Ok And FWrite(O, Hd.P, 4);
+  FClose(O); FClose(F);
+  BufFree(Ch); BufFree(Hd);
+  If Ok Then Ok := FileRen(Tmp, P);
+  If Not Ok Then
+  Begin
+    FileDel(Tmp);
+    GitErr := ''#233'criture impossible : ' + P;
+  End;
+  WriteObjectFile := Ok;
+End;
+
 { ------------------------------------------------------------------ }
-{ Pack recu (clone, fetch) : verification, empreintes, fichier .idx    }
+{ Pack recu (clone, fetch), dans un fichier : verification, empreintes, }
+{ fichier .idx                                                         }
 { ------------------------------------------------------------------ }
 
 Type
   TLongArr = Array[0..$3FFFFFF] Of LongInt;
   TPEnt = Record
     Sha : TSha;
-    Ofs, Len, Crc, Typ : LongInt;
+    Ofs, Len, Crc, Typ, Depth, BaseI : LongInt;
     Done : Boolean;
   End;
   TPEntArr = Array[0..$3FFFFF] Of TPEnt;
@@ -1326,18 +2261,18 @@ Type
 Var
   IxE : PPEntArr;                      { objets du pack en cours d'indexation }
   IxN : LongInt;
-  IxP : ^TBuf;
   IxSort : ^TLongArr;
 
 { base REF_DELTA cherchee parmi les objets deja calcules du pack }
-Function IxRefHook(Const H : TSha; Var T : LongInt; Var D : TBuf) : Boolean;
+Function IxRefHook(Const H : TSha; Var T, Sz : LongInt; Var D : TBuf;
+  Var Fn : String) : Boolean;
 Var I : LongInt;
 Begin
   IxRefHook := False;
   For I := 0 To IxN - 1 Do
     If IxE^[I].Done And ShaEq(IxE^[I].Sha, H) Then
     Begin
-      IxRefHook := PackObj(IxP^, IxE^[I].Ofs, T, D, 0);
+      IxRefHook := PackGet(IxK, IxE^[I].Ofs, T, Sz, D, Fn, 1);
       Exit;
     End;
 End;
@@ -1360,75 +2295,259 @@ Begin
   If I < R Then IxSortRange(I, R);
 End;
 
-{ verifie le pack P, calcule l'empreinte de chaque objet et l'enregistre
-  (objects/pack/pack-X.pack et .idx v2) ; Progress : appele avec le
-  nombre d'objets traites }
-Function IndexPack(Var P : TBuf) : Boolean;
-Var Cnt, I, Ofs, T, Sz, At, OB, U, Left, Pass, K : LongInt; RB, H : TSha;
-    D, Tmp, X : TBuf; C : TSha1; Prog : Boolean; Nm : String;
+{ CRC-32 d'une portion du fichier }
+Function CrcFile(H, Ofs, N : LongInt; Var Ch : TBuf) : LongInt;
+Var C, K, I, R : LongInt;
 Begin
-  IndexPack := False;
-  If (P.N < 32) Or (BufStrAt(P, 0, 4) <> 'PACK') Then
+  If Not CrcReady Then CrcInit;
+  C := LongInt($FFFFFFFF);
+  While N > 0 Do
   Begin
-    GitErr := 'pack invalide'; Exit;
+    K := MinL(N, ZChunk);
+    R := FReadAt(H, Ofs, Ch.P, K);
+    If R <= 0 Then Break;
+    For I := 0 To R - 1 Do
+      C := CrcTab[(C Xor Ch.P^[I]) And 255] Xor (C Shr 8);
+    Ofs := Ofs + R; N := N - R;
   End;
+  CrcFile := Not C;
+End;
+
+{ objet du pack en cours d'indexation a la position Ofs (parmi les N
+  premiers, ranges par position) }
+Function IxAt(Ofs, N : LongInt) : LongInt;
+Var Lo, Hi, M : LongInt;
+Begin
+  IxAt := -1;
+  Lo := 0; Hi := N - 1;
+  While Lo <= Hi Do
+  Begin
+    M := (Lo + Hi) Div 2;
+    If IxE^[M].Ofs = Ofs Then
+    Begin
+      IxAt := M; Exit;
+    End;
+    If IxE^[M].Ofs < Ofs Then Lo := M + 1 Else Hi := M - 1;
+  End;
+End;
+
+Procedure IxDone(Cnt : LongInt);
+Begin
+  If IxE <> Nil Then FreeMem(IxE, (Cnt + 1) * SizeOf(TPEnt));
+  IxE := Nil; IxN := 0;
+  If Packs[IxK].Loaded And (Packs[IxK].H >= 0) Then FClose(Packs[IxK].H);
+  Packs[IxK].H := -1; Packs[IxK].Loaded := False;
+  PackRefHookOn := False;
+  DcClear;
+  BigClear;
+End;
+
+{ verifie le pack recu dans le fichier Path, calcule l'empreinte de chaque
+  objet et l'enregistre (objects/pack/pack-X.pack et .idx v2) }
+Function IndexPackFile(Const Path : String) : Boolean;
+Var Cnt, I, Ofs, T, Sz, At, OB, U, Left, K, H0, Size, N, Dp : LongInt;
+    DCnt, DNext, DStk : ^TLongArr;
+    RB, H : TSha; D, Ch, X : TBuf; C : TSha1; Ok : Boolean;
+    Nm, Fn, FirstErr : String;
+    Tr : Array[0..19] Of Byte;
+Begin
+  IndexPackFile := False;
+  H0 := FOpenR(Path);
+  If H0 < 0 Then
+  Begin
+    GitErr := 'pack re'#231'u illisible'; Exit;
+  End;
+  Size := FSize(H0);
+  BufInit(D); BufInit(Ch); BufInit(X);
+  BufNeed(Ch, ZChunk);
+  Ch.N := 0;
+  If (Size >= 32) And (Ch.Cap >= ZChunk) Then Ch.N := FReadAt(H0, 0, Ch.P, 12);
+  If (Ch.N <> 12) Or (BufStrAt(Ch, 0, 4) <> 'PACK') Then
+  Begin
+    GitErr := 'pack invalide';
+    FClose(H0); BufFree(Ch); Exit;
+  End;
+  Ch.N := 12;
+  Cnt := BE32(Ch, 8);
   { somme de controle du pack }
   Sha1Init(C);
-  Sha1Mem(C, P, 0, P.N - 20);
+  Ofs := 0;
+  While Ofs < Size - 20 Do
+  Begin
+    N := FReadAt(H0, Ofs, Ch.P, MinL(ZChunk, Size - 20 - Ofs));
+    If N <= 0 Then Break;
+    Sha1Ptr(C, Ch.P, 0, N);
+    Ofs := Ofs + N;
+    If (Ofs And $FFFFF) < ZChunk Then
+      GitProgress('V'#233'rification du pack', Ofs, 0);
+  End;
   Sha1Final(C, H);
+  N := FReadAt(H0, Size - 20, PBytes(@Tr), 20);
+  Ok := N = 20;
   For I := 0 To 19 Do
-    If H[I] <> P.P^[P.N - 20 + I] Then
-    Begin
-      GitErr := 'somme de contr'#244'le du pack incorrecte'; Exit;
-    End;
-  Cnt := BE32(P, 8);
+    If H[I] <> Tr[I] Then Ok := False;
+  If Not Ok Then
+  Begin
+    GitErr := 'somme de contr'#244'le du pack incorrecte';
+    FClose(H0); BufFree(Ch); Exit;
+  End;
+  Packs[IxK].Name := Path; Packs[IxK].H := H0; Packs[IxK].Size := Size;
+  Packs[IxK].Loaded := True;
   GetMem(IxE, (Cnt + 1) * SizeOf(TPEnt));
-  IxN := Cnt; IxP := @P;
-  BufInit(D); BufInit(Tmp); BufInit(X);
-  { positions et longueurs }
+  If IxE = Nil Then
+  Begin
+    GitErr := 'm'#233'moire insuffisante';
+    IxDone(Cnt); BufFree(Ch); Exit;
+  End;
+  IxN := Cnt;
+  { positions, longueurs, objets entiers }
   Ofs := 12;
   For I := 0 To Cnt - 1 Do
   Begin
-    PackHdr(P, Ofs, T, Sz, At, OB, RB);
-    Tmp.N := 0;
-    If Not ZInflate(P, At, P.N - 20 - At, Tmp, U) Then
+    IxE^[I].Done := False;
+    Ok := PackHdrK(IxK, Ofs, T, Sz, At, OB, RB);
+    If Ok Then
+    Begin
+      ZSrcFile(H0, At);
+      If T <= OtTag Then
+      Begin
+        { empreinte en flux : en-tete puis contenu }
+        Sha1Init(ZSha);
+        Sha1Str(ZSha, TypeName(T) + ' ' + IStr(Sz));
+        Sha1Byte(ZSha, 0);
+        ZDstStream(-1, True, 0);
+        Ok := ZRun($7FFFFFFF, U) And (ZTotal = Sz);
+        If Ok Then
+        Begin
+          Sha1Final(ZSha, IxE^[I].Sha);
+          IxE^[I].Typ := T;
+          IxE^[I].Done := True;
+        End;
+      End
+      Else
+      Begin
+        ZDstStream(-1, False, 0);
+        Ok := ZRun($7FFFFFFF, U);
+      End;
+    End;
+    If Not Ok Then
     Begin
       GitErr := 'objet compress'#233' invalide dans le pack (' + IStr(I) + ')';
-      FreeMem(IxE, (Cnt + 1) * SizeOf(TPEnt));
-      BufFree(D); BufFree(Tmp); BufFree(X);
-      Exit;
+      IxDone(Cnt); BufFree(Ch); Exit;
+    End;
+    { profondeur dans la chaine de deltas (bases OFS_DELTA : plus haut
+      dans le pack) ; REF_DELTA : a la fin }
+    IxE^[I].Depth := 0; IxE^[I].BaseI := -1;
+    If T = OtRefDelta Then IxE^[I].Depth := 9999
+    Else If T = OtOfsDelta Then
+    Begin
+      K := IxAt(Ofs - OB, I);
+      IxE^[I].BaseI := K;
+      If K >= 0 Then IxE^[I].Depth := MinL(IxE^[K].Depth + 1, 9998)
+      Else IxE^[I].Depth := 9999;
     End;
     IxE^[I].Ofs := Ofs;
     IxE^[I].Len := At + U - Ofs;
-    IxE^[I].Crc := Crc32(P, Ofs, IxE^[I].Len);
-    IxE^[I].Done := False;
+    IxE^[I].Crc := CrcFile(H0, Ofs, IxE^[I].Len, Ch);
     Ofs := At + U;
+    If (I And 31) = 0 Then GitProgress('Lecture des objets', I, Cnt);
   End;
-  { empreintes (les bases REF_DELTA peuvent venir plus loin : passes) }
+  { deltas (les bases REF_DELTA peuvent venir plus loin : passes) }
   PackRefHookOn := True;
-  Left := Cnt; Pass := 0;
+  Left := 0;
+  For I := 0 To Cnt - 1 Do
+    If Not IxE^[I].Done Then Inc(Left);
+  { profondeur croissante : la base de chaque delta vient d'etre
+    reconstituee (cache) }
+  { ordre de resolution : parcours en profondeur de l'arbre des deltas,
+    chaine par chaine (chaque delta juste apres sa base, que le cache des
+    gros objets garde) ; les REF_DELTA et les orphelins a la fin }
+  GetMem(IxSort, (Cnt + 1) * 4);
+  GetMem(DCnt, (Cnt + 1) * 4);         { premier enfant }
+  GetMem(DNext, (Cnt + 1) * 4);        { frere suivant }
+  GetMem(DStk, (Cnt + 1) * 4);         { pile }
+  If (IxSort = Nil) Or (DCnt = Nil) Or (DNext = Nil) Or (DStk = Nil) Then
+  Begin
+    GitErr := 'm'#233'moire insuffisante';
+    IxDone(Cnt); BufFree(Ch); Exit;
+  End;
+  For I := 0 To Cnt - 1 Do
+  Begin
+    DCnt^[I] := -1; DNext^[I] := -1;
+  End;
+  For I := Cnt - 1 DownTo 0 Do
+    If IxE^[I].BaseI >= 0 Then
+    Begin
+      DNext^[I] := DCnt^[IxE^[I].BaseI];
+      DCnt^[IxE^[I].BaseI] := I;
+    End;
+  N := 0;
+  For I := 0 To Cnt - 1 Do
+    If IxE^[I].BaseI < 0 Then
+    Begin
+      Sz := 1; DStk^[0] := I;
+      While Sz > 0 Do
+      Begin
+        Dec(Sz);
+        K := DStk^[Sz];
+        IxSort^[N] := K; Inc(N);
+        K := DCnt^[K];
+        While K >= 0 Do
+        Begin
+          DStk^[Sz] := K; Inc(Sz);
+          K := DNext^[K];
+        End;
+      End;
+    End;
+  FreeMem(DNext, (Cnt + 1) * 4);
+  FreeMem(DStk, (Cnt + 1) * 4);
+  FirstErr := '';
   Repeat
     K := Left;
-    For I := 0 To Cnt - 1 Do
+    For Dp := 0 To N - 1 Do
+    Begin
+      I := IxSort^[Dp];
+      PgShaOnly := DCnt^[I] < 0;
+      PgShaSet := False;
       If Not IxE^[I].Done Then
-        If PackObj(P, IxE^[I].Ofs, T, D, 0) Then
+        If PackGet(IxK, IxE^[I].Ofs, T, Sz, D, Fn, 0) Then
         Begin
-          ObjHash(T, D, 0, D.N, IxE^[I].Sha);
-          IxE^[I].Typ := T;
-          IxE^[I].Done := True;
-          Dec(Left);
-          If (Left Mod 64) = 0 Then
-            GitProgress('Indexation des objets', Cnt - Left, Cnt);
-        End;
-    Inc(Pass);
+          If PgShaSet Then
+          Begin
+            IxE^[I].Sha := PgSha;
+            Ok := True;
+          End
+          Else If Fn <> '' Then
+          Begin
+            Ok := BigShaOf(Fn, IxE^[I].Sha);
+            If Not Ok Then Ok := HashFile(Fn, T, IxE^[I].Sha);
+          End
+          Else
+          Begin
+            ObjHash(T, D, 0, D.N, IxE^[I].Sha);
+            Ok := True;
+          End;
+          If Ok Then
+          Begin
+            IxE^[I].Typ := T;
+            IxE^[I].Done := True;
+            Dec(Left);
+            If (Left Mod 16) = 0 Then
+              GitProgress('R'#233'solution des deltas', Cnt - Left, Cnt);
+          End;
+        End
+        Else If FirstErr = '' Then FirstErr := GitErr;
+    End;
   Until (Left = 0) Or (Left = K);
+  PgShaOnly := False;
+  FreeMem(DCnt, (Cnt + 1) * 4);
+  FreeMem(IxSort, (Cnt + 1) * 4);
   PackRefHookOn := False;
   If Left > 0 Then
   Begin
     GitErr := IStr(Left) + ' objet(s) du pack sans base';
-    FreeMem(IxE, (Cnt + 1) * SizeOf(TPEnt));
-    BufFree(D); BufFree(Tmp); BufFree(X);
-    Exit;
+    If FirstErr <> '' Then GitErr := GitErr + ' (' + FirstErr + ')';
+    IxDone(Cnt); BufFree(D); BufFree(Ch); Exit;
   End;
   { .idx version 2 }
   GetMem(IxSort, (Cnt + 1) * 4);
@@ -1445,21 +2564,37 @@ Begin
   For I := 0 To Cnt - 1 Do BufMem(X, IxE^[IxSort^[I]].Sha, 20);
   For I := 0 To Cnt - 1 Do PutBE32(X, IxE^[IxSort^[I]].Crc);
   For I := 0 To Cnt - 1 Do PutBE32(X, IxE^[IxSort^[I]].Ofs);
-  BufAppend(X, P, P.N - 20, 20);
+  BufMem(X, Tr, 20);
   Sha1Init(C);
   Sha1Mem(C, X, 0, X.N);
   Sha1Final(C, RB);
   BufMem(X, RB, 20);
+  FreeMem(IxSort, (Cnt + 1) * 4);
+  IxDone(Cnt);
   Nm := GitDir + PS + 'objects' + PS + 'pack';
   MkDirs(Nm);
   Nm := Nm + PS + 'pack-' + ShaHex(H);
-  Prog := FileSave(Nm + '.pack', P, 0, P.N) And FileSave(Nm + '.idx', X, 0, X.N);
-  If Not Prog Then GitErr := ''#233'criture du pack impossible';
-  FreeMem(IxE, (Cnt + 1) * SizeOf(TPEnt));
-  FreeMem(IxSort, (Cnt + 1) * 4);
-  BufFree(D); BufFree(Tmp); BufFree(X);
+  Ok := Not GitOom;
+  If Ok Then
+  Begin
+    FileDel(Nm + '.pack');
+    Ok := FileRen(Path, Nm + '.pack');
+    If Not Ok Then Ok := FileCopy(Path, Nm + '.pack');
+    Ok := Ok And FileSave(Nm + '.idx', X, 0, X.N);
+  End;
+  If Not Ok Then GitErr := ''#233'criture du pack impossible';
+  BufFree(D); BufFree(Ch); BufFree(X);
   PacksRead := False;
-  IndexPack := Prog;
+  IndexPackFile := Ok;
+End;
+
+{ pack en memoire (tests) : enregistre dans un fichier puis indexe }
+Function IndexPack(Var P : TBuf) : Boolean;
+Var Tmp : String;
+Begin
+  Tmp := TmpPath('recv.pack');
+  IndexPack := FileSave(Tmp, P, 0, P.N) And IndexPackFile(Tmp);
+  FileDel(Tmp);
 End;
 
 { ------------------------------------------------------------------ }
@@ -1488,6 +2623,45 @@ Begin
   End;
   BufByte(P, C);
   ZDeflate(D, 0, D.N, P);
+End;
+
+{ ajoute un gros objet (fichier Fn) : blocs zlib stockes, lus par
+  morceaux }
+Function PackAddFile(Var P : TBuf; T : LongInt; Const Fn : String)
+  : Boolean;
+Var F, Sz, C, Pos, N, A, Fin : LongInt;
+Begin
+  PackAddFile := False;
+  F := FOpenR(Fn);
+  If F < 0 Then Exit;
+  Sz := FSize(F);
+  C := (T Shl 4) Or (Sz And 15);
+  N := Sz Shr 4;
+  While N > 0 Do
+  Begin
+    BufByte(P, C Or 128);
+    C := N And 127;
+    N := N Shr 7;
+  End;
+  BufByte(P, C);
+  BufByte(P, $78); BufByte(P, $01);
+  A := 1; Pos := 0;
+  Repeat
+    N := MinL(ZChunk, Sz - Pos);
+    If Pos + N >= Sz Then Fin := 1 Else Fin := 0;
+    BufByte(P, Fin);
+    BufByte(P, N And 255); BufByte(P, (N Shr 8) And 255);
+    BufByte(P, (Not N) And 255); BufByte(P, ((Not N) Shr 8) And 255);
+    BufNeed(P, P.N + N);
+    If P.N + N > P.Cap Then Break;
+    If (N > 0) And (FReadAt(F, Pos, PBytes(@P.P^[P.N]), N) <> N) Then Break;
+    A := AdlerUpd(A, P.P, P.N, N);
+    P.N := P.N + N;
+    Pos := Pos + N;
+  Until Pos >= Sz;
+  FClose(F);
+  PutBE32(P, A);
+  PackAddFile := (Pos >= Sz) And Not GitOom;
 End;
 
 Procedure PackEnd(Var P : TBuf);
@@ -2660,13 +3834,10 @@ Begin
   FlatFree(L);
 End;
 
+{ empreinte d'un fichier de travail (lu par morceaux) }
 Function BlobOfFile(Const Rel : String; Var H : TSha) : Boolean;
-Var B : TBuf;
 Begin
-  BufInit(B);
-  BlobOfFile := FileLoad(WorkPath(Rel), B);
-  ObjHash(OtBlob, B, 0, B.N, H);
-  BufFree(B);
+  BlobOfFile := HashFile(WorkPath(Rel), OtBlob, H);
 End;
 
 Function HasConflictMark(Const Rel : String) : Boolean;
@@ -2789,8 +3960,15 @@ End;
 
 { blob du fichier de travail Rel (ecrit dans la base d'objets) }
 Function StoreFile(Const Rel : String; Var H : TSha) : Boolean;
-Var B : TBuf;
+Var B : TBuf; Sz, Tm : LongInt;
 Begin
+  StoreFile := False;
+  If Not FileStat(WorkPath(Rel), Sz, Tm) Then Exit;
+  { gros fichier : objet ecrit par morceaux }
+  If Sz > BigObj Then
+  Begin
+    StoreFile := WriteObjectFile(OtBlob, WorkPath(Rel), H); Exit;
+  End;
   BufInit(B);
   StoreFile := FileLoad(WorkPath(Rel), B) And WriteObject(OtBlob, B, H);
   BufFree(B);
@@ -2910,14 +4088,13 @@ Begin
     While (K > 0) And (Rel[K] <> '/') Do Dec(K);
     If K = 0 Then Exit;
     Rel := Copy(Rel, 1, K - 1);
-    {$I-} RmDir(WorkPath(Rel)); {$I+}
-    If IOResult <> 0 Then Exit;
+    If Not FRmDir(WorkPath(Rel)) Then Exit;
   Until False;
 End;
 
 Function WriteWorkFile(Const Rel : String; Const H : TSha; Mode : LongInt)
   : Boolean;
-Var B : TBuf; T : LongInt; P : String;
+Var T : LongInt; P : String;
 Begin
   WriteWorkFile := False;
   P := WorkPath(Rel);
@@ -2926,11 +4103,8 @@ Begin
   Begin
     MkDirs(P); WriteWorkFile := True; Exit;
   End;
-  BufInit(B);
-  If ReadObject(H, T, B) And (T = OtBlob) Then
-    WriteWorkFile := FileSave(P, B, 0, B.N)
-  Else GitErr := 'objet manquant ' + ShaHex(H);
-  BufFree(B);
+  If ObjToFile(H, P, T) And (T = OtBlob) Then WriteWorkFile := True
+  Else If GitErr = '' Then GitErr := 'objet manquant ' + ShaHex(H);
 End;
 
 { fait passer le dossier de travail de Cur a Tgt et reecrit l'index }
@@ -2968,6 +4142,7 @@ Begin
     End;
   End;
   WorkUpdate := IndexFrom(Tgt);
+  BigClear;
 End;
 
 { change de commit (branche deja choisie par l'appelant) ; exige un
@@ -3450,6 +4625,15 @@ End;
 Var
   MergeConf : LongInt;                 { nombre de conflits }
 
+{ objet trop grand pour etre fusionne ou compare en memoire }
+Function BigBlob(Const H : TSha) : Boolean;
+Var T, Sz : LongInt;
+Begin
+  BigBlob := False;
+  If ShaIsZero(H) Then Exit;
+  If ObjInfo(H, T, Sz) Then BigBlob := Sz > BigObj;
+End;
+
 Function BlobLoad(Const H : TSha; Var B : TBuf) : Boolean;
 Var T : LongInt;
 Begin
@@ -3551,7 +4735,27 @@ Begin
     Begin
       { modifie des deux cotes }
 
-      If BlobLoad(SB, XB) And BlobLoad(SO, XO) And BlobLoad(ST, XT) Then
+      { gros fichiers : conflit sans fusion ligne par ligne (la version
+        locale est gardee) }
+      If BigBlob(SB) Or BigBlob(SO) Or BigBlob(ST) Then
+      Begin
+        Inc(MergeConf);
+        If KO >= 0 Then
+        Begin
+          K := FlatAdd(RF, U.E^[I].Path);
+          RF.E^[K].Sha := SO; RF.E^[K].Mode := MOu;
+        End
+        Else
+        Begin
+          K := FlatAdd(RF, U.E^[I].Path);
+          RF.E^[K].Sha := ST; RF.E^[K].Mode := MT;
+          If Not WriteWorkFile(U.E^[I].Path, ST, MT) Then
+          Begin
+            Fail := True; Break;
+          End;
+        End;
+      End
+      Else If BlobLoad(SB, XB) And BlobLoad(SO, XO) And BlobLoad(ST, XT) Then
       Begin
         If (KO < 0) Or (KT < 0) Then
         Begin
@@ -4048,6 +5252,53 @@ Begin
   BufFree(B); BufFree(E);
 End;
 
+{ reception du pack directement dans un fichier (RecvOn) : les lignes
+  ACK/NAK du debut sont lues, puis tout est ecrit a partir de 'PACK' ; le
+  tampon de reception reste petit, quelle que soit la taille du pack }
+Var
+  RecvOn, RecvStarted : Boolean;
+  RecvH, RecvTot, RecvLast : LongInt;
+  RecvErr : String;
+
+Procedure RecvFeed(Var B : TBuf);
+Var Pp, P2, Ofs, Len : LongInt;
+Begin
+  If Not RecvOn Then Exit;
+  RecvTot := RecvTot + B.N;
+  If RecvTot - RecvLast >= 65536 Then
+  Begin
+    GitProgress('R'#233'ception des objets', RecvTot, 0);
+    RecvLast := RecvTot;
+  End;
+  If Not RecvStarted Then
+  Begin
+    Pp := 0;
+    Repeat
+      If (Pp + 4 <= B.N) And (BufStrAt(B, Pp, 4) = 'PACK') Then
+      Begin
+        RecvStarted := True;
+        Break;
+      End;
+      P2 := Pp;
+      If (Pp + 4 > B.N) Or Not PktNext(B, P2, Ofs, Len) Then Break;
+      If (Len >= 4) And (BufStrAt(B, Ofs, 4) = 'ERR ') Then
+        RecvErr := 'serveur : ' + BufStrAt(B, Ofs + 4, MinL(Len - 4, 200));
+      Pp := P2;
+    Until False;
+    { garde la ligne incomplete pour la suite }
+    If Pp > 0 Then
+    Begin
+      Move(B.P^[Pp], B.P^[0], B.N - Pp);
+      B.N := B.N - Pp;
+    End;
+    If Not RecvStarted Then Exit;
+  End;
+  If B.N > 0 Then
+    If Not FWrite(RecvH, B.P, B.N) Then
+      RecvErr := ''#233'criture du pack impossible (disque plein ?)';
+  B.N := 0;
+End;
+
 { envoie la requete Req et recoit toute la reponse }
 Function RemRpc(Const Service : String; Var Req, Resp : TBuf) : Boolean;
 Var St, R, Last : LongInt; U : String; E : TBuf;
@@ -4063,12 +5314,13 @@ Begin
     Last := 0;
     Repeat
       R := TcpRecv(RemSock, Resp);
-      If Resp.N - Last >= 65536 Then
+      If RecvOn Then RecvFeed(Resp)
+      Else If Resp.N - Last >= 65536 Then
       Begin
-        GitProgress('Reception des objets', Resp.N, 0);
+        GitProgress('R'#233'ception', Resp.N, 0);
         Last := Resp.N;
       End;
-    Until R <= 0;
+    Until (R <= 0) Or GitOom;
     RemClose;
     RemRpc := R = 0;
     If R < 0 Then GitErr := 'erreur de r'#233'ception';
@@ -4123,8 +5375,9 @@ End;
 { recupere les branches distantes dans refs/remotes/<Remote>/ }
 Function DoFetch(Const Remote : String) : Boolean;
 Var Req, Resp : TBuf; I, Pp, Ofs, Len, Cnt, Wants : LongInt;
-    Seen : TShaSet; Nm : String; First : Boolean;
+    Seen : TShaSet; Nm : String; First, Ok : Boolean;
 Begin
+  GitOom := False;
   DoFetch := False;
   If Not RemDiscover('git-upload-pack') Then Exit;
   BufInit(Req); BufInit(Resp);
@@ -4155,33 +5408,32 @@ Begin
       AddHaves(Req, LocRefs.Sha[I], Seen, Cnt, 256);
     SetFree(Seen);
     PktStr(Req, 'done' + #10);
-    GitProgress('Negociation', 0, 0);
-    If Not RemRpc('git-upload-pack', Req, Resp) Then
+    GitProgress('N'#233'gociation', 0, 0);
+    { le pack est recu dans un fichier, puis indexe depuis le disque }
+    Nm := TmpPath('recv.pack');
+    RecvH := FCreate(Nm);
+    If RecvH < 0 Then
     Begin
+      GitErr := 'cr'#233'ation de ' + Nm + ' impossible';
       BufFree(Req); BufFree(Resp); Exit;
     End;
-    { ACK / NAK puis le pack }
-    Pp := 0;
-    While (Pp + 4 <= Resp.N) And (BufStrAt(Resp, Pp, 4) <> 'PACK') Do
+    RecvOn := True; RecvStarted := False; RecvErr := '';
+    RecvTot := 0; RecvLast := 0;
+    Ok := RemRpc('git-upload-pack', Req, Resp);
+    RecvOn := False;
+    FClose(RecvH);
+    If Ok And (RecvErr <> '') Then
     Begin
-      If Not PktNext(Resp, Pp, Ofs, Len) Then Break;
-      If (Len >= 4) And (BufStrAt(Resp, Ofs, 4) = 'ERR ') Then
-      Begin
-        GitErr := 'serveur : ' + BufStrAt(Resp, Ofs + 4, MinL(Len - 4, 200));
-        BufFree(Req); BufFree(Resp); Exit;
-      End;
+      GitErr := RecvErr; Ok := False;
     End;
-    If (Pp + 4 > Resp.N) Or (BufStrAt(Resp, Pp, 4) <> 'PACK') Then
+    If Ok And Not RecvStarted Then
     Begin
-      GitErr := 'pas de pack dans la r'#233'ponse du serveur';
-      BufFree(Req); BufFree(Resp); Exit;
+      GitErr := 'pas de pack dans la r'#233'ponse du serveur'; Ok := False;
     End;
-    If Pp > 0 Then
-    Begin
-      Move(Resp.P^[Pp], Resp.P^[0], Resp.N - Pp);
-      Dec(Resp.N, Pp);
-    End;
-    If Not IndexPack(Resp) Then
+    If Ok And GitOom Then Ok := False;
+    If Ok Then Ok := IndexPackFile(Nm);
+    FileDel(Nm);
+    If Not Ok Then
     Begin
       BufFree(Req); BufFree(Resp); Exit;
     End;
@@ -4295,8 +5547,8 @@ Var
   l'avance rapide }
 Function DoPush(Const Remote, Branch : String; Force : Boolean) : Boolean;
 Var Local, Old, X : TSha; Known, Excl, Added : TShaSet; L : TShaList;
-    Q : TShaList; I, J, T, Pp, Ofs, Len : LongInt; C : TCommit;
-    Req, Resp, D, Pk : TBuf; Ref, S : String; Ok : Boolean;
+    Q : TShaList; I, J, T, Pp, Ofs, Len, Sz : LongInt; C : TCommit;
+    Req, Resp, D, Pk : TBuf; Ref, S, Fn : String; Ok : Boolean;
 Begin
   DoPush := False;
   PushMsg := '';
@@ -4370,11 +5622,18 @@ Begin
   For I := 0 To L.N - 1 Do
   Begin
     If (I And 15) = 0 Then GitProgress('Compression des objets', I, L.N);
-    If Not ReadObject(L.H^[I], T, D) Then
+    If Not ObjGet(L.H^[I], T, Sz, D, Fn) Then
     Begin
       GitErr := 'objet manquant ' + ShaHex(L.H^[I]); Ok := False; Break;
     End;
-    PackAdd(Pk, T, D);
+    If Fn <> '' Then Ok := PackAddFile(Pk, T, Fn)
+    Else PackAdd(Pk, T, D);
+    If GitOom Then
+    Begin
+      GitErr := 'm'#233'moire insuffisante pour envoyer les objets';
+      Ok := False;
+    End;
+    If Not Ok Then Break;
   End;
   ListFree(L);
   If Ok Then
@@ -4832,6 +6091,22 @@ Procedure GetSystemTime(P : LongInt); stdcall;
   external 'kernel32.dll' name 'GetSystemTime';
 Function GetTickCount : LongInt; stdcall;
   external 'kernel32.dll' name 'GetTickCount';
+Function CreateFileA(N, Acc, Sh, Sec, Disp, Fl, Tpl : LongInt) : LongInt;
+  stdcall; external 'kernel32.dll' name 'CreateFileA';
+Function ReadFile(H, B, N, PR, Ov : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'ReadFile';
+Function WriteFile(H, B, N, PW, Ov : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'WriteFile';
+Function SetFilePointer(H, D, PHi, M : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'SetFilePointer';
+Function GetFileSize(H, PHi : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'GetFileSize';
+Function CloseHandle(H : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'CloseHandle';
+Function RemoveDirectoryA(P : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'RemoveDirectoryA';
+Function DeleteFileA(P : LongInt) : LongInt; stdcall;
+  external 'kernel32.dll' name 'DeleteFileA';
 { ==================================================================== }
 { Transport Win32 : WININET (http, https) et Winsock (git://)           }
 { ==================================================================== }
@@ -4951,6 +6226,10 @@ Begin
       GitErr := 'op'#233'ration annul'#233'e'; Status := 0; Break;
     End;
     BufNeed(Resp, Resp.N + 65536);
+    If Resp.N + 65536 > Resp.Cap Then
+    Begin
+      GitErr := 'm'#233'moire insuffisante'; Status := 0; Break;
+    End;
     N := 0;
     BigUnlock;
     If InternetReadFile(R, LongInt(@Resp.P^[Resp.N]), 65536,
@@ -4958,9 +6237,10 @@ Begin
     BigLock;
     If N <= 0 Then Break;
     Inc(Resp.N, N);
-    If Resp.N - Last >= 65536 Then
+    If RecvOn Then RecvFeed(Resp)
+    Else If Resp.N - Last >= 65536 Then
     Begin
-      GitProgress('Reception', Resp.N, 0);
+      GitProgress('R'#233'ception', Resp.N, 0);
       Last := Resp.N;
     End;
   Until False;
@@ -5032,6 +6312,10 @@ Begin
     GitErr := 'op'#233'ration annul'#233'e'; TcpRecv := -1; Exit;
   End;
   BufNeed(B, B.N + 65536);
+  If B.N + 65536 > B.Cap Then
+  Begin
+    GitErr := 'm'#233'moire insuffisante'; TcpRecv := -1; Exit;
+  End;
   BigUnlock;
   R := recv(H, LongInt(@B.P^[B.N]), 65536, 0);
   BigLock;
@@ -5043,6 +6327,66 @@ Procedure TcpClose(H : LongInt);
 Begin
   shutdown(H, 2);
   closesocket(H);
+End;
+
+{ ==================================================================== }
+{ Fichiers Win32 (poignees de CreateFileA)                              }
+{ ==================================================================== }
+
+Var
+  FZ : Array[0..299] Of Byte;
+
+Function FOpenR(Const P : String) : LongInt;
+Var H : LongInt;
+Begin
+  PutZ(FZ, P);
+  H := CreateFileA(LongInt(@FZ), LongInt($80000000), 1, 0, 3, 0, 0);
+  If H = -1 Then FOpenR := -1 Else FOpenR := H;
+End;
+
+Function FCreate(Const P : String) : LongInt;
+Var H : LongInt;
+Begin
+  PutZ(FZ, P);
+  H := CreateFileA(LongInt(@FZ), LongInt($C0000000), 0, 0, 2, 0, 0);
+  If H = -1 Then FCreate := -1 Else FCreate := H;
+End;
+
+Function FReadAt(H, Pos : LongInt; Q : PBytes; N : LongInt) : LongInt;
+Var R : LongInt;
+Begin
+  FReadAt := 0;
+  If SetFilePointer(H, Pos, 0, 0) = -1 Then Exit;
+  R := 0;
+  If ReadFile(H, LongInt(Q), N, LongInt(@R), 0) = 0 Then Exit;
+  FReadAt := R;
+End;
+
+Function FWrite(H : LongInt; Q : PBytes; N : LongInt) : Boolean;
+Var W : LongInt;
+Begin
+  W := 0;
+  If N <= 0 Then
+  Begin
+    FWrite := True; Exit;
+  End;
+  FWrite := (WriteFile(H, LongInt(Q), N, LongInt(@W), 0) <> 0) And (W = N);
+End;
+
+Function FSize(H : LongInt) : LongInt;
+Begin
+  FSize := GetFileSize(H, 0);
+End;
+
+Procedure FClose(H : LongInt);
+Begin
+  If H >= 0 Then CloseHandle(H);
+End;
+
+Function FRmDir(Const P : String) : Boolean;
+Begin
+  PutZ(FZ, P);
+  FRmDir := RemoveDirectoryA(LongInt(@FZ)) <> 0;
 End;
 { ==================================================================== }
 { Constantes et API Win32                                               }
@@ -5789,8 +7133,7 @@ Begin
     If L.E^[J].Mode <> 0 Then RmTree(D + '\' + L.E^[J].Path, Depth + 1)
     Else FileDel(D + '\' + L.E^[J].Path);
   FlatFree(L);
-  {$I-} RmDir(D); {$I+}
-  If IOResult <> 0 Then ;
+  If FRmDir(D) Then ;
 End;
 
 { ---- identifiants ---- }
@@ -5866,6 +7209,7 @@ Var H : TSha; Ok : Boolean; U : String;
 Begin
   DoOp := False;
   GitErr := ''; OpRes := 0;
+  GitOom := False;
   Case Op Of
     OpClone :
     Begin
@@ -6525,10 +7869,29 @@ End;
 { charge les deux versions et calcule le diff }
 Procedure DiffLoad(Const OldSha, NewSha : TSha; FromWork : Boolean;
   Const Path : String; St : LongInt);
+Var T, SA, SB, Tm : LongInt;
 Begin
   DiffTitle := Path;
   DfA.N := 0; DfB.N := 0;
   DiffMode := 1;
+  { tailles d'abord : un gros fichier n'est pas charge en memoire }
+  SA := 0; SB := 0;
+  If Not ShaIsZero(OldSha) Then
+    If Not ObjInfo(OldSha, T, SA) Then SA := 0;
+  If St <> StDel Then
+  Begin
+    If FromWork Then
+    Begin
+      If Not FileStat(WorkPath(Path), SB, Tm) Then SB := 0;
+    End
+    Else If Not ObjInfo(NewSha, T, SB) Then SB := 0;
+  End;
+  If SA + SB > 3000000 Then
+  Begin
+    DiffMode := 3; DfN := 0; DfAdd := 0; DfDel := 0;
+    DiffReset;
+    Exit;
+  End;
   If Not ShaIsZero(OldSha) Then
     If Not BlobLoad(OldSha, DfA) Then DfA.N := 0;
   If St <> StDel Then
@@ -7430,6 +8793,7 @@ Var I, K : LongInt; OldPath : String;
 Begin
   If Refreshing Or Busy Then Exit;
   Refreshing := True;
+  GitOom := False;
   LastRefresh := GetTickCount;
   OldPath := '';
   If Keep And (ChgSel >= 0) And (ChgSel < Chg.N) Then

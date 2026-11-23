@@ -7995,10 +7995,32 @@ Begin
 End;
 
 { Cluster d'indice K du fichier F (Grow : allonger la chaine) ; 0 sinon }
+{ reperes de la chaine FAT des fichiers ouverts : cluster d'index
+  J * 256 (0 : inconnu) ; un retour en arriere ne reparcourt plus toute
+  la chaine depuis le debut (fichiers de plusieurs dizaines de Mo) }
+Const
+  FoCkN = 32;
+
+Type
+  TFoCk = Array[0..MaxFo * FoCkN - 1] Of LongInt;
+
+Var
+  FoCk : ^TFoCk;
+
 Function FoClusAt(F, K : LongInt; Grow : Boolean) : LongInt;
-Var V, I, C, N : LongInt;
+Var V, I, C, N, J : LongInt;
 Begin
   FoClusAt := 0;
+  If FoCk = Nil Then
+  Begin
+    { bloc du systeme (pas du programme qui lit le fichier) }
+    J := HeapOwner; HeapOwner := 0;
+    FoCk := Pointer(KAlloc(SizeOf(TFoCk)));
+    HeapOwner := J;
+    If FoCk <> Nil Then FillChar(FoCk^, SizeOf(TFoCk), 0);
+  End;
+  If (FoCk <> Nil) And (FoCIdx[F] < 0) Then
+    FillChar(FoCk^[F * FoCkN], FoCkN * 4, 0);
   V := FoVol[F];
   If FoClus[F] = 0 Then
   Begin
@@ -8015,6 +8037,15 @@ Begin
   Else
   Begin
     I := 0; C := FoClus[F];
+    If FoCk <> Nil Then
+    Begin
+      J := Min(K Shr 8, FoCkN - 1);
+      While (J > 0) And (FoCk^[F * FoCkN + J] = 0) Do Dec(J);
+      If J > 0 Then
+      Begin
+        I := J Shl 8; C := FoCk^[F * FoCkN + J];
+      End;
+    End;
   End;
   While I < K Do
   Begin
@@ -8027,13 +8058,15 @@ Begin
     End;
     C := N;
     Inc(I);
+    If (FoCk <> Nil) And ((I And 255) = 0) And ((I Shr 8) < FoCkN) Then
+      FoCk^[F * FoCkN + (I Shr 8)] := C;
   End;
   FoCIdx[F] := K; FoCClus[F] := C;
   FoClusAt := C;
 End;
 
 Function FatRead(F, Pos0, N, Dst : LongInt) : LongInt;
-Var CB, Done, K, Off, L, C : LongInt;
+Var CB, Done, K, Off, L, C, J : LongInt;
 Begin
   If VolType[FoVol[F]] = NtfsT Then
   Begin
@@ -8061,6 +8094,14 @@ Begin
     L := Min(N - Done, CB - Off);
     C := FoClusAt(F, K, False);
     If C = 0 Then Break;
+    { clusters contigus : un seul transfert (64 Ko au plus) }
+    J := 1;
+    While (Done + L < N) And (L < 65536) And
+          (FoClusAt(F, K + J, False) = C + J) Do
+    Begin
+      L := L + Min(N - Done - L, CB);
+      Inc(J);
+    End;
     ClusIo(FoVol[F], C, Off, L, Dst + Done, False);
     Done := Done + L;
   End;
@@ -8068,7 +8109,7 @@ Begin
 End;
 
 Function FatWrite(F, Pos0, N, Src : LongInt) : LongInt;
-Var CB, Done, K, Off, L, C, Z : LongInt;
+Var CB, Done, K, Off, L, C, Z, J : LongInt;
 Begin
   FatWrite := -1;
   If VolType[FoVol[F]] = NtfsT Then
@@ -8101,6 +8142,13 @@ Begin
     L := Min(N - Done, CB - Off);
     C := FoClusAt(F, K, True);
     If C = 0 Then Break;
+    J := 1;
+    While (Done + L < N) And (L < 65536) And
+          (FoClusAt(F, K + J, True) = C + J) Do
+    Begin
+      L := L + Min(N - Done - L, CB);
+      Inc(J);
+    End;
     ClusIo(FoVol[F], C, Off, L, Src + Done, True);
     Done := Done + L;
   End;
