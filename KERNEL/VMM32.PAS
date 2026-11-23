@@ -15104,7 +15104,7 @@ Begin
     mnPrograms : MenuCount := 5 + ExeCnt;
     mnAccess : MenuCount := 11;
     mnComm : MenuCount := 1;
-    mnDevKit : MenuCount := 2;
+    mnDevKit : MenuCount := 4;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
     mnInet : MenuCount := 5 + KnownCount('I');
@@ -15243,17 +15243,31 @@ Begin
         T := BaseName(ExePaths^[I - 5]);
         Cmd := cmExeBase + I - 5; Icon := ExeIcon(T);
       End;
-    { Programmes, Developer Kit : l'EDI Pascal (WPC) et le debogueur }
+    { Programmes, Developer Kit : l'EDI Pascal (WPC), le debogueur, et
+      les clients GitHub et SVN (aussi dans Accessoires, Outils
+      Internet) }
     mnDevKit :
       If I = 0 Then
       Begin
         T := 'Pascal Developer';
         Cmd := cmPasDev; Icon := icPasDev;
       End
-      Else
+      Else If I = 1 Then
       Begin
         T := 'Pasdows Debugger';
         Cmd := cmPasDbg; Icon := icPasDbg;
+      End
+      Else If I = 2 Then
+      Begin
+        T := L('Client GitHub', 'GitHub Client', 'GitHub-Client',
+               'Client GitHub', 'Cliente GitHub');
+        Cmd := cmGit; Icon := icGit;
+      End
+      Else
+      Begin
+        T := L('Client SVN', 'SVN Client', 'SVN-Client', 'Client SVN',
+               'Cliente SVN');
+        Cmd := cmSvn; Icon := icSvn;
       End;
     { Programmes, Accessoires : groupes, puis programmes (comme Windows) }
     mnAccess :
