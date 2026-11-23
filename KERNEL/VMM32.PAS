@@ -8426,7 +8426,7 @@ Const
   icChess    = 48; icSolitair = 49; icDefrag   = 50; icCleanMgr = 51;
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
   icAppWiz   = 56; icRdp      = 57; icFtp      = 58; icSsh      = 59;
-  icPasDev   = 60; icPasDbg   = 61; icGit      = 62;
+  icPasDev   = 60; icPasDbg   = 61; icGit      = 62; icSvn      = 63;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9984,6 +9984,16 @@ Begin
       QR(21, 9, 22, 12, cBlack);
       QD(10, 7, 3, cRed); QD(10, 25, 3, cRed); QD(21, 9, 3, cMaroon);
       QD(10, 16, 2, cBlack);
+    End;
+    icSvn :
+    Begin
+      { client SVN : page et revisions numerotees reliees }
+      IFrame(3, 2, 28, 29, cWhite);
+      QR(9, 8, 10, 24, cBlack);
+      QR(6, 5, 13, 10, cNavy); QR(6, 13, 13, 18, cNavy);
+      QR(6, 21, 13, 26, cGreen);
+      QL(13, 7, 22, 7, cBlack); QL(13, 15, 22, 15, cBlack);
+      QL(13, 23, 22, 23, cBlack);
     End;
     icSsh :
     Begin
@@ -14021,7 +14031,7 @@ Const
   cmDeskFile = 78; cmCtxDel = 79; cmCtxRen = 80; cmFoldProps = 81;
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
   cmMstsc = 86; cmFtp = 93; cmSsh = 94; cmPasDev = 95; cmPasDbg = 96;
-  cmPasteLnk = 97; cmRecProps = 98; cmGit = 800;
+  cmPasteLnk = 97; cmRecProps = 98; cmGit = 800; cmSvn = 801;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -14452,7 +14462,8 @@ Begin
     (Nm = 'DEFRAG.EXE') Or (Nm = 'CLEANMGR.EXE') Or (Nm = 'MSINFO32.EXE') Or
     (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE') Or
     (Nm = 'FTPCLI.EXE') Or (Nm = 'SSHCLI.EXE') Or (Nm = 'PASDEV.EXE') Or
-    (Nm = 'PASDBG.EXE') Or (Nm = 'WPC.EXE') Or (Nm = 'GITCLI.EXE');
+    (Nm = 'PASDBG.EXE') Or (Nm = 'WPC.EXE') Or (Nm = 'GITCLI.EXE') Or
+    (Nm = 'SVNCLI.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -15061,7 +15072,7 @@ Begin
     mnDevKit : MenuCount := 2;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
-    mnInet : MenuCount := 4 + KnownCount('I');
+    mnInet : MenuCount := 5 + KnownCount('I');
     mnSettings : MenuCount := 10;
     mnMonths : MenuCount := 12;
     mnVolCtx : MenuCount := 2;
@@ -15343,9 +15354,15 @@ Begin
                'Client GitHub', 'Cliente GitHub');
         Cmd := cmGit; Icon := icGit;
       End
+      Else If I = 4 Then
+      Begin
+        T := L('Client SVN', 'SVN Client', 'SVN-Client', 'Client SVN',
+               'Cliente SVN');
+        Cmd := cmSvn; Icon := icSvn;
+      End
       Else
       Begin
-        K := KnownAt('I', I - 4);
+        K := KnownAt('I', I - 5);
         T := KnownTitle(K); Cmd := cmKnownBase + K; Icon := KnownIcon(K);
       End;
     mnTools :
@@ -16801,6 +16818,7 @@ Begin
   Else If Nm = 'FTPCLI.EXE' Then ExeIcon := icFtp
   Else If Nm = 'SSHCLI.EXE' Then ExeIcon := icSsh
   Else If Nm = 'GITCLI.EXE' Then ExeIcon := icGit
+  Else If Nm = 'SVNCLI.EXE' Then ExeIcon := icSvn
   Else If Nm = 'PASDEV.EXE' Then ExeIcon := icPasDev
   Else If Nm = 'PASDBG.EXE' Then ExeIcon := icPasDbg
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
@@ -22732,6 +22750,7 @@ Begin
     cmFtp : RunExe('FTPCLI.EXE', '');
     cmSsh : RunExe('SSHCLI.EXE', '');
     cmGit : RunExe('GITCLI.EXE', '');
+    cmSvn : RunExe('SVNCLI.EXE', '');
     cmPasDev : RunSys('PASDEV.EXE', '', 'Pascal Developer');
     cmPasDbg : RunSys('PASDBG.EXE', '', 'Pasdows Debugger');
     cmNetDisc :
