@@ -14462,7 +14462,9 @@ Begin
              (TypeTab^[LI]^.BaseTypeIdx >= 0) Then
             ParI := TypeSizeofIdx(TypeTab^[LI]^.BaseTypeIdx);
           If ParI < 4 Then ParI := 4;
-          EmitInstr('PUSH ' + IntToStr_(ParI));
+          { +4 : une chaine affectee ecrit un zero apres son dernier
+            caractere (String[N] plein en fin d'enregistrement) }
+          EmitInstr('PUSH ' + IntToStr_(ParI + 4));
           EmitInstr('PUSH 8');   { HEAP_ZERO_MEMORY }
           EmitInstr('PUSH DWORD PTR [HHEAP]');
           EmitInstr('CALL HeapAlloc');
@@ -14504,6 +14506,9 @@ Begin
           EmitInstr('PUSH EAX');          { adresse de la variable pointeur }
           EPMatch(',');
           ParseExpr(PI);   { taille dans EAX }
+          { +4 : GetMem(P, Length(S) + 1) puis P^ := S (idiome Turbo
+            Pascal) ; l'affectation ecrit aussi un zero terminal }
+          EmitInstr('ADD EAX,4');
           EmitInstr('PUSH EAX');
           EmitInstr('PUSH 8');   { HEAP_ZERO_MEMORY }
           EmitInstr('PUSH DWORD PTR [HHEAP]');

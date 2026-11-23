@@ -483,6 +483,8 @@ Begin
   End;
 End;
 
+Function HeapCheck(Tag : String) : Boolean; Forward;
+
 { Bloc de Size octets (mis a zero) ; 0 si memoire insuffisante }
 Function KAlloc(Size : LongInt) : LongInt;
 Var Need, A : LongInt;
@@ -491,7 +493,11 @@ Begin
   Need := ((Size + 15) And Not 15) + 16;
   A := KAllocFrom(HeapRover, Need);
   If A = 0 Then A := KAllocFrom(HeapStart, Need);
-  If A = 0 Then KLog('KAlloc: memoire epuisee (' + IntStr(Size) + ')')
+  If A = 0 Then
+  Begin
+    KLog('KAlloc: memoire epuisee (' + IntStr(Size) + ')');
+    HeapCheck('KAlloc');
+  End
   Else FillMem(A, Need - 16, 0);
   KAlloc := A;
 End;
@@ -27988,9 +27994,11 @@ Begin
   HeapDestroy := 1;
 End;
 
+{ un octet de plus : les programmes de WPC ecrivent un zero apres une
+  chaine (GetMem(P, Length(S) + 1) ; P^ := S) }
 Function HeapAlloc(Heap, Flags, Size : LongInt) : LongInt;
 Begin
-  HeapAlloc := KAlloc(Size);
+  HeapAlloc := KAlloc(Size + 1);
 End;
 
 Function HeapFree(Heap, Flags, A : LongInt) : LongInt;
@@ -28001,7 +28009,7 @@ End;
 
 Function HeapReAlloc(Heap, Flags, A, Size : LongInt) : LongInt;
 Begin
-  HeapReAlloc := KRealloc(A, Size);
+  HeapReAlloc := KRealloc(A, Size + 1);
 End;
 
 Function HeapSize(Heap, Flags, A : LongInt) : LongInt;
