@@ -3,7 +3,7 @@
   Compilation avec WPC (Windows 95 Pascal Compiler) :
      WPC -CW32 HTTPGET.PAS HTTPGET.EXE
 
-  Utilisation, dans l'Invite MS-DOS de Pasdows 95 (ou sous Windows) :
+  Utilisation, dans l'Invite DOS de Pasdows 95 (ou sous Windows) :
      HTTPGET https://serveur/chemin/fichier.bin C:\FICHIER.BIN
      HTTPGET http://serveur/page.html            (affiche la page)
 

@@ -3559,7 +3559,7 @@ Begin
   GenLine('REM Langue de l''interface : FR (francais), EN (anglais),');
   GenLine('REM GR (allemand), IT (italien) ou SP (espagnol).');
   GenLine('SET LANGUAGE=' + LangCode);
-  GenLine('SET PATH=C:\WINDOWS;C:\');
+  GenLine('SET PATH=C:\WINDOWS;C:\WINDOWS\COMMAND;C:\');
   GenLine('SET TEMP=C:\WINDOWS\TEMP');
   GenLine('SET PROMPT=$P$G');
 End;
