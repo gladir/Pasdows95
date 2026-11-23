@@ -119,19 +119,38 @@ Var
 {$IFDEF WINDOWS}
 Procedure W32Debug(P: Pointer); stdcall;
  external 'kernel32.dll' name 'OutputDebugStringA';
+Function W32Tick: LongInt; stdcall;
+ external 'kernel32.dll' name 'GetTickCount';
 {$ENDIF}
+
+Var
+ DebugOn: Boolean;              { /DEBUG : traces dans le journal }
+ DebugT0, ArgI: LongInt;
+
+{ Millisecondes depuis le debut de SCANDISK }
+Function DebugMs: LongInt;Begin
+ {$IFDEF WINDOWS}
+ If DebugT0 = 0 Then DebugT0 := W32Tick;
+ DebugMs := W32Tick - DebugT0;
+ {$ELSE}
+ DebugMs := 0;
+ {$ENDIF}
+End;
 
 { Trace dans le journal du noyau (port serie COM1 de Pasdows) : etapes,
   touches recues, avancement, pour diagnostiquer un blocage }
 Procedure Trace(Const S: String);
 {$IFDEF WINDOWS}
 Var
- Z: Array[0..255] of Char;
+ Z: Array[0..299] of Char;
+ T: String;
  K: Integer;
 Begin
- Z[0] := 'S'; Z[1] := 'D'; Z[2] := ':'; Z[3] := ' ';
- For K := 1 to Length(S) do If K < 250 Then Z[K + 3] := S[K];
- If Length(S) < 250 Then Z[Length(S) + 4] := #0 Else Z[253] := #0;
+ If Not DebugOn Then Exit;
+ Str(DebugMs, T);
+ T := 'SD ' + T + ' ms : ' + S;
+ For K := 1 to Length(T) do Z[K - 1] := T[K];
+ Z[Length(T)] := #0;
  W32Debug(@Z);
 End;
 {$ELSE}
@@ -1245,14 +1264,26 @@ End;
 { Lire N secteurs a partir du secteur Sec (relatif a la partition) }
 Function RawRead(Sec, N: LongInt; P: Pointer): Boolean;
 Var
- A, Hi, Got: LongInt;
+ A, Hi, Got, T0: LongInt;
+ Ok: Boolean;
 Begin
  A := Sec + PartitionOffset;
  Got := 0;
  {$IFDEF WINDOWS}
+ T0 := 0;
+ If DebugOn Then T0 := DebugMs;
  Hi := A shr 23;
  W32Seek(RawH, A shl 9, @Hi, 0);
- RawRead := (W32Read(RawH, P, N * 512, @Got, 0) <> 0) and (Got = N * 512);
+ Ok := (W32Read(RawH, P, N * 512, @Got, 0) <> 0) and (Got = N * 512);
+ RawRead := Ok;
+ If DebugOn Then Begin
+  If Not Ok Then
+   Trace('echec de lecture : secteur ' + NumS(Sec) + ' (' + NumS(N) +
+         ' secteurs, ' + NumS(Got) + ' octets lus)');
+  If DebugMs - T0 > 1000 Then
+   Trace('lecture lente : secteur ' + NumS(Sec) + ' (' + NumS(N) +
+         ' secteurs) en ' + NumS(DebugMs - T0) + ' ms');
+ End;
  {$ELSE}
  Hi := 0;
  {$I-} Seek(FileHandle, Int64(A) * 512); {$I+}
@@ -2279,7 +2310,7 @@ End;
 
 {$IFDEF FPC}
 Var
- SurfBlk: LongInt;
+ SurfBlk, SurfLastI, SurfLastT: LongInt;
  SurfOk: Boolean;
 
 { Lecture du secteur I par blocs de 64 secteurs (un bloc illisible est
@@ -2321,6 +2352,8 @@ Begin
  ShowSurfaceScanScreen;
  {$IFDEF FPC}
  SurfBlk := -1;
+ SurfLastI := 0;
+ SurfLastT := DebugMs;
  Trace('balayage de surface : ' + NumS(TotalSectors) + ' secteurs');
  {$ENDIF}
  { Initialiser le g‚n‚rateur de nombres al‚atoires pour la simulation }
@@ -2328,8 +2361,14 @@ Begin
  For i := 0 to TotalSectors - 1 do Begin
   Inc(SectorsExamined);
   {$IFDEF FPC}
-  If (TotalSectors >= 10) and (i mod (TotalSectors div 10) = 0) Then
-   Trace('balayage ' + NumS(i) + ' / ' + NumS(TotalSectors));
+  If DebugOn and (TotalSectors >= 100) and (i mod (TotalSectors div 100) = 0) Then Begin
+   Trace('balayage ' + NumS(i) + ' / ' + NumS(TotalSectors) + ' (' +
+         NumS(i div (TotalSectors div 100)) + ' %), ' +
+         NumS(((i - SurfLastI) * 100) div ((DebugMs - SurfLastT) div 10 + 1)) +
+         ' secteurs/s, ' + NumS(BadSectors) + ' defectueux');
+   SurfLastI := i;
+   SurfLastT := DebugMs;
+  End;
   BadSectorFound := Not SurfRead(i);
   {$ELSE}
   BadSectorFound := Not ReadSector(i);
@@ -2367,6 +2406,7 @@ Begin
   End;
    { V‚rifier si l'utilisateur appuie sur une touche }
   If ((i and 255) = 0) and KeyPressed Then Begin
+   Trace('touche pendant le balayage au secteur ' + NumS(i));
    Case ReadKey of
     #27, 'e', 'E': Begin { ESC ou Exit }
      Break;
@@ -4433,6 +4473,7 @@ BEGIN
     WriteLn('  /CHECKONLY Check only, do not fix');
     WriteLn('  /SURFACE   Perform surface scan');
     WriteLn('  /N         No questions (summary at the end)');
+    WriteLn('  /DEBUG     Detailed traces in the kernel log (COM1)');
     WriteLn;
     WriteLn('File systems: FAT12, FAT16, FAT32, NTFS and HPFS.');
    End;
@@ -4536,6 +4577,7 @@ BEGIN
     WriteLn('  /CHECKONLY V‚rification seulement, pas de r‚paration');
     WriteLn('  /SURFACE   Effectuer un scan de surface');
     WriteLn('  /N         Sans question (r'#130'sum'#130' '#133' la fin)');
+    WriteLn('  /DEBUG     Traces d'#130'taill'#130'es dans le journal du noyau (COM1)');
     WriteLn;
     WriteLn('Syst'#138'mes de fichiers : FAT12, FAT16, FAT32, NTFS et HPFS.');
    End;
@@ -4548,18 +4590,22 @@ BEGIN
   { Allouer la m‚moire pour les tableaux FAT et ClusterMap }
  AllocateMemory;
   { Si aucun paramÃ¨tre, permettre la s‚lection d'un lecteur }
- If ParamCount = 0 Then Begin
+ DrivePath := '';
+ For ArgI := 1 to ParamCount do Begin
+  If StrToUpper(ParamStr(ArgI)) = '/DEBUG' Then DebugOn := True
+  Else If (DrivePath = '') and (Copy(ParamStr(ArgI), 1, 1) <> '/') Then
+   DrivePath := StrToUpper(ParamStr(ArgI));
+ End;
+ Trace('SCANDISK ' + NumS(ParamCount) + ' parametre(s), lecteur "' +
+       DrivePath + '"');
+ If DrivePath = '' Then Begin
   DrivePath := SelectDrive;
+  Trace('lecteur choisi : "' + DrivePath + '"');
   If DrivePath = '' Then Begin
    FreeMemory;
    CursorOn;
    Halt(0);
   End;
- End
-  Else
- Begin
-  { Analyse des paramŠtres }
-  DrivePath := StrToUpper(ParamStr(1));
  End;
   { Initialisation des variables }
  AutoFix := False;
@@ -4631,8 +4677,8 @@ BEGIN
   {$ENDIF}
  End;
   { Traitement des options }
- If ParamCount > 1 Then Begin
-  For ErrorsFound := 2 to ParamCount do Begin
+ If ParamCount > 0 Then Begin
+  For ErrorsFound := 1 to ParamCount do Begin
    If StrToUpper(ParamStr(ErrorsFound)) = '/AUTOFIX' Then AutoFix := True;
    If StrToUpper(ParamStr(ErrorsFound)) = '/CHECKONLY' Then CheckOnly := True;
    If StrToUpper(ParamStr(ErrorsFound)) = '/SURFACE' Then DoSurfaceScan := True;
