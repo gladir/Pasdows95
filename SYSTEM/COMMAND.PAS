@@ -348,33 +348,63 @@ Begin
  NumberHistory:=0;
 End;
 
-Function CopyFile(Source,Target:String;ShowProgression:Boolean):Boolean;
+{ Copier Source dans Target (Append : ajouter a la fin de Target, comme
+  COPY *.TXT TOUT.TXT) ; la date du fichier est conservee }
+Function CopyFileEx(Source,Target:String;ShowProgression,Append:Boolean):Boolean;
 Var
  SourceFile,TargetFile:File;
- RecordsRead:Integer;
- Buffer:Array[1..1000]of Byte;
+ RecordsRead,RecordsWritten:Integer;
+ FTime:LongInt;
+ Buffer:Array[1..16384]of Byte;
 Begin
- CopyFile:=False;
+ CopyFileEx:=False;
  Assign(SourceFile,Source);
  {$I-}Reset(SourceFile,1);{$I+}
  If IOResult<>0Then Begin
   WriteLn('Fichier source introuvable ',Source);
   Exit;
  End;
+ GetFTime(SourceFile,FTime);
  Assign(TargetFile,Target);
- {$I-}Rewrite(TargetFile,1);
- If(ShowProgression)Then WriteLn('. = 1000 octets de copies');
- BlockRead(SourceFile,Buffer,SizeOf(Buffer),RecordsRead);
- While RecordsRead>0 do Begin
-  If(ShowProgression)Then Write('.');
-  BlockWrite(TargetFile,Buffer,RecordsRead);
-  BlockRead(SourceFile,Buffer,SizeOf(Buffer),RecordsRead);
+ {$I-}
+ If Append Then Begin
+  Reset(TargetFile,1);
+  If IOResult=0Then Seek(TargetFile,FileSize(TargetFile));
+ End
+  Else
+ Rewrite(TargetFile,1);
+ {$I+}
+ If IOResult<>0Then Begin
+  WriteLn('Impossible de creer le fichier ',Target);
+  Close(SourceFile);
+  Exit;
  End;
+ If(ShowProgression)Then WriteLn('. = 16384 octets de copies');
+ {$I-}
+ Repeat
+  BlockRead(SourceFile,Buffer,SizeOf(Buffer),RecordsRead);
+  If RecordsRead>0Then Begin
+   If(ShowProgression)Then Write('.');
+   BlockWrite(TargetFile,Buffer,RecordsRead,RecordsWritten);
+   If RecordsWritten<>RecordsRead Then Begin
+    WriteLn('Disque plein : ',Target);
+    Close(SourceFile);
+    Close(TargetFile);
+    {$I+}
+    Exit;
+   End;
+  End;
+ Until RecordsRead=0;
  If(ShowProgression)Then WriteLn;
+ If Not Append Then SetFTime(TargetFile,FTime);
  Close(SourceFile);
  Close(TargetFile);
  {$I+}
- CopyFile:=True;
+ CopyFileEx:=IOResult=0;
+End;
+
+Function CopyFile(Source,Target:String;ShowProgression:Boolean):Boolean;Begin
+ CopyFile:=CopyFileEx(Source,Target,ShowProgression,False);
 End;
 
 Function GetErrorMessage(Code:Word):String;Begin
@@ -819,6 +849,142 @@ Begin
  End;
 End;
 
+{ Le chemin S designe-t-il un repertoire (C:, C:\, C:\JEUX) ? }
+Function IsDirPath(S:String):Boolean;
+Var
+ SR:SearchRec;
+Begin
+ IsDirPath:=False;
+ If S=''Then Exit;
+ If(S[Length(S)]='\')or(S[Length(S)]=':')or(S='.')or(S='..')Then Begin
+  IsDirPath:=True;
+  Exit;
+ End;
+ If(Pos('*',S)>0)or(Pos('?',S)>0)Then Exit;
+ FindFirst(S,Directory,SR);
+ IsDirPath:=(DosError=0)and(SR.Attr and Directory=Directory);
+ FindClose(SR);
+End;
+
+{ Repertoire d'un chemin, avec son \ final (C:\JEUX\*.EXE -> C:\JEUX\) }
+Function DirOfPath(S:String):String;
+Var
+ I:Integer;
+Begin
+ I:=Length(S);
+ While(I>0)and(S[I]<>'\')and(S[I]<>':')do Dec(I);
+ DirOfPath:=Copy(S,1,I);
+End;
+
+{ Nom de fichier par un masque DOS : MASQUE.* , *.BAK, A?C.* }
+Function ApplyMask(Name,Mask:String):String;
+
+ Function Part(N,M:String):String;
+ Var
+  I:Integer;
+  R:String;
+ Begin
+  R:='';
+  For I:=1 to Length(M)do Begin
+   If M[I]='*'Then Begin
+    R:=R+Copy(N,I,255);
+    Break;
+   End
+    Else
+   If M[I]='?'Then Begin
+    If I<=Length(N)Then R:=R+N[I];
+   End
+    Else
+   R:=R+M[I];
+  End;
+  Part:=R;
+ End;
+
+Var
+ P:Integer;
+ NB,NE,MB,ME,R:String;
+Begin
+ P:=Length(Name);
+ While(P>0)and(Name[P]<>'.')do Dec(P);
+ If P>0Then Begin NB:=Copy(Name,1,P-1); NE:=Copy(Name,P+1,255); End
+       Else Begin NB:=Name; NE:=''; End;
+ P:=Length(Mask);
+ While(P>0)and(Mask[P]<>'.')do Dec(P);
+ If P>0Then Begin MB:=Copy(Mask,1,P-1); ME:=Copy(Mask,P+1,255); End
+       Else Begin MB:=Mask; ME:=''; End;
+ R:=Part(NB,MB);
+ If(P>0)Then Begin
+  NE:=Part(NE,ME);
+  If NE<>''Then R:=R+'.'+NE;
+ End;
+ ApplyMask:=R;
+End;
+
+{ COPY source [destination] : jokers dans la source (un fichier par
+  nom trouve), destination repertoire, masque (*.BAK) ou fichier (les
+  fichiers sont alors mis bout a bout, comme MS-DOS) ; sans destination,
+  copie dans le repertoire courant }
+Procedure CopyFiles(Source,Target:String;ShowProgression:Boolean);
+Var
+ SR:SearchRec;
+ SrcDir,TgtDir,TgtName,Dst,Cur:String;
+ Wild,ToDir,Concat,First:Boolean;
+ Count:LongInt;
+Begin
+ If IsDirPath(Source)Then Begin
+  If(Source[Length(Source)]<>'\')and(Source[Length(Source)]<>':')Then
+   Source:=Source+'\';
+  Source:=Source+'*.*';
+ End;
+ If Target=''Then Begin
+  GetDir(0,Cur);
+  Target:=Cur;
+ End;
+ Wild:=(Pos('*',Source)>0)or(Pos('?',Source)>0);
+ ToDir:=IsDirPath(Target);
+ SrcDir:=DirOfPath(Source);
+ If ToDir Then Begin
+  TgtDir:=Target;
+  If(TgtDir[Length(TgtDir)]<>'\')and(TgtDir[Length(TgtDir)]<>':')Then
+   TgtDir:=TgtDir+'\';
+  TgtName:='*.*';
+ End
+  Else
+ Begin
+  TgtDir:=DirOfPath(Target);
+  TgtName:=Copy(Target,Length(TgtDir)+1,255);
+ End;
+ Concat:=Wild and Not ToDir and(Pos('*',TgtName)=0)and(Pos('?',TgtName)=0);
+ Count:=0;
+ First:=True;
+ FindFirst(Source,ReadOnly+Hidden+SysFile+Archive,SR);
+ If DosError<>0Then Begin
+  WriteLn('Fichier source introuvable ',Source);
+  FindClose(SR);
+  Exit;
+ End;
+ While DosError=0 do Begin
+  If SR.Attr and(Directory+VolumeID)=0Then Begin
+   If(Pos('*',TgtName)>0)or(Pos('?',TgtName)>0)Then
+    Dst:=TgtDir+ApplyMask(SR.Name,TgtName)
+   Else
+    Dst:=TgtDir+TgtName;
+   If StrToUpper(Dst)=StrToUpper(SrcDir+SR.Name)Then
+    WriteLn('Impossible de copier un fichier sur lui-meme : ',SR.Name)
+   Else Begin
+    If Wild Then WriteLn(SrcDir+SR.Name);
+    If CopyFileEx(SrcDir+SR.Name,Dst,ShowProgression,Concat and Not First)
+    Then Inc(Count);
+    First:=False;
+   End;
+  End;
+  FindNext(SR);
+ End;
+ FindClose(SR);
+ If Concat and(Count>0)Then WriteLn('        1 fichier(s) copie(s)')
+                       Else WriteLn(Count:9,' fichier(s) copie(s)');
+End;
+
 Procedure CopyCommand;
 Var
  P:Byte;
@@ -881,15 +1047,11 @@ Begin
   End;
   If P>9Then Break;
  Until CurrParam='';
- If(Source='')or(Target='')Then Begin
-  WriteLn('La source et la destination sont requises');
- End
-  Else
- Begin
-  If CopyFile(Source,Target,ShowProgression)Then WriteLn('1 fichier copie')
-                                            Else WriteLn('Echec de copie de '+
-                                        'fichier');
+ If Source=''Then Begin
+  WriteLn('La source est requise');
+  Exit;
  End;
+ CopyFiles(Source,Target,ShowProgression);
 End;
 
 Procedure CTTYCommand;Begin
@@ -1001,7 +1163,7 @@ Var
  T:DateTime;
  Option:Set of (Pause,Subdirectory,Lower,Brief,Description);
  Column:Set Of (ColDouble,ColWidth);
- TotalNumFiles,TotalSize:LongInt;
+ TotalNumFiles,TotalNumDirs,TotalSize:LongInt;
  CurrParam,ShowDir,CurrLabel:String;
  CurrDrive:Char;
 Begin
@@ -1135,6 +1297,7 @@ Begin
   Else
  Begin
   TotalNumFiles:=0;
+  TotalNumDirs:=0;
   TotalSize:=0;
   If Not((Brief)in(Option))Then Begin
    Inc(P,2);
@@ -1170,6 +1333,12 @@ Begin
     WriteLn(' ',T.Year:4,'-',PadZeroLeft(T.Month,2),'-',
             PadZeroLeft(T.Day,2),' ',T.Hour:2,':',PadZeroLeft(T.Min,2));
    End;
+   { totaux de l'entree affichee (avant FindNext, qui la remplace) }
+   If Info.Attr and Directory=Directory Then Inc(TotalNumDirs)
+   Else Begin
+    Inc(TotalNumFiles);
+    Inc(TotalSize,Info.Size);
+   End;
    FindNext(Info);
    If(Pause)in(Option)Then Begin
     Inc(P);
@@ -1180,20 +1349,18 @@ Begin
      P:=0;
     End;
    End;
-   Inc(TotalNumFiles);
-   Inc(TotalSize,Info.Size);
   End;
   If Not((Brief)in(Option))Then Begin
    If(Pipe)Then Begin
-    WriteLn(PipeFile,' Les ',TotalNumFiles,' fichier(s) utilisent ',TotalSize,
-      ' octet(s)');
-    WriteLn(PipeFile,DiskFree(Byte(CurrDrive)-64):10,' octet(s) de libre');
+    WriteLn(PipeFile,TotalNumFiles:10,' fichier(s)',TotalSize:15,' octet(s)');
+    WriteLn(PipeFile,TotalNumDirs:10,' repertoire(s)',
+      DiskFree(Byte(CurrDrive)-64):12,' octet(s) de libre');
    End
     Else
    Begin
-    WriteLn(' Les ',TotalNumFiles,' fichier(s) utilisent ',TotalSize,
-      ' octet(s)');
-    WriteLn(DiskFree(Byte(CurrDrive)-64):10,' octet(s) de libre');
+    WriteLn(TotalNumFiles:10,' fichier(s)',TotalSize:15,' octet(s)');
+    WriteLn(TotalNumDirs:10,' repertoire(s)',
+      DiskFree(Byte(CurrDrive)-64):12,' octet(s) de libre');
    End;
   End;
  End;
