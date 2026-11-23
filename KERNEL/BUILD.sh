@@ -10,14 +10,19 @@
 #     l'interpreteur de commandes) et les exemples Win32 (EXAMPLES/*.PAS),
 #     avec WPC -CW32, puis les applications (APPS/*.PAS, dont PAINT.EXE,
 #     le Paint de CloneDRAW, PASDEV.EXE et PASDBG.EXE du Developer Kit),
-#     et WPC.EXE (WPC -CW32 TOOLS/WPC.PAS : le compilateur pour Pasdows) ;
+#     et WPC.EXE (WPC -CW32 TOOLS/WPC.PAS : le compilateur pour Pasdows),
+#     puis les commandes MS-DOS (DOS/*.PAS, venues de MSDOS-0 et de
+#     GWBASIC-0) dans IMAGE/CDROM/COMMAND ;
 #  4. fabrique le CD-ROM : MAKEISO PASDOWS.ISO /BOOT:IO.SYS ... avec tous
 #     les fichiers de IMAGE/CDROM (AUTOEXEC.BAT, CONFIG.SYS, MSDOS.SYS,
-#     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) ;
+#     LISEZMOI.TXT et les programmes Windows 95 qu'on y a deposes) et le
+#     dossier D:\COMMAND des commandes MS-DOS ;
 #  5. recopie IO.SYS, VMM32.VXD et les exemples dans IMAGE/CDROM ;
 #  6. compile le programme d'installation (WPC -CW95IO SETUP/INSTALL.PAS
 #     INSTALL.SYS) et fabrique le CD-ROM d'installation IMAGE/INSTALL.ISO
-#     (amorce INSTALL.SYS, memes fichiers que PASDOWS.ISO).
+#     (amorce INSTALL.SYS, memes fichiers que PASDOWS.ISO, les commandes
+#     MS-DOS etant reunies dans COMMAND.PAK par MAKEPAK : l'installation
+#     copie ce seul fichier, que VMM32 deballe dans C:\WINDOWS\COMMAND).
 #
 # Variables : FPC (compilateur Free Pascal, defaut fpc), W (dossier de
 # travail, defaut BUILD a la racine du depot).
@@ -33,10 +38,12 @@ mkdir -p "$W/obj" "$W/cd"
 echo "== Outils (Free Pascal)"
 "$FPC" -O1 -FU"$W/obj" -o"$W/wpc" "$ROOT/TOOLS/WPC.PAS" > "$W/wpc.log" || { cat "$W/wpc.log"; exit 1; }
 "$FPC" -FU"$W/obj" -o"$W/makeiso" "$ROOT/TOOLS/MAKEISO.PAS" > "$W/makeiso.log" || { cat "$W/makeiso.log"; exit 1; }
+"$FPC" -FU"$W/obj" -o"$W/makepak" "$ROOT/TOOLS/MAKEPAK.PAS" > "$W/makepak.log" || { cat "$W/makepak.log"; exit 1; }
 
 echo "== Contenu du CD-ROM"
-rm -f "$W"/cd/*
-cp "$ROOT"/IMAGE/CDROM/* "$W/cd/"
+rm -rf "$W/cd" "$W/cmd"
+mkdir -p "$W/cd" "$W/cmd" "$ROOT/IMAGE/CDROM/COMMAND"
+find "$ROOT/IMAGE/CDROM" -maxdepth 1 -type f -exec cp {} "$W/cd/" \;
 
 echo "== IO.SYS (WPC -CW95IO)"
 "$W/wpc" -CW95IO "$HERE/IO.PAS" "$W/cd/IO.SYS"
@@ -71,15 +78,23 @@ echo "== WPC.EXE : le compilateur compile par lui-meme (WPC -CW32)"
 "$W/wpc" -CW32 "$ROOT/TOOLS/WPC.PAS" "$W/cd/WPC.EXE"
 cp "$W/cd/WPC.EXE" "$ROOT/IMAGE/CDROM/WPC.EXE"
 
+echo "== Commandes MS-DOS (DOS, WPC -CW32)"
+for P in "$ROOT"/DOS/*.PAS; do
+  N=$(basename "$P" .PAS)
+  "$W/wpc" -CW32 "$P" "$W/cmd/$N.EXE"
+  cp "$W/cmd/$N.EXE" "$ROOT/IMAGE/CDROM/COMMAND/$N.EXE"
+done
+
 echo "== CD-ROM amorcable"
-"$W/makeiso" "$ROOT/IMAGE/PASDOWS.ISO" /BOOT:"$W/cd/IO.SYS" /LABEL:PASDOWS95 "$W/cd/*"
+"$W/makeiso" "$ROOT/IMAGE/PASDOWS.ISO" /BOOT:"$W/cd/IO.SYS" /LABEL:PASDOWS95 "$W/cd/*" /DIR:COMMAND "$W/cmd/*"
 cp "$W/cd/IO.SYS" "$W/cd/VMM32.VXD" "$ROOT/IMAGE/CDROM/"
 echo "Termine : $ROOT/IMAGE/PASDOWS.ISO"
 
 echo "== Programme d'installation (WPC -CW95IO) et CD-ROM d'installation"
+rm -rf "$W/cdi"
 mkdir -p "$W/cdi"
-rm -f "$W"/cdi/*
 cp "$W"/cd/* "$W/cdi/"
+"$W/makepak" "$W/cdi/COMMAND.PAK" "$W/cmd/*"
 "$W/wpc" -CW95IO "$ROOT/SETUP/INSTALL.PAS" "$W/cdi/INSTALL.SYS"
 "$W/makeiso" "$ROOT/IMAGE/INSTALL.ISO" /BOOT:"$W/cdi/INSTALL.SYS" /LABEL:PASDOWS95 "$W/cdi/*"
 echo "Termine : $ROOT/IMAGE/INSTALL.ISO"

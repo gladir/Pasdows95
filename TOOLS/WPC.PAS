@@ -4326,6 +4326,7 @@ Begin
   RegProc('NORMVIDEO');  RegProc('WINDOW');
   RegProc('DELAY');      RegProc('SOUND');
   RegProc('NOSOUND');    RegProc('ASSIGNCRT');
+  RegProc('SETUSEACP');
   RegProc('INSLINE');    RegProc('DELLINE');
   RegProc('TEXTMODE');
   RegFunc('WHEREX');     RegFunc('WHEREY');
@@ -5117,7 +5118,10 @@ Procedure RegisterSearchRecType;
 Var
   TI, SI : Integer;
 Begin
-  TI := TypeAdd(TYK_RECORD, 'SEARCHREC', 268, 4, False, -1);
+  { 268 : poignee FindFirstFileA de cette recherche, 272 : sa signature
+    (poignee XOR 5A5AA5A5h), 276 : attributs demandes (recherches
+    imbriquees, comme TREE ou XCOPY /S) }
+  TI := TypeAdd(TYK_RECORD, 'SEARCHREC', 280, 4, False, -1);
   If TI >= 0 Then
   Begin
     FieldRoom(TI, 4);
@@ -6200,6 +6204,9 @@ Begin
   EmitRaw('HHEAP     DD 0');           { handle heap           }
   EmitRaw('NUMBUF    DB 32 DUP(0)');   { buffer pour nombres   }
   EmitRaw('INBUF     DB 256 DUP(0)');  { buffer pour lecture    }
+  EmitRaw('STDIN_BUF DB 256 DUP(0)');  { tampon de l entree standard }
+  EmitRaw('STDIN_POS DD 0');
+  EmitRaw('STDIN_END DD 0');
   EmitRaw('CHRBUF    DB 4 DUP(0)');    { caractere -> chaine    }
   EmitRaw('OUTBUF    DB 4096 DUP(0)'); { tampon sortie standard }
   EmitRaw('OUTBUFLEN DD 0');
@@ -12246,6 +12253,9 @@ End;
 
 Procedure ParseLValueSuffixW32(PI : Integer; Var T : Integer); Forward;
 
+Var
+  VarArgT : Integer;      { type de la variable de ParseVarArgAddr (-1 : expression) }
+
 Procedure ParseVarArgAddr(PI : Integer);
 Var
   T, SI : Integer;
@@ -12298,10 +12308,13 @@ Begin
     End;
     If IsVarName Then
     Begin
+      T := -1;
       ParseLValueAddrW32(PI, T);
+      VarArgT := T;
       Exit;
     End;
   End;
+  VarArgT := -1;
   ParseExpr(PI);
 End;
 
@@ -12336,6 +12349,19 @@ Begin
 End;
 
 { EmitIoCheck : apres une operation fichier, erreur d execution si FILE_IOERR <> 0 }
+{ Eof(Input) : runtime Win32 (EmitRuntime) -> tampon de l entree
+  standard (fichier ou tube redirige) ; autres cibles : l indicateur }
+Procedure EmitStdinEof;
+Begin
+  If (Opts.DestTarget = DEST_DOSR) Or (Opts.DestTarget = DEST_DOSP) Or
+     (Opts.DestTarget = DEST_AMIGA) Or Is68kTarget Or Opts.AppleII Or
+     Opts.C64 Or Opts.MSX Or Opts.CoCo3 Or Opts.TO7 Or Opts.Adam Or
+     Opts.TRS80 Or Opts.Atari400 Or Opts.Atari800 Or Opts.NES Then
+    EmitInstr('MOV EAX,DWORD PTR [STDIN_EOF]')
+  Else
+    EmitInstr('CALL ' + TP_RT_PFX + 'STDINEOF');
+End;
+
 Procedure EmitIoCheck;
 Begin
   If (Not Is68kTarget) And (Opts.DestTarget <> DEST_CRAY1) And (Not Opts.Dos16Mode) And
@@ -13083,6 +13109,14 @@ Begin
      (TokenPool^[EP]^.Kind = TK_IDENT) Then
   Begin
     Up := StrUpperCase(TokenPool^[EP]^.Val);
+    { champ d un WITH actif nomme comme une primitive (Pos, Val, Length...) :
+      le champ masque la primitive, comme en Pascal ; '#' empeche les
+      comparaisons If Up = 'POS' jusqu a la resolution du champ }
+    If (TokenPool^[EP]^.Kind = TK_IDENT) And (WithDepth > 0) And
+       (WithFieldIndex(Up, WFOfs) >= 0) And Not TokIsPunct(EP + 1, '(') And
+       (Not Is68kTarget) And (Opts.DestTarget <> DEST_CRAY1) And
+       (Not Opts.Dos16Mode) Then
+      Up := '#' + Up;
 
     { Une variable locale ou un parametre masque les fonctions predefinies (ex: Str, Val, Pos) ;
       un champ d un WITH actif masque les variables (comme en Pascal) }
@@ -14073,7 +14107,7 @@ Begin
           Begin
             { EOF(Input) = EOF stdin }
             Inc(EP);
-            EmitInstr('MOV EAX,DWORD PTR [STDIN_EOF]');
+            EmitStdinEof;
           End
           Else
           Begin
@@ -14090,7 +14124,7 @@ Begin
       Else
       Begin
         { EOF sans argument = EOF(Input) }
-        EmitInstr('MOV EAX,DWORD PTR [STDIN_EOF]');
+        EmitStdinEof;
       End;
       Exit;
     End;
@@ -20009,7 +20043,16 @@ Begin
           End;
           Else
           Begin
-            ParseVarArgAddr(PI);  EmitInstr('PUSH EAX');     { Dest (PChar ou tableau de Char) }
+            VarArgT := -1;
+            ParseVarArgAddr(PI);
+            { variable PChar ou Pointer : la destination est sa valeur (un
+              tableau de Char : son adresse) }
+            WJ := TypeResolve(VarArgT);
+            If (WJ >= 0) And (WJ < TypeCount) And
+               ((TypeTab^[WJ]^.Kind = TYK_POINTER) Or
+                (TypeTab^[WJ]^.Kind = TYK_PCHAR)) Then
+              EmitInstr('MOV EAX,DWORD PTR [EAX]');
+            EmitInstr('PUSH EAX');     { Dest (PChar ou tableau de Char) }
             EPMatch(',');
             ParseExpr(PI);                                   { Source : chaine Pascal }
             If Not LastExprIsPascalStr Then
@@ -20956,6 +20999,7 @@ Begin
     End;
 
     { WITH : resoudre champ implicite en lecture }
+    If (Length(Up) > 1) And (Up[1] = '#') Then Delete(Up, 1, 1);
     If (WithDepth > 0) Then
     Begin
       WI := WithFieldIndex(Up, WFOfs);
@@ -26377,8 +26421,8 @@ Begin
       Exit;
     End;
 
-    { ASSIGNCRT }
-    If Up = 'ASSIGNCRT' Then
+    { ASSIGNCRT, SETUSEACP (Crt de FPC sous Windows) }
+    If (Up = 'ASSIGNCRT') Or (Up = 'SETUSEACP') Then
     Begin
       Inc(EP);
       If EPMatch('(') Then
@@ -27079,10 +27123,12 @@ Begin
         ParseExpr(PI);
         EPMatch(')');
       End;
-      { la recherche en cours (une seule a la fois) : son handle est ferme
-        (FindFirst suivi de FindClose sans aller jusqu au bout perdait
-        un objet du systeme a chaque appel) }
-      EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSE');
+      { la recherche du SearchRec : son handle est ferme (FindFirst suivi
+        de FindClose sans aller jusqu au bout perdait un objet du systeme
+        a chaque appel) }
+      EmitInstr('PUSH EAX');
+      EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSESR');
+      EmitInstr('ADD ESP,4');
       If (Not EPAtEnd) And (TokenPool^[EP]^.Kind = TK_PUNCT) And
          (TokIsP(EP, ';')) Then
         Inc(EP);
@@ -34428,6 +34474,73 @@ Begin
   EmitInstr('POP ECX');
   EmitInstr('RET');
 
+  { ------ _TPRT_STDIN_FILL : remplir le tampon de l entree standard }
+  { EAX = octets lus (0 : fin) ; EBX, ESI, EDI, EBP preserves           }
+  EmitBlankLine;
+  EmitLabel(TP_RT_PFX + 'STDIN_FILL');
+  EmitInstr('PUSH ECX');
+  EmitInstr('PUSH EDX');
+  EmitInstr('PUSH 0');
+  EmitInstr('PUSH OFFSET BYTESRD');
+  EmitInstr('PUSH 256');
+  EmitInstr('PUSH OFFSET STDIN_BUF');
+  EmitInstr('PUSH DWORD PTR [HSTDIN]');
+  EmitInstr('CALL ReadFile');
+  EmitInstr('TEST EAX,EAX');
+  EmitInstr('JNZ ' + TP_RT_PFX + 'SF_OK');
+  EmitInstr('MOV DWORD PTR [BYTESRD],0');
+  EmitLabel(TP_RT_PFX + 'SF_OK');
+  EmitInstr('MOV EAX,DWORD PTR [BYTESRD]');
+  EmitInstr('MOV DWORD PTR [STDIN_END],EAX');
+  EmitInstr('MOV DWORD PTR [STDIN_POS],0');
+  EmitInstr('POP EDX');
+  EmitInstr('POP ECX');
+  EmitInstr('RET');
+  { ------ _TPRT_STDIN_GETC : EAX = caractere suivant, -1 en fin ---- }
+  EmitBlankLine;
+  EmitLabel(TP_RT_PFX + 'STDIN_GETC');
+  EmitInstr('CMP DWORD PTR [STDIN_EOF],0');
+  EmitInstr('JNE ' + TP_RT_PFX + 'SG_EF');
+  EmitInstr('MOV EAX,DWORD PTR [STDIN_POS]');
+  EmitInstr('CMP EAX,DWORD PTR [STDIN_END]');
+  EmitInstr('JB ' + TP_RT_PFX + 'SG_HV');
+  EmitInstr('CALL ' + TP_RT_PFX + 'STDIN_FILL');
+  EmitInstr('TEST EAX,EAX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'SG_EF');
+  EmitInstr('XOR EAX,EAX');
+  EmitLabel(TP_RT_PFX + 'SG_HV');
+  EmitInstr('MOVZX EAX,BYTE PTR [STDIN_BUF+EAX*1]');
+  EmitInstr('INC DWORD PTR [STDIN_POS]');
+  EmitInstr('CMP AL,26');
+  EmitInstr('JNE ' + TP_RT_PFX + 'SG_RT');
+  EmitLabel(TP_RT_PFX + 'SG_EF');
+  EmitInstr('MOV EAX,-1');
+  EmitLabel(TP_RT_PFX + 'SG_RT');
+  EmitInstr('RET');
+  { ------ _TPRT_STDINEOF : Eof(Input) -> EAX (1 : fin) ------------- }
+  { (comme Turbo Pascal : attend une ligne si le tampon est vide)      }
+  EmitBlankLine;
+  EmitLabel(TP_RT_PFX + 'STDINEOF');
+  EmitInstr('CMP DWORD PTR [STDIN_EOF],0');
+  EmitInstr('JNE ' + TP_RT_PFX + 'SE_Y');
+  EmitInstr('MOV EAX,DWORD PTR [STDIN_POS]');
+  EmitInstr('CMP EAX,DWORD PTR [STDIN_END]');
+  EmitInstr('JB ' + TP_RT_PFX + 'SE_CZ');
+  EmitInstr('CALL ' + TP_RT_PFX + 'STDIN_FILL');
+  EmitInstr('TEST EAX,EAX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'SE_E');
+  EmitInstr('XOR EAX,EAX');
+  EmitLabel(TP_RT_PFX + 'SE_CZ');
+  EmitInstr('CMP BYTE PTR [STDIN_BUF+EAX*1],26');
+  EmitInstr('JE ' + TP_RT_PFX + 'SE_E');
+  EmitInstr('XOR EAX,EAX');
+  EmitInstr('RET');
+  EmitLabel(TP_RT_PFX + 'SE_E');
+  EmitInstr('MOV DWORD PTR [STDIN_EOF],1');
+  EmitLabel(TP_RT_PFX + 'SE_Y');
+  EmitInstr('MOV EAX,1');
+  EmitInstr('RET');
+
   { ------ _TPRT_READLN : lire une ligne de STDIN ----------- }
   { Sortie : INBUF contient la ligne lue, terminee par NUL    }
   { BYTESRD = nombre d octets lus                              }
@@ -34439,34 +34552,28 @@ Begin
   { Si mode graphique actif, utiliser la fenetre }
   EmitInstr('CMP DWORD PTR [GR_ACTIVE],0');
   EmitInstr('JNE ' + TP_RT_PFX + 'RL_GR');
-  { --- Chemin console (inchange) --- }
-  { ReadFile(HSTDIN, INBUF, 255, &BYTESRD, 0) }
-  EmitInstr('PUSH 0');                     { lpOverlapped         }
-  EmitInstr('PUSH OFFSET BYTESRD');        { lpNumberOfBytesRead  }
-  EmitInstr('PUSH 255');                   { nNumberOfBytesToRead  }
-  EmitInstr('PUSH OFFSET INBUF');          { lpBuffer             }
-  EmitInstr('PUSH DWORD PTR [HSTDIN]');    { hFile                }
-  EmitInstr('CALL ReadFile');
-  { Verifier EOF stdin (0 octets lus ou Ctrl+Z) }
-  EmitInstr('MOV ECX,DWORD PTR [BYTESRD]');
-  EmitInstr('TEST ECX,ECX');
-  EmitInstr('JNZ ' + TP_RT_PFX + 'RL_OK');
-  EmitInstr('MOV DWORD PTR [STDIN_EOF],1');
-  EmitInstr('JMP ' + TP_RT_PFX + 'RL_DN');
-  EmitLabel(TP_RT_PFX + 'RL_OK');
-  { Retirer CR/LF de fin et terminer par NUL }
-  EmitLabel(TP_RT_PFX + 'RL_TR');
-  EmitInstr('TEST ECX,ECX');
-  EmitInstr('JZ ' + TP_RT_PFX + 'RL_DN');
-  EmitInstr('DEC ECX');
-  EmitInstr('LEA EDI,[INBUF]');
-  EmitInstr('ADD EDI,ECX');
-  EmitInstr('CMP BYTE PTR [EDI],13');
-  EmitInstr('JE ' + TP_RT_PFX + 'RL_TR');
-  EmitInstr('CMP BYTE PTR [EDI],10');
-  EmitInstr('JE ' + TP_RT_PFX + 'RL_TR');
+  { --- Chemin console et entree redirigee --- }
+  { caracteres du tampon de l entree standard jusqu a LF (CR ignore) : }
+  { une ligne a la fois, meme si le fichier ou le tube en donne plusieurs }
+  EmitInstr('XOR ECX,ECX');
+  EmitLabel(TP_RT_PFX + 'RL_NX');
+  EmitInstr('CALL ' + TP_RT_PFX + 'STDIN_GETC');
+  EmitInstr('CMP EAX,-1');
+  EmitInstr('JE ' + TP_RT_PFX + 'RL_EF');
+  EmitInstr('CMP AL,10');
+  EmitInstr('JE ' + TP_RT_PFX + 'RL_DN');
+  EmitInstr('CMP AL,13');
+  EmitInstr('JE ' + TP_RT_PFX + 'RL_NX');
+  EmitInstr('CMP ECX,254');
+  EmitInstr('JAE ' + TP_RT_PFX + 'RL_NX');
+  EmitInstr('MOV BYTE PTR [INBUF+ECX*1],AL');
   EmitInstr('INC ECX');
+  EmitInstr('JMP ' + TP_RT_PFX + 'RL_NX');
+  { fin de l entree (0 octet lu ou Ctrl+Z) }
+  EmitLabel(TP_RT_PFX + 'RL_EF');
+  EmitInstr('MOV DWORD PTR [STDIN_EOF],1');
   EmitLabel(TP_RT_PFX + 'RL_DN');
+  EmitInstr('MOV DWORD PTR [BYTESRD],ECX');
   EmitInstr('LEA EDI,[INBUF]');
   EmitInstr('ADD EDI,ECX');
   EmitInstr('MOV BYTE PTR [EDI],0');
@@ -35092,6 +35199,51 @@ Begin
   EmitLabel(TP_RT_PFX + 'CLRSCR');
   EmitInstr('CALL ' + TP_RT_PFX + 'OFLUSH');
   EmitInstr('PUSHAD');
+  { fenetre (Window) : seulement ses lignes, comme Turbo Pascal }
+  EmitInstr('CMP DWORD PTR [WINDMIN],0');
+  EmitInstr('JNE ' + TP_RT_PFX + 'CS_WIN');
+  EmitInstr('CMP DWORD PTR [WINDMAX],184Fh');
+  EmitInstr('JNE ' + TP_RT_PFX + 'CS_WIN');
+  EmitInstr('JMP ' + TP_RT_PFX + 'CS_ALL');
+  EmitLabel(TP_RT_PFX + 'CS_WIN');
+  EmitInstr('MOVZX EBX,BYTE PTR [WINDMIN]');      { X1 }
+  EmitInstr('MOVZX ESI,BYTE PTR [WINDMIN+1]');    { Y1 }
+  EmitInstr('MOVZX EDI,BYTE PTR [WINDMAX]');      { X2 }
+  EmitInstr('SUB EDI,EBX');
+  EmitInstr('INC EDI');                            { largeur }
+  EmitLabel(TP_RT_PFX + 'CS_LP');
+  EmitInstr('MOVZX EAX,BYTE PTR [WINDMAX+1]');
+  EmitInstr('CMP ESI,EAX');
+  EmitInstr('JA ' + TP_RT_PFX + 'CS_WD');
+  EmitInstr('MOV EDX,ESI');
+  EmitInstr('SHL EDX,16');
+  EmitInstr('OR EDX,EBX');                         { COORD (X1, Y) }
+  EmitInstr('PUSH EDX');
+  EmitInstr('PUSH OFFSET CRT_NWRT');
+  EmitInstr('PUSH EDX');
+  EmitInstr('PUSH EDI');
+  EmitInstr('PUSH 32');
+  EmitInstr('PUSH DWORD PTR [HSTDOUT]');
+  EmitInstr('CALL FillConsoleOutputCharacterA');
+  EmitInstr('POP EDX');
+  EmitInstr('PUSH OFFSET CRT_NWRT');
+  EmitInstr('PUSH EDX');
+  EmitInstr('PUSH EDI');
+  EmitInstr('PUSH DWORD PTR [TEXTATTR]');
+  EmitInstr('PUSH DWORD PTR [HSTDOUT]');
+  EmitInstr('CALL FillConsoleOutputAttribute');
+  EmitInstr('INC ESI');
+  EmitInstr('JMP ' + TP_RT_PFX + 'CS_LP');
+  EmitLabel(TP_RT_PFX + 'CS_WD');
+  EmitInstr('MOVZX EDX,BYTE PTR [WINDMIN+1]');
+  EmitInstr('SHL EDX,16');
+  EmitInstr('OR EDX,EBX');
+  EmitInstr('PUSH EDX');
+  EmitInstr('PUSH DWORD PTR [HSTDOUT]');
+  EmitInstr('CALL SetConsoleCursorPosition');
+  EmitInstr('POPAD');
+  EmitInstr('RET');
+  EmitLabel(TP_RT_PFX + 'CS_ALL');
   { Obtenir les informations du buffer console }
   EmitInstr('PUSH OFFSET CRT_CSBI');
   EmitInstr('PUSH DWORD PTR [HSTDOUT]');
@@ -35493,7 +35645,7 @@ Begin
   { Retourner AsciiChar (offset 14 dans INPUT_RECORD) }
   EmitInstr('MOVZX EAX,BYTE PTR [CRT_INREC+14]');
   EmitInstr('TEST EAX,EAX');
-  EmitInstr('JNZ ' + TP_RT_PFX + 'RK_CH');
+  EmitInstr('JNZ ' + TP_RT_PFX + 'RK_AL');
   { AsciiChar = 0 : touche de modification seule -> ignoree ; touche  }
   { speciale (fleches, F1-F12...) -> #0 puis, au prochain appel, son  }
   { code de balayage (wVirtualScanCode, offset 12), comme Turbo Pascal }
@@ -35503,6 +35655,20 @@ Begin
   EmitInstr('TEST EAX,EAX');
   EmitInstr('JZ ' + TP_RT_PFX + 'RK_LP');
   EmitInstr('MOV DWORD PTR [CRT_PEND],EAX');
+  EmitInstr('XOR EAX,EAX');
+  EmitInstr('JMP ' + TP_RT_PFX + 'RK_CH');
+  { Alt+touche (sans Ctrl, pour AltGr) : #0 puis le code de balayage, }
+  { comme Turbo Pascal (Alt+F : #0, #33)                               }
+  EmitLabel(TP_RT_PFX + 'RK_AL');
+  EmitInstr('MOV EDX,DWORD PTR [CRT_INREC+16]');   { dwControlKeyState }
+  EmitInstr('TEST EDX,3');                          { Alt gauche ou droite }
+  EmitInstr('JZ ' + TP_RT_PFX + 'RK_CH');
+  EmitInstr('TEST EDX,0Ch');                        { Ctrl : AltGr }
+  EmitInstr('JNZ ' + TP_RT_PFX + 'RK_CH');
+  EmitInstr('MOVZX EDX,BYTE PTR [CRT_INREC+12]');  { wVirtualScanCode }
+  EmitInstr('TEST EDX,EDX');
+  EmitInstr('JZ ' + TP_RT_PFX + 'RK_CH');
+  EmitInstr('MOV DWORD PTR [CRT_PEND],EDX');
   EmitInstr('XOR EAX,EAX');
   EmitLabel(TP_RT_PFX + 'RK_CH');
   EmitInstr('POP EDX');
@@ -36298,8 +36464,11 @@ Begin
   EmitInstr('PUSH EBP');
   EmitInstr('MOV EBP,ESP');
   EmitInstr('PUSHAD');
-  { une recherche precedente laissee ouverte est fermee }
-  EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSE');
+  { la recherche precedente du meme SearchRec, laissee ouverte, est
+    fermee (chaque SearchRec a sa poignee : recherches imbriquees) }
+  EmitInstr('PUSH DWORD PTR [EBP+8]');
+  EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSESR');
+  EmitInstr('ADD ESP,4');
   { FindFirstFileA(path, &finddata) }
   EmitInstr('MOV EAX,DWORD PTR [EBP+16]');  { Path (ASCIIZ, first pushed) }
   EmitInstr('PUSH OFFSET DOS_FINDDATA');
@@ -36308,8 +36477,13 @@ Begin
   EmitInstr('MOV DWORD PTR [DOS_FINDHDL],EAX');
   EmitInstr('CMP EAX,-1');
   EmitInstr('JE ' + TP_RT_PFX + 'FF_NF');
+  EmitInstr('MOV EDI,DWORD PTR [EBP+8]');
+  EmitInstr('MOV DWORD PTR [EDI+268],EAX');
+  EmitInstr('XOR EAX,5A5AA5A5h');
+  EmitInstr('MOV DWORD PTR [EDI+272],EAX');
   EmitInstr('MOV EAX,DWORD PTR [EBP+12]');  { Attr demandes }
   EmitInstr('MOV DWORD PTR [DOS_FINDATTR],EAX');
+  EmitInstr('MOV DWORD PTR [EDI+276],EAX');
   { Entrees '.' et '..' et attributs non demandes (cache, systeme, repertoire) : passer }
   EmitLabel(TP_RT_PFX + 'FF_CHK');
   EmitInstr('CALL ' + TP_RT_PFX + 'FF_WANT');
@@ -36354,6 +36528,9 @@ Begin
   EmitLabel(TP_RT_PFX + 'FF_NF');
   EmitInstr('MOV DWORD PTR [DOSERROR],18'); { 18 = pas de fichier }
   EmitInstr('CALL ' + TP_RT_PFX + 'FINDCLOSE');   { aucune entree retenue }
+  EmitInstr('MOV EDI,DWORD PTR [EBP+8]');
+  EmitInstr('MOV DWORD PTR [EDI+268],-1');
+  EmitInstr('MOV DWORD PTR [EDI+272],0');
   EmitLabel(TP_RT_PFX + 'FF_DN');
   EmitInstr('POPAD');
   EmitInstr('POP EBP');
@@ -36370,6 +36547,30 @@ Begin
   EmitInstr('PUSH EAX');
   EmitInstr('CALL FindClose');
   EmitLabel(TP_RT_PFX + 'FC_DN');
+  EmitInstr('POPAD');
+  EmitInstr('RET');
+
+  { ------ _TPRT_FINDCLOSESR : [ESP+4] = SearchRec ; ferme sa recherche ------ }
+  EmitBlankLine;
+  EmitLabel(TP_RT_PFX + 'FINDCLOSESR');
+  EmitInstr('PUSHAD');
+  EmitInstr('MOV EDI,DWORD PTR [ESP+36]');
+  EmitInstr('MOV EAX,DWORD PTR [EDI+268]');
+  EmitInstr('CMP EAX,-1');
+  EmitInstr('JE ' + TP_RT_PFX + 'FCS_DN');
+  EmitInstr('MOV ECX,EAX');
+  EmitInstr('XOR ECX,5A5AA5A5h');
+  EmitInstr('CMP ECX,DWORD PTR [EDI+272]');
+  EmitInstr('JNE ' + TP_RT_PFX + 'FCS_DN');   { SearchRec jamais ouvert }
+  EmitInstr('MOV DWORD PTR [EDI+268],-1');
+  EmitInstr('MOV DWORD PTR [EDI+272],0');
+  EmitInstr('CMP EAX,DWORD PTR [DOS_FINDHDL]');
+  EmitInstr('JNE ' + TP_RT_PFX + 'FCS_CL');
+  EmitInstr('MOV DWORD PTR [DOS_FINDHDL],-1');
+  EmitLabel(TP_RT_PFX + 'FCS_CL');
+  EmitInstr('PUSH EAX');
+  EmitInstr('CALL FindClose');
+  EmitLabel(TP_RT_PFX + 'FCS_DN');
   EmitInstr('POPAD');
   EmitInstr('RET');
 
@@ -36414,6 +36615,18 @@ Begin
   EmitInstr('PUSH EBP');
   EmitInstr('MOV EBP,ESP');
   EmitInstr('PUSHAD');
+  { poignee et attributs de ce SearchRec }
+  EmitInstr('MOV EDI,DWORD PTR [EBP+8]');
+  EmitInstr('MOV EAX,DWORD PTR [EDI+268]');
+  EmitInstr('CMP EAX,-1');
+  EmitInstr('JE ' + TP_RT_PFX + 'FN_NO');
+  EmitInstr('MOV ECX,EAX');
+  EmitInstr('XOR ECX,5A5AA5A5h');
+  EmitInstr('CMP ECX,DWORD PTR [EDI+272]');
+  EmitInstr('JNE ' + TP_RT_PFX + 'FN_NO');
+  EmitInstr('MOV DWORD PTR [DOS_FINDHDL],EAX');
+  EmitInstr('MOV EAX,DWORD PTR [EDI+276]');
+  EmitInstr('MOV DWORD PTR [DOS_FINDATTR],EAX');
   { FindNextFileA(handle, &finddata) }
   EmitInstr('PUSH OFFSET DOS_FINDDATA');
   EmitInstr('PUSH DWORD PTR [DOS_FINDHDL]');
@@ -36459,6 +36672,13 @@ Begin
   EmitInstr('PUSH DWORD PTR [DOS_FINDHDL]');
   EmitInstr('CALL FindClose');
   EmitInstr('MOV DWORD PTR [DOS_FINDHDL],-1');
+  EmitInstr('MOV EDI,DWORD PTR [EBP+8]');
+  EmitInstr('MOV DWORD PTR [EDI+268],-1');
+  EmitInstr('MOV DWORD PTR [EDI+272],0');
+  EmitInstr('JMP ' + TP_RT_PFX + 'FN_DN');
+  { SearchRec sans recherche ouverte }
+  EmitLabel(TP_RT_PFX + 'FN_NO');
+  EmitInstr('MOV DWORD PTR [DOSERROR],18');
   EmitLabel(TP_RT_PFX + 'FN_DN');
   EmitInstr('POPAD');
   EmitInstr('POP EBP');
@@ -45519,6 +45739,9 @@ Begin
   BcDefineDataLabel('HHEAP');     BcDataD(0);
   BcDefineDataLabel('NUMBUF');    BcDataZeros(32);
   BcDefineDataLabel('INBUF');     BcDataZeros(256);
+  BcDefineDataLabel('STDIN_BUF'); BcDataZeros(256);
+  BcDefineDataLabel('STDIN_POS'); BcDataD(0);
+  BcDefineDataLabel('STDIN_END'); BcDataD(0);
   BcDefineDataLabel('CHRBUF');    BcDataZeros(4);
   BcDefineDataLabel('OUTBUF');    BcDataZeros(4096);
   BcDefineDataLabel('OUTBUFLEN'); BcDataD(0);
@@ -49225,6 +49448,7 @@ Begin
     MarkIf('HIGHVIDEO','CRT'); MarkIf('LOWVIDEO','CRT'); MarkIf('NORMVIDEO','CRT');
     MarkIf('WINDOW','CRT'); MarkIf('DELAY','CRT'); MarkIf('SOUND','CRT');
     MarkIf('NOSOUND','CRT'); MarkIf('ASSIGNCRT','CRT');
+    MarkIf('SETUSEACP','CRT');
     MarkIf('WHEREX','CRT'); MarkIf('WHEREY','CRT');
     MarkIf('KEYPRESSED','CRT'); MarkIf('READKEY','CRT');
     MarkIf('INSLINE','CRT'); MarkIf('DELLINE','CRT'); MarkIf('TEXTMODE','CRT');

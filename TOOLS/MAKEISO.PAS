@@ -10,10 +10,13 @@
 Program MAKEISO;
 
 { Syntaxe :
-    MAKEISO image.iso [/BOOT:fichier] [/LABEL:nom] fichier [fichier ...]
+    MAKEISO image.iso [/BOOT:fichier] [/LABEL:nom] fichier [...]
+            [/DIR:NOM fichier [...]] [/ROOT fichier [...]]
 
   - Les fichiers sont places a la racine du CD-ROM (ISO 9660 niveau 1,
-    noms 8.3 en majuscules, version ;1).
+    noms 8.3 en majuscules, version ;1) ; ceux qui suivent /DIR:NOM vont
+    dans le sous-repertoire NOM (un seul niveau, comme D:\COMMAND),
+    jusqu'au /DIR: suivant ou /ROOT.
   - /BOOT: designe le fichier d amorce (IO.SYS) : il est decrit dans le
     catalogue El Torito en mode "sans emulation", charge par le BIOS en
     0000:7C00 (segment de chargement 0 = 07C0h). Seuls les 4 premiers
@@ -28,7 +31,7 @@ Program MAKEISO;
   - Disposition : secteurs 0..15 reserves, 16 descripteur primaire,
     17 descripteur d amorce El Torito, 18 terminateur, 19 table des
     chemins (L), 20 table des chemins (M), 21 catalogue d amorce,
-    22.. repertoire racine, puis les fichiers. }
+    22.. repertoire racine, les sous-repertoires, puis les fichiers. }
 
 {$IFDEF FPC}
   {$MODE TP}
@@ -38,7 +41,8 @@ Uses Dos;
 
 Const
   SECT       = 2048;
-  MAX_FILES  = 128;
+  MAX_FILES  = 256;
+  MAX_DIRS   = 8;
 
 Type
   TSector = Array[0..SECT-1] Of Byte;
@@ -50,6 +54,11 @@ Var
   FileSizes : Array[1..MAX_FILES] Of LongInt;
   FileLBA   : Array[1..MAX_FILES] Of LongInt;
   FileTime  : Array[1..MAX_FILES] Of LongInt;  { date et heure DOS }
+  FileDir   : Array[1..MAX_FILES] Of Integer;  { 0 racine, sinon DirNames }
+  DirNames  : Array[1..MAX_DIRS] Of String[8];
+  DirLBA, DirSectors : Array[1..MAX_DIRS] Of LongInt;
+  NDirs, CurDir : Integer;
+  PathSize : LongInt;
   NowTime   : LongInt;
   NFiles    : Integer;
   BootIdx   : Integer;
@@ -57,7 +66,7 @@ Var
   RootLBA, RootSectors, TotalSectors : LongInt;
   Iso : File;
   Sec : TSector;
-  I, J : Integer;
+  I, J, K : Integer;
   Arg, U : String;
   Yr, Mo, Dy, Dw, Hr, Mi, Sc, S100 : Word;
   SR : SearchRec;
@@ -280,41 +289,72 @@ Begin
   Close(F);
 End;
 
-Procedure WriteRootDir;
-Var Ofs, L, K : Integer; Name : String;
+{ Repertoire D (0 : racine) : '.', '..', puis (racine) les
+  sous-repertoires et les fichiers dans l'ordre des noms }
+Procedure WriteDir(D : Integer);
+Var Ofs, L, K, J : Integer; Name : String; Me, MeSz : LongInt;
 Begin
   FillSec(0);
   Ofs := 0;
-  Ofs := Ofs + PutDirRec(Ofs, RootLBA, RootSectors * SECT, 2, '', 0, NowTime);
+  If D = 0 Then Begin Me := RootLBA; MeSz := RootSectors * SECT End
+  Else Begin Me := DirLBA[D]; MeSz := DirSectors[D] * SECT End;
+  Ofs := Ofs + PutDirRec(Ofs, Me, MeSz, 2, '', 0, NowTime);
   Ofs := Ofs + PutDirRec(Ofs, RootLBA, RootSectors * SECT, 2, '', 1, NowTime);
-  For K := 1 To NFiles Do
+  J := 1;
+  For K := 1 To NFiles + 1 Do
   Begin
-    Name := IsoNames[K] + ';1';
-    L := 33 + Length(Name);
-    If Odd(L) Then Inc(L);
-    If Ofs + L > SECT Then
+    { sous-repertoires de la racine avant le fichier K (ordre des noms) }
+    If D = 0 Then
+      While (J <= NDirs) And ((K > NFiles) Or (FileDir[K] <> 0) Or
+            (DirNames[J] < IsoNames[K])) Do
+      Begin
+        L := 33 + Length(DirNames[J]);
+        If Odd(L) Then Inc(L);
+        If Ofs + L > SECT Then
+        Begin
+          WriteSec; FillSec(0); Ofs := 0;
+        End;
+        Ofs := Ofs + PutDirRec(Ofs, DirLBA[J], DirSectors[J] * SECT, 2,
+                               DirNames[J], -1, NowTime);
+        Inc(J);
+      End;
+    If (K <= NFiles) And (FileDir[K] = D) Then
     Begin
-      { un enregistrement ne chevauche jamais deux secteurs }
-      WriteSec; FillSec(0); Ofs := 0;
+      Name := IsoNames[K] + ';1';
+      L := 33 + Length(Name);
+      If Odd(L) Then Inc(L);
+      If Ofs + L > SECT Then
+      Begin
+        { un enregistrement ne chevauche jamais deux secteurs }
+        WriteSec; FillSec(0); Ofs := 0;
+      End;
+      Ofs := Ofs + PutDirRec(Ofs, FileLBA[K], FileSizes[K], 0, Name, -1,
+                             FileTime[K]);
     End;
-    Ofs := Ofs + PutDirRec(Ofs, FileLBA[K], FileSizes[K], 0, Name, -1,
-                           FileTime[K]);
   End;
   WriteSec;
 End;
 
-Function CountRootSectors : LongInt;
+Function CountDirSectors(D : Integer) : LongInt;
 Var Ofs, L, K : Integer; N : LongInt;
 Begin
   N := 1; Ofs := 34 + 34;
-  For K := 1 To NFiles Do
+  For K := 1 To NFiles + NDirs Do
   Begin
-    L := 33 + Length(IsoNames[K]) + 2;
-    If Odd(L) Then Inc(L);
-    If Ofs + L > SECT Then Begin Inc(N); Ofs := 0 End;
-    Ofs := Ofs + L;
+    L := -1;
+    If K > NFiles Then
+    Begin
+      If D = 0 Then L := 33 + Length(DirNames[K - NFiles]);
+    End
+    Else If FileDir[K] = D Then L := 33 + Length(IsoNames[K]) + 2;
+    If L > 0 Then
+    Begin
+      If Odd(L) Then Inc(L);
+      If Ofs + L > SECT Then Begin Inc(N); Ofs := 0 End;
+      Ofs := Ofs + L;
+    End;
   End;
-  CountRootSectors := N;
+  CountDirSectors := N;
 End;
 
 Procedure WriteBootCatalog;
@@ -347,6 +387,7 @@ Begin
 End;
 
 Procedure WritePathTable(BigEndian : Boolean);
+Var Ofs, K : Integer;
 Begin
   FillSec(0);
   PutB(0, 1);       { longueur de l identificateur }
@@ -354,6 +395,19 @@ Begin
   If BigEndian Then Begin PutDBE(2, RootLBA); PutWBE(6, 1) End
   Else Begin PutD(2, RootLBA); PutW(6, 1) End;
   PutB(8, 0);
+  { sous-repertoires (parent : la racine, entree 1), ordre des noms }
+  Ofs := 10;
+  For K := 1 To NDirs Do
+  Begin
+    PutB(Ofs, Length(DirNames[K]));
+    PutB(Ofs + 1, 0);
+    If BigEndian Then Begin PutDBE(Ofs + 2, DirLBA[K]); PutWBE(Ofs + 6, 1) End
+    Else Begin PutD(Ofs + 2, DirLBA[K]); PutW(Ofs + 6, 1) End;
+    PutStr(Ofs + 8, Length(DirNames[K]), DirNames[K]);
+    Ofs := Ofs + 8 + Length(DirNames[K]);
+    If Odd(Ofs) Then Inc(Ofs);
+  End;
+  PathSize := Ofs;
   WriteSec;
 End;
 
@@ -370,7 +424,7 @@ Begin
   PutW2(120, 1);              { taille de l ensemble }
   PutW2(124, 1);              { numero de sequence }
   PutW2(128, SECT);           { taille de bloc logique }
-  PutD2(132, 10);             { taille de la table des chemins }
+  PutD2(132, PathSize);       { taille de la table des chemins }
   PutD(140, 19);              { table L }
   PutD(144, 0);
   PutDBE(148, 20);            { table M }
@@ -426,6 +480,7 @@ End;
 
 BEGIN
   IsoName := ''; BootName := ''; VolLabel := 'PASDOWS95'; NFiles := 0;
+  NDirs := 0; CurDir := 0; PathSize := 10;
   BootSum := 0;
   GetDate(Yr, Mo, Dy, Dw); GetTime(Hr, Mi, Sc, S100);
   NowDT.Year := Yr; NowDT.Month := Mo; NowDT.Day := Dy;
@@ -439,6 +494,13 @@ BEGIN
     If (U = '/?') Or (U = '/H') Or (U = '--HELP') Then ShowHelp
     Else If Copy(U, 1, 6) = '/BOOT:' Then BootName := Copy(Arg, 7, 255)
     Else If Copy(U, 1, 7) = '/LABEL:' Then VolLabel := UpStr(Copy(Arg, 8, 255))
+    Else If (Copy(U, 1, 5) = '/DIR:') And (NDirs < MAX_DIRS) Then
+    Begin
+      Inc(NDirs);
+      DirNames[NDirs] := Copy(U, 6, 8);
+      CurDir := NDirs;
+    End
+    Else If U = '/ROOT' Then CurDir := 0
     Else If IsoName = '' Then IsoName := Arg
     Else If (Pos('*', Arg) > 0) Or (Pos('?', Arg) > 0) Then
     Begin
@@ -451,6 +513,7 @@ BEGIN
       Begin
         Inc(NFiles);
         FileNames[NFiles] := Dir + SR.Name;
+        FileDir[NFiles] := CurDir;
         FindNext(SR);
       End;
     End
@@ -458,6 +521,7 @@ BEGIN
     Begin
       Inc(NFiles);
       FileNames[NFiles] := Arg;
+      FileDir[NFiles] := CurDir;
     End;
   End;
   If IsoName = '' Then ShowHelp;
@@ -471,6 +535,7 @@ BEGIN
     If BootIdx = 0 Then
     Begin
       Inc(NFiles); FileNames[NFiles] := BootName; BootIdx := NFiles;
+      FileDir[NFiles] := 0;
     End;
   End;
   For I := 1 To NFiles Do
@@ -478,11 +543,25 @@ BEGIN
     IsoNames[I] := IsoFileName(FileNames[I]);
     FileSizes[I] := SizeOfFile(FileNames[I], FileTime[I]);
   End;
-  { tri des noms (ordre exige par ISO 9660) }
+  { tri des sous-repertoires puis des fichiers par repertoire et par nom
+    (ordre exige par ISO 9660) }
+  For I := 1 To NDirs - 1 Do
+    For J := I + 1 To NDirs Do
+      If DirNames[J] < DirNames[I] Then
+      Begin
+        U := DirNames[I]; DirNames[I] := DirNames[J]; DirNames[J] := U;
+        For K := 1 To NFiles Do
+          If FileDir[K] = I Then FileDir[K] := -J
+          Else If FileDir[K] = J Then FileDir[K] := I;
+        For K := 1 To NFiles Do
+          If FileDir[K] < 0 Then FileDir[K] := -FileDir[K];
+      End;
   For I := 1 To NFiles - 1 Do
     For J := I + 1 To NFiles Do
-      If IsoNames[J] < IsoNames[I] Then
+      If (FileDir[J] < FileDir[I]) Or ((FileDir[J] = FileDir[I]) And
+         (IsoNames[J] < IsoNames[I])) Then
       Begin
+        K := FileDir[I]; FileDir[I] := FileDir[J]; FileDir[J] := K;
         U := IsoNames[I]; IsoNames[I] := IsoNames[J]; IsoNames[J] := U;
         U := FileNames[I]; FileNames[I] := FileNames[J]; FileNames[J] := U;
         RootLBA := FileSizes[I]; FileSizes[I] := FileSizes[J];
@@ -491,9 +570,18 @@ BEGIN
         FileTime[J] := RootLBA;
         If BootIdx = I Then BootIdx := J Else If BootIdx = J Then BootIdx := I;
       End;
+  PathSize := 10;
+  For I := 1 To NDirs Do
+    PathSize := PathSize + 8 + ((Length(DirNames[I]) + 1) Div 2) * 2;
   RootLBA := 22;
-  RootSectors := CountRootSectors;
+  RootSectors := CountDirSectors(0);
   TotalSectors := RootLBA + RootSectors;
+  For I := 1 To NDirs Do
+  Begin
+    DirLBA[I] := TotalSectors;
+    DirSectors[I] := CountDirSectors(I);
+    TotalSectors := TotalSectors + DirSectors[I];
+  End;
   For I := 1 To NFiles Do
   Begin
     FileLBA[I] := TotalSectors;
@@ -515,7 +603,8 @@ BEGIN
   WritePathTable(False);
   WritePathTable(True);
   WriteBootCatalog;
-  WriteRootDir;
+  WriteDir(0);
+  For I := 1 To NDirs Do WriteDir(I);
   If BootIdx > 0 Then
     BootSum := BootChecksum(FileNames[BootIdx], FileSizes[BootIdx]);
   For I := 1 To NFiles Do
@@ -525,7 +614,9 @@ BEGIN
           ' secteurs de 2048 octets');
   For I := 1 To NFiles Do
   Begin
-    Write('  ', IsoNames[I]:12, FileSizes[I]:9, ' octets  LBA ', FileLBA[I]);
+    If FileDir[I] > 0 Then Write('  ', DirNames[FileDir[I]], '\', IsoNames[I])
+    Else Write('  ', IsoNames[I]:12);
+    Write(FileSizes[I]:9, ' octets  LBA ', FileLBA[I]);
     If I = BootIdx Then Write('  (amorce El Torito)');
     WriteLn;
   End;

@@ -1,0 +1,519 @@
+{ @author: Sylvain Maltais (support@gladir.com)
+  @created: 2023
+  @website(https://www.gladir.com/msdos0)
+  @abstract(Target: Turbo Pascal, Free Pascal)
+}
+
+Program FASTHELP;
+
+
+{$R-}  { comme Turbo Pascal (WPC verifie les bornes par defaut) }
+Uses DOS;
+
+Var
+ I:Integer;
+
+Function StrToUpper(S:String):String;
+Var
+ I:Byte;
+Begin
+ For I:=1 to Length(S)do Begin
+  If S[I] in['a'..'z']Then S[I]:=Chr(Ord(S[I])-32);
+ End;
+ StrToUpper:=S;
+End;
+
+Const
+ CmdN=96;
+ CmdName:Array[1..CmdN]of String[8]=(
+  'APPEND','ASSIGN','ATTRIB','BACKUP','BASIC','BREAK','CALL','CD','CHCP',
+  'CHKDSK','CHOICE','CLS','COMMAND','COMP','COPY','CREF','CTTY','CURL',
+  'DATE','DEBUG','DEL','DELTREE','DEVLOAD','DIR','DISKCOMP','DISKCOPY',
+  'DOSKEY','DOSSHELL','ECHO','EDIT','EDLIN','EMM386','EXE2BIN','EXIT',
+  'EXPAND','FASTHELP','FASTOPEN','FC','FDISK','FIND','FOR','FORMAT','GOTO',
+  'GRAFTABL','GWBASIC','IF','INTERLNK','INTERSVR','IPCONFIG','JOIN','LABEL',
+  'LINK','LOADFIX','LOADHIGH','MD','MEM','MIRROR','MODE','MORE','MOVE',
+  'MSAV','MSD','MSMOUSE','NLSFUNC','PATH','PAUSE','PING','POWER','PRINT',
+  'PRINTFIX','PROMPT','RD','RECOVER','REM','REN','REPLACE','RESTORE',
+  'SCANDISK','SET','SETVER','SHARE','SHIFT','SORT','SUBST','SYS','TIME',
+  'TIMEOUT','TREE','TRUENAME','TYPE','UNDELETE','VER','VERIFY','VOL',
+  'VSAFE','XCOPY'
+ );
+ CmdDesc:Array[1..CmdN]of String[64]=(
+  'Recherche les fichiers de donnees dans d''autres repertoires',
+  'Redirige les acces d''une unite de disque vers une autre',
+  'Affiche ou modifie les attributs des fichiers',
+  'Sauvegarde des fichiers',
+  'Interpreteur BASIC',
+  'Active ou desactive la verification de Ctrl+C',
+  'Appelle un fichier de commandes depuis un autre',
+  'Affiche ou change le repertoire courant (CHDIR)',
+  'Affiche ou change la page de codes',
+  'Verifie un disque et affiche un rapport d''etat',
+  'Attend un choix de l''utilisateur dans un fichier de commandes',
+  'Efface l''ecran',
+  'Lance une nouvelle copie de l''interpreteur de commandes',
+  'Compare le contenu de deux fichiers',
+  'Copie des fichiers',
+  'Produit une liste de references croisees',
+  'Change la console du systeme',
+  'Transfere une URL (http:// ou https://)',
+  'Affiche ou change la date',
+  'Debogueur et editeur de programmes',
+  'Supprime des fichiers (ERASE)',
+  'Supprime un repertoire et son contenu',
+  'Charge un pilote de peripherique',
+  'Affiche la liste des fichiers d''un repertoire',
+  'Compare deux disquettes',
+  'Copie une disquette',
+  'Historique et macros des commandes',
+  'Interface DOS Shell',
+  'Affiche un message ou active l''echo des commandes',
+  'Editeur de texte plein ecran',
+  'Editeur de texte ligne par ligne',
+  'Gestionnaire de memoire paginee (EMS)',
+  'Convertit un fichier .EXE en .COM ou .BIN',
+  'Quitte l''interpreteur de commandes',
+  'Decompresse des fichiers',
+  'Aide rapide sur les commandes (HELP)',
+  'Accelere l''ouverture des fichiers',
+  'Compare deux fichiers et affiche leurs differences',
+  'Partitionne un disque dur',
+  'Recherche une chaine de caracteres dans des fichiers',
+  'Repete une commande pour chaque fichier',
+  'Formate un disque',
+  'Saute a une etiquette d''un fichier de commandes',
+  'Charge une table de caracteres graphiques',
+  'Interpreteur GW-BASIC',
+  'Execution conditionnelle dans un fichier de commandes',
+  'Relie deux ordinateurs par un cable (client)',
+  'Relie deux ordinateurs par un cable (serveur)',
+  'Affiche la configuration IP (TCP/IP)',
+  'Joint une unite de disque a un repertoire',
+  'Cree, change ou supprime le nom de volume',
+  'Editeur de liens',
+  'Charge un programme au-dela des premiers 64 Ko',
+  'Charge un programme en memoire superieure (LH)',
+  'Cree un repertoire (MKDIR)',
+  'Affiche la memoire utilisee et libre',
+  'Enregistre les informations de reconstitution d''un disque',
+  'Configure les peripheriques',
+  'Affiche une sortie un ecran a la fois',
+  'Deplace ou renomme des fichiers',
+  'Antivirus',
+  'Diagnostics techniques du systeme',
+  'Pilote de souris',
+  'Charge les informations de pays',
+  'Affiche ou change le chemin de recherche des programmes',
+  'Suspend un fichier de commandes',
+  'Verifie qu''un ordinateur repond sur le reseau',
+  'Gestion de l''energie',
+  'Imprime des fichiers texte en arriere-plan',
+  'Corrige les erreurs d''imprimante',
+  'Change l''invite de commandes',
+  'Supprime un repertoire (RMDIR)',
+  'Recupere des fichiers d''un disque endommage',
+  'Commentaire dans un fichier de commandes',
+  'Renomme des fichiers (RENAME)',
+  'Remplace des fichiers',
+  'Restaure des fichiers sauvegardes par BACKUP',
+  'Verifie et repare un disque',
+  'Affiche ou change les variables d''environnement',
+  'Table des versions de MS-DOS des programmes',
+  'Partage et verrouillage des fichiers',
+  'Decale les parametres d''un fichier de commandes',
+  'Trie les lignes d''un texte',
+  'Associe un repertoire a une unite de disque',
+  'Copie les fichiers systeme sur un disque',
+  'Affiche ou change l''heure',
+  'Attend un nombre de secondes',
+  'Affiche l''arborescence des repertoires',
+  'Affiche le nom complet d''un fichier',
+  'Affiche le contenu d''un fichier texte',
+  'Recupere des fichiers supprimes',
+  'Affiche la version du systeme',
+  'Verification des ecritures sur disque',
+  'Affiche le nom et le numero de serie du volume',
+  'Surveillance antivirus',
+  'Copie des fichiers et des repertoires'
+ );
+
+{ Liste des commandes (FASTHELP ou HELP sans parametre) }
+Procedure ShowList;
+Var
+ K:Integer;
+ S:String;
+Begin
+ WriteLn('Pour en savoir plus sur une commande, tapez FASTHELP commande ',
+         'ou commande /?');
+ WriteLn;
+ For K:=1 to CmdN do Begin
+  S:=CmdName[K];
+  While Length(S)<10 do S:=S+' ';
+  WriteLn(S,CmdDesc[K]);
+ End;
+End;
+
+{ Sans aide ici : la commande elle-meme avec /? (programme externe, ou
+  commande interne par COMMAND /C) }
+Procedure HelpOf(Const C:String);
+Var
+ K:Integer;
+ Found:Boolean;
+Begin
+ Found:=False;
+ For K:=1 to CmdN do If CmdName[K]=C Then Found:=True;
+ If Not(Found)Then Begin
+  WriteLn('Pas d''aide de disponible sur cette commande.');
+  Exit;
+ End;
+ Exec(C,'/?');
+ If DosError<>0Then Exec('COMMAND.EXE','/C "'+C+' /?"');
+ If DosError<>0Then WriteLn('Pas d''aide de disponible sur cette commande.');
+End;
+
+BEGIN
+ If(ParamStr(1)='/?')or(ParamStr(1)='--help')or(ParamStr(1)='-h')or
+   (ParamStr(1)='/h')or(ParamStr(1)='/H')Then Begin
+  WriteLn('FASTHELP: Cette commande permet d''afficher une aide ',
+                     'rapide sur une commande sp‚cifi‚.');
+  WriteLn;
+  WriteLn('Syntaxe: FASTHELP [command]');
+  WriteLn;
+  WriteLn('command  Ce paramŠtre permet d''indiquer la commande.');
+ End
+  Else
+ If ParamCount>0Then For I:=1 to ParamCount do Begin
+  If StrToUpper(ParamStr(I))='APPEND'Then Begin
+   WriteLn('APPEND : Cette commande permet d''ouvrir des fichiers ',
+                'quelques se trouvant dans les r‚pertoires sp‚cifi‚s ',
+          'comme s''il s''agissait du r‚pertoire courant.');
+   WriteLn;
+   WriteLn('Syntaxe : APPEND [/E] [/PATH:ON|OFF] [/X:ON|OFF]');
+   WriteLn;
+   WriteLn(' /E         Il faut associ‚ la liste des r‚pertoires … une variable');
+   WriteLn('            d''environnement se nommant ®APPEND¯.');
+   WriteLn(' /PATH:OFF  Il ne faut pas rechercher dans la liste des r‚pertoires');
+   WriteLn('            ajout‚s lors de la recherche de fichiers de donn‚es.');
+   WriteLn(' /PATH:ON   Il faut rechercher dans la liste des r‚pertoires ajout‚s');
+   WriteLn('            lors de la recherche de fichiers de donn‚es.');
+   WriteLn(' /X:OFF     Il ne faut pas rechercher dans la liste des r‚pertoires');
+   WriteLn('            ajout‚s lors de l''ex‚cution d''un programme.');
+   WriteLn(' /X:ON      Il faut rechercher dans la liste des r‚pertoires ajout‚s');
+   WriteLn('            lors de l''ex‚cution d''un programme.');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='ATTRIB'Then Begin
+   WriteLn('ATTRIB - Cette commande permet de demander ou changer l''attribut d''un fichier');
+   WriteLn;
+   WriteLn('Syntaxe : ATTRIB nomdufichier [+R|-R] [+A|-A] [+S|-S] [+H|-H]');
+   WriteLn;
+   WriteLn(' -A   Enleve de l''attribut d''archive');
+   WriteLn(' +A   Ajout de l''attribut d''archive');
+   WriteLn(' -H   EnlŠve de l''attribut cach‚');
+   WriteLn(' +H   Ajout de l''attribut cach‚');
+   WriteLn(' -R   Enleve de l''attribut de lecture seulement');
+   WriteLn(' +R   Ajout de l''attribut de lecture seulement');
+   WriteLn(' -S   Enleve de l''attribut de systeme');
+   WriteLn(' +S   Ajout de l''attribut de systeme');
+   WriteLn;
+   WriteLn(' /S   Applique le changement dans les sous-repertoires recursivement');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='BASIC'Then Begin
+   WriteLn('BASIC - Cette commande permet de lancer l''interpreteur de BASIC.');
+   WriteLn;
+   WriteLn('Syntaxe : BASIC [fichier]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='CHKDSK'Then Begin
+   WriteLn('CHKDSK : Cette commande permet de v‚rifier le disque');
+   WriteLn;
+   WriteLn('Syntaxe : CHKDSK [disque:]');
+   WriteLn('          CHKDSK [/IMAGE:fichier]');
+   WriteLn;
+   WriteLn('disque:  Indique la lettre de l''unit‚ de disque');
+   WriteLn('/IMAGE   Indique le nom du fichier a utiliser comme disque');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='CHOICE'Then Begin
+   WriteLn('CHOICE : Cette commande permet de faire un choix.');
+   WriteLn;
+   WriteLn('Syntaxe : CHOICE [/C[:]choix] [/N] [/S] [/T[:]c,nn]');
+   WriteLn;
+   WriteLn('/C[:]touches  Indique la liste des touches accept‚es comme r‚ponse');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='COMMAND'Then Begin
+   WriteLn('COMMAND : Cette commande permet de lancer l''interpreteur de commande.');
+   WriteLn;
+   WriteLn('Syntaxe : COMMAND [/C command]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='COMP'Then Begin
+   WriteLn('COMP : Cette commande permet de comparer deux fichiers.');
+   WriteLn;
+   WriteLn('Syntaxe : COMP fichier1 fichier2 [/A] [/C] [/D] [/L] [/M]');
+   WriteLn;
+   WriteLn('  fichier1 Premier fichier a comparer');
+   WriteLn('  fichier2 Deuxieme fichier a comparer');
+   WriteLn('  /A       Affiche la difference en ASCII');
+   WriteLn('  /C       Affiche la difference en Caractere');
+   WriteLn('  /D       Affiche la difference en decimale');
+   WriteLn('  /L       Affiche le numero de ligne plutot que le deplacement');
+   WriteLn('  /M       Ne pas poser de question pour d''autres comparaisons');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='DEBUG'Then Begin
+   WriteLn('DEBUG : Cette commande permet de deboguer des programmes.');
+   WriteLn;
+   WriteLn('Syntaxe : DEBUG');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='DELTREE'Then Begin
+   Write('DELTREE : Cette commande permet de supprimer un repertoire ',
+         'avec ses fichiers et repertoire.');
+   WriteLn;
+   WriteLn('Syntaxe : DELTREE repertoire [/Y]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='DISKCOMP'Then Begin
+   WriteLn('DISKCOMP : Cette commande permet de comparer des disquettes ou des images.');
+   WriteLn;
+   WriteLn('Syntaxe : DISKCOMP disque: fichier');
+   WriteLn('          DISKCOMP fichier fichier');
+   WriteLn('          DISKCOMP fichier disque:');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='DISKCOPY'Then Begin
+   WriteLn('DISKCOPY : Cette commande permet de copier des disquettes ou des images.');
+   WriteLn;
+   WriteLn('Syntaxe : DISKCOPY disque: fichier');
+   WriteLn('          DISKCOPY fichier fichier');
+   WriteLn('          DISKCOPY fichier disque:');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='DOSKEY'Then Begin
+   WriteLn('DOSKEY : Cette commande permet de charger le programme DOSKEY.');
+   WriteLn;
+   WriteLn('Syntaxe : DOSKEY /SHELL');
+   WriteLn;
+   WriteLn(' /SHELL   Lance l''interpr‚teur de commande');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='DOSSHELL'Then Begin
+   WriteLn('DOSSHELL : Cette commande permet de lancer DOSSHELL.');
+   WriteLn;
+   WriteLn('Syntaxe : DOSSHELL [/ASCII128]');
+   WriteLn;
+   WriteLn(' /ASCII128   Ce parametre permet de lancer en mode compatibilite 128 caracteres seulement.');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='EDIT'Then Begin
+   WriteLn('EDIT : Cette commande permet d''editer un fichier texte ASCII.');
+   WriteLn;
+   WriteLn('Syntaxe : EDIT nomdufichier');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='EDLIN'Then Begin
+   WriteLn('EDLIN : Cette commande permet d''editer un fichier texte ASCII.');
+   WriteLn;
+   WriteLn('Syntaxe : EDLIN [nomdufichier]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='EXE2BIN'Then Begin
+   WriteLn('EXE2BIN : Cette commande permet de convertir un fichier EXE en binaire (COM).');
+   WriteLn;
+   WriteLn('Syntaxe : EXE2BIN fichier.exe [fichier.bin]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='FASTHELP'Then Begin
+   WriteLn('FASTHELP: Cette commande permet d''afficher une aide ',
+                      'rapide sur une commande sp‚cifi‚.');
+   WriteLn;
+   WriteLn('Syntaxe: FASTHELP [command]');
+   WriteLn;
+   WriteLn('command  Ce paramŠtre permet d''indiquer la commande.');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='FC'Then Begin
+   WriteLn('FC : Cette commande permet de comparer deux fichiers.');
+   WriteLn;
+   WriteLn('Syntaxe : FC fichier1 fichier2 [/B] [/C] [/L]');
+   WriteLn;
+   WriteLn('  fichier1 Premier fichier a comparer');
+   WriteLn('  fichier2 Deuxieme fichier a comparer');
+   WriteLn('  /B       Comparaison binaire');
+   WriteLn('  /C       Sans distinction minuscule/majuscule');
+   WriteLn('  /L       Comparaison ASCII ligne par ligne');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='FDISK'Then Begin
+   WriteLn('FDISK : Cette commande permet d''effectuer la gestion d''un disque dur.');
+   WriteLn;
+   WriteLn('Syntaxe : FDISK [fichier]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='FIND'Then Begin
+   WriteLn('FIND : Cette commande permet de rechercher une chaine de caractŠres dans des fichiers.');
+   WriteLn;
+   WriteLn('Syntaxe : FIND "chaine" [fichier] [/I] [/N] [/V]');
+   WriteLn;
+   WriteLn('"chaine"  Indique la chaŒne de caractŠres … rechercher dans les fichiers.');
+   WriteLn('/I        Il ne faut pas effectuer de distinction entre les majuscules et minuscules.');
+   WriteLn('/N        Affiche le num‚ro contenant la chaŒne de caractŠres trouv‚s.');
+   WriteLn('/V        Affiche toutes les lignes ne contenant pas la chaŒne de caractŠres recherch‚s.');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='FORMAT'Then Begin
+   WriteLn('FORMAT - Cette commande permet de formater un unit‚ de disquette.');
+   WriteLn;
+   WriteLn('Syntaxe: FORMAT [A:|B:] [360|720|1200|1440] [NV] [/F]');
+   WriteLn('         FORMAT fichier');
+   WriteLn;
+   WriteLn('fichier  Utiliser le fichier sp‚cifi‚ comme disquette');
+   WriteLn('     NV  Pas de v‚rification');
+   WriteLn('     /F  Force a utiliser ce format');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='GRAFTABL'Then Begin
+   WriteLn('GRAFTABL : Cette commande permet d''effectuer le chargement en memoire conventionnel ',
+                       'd''une table de police de caracteres pour les modes graphiques.');
+   WriteLn;
+   WriteLn('Syntaxe : GRAFTABL [/STA|/STATUS]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='GWBASIC'Then Begin
+   WriteLn('GWBASIC : Cette commande permet de lancer l''interpreteur de GWBASIC.');
+   WriteLn;
+   WriteLn('Syntaxe : GWBASIC [fichier]');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='LABEL'Then Begin
+   WriteLn('LABEL : Cette commande permet de changer le nom du volume');
+   WriteLn;
+   WriteLn('Syntaxe: LABEL [unite: [nouveaunom]]');
+   WriteLn;
+   WriteLn(' unite:      Indique l''unit‚ que vous souhaitez trait‚');
+   WriteLn(' nouveaunom  Indique le nouveau du volume');
+   WriteLn;
+   WriteLn('NB: Si le nouveaunom n''est pas d‚finit, il retournera le nom courant');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='MEM'Then Begin
+   WriteLn('MEM : Cette commande permet d''afficher les informations sur la m‚moire.');
+   WriteLn;
+   WriteLn('Syntaxe : MEM');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='MODE'Then Begin
+   WriteLn('MODE - Cette commande permet d''effectuer la gestion des parametres d''un peripherique');
+   WriteLn;
+   WriteLn('MODE [/?]');
+   WriteLn('MODE [MONO|BW40|CO40|BW80|CO80] [/GS]');
+   WriteLn('MODE CON[:] RATE=taux DELAY=delai');
+   WriteLn;
+   WriteLn(' MONO         Mode texte monochrome 80x25');
+   WriteLn(' BW40         Mode texte noir et blanc 40x25');
+   WriteLn(' CO40         Mode texte couleur 40x25');
+   WriteLn(' BW80         Mode texte noir et blanc 80x25');
+   WriteLn(' CO80         Mode texte couleur 80x25');
+   WriteLn(' RATE=taux    Taux de repetition du clavier (1 a 32)');
+   WriteLn(' DELAY=delai  Delai entre les repetitions (1 a 4)');
+   WriteLn(' /GS          Force a s''appliquer en fonction d''une Graphics Solution d''ATI');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='MORE'Then Begin
+   WriteLn('MORE : Cette commande permet de recevoir l''entree puis ',
+           'l''affiche sur un peripherique de sortie un ecran a la fois.');
+   WriteLn;
+   WriteLn('Syntaxe : MORE source');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='MOVE'Then Begin
+   WriteLn('MOVE : Cette commande permet de deplacer un fichier.');
+   WriteLn;
+   WriteLn('Syntaxe : MOVE source destination');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='MSD'Then Begin
+   WriteLn('MSD : Cette commande permet de fournir des informations ',
+           'techniques … propos de votre ordinateur');
+   WriteLn;
+   WriteLn('Syntaxe : MSD [/ASCII128]');
+   WriteLn;
+   WriteLn(' /ASCII128   Ce parametre permet de lancer en mode compatibilite 128 caracteres seulement.');
+  End
+   Else
+  IF StrToUpper(ParamStr(I))='POWER'Then Begin
+   WriteLn('POWER: Cette commande permet de fixer ou de ',
+                  'demander les paramŠtres d''‚conomiseur ',
+                  'd''‚nergie du systŠme d''exploitation.');
+   WriteLn;
+   WriteLn('Syntaxe: POWER ADV:MAX|MIN|OFF|REG|STD');
+   WriteLn;
+   WriteLn('MAX  Ce paramŠtre permet d''utiliser au maximum ',
+                  'l''alimentation en courant sans jamais tenter d''‚conomiser le courant.');
+   WriteLn('MIN  Ce paramŠtre permet d''utiliser au minimum ',
+                  'l''alimentation en courant.');
+   WriteLn('OFF  Ce paramŠtre permet d''‚teindre l''ordinateur.');
+   WriteLn('REG  Ce paramŠtre permet d''utiliser l''alimentation en ',
+                 'courant selon les demandes des applications. ',
+                 'Valeur par d‚faut.');
+   WriteLn('STD  Ce paramŠtre permet d''effectuer la gestion propre ',
+                 'au mat‚riel si compatible avec APM (Gestionnaire ',
+                 'am‚liorer de courant).');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='PRINT'Then Begin
+   WriteLn('PRINT: Cette commande permet d''effectuer la gestion des ',
+                  'traitements d''impressions du systŠme d''exploitation.');
+   WriteLn;
+   WriteLn('Syntaxe: PRINT [/C] [/T] [fichier]');
+   WriteLn;
+   WriteLn('/T  Ce paramŠtre permet d''annuler toutes les impressions.');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='REPLACE'Then Begin
+   WriteLn('REPLACE : Cette commande permet de remplacer un fichier.');
+   WriteLn;
+   WriteLn('Syntaxe : REPLACE source destination [/P]');
+   WriteLn;
+   WriteLn('  /P   Demande une confirmation avant de remplacer');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='SORT'Then Begin
+   WriteLn('SORT : Cette commande permet de trier un fichier texte ASCII.');
+   WriteLn;
+   WriteLn('Syntaxe : SORT [/R] fichier');
+   WriteLn;
+   WriteLn('fichier  Indique le fichier … trier.');
+   WriteLn('/+n      Trie l''entr‚e par les caractŠres de la colonne n.');
+   WriteLn('/R       Tri dans le sens inverse');
+  End
+   Else
+  If StrToUpper(ParamStr(I))='TREE'Then Begin
+   WriteLn('TREE : Cette commande permet d''afficher un arbre de repertoire.');
+   WriteLn;
+   WriteLn('Syntaxe : TREE [repertoire]');
+   WriteLn;
+  End
+   Else
+  If StrToUpper(ParamStr(I))='XCOPY'Then Begin
+   WriteLn('XCOPY : Cette commande permet de copier des fichiers.');
+   WriteLn;
+   WriteLn('Syntaxe : XCOPY source destination [/P] [/W]');
+   WriteLn;
+   WriteLn('    /A     Copie uniquement les fichiers d''attribut archive');
+   WriteLn('    /P     Demande une confirmation avant chaque fichier');
+   WriteLn('    /W     Affiche un message avant de commencer la copie');
+  End
+   Else
+  Begin
+   HelpOf(StrToUpper(ParamStr(I)));
+   Halt;
+  End;
+ End
+  Else
+ ShowList;
+END.

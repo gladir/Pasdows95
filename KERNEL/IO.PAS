@@ -38,7 +38,7 @@ Program IO;
       d'accueil, bureau et icones, barre des taches, menu Demarrer,
       fenetres deplacables (reduire, agrandir, fermer), souris ;
     - applications : Poste de travail (explorateur du CD-ROM),
-      Bloc-notes, Calculatrice, Paint, Invite MS-DOS, Panneau de
+      Bloc-notes, Calculatrice, Paint, Invite DOS, Panneau de
       configuration (Affichage, Date/Heure, Parametres regionaux,
       Systeme), Corbeille, Aide, Executer, Arreter Windows ;
     - mode MS-DOS plein ecran (texte 80x25).
@@ -291,7 +291,7 @@ Var
   PaintTool   : Integer;
   PaintDown   : Boolean;
   PaintLX, PaintLY : Integer;
-  { Invite MS-DOS }
+  { Invite DOS }
   ConBuf      : Array[0..ConMaxC * ConMaxR - 1] Of Char;
   ConCols, ConRows, ConX, ConY : Integer;
   ConLine     : String;
@@ -2743,9 +2743,9 @@ Begin
                   'Bloc de notas');
     wkCalc : WinTitle := L('Calculatrice', 'Calculator', 'Rechner',
                            'Calcolatrice', 'Calculadora');
-    wkDos : WinTitle := L('Invite MS-DOS', 'MS-DOS Prompt',
-                          'MS-DOS-Eingabeaufforderung', 'Prompt di MS-DOS',
-                          'S'#161'mbolo del sistema');
+    wkDos : WinTitle := L('Invite DOS', 'DOS Prompt',
+                          'DOS-Eingabeaufforderung', 'Prompt di DOS',
+                          'S'#161'mbolo de DOS');
     wkControl : WinTitle := L('Panneau de configuration', 'Control Panel',
                               'Systemsteuerung', 'Pannello di controllo',
                               'Panel de control');
@@ -5077,7 +5077,7 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
-{ Invite MS-DOS (fenetre ou plein ecran texte)                       }
+{ Invite DOS (fenetre ou plein ecran texte)                       }
 { ------------------------------------------------------------------ }
 
 Procedure ConClear;
@@ -5798,9 +5798,9 @@ Begin
       'Para abrir un programa, haga clic en Inicio y luego en ' +
       'Programas.');
     1 : TipText := L(
-      'Tapez SET LANGUAGE=EN dans l''Invite MS-DOS pour passer '#133' ' +
+      'Tapez SET LANGUAGE=EN dans l''Invite DOS pour passer '#133' ' +
       'l''anglais (GR, IT, SP ou FR).',
-      'Type SET LANGUAGE=FR in the MS-DOS Prompt to switch to French ' +
+      'Type SET LANGUAGE=FR in the DOS Prompt to switch to French ' +
       '(GR, IT, SP or EN).',
       'Geben Sie SET LANGUAGE=FR in der Eingabeaufforderung ein, um ' +
       'auf Franz'#148'sisch umzuschalten.',
@@ -5856,9 +5856,9 @@ Begin
     0 : HelpPara := L(
       'Menu D'#130'marrer : cliquez sur D'#130'marrer (ou Ctrl+'#144'chap) ' +
       'pour lancer ' +
-      'les programmes : Bloc-notes, Calculatrice, Paint, Invite MS-DOS.',
+      'les programmes : Bloc-notes, Calculatrice, Paint, Invite DOS.',
       'Start menu: click Start (or Ctrl+Esc) to run programs: Notepad, ' +
-      'Calculator, Paint, MS-DOS Prompt.',
+      'Calculator, Paint, DOS Prompt.',
       'Startmen'#129': Klicken Sie auf Start (oder Strg+Esc), um Programme ' +
       'zu starten: Editor, Rechner, Paint, MS-DOS.',
       'Menu Avvio: fare clic su Avvio (o Ctrl+Esc) per avviare i ' +
@@ -5896,11 +5896,11 @@ Begin
   Else
     HelpPara := L(
       'Langue : SET LANGUAGE=EN, GR, IT, SP ou FR dans AUTOEXEC.BAT ou ' +
-      'dans l''Invite MS-DOS, ou Param'#138'tres r'#130'gionaux dans le ' +
+      'dans l''Invite DOS, ou Param'#138'tres r'#130'gionaux dans le ' +
       'Panneau ' +
       'de configuration.',
       'Language: SET LANGUAGE=FR, GR, IT, SP or EN in AUTOEXEC.BAT or ' +
-      'in the MS-DOS Prompt, or Regional Settings in the Control Panel.',
+      'in the DOS Prompt, or Regional Settings in the Control Panel.',
       'Sprache: SET LANGUAGE=FR, EN, IT, SP oder GR in AUTOEXEC.BAT ' +
       'oder in der Eingabeaufforderung, oder L'#132'ndereinstellungen in ' +
       'der Systemsteuerung.',

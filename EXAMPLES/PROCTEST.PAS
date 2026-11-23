@@ -6,7 +6,7 @@
   Compilation avec WPC (Windows 95 Pascal Compiler) :
      WPC -CW32 PROCTEST.PAS PROCTEST.EXE
 
-  Utilisation, dans l'Invite MS-DOS : PROCTEST
+  Utilisation, dans l'Invite DOS : PROCTEST
   (le programme se relance lui-meme avec /c et /s pour ses fils) }
 
 Program ProcTest;

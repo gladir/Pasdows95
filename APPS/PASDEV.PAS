@@ -2750,7 +2750,7 @@ Begin
   Else
   Begin
     { console : l'interpreteur de commandes lance le programme dans la
-      fenetre Invite MS-DOS, puis PAUSE (la fenetre reste ouverte, avec
+      fenetre Invite DOS, puis PAUSE (la fenetre reste ouverte, avec
       la sortie du programme, jusqu'a une touche) }
     Cmd := GetEnv('COMSPEC');
     If (Cmd = '') Or Not FileExists(Cmd) Then Cmd := ExeDir + 'COMMAND.EXE';

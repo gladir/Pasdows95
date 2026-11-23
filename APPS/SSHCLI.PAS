@@ -6446,7 +6446,7 @@ Begin
   Hdr := False; Exe := ''; Ic := 0;
   Case I Of
     0 : Begin Nm := 'Syst'#232'me'; Hdr := True; End;
-    1 : Begin Nm := 'Invite MS-DOS'; Exe := 'COMMAND.EXE'; Ic := IcDos; End;
+    1 : Begin Nm := 'Invite DOS'; Exe := 'COMMAND.EXE'; Ic := IcDos; End;
     2 : Begin Nm := 'Gestionnaire des t'#226'ches'; Exe := 'TASKMGR.EXE'; Ic := IcTask; End;
     3 : Begin Nm := 'Informations syst'#232'me'; Exe := 'MSINFO32.EXE'; Ic := IcInfo; End;
     4 : Begin Nm := 'Panneau de configuration'; Exe := 'CONTROL.EXE'; Ic := IcControl; End;

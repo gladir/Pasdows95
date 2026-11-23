@@ -1,0 +1,180 @@
+{ @author: Sylvain Maltais (support@gladir.com)
+  @created: 2022
+  @website(https://www.gladir.com/msdos0)
+  @abstract(Target: Turbo Pascal, Free Pascal)
+}
+
+Program Tree;
+
+
+{$R-}  { comme Turbo Pascal (WPC verifie les bornes par defaut) }
+Uses DOS;
+
+Var
+ Language:(_French,_English,_Germany,_Italian,_Spain,_Albanian,_Portuguese,_Swedish,_Danish,_Japanese);
+ TmpLanguage:String;
+ LevelState:Array[0..255]of Boolean;
+ I:Byte;
+
+Function StrToUpper(S:String):String;
+Var
+ I:Byte; { Compteur de boucle attribue a la chaine de caracteres }
+Begin
+ For I:=1to Length(S)do S[I]:=UpCase(S[I]);
+ StrToUpper:=S;
+End;
+
+Function SetPath4AddFile(Path:String):String;Begin
+ If Path=''Then GetDir(0,Path);
+ If Path[Length(Path)]<>'\'Then Path:=Path+'\';
+ SetPath4AddFile:=Path;
+End;
+
+Function Path2Dir(Const Path:String):String;
+Var
+ D:DirStr;
+ N:NameStr;
+ E:ExtStr;
+Begin
+ Path2Dir:='';
+ If Path=''Then Exit;
+ FSplit(Path,D,N,E);
+ If E=''Then Begin
+  If D[Length(D)]<>'\'Then D:=D+'\';
+  D:=D+E;
+ End;
+ If D=''Then Path2Dir:='' Else
+ If D[Length(D)]<>'\'Then D:=D+'\';
+ Path2Dir:=D;
+End;
+
+Function FindCount(CurrDir:String):Word;
+Var
+ I:Integer;
+ Rec:SearchRec;
+Begin
+ I:=0;
+ FindFirst(CurrDir,Directory,Rec);
+ While DosError=0do Begin
+  If(Rec.Attr and Directory=Directory)Then Begin
+   If Not((Rec.Name='.')or(Rec.Name='..')or(Rec.Name=''))Then Begin
+    Inc(I);
+   End;
+  End;
+  FindNext(Rec);
+ End;
+ FindCount:=I;
+End;
+
+Procedure ShowTree(Position:Byte;CurrDir:String);
+Var
+ I,CurrEntry,Count:Integer;
+ Rec:SearchRec;
+Begin
+ Count:=FindCount(CurrDir);
+ CurrEntry:=0;
+ FindFirst(CurrDir,Directory,Rec);
+ While DosError=0do Begin
+  LevelState[Position]:=CurrEntry+1<Count;
+   If(Rec.Attr and Directory=Directory)Then Begin
+   If Not((Rec.Name='.')or(Rec.Name='..')or(Rec.Name=''))Then Begin
+    Inc(CurrEntry);
+    For I:=1 to Position do Begin
+     If LevelState[I]Then Write('    |')
+                     Else Write(' ':4);
+    End;
+    If(CurrEntry>=Count)Then WriteLn('+---',Rec.Name)
+                        Else WriteLn('---',Rec.Name);
+    ShowTree(Position+1,SetPath4AddFile(Path2Dir(CurrDir)+Rec.Name)+'*.*');
+   End;
+  End;
+  FindNext(Rec);
+
+ End;
+End;
+
+BEGIN
+ Language:=_French;
+ TmpLanguage:=GetEnv('LANGUAGE');
+ If TmpLanguage<>''Then Begin
+  If TmpLanguage[1]='"'Then TmpLanguage:=Copy(TmpLanguage,2,255);
+  If StrToUpper(Copy(TmpLanguage,1,2))='EN'Then Language:=_English Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='GR'Then Language:=_Germany Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='IT'Then Language:=_Italian Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='SP'Then Language:=_Spain Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='AL'Then Language:=_Albanian Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='PT'Then Language:=_Portuguese Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='SV'Then Language:=_Swedish Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='DA'Then Language:=_Danish Else
+  If StrToUpper(Copy(TmpLanguage,1,2))='JA'Then Language:=_Japanese;
+ End;
+ If(ParamStr(1)='/?')or(ParamStr(1)='--help')or(ParamStr(1)='-h')Then Begin
+  Case Language of
+   _Germany:Begin
+    WriteLn('Zeigt die Verzeichnisstruktur eines Laufwerks oder Pfads grafisch an.');
+    WriteLn;
+    WriteLn('TREE [Laufwerk:][Pfad]');
+   End;
+   _English:Begin
+    WriteLn('Grahpically displays the directory structure of a drive or path.');
+    WriteLn;
+    WriteLn('TREE [drive:][path]');
+   End;
+   _Italian:Begin
+    WriteLn('Visualizza graficamente la struttura delle directory di un''unità o percorso.');
+    WriteLn;
+    WriteLn('TREE [unità:][percorso]');
+   End;
+   _Spain:Begin
+    WriteLn('Muestra gráficamente la estructura de directorios de una unidad o ruta.');
+    WriteLn;
+    WriteLn('TREE [unidad:][ruta]');
+   End;
+   _Albanian:Begin
+    WriteLn('Shfaq në mënyrë grafike strukturën e drejtorive të një disku ose shtegu.');
+    WriteLn;
+    WriteLn('TREE [disku:][shtegu]');
+   End;
+   _Portuguese:Begin
+    WriteLn('Exibe graficamente a estrutura de diretórios de uma unidade ou caminho.');
+    WriteLn;
+    WriteLn('TREE [unidade:][caminho]');
+   End;
+   _Swedish:Begin
+    WriteLn('Visar grafiskt katalogstrukturen för en enhet eller sökväg.');
+    WriteLn;
+    WriteLn('TREE [enhet:][sökväg]');
+   End;
+   _Danish:Begin
+    WriteLn('Viser grafisk mappestrukturen for et drev eller sti.');
+    WriteLn;
+    WriteLn('TREE [drev:][sti]');
+   End;
+   _Japanese:Begin
+    WriteLn('Doraibu ya pasuuei no direkutori kouzou wo gurafiku hyouji shimasu.');
+    WriteLn;
+    WriteLn('TREE [doraibu:][pasuuei]');
+   End;
+   Else Begin
+    WriteLn('TREE : Cette commande permet d''afficher un arbre de repertoire.');
+    WriteLn;
+    WriteLn('Syntaxe : TREE [repertoire]');
+    WriteLn;
+   End;
+  End;
+ End
+  Else
+ Begin
+  For I:=0 to 255 do LevelState[I]:=False;
+  If ParamCount>1Then WriteLn('Trop de parametre')Else
+  If ParamCount=1Then Begin
+   WriteLn(FExpand(ParamStr(1)));
+   ShowTree(1,SetPath4AddFile(FExpand(ParamStr(1)))+'*.*');
+  End
+   Else
+  Begin
+   WriteLn(FExpand(''));
+   ShowTree(1,FExpand('*.*'));
+  End;
+ End;
+END.

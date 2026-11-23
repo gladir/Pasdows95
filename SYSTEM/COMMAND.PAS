@@ -60,6 +60,15 @@ Var
  BatArg:Array[0..MaxBatLevel*MaxBatArgs-1]of String[127];
  TopEcho:Boolean;
  ErrLevel:Integer;
+ { redirections de la commande en cours : <fichier, >fichier, >>fichier ;
+   PipeIn : entree venant du tuyau precedent }
+ RedirIn,RedirOut,PipeIn:String;
+ RedirApp:Boolean;
+ PipeNum:Integer;
+ { NoHist : commande de droite d'un tuyau ; PipeLeft : celle de gauche
+   (pas de ligne vide apres elle) }
+ NoHist,PipeLeft:Boolean;
+ PipeCol:Integer;
 
 Procedure RunCommand;Forward;
 Procedure RunBatch(Name,Args:String);Forward;
@@ -426,37 +435,6 @@ Begin
     End;
    End;
    ParamList:=TrimL(Copy(CmdStr,Q,255));
-   For J:=1 to Length(ParamList)do Begin
-    Case ParamList[J]of
-     '|':Begin
-      If Not(Pipe)Then Begin
-       {$I-}Assign(PipeFile,'COMMAND.TMP');
-       Rewrite(PipeFile);{$I-}
-       If IoResult<>0 Then Begin
-        WriteLn('Tuyau invalide !');
-       End;
-       Pipe:=True;
-      End;
-      PipeToCommand:=True;
-      PipeCommand:=TrimL(Copy(ParamList,J+1,255));
-      If J=1 Then ParamList:=''
-             Else ParamList:=Copy(ParamList,1,J-1);
-     End;
-     '>':Begin
-      If Not(Pipe)Then Begin
-       {$I-}Assign(PipeFile,TrimL(Copy(ParamList,J+1,255)));
-       Rewrite(PipeFile);{$I-}
-       If IoResult<>0 Then Begin
-        WriteLn('Tuyau invalide !');
-       End
-        Else
-       Pipe:=True;
-      End;
-      If J=1 Then ParamList:=''
-             Else ParamList:=Copy(ParamList,1,J-1);
-     End;
-    End;
-   End;
    Exit;
   End;
  End;
@@ -1084,9 +1062,20 @@ Begin
  CurrDrive:=Path2Drive(ShowDir);
  CurrLabel:=GetDiskLabel(Byte(CurrDrive)-64);
  P:=0;
+ PipeCol:=0;
  FindFirst(ShowDir,AnyFile,Info);
  If(ColWidth)in(Column)Then Begin
   While DOSError=0 do Begin
+   If(Pipe)Then Begin
+    { tuyau ou fichier : 5 noms par ligne }
+    Write(PipeFile,PadRight(Info.Name,16));
+    Inc(PipeCol);
+    If PipeCol=5Then Begin
+     WriteLn(PipeFile);
+     PipeCol:=0;
+    End;
+   End
+    Else
    Write(PadRight(Info.Name,16));
    FindNext(Info);
    If(Pause)in(Option)Then Begin
@@ -1099,17 +1088,23 @@ Begin
     End;
    End;
   End;
+  If(Pipe)Then Begin
+   If PipeCol>0Then WriteLn(PipeFile);
+  End
+   Else
   If WhereX>1Then WriteLn;
  End
   Else
  If(ColDouble)in(Column)Then While DOSError=0 do Begin
-  Write(PadRight(Info.Name,13));
+  If(Pipe)Then Write(PipeFile,PadRight(Info.Name,13))
+          Else Write(PadRight(Info.Name,13));
   If Info.Attr and Directory=Directory Then Begin
    If(Pipe)Then Write(PipeFile,PadRight('<DIR>',9))
            Else Write(PadRight('<DIR>',9));
   End
    Else
-  Write(Info.Size:9);
+  If(Pipe)Then Write(PipeFile,Info.Size:9)
+          Else Write(Info.Size:9);
   UnpackTime(Info.Time,T);
   If(Pipe)Then Begin
    Write(PipeFile,' ',T.Year:4,'-',PadZeroLeft(T.Month,2),'-',
@@ -1239,10 +1234,12 @@ Begin
   End;
  End
   Else
+ If(ParamList='.')and(Pipe)Then WriteLn(PipeFile)Else
  If ParamList='.'Then WriteLn Else
  If StrToUpper(ParamList)='OFF'Then Echo:=False Else
- If StrToUpper(ParamList)='ON'Then Echo:=True
-                              Else WriteLn(ParamList);
+ If StrToUpper(ParamList)='ON'Then Echo:=True Else
+ If(Pipe)Then WriteLn(PipeFile,ParamList)
+         Else WriteLn(ParamList);
 End;
 
 Procedure EraseCommand;
@@ -2257,19 +2254,124 @@ Begin
  End;
 End;
 
+{ Programme externe avec ses entree et sortie standard dans des fichiers
+  (<, >, >>, |) : CreateProcessA et STARTF_USESTDHANDLES }
+Function CreateProcessA(App,Cmd:Pointer;PA,TA,Inh,Fl:LongInt;Env,Dir,SI,
+ PI:Pointer):LongInt;stdcall;external 'kernel32.dll' name 'CreateProcessA';
+Function CreateFileA(N:Pointer;Acc,Sh,Sa,Disp,Fl,T:LongInt):LongInt;stdcall;
+ external 'kernel32.dll' name 'CreateFileA';
+Function SetFilePointer(H,D,P,M:LongInt):LongInt;stdcall;
+ external 'kernel32.dll' name 'SetFilePointer';
+Function CloseHandle(H:LongInt):LongInt;stdcall;
+ external 'kernel32.dll' name 'CloseHandle';
+Function GetStdHandle(N:LongInt):LongInt;stdcall;
+ external 'kernel32.dll' name 'GetStdHandle';
+Function WaitForSingleObject(H,T:LongInt):LongInt;stdcall;
+ external 'kernel32.dll' name 'WaitForSingleObject';
+Function GetExitCodeProcess(H:LongInt;P:Pointer):LongInt;stdcall;
+ external 'kernel32.dll' name 'GetExitCodeProcess';
+Function GetLastError:LongInt;stdcall;
+ external 'kernel32.dll' name 'GetLastError';
+
+{ Chaine S dans B en ASCIIZ }
+Procedure PutZ(Var B:Array of Char;S:String);
+Var
+ K:Integer;
+Begin
+ For K:=1 to Length(S)do B[K-1]:=S[K];
+ B[Length(S)]:=#0;
+End;
+
+Function RunRedir(Prog,Args,InF,OutF:String;App:Boolean):Word;
+Var
+ SI:Array[0..16]of LongInt;
+ PI:Array[0..3]of LongInt;
+ Cmd:Array[0..520]of Char;
+ NB:Array[0..259]of Char;
+ HIn,HOut,Code:LongInt;
+ S:String;
+ K,L:Integer;
+Begin
+ RunRedir:=0;
+ HIn:=-1;HOut:=-1;
+ If InF<>''Then Begin
+  PutZ(NB,InF);
+  HIn:=CreateFileA(@NB,LongInt($80000000),3,0,3,$80,0);
+  If HIn=-1Then Begin
+   RunRedir:=2;
+   Exit;
+  End;
+ End;
+ If OutF<>''Then Begin
+  PutZ(NB,OutF);
+  If(App)Then HOut:=CreateFileA(@NB,$40000000,1,0,4,$80,0)
+         Else HOut:=CreateFileA(@NB,$40000000,1,0,2,$80,0);
+  If HOut=-1Then Begin
+   If HIn<>-1Then CloseHandle(HIn);
+   RunRedir:=5;
+   Exit;
+  End;
+  If(App)Then SetFilePointer(HOut,0,0,2);
+ End;
+ FillChar(SI,SizeOf(SI),0);
+ SI[0]:=68;
+ SI[11]:=$100;
+ If HIn<>-1Then SI[14]:=HIn Else SI[14]:=GetStdHandle(-10);
+ If HOut<>-1Then SI[15]:=HOut Else SI[15]:=GetStdHandle(-11);
+ SI[16]:=SI[15];
+ FillChar(PI,SizeOf(PI),0);
+ { "programme" parametres }
+ S:='"'+Prog+'"';
+ L:=0;
+ For K:=1 to Length(S)do Begin
+  Cmd[L]:=S[K];
+  Inc(L);
+ End;
+ If Args<>''Then Begin
+  Cmd[L]:=' ';
+  Inc(L);
+  For K:=1 to Length(Args)do Begin
+   Cmd[L]:=Args[K];
+   Inc(L);
+  End;
+ End;
+ Cmd[L]:=#0;
+ If CreateProcessA(Nil,@Cmd,0,0,1,0,Nil,Nil,@SI,@PI)=0Then
+  RunRedir:=GetLastError
+ Else Begin
+  WaitForSingleObject(PI[0],-1);
+  Code:=0;
+  GetExitCodeProcess(PI[0],@Code);
+  ErrLevel:=Code;
+  CloseHandle(PI[1]);
+  CloseHandle(PI[0]);
+ End;
+ If HIn<>-1Then CloseHandle(HIn);
+ If HOut<>-1Then CloseHandle(HOut);
+End;
+
 Procedure UnknownCommand;
 Var
  Err:Word;
 Begin
- Exec(CurrCommand,ParamList);
- Err:=DosError;
- If Err=0Then ErrLevel:=DosExitCode;
+ { HELP : l'aide des commandes (FASTHELP) }
+ If CurrCommand='HELP'Then CurrCommand:='FASTHELP';
+ If(RedirIn<>'')or(RedirOut<>'')Then
+  Err:=RunRedir(CurrCommand,ParamList,RedirIn,RedirOut,RedirApp)
+ Else Begin
+  Exec(CurrCommand,ParamList);
+  Err:=DosError;
+  If Err=0Then ErrLevel:=DosExitCode;
+ End;
  Case Err of
   0:;
-  2:WriteLn('Commande ou nom de fichier non reconnu');
+  2,3:If(RedirIn<>'')and Not(FileExist(RedirIn))Then
+   WriteLn('Fichier introuvable : ',RedirIn)
+  Else
+   WriteLn('Commande ou nom de fichier non reconnu');
   Else Write(GetErrorMessage(Err));
  End;
- If BatLevel=0Then WriteLn;
+ If(BatLevel=0)and Not(PipeLeft)Then WriteLn;
 End;
 
 { Parametres %0 a %9, variables %NOM% et %% d'une ligne }
@@ -2378,139 +2480,247 @@ Begin
  If BatLevel=0Then Echo:=TopEcho;
 End;
 
-Procedure RunCommand;
-Label
- Restart;
+{ Position du premier caractere C hors des guillemets (0 : absent) }
+Function PosOut(C:Char;Const S:String):Integer;
 Var
- OY:Byte;
- Error:Word;
- PipeS,BatchName:String;
+ K:Integer;
+ Q:Boolean;
 Begin
+ PosOut:=0;
+ Q:=False;
+ For K:=1 to Length(S)do Begin
+  If S[K]='"'Then Q:=Not(Q)Else
+  If(S[K]=C)and Not(Q)Then Begin
+   PosOut:=K;
+   Exit;
+  End;
+ End;
+End;
+
+{ Retirer de S les redirections <fichier, >fichier et >>fichier }
+Procedure Redirect(Var S:String);
+Var
+ K,E:Integer;
+ C:Char;
+ F:String;
+Begin
+ Repeat
+  K:=PosOut('>',S);
+  E:=PosOut('<',S);
+  If(E>0)and((K=0)or(E<K))Then K:=E;
+  If K>0Then Begin
+   C:=S[K];
+   E:=K+1;
+   If(C='>')and(E<=Length(S))and(S[E]='>')Then Begin
+    RedirApp:=True;
+    Inc(E);
+   End
+    Else
+   If C='>'Then RedirApp:=False;
+   While(E<=Length(S))and(S[E]=' ')do Inc(E);
+   F:='';
+   While(E<=Length(S))and Not(S[E]in[' ','<','>'])do Begin
+    If S[E]<>'"'Then F:=F+S[E];
+    Inc(E);
+   End;
+   If C='<'Then RedirIn:=F Else RedirOut:=F;
+   Delete(S,K,E-K);
+  End;
+ Until K=0;
+ S:=TrimR(S);
+End;
+
+{ Fichier temporaire d'un tuyau : dans TEMP, ou ailleurs si TEMP n'est
+  pas accessible en ecriture (TEMP=D:\ sur le CD-ROM) }
+Function PipeName:String;
+Var
+ T,N,R:String;
+ K:Integer;
+ F:File;
+Begin
+ Inc(PipeNum);
+ Str(PipeNum,N);
+ For K:=0 to 3 do Begin
+  Case K of
+   0:T:=EnvGet('TEMP');
+   1:T:='C:\TEMP';
+   2:T:='C:\';
+   Else T:=GetCurrentDisk+':\';
+  End;
+  If T<>''Then Begin
+   If T[Length(T)]<>'\'Then T:=T+'\';
+   R:=T+'PIPE'+N+'.TMP';
+   Assign(F,R);
+   {$I-}Rewrite(F,1);{$I+}
+   If IOResult=0Then Begin
+    Close(F);
+    PipeName:=R;
+    Exit;
+   End;
+  End;
+ End;
+ PipeName:=R;
+End;
+
+Procedure DelFile(Const N:String);
+Var
+ F:File;
+Begin
+ Assign(F,N);
+ {$I-}Erase(F);{$I+}
+ If IOResult<>0Then;
+End;
+
+{ Une commande sans tuyau (ses redirections dans RedirIn, RedirOut) }
+Procedure RunSimple;
+Var
+ BatchName:String;
+ Err:Word;
+Begin
+ ExtractCommand;
+ CommandFound:=False;
+ For J:=Low(CommandList) to High(CommandList) do
+  If CurrCommand=CommandList[J]Then Begin
+   CommandFound:=True;
+   Break;
+  End;
+ If(CommandFound)Then Begin
+  { commande interne : sortie dans PipeFile (DIR, TYPE, ECHO, DATE...) }
+  If RedirOut<>''Then Begin
+   Assign(PipeFile,RedirOut);
+   {$I-}
+   If(RedirApp)Then Begin
+    Append(PipeFile);
+    If IOResult<>0Then Rewrite(PipeFile);
+   End
+    Else
+   Rewrite(PipeFile);
+   {$I+}
+   Err:=IOResult;
+   If Err<>0Then Begin
+    WriteLn(GetErrorMessage(Err));
+    Exit;
+   End;
+   Pipe:=True;
+  End;
+  Case(J)of
+   0:BreakCommand;
+   1:CallCommand;
+   2:ChDirCommand;
+   3:CHCPCommand;
+   4:ChDirCommand;
+   5:CLSCommand;
+   6:CopyCommand;
+   7:CTTYCommand;
+   8:DeleteCommand;
+   9:DeleteCommand;
+   10:DirCommand;
+   11:EchoCommand;
+   12:EraseCommand;
+   13:EraseCommand;
+   14:Terminated:=ExitCommand;
+   15:ForCommand;
+   16:IfCommand;
+   17:LoadHighCommand;
+   18:MkDirCommand;
+   19:MkDirCommand;
+   20:PathCommand;
+   21:PauseCommand;
+   22:PromptCommand;
+   23:RmDirCommand;
+   24:RemCommand;
+   25:RenameCommand;
+   26:RenameCommand;
+   27:RmDirCommand;
+   28:SetCommand;
+   29:ShiftCommand;
+   30:TimeCommand;
+   31:TrueNameCommand;
+   32:TypeCommand;
+   33:VerCommand;
+   34:VerifyCommand;
+   35:VolCommand;
+   36:DateCommand;
+   37:TimeOutCommand;
+   38:GotoCommand;
+  End;
+  If(Pipe)Then Begin
+   Close(PipeFile);
+   Pipe:=False;
+  End
+   Else
+  If BatLevel=0Then WriteLn;
+  Exit;
+ End;
+ { fichier de traitement par lots : NOM ou NOM.BAT (sans les
+   parametres de la ligne) }
+ BatchName:=BatchOf(CurrCommand);
+ If CmdStr='?'Then Begin
+  For I:=Low(CommandList) to High(CommandList)
+    do Write(PadRight(CommandList[I],10));
+  WriteLn;
+  WriteLn;
+ End
+  Else
+ If BatchName<>''Then Begin
+  { sans CALL, le fichier appelant ne reprend pas }
+  If BatLevel>0Then BatPc[BatLevel]:=BatN[BatLevel]+1;
+  RunBatch(BatchName,ParamList);
+ End
+  Else
+ UnknownCommand;
+End;
+
+Procedure RunCommand;
+Var
+ Error:Word;
+ S,Rest,T,TIn:String;
+ K:Integer;
+Begin
+ CmdStr:=TrimL(CmdStr);
  If(CmdStr<>'')and(CmdStr[1]='@')Then CmdStr:=TrimL(Copy(CmdStr,2,255));
- If BatLevel=0Then AddHistory(CmdStr);
-  { Change d'unit‚ de disque A:, B:, C:, D:,... }
+ If CmdStr=''Then Exit;
+ If(BatLevel=0)and Not(NoHist)Then AddHistory(CmdStr);
+ TIn:=PipeIn;
+ PipeIn:='';
+  { Change d'unite de disque A:, B:, C:, D:,... }
  If(Length(CmdStr)=2)and(CmdStr[2]=':')and(CmdStr[1]in['A'..'Z',
    'a'..'z'])Then Begin
-  {$I-}GetDir(Ord(UpCase(CmdStr[1]))-64,PipeS);
-  If PipeS<>''Then ChDir(PipeS)
-              Else ChDir(CmdStr+'\');{$I+}
+  {$I-}GetDir(Ord(UpCase(CmdStr[1]))-64,S);
+  If S<>''Then ChDir(S)
+          Else ChDir(CmdStr+'\');{$I+}
   Error:=IoResult;
   If Error<>0Then WriteLn(GetErrorMessage(Error));
   Exit;
  End;
-  { Recherche une commande interne }
-Restart:
- ExtractCommand;
- CommandFound:=False;
- For J:=Low(CommandList) to High(CommandList) do Begin
-  If(PipeToCommand)and(StrToUpper(CurrCommand)='MORE')Then Begin
-   Reset(PipeFile);
-   OY:=1;
-   While Not EOF(PipeFile)do Begin
-    ReadLn(PipeFile,PipeS);
-    WriteLn(PipeS);
-    Inc(OY);
-    If OY=25 Then Begin
-     Write('Presse ESC pour quitter ou une autre touche pour continuer...');
-     If ReadKey=#27 Then Begin
-      WriteLn;
-      Break;
-     End;
-     OY:=1;
-    End;
-   End;
-   Close(PipeFile);
-   Pipe:=False;
-   PipeToCommand:=False;
-   CommandFound:=True;
-   Exit;
-  End
-   Else
-  If CurrCommand=CommandList[J]Then Begin
-   Case(J)of
-    0:BreakCommand;
-    1:CallCommand;
-    2:ChDirCommand;
-    3:CHCPCommand;
-    4:ChDirCommand;
-    5:CLSCommand;
-    6:CopyCommand;
-    7:CTTYCommand;
-    8:DeleteCommand;
-    9:DeleteCommand;
-    10:DirCommand;
-    11:EchoCommand;
-    12:EraseCommand;
-    13:EraseCommand;
-    14:Terminated:=ExitCommand;
-    15:ForCommand;
-    16:IfCommand;
-    17:LoadHighCommand;
-    18:MkDirCommand;
-    19:MkDirCommand;
-    20:PathCommand;
-    21:PauseCommand;
-    22:PromptCommand;
-    23:RmDirCommand;
-    24:RemCommand;
-    25:RenameCommand;
-    26:RenameCommand;
-    27:RmDirCommand;
-    28:SetCommand;
-    29:ShiftCommand;
-    30:TimeCommand;
-    31:TrueNameCommand;
-    32:TypeCommand;
-    33:VerCommand;
-    34:VerifyCommand;
-    35:VolCommand;
-    36:DateCommand;
-    37:TimeOutCommand;
-    38:GotoCommand;
-   End;
-   If J<=High(CommandList)Then Begin
-    CommandFound:=True;
-    If BatLevel=0Then WriteLn;
-    Break;
-   End;
-  End;
+ { tuyau : la commande de gauche ecrit dans un fichier temporaire, lu
+   comme entree standard par la commande de droite }
+ K:=PosOut('|',CmdStr);
+ Rest:='';
+ If K>0Then Begin
+  Rest:=TrimL(Copy(CmdStr,K+1,255));
+  CmdStr:=TrimR(Copy(CmdStr,1,K-1));
  End;
- If(PipeToCommand)Then Begin
-  If Not(CommandFound)Then Begin
-   WriteLn('Commande non support‚ dans un contexte du tuyau');
-   Exit;
-  End;
-  CmdStr:=PipeCommand;
-  PipeCommand:='';
-  Goto Restart;
+ RedirIn:=TIn;RedirOut:='';RedirApp:=False;
+ Redirect(CmdStr);
+ T:='';
+ If Rest<>''Then Begin
+  T:=PipeName;
+  RedirOut:=T;
+  RedirApp:=False;
  End;
- If(Pipe)Then Begin
-  If Not(CommandFound)Then Begin
-   WriteLn('Redirection non support‚ dans un contexte du tuyau');
-   Exit;
-  End;
-  Pipe:=False;
-  Close(PipeFile);
+ PipeLeft:=Rest<>'';
+ RunSimple;
+ PipeLeft:=False;
+ If(Rest<>'')and Not(Terminated)Then Begin
+  { la commande de droite ne s'ajoute pas a l'historique }
+  PipeIn:=T;
+  CmdStr:=Rest;
+  NoHist:=True;
+  RunCommand;
+  NoHist:=False;
  End;
- If Not(CommandFound)Then Begin
-  { fichier de traitement par lots : NOM ou NOM.BAT (sans les
-    parametres de la ligne) }
-  BatchName:=BatchOf(CurrCommand);
-  If CmdStr='?'Then Begin
-   For I:=Low(CommandList) to High(CommandList)
-     do Write(PadRight(CommandList[I],10));
-   WriteLn;
-   WriteLn;
-  End
-   Else
-  If BatchName<>''Then Begin
-   { sans CALL, le fichier appelant ne reprend pas }
-   If BatLevel>0Then BatPc[BatLevel]:=BatN[BatLevel]+1;
-   RunBatch(BatchName,ParamList);
-  End
-   Else
-  UnknownCommand;
- End;
+ If T<>''Then DelFile(T);
 End;
 
 Function PopupHistory:String;
@@ -2680,6 +2890,8 @@ BEGIN
  FillChar(History,SizeOf(History),0);
  NumberHistory:=0;
  Echo:=True;Pipe:=False;PipeToCommand:=False;
+ RedirIn:='';RedirOut:='';PipeIn:='';PipeNum:=0;
+ NoHist:=False;PipeLeft:=False;
  InCmd:=0;
  BatLevel:=0;ErrLevel:=0;TopEcho:=True;
  If(ParamStr(1)='/?')or(ParamStr(1)='--help')or(ParamStr(1)='-h')Then Begin

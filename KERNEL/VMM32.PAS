@@ -702,6 +702,7 @@ Var
   DbgEntry, DbgEntryB : LongInt;
   DbgEv : Array[0..23] Of LongInt;    { DEBUG_EVENT (96 octets) }
   KNextStd, KNextDbg : LongInt;     { CreateProcessA -> ProcStart }
+  KNextIn : LongInt;
 
 Function DbgTrapK(Vec, F : LongInt) : Boolean; Forward;
 
@@ -1275,7 +1276,7 @@ Begin
   { tampon du noyau (proprietaire 0) : alloue pendant qu'un programme
     tourne, il etait libere a la fin de celui-ci (KFreeOwner) alors que
     l'antememoire continuait de s'en servir, ecrasant le bloc suivant
-    (fichier .EXE relu au retour a l'Invite MS-DOS) }
+    (fichier .EXE relu au retour a l'Invite DOS) }
   If CacheData[I] = 0 Then
   Begin
     Own := HeapOwner; HeapOwner := 0;
@@ -1505,6 +1506,10 @@ End;
 { Chemins                                                            }
 { ------------------------------------------------------------------ }
 
+{ lecteurs substitues (SUBST, DefineDosDeviceA) : X: -> C:\REP }
+Var
+  SubstMap : Array[0..25] Of String[63];
+
 { Chemin complet en majuscules : X:\REP\NOM }
 Function FullPath(Name : String) : String;
 Var S, R, Part : String; P : LongInt;
@@ -1549,7 +1554,11 @@ Begin
     End;
     R := R + '\' + Part;
   End;
+  If (R[1] >= 'A') And (R[1] <= 'Z') Then
+    If SubstMap[Ord(R[1]) - 65] <> '' Then
+      R := SubstMap[Ord(R[1]) - 65] + Copy(R, 3, 255);
   If Length(R) = 2 Then R := R + '\';
+  If (Length(R) > 3) And (R[Length(R)] = '\') Then Delete(R, Length(R), 1);
   FullPath := R;
 End;
 
@@ -10994,6 +11003,7 @@ Type
     Show     : LongInt;           { nCmdShow du lancement }
     { contexte (variables globales quand il s'execute) }
     Base, Size, Entry, Cmd, Env, StdOut, ErrMode, ExcFilter : LongInt;
+    StdIn : LongInt;
     MainT    : LongInt;
     Console  : Boolean;
     Path     : String[127];
@@ -11021,7 +11031,7 @@ Var
   AppPath    : String[127];
   AppCmd     : LongInt;     { ligne de commande ASCIIZ }
   AppEnv     : LongInt;     { bloc d'environnement }
-  AppStdOut  : LongInt;
+  AppStdOut, AppStdIn : LongInt;
   AppErrMode : LongInt;
   AppExcFilter : LongInt;
   AppProcObj : LongInt;
@@ -11057,6 +11067,7 @@ Begin
   Procs^[P].Base := AppBase; Procs^[P].Size := AppSize;
   Procs^[P].Entry := AppEntry; Procs^[P].Cmd := AppCmd;
   Procs^[P].Env := AppEnv; Procs^[P].StdOut := AppStdOut;
+  Procs^[P].StdIn := AppStdIn;
   Procs^[P].ErrMode := AppErrMode; Procs^[P].ExcFilter := AppExcFilter;
   Procs^[P].Obj := AppProcObj; Procs^[P].MainT := AppMainT;
   Procs^[P].Console := AppConsole;
@@ -11069,6 +11080,7 @@ Begin
   AppBase := Procs^[P].Base; AppSize := Procs^[P].Size;
   AppEntry := Procs^[P].Entry; AppCmd := Procs^[P].Cmd;
   AppEnv := Procs^[P].Env; AppStdOut := Procs^[P].StdOut;
+  AppStdIn := Procs^[P].StdIn;
   AppErrMode := Procs^[P].ErrMode; AppExcFilter := Procs^[P].ExcFilter;
   AppProcObj := Procs^[P].Obj; AppMainT := Procs^[P].MainT;
   AppConsole := Procs^[P].Console;
@@ -12725,7 +12737,7 @@ Begin
      (Wnds^[W].Surf.H = HH) Then Exit;
   SurfFree(Wnds^[W].Surf);
   { la surface appartient au fil de la fenetre, pas au programme en
-    cours : une fenetre du noyau (Invite MS-DOS...) creee ou agrandie
+    cours : une fenetre du noyau (Invite DOS...) creee ou agrandie
     pendant qu'un programme tourne perdait sa surface a la fin de
     celui-ci (KFreeOwner), puis la reutilisait par-dessus d'autres
     blocs (ligne de commande du programme suivant remplie de 07h) }
@@ -13588,7 +13600,7 @@ Begin
         Exit;
       End;
     End;
-    { icone de la barre de titre : menu systeme (l'Invite MS-DOS a le
+    { icone de la barre de titre : menu systeme (l'Invite DOS a le
       sien : Modifier, Proprietes) }
     If ((Wnds^[T].Style And WS_CAPTION) = WS_CAPTION) And
        ((Wnds^[T].Style And WS_SYSMENU) <> 0) And
@@ -14060,7 +14072,7 @@ Const
   mnNFile = 12; mnNEdit = 13; mnNSearch = 14; mnNHelp = 15;
   mnFdDrives = 16; mnFdTypes = 17; mnTaskCtx = 18; mnDrvCtx = 19;
   mnTreeCtx = 20;                 { element de l'arbre de l'Explorateur }
-  mnConSys = 21; mnConEdit = 22;  { menus de l'Invite MS-DOS }
+  mnConSys = 21; mnConEdit = 22;  { menus de l'Invite DOS }
   mnSysGen = 23;                  { menu systeme (icone du titre) }
   mnAccess = 24; mnGames = 25;    { Programmes, Accessoires, Jeux... }
   mnMedia = 26; mnInet = 27; mnTools = 28; mnFind = 29;
@@ -14169,7 +14181,7 @@ Var
   DispiOk   : Boolean;                     { interface Bochs/QEMU (1CEh) }
   KClass    : Array[0..47] Of LongInt;     { classe interne par sorte }
   SysMenuW  : LongInt;                     { fenetre du menu systeme }
-  { Invite MS-DOS : selection a la souris (lignes et colonnes
+  { Invite DOS : selection a la souris (lignes et colonnes
     affichees), mode Marquer, fenetre Proprietes }
   ConSelOn, ConSelDrag, ConMark : Boolean;
   ConSR0, ConSC0, ConSR1, ConSC1 : LongInt;
@@ -14322,9 +14334,8 @@ End;
   programmes .EXE de la racine du CD-ROM }
 Function PromptName : String;
 Begin
-  PromptName := L('Invite MS-DOS', 'MS-DOS Prompt',
-                  'MS-DOS-Eingabeaufforderung', 'Prompt di MS-DOS',
-                  'S'#161'mbolo de MS-DOS');
+  PromptName := L('Invite DOS', 'DOS Prompt', 'DOS-Eingabeaufforderung',
+                  'Prompt di DOS', 'S'#161'mbolo de DOS');
 End;
 
 { Entree I du dossier systeme (racine du CD-ROM ou C:\WINDOWS) }
@@ -14477,7 +14488,7 @@ Begin
   DeskCnt := 0; ExeCnt := 0;
   For I := 0 To MaxDesk - 1 Do DeskMul[I] := False;
   DeskMulN := 0;
-  { bureau sur le disque dur : Lisez-moi, Invite MS-DOS, Paint, Navigateur
+  { bureau sur le disque dur : Lisez-moi, Invite DOS, Paint, Navigateur
     Web et les programmes du dossier du systeme sont de vrais raccourcis
     (.LNK) du dossier du bureau, crees une fois ; sur le CD-ROM, des
     icones fixes }
@@ -18443,8 +18454,11 @@ Begin
       PaintIcon(icLogo, X1 + 14, Y1 + 14, 64);
       OutBold(X1 + 96, Y1 + 14, 'Pasdows 95', cBlack);
       OutTxt(X1 + 96, Y1 + 32, 'Version ' + KVersion + ' (VMM32)', cBlack);
-      OutTxt(X1 + 96, Y1 + 48, 'Copyright (C) 2026 Gladir.com', cBlack);
-      WrapText(X1 + 96, Y1 + 72, X2 - X1 - 104, L(
+      OutTxt(X1 + 96, Y1 + 48, L('Auteur : ', 'Author: ', 'Autor: ',
+             'Autore: ', 'Autor: ') + 'Sylvain Maltais', cBlack);
+      OutTxt(X1 + 96, Y1 + 64, L('Licence : ', 'License: ', 'Lizenz: ',
+             'Licenza: ', 'Licencia: ') + 'MIT', cBlack);
+      WrapText(X1 + 96, Y1 + 84, X2 - X1 - 104, L(
         'Noyau 32 bits capable d''ex'#130'cuter des programmes Windows 95 ' +
         '(KERNEL32, USER32, GDI32, WINMM).',
         '32-bit kernel able to run Windows 95 programs (KERNEL32, ' +
@@ -18453,11 +18467,11 @@ Begin
         'Nucleo a 32 bit per programmi Windows 95.',
         'N'#163'cleo de 32 bits para programas de Windows 95.'),
         cBlack, True);
-      HLine(X1 + 96, X2 - 10, Y1 + 120, cGray);
-      HLine(X1 + 96, X2 - 10, Y1 + 121, cWhite);
-      OutTxt(X1 + 96, Y1 + 130, L('M'#130'moire : ', 'Memory: ', 'Speicher: ',
+      HLine(X1 + 96, X2 - 10, Y1 + 138, cGray);
+      HLine(X1 + 96, X2 - 10, Y1 + 139, cWhite);
+      OutTxt(X1 + 96, Y1 + 146, L('M'#130'moire : ', 'Memory: ', 'Speicher: ',
              'Memoria: ', 'Memoria: ') + IntStr(MemKb) + ' Ko', cBlack);
-      OutTxt(X1 + 96, Y1 + 148, L('Libre : ', 'Free: ', 'Frei: ',
+      OutTxt(X1 + 96, Y1 + 164, L('Libre : ', 'Free: ', 'Frei: ',
              'Libera: ', 'Libre: ') + IntStr(HeapFreeBytes Div 1024) +
              ' Ko', cBlack);
       N := 1;
@@ -22902,7 +22916,7 @@ Begin
     Begin
       W := KCreate(ikAbout, L('A propos de Pasdows 95', 'About Pasdows 95',
                    'Info '#129'ber Pasdows 95', 'Informazioni su Pasdows 95',
-                   'Acerca de Pasdows 95'), icLogo, 115, 100, 410, 240,
+                   'Acerca de Pasdows 95'), icLogo, 115, 90, 410, 260,
                    WS_POPUP Or WS_CAPTION Or WS_SYSMENU, WS_EX_DLGMODALFRAME);
       If W >= 0 Then ShowW(W, True, True);
     End;
@@ -23039,7 +23053,7 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
-{ Console Win32 (programmes du sous-systeme console, Invite MS-DOS)   }
+{ Console Win32 (programmes du sous-systeme console, Invite DOS)   }
 { ------------------------------------------------------------------ }
 { Une seule console, 80 x 25, dans une fenetre interne (ikConsole) :
   cellules de 7 x 16 pixels (police 8x16 sans sa 8e colonne, comme la
@@ -23072,7 +23086,8 @@ Var
   ConPal : Array[0..15] Of LongInt;      { couleurs -> indices systeme }
   ConPalVer : LongInt;                   { PalVer de ConPal (-1 : a faire) }
   ConLastCY : LongInt;                   { ligne du curseur dessine }
-  ConQVk, ConQCh, ConQCtl : Array[0..ConQMax - 1] Of LongInt;
+  ConQVk, ConQCh : Array[0..ConQMax - 1] Of Byte;
+  ConQCtl : Array[0..ConQMax - 1] Of LongInt;
   ConQHead, ConQLen : LongInt;
   ConPend : String;                      { reste d'une ligne lue }
   ConKeep : Boolean;                     { garder la console a la fin du
@@ -23556,7 +23571,7 @@ End;
 
 
 { ------------------------------------------------------------------ }
-{ Invite MS-DOS : selection, menus Modifier et Proprietes             }
+{ Invite DOS : selection, menus Modifier et Proprietes             }
 { ------------------------------------------------------------------ }
 
 Procedure ConMouse(W, Msg, X, Y : LongInt);
@@ -25913,8 +25928,8 @@ Begin
     End;
   If N = 0 Then
   Begin
-    PutPStr(LongInt(@EnvBlk), 'PATH=D:\', 64);
-    N := 9;
+    PutPStr(LongInt(@EnvBlk), 'PATH=D:\;D:\COMMAND', 64);
+    N := 20;
   End;
   EnvBlk[N] := 0; EnvBlk[N + 1] := 0;
   EnvLen := N;
@@ -26058,6 +26073,11 @@ Begin
   If (AppStdOut <> 0) And ((N = -11) Or (N = -12)) Then
   Begin
     GetStdHandle := AppStdOut;
+    Exit;
+  End;
+  If (AppStdIn <> 0) And (N = -10) Then
+  Begin
+    GetStdHandle := AppStdIn;
     Exit;
   End;
   Case N Of
@@ -26503,7 +26523,8 @@ Function ReadConsoleInputA(H, Buf, N, PR : LongInt) : LongInt;
 Var I, VK, Ch, Ctl : LongInt;
 Begin
   ReadConsoleInputA := 0;
-  If Not IsConsoleH(H) Then Exit;
+  { clavier aussi par l'entree standard redirigee (ReadKey de Crt) }
+  If Not IsConsoleH(H) And ((H = 0) Or (H <> AppStdIn)) Then Exit;
   ConWaitKey;
   I := 0;
   While (ConQLen > 0) And (I < N) Do
@@ -26904,6 +26925,30 @@ Begin
   KObjs^[I].Used := False;
 End;
 
+{ Lecture des secteurs d'un volume ouvert par \\.\C: (CHKDSK, SCANDISK) }
+Function VolReadAt(V, P, N, Buf : LongInt; Var Got : LongInt) : Boolean;
+Var S, O, K : LongInt;
+Begin
+  VolReadAt := False; Got := 0;
+  If (V < 0) Or (VolType[V] = NetT) Then
+  Begin
+    SetErr(5);
+    Exit;
+  End;
+  FatIoErr := False;
+  While Got < N Do
+  Begin
+    S := (P + Got) Div 512; O := (P + Got) Mod 512;
+    If S >= VolSecs[V] Then Break;
+    K := 512 - O;
+    If K > N - Got Then K := N - Got;
+    MoveMem(VSec(V, S) + O, Buf + Got, K);
+    Got := Got + K;
+  End;
+  If FatIoErr Then SetErr(30);
+  VolReadAt := Not FatIoErr;
+End;
+
 Function KReadFile(H, Buf, N : LongInt; Var Got : LongInt) : Boolean;
 Var I, R : LongInt;
 Begin
@@ -26932,6 +26977,12 @@ Begin
     KObjs^[I].F2 := FoSize[R];
     If FatIoErr Then SetErr(30);
     KReadFile := Not FatIoErr;
+    Exit;
+  End;
+  If KObjs^[I].F4 = -3 Then
+  Begin
+    KReadFile := VolReadAt(KObjs^[I].F1, KObjs^[I].F3, N, Buf, Got);
+    KObjs^[I].F3 := KObjs^[I].F3 + Got;
     Exit;
   End;
   If KObjs^[I].F3 + N > KObjs^[I].F2 Then N := KObjs^[I].F2 - KObjs^[I].F3;
@@ -27418,7 +27469,71 @@ Begin
   If FdPresent Then R := R Or 1;
   For V := 0 To VolN - 1 Do
     If VolLetter[V] >= 65 Then R := R Or (1 Shl (VolLetter[V] - 65));
+  For V := 0 To 25 Do
+    If SubstMap[V] <> '' Then R := R Or (1 Shl V);
   GetLogicalDrives := R;
+End;
+
+{ SUBST : DefineDosDeviceA(0, 'Z:', 'C:\REP') ; DDD_REMOVE_DEFINITION (2)
+  retire la substitution }
+Function DefineDosDeviceA(F, PDev, PTgt : LongInt) : LongInt;
+Var D : String; K : LongInt;
+Begin
+  DefineDosDeviceA := 0;
+  D := UpStr(PStr(PDev));
+  If (Length(D) <> 2) Or (D[2] <> ':') Or (D[1] < 'A') Or (D[1] > 'Z') Then
+  Begin
+    SetErr(ErrInvalidParam);
+    Exit;
+  End;
+  K := Ord(D[1]) - 65;
+  If (F And 2) <> 0 Then SubstMap[K] := ''
+  Else
+  Begin
+    SubstMap[K] := '';
+    D := FullPath(PStr(PTgt));
+    If Length(D) = 3 Then Delete(D, 3, 1);
+    SubstMap[K] := D;
+  End;
+  DefineDosDeviceA := 1;
+End;
+
+{ QueryDosDeviceA : lecteurs substitues (\??\C:\REP), ou leur liste }
+Function QueryDosDeviceA(PDev, Buf, N : LongInt) : LongInt;
+Var D : String; K, P : LongInt;
+Begin
+  QueryDosDeviceA := 0;
+  P := 0;
+  If PDev = 0 Then
+  Begin
+    For K := 0 To 25 Do
+      If (SubstMap[K] <> '') And (P + 4 < N) Then
+      Begin
+        Mem[0:Buf + P] := 65 + K; Mem[0:Buf + P + 1] := Ord(':');
+        Mem[0:Buf + P + 2] := 0;
+        P := P + 3;
+      End;
+  End
+  Else
+  Begin
+    D := UpStr(PStr(PDev));
+    K := Ord(D[1]) - 65;
+    If (Length(D) <> 2) Or (K < 0) Or (K > 25) Or (SubstMap[K] = '') Then
+    Begin
+      SetErr(ErrFileNotFound);
+      Exit;
+    End;
+    D := '\??\' + SubstMap[K];
+    If Length(D) + 2 > N Then
+    Begin
+      SetErr(122);
+      Exit;
+    End;
+    PutPStr(Buf, D, N);
+    P := Length(D) + 1;
+  End;
+  If P < N Then Mem[0:Buf + P] := 0;
+  QueryDosDeviceA := P + 1;
 End;
 
 Function GetWindowsDirectoryA(Buf, N : LongInt) : LongInt;
@@ -39592,14 +39707,67 @@ Begin
   DkMake := True;
 End;
 
-{ raccourcis du bureau : Lisez-moi, Invite MS-DOS, Paint, Navigateur Web
+{ Premier demarrage apres l'installation : les commandes MS-DOS de
+  C:\WINDOWS\COMMAND.PAK (en-tetes de 16 octets : nom sur 12, taille sur
+  4, puis les donnees) vont dans C:\WINDOWS\COMMAND, hors du bureau }
+Procedure CmdUnpack;
+Var H, O, Got, N, Sz, K, Buf : LongInt; Hd : Array[0..15] Of Byte;
+    S, T, Nm : String;
+Begin
+  S := SysDir + 'COMMAND.PAK' + #0;
+  H := CreateFileA(LongInt(@S[1]), LongInt($80000000), 1, 0, 3, $80, 0);
+  If H = INVALID_HANDLE Then Exit;
+  T := SysDir + 'COMMAND' + #0;
+  CreateDirectoryA(LongInt(@T[1]), 0);
+  Buf := KAlloc(32768);
+  Repeat
+    Got := 0;
+    ReadFile(H, LongInt(@Hd), 16, LongInt(@Got), 0);
+    If Got < 16 Then Break;
+    Nm := '';
+    K := 0;
+    While (K < 12) And (Hd[K] <> 0) Do
+    Begin
+      Nm := Nm + Chr(Hd[K]);
+      Inc(K);
+    End;
+    Sz := MemL[0:LongInt(@Hd[12])];
+    T := SysDir + 'COMMAND\' + Nm + #0;
+    O := CreateFileA(LongInt(@T[1]), $40000000, 0, 0, 2, $80, 0);
+    While Sz > 0 Do
+    Begin
+      K := Min(Sz, 32768);
+      Got := 0;
+      ReadFile(H, Buf, K, LongInt(@Got), 0);
+      If Got <= 0 Then Break;
+      If O <> INVALID_HANDLE Then WriteFile(O, Buf, Got, LongInt(@N), 0);
+      Sz := Sz - Got;
+    End;
+    If O <> INVALID_HANDLE Then CloseHandle(O);
+  Until Sz > 0;
+  KFree(Buf);
+  CloseHandle(H);
+  DeleteFileA(LongInt(@S[1]));
+  KLog('Commandes MS-DOS : C:\WINDOWS\COMMAND.PAK deballe');
+End;
+
+{ raccourcis du bureau : Lisez-moi, Invite DOS, Paint, Navigateur Web
   et les programmes du dossier du systeme absents des menus }
 Procedure DeskShortcuts;
 Var I : LongInt; Nm, S : String; Dir, Ch : Boolean;
 Begin
+  If SysDir = 'C:\WINDOWS\' Then CmdUnpack;
   If Not DkLoaded Then DkLoad;
   S := DeskDir + #0;
   If Not IsDirPath(DeskDir) Then CreateDirectoryA(LongInt(@S[1]), 0);
+  { raccourci d'une version precedente : Invite MS-DOS -> Invite DOS }
+  For I := 0 To 1 Do
+  Begin
+    If I = 0 Then S := DeskDir + '\Invite MS-DOS.LNK' + #0
+    Else S := DeskDir + '\MS-DOS Prompt.LNK' + #0;
+    Nm := DeskDir + '\' + PromptName + '.LNK' + #0;
+    MoveFileA(LongInt(@S[1]), LongInt(@Nm[1]));
+  End;
   Ch := DkMake(L('Lisez-moi', 'Read Me', 'Liesmich', 'Leggimi',
                'L'#130'ame'), 'LISEZMOI.TXT', SysDir + 'LISEZMOI.TXT');
   If DkMake(PromptName, 'COMMAND.EXE', CmdPath) Then Ch := True;
@@ -41818,6 +41986,9 @@ Begin
   If (R = '') And (SysDir = 'C:\WINDOWS\') And (Pos('\', Name) = 0) Then
     R := FindInDir('C:\WINDOWS\SYSTEM\', Name);
   If R = '' Then R := FindInDir(SysDir, Name);
+  { commandes externes (C:\WINDOWS\COMMAND, ou D:\COMMAND sur le CD) }
+  If (R = '') And (Pos('\', Name) = 0) Then
+    R := FindInDir(SysDir + 'COMMAND\', Name);
   If (R = '') And (SysDir <> 'C:\') Then R := FindInDir('C:\', Name);
   If (R = '') And (SysDir <> 'D:\') Then R := FindInDir('D:\', Name);
   { dossiers de la variable PATH }
@@ -42708,10 +42879,10 @@ Begin
     Procs^[P].Show := Show;
     KLog('Lancement de ' + S + ' (sous-systeme ' + IntStr(Sub) +
          ', processus ' + IntStr(Procs^[P].Pid) + ')');
-    { programme console : la console (fenetre Invite MS-DOS) }
+    { programme console : la console (fenetre Invite DOS) }
     AppConsole := Sub = 3;
     { STARTF_USESTDHANDLES : sorties dans un fichier, sans console }
-    AppStdOut := KNextStd;
+    AppStdOut := KNextStd; AppStdIn := KNextIn;
     If KNextStd <> 0 Then AppConsole := False;
     { debogage : INT 3 au point d'entree (premier arret) }
     If KNextDbg <> 0 Then
@@ -42771,12 +42942,12 @@ Begin
 End;
 
 { ------------------------------------------------------------------ }
-{ Lancer un programme depuis un autre (Invite MS-DOS)                  }
+{ Lancer un programme depuis un autre (Invite DOS)                  }
 { ------------------------------------------------------------------ }
 { Un seul programme Win32 a la fois : CreateProcessA note le programme
   demande ; quand l'appelant l'attend (WaitForSingleObject), il se
   termine, le programme demande demarre, puis l'appelant est relance
-  (l'Invite MS-DOS avec /R : sans banniere, meme console, meme
+  (l'Invite DOS avec /R : sans banniere, meme console, meme
   repertoire). }
 
 { ------------------------------------------------------------------ }
@@ -43108,23 +43279,31 @@ Begin
     { STARTUPINFO : dwFlags +44 (STARTF_USESHOWWINDOW 1), wShowWindow +48 }
     Sh := 1;
     If (SI <> 0) And ((MemL[0:SI + 44] And 1) <> 0) Then Sh := MemW[0:SI + 48];
+    { sans dossier : celui du programme appelant (comme Windows) }
     D := '';
-    If PDir <> 0 Then D := PStr(PDir);
+    If PDir <> 0 Then D := PStr(PDir)
+    Else If CurProc > 0 Then D := CurDirS;
     { STARTF_USESTDHANDLES (100h) : hStdOutput (+60) }
-    KNextStd := 0;
+    { (hStdInput +56 ; une poignee de console garde la console) }
+    KNextStd := 0; KNextIn := 0;
     If (SI <> 0) And ((MemL[0:SI + 44] And $100) <> 0) Then
+    Begin
       KNextStd := MemL[0:SI + 60];
+      KNextIn := MemL[0:SI + 56];
+      If IsConsoleH(KNextStd) Then KNextStd := 0;
+      If IsConsoleH(KNextIn) Then KNextIn := 0;
+    End;
     { DEBUG_PROCESS / DEBUG_ONLY_THIS_PROCESS : une session a la fois }
     KNextDbg := Flags And 3;
     If (KNextDbg <> 0) And DbgOn Then
     Begin
-      KNextStd := 0; KNextDbg := 0;
+      KNextStd := 0; KNextDbg := 0; KNextIn := 0;
       SetErr(5);
       Exit;
     End;
     P := ProcStart(F, Args, D, Sh, ((Flags And 4) <> 0) Or (KNextDbg <> 0));
     If (P >= 0) And (KNextDbg <> 0) Then DbgStart(P);
-    KNextStd := 0; KNextDbg := 0;
+    KNextStd := 0; KNextDbg := 0; KNextIn := 0;
     If P < 0 Then
     Begin
       SetErr(193);
@@ -47093,11 +47272,13 @@ Const
 Type
   TLdtArr = Array[0..LdtMax - 1] Of LongInt;
   PLdtArr = ^TLdtArr;
+  TLdt2Arr = Array[0..LdtMax * 2 - 1] Of LongInt;
+  PLdt2Arr = ^TLdt2Arr;
 
 Type
   TCtx16Tab = Array[0..MaxThread * 16 - 1] Of LongInt;
 Var
-  Ldt : Array[0..LdtMax * 2 - 1] Of LongInt;
+  Ldt : PLdt2Arr;                    { dans le tas (InitW16) }
   LdtUsed : Array[0..LdtMax - 1] Of Boolean;
   { blocs globaux : taille, nombre de tuiles, adresse, proprietaire ;
     tables dans le tas (InitW16) : l'image du noyau doit rester sous
@@ -47129,8 +47310,8 @@ Begin
     Limit := Limit Shr 12;
     G := $800000;
   End;
-  Ldt[I * 2] := (Limit And $FFFF) Or ((Base And $FFFF) Shl 16);
-  Ldt[I * 2 + 1] := ((Base Shr 16) And $FF) Or (Acc Shl 8) Or
+  Ldt^[I * 2] := (Limit And $FFFF) Or ((Base And $FFFF) Shl 16);
+  Ldt^[I * 2 + 1] := ((Base Shr 16) And $FF) Or (Acc Shl 8) Or
                     (Limit And $F0000) Or G Or (Base And LongInt($FF000000));
 End;
 
@@ -47142,9 +47323,9 @@ Begin
   If (Sel And 4) = 0 Then Exit;
   I := (Sel Shr 3) And $1FFF;
   If I >= LdtMax Then Exit;
-  SelBase := ((Ldt[I * 2] Shr 16) And $FFFF) Or
-             ((Ldt[I * 2 + 1] And $FF) Shl 16) Or
-             (Ldt[I * 2 + 1] And LongInt($FF000000));
+  SelBase := ((Ldt^[I * 2] Shr 16) And $FFFF) Or
+             ((Ldt^[I * 2 + 1] And $FF) Shl 16) Or
+             (Ldt^[I * 2 + 1] And LongInt($FF000000));
 End;
 
 Function SelLimit(Sel : LongInt) : LongInt;
@@ -47154,8 +47335,8 @@ Begin
   If (Sel And 4) = 0 Then Exit;
   I := (Sel Shr 3) And $1FFF;
   If I >= LdtMax Then Exit;
-  L := (Ldt[I * 2] And $FFFF) Or (Ldt[I * 2 + 1] And $F0000);
-  If (Ldt[I * 2 + 1] And $800000) <> 0 Then L := (L Shl 12) Or $FFF;
+  L := (Ldt^[I * 2] And $FFFF) Or (Ldt^[I * 2 + 1] And $F0000);
+  If (Ldt^[I * 2 + 1] And $800000) <> 0 Then L := (L Shl 12) Or $FFF;
   SelLimit := L;
 End;
 
@@ -47171,7 +47352,7 @@ Function KSelLive(Sel : LongInt) : Boolean;
 Begin
   If (Sel And 4) = 0 Then KSelLive := True
   Else KSelLive := SelValid(Sel) And
-                   ((Ldt[((Sel Shr 3) And $1FFF) * 2 + 1] And $8000) <> 0);
+                   ((Ldt^[((Sel Shr 3) And $1FFF) * 2 + 1] And $8000) <> 0);
 End;
 
 { N selecteurs consecutifs ; selecteur du premier ou 0 }
@@ -47190,7 +47371,7 @@ Begin
         LdtUsed[K] := True;
         GSize^[K] := 0; GTiles^[K] := 0; GLin^[K] := 0; GLock^[K] := 0;
         GOwner^[K] := HeapOwner;
-        Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
+        Ldt^[K * 2] := 0; Ldt^[K * 2 + 1] := 0;
       End;
       SelAlloc := ((I - N + 1) Shl 3) Or 7;
       Exit;
@@ -47207,7 +47388,7 @@ Begin
     If (K > 0) And (K < LdtMax) Then
     Begin
       LdtUsed[K] := False;
-      Ldt[K * 2] := 0; Ldt[K * 2 + 1] := 0;
+      Ldt^[K * 2] := 0; Ldt^[K * 2 + 1] := 0;
       GSize^[K] := 0; GTiles^[K] := 0;
     End;
 End;
@@ -47292,7 +47473,7 @@ Begin
   FillMem(Lin, Size, 0);
   MoveMem(GLin^[I], Lin, Min(Size, GSize^[I]));
   KFree(GLin^[I]);
-  Acc := (Ldt[I * 2 + 1] Shr 8) And $FF;
+  Acc := (Ldt^[I * 2 + 1] Shr 8) And $FF;
   If Tiles <= GTiles^[I] Then
   Begin
     If Tiles < GTiles^[I] Then
@@ -47321,7 +47502,7 @@ Begin
     Begin
       If GTiles^[I] > 0 Then KFree(GLin^[I]);
       LdtUsed[I] := False;
-      Ldt[I * 2] := 0; Ldt[I * 2 + 1] := 0;
+      Ldt^[I * 2] := 0; Ldt^[I * 2 + 1] := 0;
       GTiles^[I] := 0;
     End;
 End;
@@ -47576,6 +47757,8 @@ Begin
   GLin := PLdtArr(KAlloc(LdtMax * 4));
   GOwner := PLdtArr(KAlloc(LdtMax * 4));
   GLock := PLdtArr(KAlloc(LdtMax * 4));
+  Ldt := PLdt2Arr(KAlloc(LdtMax * 8));
+  FillMem(LongInt(Ldt), LdtMax * 8, 0);
   HeapOwner := A;
   { TSS : pile de l'anneau 0 (SS0 = 10h), pas de table d'E/S }
   FillMem(LongInt(@Tss), 128, 0);
@@ -47586,7 +47769,7 @@ Begin
   Gdt[10] := 103 Or ((B And $FFFF) Shl 16);
   Gdt[11] := ((B Shr 16) And $FF) Or $8900 Or (B And LongInt($FF000000));
   { LDT }
-  B := LongInt(@Ldt);
+  B := LongInt(Ldt);
   Gdt[12] := ((LdtMax * 8 - 1) And $FFFF) Or ((B And $FFFF) Shl 16);
   Gdt[13] := ((B Shr 16) And $FF) Or $8200 Or (B And LongInt($FF000000));
   BuildW16Stubs;
@@ -67352,6 +67535,71 @@ Begin
   GetIfEntry := 0;
 End;
 
+{ IPHLPAPI : GetAdaptersInfo et GetNetworkParams (IPCONFIG) }
+Procedure IpAddrStr(A, IP, Mask : LongInt);
+Begin
+  FillMem(A, 40, 0);
+  PutPStr(A + 4, IpStr(IP), 16);
+  If Mask <> 0 Then PutPStr(A + 20, IpStr(Mask), 16);
+End;
+
+Function GetAdaptersInfo(P, PSize : LongInt) : LongInt;
+Begin
+  If PSize = 0 Then
+  Begin
+    GetAdaptersInfo := 87;
+    Exit;
+  End;
+  If NicBase = 0 Then
+  Begin
+    GetAdaptersInfo := 232;                         { ERROR_NO_DATA }
+    Exit;
+  End;
+  If (P = 0) Or (MemL[0:PSize] < 640) Then
+  Begin
+    MemL[0:PSize] := 640;
+    GetAdaptersInfo := 111;                 { ERROR_BUFFER_OVERFLOW }
+    Exit;
+  End;
+  FillMem(P, 640, 0);
+  MemL[0:P + 4] := 1;
+  PutPStr(P + 8, '{PASDOWS-NIC-0}', 260);
+  PutPStr(P + 268, NicDesc, 132);
+  MemL[0:P + 400] := 6;
+  MoveMem(LongInt(@NicMac), P + 404, 6);
+  MemL[0:P + 412] := 1; MemL[0:P + 416] := 6;   { Ethernet }
+  MemL[0:P + 420] := 1;                         { DHCP }
+  MemL[0:P + 424] := P + 428;
+  IpAddrStr(P + 428, NetIP, NetMask);
+  IpAddrStr(P + 468, NetGw, 0);
+  IpAddrStr(P + 508, NetDhcpSrv, 0);
+  MemL[0:P + 636] := NetLease;
+  GetAdaptersInfo := 0;
+End;
+
+Function GetNetworkParams(P, PSize : LongInt) : LongInt;
+Var N : LongInt;
+Begin
+  If PSize = 0 Then
+  Begin
+    GetNetworkParams := 87;
+    Exit;
+  End;
+  If (P = 0) Or (MemL[0:PSize] < 584) Then
+  Begin
+    MemL[0:PSize] := 584;
+    GetNetworkParams := 111;
+    Exit;
+  End;
+  FillMem(P, 584, 0);
+  N := 132;
+  GetComputerNameA(P, LongInt(@N));
+  MemL[0:P + 264] := P + 268;
+  IpAddrStr(P + 268, NetDns, 0);
+  MemL[0:P + 308] := 1;                         { diffusion }
+  GetNetworkParams := 0;
+End;
+
 { ------------------------------------------------------------------ }
 { Ethernet et ARP                                                      }
 { ------------------------------------------------------------------ }
@@ -80825,7 +81073,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   Thread32First, Thread32Next, Module32First, Module32Next, EnumWindows,
   EnumThreadWindows, IsHungAppWindow, SwitchToThisWindow, EndTask,
   GetUserNameA, GetComputerNameA, GetNumberOfInterfaces, GetIfTable,
-  GetIfEntry,
+  GetIfEntry, GetAdaptersInfo, GetNetworkParams,
   CheckMenuRadioItem,
   OpenEventA, OpenSemaphoreA, WaitForSingleObjectEx, WaitForMultipleObjects,
   WaitForMultipleObjectsEx, MsgWaitForMultipleObjects,
@@ -80842,6 +81090,7 @@ exports VideoForWindowsVersion, GetDiskFreeSpaceExA,
   RegEnumValueA, RegDeleteValueA, RegQueryInfoKeyA,
   RtlMoveMemory, RtlZeroMemory, RtlFillMemory, OpenMutexA, GetShortPathNameA,
   GetLogicalDriveStringsA, MoveFileExA, GetTempFileNameA, SearchPathA,
+  DefineDosDeviceA, QueryDosDeviceA,
   SystemTimeToFileTime, GetLocaleInfoA, CreateFileMappingA, MapViewOfFile,
   FlushViewOfFile, UnmapViewOfFile, CreateScalableFontResourceA, CreateCaret,
   DestroyCaret, SetCaretPos, ShowCaret, HideCaret, ExcludeUpdateRgn,
@@ -84252,7 +84501,7 @@ End;
 { ------------------------------------------------------------------ }
 { Interpreteur de commandes integre (COMMAND.COM)                     }
 { ------------------------------------------------------------------ }
-{ COMSPEC designe C:\COMMAND.COM ; sans ce fichier (l'Invite MS-DOS de
+{ COMSPEC designe C:\COMMAND.COM ; sans ce fichier (l'Invite DOS de
   Pasdows est un programme Win32), EXEC charge un interpreteur integre :
   un .COM de 5 octets (HLT ; INT 21h ; JMP 100h) dont le HLT donne la
   main au moniteur. Les commandes internes sont executees ici ; pour
@@ -88059,16 +88308,16 @@ Begin
     G := $8000;
   End
   Else If G <> 0 Then Limit := Limit Shr 12;
-  Ldt[I * 2] := (Limit And $FFFF) Or ((Base And $FFFF) Shl 16);
-  Ldt[I * 2 + 1] := ((Base Shr 16) And $FF) Or ((Acc And $FF) Shl 8) Or
+  Ldt^[I * 2] := (Limit And $FFFF) Or ((Base And $FFFF) Shl 16);
+  Ldt^[I * 2 + 1] := ((Base Shr 16) And $FF) Or ((Acc And $FF) Shl 8) Or
                     (Limit And $F0000) Or ((Acc And $7000) Shl 8) Or
                     (G Shl 8) Or (Base And LongInt($FF000000));
 End;
 
 Function VmDescAcc(I : LongInt) : LongInt;
 Begin
-  VmDescAcc := ((Ldt[I * 2 + 1] Shr 8) And $FF) Or
-               ((Ldt[I * 2 + 1] Shr 8) And $F000);
+  VmDescAcc := ((Ldt^[I * 2 + 1] Shr 8) And $FF) Or
+               ((Ldt^[I * 2 + 1] Shr 8) And $F000);
 End;
 
 { Selecteurs du client (proprietaire DpOwner) }
@@ -88108,7 +88357,7 @@ Function VmSelBig(Sel : LongInt) : Boolean;
 Var I : LongInt;
 Begin
   I := VmDescI(Sel);
-  VmSelBig := (I > 0) And ((Ldt[I * 2 + 1] And $400000) <> 0);
+  VmSelBig := (I > 0) And ((Ldt^[I * 2 + 1] And $400000) <> 0);
 End;
 
 { (E)DI, (E)SI, (E)DX selon la taille du client }
@@ -88350,8 +88599,8 @@ Begin
   MemW[0:VmLin(VmCurPsp, $2C)] := En;
   VmPspSel := Ps;
   { alias de la LDT : ses pages deviennent accessibles a l'anneau 3 }
-  VmLdtSel := VmSelNew(1, LongInt(@Ldt), LdtMax * 8 - 1, $F2);
-  For I := LongInt(@Ldt) Shr 12 To (LongInt(@Ldt) + LdtMax * 8 - 1) Shr 12 Do
+  VmLdtSel := VmSelNew(1, LongInt(Ldt), LdtMax * 8 - 1, $F2);
+  For I := LongInt(Ldt) Shr 12 To (LongInt(Ldt) + LdtMax * 8 - 1) Shr 12 Do
     If I < 1024 Then MemL[0:VmPt + I * 4] := (I Shl 12) Or 7;
   For I := 0 To 255 Do
   Begin
@@ -88371,8 +88620,8 @@ Begin
   KLog('DPMI : client ' + IntStr(16 + 16 * Ord(Vm32)) + ' bits, PSP ' +
        HexStr(VmDpmiPsp, 4) + ' CS=' + HexStr(CsS, 4) + ' DS=' +
        HexStr(DsS, 4) + ' SS=' + HexStr(SsS, 4) + ' ES=' + HexStr(Ps, 4) +
-       ' ' + HexStr(Ldt[(CsS Shr 3) * 2], 8) + ' ' +
-       HexStr(Ldt[(CsS Shr 3) * 2 + 1], 8));
+       ' ' + HexStr(Ldt^[(CsS Shr 3) * 2], 8) + ' ' +
+       HexStr(Ldt^[(CsS Shr 3) * 2 + 1], 8));
 End;
 
 { Fin du client : selecteurs, memoire, rappels }
@@ -88391,7 +88640,7 @@ Begin
   If VmPmStkLin <> 0 Then KFree(VmPmStkLin);
   VmPmStkLin := 0;
   If VmRam <> 0 Then
-    For I := LongInt(@Ldt) Shr 12 To (LongInt(@Ldt) + LdtMax * 8 - 1) Shr 12
+    For I := LongInt(Ldt) Shr 12 To (LongInt(Ldt) + LdtMax * 8 - 1) Shr 12
     Do
       If (I >= 272) And (I < 1024) Then MemL[0:VmPt + I * 4] := (I Shl 12) Or 3;
   If VmRam <> 0 Then MemW[0:VmLin(VmDpmiPsp, $2C)] := VmDpmiEnv;
@@ -88574,8 +88823,8 @@ Begin
         If S = 0 Then DpFail($8011)
         Else
         Begin
-          Ldt[(S Shr 3) * 2] := Ldt[I * 2];
-          Ldt[(S Shr 3) * 2 + 1] := (Ldt[I * 2 + 1] And Not $0F00) Or $0200;
+          Ldt^[(S Shr 3) * 2] := Ldt^[I * 2];
+          Ldt^[(S Shr 3) * 2 + 1] := (Ldt^[I * 2 + 1] And Not $0F00) Or $0200;
           VS(fEax, S);
         End;
       End;
@@ -88587,7 +88836,7 @@ Begin
       Else
       Begin
         P := VmPmPtr(fEs, fEdi);
-        MemL[0:P] := Ldt[I * 2]; MemL[0:P + 4] := Ldt[I * 2 + 1];
+        MemL[0:P] := Ldt^[I * 2]; MemL[0:P + 4] := Ldt^[I * 2 + 1];
       End;
     End;
     $000C :
@@ -88600,7 +88849,7 @@ Begin
                ((MemL[0:P + 4] And $1000) = 0)) Then DpFail($8021)
       Else
       Begin
-        Ldt[I * 2] := MemL[0:P]; Ldt[I * 2 + 1] := MemL[0:P + 4];
+        Ldt^[I * 2] := MemL[0:P]; Ldt^[I * 2 + 1] := MemL[0:P + 4];
       End;
     End;
     $0100 :
