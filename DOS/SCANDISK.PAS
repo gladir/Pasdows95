@@ -2561,6 +2561,22 @@ Procedure ShowFsLine(Const S: String);Begin
  ClrEol;
 End;
 
+{ Activite en cours (ligne 13, sous la liste des verifications) : on
+  voit que ScanDisk travaille pendant les etapes longues }
+Procedure ShowActivity(Const S: String);
+Var
+ A: Byte;
+Begin
+ A := TextAttr;
+ TextBackground(Blue);
+ TextColor(LightCyan);
+ GotoXY(1, 13);
+ Write('   ', S);
+ ClrEol;
+ TextAttr := A;
+ Trace(S);
+End;
+
 Function TotSecOf: LongInt;
 Var
  T: LongInt;
@@ -2723,6 +2739,7 @@ Var
  Same: Boolean;
 Begin
  P := @SectorBuffer;
+ ShowActivity(TL('Lecture du secteur d''amorce...', 'Reading the boot sector...'));
  If Not ReadSector(0) Then Begin
   AddErr(ReadErrMsg(0));
   Exit;
@@ -2785,6 +2802,8 @@ Begin
   NSec := FFatSz;
  End;
  Ent := FMax + 1;
+ ShowActivity(TL('Lecture de la FAT (', 'Reading the FAT (') + LStr(NSec) +
+              TL(' secteurs, ', ' sectors, ') + NStr(FNClus) + ' clusters)...');
  If FsType = fsFAT12 Then Begin
   Whole := NewBuf(NSec * 512 + 4);
   S := 0;
@@ -2842,6 +2861,8 @@ Begin
             'First FAT entry does not hold the media descriptor'));
  { comparer les copies (sauf FAT32 sans miroir) }
  If (FsType = fsFAT32) and ((FExtFlags and $80) <> 0) Then Exit;
+ If FNFat > 1 Then
+  ShowActivity(TL('Comparaison des copies de la FAT...', 'Comparing the FAT copies...'));
  For K := 1 to FNFat - 1 do Begin
   S := 0;
   Diff := -1;
@@ -2945,6 +2966,9 @@ Begin
  End;
  Inc(FDirsDone);
  If NDirs > 0 Then ProgressStep(FDirsDone, NDirs + 1, 30, 60);
+ If (FDirsDone and 15) = 1 Then
+  ShowActivity(TL('R'#130'pertoires examin'#130's : ', 'Directories checked: ') +
+               NStr(FDirsDone) + TL(', fichiers : ', ', files: ') + NStr(NFiles));
  If Clus = 0 Then BlkSz := FRootSecs * 512 Else BlkSz := FClusB;
  If BlkSz <= 0 Then Exit;
  P := NewBuf(BlkSz);
@@ -3061,6 +3085,7 @@ Var
  I, V, Bad, Out, ToFree, Res: LongInt;
 Begin
  Bad := 0; Out := 0; ToFree := 0; Res := 0;
+ ShowActivity(TL('V'#130'rification des cha'#140'nes de clusters...', 'Checking cluster chains...'));
  For I := 2 to FMax do Begin
   If (I and 4095) = 0 Then ProgressStep(I, FMax, 60, 80);
   V := FatT^[I];
@@ -3100,6 +3125,7 @@ Var
 Begin
  Lost := 0;
  Free := 0;
+ ShowActivity(TL('Recherche des unit'#130's d''allocation perdues...', 'Looking for lost allocation units...'));
  For I := 2 to FMax do Begin
   If (I and 4095) = 0 Then ProgressStep(I, FMax, 80, 90);
   V := FatT^[I];
@@ -3430,6 +3456,9 @@ Begin
   Cnt := 65536 div NRecSz;
   If R0 + Cnt > NRecs Then Cnt := NRecs - R0;
   ProgressStep(R0, NRecs, 5, 30);
+  If (R0 mod (Cnt * 16)) = 0 Then
+   ShowActivity(TL('Table des fichiers (MFT) : enregistrement ', 'Master file table: record ') +
+                NStr(R0) + ' / ' + NStr(NRecs));
   If Not StreamRead(MftRL, R0 * NRecSz, Cnt * NRecSz, Big) Then Begin
    AddErr(TL('Lecture de la MFT impossible '#133' l''enregistrement ',
              'Cannot read the MFT at record ') + LStr(R0));
@@ -3617,6 +3646,9 @@ Begin
   If Not BitOn(IsDirB, R) Then Continue;
   Inc(Done);
   If (Done and 15) = 0 Then ProgressStep(Done, Total, 30, 60);
+  If (Done and 15) = 1 Then
+   ShowActivity(TL('Index des r'#130'pertoires : ', 'Directory indexes: ') + NStr(Done) +
+                ' / ' + NStr(Total));
   If Not StreamRead(MftRL, R * NRecSz, NRecSz, Rec) or Not Fixup(Rec, 0, NRecSz) Then Continue;
   A := FindAttr(Rec, 0, $90, False);
   If A < 0 Then Begin
@@ -3672,6 +3704,7 @@ Var
 Begin
  Miss := 0;
  Lost := 0;
+ ShowActivity(TL('Bitmap de la MFT...', 'MFT bitmap...'));
  For R := 0 to NRecs - 1 do Begin
   If (R and 4095) = 0 Then ProgressStep(R, NRecs, 60, 80);
   If BitOn(InUseB, R) and Not BitOn(MftBmp, R) Then Inc(Miss)
@@ -3696,6 +3729,8 @@ Begin
   Exit;
  End;
  Sz := ((NTotC + 7) div 8 + 511) and not 511;
+ ShowActivity(TL('Comparaison avec $Bitmap (', 'Comparing with $Bitmap (') + NStr(NTotC) +
+              ' clusters)...');
  VB := NewBuf(Sz);
  If Not StreamRead(BmpRL, 0, Sz, VB) Then Begin
   AddErr(TL('Lecture de $Bitmap impossible', 'Cannot read $Bitmap'));
@@ -3841,6 +3876,9 @@ Begin
  HSys(HList, HListN);
  For B := 0 to HNB - 1 do Begin
   ProgressStep(B, HNB, 5, 30);
+  If (B and 7) = 0 Then
+   ShowActivity(TL('Bitmaps d''allocation : bande ', 'Allocation bitmaps: band ') +
+                NStr(B + 1) + ' / ' + NStr(HNB));
   L := RdL(LB, B * 4);
   If (L <= 17) or (L + 4 > HTot) Then Begin
    AddErr(TL('Bitmap de la bande ', 'Bitmap of band ') + LStr(B) + TL(' invalide', ' is invalid'));
@@ -4061,7 +4099,11 @@ Begin
     Else
    Begin
     Inc(NFiles);
-    If NFiles and 63 = 0 Then ShowProgress(30 + Integer(NFiles mod 30));
+    If (NFiles and 31) = 0 Then Begin
+     ShowProgress(30 + Integer(NFiles mod 30));
+     ShowActivity(TL('R'#130'pertoires : ', 'Directories: ') + NStr(NDirs) +
+                  TL(', fichiers : ', ', files: ') + NStr(NFiles));
+    End;
     If HMark(FnL, 1, Path + Nm) Then Begin
      F := NewBuf(512);
      If Not RawRead(FnL, 1, F) or (RdL(F, 0) <> LongInt($F7E40AAE)) Then
@@ -4133,6 +4175,7 @@ Var
  K, Lost: LongInt;
 Begin
  Lost := 0;
+ ShowActivity(TL('Bande des r'#130'pertoires...', 'Directory band...'));
  For K := 0 to HNDn - 1 do
   If Not BitOn(@HDBm, K) and Not BitOn(DnSeen, K) Then Inc(Lost);
  If Lost > 0 Then
@@ -4145,6 +4188,8 @@ Var
  K, Last, U, B, M, UsedFree, Lost, Free, FirstLost: LongInt;
 Begin
  UsedFree := 0; Lost := 0; Free := 0; FirstLost := -1;
+ ShowActivity(TL('Comparaison avec les bitmaps (', 'Comparing with the bitmaps (') + NStr(HTot) +
+              TL(' secteurs)...', ' sectors)...'));
  Last := (HTot - 1) div 8;
  For K := 0 to Last do Begin
   If (K and 65535) = 0 Then ProgressStep(K, Last + 1, 80, 100);
@@ -4265,6 +4310,8 @@ Begin
    PhaseDone(ciFreeSpace, 100);
   End;
  End;
+ ShowActivity(TL('V'#130'rifications termin'#130'es : ', 'Checks done: ') + LStr(ErrorsFound) +
+              TL(' erreur(s).', ' error(s).'));
  If DoSurfaceScan Then SurfaceScan
  Else If Not NonInteractive Then Begin
   If ShowDialog(TL('Balayage de surface', 'Surface Scan'),

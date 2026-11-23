@@ -27018,9 +27018,24 @@ Begin
   KReadFile := True;
 End;
 
+{ Un programme qui enchaine les lectures et ecritures passe presque tout
+  son temps dans le noyau, ou l'horloge ne le preempte pas (TimerTail) :
+  l'ecran, la souris et le clavier n'etaient plus servis (SCANDISK sur
+  un disque de 2 Go). Sa tranche de 20 ms ecoulee, il cede le processeur
+  a l'entree de ReadFile et WriteFile, ou rien n'est encore tenu. }
+Procedure AppYield;
+Begin
+  If (CurT > 0) And Threads[CurT].IsApp And (Ticks - SliceStart >= 20) Then
+  Begin
+    KYield;
+    SliceStart := Ticks;
+  End;
+End;
+
 Function ReadFile(H, Buf, N, PRead, Ovl : LongInt) : LongInt;
 Var Got : LongInt;
 Begin
+  AppYield;
   ReadFile := Ord(KReadFile(H, Buf, N, Got));
   If PRead <> 0 Then MemL[0:PRead] := Got;
 End;
@@ -27090,6 +27105,7 @@ End;
 Function WriteFile(H, Buf, N, PWritten, Ovl : LongInt) : LongInt;
 Var R : LongInt;
 Begin
+  AppYield;
   R := KWriteFile(H, Buf, N);
   If PWritten <> 0 Then MemL[0:PWritten] := Max(R, 0);
   WriteFile := Ord(R >= 0);
