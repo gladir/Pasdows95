@@ -116,6 +116,37 @@ Type
 Var
  FsType: TFsKind;
 
+{$IFDEF WINDOWS}
+Procedure W32Debug(P: Pointer); stdcall;
+ external 'kernel32.dll' name 'OutputDebugStringA';
+{$ENDIF}
+
+{ Trace dans le journal du noyau (port serie COM1 de Pasdows) : etapes,
+  touches recues, avancement, pour diagnostiquer un blocage }
+Procedure Trace(Const S: String);
+{$IFDEF WINDOWS}
+Var
+ Z: Array[0..255] of Char;
+ K: Integer;
+Begin
+ Z[0] := 'S'; Z[1] := 'D'; Z[2] := ':'; Z[3] := ' ';
+ For K := 1 to Length(S) do If K < 250 Then Z[K + 3] := S[K];
+ If Length(S) < 250 Then Z[Length(S) + 4] := #0 Else Z[253] := #0;
+ W32Debug(@Z);
+End;
+{$ELSE}
+Begin
+End;
+{$ENDIF}
+
+Function NumS(V: LongInt): String;
+Var
+ T: String;
+Begin
+ Str(V, T);
+ NumS := T;
+End;
+
 { Texte francais ou anglais (les autres langues prennent l'anglais) }
 Function TL(Const Fr, En: String): String;Begin
  If Language = _French Then TL := Fr Else TL := En;
@@ -765,10 +796,15 @@ Begin
  { Entree : bouton choisi ; fleches et Tab : changer de bouton ;
    Echap : Non (ou fermer) ; O, Y et N directement }
  Sel := True;
+ Trace('boite "' + Title + '" affichee');
  Repeat
   Key := ReadKey;
+  Trace('touche ' + Chr(48 + Ord(Key) div 100) + Chr(48 + (Ord(Key) div 10) mod 10) +
+        Chr(48 + Ord(Key) mod 10));
   If Key = #0 Then Begin
    Key := ReadKey;
+   Trace('touche etendue ' + Chr(48 + Ord(Key) div 100) +
+         Chr(48 + (Ord(Key) div 10) mod 10) + Chr(48 + Ord(Key) mod 10));
    If ShowYesNo and (Key in [#15, #72, #75, #77, #80]) Then Begin
     Sel := Not Sel;
     DrawYesNo(X1 + 23, Y1 + BoxHeight - 1, Sel);
@@ -2285,12 +2321,15 @@ Begin
  ShowSurfaceScanScreen;
  {$IFDEF FPC}
  SurfBlk := -1;
+ Trace('balayage de surface : ' + NumS(TotalSectors) + ' secteurs');
  {$ENDIF}
  { Initialiser le g‚n‚rateur de nombres al‚atoires pour la simulation }
  Randomize;
  For i := 0 to TotalSectors - 1 do Begin
   Inc(SectorsExamined);
   {$IFDEF FPC}
+  If (TotalSectors >= 10) and (i mod (TotalSectors div 10) = 0) Then
+   Trace('balayage ' + NumS(i) + ' / ' + NumS(TotalSectors));
   BadSectorFound := Not SurfRead(i);
   {$ELSE}
   BadSectorFound := Not ReadSector(i);
@@ -2611,6 +2650,7 @@ Begin
    TotUnits := FNClus;
   End;
  End;
+ Trace('systeme de fichiers ' + FsName + ', ' + LStr(TotUnits) + ' unites');
  ShowFsLine(TL('Syst'#138'me de fichiers d'#130'tect'#130' : ',
                'Detected file system: ') + FsName + ' (' + NStr(TotUnits) +
             TL(' unit'#130's de ', ' units of ') + NStr(UnitBytes) +
@@ -4131,6 +4171,7 @@ End;
 { ==================================================================== }
 
 Procedure PhaseDone(I: TCheckItem; Pct: Integer);Begin
+ Trace('etape ' + LStr(Ord(I) + 1) + ' terminee, ' + LStr(ErrorsFound) + ' erreur(s)');
  CheckStatus[I] := True;
  ShowProgress(Pct);
  ShowCheckList;
@@ -4644,6 +4685,7 @@ BEGIN
  FreeMemory;
  { Affichage du r‚sum‚ }
  {$IFDEF FPC}
+ Trace('fin, ' + LStr(ErrorsFound) + ' erreur(s)');
  RawClose;
  ShowSummary32;
  {$ELSE}
