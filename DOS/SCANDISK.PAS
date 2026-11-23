@@ -641,9 +641,67 @@ Begin
  ShowMainButtons;
 End;
 
+{ Boutons Oui et Non de ShowDialog (Sel : Oui choisi) }
+Procedure DrawYesNo(X, Y: Byte; Sel: Boolean);Begin
+ GotoXY(X, Y);
+ Case(Language)of
+  _English:Begin
+   ShowButton('Yes',Sel);
+   Write('  ');
+   ShowButton('No',Not Sel);
+  End;
+  _Germany:Begin
+   ShowButton('Ja',Sel);
+   Write('  ');
+   ShowButton('Nein',Not Sel);
+  End;
+  _Italian:Begin
+   ShowButton('Sç',Sel);
+   Write('  ');
+   ShowButton('No',Not Sel);
+  End;
+  _Spain:Begin
+   ShowButton('S°',Sel);
+   Write('  ');
+   ShowButton('No',Not Sel);
+  End;
+  _Albanian:Begin
+   ShowButton('Po',Sel);
+   Write('  ');
+   ShowButton('Jo',Not Sel);
+  End;
+  _Portuguese:Begin
+   ShowButton('Sim',Sel);
+   Write('  ');
+   ShowButton('Nao',Not Sel);
+  End;
+  _Swedish:Begin
+   ShowButton('Ja',Sel);
+   Write('  ');
+   ShowButton('Nej',Not Sel);
+  End;
+  _Danish:Begin
+   ShowButton('Ja',Sel);
+   Write('  ');
+   ShowButton('Nej',Not Sel);
+  End;
+  _Japanese:Begin
+   ShowButton('Hai',Sel);
+   Write('  ');
+   ShowButton('Iie',Not Sel);
+  End;
+  Else Begin
+   ShowButton('Oui',Sel);
+   Write('  ');
+   ShowButton('Non',Not Sel);
+  End;
+ End;
+End;
+
 Function ShowDialog(Title,Message:String;ShowYesNo:Boolean):Boolean;
 Var
  Key: Char;
+ Sel: Boolean;
  BoxWidth, BoxHeight, X1, Y1, i, j: Byte;
  Lines: Array[0..10] of String;
  LineCount, CurrentLine, MaxLineLen: Byte;
@@ -696,59 +754,7 @@ Begin
  End;
  { Afficher les boutons }
  If ShowYesNo Then Begin
-  GotoXY(X1 + 23, Y1 + BoxHeight - 1);
-  Case(Language)of
-   _English:Begin
-    ShowButton('Yes',True);
-    Write('  ');
-    ShowButton('No',False);
-   End;
-   _Germany:Begin
-    ShowButton('Ja',True);
-    Write('  ');
-    ShowButton('Nein',False);
-   End;
-   _Italian:Begin
-    ShowButton('Sç',True);
-    Write('  ');
-    ShowButton('No',False);
-   End;
-   _Spain:Begin
-    ShowButton('S°',True);
-    Write('  ');
-    ShowButton('No',False);
-   End;
-   _Albanian:Begin
-    ShowButton('Po',True);
-    Write('  ');
-    ShowButton('Jo',False);
-   End;
-   _Portuguese:Begin
-    ShowButton('Sim',True);
-    Write('  ');
-    ShowButton('Nao',False);
-   End;
-   _Swedish:Begin
-    ShowButton('Ja',True);
-    Write('  ');
-    ShowButton('Nej',False);
-   End;
-   _Danish:Begin
-    ShowButton('Ja',True);
-    Write('  ');
-    ShowButton('Nej',False);
-   End;
-   _Japanese:Begin
-    ShowButton('Hai',True);
-    Write('  ');
-    ShowButton('Iie',False);
-   End;
-   Else Begin
-    ShowButton('Oui',True);
-    Write('  ');
-    ShowButton('Non',False);
-   End;
-  End;
+  DrawYesNo(X1 + 23, Y1 + BoxHeight - 1, True);
  End
   Else
  Begin
@@ -756,16 +762,41 @@ Begin
   ShowButton('OK',True);
  End;
   { Attendre la rÇponse }
+ { Entree : bouton choisi ; fleches et Tab : changer de bouton ;
+   Echap : Non (ou fermer) ; O, Y et N directement }
+ Sel := True;
  Repeat
   Key := ReadKey;
+  If Key = #0 Then Begin
+   Key := ReadKey;
+   If ShowYesNo and (Key in [#15, #72, #75, #77, #80]) Then Begin
+    Sel := Not Sel;
+    DrawYesNo(X1 + 23, Y1 + BoxHeight - 1, Sel);
+   End;
+  End
+   Else
+  If Key = #9 Then Begin
+   If ShowYesNo Then Begin
+    Sel := Not Sel;
+    DrawYesNo(X1 + 23, Y1 + BoxHeight - 1, Sel);
+   End;
+  End
+   Else
   If Key = #13 Then Begin
-   ShowDialog := True;
+   ShowDialog := Sel or Not ShowYesNo;
    Break;
-  End;
+  End
+   Else
+  If Key = #27 Then Begin
+   ShowDialog := Not ShowYesNo;
+   Break;
+  End
+   Else
   If ShowYesNo and (UpCase(Key) = 'N') Then Begin
    ShowDialog := False;
    Break;
-  End;
+  End
+   Else
   If ShowYesNo and (UpCase(Key) in ['Y','O'])Then Begin
    ShowDialog := True;
    Break;
@@ -1064,14 +1095,14 @@ Begin
  SectorsPerBlock := (TotalSectors + (MapWidth * MapHeight - 1)) div (MapWidth * MapHeight);
  If SectorsPerBlock < 1 Then SectorsPerBlock := 1;
  { Mettre Ö jour les statistiques - position relative }
- GotoXY(DialogX1 + 47, DialogY1 + 7);
+ GotoXY(DialogX1 + 47, DialogY1 + 6);
  TextColor(Black);
  TextBackground(LightGray);
  Case(Language)of
   _English:Write(SectorsChecked, ' examined     ');
   Else Write(SectorsChecked, ' examinÇs     ');
  End;
- GotoXY(DialogX1 + 47, DialogY1 + 8);
+ GotoXY(DialogX1 + 47, DialogY1 + 7);
  Case(Language)of
   _English:Write(BadFound, ' found bad     ');
   Else Write(BadFound, ' dÇfectueux     ');
@@ -1090,6 +1121,7 @@ Begin
  Percentage := (SectorsChecked * 100) div TotalSectors;
  If Percentage > 100 Then Percentage := 100;
  GotoXY(1, 24);
+ ClrEol;
  Write('     ');
  Case(Language)of
   _English:Write(Percentage, '% complete   ');
