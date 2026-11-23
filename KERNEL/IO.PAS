@@ -3075,7 +3075,7 @@ Begin
     wkDisplay : CenterWin(K, 340, 340);
     wkRegional : CenterWin(K, 330, 270);
     wkSystem : CenterWin(K, 390, 290);
-    wkAbout : CenterWin(K, 410, 262);
+    wkAbout : CenterWin(K, 410, 282);
     wkRun : PlaceWin(K, 6, TaskY - 180, 370, 172);
     wkShutdown : CenterWin(K, 360, 206);
     wkRecycle : PlaceWin(K, 160, 110, 360, 240);
@@ -5470,7 +5470,11 @@ Procedure ConBanner;
 Begin
   ConWriteLn('');
   ConWriteLn('Pasdows 95. [Version ' + Version + ']');
-  ConWriteLn('(C) Copyright Gladir.com 2026.');
+  ConWriteLn(L('Auteur : Sylvain Maltais - Licence MIT.',
+             'Author: Sylvain Maltais - MIT License.',
+             'Autor: Sylvain Maltais - MIT-Lizenz.',
+             'Autore: Sylvain Maltais - Licenza MIT.',
+             'Autor: Sylvain Maltais - Licencia MIT.'));
   ConWriteLn('');
   ConPrompt;
 End;
@@ -5701,19 +5705,22 @@ Begin
   X := X1 + 96;
   OutBold(X, Y1 + 14, 'Pasdows 95', cBlack);
   OutText(X, Y1 + 32, 'Version ' + Version, cBlack);
-  OutText(X, Y1 + 48, 'Copyright (C) 2026 Gladir.com', cBlack);
-  WrapText(X, Y1 + 72, X2 - X - 8, L(
+  OutText(X, Y1 + 48, L('Auteur : ', 'Author: ', 'Autor: ', 'Autore: ',
+          'Autor: ') + 'Sylvain Maltais', cBlack);
+  OutText(X, Y1 + 64, L('Licence : ', 'License: ', 'Lizenz: ', 'Licenza: ',
+          'Licencia: ') + 'MIT', cBlack);
+  WrapText(X, Y1 + 84, X2 - X - 8, L(
     'Clone de Windows 95 '#130'crit en Pascal (IO.SYS, compilateur WPC).',
     'Windows 95 clone written in Pascal (IO.SYS, WPC compiler).',
     'Windows 95-Klon in Pascal (IO.SYS, WPC-Compiler).',
     'Clone di Windows 95 scritto in Pascal (IO.SYS, compilatore WPC).',
     'Clon de Windows 95 escrito en Pascal (IO.SYS, compilador WPC).'),
     cBlack, True);
-  HLine(X, X2 - 10, Y1 + 114, cGray);
-  HLine(X, X2 - 10, Y1 + 115, cWhite);
-  OutText(X, Y1 + 124, L('M'#130'moire : ', 'Memory: ', 'Speicher: ',
+  HLine(X, X2 - 10, Y1 + 130, cGray);
+  HLine(X, X2 - 10, Y1 + 131, cWhite);
+  OutText(X, Y1 + 138, L('M'#130'moire : ', 'Memory: ', 'Speicher: ',
           'Memoria: ', 'Memoria: ') + RamText, cBlack);
-  OutText(X, Y1 + 142, L('Processeur : ', 'Processor: ', 'Prozessor: ',
+  OutText(X, Y1 + 156, L('Processeur : ', 'Processor: ', 'Prozessor: ',
           'Processore: ', 'Procesador: ') + CpuName, cBlack);
   DrawDlgButtons(wkAbout);
 End;

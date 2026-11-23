@@ -485,7 +485,13 @@ Begin
  {$ENDIF}
  WriteLn;
  WriteLn('Pasdows 95. [Version 4.00.950]');
- WriteLn('(C) Copyright Gladir.com 2026.');
+ Case Language of
+  _English:WriteLn('Author: Sylvain Maltais - MIT License.');
+  _Germany:WriteLn('Autor: Sylvain Maltais - MIT-Lizenz.');
+  _Italian:WriteLn('Autore: Sylvain Maltais - Licenza MIT.');
+  _Spain:WriteLn('Autor: Sylvain Maltais - Licencia MIT.');
+  Else WriteLn('Auteur : Sylvain Maltais - Licence MIT.');
+ End;
  WriteLn;
 End;
 

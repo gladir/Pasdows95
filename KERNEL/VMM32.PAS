@@ -26925,8 +26925,11 @@ Begin
   KObjs^[I].Used := False;
 End;
 
-{ Lecture des secteurs d'un volume ouvert par \\.\C: (CHKDSK, SCANDISK) }
-Function VolReadAt(V, P, N, Buf : LongInt; Var Got : LongInt) : Boolean;
+{ Lecture des secteurs d'un volume ouvert par \\.\C: (CHKDSK, SCANDISK) ;
+  position sur 64 bits (P en bas, Ph en haut) pour les volumes de plus
+  de 2 Go }
+Function VolReadAt(V, P, Ph, N, Buf : LongInt;
+                   Var Got : LongInt) : Boolean;
 Var S, O, K : LongInt;
 Begin
   VolReadAt := False; Got := 0;
@@ -26936,14 +26939,15 @@ Begin
     Exit;
   End;
   FatIoErr := False;
+  S := (Ph Shl 23) Or (P Shr 9); O := P And 511;
   While Got < N Do
   Begin
-    S := (P + Got) Div 512; O := (P + Got) Mod 512;
     If S >= VolSecs[V] Then Break;
     K := 512 - O;
     If K > N - Got Then K := N - Got;
     MoveMem(VSec(V, S) + O, Buf + Got, K);
     Got := Got + K;
+    Inc(S); O := 0;
   End;
   If FatIoErr Then SetErr(30);
   VolReadAt := Not FatIoErr;
@@ -26981,8 +26985,11 @@ Begin
   End;
   If KObjs^[I].F4 = -3 Then
   Begin
-    KReadFile := VolReadAt(KObjs^[I].F1, KObjs^[I].F3, N, Buf, Got);
-    KObjs^[I].F3 := KObjs^[I].F3 + Got;
+    KReadFile := VolReadAt(KObjs^[I].F1, KObjs^[I].F3, KObjs^[I].F5, N,
+                           Buf, Got);
+    R := KObjs^[I].F3 + Got;
+    If (KObjs^[I].F3 < 0) And (R >= 0) Then Inc(KObjs^[I].F5);
+    KObjs^[I].F3 := R;
     Exit;
   End;
   If KObjs^[I].F3 + N > KObjs^[I].F2 Then N := KObjs^[I].F2 - KObjs^[I].F3;
@@ -27078,13 +27085,39 @@ Begin
 End;
 
 Function SetFilePointer(H, Dist, PHigh, Method : LongInt) : LongInt;
-Var I, P : LongInt;
+Var I, P, Lo, Ph, Hi : LongInt;
 Begin
   SetFilePointer := -1;
   I := KObjOf(H, koFile);
   If I < 0 Then
   Begin
     SetErr(ErrInvalidHandle);
+    Exit;
+  End;
+  If KObjs^[I].F4 = -3 Then
+  Begin
+    { volume \\.\C: : position sur 64 bits (F3 bas, F5 haut) }
+    If PHigh <> 0 Then Hi := MemL[0:PHigh]
+    Else If Dist < 0 Then Hi := -1 Else Hi := 0;
+    Case Method Of
+      0 : Begin Lo := 0; Ph := 0; End;
+      1 : Begin Lo := KObjs^[I].F3; Ph := KObjs^[I].F5; End;
+    Else
+      Lo := VolSecs[KObjs^[I].F1] Shl 9;
+      Ph := VolSecs[KObjs^[I].F1] Shr 23;
+    End;
+    P := Lo + Dist;
+    Ph := Ph + Hi;
+    If (((Lo And Dist) Or ((Lo Or Dist) And Not P)) Shr 31) <> 0 Then
+      Inc(Ph);
+    If Ph < 0 Then
+    Begin
+      SetErr(131);
+      Exit;
+    End;
+    KObjs^[I].F3 := P; KObjs^[I].F5 := Ph;
+    If PHigh <> 0 Then MemL[0:PHigh] := Ph;
+    SetFilePointer := P;
     Exit;
   End;
   Case Method Of
