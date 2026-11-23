@@ -110,6 +110,41 @@ Var
  ErrorsFound: Integer;
  CheckStatus: Array[TCheckItem] of Boolean;
 
+Type
+ TFsKind = (fsFAT12, fsFAT16, fsFAT32, fsNTFS, fsHPFS);
+
+Var
+ FsType: TFsKind;
+
+{ Texte francais ou anglais (les autres langues prennent l'anglais) }
+Function TL(Const Fr, En: String): String;Begin
+ If Language = _French Then TL := Fr Else TL := En;
+End;
+
+{ Libelles des verifications de NTFS et HPFS ('' : ceux de FAT) }
+Function FsItem(I: TCheckItem): String;Begin
+ FsItem := '';
+ If FsType = fsNTFS Then Begin
+  Case I of
+   ciMedia: FsItem := TL('Secteur d''amorce', 'Boot sector');
+   ciFAT: FsItem := TL('Table des fichiers (MFT)', 'Master file table (MFT)');
+   ciDirectory: FsItem := TL('Index des r'#130'pertoires', 'Directory indexes');
+   ciFileSystem: FsItem := TL('Bitmap de la MFT', 'MFT bitmap');
+   ciFreeSpace: FsItem := TL('Espace libre ($Bitmap)', 'Free space ($Bitmap)');
+  End;
+ End
+  Else
+ If FsType = fsHPFS Then Begin
+  Case I of
+   ciMedia: FsItem := TL('Superbloc et bloc de r'#130'serve', 'Super block and spare block');
+   ciFAT: FsItem := TL('Bitmaps d''allocation', 'Allocation bitmaps');
+   ciDirectory: FsItem := TL('R'#130'pertoires, fnodes et fichiers', 'Directories, fnodes and files');
+   ciFileSystem: FsItem := TL('Bande des r'#130'pertoires', 'Directory band');
+   ciFreeSpace: FsItem := TL('Espace libre (bitmaps)', 'Free space (bitmaps)');
+  End;
+ End;
+End;
+
 {$IFNDEF FPC}
  Procedure CursorOff;
  Var
@@ -455,7 +490,7 @@ Var
  CheckMark: Char;
 Begin
  GotoXY(1, 4);
- If IsImageFile Then Begin
+ If IsImageFile and (Copy(FileName, 1, 4) <> '\\.\') Then Begin
   Case(Language)of
    _English:Write('ScanDisk is now checking the following areas of file ', FileName, ':');
    _Germany:Write('ScanDisk ÅberprÅft nun die folgenden Bereiche der Datei ', FileName, ':');
@@ -493,6 +528,7 @@ Begin
    ciMedia: Begin
     GotoXY(1, 6);
     Write('   ', CheckMark,'    ');
+    If FsItem(ciMedia) <> '' Then Write(FsItem(ciMedia)) Else
     Case(Language)of
      _English:Write('Media descriptor');
      _Germany:Write('Medien-Deskriptor');
@@ -510,6 +546,7 @@ Begin
    ciFAT: Begin
     GotoXY(1, 7);
     Write('   ', CheckMark, '    ');
+    If FsItem(ciFAT) <> '' Then Write(FsItem(ciFAT)) Else
     Case(Language)of
      _English:Write('File allocation tables');
      _Germany:Write('Dateizuordnungstabellen');
@@ -527,6 +564,7 @@ Begin
    ciDirectory: Begin
     GotoXY(1, 8);
     Write('   ', CheckMark, '    ');
+    If FsItem(ciDirectory) <> '' Then Write(FsItem(ciDirectory)) Else
     Case(Language)of
      _English:Write('Directory structure');
      _Germany:Write('Verzeichnisstruktur');
@@ -544,6 +582,7 @@ Begin
    ciFileSystem: Begin
     GotoXY(1, 9);
     Write('   ', CheckMark, '    ');
+    If FsItem(ciFileSystem) <> '' Then Write(FsItem(ciFileSystem)) Else
     Case(Language)of
      _English:Write('File system');
      _Germany:Write('Dateisystem');
@@ -561,6 +600,7 @@ Begin
    ciFreeSpace: Begin
     GotoXY(1, 10);
     Write('   ', CheckMark, '    ');
+    If FsItem(ciFreeSpace) <> '' Then Write(FsItem(ciFreeSpace)) Else
     Case(Language)of
      _English:Write('Free space');
      _Germany:Write('Freier Speicherplatz');
@@ -624,7 +664,7 @@ Begin
    If j = CurrentLine Then j := CurrentLine + MaxLineLen - 1; { Pas d'espace trouvÇ, couper au max }
    Lines[LineCount] := Copy(Message, CurrentLine, j - CurrentLine + 1);
    CurrentLine := j + 1;
-   If Message[j] = ' ' Then Inc(CurrentLine); { Passer l'espace }
+   { (CurrentLine := j + 1 passe deja l'espace) }
   End
    Else
   Begin
@@ -757,6 +797,10 @@ Var
 
 { Etat de chaque case de la carte : 0 libre, 1 partiellement utilise,
   2 utilise, 3 defectueux, 255 sans objet (au-dela de la fin du disque) }
+{$IFDEF FPC}
+Function SecState32(Sec: LongInt; Var Step: LongInt): Integer; Forward;
+{$ENDIF}
+
 Procedure ComputeBlockMap;
 Var
  Blk: Integer;
@@ -784,6 +828,12 @@ Begin
    While Sec < E do Begin
     Step := 1;
     Inc(Cnt);
+    {$IFDEF FPC}
+    Case SecState32(Sec, Step) of
+     1: Inc(Used);
+     2: Bad := True;
+    End;
+    {$ELSE}
     If Sec < FirstData Then Inc(Used)
     Else Begin
      Cl := (Sec - FirstData) div BootSector.SectorsPerCluster + 2;
@@ -793,6 +843,7 @@ Begin
      End;
      Step := BootSector.SectorsPerCluster;
     End;
+    {$ENDIF}
     Inc(Sec, Step);
    End;
    If Bad Then BlockState[Blk] := 3
@@ -883,7 +934,7 @@ Begin
  TextBackground(LightGray);
  { Informations du fichier/lecteur - position relative }
  GotoXY(DialogX1 + 47, DialogY1 + 2);
- If IsImageFile Then Begin
+ If IsImageFile and (Copy(FileName, 1, 4) <> '\\.\') Then Begin
   Case(Language)of
    _English:Write('File: ', FileName);
    _Germany:Write('Datei: ', FileName);
@@ -900,7 +951,7 @@ Begin
   Else
  Begin
   Case(Language)of
-   _English:Write('Drive ', DrivePath, ':');
+   _English:Write('Drive ', DrivePath);
    _Germany:Write('Laufwerk ', DrivePath, ':');
    _Italian:Write('UnitÖ ', DrivePath, ':');
    _Spain:Write('Unidad ', DrivePath, ':');
@@ -909,7 +960,7 @@ Begin
    _Swedish:Write('Enhet ', DrivePath, ':');
    _Danish:Write('Drev ', DrivePath, ':');
    _Japanese:Write('Doraibu ', DrivePath, ':');
-   Else Write('Lecteur ', DrivePath, ' :');
+   Else Write('Lecteur ', DrivePath);
   End;
  End;
  { Statistiques - position relative Ö droite de la boåte }
@@ -1061,8 +1112,130 @@ Begin
  End;
 End;
 
+{$IFDEF FPC}
+{ ==================================================================== }
+{ Lecture des secteurs en 32 bits (FPC et WPC) : volume \\.\C: de       }
+{ Pasdows ou fichier image, position sur 64 bits (volumes de plus de    }
+{ 2 Go)                                                                 }
+{ ==================================================================== }
+
+Type
+ PB = ^TBA;
+ TBA = Array[0..$3FFFFFFF] of Byte;
+ PLA = ^TLA;
+ TLA = Array[0..$0FFFFFFF] of LongInt;
+
+{$IFDEF WINDOWS}
+Function W32Create(N: Pointer; Acc, Shm, Sec, Disp, Fl, Tm: LongInt): LongInt;
+ stdcall; external 'kernel32.dll' name 'CreateFileA';
+Function W32Seek(H, Lo: LongInt; Hi: Pointer; M: LongInt): LongInt;
+ stdcall; external 'kernel32.dll' name 'SetFilePointer';
+Function W32Read(H: LongInt; B: Pointer; N: LongInt; Got: Pointer;
+ Ov: LongInt): LongInt; stdcall; external 'kernel32.dll' name 'ReadFile';
+Function W32Write(H: LongInt; B: Pointer; N: LongInt; Got: Pointer;
+ Ov: LongInt): LongInt; stdcall; external 'kernel32.dll' name 'WriteFile';
+Function W32Close(H: LongInt): LongInt;
+ stdcall; external 'kernel32.dll' name 'CloseHandle';
+Function W32Drives: LongInt;
+ stdcall; external 'kernel32.dll' name 'GetLogicalDrives';
+Function W32DriveType(P: Pointer): LongInt;
+ stdcall; external 'kernel32.dll' name 'GetDriveTypeA';
+{$ENDIF}
+
+Var
+ RawH: LongInt;
+ Big, Big2: PB;              { tampons de travail de 64 Ko }
+ NonInteractive: Boolean;
+
+Function RawOpen(Const N: String; Wr: Boolean): Boolean;
+{$IFDEF WINDOWS}
+Var
+ Z: Array[0..259] of Char;
+ K, Acc: LongInt;
+Begin
+ For K := 1 to Length(N) do Z[K - 1] := N[K];
+ Z[Length(N)] := #0;
+ Acc := -2147483647 - 1;
+ If Wr Then Acc := Acc or $40000000;
+ RawH := W32Create(@Z, Acc, 3, 0, 3, 0, 0);
+ RawOpen := RawH <> -1;
+End;
+{$ELSE}
+Begin
+ RawH := 0;
+ RawOpen := True;
+End;
+{$ENDIF}
+
+Procedure RawClose;Begin
+ {$IFDEF WINDOWS}
+ If (RawH <> 0) and (RawH <> -1) Then W32Close(RawH);
+ {$ENDIF}
+ RawH := 0;
+End;
+
+{ Lire N secteurs a partir du secteur Sec (relatif a la partition) }
+Function RawRead(Sec, N: LongInt; P: Pointer): Boolean;
+Var
+ A, Hi, Got: LongInt;
+Begin
+ A := Sec + PartitionOffset;
+ Got := 0;
+ {$IFDEF WINDOWS}
+ Hi := A shr 23;
+ W32Seek(RawH, A shl 9, @Hi, 0);
+ RawRead := (W32Read(RawH, P, N * 512, @Got, 0) <> 0) and (Got = N * 512);
+ {$ELSE}
+ Hi := 0;
+ {$I-} Seek(FileHandle, Int64(A) * 512); {$I+}
+ If IOResult <> 0 Then Begin
+  RawRead := False;
+  Exit;
+ End;
+ {$I-} BlockRead(FileHandle, P^, N * 512, Got); {$I+}
+ RawRead := (IOResult = 0) and (Got = N * 512) and (Hi = 0);
+ {$ENDIF}
+End;
+
+{ Ecrire N secteurs (fichiers images seulement : un volume en service
+  n'est jamais ecrit directement) }
+Function RawWrite(Sec, N: LongInt; P: Pointer): Boolean;
+Var
+ A, Hi, Got: LongInt;
+Begin
+ RawWrite := False;
+ If Copy(FileName, 1, 4) = '\\.\' Then Exit;
+ A := Sec + PartitionOffset;
+ Got := 0;
+ {$IFDEF WINDOWS}
+ Hi := A shr 23;
+ W32Seek(RawH, A shl 9, @Hi, 0);
+ RawWrite := (W32Write(RawH, P, N * 512, @Got, 0) <> 0) and (Got = N * 512);
+ {$ELSE}
+ Hi := 0;
+ {$I-} Seek(FileHandle, Int64(A) * 512); {$I+}
+ If IOResult <> 0 Then Exit;
+ {$I-} BlockWrite(FileHandle, P^, N * 512, Got); {$I+}
+ RawWrite := (IOResult = 0) and (Got = N * 512) and (Hi = 0);
+ {$ENDIF}
+End;
+{$ENDIF}
+
 Function DriveExists(Drive: Char): Boolean;
 {$IFDEF Windows}
+Var
+ Z: Array[0..3] of Char;
+ T: LongInt;
+Begin
+ If ((W32Drives shr (Ord(UpCase(Drive)) - 65)) and 1) = 0 Then Begin
+  DriveExists := False;
+  Exit;
+ End;
+ Z[0] := UpCase(Drive); Z[1] := ':'; Z[2] := '\'; Z[3] := #0;
+ T := W32DriveType(@Z);
+ DriveExists := (T = 2) or (T = 3);
+End;
+{$IFDEF SCANDISK_ANCIEN}
 Var
  F: File;
  TestFile: String;
@@ -1090,6 +1263,12 @@ Begin
   End;
  End;
 End;
+{$ENDIF}
+{$ELSE}
+{$IFDEF FPC}
+Begin
+ DriveExists := False;
+End;
 {$ELSE}
 Var
  Regs: Registers;
@@ -1112,6 +1291,7 @@ Begin
  Regs.DL := OldDrive;
  Intr($21, Regs);
 End;
+{$ENDIF}
 {$ENDIF}
 
 Function SelectDrive: String;
@@ -1210,6 +1390,16 @@ Begin
  Until False;
 End;
 
+{$IFDEF FPC}
+Procedure DriveGeometry;Begin
+ DrvSpt := 0;
+ DrvHeads := 0;
+End;
+
+Function BiosSector(Fn: Byte; SectorNum: LongInt): Boolean;Begin
+ BiosSector := False;
+End;
+{$ELSE}
 { Geometrie du lecteur (INT 13h fonction 08h) ; disquette 1,44 Mo par defaut }
 Procedure DriveGeometry;
 Var Regs: Registers;
@@ -1261,6 +1451,17 @@ Begin
  End;
 End;
 
+{$ENDIF}
+
+{$IFDEF FPC}
+Function ReadSector(SectorNum: LongInt): Boolean;Begin
+ ReadSector := RawRead(SectorNum, 1, @SectorBuffer);
+End;
+
+Function WriteSector(SectorNum: LongInt): Boolean;Begin
+ WriteSector := RawWrite(SectorNum, 1, @SectorBuffer);
+End;
+{$ELSE}
 Function ReadSector(SectorNum: LongInt): Boolean;
 {$IFDEF Windows}
 Begin
@@ -1315,6 +1516,8 @@ Begin
 End;
 {$ENDIF}
 
+{$ENDIF}
+
 Function DetectPartition: Boolean;
 Var
  i: Integer;
@@ -1341,7 +1544,9 @@ Begin
  End;
   { Si le fichier fait moins de 4 Mo, c'est probablement une disquette }
   { Les disquettes n'ont pas de table de partition MBR }
- If FileSize < (4 * 1024 * 1024) Then Begin
+ { (en 32 bits, le secteur d'amorce est reconnu plus bas : une image de
+   plus de 2 Go donnerait ici une taille fausse) }
+ If (FileSize < (4 * 1024 * 1024)) {$IFDEF FPC} and False {$ENDIF} Then Begin
   Case(Language)of
    _English:Begin
     GotoXY(1, 3);
@@ -1421,7 +1626,14 @@ Begin
   DetectPartition := True;
   Exit;
  End;
-  { Afficher info sur la dÇtection de MBR }
+  { secteur d'amorce d'un volume sans table de partition (EBh ou E9h,
+   512 octets par secteur) }
+ If ((MBR.BootCode[0] = $EB) or (MBR.BootCode[0] = $E9)) and
+    (MBR.BootCode[11] = 0) and (MBR.BootCode[12] = 2) Then Begin
+  DetectPartition := True;
+  Exit;
+ End;
+ { Afficher info sur la dÇtection de MBR }
  Case(Language)of
   _English:Begin
    GotoXY(1, 3);
@@ -1440,7 +1652,7 @@ Begin
   { D'abord, chercher une partition active }
  For i := 0 to 3 do Begin
   With MBR.PartitionTable[i] do Begin
-   If (Status = $80) and (PartitionType in [$01, $04, $06, $0B, $0C, $0E, $0F]) and (TotalSectors > 0) Then Begin
+   If (Status = $80) and (PartitionType in [$01, $04, $06, $07, $0B, $0C, $0E, $0F]) and (TotalSectors > 0) Then Begin
     PartitionOffset := RelativeSectors;
     HasPartition := True;
     PartitionFound := True;
@@ -1483,7 +1695,7 @@ Begin
       End;
      End;
     End;
-    If (PartitionType in [$01, $04, $06, $0B, $0C, $0E, $0F]) and (TotalSectors > 0) Then Begin
+    If (PartitionType in [$01, $04, $06, $07, $0B, $0C, $0E, $0F]) and (TotalSectors > 0) Then Begin
      PartitionOffset := RelativeSectors;
      HasPartition := True;
      PartitionFound := True;
@@ -1536,7 +1748,7 @@ Begin
    With MBR.PartitionTable[i] do Begin
     If (Not Found) and (TotalSectors > 0) and
        ((Pass = 1) or (Status = $80)) and
-       (PartitionType in [$01, $04, $06, $0B, $0C, $0E, $0F]) Then Begin
+       (PartitionType in [$01, $04, $06, $07, $0B, $0C, $0E, $0F]) Then Begin
      PartitionOffset := RelativeSectors;
      HasPartition := True;
      Found := True;
@@ -1997,6 +2209,27 @@ Begin
  CheckStatus[ciFreeSpace] := True;
 End;
 
+{$IFDEF FPC}
+Var
+ SurfBlk: LongInt;
+ SurfOk: Boolean;
+
+{ Lecture du secteur I par blocs de 64 secteurs (un bloc illisible est
+  relu secteur par secteur) }
+Function SurfRead(I: LongInt): Boolean;
+Var
+ N: LongInt;
+Begin
+ If (SurfBlk < 0) or (I < SurfBlk) or (I >= SurfBlk + 64) Then Begin
+  SurfBlk := I;
+  N := 64;
+  If I + N > TotalSectors Then N := TotalSectors - I;
+  SurfOk := RawRead(I, N, Big);
+ End;
+ If SurfOk Then SurfRead := True Else SurfRead := ReadSector(I);
+End;
+{$ENDIF}
+
 Procedure SurfaceScan;
 Var
  i: LongInt;
@@ -2018,11 +2251,18 @@ Begin
  SectorsExamined := 0;
   { Afficher l'Çcran de surface scan - êCRAN FIXE }
  ShowSurfaceScanScreen;
+ {$IFDEF FPC}
+ SurfBlk := -1;
+ {$ENDIF}
  { Initialiser le gÇnÇrateur de nombres alÇatoires pour la simulation }
  Randomize;
  For i := 0 to TotalSectors - 1 do Begin
   Inc(SectorsExamined);
+  {$IFDEF FPC}
+  BadSectorFound := Not SurfRead(i);
+  {$ELSE}
   BadSectorFound := Not ReadSector(i);
+  {$ENDIF}
   If BadSectorFound Then Begin
    Inc(BadSectors);
    BlockNo := i div SectorsPerBlockScan;
@@ -2030,7 +2270,7 @@ Begin
     BlockState[BlockNo] := 3;
     DrawBlock(BlockNo, True);
    End;
-   If AutoFix Then Begin
+   If AutoFix {$IFDEF FPC} and False {$ENDIF} Then Begin
      { Marquer le cluster correspondant comme dÇfectueux }
     If i >= (BootSector.ReservedSectors + BootSector.NumberOfFATs * BootSector.SectorsPerFAT) Then Begin
      If FATType = ftFAT12 Then Begin
@@ -2055,7 +2295,7 @@ Begin
    UpdateSurfaceProgress(SectorsExamined, BadSectors);
   End;
    { VÇrifier si l'utilisateur appuie sur une touche }
-  If KeyPressed Then Begin
+  If ((i and 255) = 0) and KeyPressed Then Begin
    Case ReadKey of
     #27, 'e', 'E': Begin { ESC ou Exit }
      Break;
@@ -2067,7 +2307,7 @@ Begin
   If TotalSectors < 10000 Then Delay(2) Else
   If HasPartition Then { Pas de dÇlai pour les disques avec partitions }
                        { Pas de dÇlai du tout }
-                  Else Delay(1);
+                  Else {$IFNDEF FPC} Delay(1) {$ENDIF};
  End;
   { Mettre Ö jour l'affichage final }
  UpdateSurfaceProgress(SectorsExamined, BadSectors);
@@ -2082,6 +2322,1915 @@ Begin
  End;
  ReadKey;
 End;
+
+{$IFDEF FPC}
+{ ==================================================================== }
+{ Verification en 32 bits : FAT12, FAT16, FAT32, NTFS et HPFS          }
+{ (Pasdows 95 et Free Pascal). Les erreurs sont notees dans un journal }
+{ affiche a la fin (et ecrit dans SCANDISK.LOG) ; aucune ecriture n'est }
+{ faite sur le disque.                                                 }
+{ ==================================================================== }
+
+Const
+ MaxLog = 400;
+ MaxRuns = 512;
+
+Type
+ TRunList = Record
+  N: LongInt;
+  V, L, C: Array[0..MaxRuns - 1] of LongInt;  { VCN, longueur, LCN (-1 : creux) }
+ End;
+
+Var
+ LogMsg: Array[0..MaxLog - 1] of String[78];
+ LogErr: Array[0..MaxLog - 1] of Boolean;
+ LogN, NoteN: LongInt;
+ PopT: Array[0..255] of Byte;
+ { statistiques }
+ UnitBytes, TotUnits, FreeUnits, BadUnits, FileUnits, DirUnits: LongInt;
+ NFiles, NDirs, LostChains: LongInt;
+ FsName: String[12];
+ { FAT }
+ FSpc, FRsvd, FNFat, FRootEnt, FFatSz, FRootSec, FRootSecs, FFirstData,
+ FNClus, FMax, FRootClus, FEoc, FBadV, FResV, FClusB, FMedia, FFsInfo,
+ FExtFlags, FBkBoot, FTotSec: LongInt;
+ FatT: PLA;
+ RefC: PB;
+ { NTFS }
+ NSpc, NCB, NTotC, NMftLcn, NMirrLcn, NRecSz, NIdxSz, NRecs: LongInt;
+ MftRL, BmpRL, IdxRL: TRunList;
+ BmpDataSize: LongInt;
+ InUseB, IsDirB, MftBmp, CMap: PB;
+ SeqA, ParRec, ParSeq: PLA;
+ NIdxQ: Array[0..1023] of LongInt;
+ { HPFS }
+ HTot, HRoot, HList, HListN, HNB, HDirS, HDirE, HDirBmp, HNDn: LongInt;
+ SMap, HBmp, DnSeen: PB;
+ HDBm: Array[0..2047] of Byte;
+ SB, SP: Array[0..511] of Byte;
+
+Function LStr(V: LongInt): String;
+Var
+ S: String;
+Begin
+ Str(V, S);
+ LStr := S;
+End;
+
+{ Nombre avec separateurs de milliers (espaces) }
+Function NStr(V: LongInt): String;
+Var
+ S, R: String;
+ K: LongInt;
+Begin
+ Str(V, S);
+ R := '';
+ K := 0;
+ While Length(S) > 0 do Begin
+  If (K > 0) and (K mod 3 = 0) and (S[Length(S)] <> '-') Then R := ' ' + R;
+  R := S[Length(S)] + R;
+  Delete(S, Length(S), 1);
+  Inc(K);
+ End;
+ NStr := R;
+End;
+
+Procedure AddLog(Const S: String; Err: Boolean);Begin
+ If Err Then Inc(ErrorsFound) Else Inc(NoteN);
+ If LogN < MaxLog Then Begin
+  LogMsg[LogN] := Copy(S, 1, 78);
+  LogErr[LogN] := Err;
+  Inc(LogN);
+ End;
+End;
+
+Procedure AddErr(Const S: String);Begin
+ AddLog(S, True);
+End;
+
+Procedure AddNote(Const S: String);Begin
+ AddLog(S, False);
+End;
+
+Function RdW(P: PB; O: LongInt): LongInt;Begin
+ RdW := LongInt(P^[O]) or (LongInt(P^[O + 1]) shl 8);
+End;
+
+Function RdL(P: PB; O: LongInt): LongInt;Begin
+ RdL := LongInt(P^[O]) or (LongInt(P^[O + 1]) shl 8) or
+        (LongInt(P^[O + 2]) shl 16) or (LongInt(P^[O + 3]) shl 24);
+End;
+
+Function BitOn(P: PB; I: LongInt): Boolean;Begin
+ BitOn := ((P^[I shr 3] shr (I and 7)) and 1) <> 0;
+End;
+
+Procedure BitSet(P: PB; I: LongInt);Begin
+ P^[I shr 3] := P^[I shr 3] or (1 shl (I and 7));
+End;
+
+Function NewBuf(Size: LongInt): PB;
+Var
+ P: PB;
+Begin
+ If Size < 16 Then Size := 16;
+ GetMem(P, Size);
+ If P <> Nil Then FillChar(P^, Size, 0);
+ NewBuf := P;
+End;
+
+Function ReadErrMsg(Sec: LongInt): String;Begin
+ ReadErrMsg := TL('Erreur de lecture au secteur ', 'Read error at sector ') +
+               LStr(Sec);
+End;
+
+Procedure ShowFsLine(Const S: String);Begin
+ GotoXY(1, 3);
+ Write(S);
+ ClrEol;
+End;
+
+Function TotSecOf: LongInt;
+Var
+ T: LongInt;
+Begin
+ T := BootSector.TotalSectors;
+ If T = 0 Then T := BootSector.TotalSectorsBig;
+ TotSecOf := T;
+End;
+
+{ -------------------------------------------------------------------- }
+{ Detection du systeme de fichiers d'apres le secteur d'amorce          }
+{ -------------------------------------------------------------------- }
+
+Function DetectFs: Boolean;
+Var
+ P: PB;
+ Oem: String;
+ K, V: LongInt;
+Begin
+ DetectFs := False;
+ For K := 0 to 255 do Begin
+  V := K;
+  PopT[K] := 0;
+  While V <> 0 do Begin
+   PopT[K] := PopT[K] + (V and 1);
+   V := V shr 1;
+  End;
+ End;
+ If Not ReadSector(0) Then Exit;
+ Move(SectorBuffer, BootSector, SizeOf(BootSector));
+ P := @SectorBuffer;
+ Oem := '';
+ For K := 3 to 10 do Oem := Oem + Chr(P^[K]);
+ If Oem = 'NTFS    ' Then FsType := fsNTFS
+  Else
+ Begin
+  FsType := fsFAT16;
+  { HPFS : superbloc au secteur 16 }
+  If ReadSector(16) and (RdL(@SectorBuffer, 0) = LongInt($F995E849)) and
+     (RdL(@SectorBuffer, 4) = LongInt($FA53E9C5)) Then FsType := fsHPFS
+  Else Begin
+   If Not ReadSector(0) Then Exit;
+   P := @SectorBuffer;
+   If (RdW(P, 22) = 0) and (RdL(P, 36) <> 0) Then FsType := fsFAT32;
+  End;
+ End;
+ If Not ReadSector(0) Then Exit;
+ P := @SectorBuffer;
+ If RdW(P, 11) <> 512 Then Begin
+  ShowDialog(TL('Erreur', 'Error'),
+             TL('Taille de secteur non prise en charge : ',
+                'Unsupported sector size: ') + LStr(RdW(P, 11)), False);
+  Exit;
+ End;
+ Case FsType of
+  fsNTFS: Begin
+   FsName := 'NTFS';
+   NSpc := P^[13];
+   If NSpc > 128 Then NSpc := 1 shl (256 - NSpc);
+   TotalSectors := RdL(P, $28);
+   NMftLcn := RdL(P, $30);
+   NMirrLcn := RdL(P, $38);
+   V := ShortInt(P^[$40]);
+   If V > 0 Then NRecSz := V * NSpc * 512 Else NRecSz := 1 shl (-V);
+   V := ShortInt(P^[$44]);
+   If V > 0 Then NIdxSz := V * NSpc * 512 Else NIdxSz := 1 shl (-V);
+   NCB := NSpc * 512;
+   If NSpc = 0 Then NTotC := 0 Else NTotC := TotalSectors div NSpc;
+   UnitBytes := NCB;
+   TotUnits := NTotC;
+  End;
+  fsHPFS: Begin
+   FsName := 'HPFS';
+   If Not ReadSector(16) Then Exit;
+   Move(SectorBuffer, SB, 512);
+   If Not ReadSector(17) Then Exit;
+   Move(SectorBuffer, SP, 512);
+   HTot := RdL(@SB, 16);
+   TotalSectors := HTot;
+   UnitBytes := 512;
+   TotUnits := HTot;
+  End;
+  Else Begin
+   FSpc := P^[13];
+   FRsvd := RdW(P, 14);
+   FNFat := P^[16];
+   FRootEnt := RdW(P, 17);
+   FTotSec := RdW(P, 19);
+   If FTotSec = 0 Then FTotSec := RdL(P, 32);
+   FMedia := P^[21];
+   FFatSz := RdW(P, 22);
+   If FFatSz = 0 Then FFatSz := RdL(P, 36);
+   FExtFlags := RdW(P, 40);
+   FRootClus := RdL(P, 44);
+   FFsInfo := RdW(P, 48);
+   FBkBoot := RdW(P, 50);
+   TotalSectors := FTotSec;
+   If (FSpc = 0) or (FNFat = 0) or (FFatSz = 0) or (FTotSec = 0) Then Begin
+    ShowDialog(TL('Erreur', 'Error'),
+               TL('Secteur d''amorce invalide : syst'#138'me de fichiers '+
+                  'inconnu.', 'Invalid boot sector: unknown file system.'),
+               False);
+    Exit;
+   End;
+   FRootSec := FRsvd + FNFat * FFatSz;
+   FRootSecs := (FRootEnt * 32 + 511) div 512;
+   FFirstData := FRootSec + FRootSecs;
+   FNClus := (FTotSec - FFirstData) div FSpc;
+   FMax := FNClus + 1;
+   FClusB := FSpc * 512;
+   If FsType <> fsFAT32 Then Begin
+    If FNClus < 4085 Then FsType := fsFAT12 Else FsType := fsFAT16;
+   End;
+   Case FsType of
+    fsFAT12: Begin
+     FsName := 'FAT12'; FEoc := $FF8; FBadV := $FF7; FResV := $FF0;
+    End;
+    fsFAT16: Begin
+     FsName := 'FAT16'; FEoc := $FFF8; FBadV := $FFF7; FResV := $FFF0;
+    End;
+    Else Begin
+     FsName := 'FAT32'; FEoc := $0FFFFFF8; FBadV := $0FFFFFF7;
+     FResV := $0FFFFFF0;
+    End;
+   End;
+   UnitBytes := FClusB;
+   TotUnits := FNClus;
+  End;
+ End;
+ ShowFsLine(TL('Syst'#138'me de fichiers d'#130'tect'#130' : ',
+               'Detected file system: ') + FsName + ' (' + NStr(TotUnits) +
+            TL(' unit'#130's de ', ' units of ') + NStr(UnitBytes) +
+            TL(' octets)', ' bytes)'));
+ GetMem(Big, 65536);
+ GetMem(Big2, 65536);
+ DetectFs := True;
+End;
+
+{ ==================================================================== }
+{ FAT12, FAT16 et FAT32                                                }
+{ ==================================================================== }
+
+Function FClusSec(C: LongInt): LongInt;Begin
+ FClusSec := FFirstData + (C - 2) * FSpc;
+End;
+
+Function FNeedBytes: LongInt;Begin
+ Case FsType of
+  fsFAT12: FNeedBytes := ((FMax + 1) * 3) div 2 + 2;
+  fsFAT16: FNeedBytes := (FMax + 1) * 2;
+  Else FNeedBytes := (FMax + 1) * 4;
+ End;
+End;
+
+Procedure FatBoot;
+Var
+ P: PB;
+ K: LongInt;
+ Same: Boolean;
+Begin
+ P := @SectorBuffer;
+ If Not ReadSector(0) Then Begin
+  AddErr(ReadErrMsg(0));
+  Exit;
+ End;
+ If RdW(P, 510) <> $AA55 Then
+  AddErr(TL('Signature AA55h absente du secteur d''amorce',
+            'Boot sector signature AA55h missing'));
+ If Not ((FMedia = $F0) or (FMedia >= $F8)) Then
+  AddErr(TL('Descripteur de m'#130'dia invalide : ', 'Invalid media descriptor: ') +
+         IntToHex(FMedia, 2) + 'h');
+ If (FSpc and (FSpc - 1)) <> 0 Then
+  AddErr(TL('Secteurs par unit'#130' invalide : ', 'Invalid sectors per cluster: ') +
+         LStr(FSpc));
+ If FNClus < 1 Then AddErr(TL('Volume sans unit'#130' d''allocation',
+                              'Volume has no data clusters'));
+ If (FsType = fsFAT32) and (FBkBoot <> 0) and (FBkBoot < FRsvd) Then Begin
+  Move(SectorBuffer, Big^, 512);
+  If ReadSector(FBkBoot) Then Begin
+   Same := True;
+   For K := 0 to 89 do
+    If Big^[K] <> SectorBuffer[K] Then Same := False;
+   If Not Same Then
+    AddErr(TL('La copie du secteur d''amorce (secteur ', 'Backup boot sector (sector ') +
+           LStr(FBkBoot) + TL(') diff'#138're de l''original', ') differs from the original'));
+  End Else AddErr(ReadErrMsg(FBkBoot));
+ End;
+ If (FsType = fsFAT32) and (FFsInfo <> 0) and (FFsInfo < FRsvd) Then Begin
+  If ReadSector(FFsInfo) Then Begin
+   If (RdL(P, 0) <> $41615252) or (RdL(P, 484) <> $61417272) Then
+    AddErr(TL('Secteur FSInfo invalide (signatures)', 'Invalid FSInfo sector (signatures)'));
+  End Else AddErr(ReadErrMsg(FFsInfo));
+ End;
+ If FsType = fsFAT32 Then Begin
+  If (FRootClus < 2) or (FRootClus > FMax) Then
+   AddErr(TL('Cluster du r'#130'pertoire racine invalide : ', 'Invalid root directory cluster: ') +
+          LStr(FRootClus));
+ End;
+End;
+
+{ Lecture de la premiere FAT et comparaison avec les copies }
+Function FatLoad: Boolean;
+Var
+ NSec, S, N, K, I, E, O, Diff, Ent: LongInt;
+ Whole: PB;
+Begin
+ FatLoad := False;
+ FatT := Nil;
+ RefC := Nil;
+ GetMem(FatT, (FMax + 2) * 4);
+ RefC := NewBuf(FMax + 2);
+ If (FatT = Nil) or (RefC = Nil) Then Begin
+  AddErr(TL('M'#130'moire insuffisante pour la FAT', 'Not enough memory for the FAT'));
+  Exit;
+ End;
+ FillChar(FatT^, (FMax + 2) * 4, 0);
+ NSec := (FNeedBytes + 511) div 512;
+ If NSec > FFatSz Then Begin
+  AddErr(TL('La FAT est trop petite pour le nombre d''unit'#130's du volume',
+            'The FAT is too small for the number of clusters'));
+  NSec := FFatSz;
+ End;
+ Ent := FMax + 1;
+ If FsType = fsFAT12 Then Begin
+  Whole := NewBuf(NSec * 512 + 4);
+  S := 0;
+  While S < NSec do Begin
+   N := NSec - S;
+   If N > 64 Then N := 64;
+   If Not RawRead(FRsvd + S, N, @Whole^[S * 512]) Then Begin
+    AddErr(ReadErrMsg(FRsvd + S));
+    FreeMem(Whole, NSec * 512 + 4);
+    Exit;
+   End;
+   S := S + N;
+  End;
+  For I := 0 to Ent do Begin
+   O := (I * 3) div 2;
+   If O + 1 >= NSec * 512 Then Break;
+   If (I and 1) = 0 Then E := RdW(Whole, O) and $FFF
+                    Else E := RdW(Whole, O) shr 4;
+   FatT^[I] := E;
+  End;
+  FreeMem(Whole, NSec * 512 + 4);
+ End
+  Else
+ Begin
+  S := 0;
+  While S < NSec do Begin
+   N := NSec - S;
+   If N > 128 Then N := 128;
+   ProgressStep(S, NSec, 2, 15);
+   If Not RawRead(FRsvd + S, N, Big) Then Begin
+    AddErr(ReadErrMsg(FRsvd + S));
+    Exit;
+   End;
+   If FsType = fsFAT16 Then Begin
+    For K := 0 to N * 256 - 1 do Begin
+     I := S * 256 + K;
+     If I > Ent Then Break;
+     FatT^[I] := RdW(Big, K * 2);
+    End;
+   End
+    Else
+   Begin
+    For K := 0 to N * 128 - 1 do Begin
+     I := S * 128 + K;
+     If I > Ent Then Break;
+     FatT^[I] := RdL(Big, K * 4) and $0FFFFFFF;
+    End;
+   End;
+   S := S + N;
+  End;
+ End;
+ FatLoad := True;
+ If (FatT^[0] and $FF) <> FMedia Then
+  AddErr(TL('La premi'#138're entr'#130'e de la FAT ne contient pas le descripteur de m'#130'dia',
+            'First FAT entry does not hold the media descriptor'));
+ { comparer les copies (sauf FAT32 sans miroir) }
+ If (FsType = fsFAT32) and ((FExtFlags and $80) <> 0) Then Exit;
+ For K := 1 to FNFat - 1 do Begin
+  S := 0;
+  Diff := -1;
+  While (S < NSec) and (Diff < 0) do Begin
+   N := NSec - S;
+   If N > 128 Then N := 128;
+   ProgressStep(S, NSec, 15, 25);
+   If Not RawRead(FRsvd + S, N, Big) Then Break;
+   If Not RawRead(FRsvd + K * FFatSz + S, N, Big2) Then Begin
+    AddErr(ReadErrMsg(FRsvd + K * FFatSz + S));
+    Break;
+   End;
+   For I := 0 to N * 512 - 1 do
+    If Big^[I] <> Big2^[I] Then Begin
+     Diff := S + I div 512;
+     Break;
+    End;
+   S := S + N;
+  End;
+  If Diff >= 0 Then
+   AddErr(TL('La copie ', 'FAT copy ') + LStr(K + 1) +
+          TL(' de la FAT diff'#138're de la premi'#138're (secteur ',
+             ' differs from the first one (sector ') + LStr(Diff) + TL(' de la FAT)', ' of the FAT)'));
+ End;
+End;
+
+{ Suivre la chaine qui commence en Start et marquer ses unites ;
+  renvoie le nombre d'unites }
+Function FMark(Start: LongInt; Const Nm: String): LongInt;
+Var
+ C, Nx, Cnt: LongInt;
+Begin
+ C := Start;
+ Cnt := 0;
+ While (C >= 2) and (C <= FMax) do Begin
+  If RefC^[C] <> 0 Then Begin
+   Inc(CrossLinkedFiles);
+   AddErr(Nm + TL(' : lien crois'#130' ou boucle au cluster ', ': cross-link or loop at cluster ') +
+          LStr(C));
+   Break;
+  End;
+  RefC^[C] := 1;
+  Inc(Cnt);
+  Nx := FatT^[C];
+  If Nx >= FEoc Then Break;
+  If Nx = 0 Then Begin
+   AddErr(Nm + TL(' : cha'#140'ne interrompue (cluster libre apr'#138's ',
+                  ': broken chain (free cluster after ') + LStr(C) + ')');
+   Break;
+  End;
+  If Nx = FBadV Then Begin
+   AddErr(Nm + TL(' : la cha'#140'ne contient un cluster d'#130'fectueux',
+                  ': chain contains a bad cluster'));
+   Break;
+  End;
+  If (Nx < 2) or (Nx > FMax) Then Begin
+   AddErr(Nm + TL(' : cluster suivant invalide (', ': invalid next cluster (') +
+          LStr(Nx) + TL(') apr'#138's ', ') after ') + LStr(C));
+   Break;
+  End;
+  C := Nx;
+ End;
+ FMark := Cnt;
+End;
+
+{ Nom 8.3 d'une entree de repertoire }
+Function FEntName(P: PB; O: LongInt): String;
+Var
+ S, E: String;
+ K: LongInt;
+Begin
+ S := '';
+ For K := 0 to 7 do S := S + Chr(P^[O + K]);
+ While (Length(S) > 0) and (S[Length(S)] = ' ') do Delete(S, Length(S), 1);
+ If (Length(S) > 0) and (S[1] = #5) Then S[1] := #229;
+ E := '';
+ For K := 8 to 10 do E := E + Chr(P^[O + K]);
+ While (Length(E) > 0) and (E[Length(E)] = ' ') do Delete(E, Length(E), 1);
+ If E <> '' Then S := S + '.' + E;
+ FEntName := S;
+End;
+
+Function FIsRoot(C: LongInt): Boolean;Begin
+ FIsRoot := (C = 0) or ((FsType = fsFAT32) and (C = FRootClus));
+End;
+
+Var
+ FDirsDone: LongInt;
+
+Procedure FScanDir(Clus, Parent: LongInt; Path: String; Depth: LongInt);
+Var
+ P: PB;
+ BlkSz, C, Nx, K, O, Cnt, Start, Size, Chain, Need, Exp, Lp: LongInt;
+ A: Byte;
+ Nm: String;
+ Fin, Ok: Boolean;
+Begin
+ If Depth > 60 Then Begin
+  AddErr(Path + TL(' : r'#130'pertoires trop imbriqu'#130's', ': directories nested too deep'));
+  Exit;
+ End;
+ Inc(FDirsDone);
+ If NDirs > 0 Then ProgressStep(FDirsDone, NDirs + 1, 30, 60);
+ If Clus = 0 Then BlkSz := FRootSecs * 512 Else BlkSz := FClusB;
+ If BlkSz <= 0 Then Exit;
+ P := NewBuf(BlkSz);
+ C := Clus;
+ Fin := False;
+ Cnt := 0;
+ Lp := 0;
+ Repeat
+  If Clus = 0 Then Ok := RawRead(FRootSec, FRootSecs, P)
+              Else Ok := RawRead(FClusSec(C), FSpc, P);
+  If Not Ok Then Begin
+   AddErr(Path + ' : ' + ReadErrMsg(FClusSec(C)));
+   Break;
+  End;
+  For K := 0 to BlkSz div 32 - 1 do Begin
+   O := K * 32;
+   If P^[O] = 0 Then Begin
+    Fin := True;
+    Break;
+   End;
+   A := P^[O + 11];
+   If (P^[O] <> $E5) and (A <> $0F) and ((A and 8) = 0) Then Begin
+    Nm := FEntName(P, O);
+    Start := RdW(P, O + 26);
+    If FsType = fsFAT32 Then Start := Start or (RdW(P, O + 20) shl 16);
+    Size := RdL(P, O + 28);
+    If P^[O] = Ord('.') Then Begin
+     If FIsRoot(Clus) Then
+      AddErr(Path + TL(' : entr'#130'e "', ': entry "') + Nm +
+             TL('" dans le r'#130'pertoire racine', '" in the root directory'))
+     Else If Nm = '.' Then Begin
+      If Start <> Clus Then
+       AddErr(Path + TL(' : entr'#130'e "." invalide', ': invalid "." entry'));
+     End
+      Else
+     Begin
+      If FIsRoot(Parent) Then Exp := 0 Else Exp := Parent;
+      If Start <> Exp Then
+       AddErr(Path + TL(' : entr'#130'e ".." invalide', ': invalid ".." entry'));
+     End;
+    End
+     Else
+    If (A and $10) <> 0 Then Begin
+     Inc(NDirs);
+     If (Start < 2) or (Start > FMax) Then
+      AddErr(Path + Nm + TL(' : cluster de d'#130'part invalide (', ': invalid start cluster (') +
+             LStr(Start) + ')')
+     Else If RefC^[Start] <> 0 Then Begin
+      Inc(CrossLinkedFiles);
+      AddErr(Path + Nm + TL(' : r'#130'pertoire en lien crois'#130,
+                            ': cross-linked directory'));
+     End
+      Else
+     Begin
+      Chain := FMark(Start, Path + Nm);
+      DirUnits := DirUnits + Chain;
+      FScanDir(Start, Clus, Path + Nm + '\', Depth + 1);
+     End;
+    End
+     Else
+    Begin
+     Inc(NFiles);
+     If Size = 0 Then Begin
+      If Start <> 0 Then Begin
+       If (Start >= 2) and (Start <= FMax) and (RefC^[Start] = 0) Then
+        FileUnits := FileUnits + FMark(Start, Path + Nm);
+       AddErr(Path + Nm + TL(' : fichier vide avec des clusters',
+                             ': empty file with clusters allocated'));
+      End;
+     End
+      Else
+     If (Start < 2) or (Start > FMax) Then
+      AddErr(Path + Nm + TL(' : cluster de d'#130'part invalide (', ': invalid start cluster (') +
+             LStr(Start) + ')')
+     Else Begin
+      Chain := FMark(Start, Path + Nm);
+      FileUnits := FileUnits + Chain;
+      Need := ((((Size - 1) shr 9) + 1) + FSpc - 1) div FSpc;
+      If Chain <> Need Then
+       AddErr(Path + Nm + TL(' : la taille (', ': size (') + NStr(Size) +
+              TL(' octets) ne correspond pas '#133' la cha'#140'ne (',
+                 ' bytes) does not match the chain (') + LStr(Chain) +
+              TL(' clusters)', ' clusters)'));
+     End;
+    End;
+   End;
+  End;
+  If Fin or (Clus = 0) Then Break;
+  Nx := FatT^[C];
+  If (Nx >= FEoc) or (Nx < 2) or (Nx > FMax) Then Break;
+  Inc(Cnt);
+  If Cnt > FNClus Then Break;
+  C := Nx;
+  Inc(Lp);
+ Until False;
+ FreeMem(P, BlkSz);
+End;
+
+Procedure FatDirs;Begin
+ FDirsDone := 0;
+ If FsType = fsFAT32 Then Begin
+  If (FRootClus >= 2) and (FRootClus <= FMax) Then Begin
+   DirUnits := DirUnits + FMark(FRootClus, DrivePath + '\');
+   FScanDir(FRootClus, FRootClus, DrivePath + '\', 0);
+  End;
+ End
+  Else
+ FScanDir(0, 0, DrivePath + '\', 0);
+End;
+
+{ Valeurs de la FAT : pointeurs hors du volume, vers un cluster libre... }
+Procedure FatChains;
+Var
+ I, V, Bad, Out, ToFree, Res: LongInt;
+Begin
+ Bad := 0; Out := 0; ToFree := 0; Res := 0;
+ For I := 2 to FMax do Begin
+  If (I and 4095) = 0 Then ProgressStep(I, FMax, 60, 80);
+  V := FatT^[I];
+  If V = 0 Then Continue;
+  If V = FBadV Then Inc(Bad)
+  Else If V >= FEoc Then
+  Else If V >= FResV Then Begin
+   Inc(Res);
+   If Res <= 3 Then AddErr(TL('Valeur r'#130'serv'#130'e dans la FAT au cluster ',
+                              'Reserved FAT value at cluster ') + LStr(I));
+  End
+  Else If (V < 2) or (V > FMax) Then Begin
+   Inc(Out);
+   If Out <= 5 Then AddErr(TL('Le cluster ', 'Cluster ') + LStr(I) +
+                           TL(' pointe hors du volume (', ' points outside the volume (') +
+                           LStr(V) + ')');
+  End
+  Else If FatT^[V] = 0 Then Begin
+   Inc(ToFree);
+   If ToFree <= 5 Then AddErr(TL('Le cluster ', 'Cluster ') + LStr(I) +
+                              TL(' pointe vers le cluster libre ', ' points to free cluster ') +
+                              LStr(V));
+  End;
+ End;
+ If Out > 5 Then AddErr(LStr(Out) + TL(' pointeurs hors du volume en tout',
+                                        ' pointers outside the volume in all'));
+ If ToFree > 5 Then AddErr(LStr(ToFree) + TL(' pointeurs vers des clusters libres en tout',
+                                              ' pointers to free clusters in all'));
+ BadUnits := Bad;
+End;
+
+{ Unites perdues (allouees dans la FAT mais d'aucun fichier) }
+Procedure FatLost;
+Var
+ I, V, Lost, Free: LongInt;
+ P: PB;
+Begin
+ Lost := 0;
+ Free := 0;
+ For I := 2 to FMax do Begin
+  If (I and 4095) = 0 Then ProgressStep(I, FMax, 80, 90);
+  V := FatT^[I];
+  If V = 0 Then Inc(Free)
+  Else If (V <> FBadV) and (RefC^[I] = 0) Then Begin
+   Inc(Lost);
+   RefC^[I] := 3;
+  End;
+ End;
+ LostChains := 0;
+ If Lost > 0 Then Begin
+  For I := 2 to FMax do
+   If RefC^[I] >= 3 Then Begin
+    V := FatT^[I];
+    If (V >= 2) and (V <= FMax) and (RefC^[V] >= 3) Then RefC^[V] := 4;
+   End;
+  For I := 2 to FMax do If RefC^[I] = 3 Then Inc(LostChains);
+  LostClusters := Lost;
+  AddErr(NStr(Lost) + TL(' unit'#130's d''allocation perdues dans ', ' lost allocation units in ') +
+         LStr(LostChains) + TL(' cha'#140'ne(s)', ' chain(s)'));
+ End;
+ FreeUnits := Free;
+ If (FsType = fsFAT32) and (FFsInfo <> 0) and (FFsInfo < FRsvd) and
+    ReadSector(FFsInfo) Then Begin
+  P := @SectorBuffer;
+  V := RdL(P, 488);
+  If (RdL(P, 0) = $41615252) and (V <> -1) and (V <> Free) Then
+   AddNote(TL('Remarque : FSInfo indique ', 'Note: FSInfo reports ') + NStr(V) +
+           TL(' clusters libres au lieu de ', ' free clusters instead of ') + NStr(Free));
+ End;
+End;
+
+{ ==================================================================== }
+{ NTFS                                                                 }
+{ ==================================================================== }
+
+{ LCN du VCN Vcn d'un attribut (Cnt : clusters restants dans l'extension) ;
+  -1 pour un creux, -2 si le VCN n'est pas decrit }
+Function RunLcn(Var R: TRunList; Vcn: LongInt; Var Cnt: LongInt): LongInt;
+Var
+ K: LongInt;
+Begin
+ RunLcn := -2;
+ Cnt := 0;
+ For K := 0 to R.N - 1 do
+  If (Vcn >= R.V[K]) and (Vcn < R.V[K] + R.L[K]) Then Begin
+   Cnt := R.V[K] + R.L[K] - Vcn;
+   If R.C[K] < 0 Then RunLcn := -1 Else RunLcn := R.C[K] + (Vcn - R.V[K]);
+   Exit;
+  End;
+End;
+
+{ Lire Len octets (multiple de 512) d'un attribut non resident a partir
+  de l'octet Off (multiple de 512) }
+Function StreamRead(Var R: TRunList; Off, Len: LongInt; P: PB): Boolean;
+Var
+ Vcn, Within, Lcn, Cnt, Avail, N, Pos: LongInt;
+Begin
+ StreamRead := False;
+ Pos := 0;
+ While Len > 0 do Begin
+  Vcn := Off div NCB;
+  Within := Off mod NCB;
+  Lcn := RunLcn(R, Vcn, Cnt);
+  If Lcn = -2 Then Exit;
+  Avail := Cnt * NCB - Within;
+  N := Len;
+  If N > Avail Then N := Avail;
+  If Lcn = -1 Then FillChar(P^[Pos], N, 0)
+  Else If Not RawRead(Lcn * NSpc + Within div 512, N div 512, @P^[Pos]) Then Exit;
+  Pos := Pos + N;
+  Off := Off + N;
+  Len := Len - N;
+ End;
+ StreamRead := True;
+End;
+
+{ Correctifs de fin de secteur (USA) d'un enregistrement FILE ou INDX }
+Function Fixup(P: PB; B, Size: LongInt): Boolean;
+Var
+ UOfs, UCnt, Usn, K: LongInt;
+Begin
+ Fixup := False;
+ UOfs := RdW(P, B + 4);
+ UCnt := RdW(P, B + 6);
+ If (UCnt < 2) or (UOfs + UCnt * 2 > Size) or ((UCnt - 1) * 512 > Size) Then Exit;
+ Usn := RdW(P, B + UOfs);
+ For K := 1 to UCnt - 1 do Begin
+  If RdW(P, B + K * 512 - 2) <> Usn Then Exit;
+  P^[B + K * 512 - 2] := P^[B + UOfs + K * 2];
+  P^[B + K * 512 - 1] := P^[B + UOfs + K * 2 + 1];
+ End;
+ Fixup := True;
+End;
+
+{ Liste des extensions (mapping pairs) de l'attribut non resident en A }
+Function ParseRuns(P: PB; A: LongInt; Var R: TRunList): Boolean;
+Var
+ O, AEnd, H, LB, OB, K, Len, Delta, Lcn, Vcn: LongInt;
+Begin
+ ParseRuns := False;
+ R.N := 0;
+ Vcn := RdL(P, A + 16);
+ Lcn := 0;
+ O := A + RdW(P, A + 32);
+ AEnd := A + RdL(P, A + 4);
+ While (O < AEnd) and (P^[O] <> 0) do Begin
+  H := P^[O];
+  LB := H and 15;
+  OB := H shr 4;
+  If (LB = 0) or (LB > 8) or (OB > 8) or (O + 1 + LB + OB > AEnd) Then Exit;
+  Len := 0;
+  For K := LB - 1 downto 0 do
+   If K < 4 Then Len := (Len shl 8) or P^[O + 1 + K];
+  Delta := 0;
+  If OB > 0 Then Begin
+   For K := OB - 1 downto 0 do
+    If K < 4 Then Delta := (Delta shl 8) or P^[O + 1 + LB + K];
+   If (OB < 4) and ((P^[O + LB + OB] and $80) <> 0) Then
+    Delta := Delta - (LongInt(1) shl (8 * OB));
+  End;
+  O := O + 1 + LB + OB;
+  If R.N < MaxRuns Then Begin
+   R.V[R.N] := Vcn;
+   R.L[R.N] := Len;
+   If OB = 0 Then R.C[R.N] := -1
+   Else Begin
+    Lcn := Lcn + Delta;
+    R.C[R.N] := Lcn;
+   End;
+   Inc(R.N);
+  End
+   Else
+  Begin
+   If OB > 0 Then Lcn := Lcn + Delta;
+  End;
+  Vcn := Vcn + Len;
+ End;
+ ParseRuns := True;
+End;
+
+{ Premier attribut de type T dans l'enregistrement en B (-1 s'il manque) ;
+  Named : False pour l'attribut sans nom }
+Function FindAttr(P: PB; B, T: LongInt; NoName: Boolean): LongInt;
+Var
+ A, L, Used, K: LongInt;
+Begin
+ FindAttr := -1;
+ A := RdW(P, B + 20);
+ Used := RdL(P, B + 24);
+ K := 0;
+ While (A + 16 <= Used) and (K < 200) do Begin
+  If RdL(P, B + A) = -1 Then Exit;
+  L := RdL(P, B + A + 4);
+  If (L < 16) or (A + L > Used) Then Exit;
+  If (RdL(P, B + A) = T) and ((Not NoName) or (P^[B + A + 9] = 0)) Then Begin
+   FindAttr := B + A;
+   Exit;
+  End;
+  A := A + L;
+  Inc(K);
+ End;
+End;
+
+Function NtfsBoot: Boolean;
+Var
+ P: PB;
+ K: LongInt;
+ Same: Boolean;
+Begin
+ NtfsBoot := False;
+ P := @SectorBuffer;
+ If Not ReadSector(0) Then Begin
+  AddErr(ReadErrMsg(0));
+  Exit;
+ End;
+ If RdW(P, 510) <> $AA55 Then
+  AddErr(TL('Signature AA55h absente du secteur d''amorce', 'Boot sector signature AA55h missing'));
+ If (NSpc = 0) or ((NSpc and (NSpc - 1)) <> 0) Then Begin
+  AddErr(TL('Secteurs par cluster invalide', 'Invalid sectors per cluster'));
+  Exit;
+ End;
+ If (NRecSz < 512) or (NRecSz > 4096) Then Begin
+  AddErr(TL('Taille des enregistrements de la MFT invalide : ', 'Invalid MFT record size: ') +
+         LStr(NRecSz));
+  Exit;
+ End;
+ If (NIdxSz < 512) or (NIdxSz > 65536) Then
+  AddErr(TL('Taille des blocs d''index invalide : ', 'Invalid index block size: ') + LStr(NIdxSz));
+ If (NMftLcn <= 0) or (NMftLcn >= NTotC) Then Begin
+  AddErr(TL('Position de la MFT invalide', 'Invalid MFT location'));
+  Exit;
+ End;
+ If (NMirrLcn <= 0) or (NMirrLcn >= NTotC) Then
+  AddErr(TL('Position de $MFTMirr invalide', 'Invalid $MFTMirr location'));
+ { copie du secteur d'amorce au dernier secteur }
+ Move(SectorBuffer, Big^, 512);
+ If ReadSector(TotalSectors) Then Begin
+  Same := True;
+  For K := 0 to 511 do If Big^[K] <> SectorBuffer[K] Then Same := False;
+  If Not Same Then
+   AddErr(TL('La copie du secteur d''amorce (dernier secteur) diff'#138're de l''original',
+             'Backup boot sector (last sector) differs from the original'));
+ End;
+ NtfsBoot := True;
+End;
+
+Procedure MarkRuns(Var R: TRunList; Rec: LongInt);
+Var
+ K, C, Dup, Out: LongInt;
+Begin
+ Dup := 0;
+ Out := 0;
+ For K := 0 to R.N - 1 do
+  If R.C[K] >= 0 Then Begin
+   C := R.C[K];
+   While C < R.C[K] + R.L[K] do Begin
+    If (C < 0) or (C >= NTotC) Then Inc(Out)
+    Else If BitOn(CMap, C) Then Inc(Dup)
+    Else BitSet(CMap, C);
+    Inc(C);
+   End;
+  End;
+ If Out > 0 Then
+  AddErr(TL('Enregistrement ', 'Record ') + LStr(Rec) + ' : ' + LStr(Out) +
+         TL(' clusters hors du volume', ' clusters outside the volume'));
+ If Dup > 0 Then Begin
+  Inc(CrossLinkedFiles);
+  AddErr(TL('Enregistrement ', 'Record ') + LStr(Rec) + ' : ' + LStr(Dup) +
+         TL(' clusters d'#130'j'#133' utilis'#130's (liens crois'#130's)',
+            ' clusters already in use (cross-links)'));
+ End;
+End;
+
+Function RunTotal(Var R: TRunList): LongInt;
+Var
+ K, T: LongInt;
+Begin
+ T := 0;
+ For K := 0 to R.N - 1 do If R.C[K] >= 0 Then T := T + R.L[K];
+ RunTotal := T;
+End;
+
+{ Enregistrement 0 ($MFT), $MFTMirr, puis parcours de toute la MFT }
+Function NtfsMft: Boolean;
+Var
+ A, K, R, R0, Cnt, B, Flags, Used, FirstA, T, L, VO, Base, NBad, NHdr,
+ NFix, AttrN, MirrN, Sz: LongInt;
+ Same, IsBase: Boolean;
+ RL: TRunList;
+Begin
+ NtfsMft := False;
+ { $MFT : enregistrement 0 lu directement }
+ If Not RawRead(NMftLcn * NSpc, NRecSz div 512, Big) Then Begin
+  AddErr(ReadErrMsg(NMftLcn * NSpc));
+  Exit;
+ End;
+ If (RdL(Big, 0) <> $454C4946) or Not Fixup(Big, 0, NRecSz) Then Begin
+  AddErr(TL('Enregistrement 0 de la MFT ($MFT) illisible', 'MFT record 0 ($MFT) is unreadable'));
+  Exit;
+ End;
+ A := FindAttr(Big, 0, $80, True);
+ If (A < 0) or (Big^[A + 8] = 0) or Not ParseRuns(Big, A, MftRL) Then Begin
+  AddErr(TL('Attribut $DATA de $MFT absent ou invalide', '$MFT $DATA attribute missing or invalid'));
+  Exit;
+ End;
+ NRecs := RdL(Big, A + 48) div NRecSz;
+ If (RdL(Big, A + 52) <> 0) or (NRecs <= 16) Then Begin
+  AddErr(TL('Taille de la MFT invalide', 'Invalid MFT size'));
+  Exit;
+ End;
+ If MftRL.C[0] <> NMftLcn Then
+  AddErr(TL('La MFT ne commence pas au cluster indiqu'#130' par le secteur d''amorce',
+            'The MFT does not start at the cluster given by the boot sector'));
+ { bitmap de la MFT }
+ Sz := ((NRecs + 7) div 8 + 511) and not 511;
+ MftBmp := NewBuf(Sz + 512);
+ A := FindAttr(Big, 0, $B0, True);
+ If A < 0 Then AddErr(TL('Attribut $BITMAP de $MFT absent', '$MFT $BITMAP attribute missing'))
+ Else If Big^[A + 8] = 0 Then Begin
+  L := RdL(Big, A + 16);
+  If L > Sz Then L := Sz;
+  Move(Big^[A + RdW(Big, A + 20)], MftBmp^, L);
+ End
+  Else
+ Begin
+  If ParseRuns(Big, A, RL) Then Begin
+   L := (RdL(Big, A + 40) + 511) and not 511;
+   If L > Sz Then L := Sz;
+   If Not StreamRead(RL, 0, L, MftBmp) Then
+    AddErr(TL('Lecture du bitmap de la MFT impossible', 'Cannot read the MFT bitmap'));
+  End;
+ End;
+ { $MFTMirr : les 4 premiers enregistrements }
+ MirrN := 4;
+ If MirrN * NRecSz > 65536 Then MirrN := 65536 div NRecSz;
+ If StreamRead(MftRL, 0, MirrN * NRecSz, Big) and
+    RawRead(NMirrLcn * NSpc, MirrN * NRecSz div 512, Big2) Then Begin
+  Same := True;
+  For K := 0 to MirrN * NRecSz - 1 do If Big^[K] <> Big2^[K] Then Same := False;
+  If Not Same Then
+   AddErr(TL('$MFTMirr ne correspond pas aux premiers enregistrements de la MFT',
+             '$MFTMirr does not match the first MFT records'));
+ End
+  Else
+ AddErr(TL('Lecture de $MFTMirr impossible', 'Cannot read $MFTMirr'));
+ { tableaux par enregistrement et carte des clusters }
+ InUseB := NewBuf(NRecs div 8 + 8);
+ IsDirB := NewBuf(NRecs div 8 + 8);
+ GetMem(SeqA, NRecs * 4 + 8);
+ GetMem(ParRec, NRecs * 4 + 8);
+ GetMem(ParSeq, NRecs * 4 + 8);
+ CMap := NewBuf(NTotC div 8 + 8);
+ If (SeqA = Nil) or (ParRec = Nil) or (ParSeq = Nil) or (CMap = Nil) Then Begin
+  AddErr(TL('M'#130'moire insuffisante', 'Not enough memory'));
+  Exit;
+ End;
+ For R := 0 to NRecs - 1 do Begin
+  SeqA^[R] := 0;
+  ParRec^[R] := -1;
+  ParSeq^[R] := 0;
+ End;
+ NBad := 0; NHdr := 0; NFix := 0; AttrN := 0;
+ BmpRL.N := 0;
+ BmpDataSize := 0;
+ R0 := 0;
+ While R0 < NRecs do Begin
+  Cnt := 65536 div NRecSz;
+  If R0 + Cnt > NRecs Then Cnt := NRecs - R0;
+  ProgressStep(R0, NRecs, 5, 30);
+  If Not StreamRead(MftRL, R0 * NRecSz, Cnt * NRecSz, Big) Then Begin
+   AddErr(TL('Lecture de la MFT impossible '#133' l''enregistrement ',
+             'Cannot read the MFT at record ') + LStr(R0));
+   Exit;
+  End;
+  For K := 0 to Cnt - 1 do Begin
+   R := R0 + K;
+   B := K * NRecSz;
+   T := RdL(Big, B);
+   If T = $44414142 Then Begin
+    Inc(NBad);
+    If NBad <= 5 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                             TL(' marqu'#130' d'#130'fectueux (BAAD)', ' marked bad (BAAD)'));
+    Continue;
+   End;
+   If T <> $454C4946 Then Continue;
+   Flags := RdW(Big, B + 22);
+   If (Flags and 1) = 0 Then Continue;
+   If Not Fixup(Big, B, NRecSz) Then Begin
+    Inc(NFix);
+    If NFix <= 5 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                             TL(' : correctifs de secteurs incorrects ('#130'criture interrompue)',
+                                ': bad update sequence (torn write)'));
+    Continue;
+   End;
+   Used := RdL(Big, B + 24);
+   FirstA := RdW(Big, B + 20);
+   If (RdL(Big, B + 28) <> NRecSz) or (Used > NRecSz) or (FirstA < 42) or
+      (FirstA >= Used) Then Begin
+    Inc(NHdr);
+    If NHdr <= 5 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                             TL(' : en-t'#136'te invalide', ': invalid header'));
+    Continue;
+   End;
+   BitSet(InUseB, R);
+   If (Flags and 2) <> 0 Then BitSet(IsDirB, R);
+   SeqA^[R] := RdW(Big, B + 16);
+   Base := RdL(Big, B + 32);
+   IsBase := (Base = 0) and (RdW(Big, B + 36) = 0);
+   If IsBase and (R >= 16) Then Begin
+    If (Flags and 2) <> 0 Then Inc(NDirs) Else Inc(NFiles);
+   End;
+   { attributs }
+   A := FirstA;
+   L := 0;
+   While A + 16 <= Used do Begin
+    T := RdL(Big, B + A);
+    If T = -1 Then Break;
+    L := RdL(Big, B + A + 4);
+    If (L < 16) or (A + L > Used) or ((L and 7) <> 0) Then Begin
+     Inc(AttrN);
+     If AttrN <= 5 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                               TL(' : attribut de longueur invalide', ': attribute with invalid length'));
+     Break;
+    End;
+    If (T = $30) and (Big^[B + A + 8] = 0) and IsBase and (ParRec^[R] = -1) Then Begin
+     VO := RdW(Big, B + A + 20);
+     ParRec^[R] := RdL(Big, B + A + VO);
+     If RdW(Big, B + A + VO + 4) <> 0 Then ParRec^[R] := -2;
+     ParSeq^[R] := RdW(Big, B + A + VO + 6);
+    End;
+    If Big^[B + A + 8] <> 0 Then Begin
+     If ParseRuns(Big, B + A, RL) Then Begin
+      MarkRuns(RL, R);
+      If (R = 8) and (T = $80) and (Big^[B + A + 9] <> 0) Then
+       BadUnits := BadUnits + RunTotal(RL);
+      If (R = 6) and (T = $80) and (Big^[B + A + 9] = 0) Then Begin
+       BmpRL := RL;
+       BmpDataSize := RdL(Big, B + A + 48);
+      End;
+      If IsBase and (R >= 16) Then Begin
+       If (Flags and 2) <> 0 Then DirUnits := DirUnits + RunTotal(RL)
+                             Else FileUnits := FileUnits + RunTotal(RL);
+      End;
+     End
+      Else
+     Begin
+      Inc(AttrN);
+      If AttrN <= 5 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                                TL(' : liste d''extensions invalide', ': invalid run list'));
+     End;
+    End;
+    A := A + L;
+   End;
+  End;
+  R0 := R0 + Cnt;
+ End;
+ If NBad > 5 Then AddErr(LStr(NBad) + TL(' enregistrements BAAD en tout', ' BAAD records in all'));
+ If NFix > 5 Then AddErr(LStr(NFix) + TL(' enregistrements interrompus en tout', ' torn records in all'));
+ If NHdr > 5 Then AddErr(LStr(NHdr) + TL(' en-t'#136'tes invalides en tout', ' invalid headers in all'));
+ If AttrN > 5 Then AddErr(LStr(AttrN) + TL(' attributs invalides en tout', ' invalid attributes in all'));
+ For R := 0 to 11 do
+  If Not BitOn(InUseB, R) Then
+   AddErr(TL('Fichier syst'#138'me absent : enregistrement ', 'Missing system file: record ') +
+          LStr(R));
+ If Not BitOn(IsDirB, 5) Then
+  AddErr(TL('L''enregistrement 5 (racine) n''est pas un r'#130'pertoire',
+            'Record 5 (root) is not a directory'));
+ NtfsMft := True;
+End;
+
+{ Entrees d'index de P^[S..E[ du repertoire Dir ; les sous-noeuds vont
+  dans la file NIdxQ }
+Var
+ NQT, NIdxBad: LongInt;
+
+Procedure NtfsEntries(P: PB; S, E, Dir: LongInt);
+Var
+ Ref, RSeq, ELen, EFl, K: LongInt;
+Begin
+ K := 0;
+ While (S + 16 <= E) and (K < 2000) do Begin
+  Ref := RdL(P, S);
+  RSeq := RdW(P, S + 6);
+  ELen := RdW(P, S + 8);
+  EFl := RdW(P, S + 12);
+  If (ELen < 16) or (S + ELen > E) Then Begin
+   Inc(NIdxBad);
+   If NIdxBad <= 10 Then AddErr(TL('Index du r'#130'pertoire ', 'Index of directory ') +
+                                LStr(Dir) + TL(' : entr'#130'e de longueur invalide',
+                                               ': entry with invalid length'));
+   Exit;
+  End;
+  If (EFl and 1) <> 0 Then Begin
+   If NQT <= High(NIdxQ) Then Begin
+    NIdxQ[NQT] := RdL(P, S + ELen - 8);
+    Inc(NQT);
+   End;
+  End;
+  If (EFl and 2) <> 0 Then Exit;
+  If (RdW(P, S + 4) <> 0) or (Ref < 0) or (Ref >= NRecs) or Not BitOn(InUseB, Ref) Then Begin
+   Inc(NIdxBad);
+   If NIdxBad <= 10 Then AddErr(TL('Index du r'#130'pertoire ', 'Index of directory ') +
+                                LStr(Dir) + TL(' : entr'#130'e vers un enregistrement libre (',
+                                               ': entry to a free record (') + LStr(Ref) + ')');
+  End
+   Else
+  If SeqA^[Ref] <> RSeq Then Begin
+   Inc(NIdxBad);
+   If NIdxBad <= 10 Then AddErr(TL('Index du r'#130'pertoire ', 'Index of directory ') +
+                                LStr(Dir) + TL(' : num'#130'ro de s'#130'quence incorrect pour ',
+                                               ': wrong sequence number for ') + LStr(Ref));
+  End;
+  S := S + ELen;
+  Inc(K);
+ End;
+End;
+
+{ Parents des enregistrements et index des repertoires }
+Procedure NtfsDirs;
+Var
+ R, Pr, A, IR, QH, Off, VUnit, Done, Total, MaxBlk, NPar, ESt: LongInt;
+ Rec, IB: PB;
+ HasAlloc: Boolean;
+Begin
+ NPar := 0;
+ For R := 0 to NRecs - 1 do
+  If BitOn(InUseB, R) and (ParRec^[R] <> -1) and (R <> 5) Then Begin
+   Pr := ParRec^[R];
+   If (Pr < 0) or (Pr >= NRecs) or Not BitOn(InUseB, Pr) or Not BitOn(IsDirB, Pr) Then Begin
+    Inc(NPar);
+    If NPar <= 10 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                              TL(' : r'#130'pertoire parent invalide (', ': invalid parent directory (') +
+                              LStr(Pr) + ')');
+   End
+    Else
+   If SeqA^[Pr] <> ParSeq^[R] Then Begin
+    Inc(NPar);
+    If NPar <= 10 Then AddErr(TL('Enregistrement ', 'Record ') + LStr(R) +
+                              TL(' : parent ', ': parent ') + LStr(Pr) +
+                              TL(' d''une autre s'#130'quence (fichier orphelin)',
+                                 ' of another sequence (orphan file)'));
+   End;
+  End;
+ If NPar > 10 Then AddErr(LStr(NPar) + TL(' fichiers orphelins en tout', ' orphan files in all'));
+ { index $I30 de chaque repertoire }
+ Rec := NewBuf(NRecSz);
+ IB := NewBuf(NIdxSz);
+ If NIdxSz >= NCB Then VUnit := NCB Else VUnit := 512;
+ NIdxBad := 0;
+ Total := 0;
+ For R := 0 to NRecs - 1 do If BitOn(IsDirB, R) Then Inc(Total);
+ Done := 0;
+ For R := 0 to NRecs - 1 do Begin
+  If Not BitOn(IsDirB, R) Then Continue;
+  Inc(Done);
+  If (Done and 15) = 0 Then ProgressStep(Done, Total, 30, 60);
+  If Not StreamRead(MftRL, R * NRecSz, NRecSz, Rec) or Not Fixup(Rec, 0, NRecSz) Then Continue;
+  A := FindAttr(Rec, 0, $90, False);
+  If A < 0 Then Begin
+   If FindAttr(Rec, 0, $20, False) < 0 Then
+    AddErr(TL('R'#130'pertoire ', 'Directory ') + LStr(R) +
+           TL(' sans racine d''index ($INDEX_ROOT)', ' without index root ($INDEX_ROOT)'));
+   Continue;
+  End;
+  IR := A + RdW(Rec, A + 20);
+  NQT := 0;
+  ESt := IR + 16 + RdL(Rec, IR + 16);
+  NtfsEntries(Rec, ESt, IR + 16 + RdL(Rec, IR + 20), R);
+  If NQT = 0 Then Continue;
+  A := FindAttr(Rec, 0, $A0, False);
+  HasAlloc := (A >= 0) and (Rec^[A + 8] <> 0) and ParseRuns(Rec, A, IdxRL);
+  If Not HasAlloc Then Begin
+   If FindAttr(Rec, 0, $20, False) < 0 Then
+    AddErr(TL('R'#130'pertoire ', 'Directory ') + LStr(R) +
+           TL(' : $INDEX_ALLOCATION absent', ': $INDEX_ALLOCATION missing'));
+   Continue;
+  End;
+  MaxBlk := RdL(Rec, A + 40) div NIdxSz + 1;
+  QH := 0;
+  While (QH < NQT) and (QH < MaxBlk) do Begin
+   Off := NIdxQ[QH] * VUnit;
+   Inc(QH);
+   If Not StreamRead(IdxRL, Off, NIdxSz, IB) Then Begin
+    AddErr(TL('R'#130'pertoire ', 'Directory ') + LStr(R) +
+           TL(' : bloc d''index illisible', ': unreadable index block'));
+    Continue;
+   End;
+   If (RdL(IB, 0) <> $58444E49) or Not Fixup(IB, 0, NIdxSz) Then Begin
+    AddErr(TL('R'#130'pertoire ', 'Directory ') + LStr(R) +
+           TL(' : bloc d''index INDX invalide', ': invalid INDX index block'));
+    Continue;
+   End;
+   NtfsEntries(IB, $18 + RdL(IB, $18), $18 + RdL(IB, $1C), R);
+  End;
+  If NQT > MaxBlk Then
+   AddErr(TL('R'#130'pertoire ', 'Directory ') + LStr(R) +
+          TL(' : boucle dans l''arbre d''index', ': loop in the index tree'));
+ End;
+ If NIdxBad > 10 Then AddErr(LStr(NIdxBad) + TL(' entr'#130'es d''index invalides en tout',
+                                                 ' invalid index entries in all'));
+ FreeMem(Rec, NRecSz);
+ FreeMem(IB, NIdxSz);
+End;
+
+{ Bitmap de la MFT et enregistrements en service }
+Procedure NtfsMftBitmap;
+Var
+ R, Miss, Lost: LongInt;
+Begin
+ Miss := 0;
+ Lost := 0;
+ For R := 0 to NRecs - 1 do Begin
+  If (R and 4095) = 0 Then ProgressStep(R, NRecs, 60, 80);
+  If BitOn(InUseB, R) and Not BitOn(MftBmp, R) Then Inc(Miss)
+  Else If (R >= 24) and BitOn(MftBmp, R) and Not BitOn(InUseB, R) Then Inc(Lost);
+ End;
+ If Miss > 0 Then
+  AddErr(LStr(Miss) + TL(' enregistrement(s) en service marqu'#130'(s) libre(s) dans le bitmap de la MFT',
+                          ' record(s) in use marked free in the MFT bitmap'));
+ If Lost > 0 Then
+  AddErr(LStr(Lost) + TL(' enregistrement(s) libre(s) marqu'#130'(s) utilis'#130'(s) dans le bitmap de la MFT',
+                          ' free record(s) marked in use in the MFT bitmap'));
+End;
+
+{ $Bitmap du volume contre les clusters des fichiers }
+Procedure NtfsFree;
+Var
+ Sz, K, Last, U, B, UsedFree, Lost, Free: LongInt;
+ VB: PB;
+Begin
+ If BmpRL.N = 0 Then Begin
+  AddErr(TL('$Bitmap (enregistrement 6) introuvable', '$Bitmap (record 6) not found'));
+  Exit;
+ End;
+ Sz := ((NTotC + 7) div 8 + 511) and not 511;
+ VB := NewBuf(Sz);
+ If Not StreamRead(BmpRL, 0, Sz, VB) Then Begin
+  AddErr(TL('Lecture de $Bitmap impossible', 'Cannot read $Bitmap'));
+  FreeMem(VB, Sz);
+  Exit;
+ End;
+ UsedFree := 0; Lost := 0; Free := 0;
+ Last := NTotC div 8;
+ For K := 0 to Last do Begin
+  If (K and 65535) = 0 Then ProgressStep(K, Last + 1, 80, 100);
+  U := CMap^[K];
+  B := VB^[K];
+  If K = Last Then Begin
+   U := U and ((1 shl (NTotC and 7)) - 1);
+   B := B and ((1 shl (NTotC and 7)) - 1);
+   Free := Free + PopT[(not B) and ((1 shl (NTotC and 7)) - 1)];
+  End
+   Else
+  Free := Free + PopT[(not B) and $FF];
+  If U <> B Then Begin
+   UsedFree := UsedFree + PopT[U and (not B) and $FF];
+   Lost := Lost + PopT[B and (not U) and $FF];
+  End;
+ End;
+ FreeMem(VB, Sz);
+ FreeUnits := Free;
+ If UsedFree > 0 Then
+  AddErr(NStr(UsedFree) + TL(' clusters utilis'#130's sont marqu'#130's libres dans $Bitmap',
+                              ' clusters in use are marked free in $Bitmap'));
+ If Lost > 0 Then Begin
+  LostClusters := Lost;
+  AddErr(NStr(Lost) + TL(' clusters marqu'#130's utilis'#130's n''appartiennent '#133' aucun fichier',
+                          ' clusters marked in use belong to no file'));
+ End;
+End;
+
+{ ==================================================================== }
+{ HPFS                                                                 }
+{ ==================================================================== }
+
+Var
+ HDup, HOut: LongInt;
+
+{ Secteurs du systeme (sans controle de liens croises) }
+Procedure HSys(L, N: LongInt);
+Var
+ K: LongInt;
+Begin
+ For K := L to L + N - 1 do
+  If (K >= 0) and (K < HTot) Then BitSet(SMap, K);
+End;
+
+{ Secteurs d'un fichier ou d'une structure : hors du volume ou deja
+  utilises (lien croise) }
+Function HMark(L, N: LongInt; Const Nm: String): Boolean;
+Var
+ K, Dup: LongInt;
+Begin
+ HMark := False;
+ If (L < 0) or (N < 0) or (L + N > HTot) or (L + N < L) Then Begin
+  Inc(HOut);
+  If HOut <= 10 Then AddErr(Nm + TL(' : secteurs hors du volume (', ': sectors outside the volume (') +
+                            LStr(L) + ')');
+  Exit;
+ End;
+ Dup := 0;
+ For K := L to L + N - 1 do
+  If BitOn(SMap, K) Then Inc(Dup) Else BitSet(SMap, K);
+ If Dup > 0 Then Begin
+  Inc(HDup);
+  Inc(CrossLinkedFiles);
+  If HDup <= 10 Then AddErr(Nm + TL(' : lien crois'#130' (secteur ', ': cross-link (sector ') +
+                            LStr(L) + ')');
+  Exit;
+ End;
+ HMark := True;
+End;
+
+Function HpfsBoot: Boolean;
+Var
+ V: LongInt;
+Begin
+ HpfsBoot := False;
+ If RdL(@SB, 4) <> LongInt($FA53E9C5) Then
+  AddErr(TL('Signature du superbloc incorrecte', 'Bad super block signature'));
+ If Not (SB[8] in [2, 3]) Then
+  AddErr(TL('Version HPFS inconnue : ', 'Unknown HPFS version: ') + LStr(SB[8]));
+ V := TotSecOf;
+ If (V <> 0) and (HTot > V) Then
+  AddErr(TL('Le superbloc d'#130'clare plus de secteurs que la partition',
+            'The super block declares more sectors than the partition'));
+ HRoot := RdL(@SB, 12);
+ HList := RdL(@SB, 24);
+ HDirS := RdL(@SB, 52);
+ HDirE := RdL(@SB, 56);
+ HDirBmp := RdL(@SB, 60);
+ If (HTot < 64) Then Begin
+  AddErr(TL('Taille du volume invalide', 'Invalid volume size'));
+  Exit;
+ End;
+ If (HRoot <= 17) or (HRoot >= HTot) Then Begin
+  AddErr(TL('Fnode de la racine invalide', 'Invalid root fnode'));
+  Exit;
+ End;
+ If (HList <= 17) or (HList >= HTot) Then Begin
+  AddErr(TL('Liste des bitmaps invalide', 'Invalid bitmap list'));
+  Exit;
+ End;
+ If (RdL(@SP, 0) <> LongInt($F9911849)) or (RdL(@SP, 4) <> LongInt($FA5229C5)) Then
+  AddErr(TL('Signature du bloc de r'#130'serve incorrecte', 'Bad spare block signature'));
+ If (SP[8] and 1) <> 0 Then
+  AddErr(TL('Le volume est marqu'#130' "sale" (non d'#130'mont'#130' proprement)',
+            'The volume is marked dirty (not unmounted cleanly)'));
+ If RdL(@SP, 16) > 0 Then
+  AddNote(TL('Remarque : ', 'Note: ') + LStr(RdL(@SP, 16)) +
+          TL(' secteur(s) remplac'#130'(s) (hotfix)', ' sector(s) hot-fixed'));
+ If (HDirS > 0) and ((HDirE < HDirS) or (HDirE >= HTot)) Then
+  AddErr(TL('Bande des r'#130'pertoires invalide', 'Invalid directory band'));
+ HpfsBoot := True;
+End;
+
+{ Bitmaps des bandes et structures du systeme }
+Function HpfsBitmaps: Boolean;
+Var
+ B, L, K, N, Next, Guard: LongInt;
+ LB: PB;
+Begin
+ HpfsBitmaps := False;
+ HNB := (HTot + 16383) div 16384;
+ HListN := ((HNB * 4 + 2047) div 2048) * 4;
+ SMap := NewBuf(HTot div 8 + 8);
+ HBmp := NewBuf(HNB * 2048 + 8);
+ LB := NewBuf(HListN * 512);
+ If (SMap = Nil) or (HBmp = Nil) or (LB = Nil) Then Begin
+  AddErr(TL('M'#130'moire insuffisante', 'Not enough memory'));
+  Exit;
+ End;
+ If Not RawRead(HList, HListN, LB) Then Begin
+  AddErr(ReadErrMsg(HList));
+  Exit;
+ End;
+ HSys(0, 18);
+ HSys(HList, HListN);
+ For B := 0 to HNB - 1 do Begin
+  ProgressStep(B, HNB, 5, 30);
+  L := RdL(LB, B * 4);
+  If (L <= 17) or (L + 4 > HTot) Then Begin
+   AddErr(TL('Bitmap de la bande ', 'Bitmap of band ') + LStr(B) + TL(' invalide', ' is invalid'));
+   Continue;
+  End;
+  If Not RawRead(L, 4, @HBmp^[B * 2048]) Then AddErr(ReadErrMsg(L));
+  HSys(L, 4);
+ End;
+ FreeMem(LB, HListN * 512);
+ { secteurs defectueux (liste chainee de blocs de 4 secteurs) }
+ L := RdL(@SB, 32);
+ Guard := 0;
+ While (L > 0) and (L + 4 <= HTot) and (Guard < 1000) do Begin
+  HSys(L, 4);
+  If Not ReadSector(L) Then Break;
+  L := RdL(@SectorBuffer, 0);
+  Inc(Guard);
+ End;
+ { table de remplacement (hotfix) et secteurs de remplacement }
+ L := RdL(@SP, 12);
+ If (L > 0) and (L + 4 <= HTot) Then Begin
+  HSys(L, 4);
+  N := RdL(@SP, 20);
+  If (N > 0) and (N <= 256) and RawRead(L, 4, Big) Then
+   For K := 0 to N - 1 do HSys(RdL(Big, (N + K) * 4), 1);
+ End;
+ { pages de codes }
+ L := RdL(@SP, 32);
+ If (L > 0) and (L < HTot) Then Begin
+  HSys(L, 1);
+  If ReadSector(L) Then Begin
+   N := RdL(@SectorBuffer, 4);
+   If N > 24 Then N := 24;
+   For K := 0 to N - 1 do Begin
+    Next := RdL(@SectorBuffer, 16 + K * 20 + 8);
+    If (Next > 0) and (Next < HTot) Then HSys(Next, 1);
+   End;
+  End;
+ End;
+ { dnodes de reserve }
+ N := RdL(@SP, 28);
+ If N > 100 Then N := 100;
+ For K := 0 to N - 1 do Begin
+  L := RdL(@SP, 108 + K * 4);
+  If L > 0 Then HSys(L, 4);
+ End;
+ { table des identificateurs }
+ L := RdL(@SB, 96);
+ If (L > 0) and (L + 8 <= HTot) Then HSys(L, 8);
+ { bande des repertoires et sa bitmap }
+ FillChar(HDBm, SizeOf(HDBm), 0);
+ HNDn := 0;
+ If (HDirS > 0) and (HDirE >= HDirS) and (HDirE < HTot) Then Begin
+  HSys(HDirS, HDirE - HDirS + 1);
+  HNDn := (HDirE - HDirS + 1) div 4;
+  If HNDn > 16384 Then HNDn := 16384;
+  If (HDirBmp > 0) and (HDirBmp + 4 <= HTot) Then Begin
+   HSys(HDirBmp, 4);
+   If Not RawRead(HDirBmp, 4, @HDBm) Then AddErr(ReadErrMsg(HDirBmp));
+  End;
+ End;
+ DnSeen := NewBuf(HNDn div 8 + 8);
+ HpfsBitmaps := True;
+End;
+
+Var
+ HTreeOut: LongInt;
+
+{ Arbre B+ d'allocation (fnode : en-tete en 56, noeuds en 64 ; anode :
+  en-tete en 12, noeuds en 20) ; renvoie le nombre de secteurs }
+Function HTree(P: PB; Hd, Nd, Cap: LongInt; Const Nm: String; Depth: LongInt): LongInt;
+Var
+ Fl, NU, K, Tot, Dn, Len, Dsk: LongInt;
+ A: PB;
+Begin
+ HTree := 0;
+ If Depth > 10 Then Exit;
+ Fl := P^[Hd];
+ NU := P^[Hd + 5];
+ Tot := 0;
+ If (Fl and $80) <> 0 Then Begin
+  If NU > (Cap * 3) div 2 Then Begin
+   AddErr(Nm + TL(' : arbre d''allocation invalide', ': invalid allocation tree'));
+   Exit;
+  End;
+  For K := 0 to NU - 1 do Begin
+   Dn := RdL(P, Nd + K * 8 + 4);
+   If Not HMark(Dn, 1, Nm) Then Continue;
+   A := NewBuf(512);
+   If RawRead(Dn, 1, A) and (RdL(A, 0) = $37E40AAE) and (RdL(A, 4) = Dn) Then
+    Tot := Tot + HTree(A, 12, 20, 40, Nm, Depth + 1)
+   Else AddErr(Nm + TL(' : anode invalide (secteur ', ': invalid anode (sector ') + LStr(Dn) + ')');
+   FreeMem(A, 512);
+  End;
+ End
+  Else
+ Begin
+  If NU > Cap Then Begin
+   AddErr(Nm + TL(' : arbre d''allocation invalide', ': invalid allocation tree'));
+   Exit;
+  End;
+  For K := 0 to NU - 1 do Begin
+   Len := RdL(P, Nd + K * 12 + 4);
+   Dsk := RdL(P, Nd + K * 12 + 8);
+   If HMark(Dsk, Len, Nm) Then Tot := Tot + Len;
+  End;
+ End;
+ HTree := Tot;
+End;
+
+{ Attributs etendus (EA) et liste d'acces (ACL) hors du fnode }
+Procedure HExtra(F: PB; Const Nm: String);
+Var
+ L, S: LongInt;
+ A: PB;
+Begin
+ L := RdL(F, 44);
+ S := RdL(F, 48);
+ If (L > 0) and (S > 0) Then Begin
+  If (F^[54] and 1) = 0 Then HMark(S, (L + 511) div 512, Nm + ' (EA)')
+  Else If HMark(S, 1, Nm + ' (EA)') Then Begin
+   A := NewBuf(512);
+   If RawRead(S, 1, A) and (RdL(A, 0) = $37E40AAE) Then HTree(A, 12, 20, 40, Nm + ' (EA)', 1);
+   FreeMem(A, 512);
+  End;
+ End;
+ L := RdL(F, 32);
+ S := RdL(F, 36);
+ If (L > 0) and (S > 0) Then Begin
+  If F^[42] = 0 Then HMark(S, (L + 511) div 512, Nm + ' (ACL)')
+  Else If HMark(S, 1, Nm + ' (ACL)') Then Begin
+   A := NewBuf(512);
+   If RawRead(S, 1, A) and (RdL(A, 0) = $37E40AAE) Then HTree(A, 12, 20, 40, Nm + ' (ACL)', 1);
+   FreeMem(A, 512);
+  End;
+ End;
+End;
+
+Procedure HScanDir(Fn, Up: LongInt; Path: String; Depth: LongInt); Forward;
+
+{ Arbre de dnodes du repertoire de fnode DirFn }
+Procedure HWalkDn(Dn, UpDn, DirFn: LongInt; Const Path: String; Depth, DDepth: LongInt);
+Var
+ D, F: PB;
+ E, FF, Len, Fl, FnL, Size, NL, K, Idx, Need, Tot: LongInt;
+ Nm: String;
+ Attr: Byte;
+Begin
+ If DDepth > 30 Then Begin
+  AddErr(Path + TL(' : arbre de dnodes trop profond', ': dnode tree too deep'));
+  Exit;
+ End;
+ If (HDirS > 0) and (Dn >= HDirS) and (Dn <= HDirE) Then Begin
+  Idx := (Dn - HDirS) div 4;
+  If ((Dn - HDirS) mod 4 <> 0) or (Idx >= HNDn) Then Begin
+   AddErr(Path + TL(' : dnode mal align'#130, ': misaligned dnode'));
+   Exit;
+  End;
+  If BitOn(DnSeen, Idx) Then Begin
+   Inc(CrossLinkedFiles);
+   AddErr(Path + TL(' : dnode utilis'#130' deux fois (', ': dnode used twice (') + LStr(Dn) + ')');
+   Exit;
+  End;
+  BitSet(DnSeen, Idx);
+  If BitOn(@HDBm, Idx) Then
+   AddErr(Path + TL(' : dnode marqu'#130' libre dans la bande (', ': dnode marked free in the band (') +
+          LStr(Dn) + ')');
+ End
+  Else
+ If Not HMark(Dn, 4, Path + ' (dnode)') Then Exit;
+ D := NewBuf(2048);
+ If Not RawRead(Dn, 4, D) Then Begin
+  AddErr(Path + ' : ' + ReadErrMsg(Dn));
+  FreeMem(D, 2048);
+  Exit;
+ End;
+ If (RdL(D, 0) <> $77E40AAE) or (RdL(D, 16) <> Dn) Then Begin
+  AddErr(Path + TL(' : dnode invalide (secteur ', ': invalid dnode (sector ') + LStr(Dn) + ')');
+  FreeMem(D, 2048);
+  Exit;
+ End;
+ If RdL(D, 12) <> UpDn Then
+  AddErr(Path + TL(' : lien vers le parent incorrect dans le dnode ', ': wrong parent link in dnode ') +
+         LStr(Dn));
+ FF := RdL(D, 4);
+ If (FF < 20) or (FF > 2048) Then Begin
+  AddErr(Path + TL(' : dnode ', ': dnode ') + LStr(Dn) + TL(' mal rempli', ' badly filled'));
+  FreeMem(D, 2048);
+  Exit;
+ End;
+ E := 20;
+ While E + 32 <= FF do Begin
+  Len := RdW(D, E);
+  Fl := D^[E + 2];
+  If (Len < 32) or (E + Len > FF) or ((Len and 3) <> 0) Then Begin
+   AddErr(Path + TL(' : entr'#130'e de r'#130'pertoire invalide (dnode ', ': invalid directory entry (dnode ') +
+          LStr(Dn) + ')');
+   Break;
+  End;
+  If (Fl and 4) <> 0 Then
+   HWalkDn(RdL(D, E + Len - 4), Dn, DirFn, Path, Depth, DDepth + 1);
+  If (Fl and 8) <> 0 Then Break;
+  If (Fl and 1) = 0 Then Begin
+   Attr := D^[E + 3];
+   FnL := RdL(D, E + 4);
+   Size := RdL(D, E + 12);
+   NL := D^[E + 30];
+   If 31 + NL > Len Then Begin
+    AddErr(Path + TL(' : nom trop long (dnode ', ': name too long (dnode ') + LStr(Dn) + ')');
+    Break;
+   End;
+   Nm := '';
+   For K := 0 to NL - 1 do If K < 200 Then Nm := Nm + Chr(D^[E + 31 + K]);
+   If (Attr and $10) <> 0 Then Begin
+    Inc(NDirs);
+    HScanDir(FnL, DirFn, Path + Nm + '\', Depth + 1);
+   End
+    Else
+   Begin
+    Inc(NFiles);
+    If NFiles and 63 = 0 Then ShowProgress(30 + Integer(NFiles mod 30));
+    If HMark(FnL, 1, Path + Nm) Then Begin
+     F := NewBuf(512);
+     If Not RawRead(FnL, 1, F) or (RdL(F, 0) <> LongInt($F7E40AAE)) Then
+      AddErr(Path + Nm + TL(' : fnode invalide (secteur ', ': invalid fnode (sector ') + LStr(FnL) + ')')
+     Else Begin
+      If RdL(F, 28) <> DirFn Then
+       AddErr(Path + Nm + TL(' : le fnode ne pointe pas vers son r'#130'pertoire',
+                             ': fnode does not point to its directory'));
+      If (F^[55] and 1) <> 0 Then
+       AddErr(Path + Nm + TL(' : fichier marqu'#130' r'#130'pertoire dans son fnode',
+                             ': file marked as directory in its fnode'));
+      Tot := HTree(F, 56, 64, 8, Path + Nm, 0);
+      FileUnits := FileUnits + Tot + 1;
+      Need := (((RdL(F, 160) - 1) shr 9) + 1);
+      If RdL(F, 160) = 0 Then Need := 0;
+      If Tot < Need Then
+       AddErr(Path + Nm + TL(' : allocation plus petite que la taille du fichier',
+                             ': allocation smaller than the file size'));
+      If RdL(F, 160) <> Size Then
+       AddErr(Path + Nm + TL(' : taille diff'#130'rente dans le r'#130'pertoire et le fnode',
+                             ': size differs between directory and fnode'));
+      HExtra(F, Path + Nm);
+     End;
+     FreeMem(F, 512);
+    End;
+   End;
+  End;
+  E := E + Len;
+ End;
+ FreeMem(D, 2048);
+End;
+
+Procedure HScanDir(Fn, Up: LongInt; Path: String; Depth: LongInt);
+Var
+ F: PB;
+ Dn: LongInt;
+Begin
+ If Depth > 60 Then Begin
+  AddErr(Path + TL(' : r'#130'pertoires trop imbriqu'#130's', ': directories nested too deep'));
+  Exit;
+ End;
+ If Not HMark(Fn, 1, Path) Then Exit;
+ DirUnits := DirUnits + 1;
+ F := NewBuf(512);
+ If Not RawRead(Fn, 1, F) or (RdL(F, 0) <> LongInt($F7E40AAE)) Then Begin
+  AddErr(Path + TL(' : fnode invalide (secteur ', ': invalid fnode (sector ') + LStr(Fn) + ')');
+  FreeMem(F, 512);
+  Exit;
+ End;
+ If (F^[55] and 1) = 0 Then
+  AddErr(Path + TL(' : fnode sans l''indicateur de r'#130'pertoire', ': fnode without the directory flag'));
+ If RdL(F, 28) <> Up Then
+  AddErr(Path + TL(' : le fnode ne pointe pas vers son parent', ': fnode does not point to its parent'));
+ HExtra(F, Path);
+ If F^[61] < 1 Then
+  AddErr(Path + TL(' : r'#130'pertoire sans dnode', ': directory without dnode'))
+ Else Begin
+  Dn := RdL(F, 72);
+  FreeMem(F, 512);
+  F := Nil;
+  HWalkDn(Dn, Fn, Fn, Path, Depth, 0);
+ End;
+ If F <> Nil Then FreeMem(F, 512);
+End;
+
+{ dnodes de la bande marques utilises mais d'aucun repertoire }
+Procedure HpfsBand;
+Var
+ K, Lost: LongInt;
+Begin
+ Lost := 0;
+ For K := 0 to HNDn - 1 do
+  If Not BitOn(@HDBm, K) and Not BitOn(DnSeen, K) Then Inc(Lost);
+ If Lost > 0 Then
+  AddErr(LStr(Lost) + TL(' dnode(s) de la bande marqu'#130'(s) utilis'#130'(s) sans r'#130'pertoire',
+                          ' band dnode(s) marked in use without a directory'));
+End;
+
+Procedure HpfsFree;
+Var
+ K, Last, U, B, M, UsedFree, Lost, Free, FirstLost: LongInt;
+Begin
+ UsedFree := 0; Lost := 0; Free := 0; FirstLost := -1;
+ Last := (HTot - 1) div 8;
+ For K := 0 to Last do Begin
+  If (K and 65535) = 0 Then ProgressStep(K, Last + 1, 80, 100);
+  M := $FF;
+  If (K = Last) and ((HTot and 7) <> 0) Then M := (1 shl (HTot and 7)) - 1;
+  U := SMap^[K] and M;
+  B := HBmp^[K] and M;       { 1 = libre }
+  Free := Free + PopT[B];
+  UsedFree := UsedFree + PopT[U and B];
+  If (FirstLost < 0) and (((not U) and (not B) and M) <> 0) Then Begin
+   FirstLost := K * 8;
+   While BitOn(SMap, FirstLost) or BitOn(HBmp, FirstLost) do Inc(FirstLost);
+  End;
+  Lost := Lost + PopT[(not U) and (not B) and M];
+ End;
+ FreeUnits := Free;
+ If UsedFree > 0 Then
+  AddErr(NStr(UsedFree) + TL(' secteurs utilis'#130's sont marqu'#130's libres dans les bitmaps',
+                              ' sectors in use are marked free in the bitmaps'));
+ If Lost > 0 Then Begin
+  LostClusters := Lost;
+  AddErr(NStr(Lost) + TL(' secteurs marqu'#130's utilis'#130's n''appartiennent '#133' aucun fichier (',
+                          ' sectors marked in use belong to no file (') +
+         TL('premier : ', 'first: ') + LStr(FirstLost) + ')');
+ End;
+End;
+
+
+{ Etat du secteur Sec pour la carte du balayage : 0 libre, 1 utilise,
+  2 defectueux ; Step : secteurs de meme etat a partir de Sec }
+Function SecState32(Sec: LongInt; Var Step: LongInt): Integer;
+Var
+ C: LongInt;
+Begin
+ SecState32 := 0;
+ Step := 1;
+ Case FsType of
+  fsNTFS: Begin
+   If NSpc <= 0 Then Exit;
+   Step := NSpc - Sec mod NSpc;
+   C := Sec div NSpc;
+   If (CMap <> Nil) and (C < NTotC) and BitOn(CMap, C) Then SecState32 := 1;
+  End;
+  fsHPFS: Begin
+   If (SMap <> Nil) and (Sec < HTot) and
+      (BitOn(SMap, Sec) or Not BitOn(HBmp, Sec)) Then SecState32 := 1;
+  End;
+  Else Begin
+   If Sec < FFirstData Then SecState32 := 1
+   Else If (FatT <> Nil) and (FSpc > 0) Then Begin
+    C := (Sec - FFirstData) div FSpc + 2;
+    Step := FSpc - (Sec - FFirstData) mod FSpc;
+    If C <= FMax Then Begin
+     If FatT^[C] = FBadV Then SecState32 := 2
+     Else If FatT^[C] <> 0 Then SecState32 := 1;
+    End;
+   End;
+  End;
+ End;
+End;
+
+{ ==================================================================== }
+{ Deroulement et resume                                                }
+{ ==================================================================== }
+
+Procedure PhaseDone(I: TCheckItem; Pct: Integer);Begin
+ CheckStatus[I] := True;
+ ShowProgress(Pct);
+ ShowCheckList;
+End;
+
+Procedure PerformChecks32;
+Var
+ Ok: Boolean;
+Begin
+ ClrScr;
+ ShowTitle;
+ ShowFsLine(TL('Syst'#138'me de fichiers : ', 'File system: ') + FsName);
+ ShowCheckList;
+ LastPct := -1;
+ ShowProgress(0);
+ Case FsType of
+  fsNTFS: Begin
+   Ok := NtfsBoot;
+   PhaseDone(ciMedia, 5);
+   If Ok Then Ok := NtfsMft;
+   PhaseDone(ciFAT, 30);
+   If Ok Then NtfsDirs;
+   PhaseDone(ciDirectory, 60);
+   If Ok Then NtfsMftBitmap;
+   PhaseDone(ciFileSystem, 80);
+   If Ok Then NtfsFree;
+   PhaseDone(ciFreeSpace, 100);
+  End;
+  fsHPFS: Begin
+   Ok := HpfsBoot;
+   PhaseDone(ciMedia, 5);
+   If Ok Then Ok := HpfsBitmaps;
+   PhaseDone(ciFAT, 30);
+   If Ok Then HScanDir(HRoot, HRoot, DrivePath + '\', 0);
+   PhaseDone(ciDirectory, 60);
+   If Ok Then HpfsBand;
+   PhaseDone(ciFileSystem, 80);
+   If Ok Then HpfsFree;
+   PhaseDone(ciFreeSpace, 100);
+  End;
+  Else Begin
+   FatBoot;
+   PhaseDone(ciMedia, 2);
+   Ok := FatLoad;
+   PhaseDone(ciFAT, 30);
+   If Ok Then FatDirs;
+   PhaseDone(ciDirectory, 60);
+   If Ok Then FatChains;
+   PhaseDone(ciFileSystem, 80);
+   If Ok Then FatLost;
+   PhaseDone(ciFreeSpace, 100);
+  End;
+ End;
+ If DoSurfaceScan Then SurfaceScan
+ Else If Not NonInteractive Then Begin
+  If ShowDialog(TL('Balayage de surface', 'Surface Scan'),
+                TL('ScanDisk a termin'#130' les tests de structure de fichiers. Voulez-vous '+
+                   'effectuer un test de surface maintenant ?',
+                   'ScanDisk has finished testing the file structure. Do you want to '+
+                   'perform a surface scan now?'), True) Then Begin
+   DoSurfaceScan := True;
+   SurfaceScan;
+  End;
+ End;
+End;
+
+{ Taille en Ko de N unites }
+Function UKb(N: LongInt): String;Begin
+ If UnitBytes >= 1024 Then UKb := NStr(N * (UnitBytes div 1024))
+                      Else UKb := NStr(N div (1024 div UnitBytes));
+End;
+
+Procedure ShowSummary32;
+Var
+ K, Shown: LongInt;
+ F: Text;
+ LogName: String;
+Begin
+ TextBackground(Black);
+ TextColor(LightGray);
+ ClrScr;
+ WriteLn(TL('ScanDisk a v'#130'rifi'#130' ', 'ScanDisk checked ') + DrivePath + ' (' + FsName + ').');
+ WriteLn;
+ WriteLn(UKb(TotUnits): 14, TL(' Ko d''espace disque total', ' KB total disk space'));
+ WriteLn(UKb(FileUnits): 14, TL(' Ko dans ', ' KB in ') + NStr(NFiles) + TL(' fichier(s)', ' file(s)'));
+ WriteLn(UKb(DirUnits): 14, TL(' Ko dans ', ' KB in ') + NStr(NDirs) + TL(' r'#130'pertoire(s)', ' director(ies)'));
+ If BadUnits > 0 Then
+  WriteLn(UKb(BadUnits): 14, TL(' Ko dans des secteurs d'#130'fectueux', ' KB in bad sectors'));
+ WriteLn(UKb(FreeUnits): 14, TL(' Ko disponibles', ' KB available'));
+ WriteLn;
+ WriteLn(NStr(UnitBytes): 14, TL(' octets dans chaque unit'#130' d''allocation', ' bytes in each allocation unit'));
+ WriteLn(NStr(TotUnits): 14, TL(' unit'#130's d''allocation au total', ' total allocation units'));
+ WriteLn(NStr(FreeUnits): 14, TL(' unit'#130's d''allocation disponibles', ' available allocation units'));
+ If BadSectors > 0 Then
+  WriteLn(NStr(BadSectors): 14, TL(' secteurs illisibles (balayage de surface)', ' unreadable sectors (surface scan)'));
+ WriteLn;
+ If ErrorsFound = 0 Then
+  WriteLn(TL('Aucune erreur trouv'#130'e : le disque est en bon '#130'tat.',
+             'No errors found: the disk is in good condition.'))
+ Else
+  WriteLn(LStr(ErrorsFound) + TL(' erreur(s) trouv'#130'e(s) :', ' error(s) found:'));
+ Shown := 0;
+ For K := 0 to LogN - 1 do
+  If Shown < 6 Then Begin
+   If LogErr[K] Then Write(' - ') Else Write('   ');
+   WriteLn(Copy(LogMsg[K], 1, 76));
+   Inc(Shown);
+  End;
+ If LogN > 0 Then Begin
+  LogName := GetEnv('TEMP');
+  If LogName <> '' Then Begin
+   If LogName[Length(LogName)] <> '\' Then LogName := LogName + '\';
+  End;
+  LogName := LogName + 'SCANDISK.LOG';
+  {$I-} Assign(F, LogName); Rewrite(F); {$I+}
+  If IOResult = 0 Then Begin
+   WriteLn(F, 'ScanDisk - ', DrivePath, ' (', FsName, ')');
+   For K := 0 to LogN - 1 do Begin
+    If LogErr[K] Then Write(F, '- ') Else Write(F, '  ');
+    WriteLn(F, LogMsg[K]);
+   End;
+   If LogN >= MaxLog Then WriteLn(F, '...');
+   Close(F);
+   If LogN > Shown Then
+    WriteLn(TL('Liste compl'#138'te dans ', 'Full list in ') + LogName);
+  End;
+  If ErrorsFound > 0 Then
+   WriteLn(TL('Aucune r'#130'paration n''est faite sur un disque en service.',
+              'No repair is made on a disk in use.'));
+ End;
+End;
+{$ENDIF}
 
 Procedure PerformChecks;
 Var
@@ -2133,7 +4282,7 @@ Begin
    End;
   End;
   Else Begin
-   If ShowDialog('Balayage de surface', 'ScanDisk a terminÇ les testes de structure de fichiers. Voulez-vous '+
+   If ShowDialog('Balayage de surface', 'ScanDisk a terminÇ les tests de structure de fichiers. Voulez-vous '+
                  'effectuer un test de surface maintenant ?', True)Then Begin
     DoSurfaceScan:=True;
     SurfaceScan;
@@ -2210,6 +4359,9 @@ BEGIN
     WriteLn('  /AUTOFIX   Automatically fix errors');
     WriteLn('  /CHECKONLY Check only, do not fix');
     WriteLn('  /SURFACE   Perform surface scan');
+    WriteLn('  /N         No questions (summary at the end)');
+    WriteLn;
+    WriteLn('File systems: FAT12, FAT16, FAT32, NTFS and HPFS.');
    End;
    _Germany: Begin
     WriteLn('SCANDISK - Festplatten-Diagnose- und Reparaturprogramm');
@@ -2310,6 +4462,9 @@ BEGIN
     WriteLn('  /AUTOFIX   RÇparer automatiquement les erreurs');
     WriteLn('  /CHECKONLY VÇrification seulement, pas de rÇparation');
     WriteLn('  /SURFACE   Effectuer un scan de surface');
+    WriteLn('  /N         Sans question (r'#130'sum'#130' '#133' la fin)');
+    WriteLn;
+    WriteLn('Syst'#138'mes de fichiers : FAT12, FAT16, FAT32, NTFS et HPFS.');
    End;
   End;
   Halt;
@@ -2376,7 +4531,12 @@ BEGIN
   { C'est un fichier image }
   IsImageFile := True;
   FileName := DrivePath;
+  {$IFDEF FPC}
+  If Copy(FileName, 1, 4) = '\\.\' Then DrivePath := Copy(FileName, 5, 2)
+                                   Else DrivePath := FileName;
+  {$ELSE}
   DrivePath := 'file';
+  {$ENDIF}
   {$I-} Assign(FileHandle, FileName);
   Reset(FileHandle, 1);
   {$I+}
@@ -2388,6 +4548,14 @@ BEGIN
    FreeMemory;
    Halt(1);
   End;
+  {$IFDEF FPC}
+  If Not RawOpen(FileName, False) Then Begin
+   ShowDialog(TL('Erreur', 'Error'), TL('Impossible d''ouvrir ', 'Cannot open ') +
+              FileName, False);
+   FreeMemory;
+   Halt(1);
+  End;
+  {$ENDIF}
  End;
   { Traitement des options }
  If ParamCount > 1 Then Begin
@@ -2395,6 +4563,9 @@ BEGIN
    If StrToUpper(ParamStr(ErrorsFound)) = '/AUTOFIX' Then AutoFix := True;
    If StrToUpper(ParamStr(ErrorsFound)) = '/CHECKONLY' Then CheckOnly := True;
    If StrToUpper(ParamStr(ErrorsFound)) = '/SURFACE' Then DoSurfaceScan := True;
+   {$IFDEF FPC}
+   If StrToUpper(ParamStr(ErrorsFound)) = '/N' Then NonInteractive := True;
+   {$ENDIF}
   End;
  End;
  ErrorsFound := 0;
@@ -2412,7 +4583,11 @@ BEGIN
   DetectDrivePartition;
  End;
   { Lecture du secteur de boot }
+ {$IFDEF FPC}
+ If Not DetectFs Then Begin
+ {$ELSE}
  If Not ReadBootSector Then Begin
+ {$ENDIF}
   Case(Language)of
    _English:ShowDialog('Error', 'Cannot read boot sector', False);
    Else ShowDialog('Erreur', 'Impossible de lire le secteur de boot', False);
@@ -2422,7 +4597,11 @@ BEGIN
   Halt(1);
  End;
   { Effectuer les vÇrifications avec interface graphique }
+ {$IFDEF FPC}
+ PerformChecks32;
+ {$ELSE}
  PerformChecks;
+ {$ENDIF}
   { Sauvegarde si des modifications ont ÇtÇ faites }
  If AutoFix and (ErrorsFound > 0) and Not CheckOnly Then Begin
   { RÇÇcrire la FAT si nÇcessaire }
@@ -2432,7 +4611,12 @@ BEGIN
   { LibÇrer la mÇmoire allouÇe }
  FreeMemory;
  { Affichage du rÇsumÇ }
+ {$IFDEF FPC}
+ RawClose;
+ ShowSummary32;
+ {$ELSE}
  ShowSummary;
+ {$ENDIF}
  CursorOn;
   { Code de sortie }
  If ErrorsFound > 0 Then Halt(1) Else Halt(0);

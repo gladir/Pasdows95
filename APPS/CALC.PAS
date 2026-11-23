@@ -855,7 +855,9 @@ Begin
                 'Acerca de Calculadora'),
               L('Calculatrice', 'Calculator', 'Rechner', 'Calcolatrice',
                 'Calculadora') + #13#10'Pasdows 95 4.00.950'#13#10 +
-              'Copyright Gladir.com 2026', $40);
+              L('Auteur : ', 'Author: ', 'Autor: ', 'Autore: ', 'Autor: ') +
+              'Sylvain Maltais'#13#10 + L('Licence : ', 'License: ',
+              'Lizenz: ', 'Licenza: ', 'Licencia: ') + 'MIT', $40);
       End;
     WM_DESTROY : PostQuitMessage(0);
   Else

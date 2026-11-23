@@ -1834,6 +1834,9 @@ Var
   FoUsed    : Array[0..MaxFo - 1] Of Boolean;
   FoVol, FoClus, FoSize, FoDir, FoIdx, FoCIdx, FoCClus, FoTime
     : Array[0..MaxFo - 1] Of LongInt;
+  { date imposee par SetFileTime (heure DOS, 0 : aucune) : NTFS et HPFS
+    l'ecrivent a la fermeture }
+  FoSetT    : Array[0..MaxFo - 1] Of LongInt;
   FoDirty   : Array[0..MaxFo - 1] Of Boolean;
   { NTFS : runs de $DATA du fichier ouvert, donnees residentes }
   FoRA, FoRN : Array[0..MaxFo - 1] Of LongInt;
@@ -4144,7 +4147,7 @@ Begin
     End;
   End;
   FoVol[F] := V; FoClus[F] := FfClus; FoDir[F] := FfDirClus;
-  FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoCIdx[F] := -1;
+  FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoSetT[F] := 0; FoCIdx[F] := -1;
   FoDirty[F] := False;
   NtOpenR := NtFoLoad(F);
 End;
@@ -5354,6 +5357,7 @@ Var V, R, P, Si, I, E, Alloc : LongInt;
 Begin
   V := FoVol[F];
   NtNow(LongInt(@T));
+  If FoSetT[F] <> 0 Then DosToFileTime(FoSetT[F], LongInt(@T));
   R := KAlloc(NvRec[V]);
   If R = 0 Then Exit;
   Alloc := 0;
@@ -7185,7 +7189,7 @@ Begin
     If FoRA[F] = 0 Then Exit;
   End;
   FoVol[F] := V; FoClus[F] := FfClus; FoDir[F] := FfDirClus;
-  FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoCIdx[F] := -1;
+  FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoSetT[F] := 0; FoCIdx[F] := -1;
   FoDirty[F] := False;
   HpOpenR := HpFoLoad(F);
 End;
@@ -7343,6 +7347,7 @@ Var V, Fn, T, Dn : LongInt;
 Begin
   V := FoVol[F];
   T := HpNow;
+  If FoSetT[F] <> 0 Then T := HpFromDos(FoSetT[F]);
   Fn := KAlloc(512);
   If Fn = 0 Then Exit;
   If HpFnode(V, FoClus[F], Fn) Then
@@ -7989,7 +7994,7 @@ Begin
   End;
   FoUsed[F] := True;
   FoVol[F] := V; FoClus[F] := FfClus; FoSize[F] := FfSize;
-  FoDir[F] := FfDirClus; FoIdx[F] := FfIdx; FoTime[F] := FfTime;
+  FoDir[F] := FfDirClus; FoIdx[F] := FfIdx; FoTime[F] := FfTime; FoSetT[F] := 0;
   FoCIdx[F] := -1; FoCClus[F] := 0;
   FoDirty[F] := Not Ex;
   If Ex And ((Disp = 2) Or (Disp = 5)) And (FoSize[F] > 0) Then
@@ -26925,8 +26930,11 @@ Begin
   KObjs^[I].Used := False;
 End;
 
-{ Lecture des secteurs d'un volume ouvert par \\.\C: (CHKDSK, SCANDISK) }
-Function VolReadAt(V, P, N, Buf : LongInt; Var Got : LongInt) : Boolean;
+{ Lecture des secteurs d'un volume ouvert par \\.\C: (CHKDSK, SCANDISK) ;
+  position sur 64 bits (P en bas, Ph en haut) pour les volumes de plus
+  de 2 Go }
+Function VolReadAt(V, P, Ph, N, Buf : LongInt;
+                   Var Got : LongInt) : Boolean;
 Var S, O, K : LongInt;
 Begin
   VolReadAt := False; Got := 0;
@@ -26936,14 +26944,15 @@ Begin
     Exit;
   End;
   FatIoErr := False;
+  S := (Ph Shl 23) Or (P Shr 9); O := P And 511;
   While Got < N Do
   Begin
-    S := (P + Got) Div 512; O := (P + Got) Mod 512;
     If S >= VolSecs[V] Then Break;
     K := 512 - O;
     If K > N - Got Then K := N - Got;
     MoveMem(VSec(V, S) + O, Buf + Got, K);
     Got := Got + K;
+    Inc(S); O := 0;
   End;
   If FatIoErr Then SetErr(30);
   VolReadAt := Not FatIoErr;
@@ -26981,8 +26990,11 @@ Begin
   End;
   If KObjs^[I].F4 = -3 Then
   Begin
-    KReadFile := VolReadAt(KObjs^[I].F1, KObjs^[I].F3, N, Buf, Got);
-    KObjs^[I].F3 := KObjs^[I].F3 + Got;
+    KReadFile := VolReadAt(KObjs^[I].F1, KObjs^[I].F3, KObjs^[I].F5, N,
+                           Buf, Got);
+    R := KObjs^[I].F3 + Got;
+    If (KObjs^[I].F3 < 0) And (R >= 0) Then Inc(KObjs^[I].F5);
+    KObjs^[I].F3 := R;
     Exit;
   End;
   If KObjs^[I].F3 + N > KObjs^[I].F2 Then N := KObjs^[I].F2 - KObjs^[I].F3;
@@ -27078,13 +27090,39 @@ Begin
 End;
 
 Function SetFilePointer(H, Dist, PHigh, Method : LongInt) : LongInt;
-Var I, P : LongInt;
+Var I, P, Lo, Ph, Hi : LongInt;
 Begin
   SetFilePointer := -1;
   I := KObjOf(H, koFile);
   If I < 0 Then
   Begin
     SetErr(ErrInvalidHandle);
+    Exit;
+  End;
+  If KObjs^[I].F4 = -3 Then
+  Begin
+    { volume \\.\C: : position sur 64 bits (F3 bas, F5 haut) }
+    If PHigh <> 0 Then Hi := MemL[0:PHigh]
+    Else If Dist < 0 Then Hi := -1 Else Hi := 0;
+    Case Method Of
+      0 : Begin Lo := 0; Ph := 0; End;
+      1 : Begin Lo := KObjs^[I].F3; Ph := KObjs^[I].F5; End;
+    Else
+      Lo := VolSecs[KObjs^[I].F1] Shl 9;
+      Ph := VolSecs[KObjs^[I].F1] Shr 23;
+    End;
+    P := Lo + Dist;
+    Ph := Ph + Hi;
+    If (((Lo And Dist) Or ((Lo Or Dist) And Not P)) Shr 31) <> 0 Then
+      Inc(Ph);
+    If Ph < 0 Then
+    Begin
+      SetErr(131);
+      Exit;
+    End;
+    KObjs^[I].F3 := P; KObjs^[I].F5 := Ph;
+    If PHigh <> 0 Then MemL[0:PHigh] := Ph;
+    SetFilePointer := P;
     Exit;
   End;
   Case Method Of
@@ -46451,9 +46489,47 @@ Begin
                                      MemL[0:P + 16], MemL[0:P + 20]);
 End;
 
+{ Date de derniere ecriture d'un fichier ouvert (COPY, XCOPY) : FAT
+  aussitot dans l'entree du repertoire, NTFS et HPFS a la fermeture }
 Function SetFileTime(H, PC, PA, PW : LongInt) : LongInt;
+Var I, F, V, A, Sec, T : LongInt; D, Tm : Word;
 Begin
+  SetFileTime := 0;
+  I := KObjOf(H, koFile);
+  If I < 0 Then
+  Begin
+    SetErr(ErrInvalidHandle);
+    Exit;
+  End;
   SetFileTime := 1;
+  If PW = 0 Then Exit;
+  D := 0; Tm := 0;
+  FileTimeToDosDateTime(PW, LongInt(@D), LongInt(@Tm));
+  T := (LongInt(D) Shl 16) Or Tm;
+  F := KObjs^[I].F4;
+  If F >= 0 Then
+  Begin
+    RamFiles[F].Time := T;
+    Exit;
+  End;
+  If F > -1000 Then Exit;
+  F := -1000 - F;
+  If (F >= MaxFo) Or Not FoUsed[F] Then Exit;
+  V := FoVol[F];
+  FoTime[F] := T;
+  If (VolType[V] = NtfsT) Or (VolType[V] = HpfsT) Then
+  Begin
+    FoSetT[F] := T;
+    FoDirty[F] := True;
+  End
+  Else If VolType[V] <> NetT Then
+  Begin
+    A := DirEnt(V, FoDir[F], FoIdx[F], Sec, False);
+    If A = 0 Then Exit;
+    MemW[0:A + 22] := Tm;
+    MemW[0:A + 24] := D;
+    VPut(V, Sec);
+  End;
 End;
 
 Function SetHandleCount(N : LongInt) : LongInt;
@@ -73084,6 +73160,7 @@ Begin
   End;
   FoUsed[F] := True;
   FoVol[F] := V; FoSize[F] := ScSize; FoTime[F] := ScTime;
+  FoSetT[F] := 0;
   FoClus[F] := ScFid[0]; FoDir[F] := ScFid[1];
   FoIdx[F] := ScFid[2]; FoCClus[F] := ScFid[3];
   FoCIdx[F] := -1;
