@@ -9,7 +9,8 @@
 #  3. compile les programmes systeme (SYSTEM/*.PAS, dont COMMAND.EXE,
 #     l'interpreteur de commandes) et les exemples Win32 (EXAMPLES/*.PAS),
 #     avec WPC -CW32, puis les applications (APPS/*.PAS, dont PAINT.EXE,
-#     le Paint de CloneDRAW, PASDEV.EXE et PASDBG.EXE du Developer Kit),
+#     le Paint de CloneDRAW, PASDEV.EXE, PASDBG.EXE et WEBDEV.EXE du
+#     Developer Kit),
 #     et WPC.EXE (WPC -CW32 TOOLS/WPC.PAS : le compilateur pour Pasdows),
 #     puis les commandes MS-DOS (DOS/*.PAS, venues de MSDOS-0 et de
 #     GWBASIC-0) dans IMAGE/CDROM/COMMAND ;
