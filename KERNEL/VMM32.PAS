@@ -8447,6 +8447,7 @@ Const
   icMsInfo   = 52; icTaskSch  = 53; icNetDrv   = 54; icFonts    = 55;
   icAppWiz   = 56; icRdp      = 57; icFtp      = 58; icSsh      = 59;
   icPasDev   = 60; icPasDbg   = 61; icGit      = 62; icSvn      = 63;
+  icWebDev   = 64;
 
   CurH = 19;
   CurShape : Array[0..18] Of String[12] = (
@@ -9994,6 +9995,20 @@ Begin
       QD(19, 20, 6, cRed); QC(19, 20, 6, cMaroon);
       QD(19, 12, 3, cBlack);
       QR(19, 14, 19, 26, cBlack);
+    End;
+    icWebDev :
+    Begin
+      { Web Developer : page HTML (balises < / >) et globe }
+      IFrame(2, 3, 24, 28, cWhite);
+      QR(3, 4, 23, 7, cNavy);
+      QL(8, 10, 5, 13, cMaroon); QL(5, 13, 8, 16, cMaroon);
+      QL(14, 10, 17, 13, cMaroon); QL(17, 13, 14, 16, cMaroon);
+      QL(10, 16, 12, 10, cBlue);
+      QR(5, 20, 13, 21, cBlue); QR(5, 23, 10, 24, cGreen);
+      QD(23, 22, 7, cBlue);
+      QR(20, 18, 23, 20, cGreen); QR(19, 21, 21, 23, cGreen);
+      QR(24, 23, 27, 26, cGreen);
+      QC(23, 22, 7, cNavy);
     End;
     icGit :
     Begin
@@ -14068,6 +14083,7 @@ Const
   cmMapDrv = 82; cmDiscDrv = 83; cmControl = 84; cmNetDisc = 85;
   cmMstsc = 86; cmFtp = 93; cmSsh = 94; cmPasDev = 95; cmPasDbg = 96;
   cmPasteLnk = 97; cmRecProps = 98; cmGit = 800; cmSvn = 801;
+  cmWebDev = 802;
   cmCut = 87; cmCopy = 88; cmPaste = 89;   { fichiers : presse-papiers }
   cmSelAll = 90; cmRefresh = 91; cmFileProps = 92;
   cmNetLetBase = 700;               { + lettre (0 = A) : lecteur reseau }
@@ -14498,7 +14514,7 @@ Begin
     (Nm = 'MSTASK.EXE') Or (Nm = 'CONTROL.EXE') Or (Nm = 'MSTSC.EXE') Or
     (Nm = 'FTPCLI.EXE') Or (Nm = 'SSHCLI.EXE') Or (Nm = 'PASDEV.EXE') Or
     (Nm = 'PASDBG.EXE') Or (Nm = 'WPC.EXE') Or (Nm = 'GITCLI.EXE') Or
-    (Nm = 'SVNCLI.EXE');
+    (Nm = 'SVNCLI.EXE') Or (Nm = 'WEBDEV.EXE');
   For K := 0 To KnownN - 1 Do
     If Nm = KnownExe[K] Then MenuApp := True;
 End;
@@ -15104,7 +15120,7 @@ Begin
     mnPrograms : MenuCount := 5 + ExeCnt;
     mnAccess : MenuCount := 11;
     mnComm : MenuCount := 1;
-    mnDevKit : MenuCount := 4;
+    mnDevKit : MenuCount := 5;
     mnGames : MenuCount := 3;
     mnMedia : MenuCount := 3 + KnownCount('M');
     mnInet : MenuCount := 5 + KnownCount('I');
@@ -15243,9 +15259,9 @@ Begin
         T := BaseName(ExePaths^[I - 5]);
         Cmd := cmExeBase + I - 5; Icon := ExeIcon(T);
       End;
-    { Programmes, Developer Kit : l'EDI Pascal (WPC), le debogueur, et
-      les clients GitHub et SVN (aussi dans Accessoires, Outils
-      Internet) }
+    { Programmes, Developer Kit : l'EDI Pascal (WPC), le debogueur,
+      l'editeur de pages Web et les clients GitHub et SVN (aussi dans
+      Accessoires, Outils Internet) }
     mnDevKit :
       If I = 0 Then
       Begin
@@ -15258,6 +15274,11 @@ Begin
         Cmd := cmPasDbg; Icon := icPasDbg;
       End
       Else If I = 2 Then
+      Begin
+        T := 'Web Developer';
+        Cmd := cmWebDev; Icon := icWebDev;
+      End
+      Else If I = 3 Then
       Begin
         T := L('Client GitHub', 'GitHub Client', 'GitHub-Client',
                'Client GitHub', 'Cliente GitHub');
@@ -16870,6 +16891,7 @@ Begin
   Else If Nm = 'SVNCLI.EXE' Then ExeIcon := icSvn
   Else If Nm = 'PASDEV.EXE' Then ExeIcon := icPasDev
   Else If Nm = 'PASDBG.EXE' Then ExeIcon := icPasDbg
+  Else If Nm = 'WEBDEV.EXE' Then ExeIcon := icWebDev
   Else If Nm = 'APPWIZ.EXE' Then ExeIcon := icAppWiz
   Else If Nm = 'MP3PLAY.EXE' Then ExeIcon := icSound
   Else If Nm = 'CDPLAYER.EXE' Then ExeIcon := icCdPlayer
@@ -23060,6 +23082,7 @@ Begin
     cmSvn : RunExe('SVNCLI.EXE', '');
     cmPasDev : RunSys('PASDEV.EXE', '', 'Pascal Developer');
     cmPasDbg : RunSys('PASDBG.EXE', '', 'Pasdows Debugger');
+    cmWebDev : RunSys('WEBDEV.EXE', '', 'Web Developer');
     cmNetDisc :
       If CtxNetDrv <> #0 Then
       Begin
@@ -35935,6 +35958,11 @@ Begin
   Else If (Flags And 4) <> 0 Then
     MoveW(MW, Max(0, X - Wnds^[MW].W Div 2), Wnds^[MW].Y, Wnds^[MW].W,
           Wnds^[MW].H, True);
+  { comme Windows : un menu qui ne tient pas sous le pointeur s'ouvre
+    au-dessus (sinon le relachement du bouton choisirait un element) }
+  If (Wnds^[MW].Y < Y) And (Y - Wnds^[MW].H >= 0) Then
+    MoveW(MW, Wnds^[MW].X, Y - Wnds^[MW].H, Wnds^[MW].W, Wnds^[MW].H,
+          True);
   TrackRes := 0;
   If CurT = 0 Then
   Begin
