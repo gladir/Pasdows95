@@ -52,6 +52,8 @@ Var
   NClus, Drive, Phase, Method, Cur, CurV, Steps, StepsDone, MapCols, MapRows, PerCell : LongInt;
   VolH : LongInt;
   Paused, Busy, ShowLegend : Boolean;
+  Analyzing, QuitReq : Boolean;            { analyse en cours ; fermer apres }
+  LastShow : LongInt;                       { dernier affichage de l'analyse }
   CW, CH, MemDC, MemBmp, FontS : LongInt;
   StartW, PauseW, StopW, DriveW, SetW, LegW : LongInt;
   MSet : LongInt;
@@ -470,6 +472,7 @@ End;
 
 Function DeviceIoControl(H, Code, PIn, NIn, POut, NOut, PRet, Ov : LongInt) : LongInt; stdcall;
   external 'kernel32.dll' name 'DeviceIoControl';
+Function PeekMessageA(P, H, F, L, R : LongInt) : LongInt; stdcall; external 'user32.dll' name 'PeekMessageA';
 Function GetDriveTypeA(P : LongInt) : LongInt; stdcall; external 'kernel32.dll' name 'GetDriveTypeA';
 Function GetLastError : LongInt; stdcall; external 'kernel32.dll' name 'GetLastError';
 Function CreateFileA2(Name, Access, Share, Sec, Disp, Flags, Tmpl : LongInt) : LongInt; stdcall;
@@ -604,7 +607,7 @@ Begin
   W := ((TW - 64) * P) Div 100;
   Bar(Dc, 14, Y + 22, TW - 50, Y + 36, ClrFace);
   Bar(Dc, 14, Y + 22, 14 + W, Y + 36, ClrSel);
-  If Phase >= 2 Then Txt(Dc, TW - 40, Y + 21, IStr(P) + ' %', ClrDark, ClrFace);
+  If (Phase >= 2) Or ((Phase = 0) And (Steps > 0)) Then Txt(Dc, TW - 40, Y + 21, IStr(P) + ' %', ClrDark, ClrFace);
   ClipTxt(Dc, 12, Y + 42, TW, Status2);
 End;
 
@@ -710,6 +713,7 @@ Begin
     Begin
       L := RpOut[6 + K * 4];
       For J := 0 To RpOut[4 + K * 4] - PrevV - 1 Do SetCS(L + J, S);
+      If Phase = 0 Then StepsDone := StepsDone + RpOut[4 + K * 4] - PrevV;
       PrevV := RpOut[4 + K * 4];
     End;
     Vcn := PrevV;
@@ -732,6 +736,38 @@ Begin
   Inc(NDirs);
 End;
 
+{ pendant l'analyse : la fenetre reste vivante (dessin, deplacement,
+  fermeture) et montre ce qu'elle fait ; les commandes attendent la fin }
+Procedure Pump;
+Var M : Array[0..7] Of LongInt;
+Begin
+  While PeekMessageA(LongInt(@M), 0, 0, 0, 1) <> 0 Do
+  Begin
+    If M[1] = $0012 Then
+    Begin
+      { WM_QUIT : pour la boucle principale }
+      QuitReq := True;
+      PostQuitMessage(M[2]);
+      Exit;
+    End;
+    Dummy := TranslateMessage(LongInt(@M));
+    Dummy := DispatchMessageA(LongInt(@M));
+  End;
+End;
+
+Procedure AnalyzeShow(D : String);
+Var Dc : LongInt;
+Begin
+  If GetTickCount - LastShow < 250 Then Exit;
+  LastShow := GetTickCount;
+  Status2 := IStr(NF) + ' fichiers analys'#233's : ' + D;
+  DrawAll(MemDC);
+  Dc := GetDC(Wnd);
+  Dummy := BitBlt(Dc, 0, 0, CW, CH, MemDC, 0, 0, SRCCOPY);
+  Dummy := ReleaseDC(Wnd, Dc);
+  Pump;
+End;
+
 { un dossier : ses fichiers dans la liste, ses sous-dossiers a suivre }
 Procedure ScanDir(D : String);
 Var H, A, Fi, F, L, Fr, Hf : LongInt; N, P : String; L4 : PLng; Q : PStr;
@@ -743,6 +779,8 @@ Begin
     N := GetZ(LongInt(@FData[44]));
     L4 := PLng(LongInt(@FData[0])); A := L4^;
     P := D + N;
+    AnalyzeShow(D);
+    If QuitReq Then Break;
     If (N <> '.') And (N <> '..') Then
     Begin
       If (A And $10) <> 0 Then AddDir(P)
@@ -822,16 +860,16 @@ End;
 
 Procedure SetButtons;
 Begin
-  Dummy := EnableWindow(StartW, Ord(Not Busy And (Phase = 1)));
+  Dummy := EnableWindow(StartW, Ord(Not Busy And Not Analyzing And (Phase = 1)));
   Dummy := EnableWindow(PauseW, Ord(Busy));
   Dummy := EnableWindow(StopW, Ord(Busy));
-  Dummy := EnableWindow(DriveW, Ord(Not Busy));
-  Dummy := EnableWindow(SetW, Ord(Not Busy));
+  Dummy := EnableWindow(DriveW, Ord(Not Busy And Not Analyzing));
+  Dummy := EnableWindow(SetW, Ord(Not Busy And Not Analyzing));
   If Paused Then SetText(PauseW, 'Reprendre') Else SetText(PauseW, 'Pause');
 End;
 
 Procedure Analyze;
-Var D : String; Dc : LongInt;
+Var D : String; Dc, K : LongInt;
 Begin
   ClearFiles;
   Phase := 0; Steps := 0; StepsDone := 0;
@@ -850,21 +888,35 @@ Begin
     Exit;
   End;
   Layout;
+  { progression : clusters des fichiers deja vus / clusters occupes }
+  Steps := 0;
+  For K := 0 To NClus - 1 Do If CS(K) <> csFree Then Inc(Steps);
+  StepsDone := 0;
+  Analyzing := True;
+  SetButtons;
   DrawAll(MemDC);
   Dc := GetDC(Wnd);
   Dummy := BitBlt(Dc, 0, 0, CW, CH, MemDC, 0, 0, SRCCOPY);
   Dummy := ReleaseDC(Wnd, Dc);
   Dummy := SetCursor(LoadCursorA(0, IDC_WAIT));
+  LastShow := GetTickCount;
   { parcours des dossiers (une pile) }
   AddDir(DriveRoot);
-  While NDirs > 0 Do
+  While (NDirs > 0) And Not QuitReq Do
   Begin
     Dec(NDirs);
     D := Dirs[NDirs]^;
     FreeMem(Dirs[NDirs], 256);
     ScanDir(D);
   End;
+  Analyzing := False;
   Dummy := SetCursor(LoadCursorA(0, IDC_ARROW));
+  If QuitReq Then
+  Begin
+    Dummy := DestroyWindow(Wnd);
+    Exit;
+  End;
+  Steps := 0; StepsDone := 0;
   Phase := 1;
   StatusS := 'Le lecteur ' + Chr(65 + Drive) + ': est fragment'#233' '#224' ' + IStr(FragPct) + ' %.';
   Status2 := IStr(NF) + ' fichiers, dont ' + IStr(FragCount) + ' fragment'#233's ; ' + IStr(UsedPct) +
@@ -944,7 +996,8 @@ Begin
   Vcn := 0;
   While Vcn < FLen[I] Do
   Begin
-    N := MinI(256, FLen[I] - Vcn);
+    { 32 clusters par appel : le noyau rend la main entre deux appels }
+    N := MinI(32, FLen[I] - Vcn);
     MvIn[0] := H; MvIn[1] := 0;
     MvIn[2] := Vcn; MvIn[3] := 0;
     MvIn[4] := T + Vcn; MvIn[5] := 0;
@@ -1179,6 +1232,7 @@ Begin
     WM_ERASEBKGND : MainProc := 1;
     WM_STEP : Step;
     WM_COMMAND :
+      If Not Analyzing Then
       Case WP And $FFFF Of
         ID_START : StartDefrag;
         ID_PAUSE :
@@ -1209,7 +1263,8 @@ Begin
           End;
       End;
     WM_CLOSE :
-      If Busy And (Ask('La d'#233'fragmentation n''est pas termin'#233'e. Voulez-vous quitter ?',
+      If Analyzing Then QuitReq := True
+      Else If Busy And (Ask('La d'#233'fragmentation n''est pas termin'#233'e. Voulez-vous quitter ?',
                        'D'#233'fragmenteur de disque', MB_YESNO Or MB_ICONQUESTION) <> IDYES) Then
       Else Dummy := DestroyWindow(H);
     WM_DESTROY : PostQuitMessage(0);
@@ -1227,7 +1282,7 @@ BEGIN
   Inst := GetModuleHandleA(0);
   DetectOem;
   NF := 0; NDirs := 0; St := Nil; BmOut := Nil; NClus := 0; VolH := INVALID_HANDLE;
-  Phase := 0; Method := 0; Busy := False; Paused := False; ShowLegend := True; StartW := 0;
+  Phase := 0; Method := 0; Busy := False; Paused := False; Analyzing := False; QuitReq := False; ShowLegend := True; StartW := 0;
   Drive := 2;
   For K := 1 To ParamCount Do
   Begin

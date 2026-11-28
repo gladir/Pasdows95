@@ -11395,6 +11395,23 @@ Begin
   KSchedule;
 End;
 
+{ Un programme qui enchaine les appels systeme longs passe presque tout
+  son temps dans le noyau, ou l'horloge ne le preempte pas (TimerTail) :
+  l'ecran, la souris et le clavier n'etaient plus servis (SCANDISK sur
+  un disque de 2 Go ; le Defragmenteur, qui se poste un message par
+  fichier deplace). Sa tranche de 20 ms ecoulee, il cede le processeur a
+  l'entree de ces appels, ou rien n'est encore tenu : ReadFile,
+  WriteFile, CreateFileA, FindFirstFileA, FindNextFileA,
+  DeviceIoControl, et GetMessageA quand un message attend deja. }
+Procedure AppYield;
+Begin
+  If (CurT > 0) And Threads[CurT].IsApp And (Ticks - SliceStart >= 20) Then
+  Begin
+    KYield;
+    SliceStart := Ticks;
+  End;
+End;
+
 { Bloquer la tache courante jusqu'a ce qu'elle redevienne executable }
 Procedure KBlock;
 Begin
@@ -27209,6 +27226,7 @@ End;
 Function CreateFileA(PName, Access, Share, Sec, Disp, Flags, Templ : LongInt)
   : LongInt;
 Begin
+  AppYield;
   CreateFileA := KOpenFile(PStr(PName), (Access And $40000000) <> 0, Disp);
 End;
 
@@ -27326,19 +27344,6 @@ Begin
   KReadFile := True;
 End;
 
-{ Un programme qui enchaine les lectures et ecritures passe presque tout
-  son temps dans le noyau, ou l'horloge ne le preempte pas (TimerTail) :
-  l'ecran, la souris et le clavier n'etaient plus servis (SCANDISK sur
-  un disque de 2 Go). Sa tranche de 20 ms ecoulee, il cede le processeur
-  a l'entree de ReadFile et WriteFile, ou rien n'est encore tenu. }
-Procedure AppYield;
-Begin
-  If (CurT > 0) And Threads[CurT].IsApp And (Ticks - SliceStart >= 20) Then
-  Begin
-    KYield;
-    SliceStart := Ticks;
-  End;
-End;
 
 Function ReadFile(H, Buf, N, PRead, Ovl : LongInt) : LongInt;
 Var Got : LongInt;
@@ -28180,6 +28185,7 @@ End;
 Function FindFirstFileA(PName, P : LongInt) : LongInt;
 Var I : LongInt; S : String;
 Begin
+  AppYield;
   FindFirstFileA := INVALID_HANDLE;
   I := KObjNew(koFind);
   If I < 0 Then Exit;
@@ -28203,6 +28209,7 @@ End;
 Function FindNextFileA(H, P : LongInt) : LongInt;
 Var I : LongInt;
 Begin
+  AppYield;
   FindNextFileA := 0;
   I := KObjOf(H, koFind);
   If I < 0 Then Exit;
@@ -33435,6 +33442,9 @@ End;
 Function GetMessageA(P, H, MinM, MaxM : LongInt) : LongInt;
 Var M : TMsgRec;
 Begin
+  { un programme qui se poste lui-meme des messages (un pas de travail
+    par message) ne doit pas affamer les autres taches }
+  AppYield;
   While Not KPeekMsg(CurT, M, H, MinM, MaxM, True) Do
   Begin
     If CurT = 0 Then
@@ -75503,6 +75513,7 @@ Function DeviceIoControl(H, Code, PIn, NIn, POut, NOut, PRet, Ovl
   : LongInt) : LongInt;
 Var V, F, Ret, R : LongInt;
 Begin
+  AppYield;
   DeviceIoControl := 0;
   Ret := 0; R := 0;
   V := IoVolOf(H);
