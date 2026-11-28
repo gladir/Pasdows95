@@ -112,6 +112,7 @@ Const
   GWL_WNDPROC = -4;
   CF_TEXT = 1; GMEM_MOVEABLE = 2;
   ETO_OPAQUE = 2; TRANSPARENT = 1; DIB_RGB_COLORS = 0; SRCCOPY = $00CC0020;
+  SRCAND = $008800C6; SRCPAINT = $00EE0086;
   MEM_COMMIT = $1000; MEM_RESERVE = $2000; PAGE_READWRITE = 4;
   GENERIC_READ = LongInt($80000000); GENERIC_WRITE = $40000000;
   OPEN_EXISTING = 3; CREATE_ALWAYS = 2; INVALID_HANDLE = -1;
@@ -154,7 +155,7 @@ Const
   MAX_CTRLS = 400;
   MAX_IMGS = 200;
   MAX_COLS = 40;
-  MAX_CSS = 600;
+  MAX_CSS = 2500;
   HIST_MENU = 16;
 
   { --- types de noeuds et balises (memes valeurs que le navigateur
@@ -183,6 +184,7 @@ Const
 
   { --- liste d'affichage --- }
   OP_TEXT = 1; OP_RECT = 2; OP_FRAME = 3; OP_LINE = 4; OP_IMAGE = 5; OP_CTRL = 6; OP_BULLET = 7;
+  OP_BGIMG = 8; OP_CLIP = 9; OP_UNCLIP = 10; OP_GROUP = 11;   { fond en image, decoupage, inline-block }
 
   { styles du texte }
   ST_BOLD = 1; ST_ITALIC = 2; ST_UNDER = 4; ST_STRIKE = 8; ST_MONO = 16;
@@ -224,6 +226,18 @@ Type
     Width : LongInt;              { 0 ou largeur en pels }
     { marges et retraits (margin, padding) en pels ; -1 : non precise }
     MarT, MarR, MarB, MarL, PadT, PadR, PadB, PadL : LongInt;
+    { boite CSS 2 : hauteur, largeur (WPm/10000 du conteneur + WPx),
+      genre d'affichage (1 normal, 2 table, 3 table-row, 4 table-cell,
+      5 inline-block), position, flottant, debordement, visibilite }
+    HasH, HasW, HasMaxW, DKind, PosK, FloatK, OverK, InvisK, NoWrapK, AutoL, AutoR : Byte;
+    Height, MinH, WPm, WPx, MaxPm, MaxPx : LongInt;
+    PTop, PLeft, PRight, PBot : LongInt;      { UNSET : non precise }
+    { fond : image (adresse de l'url ; -1 none), indice + 1, repetition
+      (1 repeat, 2 repeat-x, 3 repeat-y, 4 no-repeat), position }
+    BImg, BImgI, BPx, BPy : LongInt;
+    BRep, HasBPos : Byte;
+    { bordures haut, droite, bas, gauche : epaisseur et couleur (-1) }
+    BW, BC : Array[0..3] Of LongInt;
   End;
 
   { operation de la liste d'affichage (dans l'arene) }
@@ -369,6 +383,12 @@ Function SetBkColor(D, C : LongInt) : LongInt; stdcall;
   external 'gdi32.dll' name 'SetBkColor';
 Function SetBkMode(D, M : LongInt) : LongInt; stdcall;
   external 'gdi32.dll' name 'SetBkMode';
+Function SaveDC(D : LongInt) : LongInt; stdcall;
+  external 'gdi32.dll' name 'SaveDC';
+Function RestoreDC(D, N : LongInt) : LongInt; stdcall;
+  external 'gdi32.dll' name 'RestoreDC';
+Function IntersectClipRect(D, L, T, R, B : LongInt) : LongInt; stdcall;
+  external 'gdi32.dll' name 'IntersectClipRect';
 Function StretchDIBits(D, X, Y, W, H, SX, SY, SW, SH, B, I, U,
   R : LongInt) : LongInt; stdcall;
   external 'gdi32.dll' name 'StretchDIBits';
@@ -2381,12 +2401,31 @@ Type
     PCls : Array[0..3] Of String[23];
     PCls2 : Array[0..3] Of String[23];
     Spec, Order : LongInt;
+    Scope : PNode;                { cadre (iframe) de la feuille ; Nil : la page }
     St : TStyle;
   End;
 
 Var
   Rules : Array[0..MAX_CSS - 1] Of PRule;
   NRules : LongInt;
+  CssScope : PNode;               { cadre dont on lit les feuilles (Nil : la page) }
+
+{ cadre (iframe) qui contient le noeud ; Nil : la page elle-meme }
+Function IframeOf(N : PNode) : PNode;
+Begin
+  IframeOf := Nil;
+  If N = Nil Then Exit;
+  N := N^.Parent;
+  While N <> Nil Do
+  Begin
+    If (N^.Kind = NODE_ELEM) And (N^.Tag = TAG_IFRAME) Then
+    Begin
+      IframeOf := N;
+      Exit;
+    End;
+    N := N^.Parent;
+  End;
+End;
 
 { couleur CSS / HTML -> RGB ; -1 si inconnue ou transparente }
 Function ParseColor(S : String) : LongInt;
@@ -2493,7 +2532,7 @@ Begin
   If Pos('em', L) > 0 Then V := V * 16 + (F * 16) Div D
   Else If Pos('pt', L) > 0 Then V := (V * 4) Div 3
   Else If Pos('ex', L) > 0 Then V := V * 8 + (F * 8) Div D;
-  CssLen := MinI(96, V);
+  CssLen := MinI(600, V);
 End;
 
 { "margin: a b c d" (1 a 4 valeurs) -> haut, droite, bas, gauche }
@@ -2559,6 +2598,650 @@ Begin
   End;
 End;
 
+{ --- ajouts CSS 2 : longueurs signees, largeurs (%, calc), fonds,
+  bordures, positionnement, requetes @media --- }
+
+Const
+  NOLEN = -32768;                 { longueur "auto" }
+  UNSET = -32769;                 { propriete absente }
+
+Var
+  CssBase : String;               { adresse de la feuille en cours (url()) }
+  MediaW, MediaDW : LongInt;      { largeur de la vue et de l'ecran (@media) }
+
+{ longueur signee en pels (px, em, rem, pt, ex, 0) ; faux : %, auto... }
+Function CssLenS(S : String; Var V : LongInt) : Boolean;
+Var L : String; K, I, F, D : LongInt; Neg : Boolean;
+Begin
+  CssLenS := False;
+  L := LowStr(TrimS(S));
+  If L = '' Then Exit;
+  Neg := False;
+  K := 1;
+  If L[1] = '-' Then
+  Begin
+    Neg := True; K := 2;
+  End
+  Else If L[1] = '+' Then K := 2;
+  I := 0; F := 0; D := 1;
+  If (K > Length(L)) Or Not (L[K] In ['0'..'9', '.']) Then Exit;
+  While (K <= Length(L)) And (L[K] In ['0'..'9']) And (I < 100000) Do
+  Begin
+    I := I * 10 + Ord(L[K]) - 48; Inc(K);
+  End;
+  If (K <= Length(L)) And (L[K] = '.') Then
+  Begin
+    Inc(K);
+    While (K <= Length(L)) And (L[K] In ['0'..'9']) Do
+    Begin
+      If D < 1000 Then
+      Begin
+        F := F * 10 + Ord(L[K]) - 48; D := D * 10;
+      End;
+      Inc(K);
+    End;
+  End;
+  L := Copy(L, K, 10);
+  If (L = 'px') Or ((L = '') And (I = 0) And (F = 0)) Then V := I
+  Else If (L = 'em') Or (L = 'rem') Then V := I * 16 + (F * 16) Div D
+  Else If L = 'pt' Then V := (I * 4) Div 3 + (F * 4) Div (3 * D)
+  Else If L = 'ex' Then V := I * 8 + (F * 8) Div D
+  Else If L = 'vw' Then V := (I * MediaW) Div 100
+  Else Exit;
+  If V > 30000 Then V := 30000;
+  If Neg Then V := -V;
+  CssLenS := True;
+End;
+
+{ calc() et pourcentages : valeur lineaire Pm/10000 du conteneur + Px }
+Var
+  CcS : String;
+  CcI : LongInt;
+  CcOk : Boolean;
+
+Procedure CcSkip;
+Begin
+  While (CcI <= Length(CcS)) And (CcS[CcI] = ' ') Do Inc(CcI);
+End;
+
+Procedure CcExpr(Var Pm, Px : LongInt); Forward;
+
+Procedure CcFactor(Var Pm, Px : LongInt);
+Var W : String; V : LongInt;
+Begin
+  Pm := 0; Px := 0;
+  CcSkip;
+  If CcI > Length(CcS) Then
+  Begin
+    CcOk := False;
+    Exit;
+  End;
+  If CcS[CcI] = '(' Then
+  Begin
+    Inc(CcI);
+    CcExpr(Pm, Px);
+    CcSkip;
+    If (CcI <= Length(CcS)) And (CcS[CcI] = ')') Then Inc(CcI) Else CcOk := False;
+    Exit;
+  End;
+  If Copy(CcS, CcI, 5) = 'calc(' Then
+  Begin
+    CcI := CcI + 4;
+    CcFactor(Pm, Px);
+    Exit;
+  End;
+  W := '';
+  While (CcI <= Length(CcS)) And (CcS[CcI] In ['0'..'9', '.', 'a'..'z', '%']) Do
+  Begin
+    W := W + CcS[CcI];
+    Inc(CcI);
+  End;
+  If W = '' Then
+  Begin
+    CcOk := False;
+    Exit;
+  End;
+  If W[Length(W)] = '%' Then Pm := (SVal(Copy(W, 1, Length(W) - 1), 0) * 100)
+  Else If CssLenS(W, V) Then Px := V
+  Else If SVal(W, -99999) <> -99999 Then Px := SVal(W, 0)
+  Else CcOk := False;
+End;
+
+Procedure CcTerm(Var Pm, Px : LongInt);
+Var Pm2, Px2, J : LongInt; Op : Char; W : String;
+Begin
+  CcFactor(Pm, Px);
+  While CcOk Do
+  Begin
+    CcSkip;
+    If (CcI > Length(CcS)) Or Not (CcS[CcI] In ['*', '/']) Then Exit;
+    Op := CcS[CcI];
+    Inc(CcI);
+    CcSkip;
+    { nombre nu }
+    W := '';
+    J := CcI;
+    While (J <= Length(CcS)) And (CcS[J] In ['0'..'9']) Do
+    Begin
+      W := W + CcS[J];
+      Inc(J);
+    End;
+    If W = '' Then
+    Begin
+      CcOk := False;
+      Exit;
+    End;
+    CcI := J;
+    Pm2 := SVal(W, 1);
+    If Op = '*' Then
+    Begin
+      Pm := Pm * Pm2; Px := Px * Pm2;
+    End
+    Else If Pm2 <> 0 Then
+    Begin
+      Pm := Pm Div Pm2; Px := Px Div Pm2;
+    End;
+    Px2 := 0;
+  End;
+End;
+
+Procedure CcExpr(Var Pm, Px : LongInt);
+Var Pm2, Px2 : LongInt; Op : Char;
+Begin
+  CcTerm(Pm, Px);
+  While CcOk Do
+  Begin
+    CcSkip;
+    If (CcI > Length(CcS)) Or Not (CcS[CcI] In ['+', '-']) Then Exit;
+    Op := CcS[CcI];
+    Inc(CcI);
+    CcTerm(Pm2, Px2);
+    If Op = '+' Then
+    Begin
+      Pm := Pm + Pm2; Px := Px + Px2;
+    End
+    Else
+    Begin
+      Pm := Pm - Pm2; Px := Px - Px2;
+    End;
+  End;
+End;
+
+{ largeur CSS : px, %, calc() ; faux : auto ou inconnue }
+Function CssWidth(S : String; Var Pm, Px : LongInt) : Boolean;
+Var V : LongInt;
+Begin
+  CssWidth := False;
+  S := LowStr(TrimS(S));
+  Pm := 0; Px := 0;
+  If (S = '') Or (S = 'auto') Or (S = 'inherit') Or (S = 'initial') Then Exit;
+  If (Length(S) > 1) And (S[Length(S)] = '%') And (Pos('(', S) = 0) Then
+  Begin
+    Pm := SVal(Copy(S, 1, Length(S) - 1), 0) * 100;
+    CssWidth := True;
+    Exit;
+  End;
+  If CssLenS(S, V) Then
+  Begin
+    Px := V;
+    CssWidth := True;
+    Exit;
+  End;
+  If Copy(S, 1, 5) <> 'calc(' Then Exit;
+  CcS := S; CcI := 1; CcOk := True;
+  CcFactor(Pm, Px);
+  CssWidth := CcOk;
+End;
+
+{ url(...) -> adresse complete dans l'arene (octet de longueur, texte) }
+Function CssUrl(S : String) : LongInt;
+Var K, A : LongInt; U : String;
+Begin
+  CssUrl := 0;
+  K := Pos('url(', LowStr(S));
+  If K = 0 Then Exit;
+  U := Copy(S, K + 4, 255);
+  K := Pos(')', U);
+  If K > 0 Then U := Copy(U, 1, K - 1);
+  U := TrimS(U);
+  If (Length(U) >= 2) And ((U[1] = '"') Or (U[1] = '''')) Then U := Copy(U, 2, Length(U) - 2);
+  If (U = '') Or (LowStr(Copy(U, 1, 5)) = 'data:') Then Exit;
+  U := ResolveUrl(CssBase, U);
+  A := ArAlloc(Length(U) + 2);
+  If A = 0 Then Exit;
+  WrB(A, Length(U));
+  For K := 1 To Length(U) Do WrB(A + K, Ord(U[K]));
+  CssUrl := A;
+End;
+
+{ mot K (0..) d'une valeur, url(...) gardee entiere }
+Function CssWord(S : String; K : LongInt) : String;
+Var I, N, D : LongInt; W : String;
+Begin
+  CssWord := '';
+  N := 0; W := ''; D := 0;
+  For I := 1 To Length(S) + 1 Do
+  Begin
+    If (I <= Length(S)) And (S[I] = '(') Then Inc(D);
+    If (I <= Length(S)) And (S[I] = ')') And (D > 0) Then Dec(D);
+    If (I > Length(S)) Or ((S[I] = ' ') And (D = 0)) Then
+    Begin
+      If W <> '' Then
+      Begin
+        If N = K Then
+        Begin
+          CssWord := W;
+          Exit;
+        End;
+        Inc(N);
+      End;
+      W := '';
+    End
+    Else W := W + S[I];
+  End;
+End;
+
+{ position de fond : mot-cle ou longueur ; NOLEN - pct pour les mots }
+Function BgPosVal(W : String) : LongInt;
+Var V : LongInt;
+Begin
+  W := LowStr(W);
+  If (W = 'left') Or (W = 'top') Then BgPosVal := 0
+  Else If W = 'center' Then BgPosVal := -1000050
+  Else If (W = 'right') Or (W = 'bottom') Then BgPosVal := -1000100
+  Else If (Length(W) > 1) And (W[Length(W)] = '%') Then BgPosVal := -1000000 - SVal(W, 0)
+  Else If CssLenS(W, V) Then BgPosVal := V
+  Else BgPosVal := 0;
+End;
+
+{ background-position "x y" }
+Procedure BgPos(Var St : TStyle; L : String);
+Var A, B : String;
+Begin
+  A := CssWord(L, 0); B := CssWord(L, 1);
+  If B = '' Then B := 'center';
+  If (LowStr(A) = 'top') Or (LowStr(A) = 'bottom') Then
+  Begin
+    St.BPy := BgPosVal(A); St.BPx := BgPosVal(B);
+  End
+  Else
+  Begin
+    St.BPx := BgPosVal(A); St.BPy := BgPosVal(B);
+  End;
+  St.HasBPos := 1;
+End;
+
+{ "background" : couleur, image, repetition, position }
+Procedure CssBackground(Var St : TStyle; V, L : String; Short : Boolean);
+Var K, C : LongInt; W, Ps : String;
+Begin
+  If Short Then
+  Begin
+    { la forme abregee remet a zero ce qu'elle ne dit pas }
+    St.BImg := -1; St.BRep := 1; St.BPx := 0; St.BPy := 0; St.HasBPos := 1;
+  End;
+  Ps := '';
+  K := 0;
+  Repeat
+    W := CssWord(V, K);
+    If W = '' Then Break;
+    L := LowStr(W);
+    If Copy(L, 1, 4) = 'url(' Then
+    Begin
+      C := CssUrl(W);
+      If C <> 0 Then St.BImg := C;
+    End
+    Else If L = 'none' Then St.BImg := -1
+    Else If L = 'repeat' Then St.BRep := 1
+    Else If L = 'repeat-x' Then St.BRep := 2
+    Else If L = 'repeat-y' Then St.BRep := 3
+    Else If L = 'no-repeat' Then St.BRep := 4
+    Else If L = 'transparent' Then St.Back := -2
+    Else If (L = 'left') Or (L = 'right') Or (L = 'top') Or (L = 'bottom') Or (L = 'center') Or
+            (L[1] In ['0'..'9', '-']) Then
+    Begin
+      If Ps = '' Then Ps := L Else If Pos(' ', Ps) = 0 Then Ps := Ps + ' ' + L;
+    End
+    Else If (L = 'scroll') Or (L = 'fixed') Or (L = 'local') Or (Pos('/', L) > 0) Then
+    Else
+    Begin
+      C := ParseColor(L);
+      If C >= 0 Then St.Back := C;
+    End;
+    Inc(K);
+  Until K > 12;
+  If Ps <> '' Then BgPos(St, Ps);
+End;
+
+{ bordure : epaisseur, style, couleur ; Side 0..3 ou 4 (toutes) }
+Procedure CssBorder(Var St : TStyle; V : String; Side : LongInt);
+Var K, I, Wd, C : LongInt; W, L : String; HasW, HasC, NoneS : Boolean;
+Begin
+  HasW := False; HasC := False; NoneS := False; Wd := 3; C := -1;
+  K := 0;
+  Repeat
+    W := CssWord(V, K);
+    If W = '' Then Break;
+    L := LowStr(W);
+    If L = 'thin' Then
+    Begin
+      Wd := 1; HasW := True;
+    End
+    Else If L = 'medium' Then
+    Begin
+      Wd := 3; HasW := True;
+    End
+    Else If L = 'thick' Then
+    Begin
+      Wd := 5; HasW := True;
+    End
+    Else If CssLenS(L, I) Then
+    Begin
+      Wd := MaxI(0, MinI(I, 200)); HasW := True;
+    End
+    Else If (L = 'none') Or (L = 'hidden') Then NoneS := True
+    Else If (L = 'solid') Or (L = 'dashed') Or (L = 'dotted') Or (L = 'double') Or (L = 'groove') Or
+            (L = 'ridge') Or (L = 'inset') Or (L = 'outset') Then
+    Else
+    Begin
+      C := ParseColor(L);
+      If C >= 0 Then HasC := True;
+    End;
+    Inc(K);
+  Until K > 6;
+  If NoneS Then Wd := 0;
+  If Not HasC Then C := 0;
+  For I := 0 To 3 Do
+    If (Side = 4) Or (Side = I) Then
+    Begin
+      St.BW[I] := Wd; St.BC[I] := C;
+    End;
+End;
+
+{ 1 a 4 valeurs "haut droite bas gauche" (largeurs ou couleurs) }
+Procedure CssQuad(V : String; Colors : Boolean; Var Q0, Q1, Q2, Q3 : LongInt);
+Var W : Array[0..3] Of String; X : Array[0..3] Of LongInt; N, K : LongInt;
+Begin
+  N := 0;
+  For K := 0 To 3 Do
+  Begin
+    W[K] := CssWord(V, K);
+    If W[K] <> '' Then N := K + 1;
+  End;
+  If N = 0 Then Exit;
+  If N = 1 Then
+  Begin
+    W[1] := W[0]; W[2] := W[0]; W[3] := W[0];
+  End
+  Else If N = 2 Then
+  Begin
+    W[2] := W[0]; W[3] := W[1];
+  End
+  Else If N = 3 Then W[3] := W[1];
+  For K := 0 To 3 Do
+  Begin
+    If Colors Then X[K] := ParseColor(W[K])
+    Else If LowStr(W[K]) = 'thin' Then X[K] := 1
+    Else If LowStr(W[K]) = 'medium' Then X[K] := 3
+    Else If LowStr(W[K]) = 'thick' Then X[K] := 5
+    Else If Not CssLenS(W[K], X[K]) Then X[K] := -1;
+  End;
+  If X[0] >= 0 Then Q0 := X[0];
+  If X[1] >= 0 Then Q1 := X[1];
+  If X[2] >= 0 Then Q2 := X[2];
+  If X[3] >= 0 Then Q3 := X[3];
+End;
+
+{ requete @media : types et caracteristiques (largeurs de la vue et de
+  l'ecran, orientation) ; listes separees par des virgules }
+Function MediaOne(Q : String) : Boolean;
+Var K, J, V, Wv : LongInt; F, Nm, Vl : String; Neg, Ok : Boolean;
+Begin
+  Q := LowStr(TrimS(Q));
+  Neg := False;
+  If Copy(Q, 1, 4) = 'not ' Then
+  Begin
+    Neg := True; Q := TrimS(Copy(Q, 5, 255));
+  End;
+  If Copy(Q, 1, 5) = 'only ' Then Q := TrimS(Copy(Q, 6, 255));
+  Ok := True;
+  { type de media }
+  If (Q <> '') And (Q[1] <> '(') Then
+  Begin
+    K := Pos(' ', Q);
+    If K = 0 Then K := Length(Q) + 1;
+    F := Copy(Q, 1, K - 1);
+    If (F <> 'screen') And (F <> 'all') Then Ok := False;
+    Q := TrimS(Copy(Q, K, 255));
+    If Copy(Q, 1, 4) = 'and ' Then Q := TrimS(Copy(Q, 5, 255));
+  End;
+  { caracteristiques "(nom: valeur) and (...)" }
+  While Ok And (Pos('(', Q) > 0) Do
+  Begin
+    K := Pos('(', Q); J := Pos(')', Q);
+    If J < K Then Break;
+    F := Copy(Q, K + 1, J - K - 1);
+    Q := Copy(Q, J + 1, 255);
+    K := Pos(':', F);
+    If K = 0 Then
+    Begin
+      Nm := TrimS(F); Vl := '';
+    End
+    Else
+    Begin
+      Nm := TrimS(Copy(F, 1, K - 1)); Vl := TrimS(Copy(F, K + 1, 255));
+    End;
+    If Not CssLenS(Vl, V) Then V := SVal(Vl, 0);
+    If Pos('device-', Nm) > 0 Then Wv := MediaDW Else Wv := MediaW;
+    If (Nm = 'min-width') Or (Nm = 'min-device-width') Then Ok := Wv >= V
+    Else If (Nm = 'max-width') Or (Nm = 'max-device-width') Then Ok := Wv <= V
+    Else If Nm = 'orientation' Then Ok := Vl = 'landscape'
+    Else If Nm = 'prefers-color-scheme' Then Ok := Vl <> 'dark'
+    Else If (Nm = 'hover') Or (Nm = 'pointer') Then Ok := (Vl = 'hover') Or (Vl = 'fine') Or (Vl = '')
+    Else If (Nm = 'min-height') Or (Nm = 'min-device-height') Then Ok := 600 >= V
+    Else If (Nm = 'max-height') Or (Nm = 'max-device-height') Then Ok := 480 <= V;
+  End;
+  If Neg Then Ok := Not Ok;
+  MediaOne := Ok;
+End;
+
+Function MediaOk(Q : String) : Boolean;
+Var K : LongInt;
+Begin
+  MediaOk := True;
+  Q := TrimS(Q);
+  If Q = '' Then Exit;
+  Repeat
+    K := Pos(',', Q);
+    If K = 0 Then K := Length(Q) + 1;
+    If MediaOne(Copy(Q, 1, K - 1)) Then Exit;
+    Q := Copy(Q, K + 1, 255);
+  Until Q = '';
+  MediaOk := False;
+End;
+
+{ proprietes ajoutees (boite, position, fond, bordures) ; faux : laisser
+  la suite d'ApplyDecl traiter la declaration }
+Function CssMore(Var St : TStyle; P, V, L : String) : Boolean;
+Var A, B, K : LongInt; W : Array[0..3] Of String; N : LongInt;
+Begin
+  CssMore := True;
+  If P = 'background' Then CssBackground(St, V, L, True)
+  Else If P = 'background-image' Then
+  Begin
+    If L = 'none' Then St.BImg := -1
+    Else
+    Begin
+      A := CssUrl(V);
+      If A <> 0 Then St.BImg := A;
+    End;
+  End
+  Else If P = 'background-repeat' Then
+  Begin
+    If L = 'repeat-x' Then St.BRep := 2
+    Else If L = 'repeat-y' Then St.BRep := 3
+    Else If L = 'no-repeat' Then St.BRep := 4
+    Else St.BRep := 1;
+  End
+  Else If P = 'background-position' Then BgPos(St, L)
+  Else If P = 'display' Then
+  Begin
+    If L = 'none' Then St.Display := 1
+    Else If (L = 'table') Then
+    Begin
+      St.Display := 2; St.DKind := 2;
+    End
+    Else If (L = 'table-row') Or (L = 'table-row-group') Or (L = 'table-header-group') Or
+            (L = 'table-footer-group') Then
+    Begin
+      St.Display := 2; St.DKind := 3;
+    End
+    Else If L = 'table-cell' Then
+    Begin
+      St.Display := 2; St.DKind := 4;
+    End
+    Else If (L = 'inline-block') Or (L = 'inline-flex') Or (L = 'inline-grid') Or (L = 'inline-table') Then
+    Begin
+      St.Display := 3; St.DKind := 5;
+    End
+    Else If L = 'inline' Then
+    Begin
+      St.Display := 3; St.DKind := 1;
+    End
+    Else If (L = 'block') Or (L = 'list-item') Or (L = 'flex') Or (L = 'grid') Or (L = 'flow-root') Then
+    Begin
+      St.Display := 2; St.DKind := 1;
+    End;
+  End
+  Else If P = 'visibility' Then
+  Begin
+    If (L = 'hidden') Or (L = 'collapse') Then St.InvisK := 2 Else If L = 'visible' Then St.InvisK := 1;
+  End
+  Else If P = 'opacity' Then
+  Begin
+    { opacite nulle : invisible (la place reste prise) }
+    B := 0;
+    For K := 1 To Length(L) Do If L[K] In ['1'..'9'] Then B := 1;
+    If B = 0 Then St.InvisK := 2 Else St.InvisK := 1;
+  End
+  Else If P = 'width' Then
+  Begin
+    If CssWidth(L, A, B) Then
+    Begin
+      St.HasW := 1; St.WPm := A; St.WPx := B;
+      If (A = 0) And (B > 0) Then St.Width := B;
+    End
+    Else If L = 'auto' Then St.HasW := 2;
+  End
+  Else If P = 'max-width' Then
+  Begin
+    If CssWidth(L, A, B) Then
+    Begin
+      St.HasMaxW := 1; St.MaxPm := A; St.MaxPx := B;
+    End;
+  End
+  Else If P = 'height' Then
+  Begin
+    If CssLenS(L, A) And (A >= 0) Then
+    Begin
+      St.HasH := 1; St.Height := A;
+    End
+    Else If L = 'auto' Then St.HasH := 2;
+  End
+  Else If P = 'min-height' Then
+  Begin
+    If CssLenS(L, A) And (A >= 0) Then St.MinH := A;
+  End
+  Else If P = 'position' Then
+  Begin
+    If L = 'static' Then St.PosK := 1
+    Else If (L = 'relative') Or (L = 'sticky') Then St.PosK := 2
+    Else If L = 'absolute' Then St.PosK := 3
+    Else If L = 'fixed' Then St.PosK := 4;
+  End
+  Else If (P = 'top') Or (P = 'left') Or (P = 'right') Or (P = 'bottom') Then
+  Begin
+    If Not CssLenS(L, A) Then A := NOLEN;
+    If P = 'top' Then St.PTop := A
+    Else If P = 'left' Then St.PLeft := A
+    Else If P = 'right' Then St.PRight := A
+    Else St.PBot := A;
+  End
+  Else If P = 'float' Then
+  Begin
+    If L = 'left' Then St.FloatK := 2 Else If L = 'right' Then St.FloatK := 3 Else St.FloatK := 1;
+  End
+  Else If (P = 'overflow') Or (P = 'overflow-x') Or (P = 'overflow-y') Then
+  Begin
+    If L = 'visible' Then St.OverK := 1 Else St.OverK := 2;
+  End
+  Else If P = 'white-space' Then
+  Begin
+    If (L = 'nowrap') Or (L = 'pre') Then St.NoWrapK := 2 Else St.NoWrapK := 1;
+  End
+  Else If P = 'border' Then CssBorder(St, V, 4)
+  Else If P = 'border-top' Then CssBorder(St, V, 0)
+  Else If P = 'border-right' Then CssBorder(St, V, 1)
+  Else If P = 'border-bottom' Then CssBorder(St, V, 2)
+  Else If P = 'border-left' Then CssBorder(St, V, 3)
+  Else If P = 'border-width' Then CssQuad(V, False, St.BW[0], St.BW[1], St.BW[2], St.BW[3])
+  Else If P = 'border-color' Then CssQuad(V, True, St.BC[0], St.BC[1], St.BC[2], St.BC[3])
+  Else If P = 'border-style' Then
+  Begin
+    If (L = 'none') Or (L = 'hidden') Then
+      For K := 0 To 3 Do St.BW[K] := 0;
+  End
+  Else If (P = 'border-top-width') Or (P = 'border-right-width') Or (P = 'border-bottom-width') Or
+          (P = 'border-left-width') Then
+  Begin
+    If L = 'thin' Then A := 1 Else If L = 'medium' Then A := 3 Else If L = 'thick' Then A := 5
+    Else If Not CssLenS(L, A) Then A := -1;
+    If A >= 0 Then
+    Begin
+      If P = 'border-top-width' Then St.BW[0] := A
+      Else If P = 'border-right-width' Then St.BW[1] := A
+      Else If P = 'border-bottom-width' Then St.BW[2] := A
+      Else St.BW[3] := A;
+    End;
+  End
+  Else If (P = 'border-top-color') Or (P = 'border-right-color') Or (P = 'border-bottom-color') Or
+          (P = 'border-left-color') Then
+  Begin
+    A := ParseColor(L);
+    If A >= 0 Then
+    Begin
+      If P = 'border-top-color' Then St.BC[0] := A
+      Else If P = 'border-right-color' Then St.BC[1] := A
+      Else If P = 'border-bottom-color' Then St.BC[2] := A
+      Else St.BC[3] := A;
+    End;
+  End
+  Else If P = 'margin' Then
+  Begin
+    { marges automatiques (centrage), puis la suite d'ApplyDecl }
+    N := 0;
+    For K := 0 To 3 Do
+    Begin
+      W[K] := CssWord(L, K);
+      If W[K] <> '' Then N := K + 1;
+    End;
+    If ((N = 1) And (W[0] = 'auto')) Or (((N = 2) Or (N = 3)) And (W[1] = 'auto')) Then
+    Begin
+      St.AutoL := 2; St.AutoR := 2;
+    End
+    Else If N >= 1 Then
+    Begin
+      St.AutoL := 1; St.AutoR := 1;
+      If (N = 4) And (W[1] = 'auto') Then St.AutoR := 2;
+      If (N = 4) And (W[3] = 'auto') Then St.AutoL := 2;
+    End;
+    CssMore := False;
+  End
+  Else If (P = 'margin-left') And (L = 'auto') Then St.AutoL := 2
+  Else If (P = 'margin-right') And (L = 'auto') Then St.AutoR := 2
+  Else CssMore := False;
+End;
+
 { une declaration "prop: valeur" appliquee a St }
 Procedure ApplyDecl(Var St : TStyle; P, V : String);
 Var L : String; C, K : LongInt;
@@ -2568,6 +3251,7 @@ Begin
   K := Pos('!important', LowStr(V));
   If K > 0 Then V := TrimS(Copy(V, 1, K - 1));
   L := LowStr(V);
+  If CssMore(St, P, V, L) Then Exit;
   If P = 'color' Then
   Begin
     C := ParseColor(L);
@@ -2645,11 +3329,21 @@ Begin
 End;
 
 Procedure StyleInit(Var St : TStyle);
+Var K : LongInt;
 Begin
   St.Color := -1; St.Back := -1; St.Display := 0; St.Align := 0;
   St.Bold := 0; St.Italic := 0; St.Under := 0; St.Size := 0; St.Width := 0;
   St.MarT := -1; St.MarR := -1; St.MarB := -1; St.MarL := -1;
   St.PadT := -1; St.PadR := -1; St.PadB := -1; St.PadL := -1;
+  St.HasH := 0; St.HasW := 0; St.HasMaxW := 0; St.DKind := 0; St.PosK := 0; St.FloatK := 0;
+  St.OverK := 0; St.InvisK := 0; St.NoWrapK := 0; St.AutoL := 0; St.AutoR := 0;
+  St.Height := 0; St.MinH := 0; St.WPm := 0; St.WPx := 0; St.MaxPm := 0; St.MaxPx := 0;
+  St.PTop := UNSET; St.PLeft := UNSET; St.PRight := UNSET; St.PBot := UNSET;
+  St.BImg := 0; St.BImgI := 0; St.BPx := 0; St.BPy := 0; St.BRep := 0; St.HasBPos := 0;
+  For K := 0 To 3 Do
+  Begin
+    St.BW[K] := -1; St.BC[K] := -1;
+  End;
 End;
 
 { declarations "a: b; c: d" lues dans l'arene (A, N) }
@@ -2759,6 +3453,7 @@ Begin
   StyleInit(R^.St);
   ApplyDecls(R^.St, DA, DN);
   R^.Order := NRules;
+  R^.Scope := CssScope;
   Rules[NRules] := R;
   Inc(NRules);
 End;
@@ -2785,6 +3480,13 @@ Begin
     Begin
       C := RdB(A + I);
       If (C = 47) And (I + 1 < N) And (RdB(A + I + 1) = 42) Then Break;
+      { @charset, @import... : instruction terminee par un point-virgule }
+      If (C = 59) And (Length(Sel) > 0) And (Sel[1] = '@') Then
+      Begin
+        Sel := '';
+        Inc(I);
+        Continue;
+      End;
       If C < 32 Then C := 32;
       If (Length(Sel) < 250) And Not ((C = 32) And (Length(Sel) > 0) And (Sel[Length(Sel)] = ' ')) Then Sel := Sel + Chr(C);
       Inc(I);
@@ -2801,8 +3503,8 @@ Begin
     If (Length(Sel) > 0) And (Sel[1] = '@') Then
     Begin
       W := LowStr(Sel);
-      Skip := Not ((Copy(W, 1, 6) = '@media') And ((Pos('screen', W) > 0) Or (Pos('all', W) > 0)) And
-                   (Pos('max-width', W) = 0) And (Pos('print', W) = 0));
+      { @media : requete evaluee (largeur de la vue et de l'ecran) }
+      Skip := Not ((Copy(W, 1, 6) = '@media') And MediaOk(Copy(W, 7, 255)));
       If Not Skip Then Continue;     { regles internes lues normalement }
       { bloc @ ignore (en entier, accolades imbriquees) }
       Lvl := 1;
@@ -2905,12 +3607,51 @@ Begin
   If S.PadR >= 0 Then D.PadR := S.PadR;
   If S.PadB >= 0 Then D.PadB := S.PadB;
   If S.PadL >= 0 Then D.PadL := S.PadL;
+  If S.HasH <> 0 Then
+  Begin
+    D.HasH := S.HasH; D.Height := S.Height;
+  End;
+  If S.MinH > 0 Then D.MinH := S.MinH;
+  If S.HasW <> 0 Then
+  Begin
+    D.HasW := S.HasW; D.WPm := S.WPm; D.WPx := S.WPx;
+  End;
+  If S.HasMaxW <> 0 Then
+  Begin
+    D.HasMaxW := S.HasMaxW; D.MaxPm := S.MaxPm; D.MaxPx := S.MaxPx;
+  End;
+  If S.DKind <> 0 Then D.DKind := S.DKind;
+  If S.PosK <> 0 Then D.PosK := S.PosK;
+  If S.FloatK <> 0 Then D.FloatK := S.FloatK;
+  If S.OverK <> 0 Then D.OverK := S.OverK;
+  If S.InvisK <> 0 Then D.InvisK := S.InvisK;
+  If S.NoWrapK <> 0 Then D.NoWrapK := S.NoWrapK;
+  If S.AutoL <> 0 Then D.AutoL := S.AutoL;
+  If S.AutoR <> 0 Then D.AutoR := S.AutoR;
+  If S.PTop <> UNSET Then D.PTop := S.PTop;
+  If S.PLeft <> UNSET Then D.PLeft := S.PLeft;
+  If S.PRight <> UNSET Then D.PRight := S.PRight;
+  If S.PBot <> UNSET Then D.PBot := S.PBot;
+  If S.BImg <> 0 Then D.BImg := S.BImg;
+  If S.BRep <> 0 Then D.BRep := S.BRep;
+  If S.HasBPos <> 0 Then
+  Begin
+    D.HasBPos := 1; D.BPx := S.BPx; D.BPy := S.BPy;
+  End;
+  If S.BW[0] >= 0 Then D.BW[0] := S.BW[0];
+  If S.BW[1] >= 0 Then D.BW[1] := S.BW[1];
+  If S.BW[2] >= 0 Then D.BW[2] := S.BW[2];
+  If S.BW[3] >= 0 Then D.BW[3] := S.BW[3];
+  If S.BC[0] >= 0 Then D.BC[0] := S.BC[0];
+  If S.BC[1] >= 0 Then D.BC[1] := S.BC[1];
+  If S.BC[2] >= 0 Then D.BC[2] := S.BC[2];
+  If S.BC[3] >= 0 Then D.BC[3] := S.BC[3];
 End;
 
 { style calcule d'un element (garde dans le noeud) ; Nil : aucun }
 Function NodeStyle(N : PNode) : PStyle;
 Var St : TStyle; K, J, Best, BestI : LongInt; Any : Boolean; A : PAttr; P : PStyle;
-    Hit : Array[0..63] Of LongInt; NHit : LongInt;
+    Hit : Array[0..63] Of LongInt; NHit : LongInt; Anc : PNode;
 Begin
   NodeStyle := Nil;
   If (N = Nil) Or (N^.Kind <> NODE_ELEM) Then Exit;
@@ -2924,8 +3665,11 @@ Begin
   Any := False;
   { regles qui s'appliquent, par specificite puis ordre }
   NHit := 0;
+  { les feuilles d'un cadre ne valent que pour lui, celles de la page
+    pas pour ses cadres }
+  Anc := IframeOf(N);
   For K := 0 To NRules - 1 Do
-    If (NHit < 64) And MatchRule(N, Rules[K]) Then
+    If (NHit < 64) And (Rules[K]^.Scope = Anc) And MatchRule(N, Rules[K]) Then
     Begin
       Hit[NHit] := K;
       Inc(NHit);
@@ -2957,6 +3701,7 @@ Begin
   A := FindAttr(N, 'style');
   If A <> Nil Then
   Begin
+    CssBase := BaseUrl;
     ApplyDecls(St, A^.Val, A^.VLen);
     Any := True;
   End;
@@ -2978,7 +3723,7 @@ End;
 
 { toutes les feuilles <style> du document }
 Procedure CollectStyles(N : PNode);
-Var C : PNode;
+Var C, S : PNode;
 Begin
   If (N = Nil) Or StackLow Then Exit;
   C := N^.First;
@@ -2989,7 +3734,10 @@ Begin
       If (C^.First <> Nil) And (C^.First^.Kind = NODE_TEXT) And
          ((GetAttr(C, 'media') = '') Or (Pos('screen', LowStr(GetAttr(C, 'media'))) > 0) Or
           (Pos('all', LowStr(GetAttr(C, 'media'))) > 0)) Then
+      Begin
+        If CssScope <> Nil Then CssBase := ResolveUrl(BaseUrl, GetAttr(CssScope, 'src')) Else CssBase := BaseUrl;
         ParseCss(C^.First^.Txt, C^.First^.TLen);
+      End;
     End
     Else If (C^.Kind = NODE_ELEM) And (C^.Tag = TAG_LINK) Then
     Begin
@@ -2997,7 +3745,18 @@ Begin
       If (FindAttr(C, '#css') <> Nil) And
          ((GetAttr(C, 'media') = '') Or (Pos('screen', LowStr(GetAttr(C, 'media'))) > 0) Or
           (Pos('all', LowStr(GetAttr(C, 'media'))) > 0)) Then
+      Begin
+        CssBase := ResolveUrl(BaseUrl, GetAttr(C, 'href'));
         ParseCss(FindAttr(C, '#css')^.Val, FindAttr(C, '#css')^.VLen);
+      End;
+    End
+    Else If (C^.Kind = NODE_ELEM) And (C^.Tag = TAG_IFRAME) Then
+    Begin
+      { feuilles du document du cadre : pour lui seul }
+      S := CssScope;
+      CssScope := C;
+      CollectStyles(C);
+      CssScope := S;
     End
     Else If C^.Kind = NODE_ELEM Then CollectStyles(C);
     C := C^.Next;
@@ -3021,6 +3780,7 @@ Var
   FocusCtl : LongInt;
   NImgs : LongInt;
   ImUrl, ImState, ImW, ImH, ImBits, ImBmi : Array[0..MAX_IMGS - 1] Of LongInt;
+  ImMask : Array[0..MAX_IMGS - 1] Of LongInt;   { masque de transparence (DIB, blanc : transparent) ou 0 }
   ImgNext : LongInt;
   LoadImages : Boolean;
   PageBg, PageFg, LinkFg : LongInt;
@@ -3079,6 +3839,7 @@ Begin
   MemCopy(LongInt(@U[1]), K + 1, Length(U));
   ImUrl[NImgs] := K + 1;
   ImState[NImgs] := 0; ImW[NImgs] := 0; ImH[NImgs] := 0; ImBits[NImgs] := 0; ImBmi[NImgs] := 0;
+  ImMask[NImgs] := 0;
   AddImage := NImgs;
   Inc(NImgs);
 End;
@@ -3226,6 +3987,28 @@ Begin
     End;
 End;
 
+{ images de fond des feuilles de style (chargees avec celles de la page) }
+Procedure ScanBg(N : PNode);
+Var C : PNode; Cs : PStyle; K : LongInt;
+Begin
+  If (N = Nil) Or StackLow Then Exit;
+  C := N^.First;
+  While C <> Nil Do
+  Begin
+    If C^.Kind = NODE_ELEM Then
+    Begin
+      Cs := NodeStyle(C);
+      If (Cs <> Nil) And (Cs^.BImg > 0) And (Cs^.BImgI = 0) And (Cs^.Display <> 1) Then
+      Begin
+        K := AddImage(ArGet(Cs^.BImg + 1, RdB(Cs^.BImg)));
+        Cs^.BImgI := K + 1;
+      End;
+      If Not IsHiddenTag(C^.Tag) Then ScanBg(C);
+    End;
+    C := C^.Next;
+  End;
+End;
+
 { ==================================================================== }
 { Mise en page : liste d'affichage dans une arene propre, refaite a     }
 { chaque changement de largeur ou d'image                               }
@@ -3250,6 +4033,7 @@ Var
   LnN, LnW : LongInt;
   LnOp : Array[0..MAX_LINE - 1] Of POp;
   PendSpace : Boolean;
+  InvisN : LongInt;               { > 0 : operations invisibles (opacity: 0, visibility: hidden) }
   PageH, PageW, LayGen : LongInt;
   MLine, MMin, MMax : LongInt;
   NAnch : LongInt;
@@ -3296,6 +4080,7 @@ Begin
   If O <> Nil Then
   Begin
     O^.Kind := Kind;
+    If InvisN > 0 Then O^.Kind := 0;
     O^.Elem := CurElem;
     If OpLast = Nil Then OpFirst := O Else OpLast^.Next := O;
     OpLast := O;
@@ -3339,6 +4124,19 @@ Begin
   End;
 End;
 
+Procedure ShiftOpsXY(After, Last : POp; Dx, Dy : LongInt);
+Var O : POp;
+Begin
+  If ((Dx = 0) And (Dy = 0)) Or (Last = Nil) Or (Last = After) Then Exit;
+  If After = Nil Then O := OpFirst Else O := After^.Next;
+  While O <> Nil Do
+  Begin
+    O^.X := O^.X + Dx; O^.Y := O^.Y + Dy;
+    If O = Last Then Exit;
+    O := O^.Next;
+  End;
+End;
+
 { espace vertical (les marges consecutives se confondent) }
 Procedure VSpace(M : LongInt);
 Begin
@@ -3351,7 +4149,7 @@ End;
 
 { fin de la ligne courante : hauteur, alignement, position verticale }
 Procedure FlushLine;
-Var K, H, Dx : LongInt;
+Var K, H, Dx, Ox, Oy : LongInt;
 Begin
   If LnN = 0 Then
   Begin
@@ -3366,8 +4164,12 @@ Begin
   Else If CurAlign = 3 Then Dx := MaxI(0, LX1 - LX0 - LnW);
   For K := 0 To LnN - 1 Do
   Begin
+    Ox := LnOp[K]^.X; Oy := LnOp[K]^.Y;
     LnOp[K]^.X := LnOp[K]^.X + Dx;
     LnOp[K]^.Y := CurY + H - LnOp[K]^.H;
+    { inline-block : son contenu suit }
+    If LnOp[K]^.Kind = OP_GROUP Then
+      ShiftOpsXY(LnOp[K], Pointer(LnOp[K]^.Data), LnOp[K]^.X - Ox, LnOp[K]^.Y - Oy);
   End;
   CurY := CurY + H + 2;
   VGap := 0;
@@ -3702,7 +4504,8 @@ Begin
       Exit;
     End;
     If (Cs^.Display = 2) And (N^.Tag <> TAG_TD) And (N^.Tag <> TAG_TH) Then D := 1;
-    If (Cs^.Display = 3) And (N^.Tag <> TAG_TABLE) And (N^.Tag <> TAG_TR) And (N^.Tag <> TAG_LI) Then D := 2;
+    If (Cs^.Display = 3) And (N^.Tag <> TAG_TABLE) And (N^.Tag <> TAG_TR) And ((N^.Tag <> TAG_LI) Or (Cs^.DKind <> 0)) Then
+      D := 2;
     If Cs^.Color >= 0 Then St.Color := Cs^.Color;
     If Cs^.Back >= 0 Then St.Back := Cs^.Back;
     If Cs^.Align <> 0 Then St.Align := Cs^.Align;
@@ -3738,7 +4541,7 @@ Procedure MeasureTable(T : PNode; Var St : TSt; Var Mn, Mx : LongInt); Forward;
 
 Procedure MeasureFlow(N : PNode; Var St : TSt);
 Var C : PNode; S2 : TSt; D, W, H, I, J, Cw, Len, SMin, SMax, SLine, Ind, K, ET, ER, EB, EL : LongInt;
-    HasT, HasB : Boolean;
+    HasT, HasB : Boolean; Cs : PStyle;
 Begin
   If StackLow Then Exit;
   C := N^.First;
@@ -3774,6 +4577,24 @@ Begin
     Begin
       S2 := St;
       D := ApplyStyle(C, S2);
+      Cs := NodeStyle(C);
+      { hors du flux : ne compte pas }
+      If (D <> 0) And (Cs <> Nil) And ((Cs^.PosK = 3) Or (Cs^.PosK = 4)) Then D := 0;
+      If (D <> 0) And (Cs <> Nil) And (Cs^.HasW = 1) And (Cs^.WPm = 0) And (C^.Tag <> TAG_TABLE) Then
+      Begin
+        { largeur CSS en pels : celle de la boite }
+        W := Cs^.WPx + MaxI(0, Cs^.PadL) + MaxI(0, Cs^.PadR) + MaxI(0, Cs^.BW[1]) + MaxI(0, Cs^.BW[3]) +
+             MaxI(0, Cs^.MarL) + MaxI(0, Cs^.MarR);
+        If W > MMin Then MMin := W;
+        If (D = 1) Or (Cs^.FloatK >= 2) Then
+        Begin
+          If MLine > MMax Then MMax := MLine;
+          MLine := 0;
+          If W > MMax Then MMax := W;
+        End
+        Else MLine := MLine + W;
+        D := 0;
+      End;
       If D <> 0 Then
       Begin
         If C^.Tag = TAG_BR Then
@@ -3784,6 +4605,14 @@ Begin
         Else If C^.Tag = TAG_IMG Then
         Begin
           ImgSize(C, C^.Aux - 1, W, H);
+          If W > MMin Then MMin := W;
+          MLine := MLine + W;
+        End
+        Else If C^.Tag = TAG_IFRAME Then
+        Begin
+          { cadre : element remplace (largeur en pels, sinon souple) }
+          W := 0;
+          If Pos('%', GetAttr(C, 'width')) = 0 Then W := SVal(GetAttr(C, 'width'), 300);
           If W > MMin Then MMin := W;
           MLine := MLine + W;
         End
@@ -3930,7 +4759,7 @@ End;
 
 { largeurs des colonnes : minimum et maximum de chaque colonne }
 Procedure ColWidths(Cells, N, NCol, Pad : LongInt; Var St : TSt; CMn, CMx, CFx : PLongArr);
-Var I, K, Need, Have, Sp, W, Mn1, Mx1 : LongInt; P : PCell; S2 : TSt; S : String;
+Var I, K, Need, Have, Sp, W, Mn1, Mx1, Nf : LongInt; P : PCell; S2 : TSt; S : String;
 Begin
   For K := 0 To NCol Do
   Begin
@@ -3970,19 +4799,24 @@ Begin
           If ApplyStyle(P^.Node, S2) <> 0 Then MeasureCell(P^.Node, S2, Mn1, Mx1);
           P^.Mn := Mn1; P^.Mx := Mx1;
           P^.Mn := P^.Mn + 2 * Pad; P^.Mx := P^.Mx + 2 * Pad;
+          { le surplus va aux colonnes sans largeur fixe (width="20") }
+          Nf := 0;
+          For K := P^.Col To P^.Col + P^.Span - 1 Do If CFx^[K] = 0 Then Inc(Nf);
           Have := 0;
           For K := P^.Col To P^.Col + P^.Span - 1 Do Have := Have + CMn^[K];
           If P^.Mn > Have Then
           Begin
-            Need := (P^.Mn - Have + P^.Span - 1) Div P^.Span;
-            For K := P^.Col To P^.Col + P^.Span - 1 Do CMn^[K] := CMn^[K] + Need;
+            If Nf > 0 Then Need := (P^.Mn - Have + Nf - 1) Div Nf Else Need := (P^.Mn - Have + P^.Span - 1) Div P^.Span;
+            For K := P^.Col To P^.Col + P^.Span - 1 Do
+              If (Nf = 0) Or (CFx^[K] = 0) Then CMn^[K] := CMn^[K] + Need;
           End;
           Have := 0;
           For K := P^.Col To P^.Col + P^.Span - 1 Do Have := Have + CMx^[K];
           If P^.Mx > Have Then
           Begin
-            Need := (P^.Mx - Have + P^.Span - 1) Div P^.Span;
-            For K := P^.Col To P^.Col + P^.Span - 1 Do CMx^[K] := CMx^[K] + Need;
+            If Nf > 0 Then Need := (P^.Mx - Have + Nf - 1) Div Nf Else Need := (P^.Mx - Have + P^.Span - 1) Div P^.Span;
+            For K := P^.Col To P^.Col + P^.Span - 1 Do
+              If (Nf = 0) Or (CFx^[K] = 0) Then CMx^[K] := CMx^[K] + Need;
           End;
         End;
       End;
@@ -4391,76 +5225,137 @@ Begin
   CurElem := Save;
 End;
 
-Procedure DoElem2(C : PNode; Var St : TSt);
-Var S2 : TSt; D, SX0, SX1, SAl, Top, Bot, Ind, K, ET, ER, EB, EL : LongInt; Bg, Mark : POp; S : String;
-    HasT, HasB : Boolean;
+{ --- boites CSS 2 : positionnement, rangees (float, table-cell),
+  inline-block, fonds en image, bordures, decoupage --- }
+
+Type
+  TRowItems = Array[0..31] Of PNode;
+  TLineSave = Record
+    N, W, P : LongInt;
+    Ps : Boolean;
+  End;
+
+Var
+  CbX, CbY, CbW : LongInt;        { bloc conteneur des elements positionnes }
+  ForceW : LongInt;               { largeur imposee a la boite suivante (-1) }
+  LastBg, LastBgI : POp;          { fonds de la derniere boite (rangees) }
+
+Function PctW(Pm, Px, Base : LongInt) : LongInt;
 Begin
-  S2 := St;
-  D := ApplyStyle(C, S2);
-  If D = 0 Then Exit;
-  If HasAttr(C, 'id') Or ((C^.Tag = TAG_A) And HasAttr(C, 'name')) Then AddAnchor(C);
-  Case C^.Tag Of
-    TAG_BR :
-      Begin
-        LineBreak(S2);
-        Exit;
-      End;
-    TAG_WBR : Exit;
-    TAG_IMG :
-      Begin
-        DoImage(C, S2);
-        Exit;
-      End;
-    TAG_INPUT, TAG_SELECT, TAG_TEXTAREA :
-      Begin
-        DoControl(C, S2);
-        Exit;
-      End;
-    TAG_BUTTON :
-      Begin
-        If C^.Aux > 0 Then DoControl(C, S2);
-        Exit;
-      End;
-    TAG_HR :
-      Begin
-        DoHr(C, S2);
-        Exit;
-      End;
-    TAG_TABLE :
-      Begin
-        DoTable(C, S2);
-        Exit;
-      End;
-    TAG_IFRAME :
-      Begin
-        { cadre : lien vers sa page }
-        S := GetAttr(C, 'src');
-        If (S <> '') And Not StartsWith(S, 'javascript:') And Not StartsWith(S, 'about:') Then
-        Begin
-          S2.Link := LongInt(C); S2.Color := LinkFg; S2.Flags := S2.Flags Or ST_UNDER;
-          AddStr('[Cadre : ' + Copy(ResolveUrl(BaseUrl, S), 1, 60) + ']', S2);
-        End;
-        Exit;
-      End;
-  End;
-  CssEdges(C, ET, ER, EB, EL, HasT, HasB);
-  If D = 2 Then
+  PctW := (Pm * Base) Div 10000 + Px;
+End;
+
+Function ValidLen(V : LongInt) : Boolean;
+Begin
+  ValidLen := (V <> UNSET) And (V <> NOLEN);
+End;
+
+{ ligne en cours mise de cote (contenu positionne ou inline-block) }
+Procedure LineSave(Var L : TLineSave);
+Var K : LongInt;
+Begin
+  L.N := LnN; L.W := LnW; L.Ps := PendSpace; L.P := 0;
+  If LnN > 0 Then
   Begin
-    { element en ligne : marges horizontales CSS de part et d'autre }
-    If EL > 0 Then
-    Begin
-      If PendSpace And (LnN > 0) Then LnW := LnW + CharWs[S2.Scale];
-      PendSpace := False;
-      LnW := MinI(LnW + EL, MaxI(0, LX1 - LX0 - 8));
-    End;
-    FlowChildren(C, S2);
-    If (ER > 0) And (LnN > 0) Then LnW := MinI(LnW + ER, LX1 - LX0);
-    Exit;
+    L.P := LaAlloc(LnN * 4);
+    If L.P <> 0 Then
+      For K := 0 To LnN - 1 Do WrL(L.P + K * 4, LongInt(LnOp[K]))
+    Else FlushLine;
   End;
-  { element de bloc }
+  LnN := 0; LnW := 0; PendSpace := False;
+End;
+
+Procedure LineRestore(Var L : TLineSave);
+Var K : LongInt;
+Begin
+  LnN := 0;
+  If L.P <> 0 Then
+  Begin
+    For K := 0 To L.N - 1 Do LnOp[K] := Pointer(RdL(L.P + K * 4));
+    LnN := L.N;
+  End;
+  LnW := L.W; PendSpace := L.Ps;
+End;
+
+Function ClipOp(X, Y, W, H : LongInt) : POp;
+Var O : POp;
+Begin
+  O := NewOp(OP_CLIP);
+  If O <> Nil Then
+  Begin
+    O^.X := X; O^.Y := Y; O^.W := W; O^.H := H;
+    O^.Kind := OP_CLIP;
+  End;
+  ClipOp := O;
+End;
+
+Procedure UnclipOp;
+Var O : POp;
+Begin
+  O := NewOp(OP_UNCLIP);
+  If O <> Nil Then O^.Kind := OP_UNCLIP;
+End;
+
+{ image de fond de la boite (hauteur corrigee a la fin de la boite) }
+Function BgImgOp(Cs : PStyle; X, Y, W : LongInt) : POp;
+Var O : POp; K : LongInt;
+Begin
+  BgImgOp := Nil;
+  If Cs^.BImgI = 0 Then
+  Begin
+    K := AddImage(ArGet(Cs^.BImg + 1, RdB(Cs^.BImg)));
+    Cs^.BImgI := K + 1;
+  End;
+  If Cs^.BImgI <= 0 Then Exit;
+  O := NewOp(OP_BGIMG);
+  If O = Nil Then Exit;
+  O^.X := X; O^.Y := Y; O^.W := W; O^.H := 0; O^.Data := Cs^.BImgI - 1;
+  O^.Style := Cs^.BRep;
+  If Cs^.HasBPos <> 0 Then
+  Begin
+    O^.Color := Cs^.BPx; O^.Back := Cs^.BPy;
+  End;
+  BgImgOp := O;
+End;
+
+{ marges, bordures et retraits horizontaux (pour les largeurs) }
+Function EdgeW(Cs : PStyle) : LongInt;
+Begin
+  EdgeW := 0;
+  If Cs = Nil Then Exit;
+  EdgeW := MaxI(0, Cs^.PadL) + MaxI(0, Cs^.PadR) + MaxI(0, Cs^.BW[1]) + MaxI(0, Cs^.BW[3]);
+End;
+
+Function MarW(Cs : PStyle) : LongInt;
+Begin
+  MarW := 0;
+  If Cs = Nil Then Exit;
+  MarW := MaxI(0, Cs^.MarL) + MaxI(0, Cs^.MarR);
+End;
+
+{ element de bloc : marges, bordures, retraits, largeur (px, %, calc,
+  auto), hauteur, fond (couleur et image), decoupage (overflow),
+  position relative ; ForceW >= 0 : largeur exterieure imposee }
+Procedure LayBlock(C : PNode; Var S2 : TSt);
+Var Cs : PStyle; SX0, SX1, SAl, Top, Bot, Ind, ExR, K, MT, MR, MB, ML, BT, BR, BB, BL, PT, PR, PB, PL,
+    Avail, BoxW, BoxX, BoxY, H, Mn, Mx, SCbX, SCbY, SCbW, FW, Dx, Dy : LongInt;
+    Bg, BgI, Cl, First, Ob : POp; S : String; Pos : Boolean;
+Begin
   FlushLine;
+  FW := ForceW; ForceW := -1;
+  Cs := NodeStyle(C);
+  { corps : marges CSS a la place des 8 pels par defaut }
+  If (C^.Tag = TAG_BODY) And (Cs <> Nil) Then
+  Begin
+    If Cs^.MarL >= 0 Then LX0 := MaxI(0, LX0 - 8 + Cs^.MarL);
+    If Cs^.MarR >= 0 Then LX1 := LX1 + 8 - Cs^.MarR;
+    If (Cs^.MarT >= 0) And (CurY = 8) Then
+    Begin
+      CurY := Cs^.MarT; VGap := 0;
+    End;
+  End;
   SX0 := LX0; SX1 := LX1; SAl := CurAlign;
-  Top := 0; Bot := 0; Ind := 0;
+  Top := 0; Bot := 0; Ind := 0; ExR := 0;
   Case C^.Tag Of
     TAG_P : Top := 12;
     TAG_H1 : Top := 16;
@@ -4475,38 +5370,80 @@ Begin
     TAG_DD : Ind := 40;
     TAG_BLOCKQUOTE :
       Begin
-        Top := 12; Ind := 40;
-        LX1 := LX1 - 40;
+        Top := 12; Ind := 40; ExR := 40;
       End;
     TAG_PRE : Top := 12;
     TAG_FORM : Top := 0;
     TAG_FIELDSET :
       Begin
-        Top := 8; Ind := 8;
-        LX1 := LX1 - 8;
+        Top := 8; Ind := 8; ExR := 8;
       End;
     TAG_FIGURE :
       Begin
-        Top := 12; Ind := 40;
-        LX1 := LX1 - 40;
+        Top := 12; Ind := 40; ExR := 40;
       End;
   End;
   Bot := Top;
   If C^.Tag = TAG_FORM Then Bot := 12;
-  If (C^.Tag <> TAG_BODY) And (C^.Tag <> TAG_HTML) Then
+  MT := Top; MB := Bot; ML := 0; MR := ExR;
+  BT := 0; BR := 0; BB := 0; BL := 0; PT := 0; PR := 0; PB := 0; PL := Ind;
+  If (Cs <> Nil) And (C^.Tag <> TAG_BODY) And (C^.Tag <> TAG_HTML) Then
   Begin
-    { marges CSS : remplacent celles par defaut ; retraits ajoutes }
-    If HasT Then Top := ET Else Top := Top + ET;
-    If HasB Then Bot := EB Else Bot := Bot + EB;
-    Ind := Ind + EL;
-    LX1 := MaxI(LX0 + 32, LX1 - ER);
+    If Cs^.MarT >= 0 Then MT := Cs^.MarT;
+    If Cs^.MarB >= 0 Then MB := Cs^.MarB;
+    If Cs^.MarL >= 0 Then ML := Cs^.MarL;
+    If Cs^.MarR >= 0 Then MR := ExR + Cs^.MarR;
+    If Cs^.PadT >= 0 Then PT := Cs^.PadT;
+    If Cs^.PadB >= 0 Then PB := Cs^.PadB;
+    If Cs^.PadR >= 0 Then PR := Cs^.PadR;
+    If Cs^.PadL >= 0 Then PL := Cs^.PadL;
+    BT := MaxI(0, Cs^.BW[0]); BR := MaxI(0, Cs^.BW[1]); BB := MaxI(0, Cs^.BW[2]); BL := MaxI(0, Cs^.BW[3]);
   End;
-  VSpace(Top);
-  LX0 := MinI(LX1 - 16, LX0 + Ind);
-  CurAlign := S2.Align;
-  Bg := Nil;
+  Avail := SX1 - SX0;
+  If FW >= 0 Then
+  Begin
+    BoxX := SX0 + ML; BoxW := FW - ML - MR;
+  End
+  Else If (Cs <> Nil) And (Cs^.HasW = 1) Then
+  Begin
+    BoxW := PctW(Cs^.WPm, Cs^.WPx, Avail) + PL + PR + BL + BR;
+    If (Cs^.AutoL = 2) And (Cs^.AutoR = 2) Then BoxX := SX0 + (Avail - BoxW) Div 2
+    Else If Cs^.AutoL = 2 Then BoxX := SX1 - MR - BoxW
+    Else BoxX := SX0 + ML;
+  End
+  Else If (Cs <> Nil) And (Cs^.DKind = 2) Then
+  Begin
+    { display: table sans largeur : largeur du contenu }
+    MeasureCell(C, S2, Mn, Mx);
+    BoxW := MinI(Avail - ML - MR, Mx + PL + PR + BL + BR + 2);
+    If (Cs^.AutoL = 2) And (Cs^.AutoR = 2) Then BoxX := SX0 + (Avail - BoxW) Div 2 Else BoxX := SX0 + ML;
+  End
+  Else
+  Begin
+    BoxX := SX0 + ML; BoxW := Avail - ML - MR;
+  End;
+  If BoxW < 1 Then BoxW := 1;
+  VSpace(MT);
+  BoxY := CurY;
+  First := OpLast;
+  Bg := Nil; BgI := Nil; Cl := Nil;
   If (S2.Back >= 0) And (C^.Tag <> TAG_BODY) And (C^.Tag <> TAG_HTML) Then
-    Bg := RectOp(SX0, CurY, SX1 - SX0, 0, S2.Back);
+    Bg := RectOp(BoxX, BoxY, BoxW, 0, S2.Back);
+  If (Cs <> Nil) And (Cs^.BImg > 0) And (C^.Tag <> TAG_BODY) And (C^.Tag <> TAG_HTML) Then
+    BgI := BgImgOp(Cs, BoxX, BoxY, BoxW);
+  If (Cs <> Nil) And (Cs^.OverK = 2) And (Cs^.HasH = 1) Then
+    Cl := ClipOp(BoxX, BoxY, BoxW, Cs^.Height + PT + PB + BT + BB);
+  Pos := (Cs <> Nil) And (Cs^.PosK >= 2);
+  If Pos Then
+  Begin
+    SCbX := CbX; SCbY := CbY; SCbW := CbW;
+    CbX := BoxX; CbY := BoxY; CbW := BoxW;
+  End;
+  CurY := BoxY + BT + PT;
+  If BT + PT > 0 Then VGap := 0;
+  LX0 := BoxX + BL + PL; LX1 := BoxX + BoxW - BR - PR;
+  If LX1 < LX0 + 8 Then LX1 := LX0 + 8;
+  CurAlign := S2.Align;
   K := CurY;
   If (C^.Tag = TAG_UL) Or (C^.Tag = TAG_OL) Or (C^.Tag = TAG_MENU) Then
   Begin
@@ -4546,18 +5483,425 @@ Begin
   Else FlowChildren(C, S2);
   FlushLine;
   If (C^.Tag = TAG_LI) And (CurY = K) Then CurY := CurY + CharHs[S2.Scale] + 2;
-  If Bg <> Nil Then Bg^.H := CurY - Bg^.Y;
-  VSpace(Bot);
+  H := CurY + PB + BB - BoxY;
+  If (Cs <> Nil) And (Cs^.HasH = 1) Then H := Cs^.Height + PT + PB + BT + BB;
+  If (Cs <> Nil) And (Cs^.MinH > 0) And (H < Cs^.MinH + PT + PB + BT + BB) Then H := Cs^.MinH + PT + PB + BT + BB;
+  CurY := BoxY + H;
+  If PB + BB > 0 Then VGap := 0;
+  If Bg <> Nil Then Bg^.H := H;
+  If BgI <> Nil Then BgI^.H := H;
+  If Cl <> Nil Then UnclipOp;
+  If Cs <> Nil Then
+  Begin
+    If BT > 0 Then Ob := RectOp(BoxX, BoxY, BoxW, BT, MaxI(0, Cs^.BC[0]));
+    If BB > 0 Then Ob := RectOp(BoxX, BoxY + H - BB, BoxW, BB, MaxI(0, Cs^.BC[2]));
+    If BL > 0 Then Ob := RectOp(BoxX, BoxY, BL, H, MaxI(0, Cs^.BC[3]));
+    If BR > 0 Then Ob := RectOp(BoxX + BoxW - BR, BoxY, BR, H, MaxI(0, Cs^.BC[1]));
+  End;
+  LastBg := Bg; LastBgI := BgI;
+  If Pos Then
+  Begin
+    If Cs^.PosK = 2 Then
+    Begin
+      Dx := 0; Dy := 0;
+      If ValidLen(Cs^.PLeft) Then Dx := Cs^.PLeft Else If ValidLen(Cs^.PRight) Then Dx := -Cs^.PRight;
+      If ValidLen(Cs^.PTop) Then Dy := Cs^.PTop Else If ValidLen(Cs^.PBot) Then Dy := -Cs^.PBot;
+      ShiftOpsXY(First, OpLast, Dx, Dy);
+    End;
+    CbX := SCbX; CbY := SCbY; CbW := SCbW;
+  End;
+  VSpace(MB);
   LX0 := SX0; LX1 := SX1; CurAlign := SAl;
 End;
 
+{ element positionne (absolute, fixed) : hors du flux, place dans son
+  bloc conteneur ; largeur donnee, entre left et right, ou du contenu }
+Procedure LayAbs(C : PNode; Var S2 : TSt; Cs : PStyle);
+Var L : TLineSave; SCurY, SVGap, SX0, SX1, SAl, X, Y, W, Mn, Mx, CX, CY, CWd : LongInt;
+Begin
+  If StackLow Then Exit;
+  LineSave(L);
+  SCurY := CurY; SVGap := VGap; SX0 := LX0; SX1 := LX1; SAl := CurAlign;
+  If Cs^.PosK = 4 Then
+  Begin
+    CX := 0; CY := 0; CWd := PageW;
+  End
+  Else
+  Begin
+    CX := CbX; CY := CbY; CWd := CbW;
+  End;
+  If Cs^.HasW = 1 Then W := PctW(Cs^.WPm, Cs^.WPx, CWd) + EdgeW(Cs)
+  Else If ValidLen(Cs^.PLeft) And ValidLen(Cs^.PRight) Then W := CWd - Cs^.PLeft - Cs^.PRight - MarW(Cs)
+  Else
+  Begin
+    MeasureCell(C, S2, Mn, Mx);
+    W := MinI(Mx + EdgeW(Cs) + 1, MaxI(8, CWd));
+  End;
+  If W < 1 Then W := 1;
+  W := W + MarW(Cs);
+  If ValidLen(Cs^.PLeft) Then X := CX + Cs^.PLeft
+  Else If ValidLen(Cs^.PRight) Then X := CX + CWd - Cs^.PRight - W
+  Else X := LX0;
+  If ValidLen(Cs^.PTop) Then Y := CY + Cs^.PTop Else Y := CurY;
+  LX0 := X; LX1 := X + W; CurY := Y; VGap := 0;
+  ForceW := W;
+  LayBlock(C, S2);
+  ForceW := -1;
+  CurY := SCurY; VGap := SVGap; LX0 := SX0; LX1 := SX1; CurAlign := SAl;
+  LineRestore(L);
+End;
+
+{ inline-block : boite placee sur la ligne comme un mot ; son contenu
+  suit la ligne (operation OP_GROUP) quand celle-ci est alignee }
+Procedure LayInlineBlock(C : PNode; Var S2 : TSt; Cs : PStyle);
+Var L : TLineSave; G : POp; SCurY, SVGap, SX0, SX1, SAl, W, Mn, Mx, X, Avail : LongInt;
+Begin
+  If StackLow Then Exit;
+  Avail := MaxI(8, LX1 - LX0);
+  If Cs^.HasW = 1 Then W := PctW(Cs^.WPm, Cs^.WPx, Avail) + EdgeW(Cs)
+  Else
+  Begin
+    MeasureCell(C, S2, Mn, Mx);
+    W := MinI(Mx + EdgeW(Cs) + 1, Avail);
+  End;
+  W := MaxI(1, W + MarW(Cs));
+  X := PlaceItem(W, S2);
+  LineSave(L);
+  SCurY := CurY; SVGap := VGap; SX0 := LX0; SX1 := LX1; SAl := CurAlign;
+  G := NewOp(OP_GROUP);
+  If G = Nil Then
+  Begin
+    LineRestore(L);
+    Exit;
+  End;
+  G^.Kind := OP_GROUP;
+  G^.X := X; G^.Y := CurY; G^.W := W;
+  LX0 := X; LX1 := X + W; VGap := 0;
+  ForceW := W;
+  LayBlock(C, S2);
+  ForceW := -1;
+  G^.H := MaxI(1, CurY - G^.Y);
+  G^.Data := LongInt(OpLast);
+  CurY := SCurY; VGap := SVGap; LX0 := SX0; LX1 := SX1; CurAlign := SAl;
+  LineRestore(L);
+  PushLine(G);
+End;
+
+{ element d'une rangee : flottant, cellule (display: table-cell) ou
+  enfant d'une rangee (display: table-row) }
+Function RowItem(C : PNode; RowPar : Boolean) : Boolean;
+Var Cs : PStyle;
+Begin
+  RowItem := False;
+  If (C = Nil) Or (C^.Kind <> NODE_ELEM) Then Exit;
+  If IsHiddenTag(C^.Tag) Or (C^.Tag = TAG_BR) Or (C^.Tag = TAG_SCRIPT) Or (C^.Tag = TAG_STYLE) Then Exit;
+  Cs := NodeStyle(C);
+  If (Cs <> Nil) And ((Cs^.Display = 1) Or (Cs^.PosK = 3) Or (Cs^.PosK = 4)) Then Exit;
+  If RowPar Then
+  Begin
+    RowItem := True;
+    Exit;
+  End;
+  If Cs = Nil Then Exit;
+  RowItem := (Cs^.FloatK >= 2) Or (Cs^.DKind = 4);
+End;
+
+{ texte blanc ou commentaire entre deux elements d'une rangee }
+Function BlankNode(C : PNode) : Boolean;
+Var K : LongInt;
+Begin
+  BlankNode := True;
+  If C^.Kind = NODE_COMMENT Then Exit;
+  If (C^.Kind = NODE_ELEM) And ((C^.Tag = TAG_SCRIPT) Or (C^.Tag = TAG_STYLE)) Then Exit;
+  BlankNode := False;
+  If C^.Kind <> NODE_TEXT Then Exit;
+  For K := 0 To C^.TLen - 1 Do
+    If RdB(C^.Txt + K) > 32 Then Exit;
+  BlankNode := True;
+End;
+
+{ rangee : boites cote a cote (largeurs donnees ou du contenu, flottants
+  a droite depuis le bord droit, retour a la ligne si besoin) }
+Procedure LayRow(Var It : TRowItems; N : LongInt; Var St : TSt; RowPar : Boolean);
+Var K, D, Avail, Rem, TotMx, XL, XR, Y0, MaxB, W, X, SX0, SX1 : LongInt; Cs : PStyle; S2 : TSt;
+    Wd, Mn, Mx, Ys : Array[0..31] Of LongInt; Fix, Cell : Array[0..31] Of Boolean; Bgs, BgIs : Array[0..31] Of POp;
+Begin
+  FlushLine;
+  SX0 := LX0; SX1 := LX1; Avail := MaxI(8, SX1 - SX0);
+  Rem := Avail; TotMx := 0;
+  For K := 0 To N - 1 Do
+  Begin
+    Cs := NodeStyle(It[K]);
+    S2 := St;
+    D := ApplyStyle(It[K], S2);
+    Cell[K] := RowPar Or ((Cs <> Nil) And (Cs^.DKind = 4) And (Cs^.FloatK < 2));
+    Mn[K] := 0; Mx[K] := 0;
+    If (Cs <> Nil) And (Cs^.HasW = 1) Then
+    Begin
+      Wd[K] := PctW(Cs^.WPm, Cs^.WPx, Avail) + EdgeW(Cs) + MarW(Cs);
+      Fix[K] := True;
+      Rem := Rem - Wd[K];
+    End
+    Else
+    Begin
+      MeasureCell(It[K], S2, Mn[K], Mx[K]);
+      Mx[K] := Mx[K] + EdgeW(Cs) + MarW(Cs) + 1;
+      Mn[K] := Mn[K] + EdgeW(Cs) + MarW(Cs);
+      Fix[K] := False;
+      TotMx := TotMx + Mx[K];
+    End;
+  End;
+  For K := 0 To N - 1 Do
+    If Not Fix[K] Then
+    Begin
+      If (TotMx > Rem) And (TotMx > 0) Then Wd[K] := MaxI(Mn[K], (Mx[K] * MaxI(0, Rem)) Div TotMx)
+      Else If Cell[K] And (TotMx > 0) Then Wd[K] := Mx[K] + ((Rem - TotMx) * Mx[K]) Div TotMx
+      Else Wd[K] := Mx[K];
+    End;
+  Y0 := CurY;
+  XL := SX0; XR := SX1; MaxB := Y0;
+  For K := 0 To N - 1 Do
+  Begin
+    W := MaxI(1, MinI(Wd[K], Avail));
+    Cs := NodeStyle(It[K]);
+    If (Cs <> Nil) And (Cs^.FloatK = 3) Then
+    Begin
+      If (XR - W < XL) And (XL > SX0) Then
+      Begin
+        Y0 := MaxB; XL := SX0; XR := SX1;
+      End;
+      XR := XR - W; X := XR;
+    End
+    Else
+    Begin
+      If (XL + W > XR) And (XL > SX0) Then
+      Begin
+        Y0 := MaxB; XL := SX0; XR := SX1;
+      End;
+      X := XL; XL := XL + W;
+    End;
+    LX0 := X; LX1 := X + W; CurY := Y0; VGap := 0;
+    ForceW := W;
+    LastBg := Nil; LastBgI := Nil;
+    DoElem(It[K], St);
+    ForceW := -1;
+    FlushLine;
+    Bgs[K] := LastBg; BgIs[K] := LastBgI; Ys[K] := Y0;
+    If CurY > MaxB Then MaxB := CurY;
+  End;
+  { cellules : fonds a la hauteur de la rangee }
+  For K := 0 To N - 1 Do
+    If Cell[K] Then
+    Begin
+      If (Bgs[K] <> Nil) And (Bgs[K]^.Y >= Ys[K]) Then Bgs[K]^.H := MaxI(Bgs[K]^.H, MaxB - Bgs[K]^.Y);
+      If (BgIs[K] <> Nil) And (BgIs[K]^.Y >= Ys[K]) Then BgIs[K]^.H := MaxI(BgIs[K]^.H, MaxB - BgIs[K]^.Y);
+    End;
+  CurY := MaxB; VGap := 0;
+  LX0 := SX0; LX1 := SX1;
+End;
+
+{ corps (body) d'un sous-document ; le document lui-meme sinon }
+Function FindBody(D : PNode) : PNode;
+Var C, G : PNode;
+Begin
+  FindBody := D;
+  C := D^.First;
+  While C <> Nil Do
+  Begin
+    If (C^.Kind = NODE_ELEM) And (C^.Tag = TAG_BODY) Then
+    Begin
+      FindBody := C;
+      Exit;
+    End;
+    If (C^.Kind = NODE_ELEM) And (C^.Tag = TAG_HTML) Then
+    Begin
+      G := C^.First;
+      While G <> Nil Do
+      Begin
+        If (G^.Kind = NODE_ELEM) And (G^.Tag = TAG_BODY) Then
+        Begin
+          FindBody := G;
+          Exit;
+        End;
+        G := G^.Next;
+      End;
+    End;
+    C := C^.Next;
+  End;
+End;
+
+{ cadre (iframe) : sa page, chargee et analysee sous l'element, mise en
+  page dans la boite du cadre (largeur, hauteur, bordure, marges) et
+  decoupee ; sans page : lien vers elle }
+Procedure DoIframe(C : PNode; Var S2 : TSt);
+Var S : String; B : PNode; W, H, X, Y, Bw, Mw, Mh, D, SCurY, SVGap, SX0, SX1, SAl, SCbX, SCbY, SCbW, SInv : LongInt;
+    L : TLineSave; G, O : POp; St3 : TSt; Cs : PStyle;
+Begin
+  If (C^.First = Nil) Or (FindAttr(C, '#doc') = Nil) Then
+  Begin
+    S := GetAttr(C, 'src');
+    If (S <> '') And Not StartsWith(S, 'javascript:') And Not StartsWith(S, 'about:') Then
+    Begin
+      S2.Link := LongInt(C); S2.Color := LinkFg; S2.Flags := S2.Flags Or ST_UNDER;
+      AddStr('[Cadre : ' + Copy(ResolveUrl(BaseUrl, S), 1, 60) + ']', S2);
+    End;
+    Exit;
+  End;
+  If StackLow Then Exit;
+  { taille : attributs width et height, ou CSS ; sinon 300 x 150 }
+  S := GetAttr(C, 'width');
+  W := 300;
+  If S <> '' Then
+  Begin
+    If Pos('%', S) > 0 Then W := (MaxI(8, LX1 - LX0) * SVal(S, 100)) Div 100 Else W := SVal(S, 300);
+  End;
+  S := GetAttr(C, 'height');
+  H := 150;
+  If (S <> '') And (Pos('%', S) = 0) Then H := SVal(S, 150);
+  Cs := NodeStyle(C);
+  If (Cs <> Nil) And (Cs^.HasW = 1) Then W := PctW(Cs^.WPm, Cs^.WPx, LX1 - LX0);
+  If (Cs <> Nil) And (Cs^.HasH = 1) Then H := Cs^.Height;
+  Bw := 2;
+  If (GetAttr(C, 'frameborder') = '0') Or (LowStr(GetAttr(C, 'frameborder')) = 'no') Then Bw := 0;
+  If (Cs <> Nil) And (Cs^.BW[0] >= 0) Then Bw := Cs^.BW[0];
+  W := MaxI(8, MinI(W, LX1 - LX0 - 2 * Bw)); H := MaxI(8, MinI(H, 4000));
+  X := PlaceItem(W + 2 * Bw, S2);
+  LineSave(L);
+  SCurY := CurY; SVGap := VGap; SX0 := LX0; SX1 := LX1; SAl := CurAlign;
+  SCbX := CbX; SCbY := CbY; SCbW := CbW;
+  SInv := InvisN;
+  G := NewOp(OP_GROUP);
+  If G = Nil Then
+  Begin
+    LineRestore(L);
+    Exit;
+  End;
+  G^.Kind := OP_GROUP;
+  Y := CurY;
+  G^.X := X; G^.Y := Y; G^.W := W + 2 * Bw; G^.H := H + 2 * Bw;
+  { bordure en creux, comme les cadres de Windows }
+  If Bw > 0 Then
+  Begin
+    O := RectOp(X, Y, W + 2 * Bw, Bw, $808080);
+    O := RectOp(X, Y, Bw, H + 2 * Bw, $808080);
+    O := RectOp(X, Y + H + Bw, W + 2 * Bw, Bw, $FFFFFF);
+    O := RectOp(X + W + Bw, Y, Bw, H + 2 * Bw, $FFFFFF);
+  End;
+  B := FindBody(C^.First);
+  { couleurs et fond du corps du document du cadre }
+  St3.Color := 0; St3.Back := -1; St3.Link := 0; St3.Scale := 1; St3.Flags := 0; St3.Align := 1;
+  St3.Pre := 0; St3.NoWrap := 0;
+  D := 1;
+  If B^.Tag = TAG_BODY Then D := ApplyStyle(B, St3);
+  If St3.Back >= 0 Then O := RectOp(X + Bw, Y + Bw, W, H, St3.Back);
+  O := ClipOp(X + Bw, Y + Bw, W, H);
+  { marges : marginwidth / marginheight, puis celles du corps }
+  Mw := 8; Mh := 8;
+  If GetAttr(C, 'marginwidth') <> '' Then Mw := SVal(GetAttr(C, 'marginwidth'), 8);
+  If GetAttr(C, 'marginheight') <> '' Then Mh := SVal(GetAttr(C, 'marginheight'), 8);
+  If B^.Tag = TAG_BODY Then
+  Begin
+    If GetAttr(B, 'leftmargin') <> '' Then Mw := SVal(GetAttr(B, 'leftmargin'), Mw);
+    If GetAttr(B, 'topmargin') <> '' Then Mh := SVal(GetAttr(B, 'topmargin'), Mh);
+    Cs := NodeStyle(B);
+    If Cs <> Nil Then
+    Begin
+      If Cs^.MarL >= 0 Then Mw := Cs^.MarL;
+      If Cs^.MarT >= 0 Then Mh := Cs^.MarT;
+    End;
+  End;
+  CbX := X + Bw; CbY := Y + Bw; CbW := W;
+  LX0 := X + Bw + Mw; LX1 := MaxI(LX0 + 8, X + Bw + W - Mw);
+  CurY := Y + Bw + Mh; VGap := 0; CurAlign := 1;
+  If D <> 0 Then FlowChildren(B, St3);
+  FlushLine;
+  UnclipOp;
+  G^.Data := LongInt(OpLast);
+  InvisN := SInv;
+  CbX := SCbX; CbY := SCbY; CbW := SCbW;
+  CurY := SCurY; VGap := SVGap; LX0 := SX0; LX1 := SX1; CurAlign := SAl;
+  LineRestore(L);
+  PushLine(G);
+End;
+
+Procedure DoElem2(C : PNode; Var St : TSt);
+Var S2 : TSt; D, SInv, ET, ER, EB, EL : LongInt; Cs : PStyle; HasT, HasB : Boolean;
+Begin
+  S2 := St;
+  D := ApplyStyle(C, S2);
+  If D = 0 Then Exit;
+  If HasAttr(C, 'id') Or ((C^.Tag = TAG_A) And HasAttr(C, 'name')) Then AddAnchor(C);
+  Cs := NodeStyle(C);
+  SInv := InvisN;
+  If (Cs <> Nil) And (Cs^.InvisK = 2) Then Inc(InvisN);
+  If Cs <> Nil Then
+  Begin
+    If Cs^.NoWrapK = 2 Then S2.NoWrap := 1 Else If Cs^.NoWrapK = 1 Then S2.NoWrap := 0;
+  End;
+  { flottant ou cellule place par une rangee : bloc }
+  If (ForceW >= 0) And (D = 2) And Not (C^.Tag In [TAG_IMG, TAG_INPUT, TAG_SELECT, TAG_TEXTAREA, TAG_BUTTON,
+     TAG_BR, TAG_IFRAME]) Then D := 1;
+  If (Cs <> Nil) And ((Cs^.PosK = 3) Or (Cs^.PosK = 4)) And (C^.Tag <> TAG_BODY) And (C^.Tag <> TAG_HTML) And
+     Not (C^.Tag In [TAG_IMG, TAG_INPUT, TAG_SELECT, TAG_TEXTAREA, TAG_BUTTON, TAG_TABLE, TAG_BR]) Then
+    LayAbs(C, S2, Cs)
+  Else If (D = 2) And (Cs <> Nil) And (Cs^.DKind = 5) And
+          Not (C^.Tag In [TAG_IMG, TAG_INPUT, TAG_SELECT, TAG_TEXTAREA, TAG_BUTTON, TAG_BR, TAG_TABLE,
+          TAG_IFRAME]) Then
+    LayInlineBlock(C, S2, Cs)
+  Else
+    Case C^.Tag Of
+      TAG_BR : LineBreak(S2);
+      TAG_WBR : ;
+      TAG_IMG : DoImage(C, S2);
+      TAG_INPUT, TAG_SELECT, TAG_TEXTAREA : DoControl(C, S2);
+      TAG_BUTTON : If C^.Aux > 0 Then DoControl(C, S2);
+      TAG_HR : DoHr(C, S2);
+      TAG_TABLE : DoTable(C, S2);
+      TAG_IFRAME : DoIframe(C, S2);
+    Else
+      If D = 2 Then
+      Begin
+        CssEdges(C, ET, ER, EB, EL, HasT, HasB);
+        { element en ligne : marges horizontales CSS de part et d'autre }
+        If EL > 0 Then
+        Begin
+          If PendSpace And (LnN > 0) Then LnW := LnW + CharWs[S2.Scale];
+          PendSpace := False;
+          LnW := MinI(LnW + EL, MaxI(0, LX1 - LX0 - 8));
+        End;
+        FlowChildren(C, S2);
+        If (ER > 0) And (LnN > 0) Then LnW := MinI(LnW + ER, LX1 - LX0);
+      End
+      Else LayBlock(C, S2);
+    End;
+  InvisN := SInv;
+End;
+
 Procedure FlowChildren(N : PNode; Var St : TSt);
-Var C : PNode;
+Var C : PNode; It : TRowItems; NIt : LongInt; Cs : PStyle; RowPar : Boolean;
 Begin
   If (N = Nil) Or StackLow Then Exit;
+  Cs := NodeStyle(N);
+  RowPar := (Cs <> Nil) And (Cs^.DKind = 3);
   C := N^.First;
   While C <> Nil Do
   Begin
+    If RowItem(C, RowPar) Then
+    Begin
+      { flottants, cellules : une rangee }
+      NIt := 0;
+      While (C <> Nil) And (NIt < 32) And (RowItem(C, RowPar) Or BlankNode(C)) Do
+      Begin
+        If RowItem(C, RowPar) Then
+        Begin
+          It[NIt] := C;
+          Inc(NIt);
+        End;
+        C := C^.Next;
+      End;
+      LayRow(It, NIt, St, RowPar);
+      Continue;
+    End;
     If C^.Kind = NODE_TEXT Then AddText(C, St)
     Else If C^.Kind = NODE_ELEM Then DoElem(C, St);
     C := C^.Next;
@@ -4769,6 +6113,7 @@ Begin
   LnN := 0; LnW := 0; PendSpace := False;
   CurElem := Nil;
   PageW := Width;
+  CbX := 0; CbY := 0; CbW := Width; InvisN := 0; ForceW := -1;
   If ViewSource Then LayoutSource(Width)
   Else If Root <> Nil Then
   Begin
@@ -4809,6 +6154,7 @@ Var
   ScBase, ScUsed : LongInt;
   IErr : Boolean;
   IW, IH, IPix, IStride : LongInt;
+  IMaskA, ICur : LongInt;         { masque de l'image en cours, son indice }
   { LZW (GIF) }
   LzPre : Array[0..4095] Of LongInt;
   LzSuf : Array[0..4095] Of LongInt;
@@ -4895,6 +6241,7 @@ Begin
   ImBits[I] := A + 40;
   ImW[I] := W; ImH[I] := H;
   IW := W; IH := H; IPix := A + 40;
+  IMaskA := 0; ICur := I; ImMask[I] := 0;
   Bg := PageBg;
   For K := 0 To W - 1 Do
   Begin
@@ -4904,11 +6251,31 @@ Begin
   NewImage := True;
 End;
 
+{ image avec transparence : masque (blanc partout : transparent) ;
+  chaque pel ecrit devient opaque (noir dans le masque). Au dessin,
+  seuls les pels opaques sont copies (BlitImg). }
+Procedure MaskInit;
+Var A : LongInt;
+Begin
+  If IMaskA <> 0 Then Exit;
+  A := ArAlloc(IStride * IH);
+  If A = 0 Then Exit;
+  MemFill(A, IStride * IH, 255);
+  MemFill(IPix, IStride * IH, 0);
+  IMaskA := A;
+  ImMask[ICur] := A;
+End;
+
 { pel (X, Y depuis le haut) en RVB }
 Procedure PutPel(X, Y, Rgb : LongInt);
 Var A : LongInt;
 Begin
   If (X < 0) Or (Y < 0) Or (X >= IW) Or (Y >= IH) Then Exit;
+  If IMaskA <> 0 Then
+  Begin
+    A := IMaskA + (IH - 1 - Y) * IStride + X * 3;
+    WrB(A, 0); WrB(A + 1, 0); WrB(A + 2, 0);
+  End;
   A := IPix + (IH - 1 - Y) * IStride + X * 3;
   WrB(A, Rgb And 255); WrB(A + 1, (Rgb Shr 8) And 255); WrB(A + 2, (Rgb Shr 16) And 255);
 End;
@@ -4923,6 +6290,12 @@ Begin
     Exit;
   End;
   If A <= 0 Then Exit;
+  { avec masque : transparent sous la moitie, opaque au-dessus }
+  If IMaskA <> 0 Then
+  Begin
+    If A >= 128 Then PutPel(X, Y, Rgb);
+    Exit;
+  End;
   Bg := PageBg;
   R := (((Rgb Shr 16) And 255) * A + ((Bg Shr 16) And 255) * (255 - A)) Div 255;
   G := (((Rgb Shr 8) And 255) * A + ((Bg Shr 8) And 255) * (255 - A)) Div 255;
@@ -4971,6 +6344,7 @@ Begin
   End;
   Inter := Flags And $40;
   If (Pal = 0) Or (W <= 0) Or (H <= 0) Then Exit;
+  If Trans >= 0 Then MaskInit;
   MinCode := IB(P);
   Inc(P);
   If (MinCode < 2) Or (MinCode > 11) Then Exit;
@@ -5492,6 +6866,7 @@ Begin
   IErr := False;
   If Got <= 0 Then Exit;
   If Not NewImage(Ix, W, H) Then Exit;
+  If (PngCT = 4) Or (PngCT = 6) Or (PngTrns <> 0) Then MaskInit;
   If Inter = 0 Then
   Begin
     RowB := (W * BitsPx + 7) Div 8;
@@ -5925,7 +7300,7 @@ Begin
   Begin
     { memoire de l'image rendue a l'arene }
     ArUsed := Save;
-    ImBits[I] := 0; ImBmi[I] := 0;
+    ImBits[I] := 0; ImBmi[I] := 0; ImMask[I] := 0;
   End;
   DecodeImage := Ok;
 End;
@@ -12976,6 +14351,44 @@ End;
 
 { --- page (fenetre de vue) --- }
 
+{ morceau d'image : source (Sx, Sy depuis le BAS, Sw x Sh) vers la
+  destination (Dx, Dy, Dw x Dh). Avec un masque de transparence, seules
+  les suites de pels opaques de chaque ligne sont copiees (le fond
+  reste visible, quel que soit le nombre de couleurs de l'ecran). }
+Procedure BlitImg(I, Dx, Dy, Dw, Dh, Sx, Sy, Sw, Sh : LongInt);
+Var Y, St, Row, Ih, Iw, X, R0, X0, X1, Top, Ly : LongInt;
+Begin
+  If (Dw <= 0) Or (Dh <= 0) Or (Sw <= 0) Or (Sh <= 0) Then Exit;
+  If ImMask[I] = 0 Then
+  Begin
+    Dummy := StretchDIBits(Ps, Dx, Dy, Dw, Dh, Sx, Sy, Sw, Sh, ImBits[I], ImBmi[I], DIB_RGB_COLORS, SRCCOPY);
+    Exit;
+  End;
+  Iw := ImW[I]; Ih := ImH[I];
+  St := ((Iw * 3 + 3) Div 4) * 4;
+  Top := Ih - Sy - Sh;                    { premiere ligne source depuis le haut }
+  For Y := 0 To Dh - 1 Do
+  Begin
+    If (Dy + Y < 0) Or (Dy + Y > VH) Then Continue;
+    Ly := Top + (Y * Sh) Div Dh;          { ligne source depuis le haut }
+    If (Ly < 0) Or (Ly >= Ih) Then Continue;
+    Row := ImMask[I] + (Ih - 1 - Ly) * St;
+    X := Sx;
+    While X < Sx + Sw Do
+    Begin
+      While (X < Sx + Sw) And (RdB(Row + X * 3) <> 0) Do Inc(X);
+      If X >= Sx + Sw Then Break;
+      R0 := X;
+      While (X < Sx + Sw) And (RdB(Row + X * 3) = 0) Do Inc(X);
+      X0 := Dx + ((R0 - Sx) * Dw) Div Sw;
+      X1 := Dx + ((X - Sx) * Dw) Div Sw;
+      If X1 > X0 Then
+        Dummy := StretchDIBits(Ps, X0, Dy + Y, X1 - X0, 1, R0, Ih - 1 - Ly, X - R0, 1, ImBits[I], ImBmi[I],
+                               DIB_RGB_COLORS, SRCCOPY);
+    End;
+  End;
+End;
+
 Procedure DrawImageOp(O : POp; X, Yt : LongInt);
 Var I, Yb : LongInt; S : String;
 Begin
@@ -12983,8 +14396,7 @@ Begin
   Yb := Yt + O^.H - 1;
   If (I >= 0) And (I < NImgs) And (ImState[I] = 1) And (ImBits[I] <> 0) Then
   Begin
-    Dummy := StretchDIBits(Ps, X, Yt, O^.W, O^.H, 0, 0, ImW[I], ImH[I], ImBits[I], ImBmi[I],
-                           DIB_RGB_COLORS, SRCCOPY);
+    BlitImg(I, X, Yt, O^.W, O^.H, 0, 0, ImW[I], ImH[I]);
     If O^.Link <> 0 Then GBoxO(X, Yt, X + O^.W - 1, Yb, LinkFg);
   End
   Else
@@ -13006,8 +14418,58 @@ Begin
   End;
 End;
 
+{ image de fond : mosaique (repeat, repeat-x, repeat-y) ou une fois,
+  decalee par background-position ; seule la partie visible de chaque
+  carreau est copiee (sprites CSS) }
+Procedure DrawBgOp(O : POp; X, Yt, Rt, Rb : LongInt);
+Var I, Iw, Ih, Ox, Oy, Tx, Ty, X0, Y0, Rep, N, Dx0, Dy0, Dx1, Dy1, Bx1, By1 : LongInt;
+Begin
+  I := O^.Data;
+  If (I < 0) Or (I >= NImgs) Or (O^.W <= 0) Or (O^.H <= 0) Then Exit;
+  If (ImState[I] <> 1) Or (ImBits[I] = 0) Then Exit;
+  Iw := ImW[I]; Ih := ImH[I];
+  If (Iw <= 0) Or (Ih <= 0) Then Exit;
+  Ox := O^.Color; Oy := O^.Back;
+  If Ox <= -1000000 Then Ox := ((O^.W - Iw) * (-1000000 - Ox)) Div 100;
+  If Oy <= -1000000 Then Oy := ((O^.H - Ih) * (-1000000 - Oy)) Div 100;
+  Rep := O^.Style;
+  If Rep = 0 Then Rep := 1;
+  Bx1 := X + O^.W; By1 := MinI(Yt + O^.H, Rb + 1);
+  X0 := X + Ox; Y0 := Yt + Oy;
+  If ((Rep = 1) Or (Rep = 2)) And (X0 > X) Then X0 := X0 - ((X0 - X + Iw - 1) Div Iw) * Iw;
+  If ((Rep = 1) Or (Rep = 3)) And (Y0 > Yt) Then Y0 := Y0 - ((Y0 - Yt + Ih - 1) Div Ih) * Ih;
+  { carreaux au-dessus de la zone a peindre : sautes }
+  If ((Rep = 1) Or (Rep = 3)) And (Y0 + Ih < Rt) Then Y0 := Y0 + ((Rt - Y0) Div Ih) * Ih - Ih;
+  { image d'un pel de large repetee en x : etiree (meme rendu) }
+  If (Iw = 1) And ((Rep = 1) Or (Rep = 2)) Then
+  Begin
+    Ty := Y0;
+    N := 0;
+    Repeat
+      Dy0 := MaxI(Ty, MaxI(Yt, Rt)); Dy1 := MinI(Ty + Ih, By1);
+      If Dy1 > Dy0 Then
+        BlitImg(I, X, Dy0, O^.W, Dy1 - Dy0, 0, Ih - (Dy0 - Ty) - (Dy1 - Dy0), 1, Dy1 - Dy0);
+      Ty := Ty + Ih; Inc(N);
+    Until (Rep = 2) Or (Ty >= By1) Or (N > 2000);
+    Exit;
+  End;
+  N := 0;
+  Ty := Y0;
+  Repeat
+    Tx := X0;
+    Repeat
+      Dx0 := MaxI(Tx, X); Dy0 := MaxI(Ty, MaxI(Yt, Rt));
+      Dx1 := MinI(Tx + Iw, Bx1); Dy1 := MinI(Ty + Ih, By1);
+      If (Dx1 > Dx0) And (Dy1 > Dy0) Then
+        BlitImg(I, Dx0, Dy0, Dx1 - Dx0, Dy1 - Dy0, Dx0 - Tx, Ih - (Dy0 - Ty) - (Dy1 - Dy0), Dx1 - Dx0, Dy1 - Dy0);
+      Tx := Tx + Iw; Inc(N);
+    Until (Rep = 3) Or (Rep = 4) Or (Tx >= Bx1) Or (N > 4000);
+    Ty := Ty + Ih;
+  Until (Rep = 2) Or (Rep = 4) Or (Ty >= By1) Or (N > 4000);
+End;
+
 Procedure PaintView(H : LongInt);
-Var O : POp; X, Yt, Yb, Bx0, By0, Bx1, By1, D, Rt, Rb : LongInt; E : PNode;
+Var O : POp; X, Yt, Yb, Bx0, By0, Bx1, By1, D, Rt, Rb, Clips : LongInt; E : PNode;
 Begin
   D := BeginPaint(H, LongInt(@PaintS));
   If D = 0 Then Exit;
@@ -13018,13 +14480,29 @@ Begin
     Rt := 0; Rb := VH;
   End;
   GBoxF(0, Rt, VW, Rb, PageBg);
+  Clips := 0;
   O := OpFirst;
   While O <> Nil Do
   Begin
     X := O^.X;
     Yt := O^.Y - ScrollY;
     Yb := Yt + O^.H - 1;
-    If (Yt <= Rb) And (Yb >= Rt - 1) And (Yb >= -1) And (Yt <= VH) Then
+    { decoupage (overflow: hidden) : toujours traite }
+    If O^.Kind = OP_CLIP Then
+    Begin
+      If Clips < 8 Then Dummy := SaveDC(Ps);
+      Inc(Clips);
+      Dummy := IntersectClipRect(Ps, X, Yt, X + O^.W, Yt + O^.H);
+    End
+    Else If O^.Kind = OP_UNCLIP Then
+    Begin
+      If Clips > 0 Then
+      Begin
+        Dec(Clips);
+        If Clips < 8 Then Dummy := RestoreDC(Ps, -1);
+      End;
+    End
+    Else If (Yt <= Rb) And (Yb >= Rt - 1) And (Yb >= -1) And (Yt <= VH) Then
       Case O^.Kind Of
         OP_TEXT : TextAt(X, Yt, MaxI(1, MinI(3, O^.Size)), O^.Style, MaxI(0, O^.Color), O^.Data, O^.Len);
         OP_RECT : GBoxF(X, Yt, X + O^.W - 1, Yb, O^.Color);
@@ -13046,8 +14524,14 @@ Begin
           End;
         OP_IMAGE : DrawImageOp(O, X, Yt);
         OP_CTRL : DrawCtl(O^.Data, X, Yt, O^.W, O^.H - 2);
+        OP_BGIMG : DrawBgOp(O, X, Yt, Rt, Rb);
       End;
     O := O^.Next;
+  End;
+  While Clips > 0 Do
+  Begin
+    Dec(Clips);
+    If Clips < 8 Then Dummy := RestoreDC(Ps, -1);
   End;
   { inspecteur : cadre autour de l'element choisi }
   If DevOpen And (DevSel <> Nil) And (DevTab = DT_INSP) Then
@@ -13124,7 +14608,7 @@ Begin
   Case O^.Kind Of
     OP_TEXT :
       For K := 0 To MinI(O^.Len, 400) - 1 Do H := SgMix(H, RdB(O^.Data + K));
-    OP_IMAGE :
+    OP_IMAGE, OP_BGIMG :
       Begin
         I := O^.Data;
         If (I >= 0) And (I < NImgs) Then
@@ -13368,6 +14852,14 @@ Begin
       Begin
         ResNode[ResN] := C; ResKind[ResN] := 2; ResUrl[ResN] := ResolveUrl(BaseUrl, GetAttr(C, 'src'));
         Inc(ResN);
+      End
+      Else If (ResN < 64) And (C^.Tag = TAG_IFRAME) And (IframeOf(C) = Nil) And
+              (StartsWith(LowStr(ResolveUrl(BaseUrl, GetAttr(C, 'src'))), 'http') Or
+               StartsWith(LowStr(ResolveUrl(BaseUrl, GetAttr(C, 'src'))), 'file:')) Then
+      Begin
+        { cadre : sa page, analysee sous l'element }
+        ResNode[ResN] := C; ResKind[ResN] := 3; ResUrl[ResN] := ResolveUrl(BaseUrl, GetAttr(C, 'src'));
+        Inc(ResN);
       End;
       CollectRes(C);
     End;
@@ -13384,6 +14876,7 @@ Begin
     If StartsWith(U, 'http:') Or StartsWith(U, 'https:') Or StartsWith(U, 'file:') Then
     Begin
       If ResKind[ResNext] = 1 Then SetStatus('Feuille de style : ' + Copy(U, 1, 80))
+      Else If ResKind[ResNext] = 3 Then SetStatus('Cadre : ' + Copy(U, 1, 80))
       Else SetStatus('Script : ' + Copy(U, 1, 80));
       FetchT0 := KTicks;
       If StartFetch(U, '', 1) Then Exit;
@@ -13391,6 +14884,30 @@ Begin
     Inc(ResNext);
   End;
   PageFinish;
+End;
+
+{ page d'un cadre (ImgBuf) : gardee dans l'attribut interne #doc et
+  analysee ; son arbre devient l'unique enfant de l'element <iframe> }
+Procedure IframeLoaded(F : PNode; U : String);
+Var A : PAttr; SB, SL, SBg, SFg, SLk : LongInt; SRoot, Sub : PNode; ST, SR, SBase : String; STr : Boolean;
+Begin
+  JsSetAttr(F, '#doc', ImgBuf, ImgLen);
+  A := FindAttr(F, '#doc');
+  If (A = Nil) Or (A^.VLen = 0) Then Exit;
+  SB := SrcBuf; SL := SrcLen; SRoot := Root; ST := DocTitle; SR := RefreshUrl; SBase := BaseUrl;
+  STr := ParseTrunc; SBg := PageBg; SFg := PageFg; SLk := LinkFg;
+  SrcBuf := A^.Val; SrcLen := A^.VLen;
+  BaseUrl := U;
+  ParseDocument;
+  Sub := Root;
+  If Sub <> Nil Then
+  Begin
+    ScanDoc(Sub, -1);
+    Sub^.Parent := F; Sub^.Next := Nil;
+    F^.First := Sub; F^.Last := Sub;
+  End;
+  SrcBuf := SB; SrcLen := SL; Root := SRoot; DocTitle := ST; RefreshUrl := SR; BaseUrl := SBase;
+  ParseTrunc := STr; PageBg := SBg; PageFg := SFg; LinkFg := SLk;
 End;
 
 { ressource recue (ImgBuf) : convertie en page 437 et gardee dans
@@ -13406,6 +14923,7 @@ Begin
     ImgLen := SrcLen;
     SrcBuf := SB; SrcLen := SL;
     If ResKind[ResNext] = 1 Then JsSetAttr(ResNode[ResNext], '#css', ImgBuf, ImgLen)
+    Else If ResKind[ResNext] = 3 Then IframeLoaded(ResNode[ResNext], ResUrl[ResNext])
     Else JsSetAttr(ResNode[ResNext], '#js', ImgBuf, ImgLen);
   End;
   Inc(ResNext);
@@ -13448,7 +14966,7 @@ Begin
   N := Root; Cnt := 0;
   While (N <> Nil) And (Cnt < 500) Do
   Begin
-    If (N^.Kind = NODE_ELEM) And (N^.Tag = TAG_SCRIPT) And ScriptTypeOk(N) Then
+    If (N^.Kind = NODE_ELEM) And (N^.Tag = TAG_SCRIPT) And ScriptTypeOk(N) And (IframeOf(N) = Nil) Then
     Begin
       Inc(Cnt);
       JvUndef(U);
@@ -13755,7 +15273,9 @@ Begin
     RunPageScripts;
     Trace('styles');
     NRules := 0;
+    MediaW := MaxI(80, VW); MediaDW := GetSystemMetrics(0);
     CollectStyles(Root);
+    ScanBg(Root);
     Trace('styles ' + IStr(NRules));
     { fond et couleur du corps par les feuilles de style }
     B := Root^.First;
@@ -15656,7 +17176,9 @@ Begin
     C := NextInDoc(C);
   End;
   NRules := 0;
+  MediaW := MaxI(80, VW); MediaDW := GetSystemMetrics(0);
   CollectStyles(Root);
+  ScanBg(Root);
   Inc(LayGen);
   Relayout;
   SetStatus('Style appliqu' + Chr(130) + ' (' + IStr(NRules) + ' r' + Chr(138) + 'gles)');
